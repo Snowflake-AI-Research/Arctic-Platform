@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("trl.experimental.async_grpo.training_client")
+pytest.importorskip("trl.experimental.async_grpo.async_grpo_trainer")
 
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
 

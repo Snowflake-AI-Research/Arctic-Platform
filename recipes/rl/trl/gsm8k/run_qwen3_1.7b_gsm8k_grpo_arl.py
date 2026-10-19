@@ -53,33 +53,6 @@ MAX_TOKEN_LEN_PER_GPU = int(os.environ.get("MAX_TOKEN_LEN_PER_GPU", "4096"))
 # --------------------------------------------------------------------------------------------------------------- #
 # Inert local-model stub (README open item #1)
 # --------------------------------------------------------------------------------------------------------------- #
-def install_stub_model_loader() -> None:
-    """Replace the trainer's ``AutoModelForCausalLM`` with a loader that builds a tiny, inert stub.
-
-    Arctic owns the weights; the trainer's local module is never run (ArcticTrainingClient ignores it) and never
-    streamed (ArcticWeightTransfer ignores the iterator). So we only need a real ``*ForCausalLM`` shell with a
-    ``.config`` (for MoE detection / model id), a ``.model`` + ``.lm_head`` (for ``patch_chunked_lm_head``), and
-    parameters (for the optimizer + accelerate). Shrinking to 1 layer + eager attention keeps it cheap and
-    avoids both the checkpoint download and the flash-attn3 kernel fetch.
-    """
-    import trl.experimental.async_grpo.async_grpo_trainer as agt
-    from transformers import AutoConfig
-    from transformers import AutoModelForCausalLM as _RealAuto
-
-    class _StubLoader:
-        @staticmethod
-        def from_pretrained(model_id: str, **kwargs):
-            cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=kwargs.get("trust_remote_code", False))
-            text = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-            if hasattr(text, "num_hidden_layers"):
-                text.num_hidden_layers = 1  # inert: depth doesn't matter, never forwarded
-            model = _RealAuto.from_config(cfg, attn_implementation="eager")
-            return model.to(torch.float32)
-
-    agt.AutoModelForCausalLM = _StubLoader
-    print("[e2e] installed inert stub-model loader (1 layer, eager attn, no checkpoint download)", flush=True)
-
-
 # --------------------------------------------------------------------------------------------------------------- #
 # GSM8K data + reward
 # --------------------------------------------------------------------------------------------------------------- #
@@ -89,6 +62,13 @@ def format_sample(sample: dict) -> dict:
         "prompt": [{"role": "user", "content": sample["question"]}],
         "solution": sample["answer"].split("####")[-1].strip(),
     }
+
+
+def _arctic_inference_config() -> dict | None:
+    # Forest cascade on the sampler. ZoRRo training is the separate --zorro flag.
+    if os.environ.get("ARCTIC_ZORRO_INFERENCE", "0") in ("0", "false", "False"):
+        return None
+    return {"zorro_inference": {"enable": True}}
 
 
 # --------------------------------------------------------------------------------------------------------------- #
@@ -160,6 +140,17 @@ def build_client(
         use_unpad=(os.environ.get("ARCTIC_ATTN_IMPL", "flash_attention_2") == "flash_attention_2"),
         use_autocast=False,
     )
+    aic = _arctic_inference_config()
+    vllm = {
+        # TP=1 => `sampling_gpus` data-parallel replicas; the ReplicaPool spreads generate() across them.
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_mem_util,
+        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
+        "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False"),
+    }
+    if aic is not None:
+        # Full CUDA graphs skip forest cascade at runtime.
+        vllm["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
     cfg = ArcticClientConfig(
         model_name=model,
         seed=seed,
@@ -168,26 +159,8 @@ def build_client(
         sampling_gpus=sampling_gpus,
         log_prob_gpus=0,
         training=TrainingConfig(ds_config=ds_config, ds_worker_config=ds_worker_config, checkpoint_path=ckpt_dir),
-        sampling=SamplingConfig(
-            vllm={
-                # TP=1 => `sampling_gpus` data-parallel replicas; the ReplicaPool spreads generate() across them.
-                "tensor_parallel_size": tensor_parallel_size,
-                "gpu_memory_utilization": gpu_mem_util,
-                "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
-                "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1")
-                not in ("0", "false", "False"),
-            }
-        ),
-        backend=OnPremConfig(
-            # "ray" builds the server in-process (no HTTP, no serialization); "http" connects to a subprocess
-            # server we launch separately. Either way launch_local_server=False -- the caller owns lifecycle.
-            protocol=comm_protocol,
-            host=host,
-            port=port,
-            colocate=colocate,
-            launch_local_server=False,
-            startup_timeout=startup_timeout,
-        ),
+        sampling=SamplingConfig(vllm=vllm, arctic_inference_config=aic),
+        backend=OnPremConfig(colocate=colocate),
     )
     return ArcticRLClient(cfg)
 
@@ -217,41 +190,6 @@ def _tail(path: str, n: int = 100) -> str:
             return "".join(fh.readlines()[-n:])
     except OSError:
         return "(no server log)"
-
-
-# --------------------------------------------------------------------------------------------------------------- #
-# Trainer subclass: build ArcticOptimizer from the trainer's own (stub) model
-# --------------------------------------------------------------------------------------------------------------- #
-def make_trainer(
-    *, model, args, train_dataset, processing_class, training_client, rollout_worker, weight_transfer, arctic_client
-):
-    from trl.experimental.async_grpo import AsyncGRPOTrainer
-
-    from arctic_platform.integrations.trl.client import ArcticOptimizer
-
-    class ArcticAsyncGRPOTrainer(AsyncGRPOTrainer):
-        def __init__(self, *a, **kw):
-            self._arctic_client = arctic_client
-            super().__init__(*a, **kw)
-
-        def create_optimizer(self, *args, **kwargs):
-            # Called by transformers at train start, once the (stub) model exists. ArcticOptimizer.step()
-            # drives client.step(); the params are only a handle for accelerate + the scheduler.
-            if self.optimizer is None:
-                self.optimizer = ArcticOptimizer(
-                    self._arctic_client, self.model.parameters(), lr=self.args.learning_rate
-                )
-            return self.optimizer
-
-    return ArcticAsyncGRPOTrainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        processing_class=processing_class,
-        training_client=training_client,
-        rollout_worker=rollout_worker,
-        weight_transfer=weight_transfer,
-    )
 
 
 def main() -> None:
@@ -436,8 +374,6 @@ def main() -> None:
         dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
         print(f"[e2e] dataset ready: {len(dataset)} prompts (split={split})", flush=True)
 
-        install_stub_model_loader()
-
         world = int(os.environ.get("WORLD_SIZE", "1"))
         max_inflight = args.max_inflight_tasks
         if max_inflight < 0:
@@ -542,15 +478,27 @@ def main() -> None:
         )
         weight_transfer = ArcticWeightTransfer(client)
 
-        trainer = make_trainer(
-            model=args.model,
+        from transformers import AutoConfig
+
+        from arctic_platform.integrations.trl.trainer import ArcticAsyncGRPOTrainer
+        from arctic_platform.integrations.trl.trainer import build_stub_model
+
+        model_config = AutoConfig.from_pretrained(args.model)
+        model_config._name_or_path = args.model
+        stub = build_stub_model(model_config)
+        print(
+            f"[e2e] stub model: layers={stub.config.num_hidden_layers} dtype={next(stub.parameters()).dtype}",
+            flush=True,
+        )
+        trainer = ArcticAsyncGRPOTrainer(
+            model=stub,
             args=config,
             train_dataset=dataset,
             processing_class=tokenizer,
-            training_client=training_client,
             rollout_worker=rollout_worker,
             weight_transfer=weight_transfer,
             arctic_client=client,
+            training_client=training_client,
         )
 
         run_desc = f"max_steps={args.max_steps}" if args.max_steps > 0 else f"{args.num_train_epochs} epoch(s)"

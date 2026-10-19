@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 import torch
 
-pytest.importorskip("trl.experimental.async_grpo.training_client")
+pytest.importorskip("trl.experimental.async_grpo.async_grpo_trainer")
 
 from arctic_platform.integrations.trl.client import engine_old_log_probs  # noqa: E402
 

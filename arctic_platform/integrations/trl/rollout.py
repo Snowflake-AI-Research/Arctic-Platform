@@ -335,16 +335,19 @@ class ArcticRolloutWorker:
                 "reward_std": float(reward_std),
                 **{f"rewards/{name}": float(per_func_rewards[k, i]) for k, name in enumerate(self.reward_func_names)},
             }
+            length = len(rows[i]["input_ids"])
             sample = RolloutSample(
                 prompt=prompt,
                 completion=completions[i],
-                input_ids=rows[i]["input_ids"],
-                completion_mask=rows[i]["completion_mask"],
-                old_log_probs=rows[i]["old_log_probs"],
+                input_ids=np.asarray(rows[i]["input_ids"], dtype=np.int64),
+                completion_mask=np.asarray(rows[i]["completion_mask"], dtype=np.int64),
+                old_log_probs=np.asarray(rows[i]["old_log_probs"], dtype=np.float32),
+                sampling_mask=[[] for _ in range(length)],
                 advantage=float(adv),
                 model_version=model_version,
                 group_id=group_id,
                 metrics=metrics,
+                enqueued_at=time.time(),
             )
             self._put(sample)
 

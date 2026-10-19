@@ -22,13 +22,14 @@ Each recipe is a standalone folder with its own `requirements.txt`, `overrides.t
 launchers, and README. Same env across both — build it once and either recipe
 launches from that env.
 
-1. **Clone this repo and the TRL async-GRPO branch.** The trainer hooks
-   (`TrainingClientProtocol`, `RolloutWorkerProtocol`, `WeightTransferProtocol`)
-   are not in a released TRL yet; they live on the paired training-client branch.
+1. **Clone this repo and TRL #6676.** The paired trainer is
+   [huggingface/trl#6676](https://github.com/huggingface/trl/pull/6676) at `e7f6928`
+   (instantiated models, no `training_client` argument).
 
    ```bash
    git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
-   git clone -b api-training-client https://github.com/kashif/trl
+   git clone https://github.com/huggingface/trl
+   git -C trl checkout e7f6928cfc0f49df6e52b05eaab7a1bdf96973e3
    cd Arctic-Platform/recipes/rl/trl
    ```
 

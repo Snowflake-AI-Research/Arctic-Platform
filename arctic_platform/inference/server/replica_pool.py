@@ -207,6 +207,21 @@ class ReplicaPool:
         # The pool does NOT create or remove this PG; lifetime is the caller's.
         self._engine_pg: Any | None = None
 
+    def __getstate__(self) -> dict[str, Any]:
+        # The driver pulls this pool back across Ray. Locks and tasks are local
+        # to the actor that created them.
+        state = self.__dict__.copy()
+        state["_lock"] = None
+        state["_health_task"] = None
+        state["_scale_task"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = asyncio.Lock()
+        self._health_task = None
+        self._scale_task = None
+
     @property
     def config(self) -> ModelConfig:
         if self._config is None:

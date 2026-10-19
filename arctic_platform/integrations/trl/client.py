@@ -13,16 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic backend for TRL's ``TrainingClientProtocol``.
+"""Arctic backend for TRL async-GRPO.
 
-TRL's fused ``forward_backward(..., loss_fn)`` stays in-process: Arctic runs the
-model, this adapter unpacks packed rows and evaluates ``loss_fn`` on returned logprobs.
+The model stays on the Arctic server. This adapter unpacks packed rows, runs the
+clipped surrogate on explicit shifted-frame tensors, and ships the resulting
+log-prob weights back for the server backward.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
-from trl.experimental.async_grpo.training_client import ForwardBackwardOutput
+
+
+@dataclass
+class ForwardBackwardOutput:
+    """Client-side result of one Arctic forward/backward."""
+
+    loss: torch.Tensor
+    log_probs: torch.Tensor
+    entropy: torch.Tensor
+
+
+def clipped_surrogate_sum(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    epsilon_low: float,
+    epsilon_high: float,
+) -> torch.Tensor:
+    """Unscaled sum of TRL's clipped GRPO surrogate on the shifted frame."""
+    ratio = torch.exp(log_probs - old_log_probs)
+    unclipped = ratio * advantages
+    clipped = torch.clamp(ratio, 1.0 - float(epsilon_low), 1.0 + float(epsilon_high)) * advantages
+    per_token = -torch.minimum(unclipped, clipped)
+    return torch.where(loss_mask.to(dtype=torch.bool), per_token, torch.zeros_like(per_token)).sum()
 
 
 def _meta_dict(
@@ -61,11 +87,11 @@ class ArcticTrainingClient:
     Args:
         client: :class:`~arctic_platform.client.ArcticRLClient`.
         temperature: Applied by the ``apply_temperature`` post-processor.
-        loss_fn: Server surrogate name (or dotted import). Not TRL's local ``loss_fn`` callable.
-        server_side_loss: When ``True``, ship GRPO ingredients to the server and run
-            forward+loss+backward in one fused ``fwd_bwd`` via ``server_loss_fn``
-            (perf + parity with verl/SkyRL). When ``False`` (default), keep the
-            two-pass client-side surrogate path.
+        loss_fn: Server surrogate name (or dotted import) for the client-placement backward.
+        server_side_loss: When ``True``, ship explicit GRPO tensors to the server and run
+            forward+loss+backward in one fused ``fwd_bwd`` via ``server_loss_fn``.
+            When ``False`` (default), evaluate the clipped surrogate here and ship its
+            log-prob gradient.
         server_loss_fn: Server GRPO loss name/dotted-path used when ``server_side_loss``.
     """
 
@@ -139,31 +165,45 @@ class ArcticTrainingClient:
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         completion_mask: torch.Tensor,
-        loss: Any = None,
-        loss_fn: Any = None,
-        model: torch.nn.Module | None = None,
-        aux_loss_coef: float = 0.0,
+        *,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        loss_mask: torch.Tensor,
+        epsilon_low: float,
+        epsilon_high: float,
+        tokens_per_rank: float | torch.Tensor,
+        world_size: int = 1,
     ) -> ForwardBackwardOutput:
-        del model, aux_loss_coef  # #6676 no longer passes these; aux coef lives on GRPOLoss
-        # Rebased TRL passes a GRPOLoss as ``loss``. Older callers pass ``loss_fn``.
-        if loss is None:
-            loss = loss_fn
-        if loss is None:
-            raise TypeError("forward_backward requires loss")
-        loss_fn = loss
+        """Run one packed row.
+
+        ``old_log_probs``, ``advantages`` and ``loss_mask`` are the shifted ``[1, T-1]``
+        frame (TRL's ``[:, 1:]``). ``input_ids`` / ``position_ids`` / ``completion_mask``
+        stay the full packed row; segments split where ``position_ids == 0``.
+        """
         seq_lens = _segment_lengths(position_ids)
+        ingredients = {
+            "old_log_probs": old_log_probs,
+            "advantages": advantages,
+            "completion_mask": loss_mask,
+            "tokens_per_rank": tokens_per_rank,
+            "epsilon_low": float(epsilon_low),
+            "epsilon_high": float(epsilon_high),
+        }
+
+        if self.zorro_train_enable or self.server_side_loss:
+            _reject_multiprocess_trl(world_size)
 
         if self.zorro_train_enable:
             # Zorro needs verl-style structured [B, max_prompt_len + response_len] batches (built from the
             # packed rows + completion_mask), not the plain right-padded [B, S] the other paths use.
             return self._forward_backward_server_loss_zorro(
-                loss_fn, input_ids, completion_mask, seq_lens, input_ids.device
+                ingredients, input_ids, completion_mask, seq_lens, input_ids.device
             )
 
         batch = _unpack_to_padded_rows(input_ids, position_ids, completion_mask, seq_lens)
 
         if self.server_side_loss:
-            return self._forward_backward_server_loss(loss_fn, batch, seq_lens, input_ids.device)
+            return self._forward_backward_server_loss(ingredients, batch, seq_lens, input_ids.device)
 
         response = self.client.fwd_no_grad(
             {
@@ -183,8 +223,17 @@ class ArcticTrainingClient:
         entropy = _shift_for_trl(_repack_to_row(out["entropy"], seq_lens)).to(device)
 
         leaf = log_probs.detach().requires_grad_(True)
-        loss = loss_fn(leaf)
-        (grad_log_probs,) = torch.autograd.grad(loss, leaf)
+        loss = clipped_surrogate_sum(
+            leaf,
+            old_log_probs.to(device=leaf.device, dtype=leaf.dtype),
+            advantages.to(device=leaf.device, dtype=leaf.dtype),
+            loss_mask.to(device=leaf.device),
+            epsilon_low,
+            epsilon_high,
+        )
+        (grad_log_probs,) = torch.autograd.grad(loss, leaf, allow_unused=True)
+        if grad_log_probs is None:
+            grad_log_probs = torch.zeros_like(leaf)
 
         def send_backward(grad_loss: torch.Tensor) -> None:
             # Scale, unshift to [1, T], unpack to [B, S].
@@ -206,26 +255,22 @@ class ArcticTrainingClient:
         return ForwardBackwardOutput(
             loss=reported_loss,
             log_probs=log_probs.detach(),
-            entropy=entropy,
-            aux_loss=None,  # MoE aux is a server metric, not a tensor
+            entropy=entropy.detach(),
         )
 
     def _forward_backward_server_loss(
         self,
-        loss_fn: Any,
+        ing: dict,
         batch: dict,
         seq_lens: torch.Tensor,
         device: torch.device,
     ) -> ForwardBackwardOutput:
         """Single fused ``fwd_bwd``: server runs forward + GRPO loss + backward.
 
-        Recovers GRPO ingredients from TRL's ``loss_fn`` closure, re-aligns them
-        into the server's roll(-1) ``[B, S]`` frame, and hands them to the
-        ``server_loss_fn``. The returned loss leaf is a no-op backward (the real
-        backward already ran on the server).
+        ``ing`` holds explicit shifted-frame tensors. They are re-aligned into the
+        server's roll(-1) ``[B, S]`` frame. The returned loss leaf is a no-op
+        backward (the real backward already ran on the server).
         """
-        ing = _extract_grpo_ingredients(loss_fn)
-
         old_lp_bs = _to_server_bs(ing["old_log_probs"], seq_lens)
         adv_bs = _to_server_bs(ing["advantages"], seq_lens)
         mask_bs = _to_server_bs(ing["completion_mask"].to(torch.float32), seq_lens)
@@ -271,13 +316,12 @@ class ArcticTrainingClient:
         return ForwardBackwardOutput(
             loss=loss,
             log_probs=log_probs.detach(),
-            entropy=entropy,
-            aux_loss=None,
+            entropy=entropy.detach(),
         )
 
     def _forward_backward_server_loss_zorro(
         self,
-        loss_fn: Any,
+        ing: dict,
         input_ids: torch.Tensor,
         completion_mask: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -288,12 +332,10 @@ class ArcticTrainingClient:
         Zorro assumes verl's structured layout: a fixed-width ``[B, max_prompt_len + response_len]`` batch
         with left-padded prompts (so a rollout group's shared prefix is byte-identical for ``find_prompt_groups``)
         and right-padded responses. This builds that batch from TRL's packed rows + ``completion_mask``, ships
-        the GRPO ingredients (recovered from ``loss_fn``'s closure) in the response window exactly like verl's
+        the explicit GRPO tensors in the response window exactly like verl's
         ``_send_update_actor`` left-pad, and maps the response-aligned logprobs/entropy back to TRL's shifted
         ``[1, T-1]`` packed frame.
         """
-        ing = _extract_grpo_ingredients(loss_fn)
-
         batch, layout = _zorro_structured_batch(
             input_ids, completion_mask, seq_lens, self.pad_token_id, self.response_len
         )
@@ -353,8 +395,7 @@ class ArcticTrainingClient:
         return ForwardBackwardOutput(
             loss=loss,
             log_probs=log_probs.detach(),
-            entropy=entropy,
-            aux_loss=None,
+            entropy=entropy.detach(),
         )
 
     def save(self, output_dir: str) -> None:
@@ -383,9 +424,8 @@ class ArcticOptimizer(torch.optim.Optimizer):
         pass  # server clears grads in step()
 
 
-# Packed [1, T] <-> padded [B, S]. Client-side path keeps advantages /
-# old_log_probs inside TRL's loss_fn; server_side_loss extracts them from
-# the closure and ships them on the fused fwd_bwd.
+# Packed [1, T] <-> padded [B, S]. Shifted-frame GRPO tensors are explicit
+# arguments; the server path re-aligns them onto the fused fwd_bwd.
 
 
 def _segment_lengths(position_ids: torch.Tensor) -> torch.Tensor:
@@ -611,12 +651,6 @@ def _response_window_to_shifted(full_2d: torch.Tensor, layout: dict, response_le
     return out
 
 
-# GRPO ingredients that TRL captures in its ``compute_loss.loss_fn`` closure
-# (trl/experimental/async_grpo/async_grpo_trainer.py). Recovered by name so the
-# server can run the loss instead of the CPU client.
-_TRL_LOSS_FREEVARS = ("shifted_old_log_probs", "shifted_advantages", "shifted_completion_mask", "tokens_per_rank")
-
-
 def _reject_multiprocess_trl(world_size: int) -> None:
     """Server-side ``trl_grpo`` treats ``tokens_per_rank`` as the global token count.
 
@@ -628,61 +662,6 @@ def _reject_multiprocess_trl(world_size: int) -> None:
             "server_side_loss assumes a single-process TRL trainer, but "
             f"num_processes={world_size}. Use loss_placement=client."
         )
-
-
-def _trl_num_processes() -> int:
-    """TRL process count. ``GRPOLoss`` does not carry the trainer."""
-    from accelerate import PartialState
-
-    return int(PartialState().num_processes)
-
-
-def _extract_grpo_ingredients(loss_fn: Any) -> dict:
-    """Recover GRPO tensors/scalars from a ``GRPOLoss`` or TRL's old ``loss_fn`` closure.
-
-    Rebased TRL passes a ``GRPOLoss`` dataclass (fields, also callable). Older TRL
-    handed a closure; advantages/old_log_probs/mask/epsilons lived in its freevars.
-    """
-    if hasattr(loss_fn, "num_tokens_per_rank") and hasattr(loss_fn, "old_log_probs"):
-        _reject_multiprocess_trl(_trl_num_processes())
-        return {
-            "old_log_probs": loss_fn.old_log_probs,
-            "advantages": loss_fn.advantages,
-            "completion_mask": loss_fn.completion_mask,
-            "tokens_per_rank": loss_fn.num_tokens_per_rank,
-            "epsilon_low": float(loss_fn.epsilon_low),
-            "epsilon_high": float(loss_fn.epsilon_high),
-        }
-
-    code = getattr(loss_fn, "__code__", None)
-    closure = getattr(loss_fn, "__closure__", None)
-    if code is None or closure is None:
-        raise RuntimeError(
-            "server_side_loss requires TRL's closure-based loss_fn; got a plain callable. Use loss_placement=client."
-        )
-    cells = dict(zip(code.co_freevars, (cell.cell_contents for cell in closure)))
-
-    missing = [name for name in (*_TRL_LOSS_FREEVARS, "self") if name not in cells]
-    if missing:
-        raise RuntimeError(
-            f"server_side_loss could not find TRL loss_fn freevars {missing}; TRL's "
-            f"compute_loss may have changed (saw {tuple(cells)}). Use loss_placement=client."
-        )
-
-    trainer = cells["self"]
-    # tokens_per_rank must be the global completion count. trl_grpo divides by it
-    # and multiplies by dp_size, which is the only DP correction.
-    _reject_multiprocess_trl(int(getattr(trainer.accelerator, "num_processes", 1)))
-    _reject_multiprocess_trl(_trl_num_processes())
-
-    return {
-        "old_log_probs": cells["shifted_old_log_probs"],
-        "advantages": cells["shifted_advantages"],
-        "completion_mask": cells["shifted_completion_mask"],
-        "tokens_per_rank": cells["tokens_per_rank"],
-        "epsilon_low": float(trainer.epsilon_low),
-        "epsilon_high": float(trainer.epsilon_high),
-    }
 
 
 def _pad_rows(input_ids_rows: list[list[int]], pad_token_id: int) -> tuple[dict, list[int]]:

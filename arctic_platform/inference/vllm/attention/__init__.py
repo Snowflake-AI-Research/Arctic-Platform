@@ -72,9 +72,14 @@ def install_forest_cascade_patches() -> None:
     already checked that the process is on vLLM 0.31.
     """
     from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.arg_utils import EngineArgs
 
     from arctic_platform.inference.vllm.args import AsyncEngineArgsPatch
+    from arctic_platform.inference.vllm.args import EngineArgsPatch
 
     if "__new__" not in getattr(AsyncEngineArgs, "_arctic_patches", {}):
         AsyncEngineArgsPatch.apply_patch()
+    # create_engine_config is what copies forest_cascade_attn_configs onto VllmConfig.
+    if "create_engine_config" not in getattr(EngineArgs, "_arctic_patches", {}):
+        EngineArgsPatch.apply_patch()
     apply_forest_cascade_patches()

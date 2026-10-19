@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic RL backend for TRL. Construct the trainer with these objects; ``weighted_logprob_sum`` is lazy."""
+"""Arctic RL backend for TRL. The trainer and stub builder import TRL lazily."""
 
 from typing import TYPE_CHECKING
 
@@ -22,20 +22,23 @@ from arctic_platform.integrations.trl.client import ArcticTrainingClient
 
 if TYPE_CHECKING:
     from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
+    from arctic_platform.integrations.trl.trainer import ArcticAsyncGRPOTrainer
+    from arctic_platform.integrations.trl.trainer import build_stub_model
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
     from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
 __all__ = [
+    "ArcticAsyncGRPOTrainer",
     "ArcticOptimizer",
-    "ArcticTrainingClient",
     "ArcticRolloutWorker",
+    "ArcticTrainingClient",
     "ArcticWeightTransfer",
+    "build_stub_model",
     "weighted_logprob_sum",
 ]
 
 
 def __getattr__(name: str):
-    # Lazy: rollout/weights need async_grpo; loss needs the server.
     if name == "ArcticRolloutWorker":
         from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
 
@@ -48,4 +51,10 @@ def __getattr__(name: str):
         from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
         return weighted_logprob_sum
+    if name in {"ArcticAsyncGRPOTrainer", "build_stub_model"}:
+        from arctic_platform.integrations.trl import trainer as trainer_mod
+
+        if name == "ArcticAsyncGRPOTrainer":
+            return trainer_mod._trainer_cls()
+        return trainer_mod.build_stub_model
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

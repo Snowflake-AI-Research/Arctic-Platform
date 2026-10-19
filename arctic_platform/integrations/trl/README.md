@@ -82,7 +82,7 @@ loss is not also divided by engine GAS. The `* dp_size`
 factor makes the gradient correct after DeepSpeed's cross-DP averaging — identical to verl's
 `agg_loss` token-mean. Contract: the TRL trainer is single-process
 (`accelerator.num_processes == 1`), so `tokens_per_rank` is the global completion-token count
-and server-side `dp_size` is the only DP correction (asserted in `_extract_grpo_ingredients`).
+and server-side `dp_size` is the only DP correction (asserted in `_reject_multiprocess_trl`).
 
 Server enabler: `forward_backward` on the Ray/HTTP servers drops the per-token `batch` by
 default (verl never reads it); the server path opts in via `meta["return_fwd_batch"]` so the
@@ -90,9 +90,11 @@ adapter gets logprobs/entropy back for TRL's unchanged metrics block.
 
 ## What TRL changes
 
-Nothing. `training_client=` already exists on `AsyncGRPOTrainer` alongside the `rollout_worker` and
-`weight_transfer` hooks, and `transformers.Trainer` already accepts `optimizers=`, which is why there is no
-`optim_step` or `clip_grad_norm` in the protocol.
+Nothing inside TRL. The paired checkout is huggingface/trl#6676 at `e7f6928`
+(`AsyncGRPOTrainer` takes an instantiated model and has no `training_client` argument).
+`ArcticAsyncGRPOTrainer` keeps the Arctic client as its own argument, builds a one-layer
+model so TRL can initialize, and sends packed rows to the server. Tree attention stays
+inside TRL; Arctic still trains the flat packed rows.
 
 ## Open items
 

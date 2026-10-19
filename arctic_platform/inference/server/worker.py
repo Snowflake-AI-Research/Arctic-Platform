@@ -373,6 +373,16 @@ def _create_async_engine_args(
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
         require_supported_vllm_version("InferenceWorker")
 
+    # Stock AsyncEngineArgs rejects this field, and its __init__ still runs
+    # after the __new__ patch. Build the Arctic subclass directly so FCA stays on.
+    if engine_kwargs.get("forest_cascade_attn_configs") is not None:
+        from arctic_platform.inference.vllm.args import ArcticAsyncEngineArgs
+        from arctic_platform.inference.vllm.attention import install_forest_cascade_patches
+
+        install_forest_cascade_patches()
+        _coerce_structured_outputs_config(engine_kwargs)
+        return ArcticAsyncEngineArgs(**engine_kwargs)
+
     if enable_arctic_patches:
         _ensure_arctic_vllm_patches()
         from vllm.engine.arg_utils import AsyncEngineArgs

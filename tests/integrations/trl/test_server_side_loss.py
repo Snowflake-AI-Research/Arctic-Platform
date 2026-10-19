@@ -13,125 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for the adapter's server-side-loss plumbing: GRPO closure
-introspection (``_extract_grpo_ingredients``) and TRL-frame re-alignment
-(``_to_server_bs``)."""
+"""CPU tests for the adapter's server-side-loss plumbing: explicit shifted-frame
+tensors, multiprocess rejection, and TRL-frame re-alignment (``_to_server_bs``)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-pytest.importorskip("trl.experimental.async_grpo.training_client")
+pytest.importorskip("trl.experimental.async_grpo.async_grpo_trainer")
 
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
-from arctic_platform.integrations.trl.client import _extract_grpo_ingredients  # noqa: E402
+from arctic_platform.integrations.trl.client import _reject_multiprocess_trl  # noqa: E402
 from arctic_platform.integrations.trl.client import _to_server_bs  # noqa: E402
 
 
-class _FakeAccelerator:
-    def __init__(self, num_processes: int = 1) -> None:
-        self.num_processes = num_processes
-
-
-class _FakeTrainer:
-    """Minimal stand-in for TRL's AsyncGRPOTrainer (the closure's ``self``)."""
-
-    def __init__(self, num_processes: int = 1) -> None:
-        self.accelerator = _FakeAccelerator(num_processes)
-        self.epsilon_low = 0.2
-        self.epsilon_high = 0.3
-        self.current_gradient_accumulation_steps = 2
-
-
-def _make_trl_like_loss_fn(trainer, old, adv, mask, tokens):
-    """Build a closure with the same freevar names TRL's compute_loss creates."""
-    shifted_old_log_probs = old
-    shifted_advantages = adv
-    shifted_completion_mask = mask
-    tokens_per_rank = tokens
-    self = trainer
-
-    def loss_fn(log_probs):
-        coef_1 = torch.exp(log_probs - shifted_old_log_probs)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token = -torch.min(coef_1 * shifted_advantages, coef_2 * shifted_advantages)
-        loss = (per_token * shifted_completion_mask).sum() / tokens_per_rank
-        return loss / self.current_gradient_accumulation_steps
-
-    return loss_fn
-
-
-def test_extract_recovers_closure_values():
-    trainer = _FakeTrainer()
-    old = torch.tensor([[0.1, 0.2, 0.3]])
-    adv = torch.tensor([[1.0, -1.0, 0.5]])
-    mask = torch.tensor([[1.0, 1.0, 0.0]])
-    tokens = torch.tensor(2.0)
-
-    loss_fn = _make_trl_like_loss_fn(trainer, old, adv, mask, tokens)
-    ing = _extract_grpo_ingredients(loss_fn)
-
-    assert torch.equal(ing["old_log_probs"], old)
-    assert torch.equal(ing["advantages"], adv)
-    assert torch.equal(ing["completion_mask"], mask)
-    assert ing["tokens_per_rank"] is tokens
-    assert ing["epsilon_low"] == pytest.approx(0.2)
-    assert ing["epsilon_high"] == pytest.approx(0.3)
-
-
-def test_extract_raises_on_plain_callable():
-    def not_a_closure(log_probs):
-        return log_probs.sum()
-
-    with pytest.raises(RuntimeError, match="loss_placement=client"):
-        _extract_grpo_ingredients(not_a_closure)
-
-
-def test_extract_raises_on_missing_freevar():
-    # A closure that omits shifted_advantages/etc must fail loudly (TRL drift guard).
-    other = torch.tensor([[1.0]])
-
-    def partial_loss_fn(log_probs):
-        return (log_probs * other).sum()
-
-    with pytest.raises(RuntimeError, match="freevars"):
-        _extract_grpo_ingredients(partial_loss_fn)
-
-
-def test_extract_raises_on_multiprocess_trainer():
-    trainer = _FakeTrainer(num_processes=2)
-    loss_fn = _make_trl_like_loss_fn(
-        trainer, torch.zeros(1, 2), torch.zeros(1, 2), torch.ones(1, 2), torch.tensor(2.0)
+def _loss_kwargs(old, adv, mask, tokens, *, world_size=1, epsilon_low=0.2, epsilon_high=0.3):
+    return dict(
+        old_log_probs=old,
+        advantages=adv,
+        loss_mask=mask,
+        epsilon_low=epsilon_low,
+        epsilon_high=epsilon_high,
+        tokens_per_rank=tokens,
+        world_size=world_size,
     )
+
+
+def test_server_loss_rejects_multiprocess_trainer():
     with pytest.raises(RuntimeError, match="single-process"):
-        _extract_grpo_ingredients(loss_fn)
-
-
-class _GRPOLoss:
-    """Field stub of TRL's ``GRPOLoss``. It does not carry the trainer."""
-
-    def __init__(self) -> None:
-        self.num_tokens_per_rank = torch.tensor(4.0)
-        self.old_log_probs = torch.zeros(1, 2)
-        self.advantages = torch.ones(1, 2)
-        self.completion_mask = torch.ones(1, 2)
-        self.epsilon_low = 0.2
-        self.epsilon_high = 0.28
-
-
-def test_extract_grpo_loss_single_process(monkeypatch):
-    monkeypatch.setattr("arctic_platform.integrations.trl.client._trl_num_processes", lambda: 1)
-    ing = _extract_grpo_ingredients(_GRPOLoss())
-    assert ing["tokens_per_rank"] == pytest.approx(4.0)
-    assert ing["epsilon_low"] == pytest.approx(0.2)
-    assert ing["epsilon_high"] == pytest.approx(0.28)
-
-
-def test_extract_grpo_loss_raises_when_num_processes_gt_1(monkeypatch):
-    monkeypatch.setattr("arctic_platform.integrations.trl.client._trl_num_processes", lambda: 2)
-    with pytest.raises(RuntimeError, match="single-process"):
-        _extract_grpo_ingredients(_GRPOLoss())
+        _reject_multiprocess_trl(2)
 
 
 def test_to_server_bs_places_shifted_into_padded_rows():
@@ -165,12 +76,10 @@ def test_forward_backward_server_branch_wiring():
     position_ids = torch.tensor([[0, 1, 2, 0, 1]])
     completion_mask = torch.tensor([[0, 1, 1, 0, 1]])
 
-    trainer = _FakeTrainer()  # epsilon 0.2/0.3, grad_accum 2, num_processes 1
     old = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
     adv = torch.tensor([[1.0, -1.0, 0.5, 2.0]])
     mask = torch.tensor([[0.0, 1.0, 0.0, 1.0]])
     tokens_per_rank = torch.tensor(4.0)
-    loss_fn = _make_trl_like_loss_fn(trainer, old, adv, mask, tokens_per_rank)
 
     server_logprobs = torch.tensor([[0.0, -0.1, -0.2], [0.0, -0.3, 0.0]])  # [B=2, S=3]
     server_entropy = torch.tensor([[1.0, 1.1, 1.2], [1.3, 1.4, 0.0]])
@@ -178,11 +87,10 @@ def test_forward_backward_server_branch_wiring():
 
     adapter = ArcticTrainingClient(client=client, temperature=0.7, server_side_loss=True)
     out = adapter.forward_backward(
-        model=None,
-        input_ids=input_ids,
-        position_ids=position_ids,
-        completion_mask=completion_mask,
-        loss_fn=loss_fn,
+        input_ids,
+        position_ids,
+        completion_mask,
+        **_loss_kwargs(old, adv, mask, tokens_per_rank),
     )
 
     payload = client.last_payload
@@ -206,7 +114,6 @@ def test_forward_backward_server_branch_wiring():
     # log_probs/entropy come back in TRL frame [1, T-1].
     assert out.log_probs.shape == (1, 4)
     assert out.entropy.shape == (1, 4)
-    assert out.aux_loss is None
     # No-op backward leaf carrying the server's reported loss.
     assert out.loss.requires_grad
     assert out.loss.item() == pytest.approx(0.5, abs=1e-6)
@@ -217,14 +124,6 @@ def test_server_side_loss_forwards_logits_optimization_memory():
     input_ids = torch.tensor([[10, 11, 12, 20, 21]])
     position_ids = torch.tensor([[0, 1, 2, 0, 1]])
     completion_mask = torch.tensor([[0, 1, 1, 0, 1]])
-    trainer = _FakeTrainer()
-    loss_fn = _make_trl_like_loss_fn(
-        trainer,
-        torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
-        torch.tensor([[1.0, -1.0, 0.5, 2.0]]),
-        torch.tensor([[0.0, 1.0, 0.0, 1.0]]),
-        torch.tensor(4.0),
-    )
     client = _RecordingClient(
         torch.tensor([[0.0, -0.1, -0.2], [0.0, -0.3, 0.0]]),
         torch.tensor([[1.0, 1.1, 1.2], [1.3, 1.4, 0.0]]),
@@ -238,11 +137,15 @@ def test_server_side_loss_forwards_logits_optimization_memory():
         logits_optimization_peak_mem_size_in_gib=8,
     )
     adapter.forward_backward(
-        model=None,
-        input_ids=input_ids,
-        position_ids=position_ids,
-        completion_mask=completion_mask,
-        loss_fn=loss_fn,
+        input_ids,
+        position_ids,
+        completion_mask,
+        **_loss_kwargs(
+            torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
+            torch.tensor([[1.0, -1.0, 0.5, 2.0]]),
+            torch.tensor([[0.0, 1.0, 0.0, 1.0]]),
+            torch.tensor(4.0),
+        ),
     )
     meta = client.last_payload["meta"]
     assert meta["logits_optimization"] == "memory"

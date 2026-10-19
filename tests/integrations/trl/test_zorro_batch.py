@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("trl.experimental.async_grpo.training_client")
+pytest.importorskip("trl.experimental.async_grpo.async_grpo_trainer")
 
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
 from arctic_platform.integrations.trl.client import _place_response_window  # noqa: E402
@@ -220,34 +220,15 @@ class _RecordingClient:
         return {"batch": {"logprobs": self._logprobs, "entropy": self._entropy}, "avg_loss": self._avg_loss}
 
 
-class _FakeAccelerator:
-    def __init__(self, num_processes=1):
-        self.num_processes = num_processes
-
-
-class _FakeTrainer:
-    def __init__(self):
-        self.accelerator = _FakeAccelerator(1)
-        self.epsilon_low = 0.2
-        self.epsilon_high = 0.3
-        self.current_gradient_accumulation_steps = 2
-
-
-def _make_loss_fn(trainer, old, adv, mask, tokens):
-    shifted_old_log_probs = old
-    shifted_advantages = adv
-    shifted_completion_mask = mask
-    tokens_per_rank = tokens
-    self = trainer
-
-    def loss_fn(log_probs):
-        coef_1 = torch.exp(log_probs - shifted_old_log_probs)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token = -torch.min(coef_1 * shifted_advantages, coef_2 * shifted_advantages)
-        loss = (per_token * shifted_completion_mask).sum() / tokens_per_rank
-        return loss / self.current_gradient_accumulation_steps
-
-    return loss_fn
+def _loss_kwargs(old, adv, mask, tokens):
+    return dict(
+        old_log_probs=old,
+        advantages=adv,
+        loss_mask=mask,
+        epsilon_low=0.2,
+        epsilon_high=0.3,
+        tokens_per_rank=tokens,
+    )
 
 
 def test_zorro_forward_backward_wiring():
@@ -256,13 +237,11 @@ def test_zorro_forward_backward_wiring():
     mp = layout["max_prompt_len"]
     s = mp + RESPONSE_LEN
 
-    trainer = _FakeTrainer()
     old = torch.zeros(1, layout["T"] - 1)
     adv = torch.zeros(1, layout["T"] - 1)
     mask = torch.zeros(1, layout["T"] - 1)
     mask[0, _completion_positions(layout)] = 1.0
     tokens = torch.tensor(float(sum(layout["resp_lens"])))
-    loss_fn = _make_loss_fn(trainer, old, adv, mask, tokens)
 
     # Server returns response-window logprobs/entropy (values only in the response columns).
     server_logprobs = torch.zeros(4, s)
@@ -273,11 +252,10 @@ def test_zorro_forward_backward_wiring():
         client=client, temperature=0.7, server_side_loss=True, zorro_train_enable=True, response_len=RESPONSE_LEN
     )
     out = adapter.forward_backward(
-        model=None,
-        input_ids=PACKED_INPUT_IDS,
-        position_ids=PACKED_POSITION_IDS,
-        completion_mask=PACKED_COMPLETION_MASK,
-        loss_fn=loss_fn,
+        PACKED_INPUT_IDS,
+        PACKED_POSITION_IDS,
+        PACKED_COMPLETION_MASK,
+        **_loss_kwargs(old, adv, mask, tokens),
     )
 
     payload = client.last_payload
@@ -317,20 +295,11 @@ def test_zorro_load_balancer_opt_in():
         zorro_load_balancer=True,
         rollout_n=2,
     )
-    trainer = _FakeTrainer()
-    loss_fn = _make_loss_fn(
-        trainer,
-        torch.zeros(1, 18),
-        torch.zeros(1, 18),
-        torch.zeros(1, 18),
-        torch.tensor(9.0),
-    )
     adapter.forward_backward(
-        model=None,
-        input_ids=PACKED_INPUT_IDS,
-        position_ids=PACKED_POSITION_IDS,
-        completion_mask=PACKED_COMPLETION_MASK,
-        loss_fn=loss_fn,
+        PACKED_INPUT_IDS,
+        PACKED_POSITION_IDS,
+        PACKED_COMPLETION_MASK,
+        **_loss_kwargs(torch.zeros(1, 18), torch.zeros(1, 18), torch.zeros(1, 18), torch.tensor(9.0)),
     )
     assert adapter.client.last_payload["meta"]["load_balancer"] is True
 
@@ -355,16 +324,14 @@ def test_zorro_load_balancer_ragged_groups_raise():
         zorro_load_balancer=True,
         rollout_n=2,
     )
-    trainer = _FakeTrainer()
     n = RAGGED_INPUT_IDS.shape[1] - 1  # 13
-    loss_fn = _make_loss_fn(trainer, torch.zeros(1, n), torch.zeros(1, n), torch.zeros(1, n), torch.tensor(6.0))
+    zeros = torch.zeros(1, n)
     with pytest.raises(ValueError, match="ragged prompt groups"):
         adapter.forward_backward(
-            model=None,
-            input_ids=RAGGED_INPUT_IDS,
-            position_ids=RAGGED_POSITION_IDS,
-            completion_mask=RAGGED_COMPLETION_MASK,
-            loss_fn=loss_fn,
+            RAGGED_INPUT_IDS,
+            RAGGED_POSITION_IDS,
+            RAGGED_COMPLETION_MASK,
+            **_loss_kwargs(zeros, zeros, zeros, torch.tensor(6.0)),
         )
 
 
@@ -378,15 +345,13 @@ def test_zorro_load_balancer_off_allows_ragged_groups():
         zorro_load_balancer=False,
         rollout_n=2,
     )
-    trainer = _FakeTrainer()
     n = RAGGED_INPUT_IDS.shape[1] - 1
-    loss_fn = _make_loss_fn(trainer, torch.zeros(1, n), torch.zeros(1, n), torch.zeros(1, n), torch.tensor(6.0))
+    zeros = torch.zeros(1, n)
     adapter.forward_backward(
-        model=None,
-        input_ids=RAGGED_INPUT_IDS,
-        position_ids=RAGGED_POSITION_IDS,
-        completion_mask=RAGGED_COMPLETION_MASK,
-        loss_fn=loss_fn,
+        RAGGED_INPUT_IDS,
+        RAGGED_POSITION_IDS,
+        RAGGED_COMPLETION_MASK,
+        **_loss_kwargs(zeros, zeros, zeros, torch.tensor(6.0)),
     )
     assert adapter.client.last_payload["meta"]["load_balancer"] is False
 

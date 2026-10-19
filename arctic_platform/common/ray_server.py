@@ -76,16 +76,24 @@ def _transfer_schedule_cls():
 def _arctic_sampling_env(job_config) -> dict[str, str]:
     """Env for vLLM workers when the job asked for the in-tree Arctic Inference plugin.
 
-    The plugin accepts vLLM 0.31 only. Forest cascade is part of that plugin and
-    stays on the engine kwargs when this env is set.
+    The plugin accepts vLLM 0.31 only. Forest cascade stays on the engine kwargs
+    when this env is set. A zorro-inference-only request uses the FCA path so
+    the worker does not import the uncompiled suffix-decoding extension.
     """
-    if not getattr(job_config, "arctic_inference_config", None):
+    cfg = getattr(job_config, "arctic_inference_config", None)
+    if not cfg:
         return {}
-    return {
-        "ARCTIC_INFERENCE_ENABLED": "1",
+    env = {
         "VLLM_DISABLE_COMPILE_CACHE": "0",
         "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "ARCTIC_INFERENCE_",
     }
+    zorro = cfg.get("zorro_inference") if isinstance(cfg, dict) else None
+    spec = cfg.get("speculative_decoding") if isinstance(cfg, dict) else None
+    if isinstance(zorro, dict) and zorro.get("enable") and not spec:
+        env["ARCTIC_INFERENCE_FCA_ONLY"] = "1"
+        return env
+    env["ARCTIC_INFERENCE_ENABLED"] = "1"
+    return env
 
 
 logger = logging.getLogger(__name__)
@@ -249,15 +257,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
         colocate = self.colocate
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        # Let vLLM's CuMemAllocator free the weights (offload_weights=False)
-        # instead of the legacy manual offload, which reallocated param.data on
-        # each wake and changed weight addresses -> stale rollout CUDA graphs
-        # (compile on) -> grad-norm explosion. cumem keeps addresses stable.
-        offload_weights = False
-        results["sampling"] = await pool.sleep(level=level, offload_weights=offload_weights)
+        results["sampling"] = await pool.sleep(level=level)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and not lp_pool.sleeping:
-            results["log_prob"] = await lp_pool.sleep(level=level, offload_weights=offload_weights)
+            results["log_prob"] = await lp_pool.sleep(level=level)
         if colocate:
             await pool.close_weight_sync()
             if lp_pool is not None and lp_pool._config is not None:
@@ -281,17 +284,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
         if self.colocate:
             # Release cached GPU pages so cumem can remap.
             await self._empty_training_cache(self.training_workers)
-        colocate = self.colocate
-        if restore_weights is None:
-            restore = colocate and (tags is None or "weights" in tags)
-        else:
-            restore = restore_weights
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        results["sampling"] = await pool.wake_up(tags=tags, restore_weights=restore)
+        results["sampling"] = await pool.wake_up(tags=tags)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and lp_pool.sleeping:
-            results["log_prob"] = await lp_pool.wake_up(tags=tags, restore_weights=restore)
+            results["log_prob"] = await lp_pool.wake_up(tags=tags)
         return results
 
     async def reset_prefix_cache(self, job_id: int) -> dict[str, Any]:
@@ -408,7 +406,6 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 await pool.initialize(
                     model_cfg,
                     num_replicas=num_replicas,
-                    extra_env=extra_env or None,
                 )
 
         elif job_type == "log_prob":
@@ -499,7 +496,6 @@ class ArcticRLRayServerState(ArcticRLServerState):
                     await pool.initialize(
                         model_cfg,
                         num_replicas=num_replicas,
-                        extra_env=lp_extra_env or None,
                     )
                 engine = "vllm"
 
