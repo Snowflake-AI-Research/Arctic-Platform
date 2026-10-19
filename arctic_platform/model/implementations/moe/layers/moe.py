@@ -16,6 +16,7 @@ from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
+from ..routing_weights import apply_routing_weights
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -674,12 +675,12 @@ class MoE(nn.Module):
         routed_input = torch.gather(x, dim=0, index=routed_indices)
 
         if self.score_before_experts:
-            routed_input = (routed_input.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
+            routed_input = apply_routing_weights(routed_input, top_scores_experts_sorted)
 
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         if not self.score_before_experts:
-            routed_output = (routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
+            routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted, out_dtype=x.dtype)
 
         return routed_output
 
@@ -1114,7 +1115,7 @@ class LatentMoE(nn.Module):
         routed_input = self.fc1_latent_proj(routed_input)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-        routed_output = (routed_output.float() * top_scores_experts_sorted.reshape(-1, 1)).to(routed_output.dtype)
+        routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted)
         routed_output = routed_output * self.routed_scaling_factor
 
         routed_output = self.fc2_latent_proj(routed_output)
