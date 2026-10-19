@@ -68,8 +68,12 @@ def _worker(death: type[Exception] | None) -> MagicMock:
 def test_requests_routed_to_a_dead_replica_finish_on_a_live_one(death):
     async def run():
         scheduler = Scheduler([_worker(None), _worker(death), _worker(None)])
-        futures = [scheduler.submit(f"p{i}", {}) for i in range(30)]
-        return scheduler, await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=10)
+        futures = [scheduler.submit(f"p{i}", {}, routing_key=f"group{i % 3}") for i in range(30)]
+        results = await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=10)
+        assert await scheduler.submit("next", {}, routing_key="group1") == {"text": "next"}
+        assert all(ws.active_requests == 0 for ws in scheduler._workers)
+        assert not any(scheduler._inflight_tasks.values())
+        return scheduler, results
 
     scheduler, results = asyncio.run(run())
     assert results == [{"text": f"p{i}"} for i in range(30)]
@@ -79,11 +83,16 @@ def test_requests_routed_to_a_dead_replica_finish_on_a_live_one(death):
 @pytest.mark.parametrize("death", DEATHS, ids=lambda d: d.__name__)
 def test_when_every_replica_died_the_error_reaches_the_caller(death):
     async def run():
-        scheduler = Scheduler([_worker(death), _worker(death)])
+        scheduler = Scheduler([_worker(death), _worker(death)], initial_concurrency=1)
         futures = [scheduler.submit(f"p{i}", {}) for i in range(4)]
-        return await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=10)
+        results = await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=1)
+        with pytest.raises(RuntimeError, match="All workers are quarantined"):
+            await asyncio.wait_for(scheduler.submit("later", {}), timeout=1)
+        return results
 
-    assert all(isinstance(result, death) for result in asyncio.run(run()))
+    results = asyncio.run(run())
+    assert all(isinstance(result, (death, RuntimeError)) for result in results)
+    assert any(isinstance(result, death) for result in results)
 
 
 def test_a_request_that_kills_every_engine_it_reaches_takes_down_at_most_two_replicas():
@@ -108,3 +117,27 @@ def test_a_request_that_kills_every_engine_it_reaches_takes_down_at_most_two_rep
     assert isinstance(result, EngineDeadError)
     assert len(sent) <= 2
     assert sum(not scheduler.is_worker_available(i) for i in range(5)) <= 2
+
+
+def test_late_death_does_not_quarantine_a_replacement():
+    async def run():
+        started, replaced = asyncio.Event(), asyncio.Event()
+
+        async def generate(prompt, params):
+            started.set()
+            await replaced.wait()
+            raise EngineDeadError()
+
+        old = _worker(None)
+        old.generate.remote = generate
+        scheduler = Scheduler([old])
+        future = scheduler.submit("p", {})
+        await started.wait()
+        scheduler.mark_worker_unavailable(0)
+        scheduler.update_worker_handle(0, _worker(None))
+        scheduler.mark_worker_available(0)
+        replaced.set()
+        assert await asyncio.wait_for(future, timeout=1) == {"text": "p"}
+        assert scheduler.is_worker_available(0)
+
+    asyncio.run(run())

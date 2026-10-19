@@ -716,6 +716,8 @@ class Scheduler:
 
         try:
             while not self._stopped:
+                if all(w.quarantined for w in self._workers):
+                    raise RuntimeError("All workers are quarantined")
                 if self._paused:
                     await self._pause_event.wait()
                     continue
@@ -762,8 +764,9 @@ class Scheduler:
             if current_task is not None and tracked_worker_idx is not None:
                 self._inflight_tasks[tracked_worker_idx].add(current_task)
 
+            handle = ws.handle
             try:
-                result = await ws.handle.generate.remote(req.prompt, req.sampling_params)
+                result = await handle.generate.remote(req.prompt, req.sampling_params)
                 if not req.future.done():
                     req.future.set_result(result)
             except asyncio.CancelledError:
@@ -780,8 +783,9 @@ class Scheduler:
                 )
                 if not isinstance(exc, (ray.exceptions.ActorDiedError, EngineDeadError)) or self._stopped:
                     raise
-                # A replica whose actor or engine died never serves again: stop routing to it and re-route this request.
-                ws.quarantine()
+                # A late failure from an old actor must not quarantine its replacement.
+                if ws.handle is handle:
+                    ws.quarantine()
                 if req.rerouted or all(w.quarantined for w in self._workers):
                     raise  # re-route once: a request that itself kills engines must not walk through every replica
                 req.rerouted = True
@@ -799,7 +803,7 @@ class Scheduler:
         finally:
             if current_task is not None and tracked_worker_idx is not None:
                 self._inflight_tasks[tracked_worker_idx].discard(current_task)
-            if ws is not None:
+            if ws is not None and tracked_worker_idx is not None:
                 ws.active_requests = max(0, ws.active_requests - 1)
             # Record the per-request metric — only if we successfully
             # submitted to a worker. Skipping cancelled / failed requests
