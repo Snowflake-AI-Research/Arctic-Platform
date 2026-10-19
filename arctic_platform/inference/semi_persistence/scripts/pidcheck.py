@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a CRIU image's recorded task ids against the ones live on this node.
 
-    sudo python3 scripts/pidcheck.py /data-fast/image-cache/qwen_27b/image
+    python3 scripts/pidcheck.py /data-fast/image-cache/qwen_27b/image
     python3 scripts/pidcheck.py <image> --burn        # make room, then restore
     python3 scripts/pidcheck.py --burn-to 200000      # dump side, before init
 
@@ -16,10 +16,18 @@ three leaders *and* the ~900 thread ids they recorded, and an unrelated
 same-PID process would.  ``ps`` and a plain ``/proc`` scan both hide this,
 because threads appear only under ``/proc/<pid>/task``.
 
-CRIU reports the two cases through different code paths and names neither the
-id nor the occupant:
+Worse, an id with **no task at all** can be unallocatable.  A pid is a
+refcounted ``struct pid``, and every process using it as a process-group or
+session id holds a reference on it -- a zombie included, since a corpse keeps
+those links until it is reaped.  So this script scans ``pgrp`` and ``session``
+(fields 5 and 6 of ``/proc/*/stat``) as well as ``/proc/<pid>/task``.  Without
+that it reported "No collisions" through the dev-cluster restore failure, which was a
+dumped leader's id pinned by two unreaped members of its own session.
 
-    Can't fork for 47619: File exists                 # a leader
+CRIU reports the cases through different code paths and names neither the id
+nor the occupant:
+
+    Can't fork for 47619: File exists                 # a leader, by either route
     pie: 2103: Unable to create a thread: -17         # any other thread
 
 ``--burn`` advances the namespace's PID counter past the image's highest
@@ -35,8 +43,17 @@ The durable fix is dump-side: ``--burn-to N`` before the cold start, so the
 image records ids far above anything a container hands out in normal operation.
 That form needs no image and no root -- it only advances the counter.
 
+The serving adapter now does this on its own: ``_raise_pid_floor`` in
+``server/semip_engine.py`` runs before the ``Instance`` that spawns the tree,
+so images it dumps record ids above ``SEMIP_PID_FLOOR`` (100000 by default) and
+note the floor reached in ``meta.json``.  It burns in parallel, since the
+counter is namespace-global and a single fork costs ~540us on these nodes.
+This script stays the manual form, for an image dumped elsewhere or a node
+being investigated by hand.
+
 Like ``imgdiff.py`` this imports nothing from the package and needs no GPU --
-just ``crit`` (from the CRIU install) and root to read the image.
+just ``crit`` (from the CRIU install) and read access to the image, which
+means running as the uid that dumped it.
 """
 
 import json
@@ -48,13 +65,12 @@ BURN_MARGIN = 2000  # headroom for the restore driver and its threads
 
 
 def decode_pstree(path):
-    cmd = ["crit", "decode", "-i", path]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    res = subprocess.run(cmd, capture_output=True)
+    res = subprocess.run(["crit", "decode", "-i", path], capture_output=True)
     if res.returncode != 0:
-        sys.exit("crit decode failed (rc=%d); root is needed to read the image:"
-                 "\n%s" % (res.returncode, res.stderr.decode("utf-8", "replace")))
+        sys.exit("crit decode failed (rc=%d); the image must be readable by "
+                 "this user (uid %d):\n%s"
+                 % (res.returncode, os.getuid(),
+                    res.stderr.decode("utf-8", "replace")))
     return json.loads(res.stdout.decode("utf-8", "replace"))
 
 
@@ -82,6 +98,48 @@ def live_task_ids():
         except OSError:
             continue                     # exited while we walked it
     return live
+
+
+def group_references(wanted):
+    """{id: [(pid, comm, state, kind), ...]} for ids held with no task.
+
+    A task scan is not the whole picture, and the gap is what made this script
+    report "No collisions" through a restore that then failed EEXIST on the
+    first id it tried.  A pid is a refcounted ``struct pid``, and references
+    come from the task itself *and* from every process using it as a process
+    group or session id -- a group is named by its leader's pid, and an
+    unreaped zombie keeps those links.  So an id with no task can still be
+    unallocatable, and ``clone3(set_tid)`` fails on it while ``/proc`` shows
+    nothing there, because ``/proc`` lists tasks.
+
+    Self-references are skipped: an id held by its own live leader is a task
+    collision, already reported with its occupant named.
+    """
+    refs = {}
+    if not wanted:
+        return refs
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        # comm is parenthesised and may contain parens and spaces, so split
+        # after the last ')': index 0 is then field 3 (state), which puts
+        # pgrp and session -- fields 5 and 6 -- at 2 and 3.
+        try:
+            with open("/proc/%s/stat" % entry) as fh:
+                head, _, tail = fh.read().rpartition(")")
+            fields = tail.split()
+            comm = head.partition("(")[2] or "?"
+            state, pgrp, sid = fields[0], int(fields[2]), int(fields[3])
+        except (OSError, IndexError, ValueError):
+            continue                     # exited while we walked it
+        pid = int(entry)
+        for rid in set([pgrp, sid]):
+            if rid not in wanted or rid == pid:
+                continue
+            kind = "+".join(k for k, v in (("pgid", pgrp), ("sid", sid))
+                            if v == rid)
+            refs.setdefault(rid, []).append((pid, comm, state, kind))
+    return refs
 
 
 def proc_field(pid, name):
@@ -207,9 +265,11 @@ def main():
     for tid in sorted(tids.intersection(live)):
         taken_by.setdefault(live[tid], []).append(tid)
 
+    refs = group_references(tids.difference(live))
+
     if taken_by:
         print("-" * 78)
-        print("OCCUPIED  (%d id(s) across %d process(es))"
+        print("OCCUPIED BY A TASK  (%d id(s) across %d process(es))"
               % (sum(len(v) for v in taken_by.values()), len(taken_by)))
         print("-" * 78)
         for owner, taken in sorted(taken_by.items()):
@@ -225,8 +285,29 @@ def main():
         print("A restore will fail with EEXIST on the first of these.")
         print("Zombies clear themselves once reaped; a live process must exit,")
         print("or the image must be re-dumped with its ids placed higher.")
-    else:
-        print("No collisions: every recorded task id is free on this node.")
+
+    if refs:
+        print("-" * 78)
+        print("HELD WITH NO TASK  (%d id(s) referenced as a pgid or sid)"
+              % len(refs))
+        print("-" * 78)
+        for rid, holders in sorted(refs.items()):
+            print("  id %-7d referenced by %d process(es):" % (rid,
+                                                               len(holders)))
+            for hpid, hcomm, hstate, hkind in holders:
+                print("      pid %-7d %-20s state=%-2s as its %s"
+                      % (hpid, hcomm, hstate, hkind))
+        print()
+        print("These ids have no task, so a /proc or ps scan calls them free,")
+        print("and a restore still fails EEXIST on them: a process group or")
+        print("session id stays allocated until every member is reaped, and a")
+        print("zombie is a member.  Reap the holders above -- if their PPid is")
+        print("1 and PID 1 does not wait(), only its exit will -- or re-dump")
+        print("with the ids placed higher.")
+
+    if not taken_by and not refs:
+        print("No collisions: every recorded task id is free on this node,")
+        print("as a task and as a process group / session reference.")
 
     if burn or burn_to is not None:
         goal = burn_to if burn_to is not None else max(tids) + BURN_MARGIN
@@ -238,7 +319,7 @@ def main():
         print("-" * 78)
         burn_past(goal)
 
-    sys.exit(1 if taken_by else 0)
+    sys.exit(1 if (taken_by or refs) else 0)
 
 
 if __name__ == "__main__":
