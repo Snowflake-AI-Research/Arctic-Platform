@@ -15,7 +15,6 @@
 
 import gc
 import weakref
-
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -23,6 +22,7 @@ import pytest
 import torch
 
 from arctic_platform.model.implementations.gpu.sp import collectives
+from arctic_platform.model.implementations.layers import cp_mamba
 from arctic_platform.testing_utils import get_unique_port_number
 from arctic_platform.testing_utils import reserve_free_port
 from arctic_platform.testing_utils import torch_assert_equal
@@ -45,7 +45,7 @@ def group_runtime(monkeypatch):
     destroyed = []
     world = Group()
     ranks[world] = [0, 1]
-    monkeypatch.setattr(collectives.dist.group, "WORLD", world)
+    monkeypatch.setattr(collectives.dist, "group", SimpleNamespace(WORLD=world))
     monkeypatch.setattr(collectives.dist, "is_initialized", lambda: world in ranks)
     monkeypatch.setattr(collectives.dist, "get_process_group_ranks", lambda group: ranks[group])
 
@@ -157,17 +157,40 @@ def test_unregistered_source_is_rejected_without_creating_a_group(monkeypatch, g
     assert group_runtime.created == []
 
 
-def test_worker_destroy_releases_barriers_before_process_groups(monkeypatch):
+@pytest.mark.parametrize("sender_fails", [False, True])
+@pytest.mark.parametrize("barrier_fails", [False, True])
+def test_worker_destroy_releases_barriers_before_process_groups(monkeypatch, sender_fails, barrier_fails):
     pytest.importorskip("ray")
+    pytest.importorskip("deepspeed")
     from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 
     events = []
-    monkeypatch.setattr(collectives, "destroy_exchange_barrier_groups", lambda: events.append("barriers"))
+
+    def sender_destroy():
+        events.append("sender")
+        if sender_fails:
+            raise RuntimeError("sender failed")
+
+    def barrier_destroy():
+        events.append("barriers")
+        if barrier_fails:
+            raise RuntimeError("barrier cleanup failed")
+
+    monkeypatch.setattr(collectives, "destroy_exchange_barrier_groups", barrier_destroy)
     monkeypatch.setattr(collectives.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(collectives.dist, "destroy_process_group", lambda: events.append("process-groups"))
-    worker = SimpleNamespace(_weight_sender=None, engine=object())
-    assert DeepSpeedWorker.destroy(worker)
-    assert events == ["barriers", "process-groups"]
+    cls = DeepSpeedWorker.__ray_metadata__.modified_class
+    worker = object.__new__(cls)
+    worker._weight_sender = SimpleNamespace(destroy=sender_destroy)
+    worker.engine = object()
+    if sender_fails or barrier_fails:
+        expected = "barrier cleanup failed" if barrier_fails else "sender failed"
+        with pytest.raises(RuntimeError, match=expected):
+            worker.destroy()
+    else:
+        assert worker.destroy()
+    assert events == ["sender", "barriers", "process-groups"]
+    assert worker._weight_sender is None
     assert worker.engine is None
 
 
@@ -241,4 +264,48 @@ def test_single_rank_does_not_create_a_barrier(monkeypatch):
     monkeypatch.setattr(collectives, "_exchange_barrier_group", lambda group: pytest.fail("unexpected group"))
     value = torch.ones(1, 2, 2, requires_grad=True)
     collectives.sequence_head_all_to_all(object(), value, scatter_dim=2, gather_dim=1).sum().backward()
+    torch_assert_equal(value.grad, torch.ones_like(value))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("direction", ["seq_to_head_parallel", "head_to_seq_parallel"])
+def test_mamba_barrier_follows_forward_and_backward_exchange(monkeypatch, enabled, direction):
+    events = []
+    barrier = object() if enabled else None
+    group = object()
+    monkeypatch.setattr(cp_mamba, "_exchange_barrier_group", lambda group: barrier)
+    monkeypatch.setattr(
+        collectives.torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: events.append("cuda")),
+    )
+    monkeypatch.setattr(collectives.dist, "barrier", lambda **kw: events.append(("gloo", kw["group"])))
+
+    def exchange(output, value, **kwargs):
+        assert kwargs["group"] is group
+        events.append("exchange")
+        output.copy_(value)
+
+    monkeypatch.setattr(cp_mamba.dist, "all_to_all_single", exchange)
+    value = torch.arange(16.0).reshape(1, 4, 4).requires_grad_()
+    result = getattr(cp_mamba, direction)(value, group, 2)
+    if direction == "seq_to_head_parallel":
+        expected = torch.cat(value.chunk(2, dim=2), dim=1)
+    else:
+        expected = torch.cat(value.chunk(2, dim=1), dim=2)
+    torch_assert_equal(result, expected)
+    result.sum().backward()
+    torch_assert_equal(value.grad, torch.ones_like(value))
+    expected_events = ["exchange", "cuda", ("gloo", barrier)] if enabled else ["exchange"]
+    assert events == expected_events * 2
+
+
+@pytest.mark.parametrize("direction", ["seq_to_head_parallel", "head_to_seq_parallel"])
+def test_mamba_single_rank_does_not_exchange_or_create_a_barrier(monkeypatch, direction):
+    monkeypatch.setattr(cp_mamba, "_exchange_barrier_group", lambda group: pytest.fail("unexpected group"))
+    monkeypatch.setattr(cp_mamba.dist, "all_to_all_single", lambda *args, **kwargs: pytest.fail("unexpected exchange"))
+    value = torch.ones(1, 2, 2, requires_grad=True)
+    result = getattr(cp_mamba, direction)(value, object(), 1)
+    torch_assert_equal(result, value)
+    result.sum().backward()
     torch_assert_equal(value.grad, torch.ones_like(value))

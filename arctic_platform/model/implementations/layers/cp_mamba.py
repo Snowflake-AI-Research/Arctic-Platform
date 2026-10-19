@@ -17,6 +17,9 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from arctic_platform.model.implementations.gpu.sp.collectives import _exchange_barrier_group
+from arctic_platform.model.implementations.gpu.sp.collectives import _finish_exchange
+
 
 class _SeqToHeadParallel(torch.autograd.Function):
     """[B, S/cp, D] -> [B, S, D/cp] via all-to-all."""
@@ -52,6 +55,9 @@ def _all_to_all_seq_to_head(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
     Each rank sends its S_local tokens split into cp_size chunks along D,
     and receives one D_local chunk from each of the cp_size ranks.
     """
+    if cp_size == 1:
+        return x
+    barrier_group = _exchange_barrier_group(cp_group)
     B, S_local, D = x.shape
     D_local = D // cp_size
 
@@ -60,6 +66,7 @@ def _all_to_all_seq_to_head(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
     x = x.reshape(B, S_local, cp_size, D_local).permute(2, 0, 1, 3).contiguous()
     output = torch.empty_like(x)
     dist.all_to_all_single(output, x, group=cp_group)
+    _finish_exchange(barrier_group)
     # output[i] = data from rank i (its S_local tokens, our D_local slice)
     # [cp, B, S_local, D_local] -> [B, cp, S_local, D_local] -> [B, cp*S_local, D_local]
     return output.permute(1, 0, 2, 3).reshape(B, cp_size * S_local, D_local).contiguous()
@@ -70,6 +77,9 @@ def _all_to_all_head_to_seq(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
 
     Inverse of _all_to_all_seq_to_head.
     """
+    if cp_size == 1:
+        return x
+    barrier_group = _exchange_barrier_group(cp_group)
     B, S_global, D_local = x.shape
     S_local = S_global // cp_size
 
@@ -78,6 +88,7 @@ def _all_to_all_head_to_seq(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
     x = x.reshape(B, cp_size, S_local, D_local).permute(1, 0, 2, 3).contiguous()
     output = torch.empty_like(x)
     dist.all_to_all_single(output, x, group=cp_group)
+    _finish_exchange(barrier_group)
     # Each rank now has cp chunks of [B, S_local, D_local] — one D_local slice from each rank
     # [cp, B, S_local, D_local] -> [B, S_local, cp, D_local] -> [B, S_local, D]
     return output.permute(1, 2, 0, 3).reshape(B, S_local, cp_size * D_local).contiguous()

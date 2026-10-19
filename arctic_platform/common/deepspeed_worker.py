@@ -1189,13 +1189,19 @@ class DeepSpeedWorker:
     def destroy(self) -> bool:
         from arctic_platform.model.implementations.gpu.sp.collectives import destroy_exchange_barrier_groups
 
-        if self._weight_sender is not None:
-            self._weight_sender.destroy()
+        try:
+            if self._weight_sender is not None:
+                self._weight_sender.destroy()
+        finally:
             self._weight_sender = None
-        destroy_exchange_barrier_groups()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        self.engine = None
+            try:
+                destroy_exchange_barrier_groups()
+            finally:
+                try:
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
+                finally:
+                    self.engine = None
         return True
 
 
