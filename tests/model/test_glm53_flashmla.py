@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
@@ -29,41 +31,6 @@ from arctic_platform.testing_utils import torch_assert_equal
 def _assert_bf16_kernel_close(actual, expected, *, atol=1e-6):
     # Allow one BF16 epsilon per element, with a fixed floor for cancellation near zero.
     torch_assert_close(actual, expected, rtol=torch.finfo(torch.bfloat16).eps, atol=atol)
-
-
-def _tiny_glm_sparse_model(*, kv_lora_rank=512, qk_rope_head_dim=0):
-    configuration = pytest.importorskip("transformers.models.glm5_next.configuration_glm5_next")
-    modeling = pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
-    config = configuration.Glm5NextTextConfig(
-        vocab_size=64,
-        pad_token_id=0,
-        hidden_size=16,
-        intermediate_size=32,
-        moe_intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        n_routed_experts=2,
-        num_experts_per_tok=1,
-        kv_lora_rank=kv_lora_rank,
-        q_lora_rank=8,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=4,
-        qk_nope_head_dim=4,
-        layer_types=["deepseek_sparse_attention"],
-        indexer_types=["full"],
-        mlp_layer_types=["dense"],
-        index_topk=4,
-        index_head_dim=4,
-        index_n_heads=2,
-        index_kpool=2,
-        hc_mult=1,
-        max_position_embeddings=32,
-    )
-    model = torch.nn.Module()
-    model.model = modeling.Glm5NextTextModel(config)
-    context_parallel.apply_context_parallelism(model, 1, None)
-    return model
 
 
 @pytest.mark.parametrize("magnitude", [1.0, 1e-2, 1e-5])
@@ -114,6 +81,74 @@ def test_zero_padded_channels_preserve_attention_and_gradients():
         torch_assert_close(actual_grad, expected_grad, rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)])
+def test_flashinfer_fa3_requires_hopper_on_query_device(monkeypatch, capability):
+    device = torch.device("cuda:3")
+    query = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16, shape=(1, 4, 2, 512), device=device)
+    kv = SimpleNamespace(shape=(1, 5, 1, 512))
+    capability_lookup = Mock(return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_lookup)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: True)
+    assert context_parallel._use_flashinfer(query, kv) == (capability[0] == 9)
+    capability_lookup.assert_called_once_with(device)
+
+
+def test_flashinfer_guard_does_not_query_cuda_for_cpu(monkeypatch):
+    query = SimpleNamespace(is_cuda=False)
+    capability_lookup = Mock(side_effect=AssertionError("CPU input queried CUDA"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_lookup)
+    assert not context_parallel._use_flashinfer(query, None)
+    capability_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("tile_rows", [1, 3])
+@pytest.mark.parametrize("requires_grad", [(True, True), (True, False), (False, True)])
+def test_tiled_reference_gradients_match_fp32_dense(monkeypatch, dtype, tile_rows, requires_grad):
+    set_seed(42)
+    query = torch.randn(1, 17, 2, 8, dtype=dtype).requires_grad_(requires_grad[0])
+    kv = torch.randn(1, 7, 1, 8, dtype=dtype).requires_grad_(requires_grad[1])
+    indices = torch.randint(-1, 8, (1, 17, 4), dtype=torch.int32)
+    indices[:, 0] = -1
+    reference_query = query.detach().float().requires_grad_(requires_grad[0])
+    reference_kv = kv.detach().float().requires_grad_(requires_grad[1])
+    expected = context_parallel._reference_sparse_mla_math(reference_query, reference_kv, indices, 0.25, 5).to(dtype)
+    gradient = torch.randn_like(expected)
+    expected.backward(gradient)
+    monkeypatch.setattr(context_parallel, "_REFERENCE_SPARSE_MLA_TILE_BYTES", tile_rows * 4 * 8 * 4)
+    actual = context_parallel._reference_sparse_mla(query, kv, indices, scale=0.25, value_dim=5)
+    actual.backward(gradient)
+    torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+    for value, reference in [(query, reference_query), (kv, reference_kv)]:
+        if value.requires_grad:
+            assert value.grad.dtype == dtype
+            expected_grad = reference.grad.to(dtype)
+            if dtype == torch.bfloat16:
+                # Tile reduction order can move the final BF16 rounding by one unit.
+                _assert_bf16_kernel_close(value.grad, expected_grad)
+            else:
+                torch_assert_close(value.grad, expected_grad, rtol=0, atol=2e-6)
+        else:
+            assert value.grad is None
+    torch_assert_equal(actual[:, 0], torch.zeros_like(actual[:, 0]))
+
+
+def test_tiled_bf16_kv_gradients_accumulate_before_final_cast(monkeypatch):
+    query = torch.zeros(1, 1025, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.ones(1, 2, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    indices = torch.zeros(1, 1025, 1, dtype=torch.int32)
+    gradient = torch.ones_like(query)
+    gradient[:, 512:1024] = -1
+    gradient[:, -1] = 0.5
+    monkeypatch.setattr(context_parallel, "_REFERENCE_SPARSE_MLA_TILE_BYTES", 16)
+    output = context_parallel._reference_sparse_mla(query, kv, indices, scale=0.5, value_dim=4)
+    output.backward(gradient)
+    expected = torch.zeros_like(kv)
+    expected[:, 0] = 0.5
+    torch_assert_equal(kv.grad, expected)
+    torch_assert_equal(query.grad, torch.zeros_like(query))
+
+
 @require_torch_gpu
 def test_real_flashmla_padded_width_matches_original_reference():
     set_seed(42)
@@ -161,18 +196,25 @@ def test_real_flashmla_padded_width_matches_original_reference():
 
 @require_torch_gpu
 @pytest.mark.parametrize(
-    "kv_lora_rank,rope_width,use_flashmla",
+    "kv_lora_rank,rope_width,use_flashmla,capability",
     [
-        pytest.param(512, 0, True, id="rope-free-512-pads-to-576"),
-        pytest.param(512, 64, True, id="native-576"),
-        pytest.param(448, 64, False, id="query-512-values-not-512"),
-        pytest.param(448, 128, False, id="query-576-values-not-512"),
-        pytest.param(512, 32, False, id="unsupported-query-544"),
-        pytest.param(256, 0, False, id="unsupported-query-256"),
+        pytest.param(512, 0, True, None, id="rope-free-512-pads-to-576"),
+        pytest.param(512, 64, True, None, id="native-576"),
+        pytest.param(448, 64, False, None, id="query-512-values-not-512"),
+        pytest.param(448, 128, False, None, id="query-576-values-not-512"),
+        pytest.param(512, 32, False, None, id="unsupported-query-544"),
+        pytest.param(256, 0, False, None, id="unsupported-query-256"),
+        pytest.param(512, 0, False, (8, 0), id="pre-hopper-reference-fallback"),
     ],
 )
-def test_sparse_attention_dispatches_only_supported_flashmla_layouts(kv_lora_rank, rope_width, use_flashmla):
+def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
+    monkeypatch, kv_lora_rank, rope_width, use_flashmla, capability
+):
     set_seed(42)
+    if capability is not None:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    logger = Mock()
+    monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
     # Exercise the adapter independently: current GLM configs reject nonzero RoPE widths.
     attention = torch.nn.Module()
     attention.num_heads = 2
@@ -206,23 +248,35 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(kv_lora_ran
                 assert torch.isfinite(hidden).all()
                 hidden.float().square().mean().backward()
                 torch.cuda.synchronize()
+                if not use_flashmla:
+                    with torch.no_grad():
+                        context_parallel._sparse_attention_forward(
+                            attention, hidden_states, None, prev_topk_indices=indices
+                        )
     assert flash.call_count == int(use_flashmla)
-    assert ref.call_count == int(not use_flashmla)
+    assert ref.call_count == 2 * int(not use_flashmla)
     if use_flashmla:
         assert flash.call_args.args[0].shape[-1] == 576
         assert flash.call_args.args[1].shape[-1] == 576
     else:
         assert ref.call_args.args[0].shape[-1] == kv_lora_rank + rope_width
         assert ref.call_args.kwargs["value_dim"] == kv_lora_rank
+        logger.info.assert_called_once_with(
+            "GLM53_REFERENCE_EXECUTED rank=%s kv_lora_rank=%s query_width=%s is_cuda=%s backward=tiled",
+            0,
+            kv_lora_rank,
+            kv_lora_rank + rope_width,
+            True,
+        )
     grads = [parameter.grad for parameter in attention.parameters() if parameter.grad is not None]
     assert grads and all(torch.isfinite(gradient).all() for gradient in grads)
     assert torch.isfinite(hidden_states.grad).all()
 
 
 @require_torch_gpu
-def test_glm53_rope_free_model_executes_flashmla():
+def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
     set_seed(42)
-    model = _tiny_glm_sparse_model().to(device="cuda", dtype=torch.bfloat16).train()
+    model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
@@ -243,10 +297,10 @@ def test_glm53_rope_free_model_executes_flashmla():
 
 
 @require_torch_gpu
-def test_glm53_rope_free_model_prefers_flashinfer():
+def test_glm53_rope_free_model_prefers_flashinfer(tiny_glm_sparse_model):
     pytest.importorskip("flashinfer")
     set_seed(42)
-    model = _tiny_glm_sparse_model().to(device="cuda", dtype=torch.bfloat16).train()
+    model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")

@@ -191,18 +191,18 @@ def _reference_sparse_mla_math(
     valid = (indices >= 0) & (indices < kv_length)
     safe = indices.long().clamp(0, kv_length)
     batch = torch.arange(query.shape[0], device=query.device)[:, None, None]
-    gathered = key_value[batch, safe, 0]
-    scores = torch.einsum("bqhd,bqkd->bqhk", query.float(), gathered.float())
+    gathered = key_value[batch, safe, 0].float()
+    scores = torch.einsum("bqhd,bqkd->bqhk", query.float(), gathered)
     scores.mul_(scale).masked_fill_(~valid[:, :, None], float("-inf"))
     empty = ~valid.any(dim=-1)
     scores.masked_fill_(empty[:, :, None, None], 0)
-    probabilities = torch.softmax(scores, dim=-1).to(query.dtype)
+    probabilities = torch.softmax(scores, dim=-1)
     probabilities = probabilities.masked_fill(empty[:, :, None, None], 0)
     return torch.einsum(
         "bqhk,bqkd->bqhd",
         probabilities,
         gathered[..., :value_dim],
-    )
+    ).to(query.dtype)
 
 
 def _sparse_mla_query_tile(query_len: int, topk: int, dim: int) -> int:
@@ -251,6 +251,7 @@ def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
         and query.shape[-1] == 512
         and key_value.shape[-1] == 512
         and _flashinfer_available()
+        and torch.cuda.get_device_capability(query.device)[0] == 9
     )
 
 
@@ -356,15 +357,17 @@ class _TiledSparseMLA(torch.autograd.Function):
         query, key_value, indices = ctx.saved_tensors
         need_query, need_kv = ctx.needs_input_grad[:2]
         grad_query = torch.zeros_like(query) if need_query else None
-        grad_kv = torch.zeros_like(key_value) if need_kv else None
+        grad_kv = torch.zeros_like(key_value, dtype=torch.float32) if need_kv else None
         if need_query or need_kv:
+            # FP32 leaves keep tile derivatives unrounded until the final KV-gradient cast.
+            kv_source = key_value.detach().float() if need_kv else key_value.detach()
             query_len = query.shape[1]
             tile = _sparse_mla_query_tile(query_len, indices.shape[-1], key_value.shape[-1])
             grad_output = grad_output.contiguous()
             for start in range(0, query_len, tile):
                 end = min(start + tile, query_len)
                 query_tile = query[:, start:end].detach()
-                kv_tile = key_value.detach()
+                kv_tile = kv_source.detach()
                 if need_query:
                     query_tile = query_tile.requires_grad_(True)
                 if need_kv:
@@ -382,6 +385,8 @@ class _TiledSparseMLA(torch.autograd.Function):
                     grad_query[:, start:end] = query_tile.grad
                 if need_kv:
                     grad_kv.add_(kv_tile.grad)
+        if need_kv:
+            grad_kv = grad_kv.to(key_value.dtype)
         return grad_query, grad_kv, None, None, None, None
 
 
@@ -507,7 +512,12 @@ def _sparse_attention_forward(
                 dist.get_rank() if dist.is_initialized() else 0,
             )
             self._ap_flashinfer_dispatch_reported = True
-    elif sparse_query.is_cuda and self.kv_lora_rank == 512 and sparse_query.shape[-1] in (512, 576):
+    elif (
+        sparse_query.is_cuda
+        and self.kv_lora_rank == 512
+        and sparse_query.shape[-1] in (512, 576)
+        and torch.cuda.get_device_capability(sparse_query.device)[0] >= 9
+    ):
         # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
         padding = 576 - sparse_query.shape[-1]
         if padding:
@@ -534,6 +544,15 @@ def _sparse_attention_forward(
             scale=self.scaling,
             value_dim=self.kv_lora_rank,
         )
+        if not getattr(self, "_ap_reference_dispatch_reported", False):
+            get_logger().info(
+                "GLM53_REFERENCE_EXECUTED rank=%s kv_lora_rank=%s query_width=%s is_cuda=%s backward=tiled",
+                dist.get_rank() if dist.is_initialized() else 0,
+                self.kv_lora_rank,
+                sparse_query.shape[-1],
+                sparse_query.is_cuda,
+            )
+            self._ap_reference_dispatch_reported = True
     attention_output = torch.einsum("bqhk,hdk->bqhd", absorbed_output, value_weight)
     attention_output = attention_output.reshape(batch_size, local_length, -1)
     attention_output = self.o_proj(attention_output)
