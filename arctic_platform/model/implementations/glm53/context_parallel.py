@@ -529,6 +529,8 @@ def _sparse_attention_forward(
             # Capacity failures must still fail the trial, not select another backend.
             raise
         except Exception as error:
+            if isinstance(error, RuntimeError) and str(error).startswith("CUDA error"):
+                raise
             self._ap_flashinfer_failed = True
             get_logger().warning(
                 "GLM53_FLASHINFER_FALLBACK rank=%s error=%s; disabling FlashInfer for this module",

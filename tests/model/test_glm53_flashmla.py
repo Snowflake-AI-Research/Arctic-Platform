@@ -213,6 +213,37 @@ def test_flashinfer_oom_is_not_hidden_by_runtime_fallback(monkeypatch):
     assert not getattr(attention, "_ap_flashinfer_failed", False)
 
 
+@pytest.mark.parametrize(
+    "message", ["CUDA error: an illegal memory access", "CUDA error: device-side assert triggered"]
+)
+def test_flashinfer_sticky_cuda_error_is_not_hidden_by_runtime_fallback(monkeypatch, message):
+    attention = _dispatch_attention()
+    error = RuntimeError(message)
+    logger = Mock()
+    flashinfer = Mock(side_effect=error)
+    flashmla_guard = Mock(side_effect=AssertionError("Sticky CUDA error must propagate"))
+    flashmla = Mock()
+    reference = Mock()
+    monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
+    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
+    monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
+    monkeypatch.setattr(context_parallel, "_use_flashmla", flashmla_guard)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
+    with pytest.raises(RuntimeError, match="CUDA error") as raised:
+        context_parallel._sparse_attention_forward(
+            attention, torch.zeros(1, 4, 16), None, prev_topk_indices=torch.arange(4).expand(1, 4, -1)
+        )
+    assert raised.value is error
+    flashinfer.assert_called_once()
+    flashmla_guard.assert_not_called()
+    flashmla.assert_not_called()
+    reference.assert_not_called()
+    logger.warning.assert_not_called()
+    logger.info.assert_not_called()
+    assert not hasattr(attention, "_ap_flashinfer_failed")
+
+
 @pytest.mark.parametrize("all_empty", [False, True])
 def test_flashinfer_request_contract_and_empty_rows(monkeypatch, all_empty):
     query = torch.zeros(1, 3, 2, 512, dtype=torch.bfloat16)
