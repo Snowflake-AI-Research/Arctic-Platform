@@ -124,7 +124,7 @@ class OnPremTransport(Transport):
         if request.op in CLUSTER_OPS:
             raise NotImplementedError(f"on-prem does not support cluster operation {request.op!r}")
         if request.op in _UNSUPPORTED_OPS:
-            raise NotImplementedError(f"on-prem does not support {request.op!r}")
+            raise NotImplementedError(f"on-prem does not support job operation {request.op!r}")
         method = getattr(self._server, method_name(request.op))
         # Pass job_id only when set (ops omitting it call method(body)), then the body.
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
