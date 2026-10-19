@@ -288,13 +288,25 @@ def _sparse_attention_forward(
     )
 
     kernel_indices = _pad_sparse_indices(topk_indices)
-    if sparse_query.is_cuda and sparse_query.shape[-1] == 576:
+    if sparse_query.is_cuda and self.kv_lora_rank == 512 and sparse_query.shape[-1] in (512, 576):
+        # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
+        padding = 576 - sparse_query.shape[-1]
+        if padding:
+            sparse_query = F.pad(sparse_query, (0, padding))
+            sparse_kv = F.pad(sparse_kv, (0, padding))
         absorbed_output = sparse_mla_flashmla_apply(
             sparse_query,
             sparse_kv,
             kernel_indices.unsqueeze(2),
             self.scaling,
         )
+        if not getattr(self, "_ap_flashmla_dispatch_reported", False):
+            get_logger().info(
+                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=reference",
+                dist.get_rank() if dist.is_initialized() else 0,
+                576 - padding,
+            )
+            self._ap_flashmla_dispatch_reported = True
     else:
         absorbed_output = _reference_sparse_mla(
             sparse_query,
