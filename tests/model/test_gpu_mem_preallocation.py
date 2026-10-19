@@ -16,7 +16,6 @@
 """CPU tests of capacity-guard configuration and allocation, with CUDA calls mocked."""
 
 import logging
-
 from copy import deepcopy
 from types import SimpleNamespace
 
