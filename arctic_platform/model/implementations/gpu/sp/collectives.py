@@ -16,8 +16,31 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
+
+_barrier_groups: dict[object, object] = {}
+
+
+def _exchange_barrier_group(group):
+    if os.environ.get("ARCTIC_SP_ALLTOALL_BARRIER") != "1":
+        return None
+    if group not in _barrier_groups:
+        _barrier_groups[group] = dist.new_group(
+            ranks=dist.get_process_group_ranks(group),
+            backend="gloo",
+            use_local_synchronization=True,
+        )
+    return _barrier_groups[group]
+
+
+def _finish_exchange(barrier_group):
+    if barrier_group is not None:
+        # Finish GPU communication before another rank can enqueue the next exchange.
+        torch.cuda.current_stream().synchronize()
+        dist.barrier(group=barrier_group)
 
 
 class _SeqAllToAll(torch.autograd.Function):
@@ -37,9 +60,11 @@ class _SeqAllToAll(torch.autograd.Function):
                 f"SP all-to-all scatter dim {scatter_dim} with size "
                 f"{tensor.size(scatter_dim)} is not divisible by world size {world_size}"
             )
+        ctx.barrier_group = _exchange_barrier_group(group)
         input_chunks = [chunk.contiguous() for chunk in tensor.chunk(world_size, dim=scatter_dim)]
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         dist.all_to_all(output_chunks, input_chunks, group=group)
+        _finish_exchange(ctx.barrier_group)
         return torch.cat(output_chunks, dim=gather_dim)
 
     @staticmethod
@@ -55,6 +80,7 @@ class _SeqAllToAll(torch.autograd.Function):
         input_chunks = [chunk.contiguous() for chunk in grad.chunk(ctx.world_size, dim=ctx.gather_dim)]
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(ctx.world_size)]
         dist.all_to_all(output_chunks, input_chunks, group=ctx.group)
+        _finish_exchange(ctx.barrier_group)
         return None, torch.cat(output_chunks, dim=ctx.scatter_dim), None, None
 
 
