@@ -511,6 +511,7 @@ class CortexTransport(Transport):
         self.jobs = JobHandles()
         self.job_id: str | None = None
         self._roles: list[str] = []
+        self._owns_job = False
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -549,6 +550,7 @@ class CortexTransport(Transport):
         else:
             body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
+            self._owns_job = True
             # Logged before the wait: a job can stay PLACING for a long time.
             logger.info("created cortex job %s", self.job_id)
         return self.jobs
@@ -566,11 +568,12 @@ class CortexTransport(Transport):
     def shutdown(self) -> None:
         import aiohttp
 
-        if self.job_id is not None:
+        if self._owns_job and self.job_id is not None:
             # Best-effort teardown, tolerating failure (the job may be gone).
             with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
                 self.call(cancel_job_request(self.job_id))
             self.job_id = None
+            self._owns_job = False
         self._on_loop(self._close_session()).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
