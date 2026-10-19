@@ -379,6 +379,7 @@ class DeepSpeedWorker:
         see_memory_usage("_forward_maybe_backward start", force=True)
 
         from arctic_platform import sft_profile
+        from arctic_platform.rl.processors.base_loss import USES_TOKEN_BUDGET_PIPELINE
         from arctic_platform.rl.processors.base_loss import _pop_loss_object
 
         loss_object = _pop_loss_object(batch)
@@ -403,6 +404,32 @@ class DeepSpeedWorker:
             for k, v in batch_data.items():
                 pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
+        if loss_object is not None and loss_object.has_capability(USES_TOKEN_BUDGET_PIPELINE):
+            from arctic_platform.rl.processors import DEFAULT_MAX_TOKENS_PER_MB
+            from arctic_platform.rl.processors import run_pipeline
+
+            pipeline_outputs = run_pipeline(
+                self.engine,
+                args,
+                batch_data,
+                meta_data,
+                processing,
+                device=self._device,
+                backward="summed" if backward else False,
+                max_tokens_per_mb=meta_data.get("max_tokens_per_mb", DEFAULT_MAX_TOKENS_PER_MB),
+                return_tensors=meta_data.get("worker_return_tensors", False),
+                loss_object=loss_object,
+            )
+        else:
+            pipeline_outputs = self._run_gas_microbatches(
+                args, batch_data, meta_data, processing, backward, loss_object
+            )
+
+        return self._finalize_pipeline_outputs(pipeline_outputs, tag, profile=PROFILE)
+
+    def _run_gas_microbatches(self, args, batch_data, meta_data, processing, backward, loss_object):
+        """Execute the fixed GAS schedule, including client-supplied microbatches."""
+        tag = "forward_backward" if backward else "forward_only"
         grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.
         if isinstance(batch_data, list):
@@ -557,10 +584,14 @@ class DeepSpeedWorker:
                 else:
                     pipeline_outputs[k] = sum(values) / len(values)
 
+        return pipeline_outputs
+
+    def _finalize_pipeline_outputs(self, pipeline_outputs: dict, tag: str, profile: bool) -> dict:
+        """Finalize worker outputs and profiling for either execution path."""
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 
         see_memory_usage("_forward_maybe_backward end", force=True)
-        if PROFILE:
+        if profile:
             dir = "/tmp/mem-prof"
             rank = 0  # torch.distributed.get_rank()
             from pathlib import Path

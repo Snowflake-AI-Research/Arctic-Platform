@@ -52,15 +52,15 @@ def batch_tensor(batch: Dict[str, Any], key: str, *, min_dims: int) -> Optional[
 
 
 def batch_position_ids(batch: Dict[str, Any]) -> Optional[torch.Tensor]:
-    """The 2D ``position_ids`` of a batch."""
+    """Position IDs with a final token axis, optionally grouped by example."""
     position_ids = batch_tensor(batch, "position_ids", min_dims=2)
-    if position_ids is not None and position_ids.ndim == 2:
+    if position_ids is not None and position_ids.ndim in (2, 3):
         return position_ids
     return None
 
 
 def batch_input_ids(batch: Dict[str, Any]) -> Optional[torch.Tensor]:
-    """The ``[B, S]`` ``input_ids`` of a batch or shard."""
+    """Input IDs shaped [B, S] or [items, alternatives, S]."""
     return batch_tensor(batch, "input_ids", min_dims=2)
 
 
@@ -71,11 +71,11 @@ def batch_num_rows(batch: Dict[str, Any]) -> Optional[int]:
 
 def batch_seqlen(batch: Dict[str, Any]) -> Optional[int]:
     input_ids = batch_input_ids(batch)
-    return int(input_ids.shape[1]) if input_ids is not None else None
+    return int(input_ids.shape[-1]) if input_ids is not None else None
 
 
 def token_validity_mask(batch: Dict[str, Any]) -> torch.Tensor:
-    """A 2D ``[B, S]`` mask of the real (non-pad) tokens of every row.
+    """A mask of real tokens, preserving any grouped-example axis.
 
     Requests usually ship ``position_ids`` rather than an ``attention_mask``, since a mask large enough to
     describe a packed batch costs more to move than the positions it encodes. Positions carry the signal
@@ -87,15 +87,15 @@ def token_validity_mask(batch: Dict[str, Any]) -> torch.Tensor:
     bills the row a length its real prefix does not have.
     """
     attention_mask = batch_tensor(batch, "attention_mask", min_dims=2)
-    if attention_mask is not None and attention_mask.ndim == 2:
+    if attention_mask is not None and attention_mask.ndim in (2, 3):
         return attention_mask
 
     position_ids = batch_position_ids(batch)
     if position_ids is not None and torch.is_tensor(position_ids):
-        seq_positions = torch.arange(position_ids.shape[1], device=position_ids.device).unsqueeze(0)
-        expected_positions = position_ids[:, :1] + seq_positions
+        seq_positions = torch.arange(position_ids.shape[-1], device=position_ids.device)
+        expected_positions = position_ids[..., :1] + seq_positions
         advances_by_one = position_ids.eq(expected_positions).to(dtype=torch.long)
-        return advances_by_one.cumprod(dim=1)
+        return advances_by_one.cumprod(dim=-1)
 
     raise ValueError("token-budget grouping requires a 2D attention_mask or 2D position_ids to find real tokens")
 
@@ -153,7 +153,7 @@ def shard_valid_lengths(batch: Dict[str, Any]) -> List[int]:
     validity_mask = token_validity_mask(batch)
     if int(validity_mask.shape[0]) == 0:
         return []
-    return [int(length) for length in validity_mask.sum(dim=1).to(torch.long).cpu().tolist()]
+    return [int(length) for length in validity_mask.flatten(1).sum(dim=1).to(torch.long).cpu().tolist()]
 
 
 def split_groups_to_count(

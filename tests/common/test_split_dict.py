@@ -33,11 +33,13 @@ class TestSplitDictRemainder(TestCasePlus):
         # torch.chunk(B, n) can return fewer than n tensors (B=6 n=4 → 3 chunks).
         for batch_size, num_chunks in ((6, 4), (5, 4), (9, 4), (13, 8), (4, 4), (7, 4)):
             ids = torch.arange(batch_size * 3).view(batch_size, 3)
-            shards = split_dict({"input_ids": ids}, num_chunks)
+            shards = split_dict({"input_ids": ids, "row_tags": list(range(batch_size))}, num_chunks)
             self.assertEqual(len(shards), num_chunks, msg=f"B={batch_size} n={num_chunks}")
             rows = [int(s["input_ids"].shape[0]) for s in shards]
             self.assertEqual(sum(rows), batch_size, msg=f"B={batch_size} n={num_chunks} rows={rows}")
             torch_assert_equal(torch.cat([s["input_ids"] for s in shards], dim=0), ids)
+            for shard in shards:
+                self.assertEqual(shard["row_tags"], (shard["input_ids"][:, 0] // 3).tolist())
 
     def test_batch_smaller_than_ranks_is_rejected(self):
         ids = torch.arange(6).view(3, 2)

@@ -102,6 +102,7 @@ class MicroBatchList:
     group_lens: list
     forward_indices: list | None = None
     backward_indices: list | None = None
+    padding_count: int = 0
 
     def __len__(self) -> int:
         return len(self.mbs)
@@ -142,27 +143,30 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
         mb_spec = MicroBatchSpec.new(mb_spec, max_tokens_per_mb=DEFAULT_MAX_TOKENS_PER_MB)
     granularity = mb_spec.granularity
     bs = data["attention_mask"].shape[0]
-    max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = data["attention_mask"].view(bs // granularity, granularity, -1).sum(dim=(1, 2)).long().cpu().numpy()
+    grouped = data["attention_mask"].ndim == 3
+    seq_lens = data["attention_mask"].reshape(bs, -1).sum(1).long().cpu().numpy().tolist()
+    input_lens = (
+        data["attention_mask"].reshape(bs // granularity, granularity, -1).sum(dim=(1, 2)).long().cpu().numpy()
+    )
 
     multimodal_keys = {key for key in data if _is_multi_modal_key(key)}
     to_split, not_to_split = {}, {}
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        # Token rows: [B, S, ...] with numel == B * max_seqlen. Per-sequence
-        # vectors: known length-[B] keys only (do not split every 1-D tensor
-        # whose length happens to equal B).
-        is_token_row = torch.is_tensor(value) and value.numel() == bs * max_seqlen
+        # Grouped inputs keep their alternative axis through scheduling.
+        # Per-sequence vectors use known keys rather than incidental sizes.
+        is_token_row = torch.is_tensor(value) and value.numel() == data["attention_mask"].numel()
         is_per_sequence = (
             key in BATCH_DIM_CONTEXT_KEYS and torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == bs
         )
-        if key == "position_ids" or is_token_row or is_per_sequence:
+        is_grouped_list = grouped and isinstance(value, list) and len(value) == bs
+        if key == "position_ids" or is_token_row or is_per_sequence or is_grouped_list:
             to_split[key] = value
         else:
             not_to_split[key] = value
 
+    padding_count = 0
     group_indices = _allocate_balanced_mbs(mb_spec, input_lens)
     if dist.is_initialized():
         # Sync microbatch count across all ranks so every rank runs the same
@@ -176,7 +180,12 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
         dist.all_gather_object(all_n_mbs, len(group_indices), group=sync_group)
         max_n_mbs = max(all_n_mbs)
         if max_n_mbs != len(group_indices):
-            group_indices = _allocate_balanced_mbs(MicroBatchSpec.new(mb_spec, n_mbs=max_n_mbs), input_lens)
+            if grouped:
+                # A second FFD allocation can exceed max_n_mbs. Preserve the
+                # real atomic groups and fill missing calls with zero-loss repeats.
+                padding_count = max_n_mbs - len(group_indices)
+            else:
+                group_indices = _allocate_balanced_mbs(MicroBatchSpec.new(mb_spec, n_mbs=max_n_mbs), input_lens)
 
     group_indices = [
         _flat2d_mb([list(range(i * granularity, (i + 1) * granularity)) for i in gi]) for gi in group_indices
@@ -190,9 +199,10 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
     backward_indices = _np.zeros(bs, dtype=_np.int64)
     backward_indices[forward_indices] = _np.arange(bs)
 
-    def _split(tensor):
-        unpacked = [tensor[i] for i in range(bs)]
-        reordered = torch.stack(_reorder_list(unpacked, forward_indices))
+    def _split(value):
+        reordered = _reorder_list(value, forward_indices)
+        if torch.is_tensor(value):
+            reordered = torch.stack(reordered)
         result, offset = [], 0
         for n in group_n_seqs:
             result.append(reordered[offset : offset + n])
@@ -213,4 +223,5 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
         forward_indices=forward_indices,
         backward_indices=backward_indices.tolist(),
         group_lens=group_lens,
+        padding_count=padding_count,
     )
