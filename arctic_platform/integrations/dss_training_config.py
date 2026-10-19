@@ -22,6 +22,7 @@ from typing import Any
 from typing import Mapping
 
 from arctic_platform.model.implementations.debug.config import training_debug_config
+from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 
 _DSS_MOE_LOADERS = frozenset({"generic_moe", "glm_moe_dsa", "qwen3_5_moe", "glm5_next", "qwen4_exp"})
 
@@ -72,6 +73,9 @@ def dss_moe_initialize_payload(payload: Mapping[str, Any]) -> dict:
         and training.get("model_provider", "prime_rl") == "prime_rl"
         and (training.get("ep_size") or 1) > 1
     ):
+        # DSS otherwise defaults to Liger, which conflicts with an integer chunked head.
+        legacy.setdefault("fused_cross_entropy", False)
+        validate_lm_head_fused_ce_config({**legacy, "fused_lm_head_token_chunk_size": effective_head_chunk})
         # The carved MoE head fixes vocabulary tiles at 8192, without a loader option.
         for location, controls in (("training_config", training), ("training_config.prime_rl", legacy)):
             if "fused_lm_head_vocab_chunk_size" in controls:

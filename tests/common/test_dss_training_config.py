@@ -15,6 +15,7 @@
 
 """CPU-only tests of the explicit AP-owned DSS configuration bridge."""
 
+import json
 from collections import UserDict
 from copy import deepcopy
 from types import SimpleNamespace
@@ -166,9 +167,38 @@ def test_exact_emitted_keys_for_dispatch_and_head_controls():
     assert set(training["prime_rl"]) == {
         "deepep_token_chunk_size",
         "fused_lm_head_token_chunk_size",
+        "fused_cross_entropy",
         "fp32_lm_head",
         "seq_len",
     }
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_integer_head_disables_only_implicit_fused_cross_entropy(nested):
+    controls = {"fused_lm_head_token_chunk_size": 1024}
+    source = job(**({"prime_rl": controls} if nested else controls))
+    original = deepcopy(source)
+    training = dss_moe_initialize_payload(source)["training_config"]
+    assert training["prime_rl"]["fused_cross_entropy"] is False
+    assert "fused_cross_entropy" not in training
+    assert source == original
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fused_ce", [True, "liger", "quack"])
+def test_integer_head_rejects_explicit_fused_cross_entropy_before_resolution(monkeypatch, nested, fused_ce):
+    from arctic_platform.model import loader
+
+    monkeypatch.setattr(loader, "_load_hf_config", lambda _: pytest.fail("Conflict must fail before resolution"))
+    controls = {"fused_lm_head_token_chunk_size": 1024}
+    source = job(**({"prime_rl": {**controls, "fused_cross_entropy": fused_ce}} if nested else controls))
+    if not nested:
+        source["training_config"]["prime_rl"] = {"fused_cross_entropy": fused_ce}
+    source["training_config"].pop("model_provider")
+    original = deepcopy(source)
+    with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
+        dss_moe_initialize_payload(source)
+    assert source == original
 
 
 @pytest.mark.parametrize(
@@ -423,3 +453,121 @@ def test_explicit_provider_is_not_auto_replaced(monkeypatch):
     monkeypatch.setattr(loader, "_load_hf_config", lambda _: pytest.fail("Explicit provider must stay explicit"))
     source = job(model_provider="huggingface")
     assert dss_moe_initialize_payload(source) == source
+
+
+@pytest.mark.parametrize(
+    "model_type,expected_loader",
+    [("qwen3_moe", "generic_moe"), ("glm5_next", "glm5_next"), ("qwen4_exp", "qwen4_exp")],
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fp32_head", [False, True])
+def test_transport_controls_reach_real_loader_and_model_config(
+    monkeypatch, model_type, expected_loader, nested, fp32_head
+):
+    pytest.importorskip("transformers.models.qwen3_5_moe")
+    from torch import nn
+
+    from arctic_platform.integrations.dss_training_config import _moe_model_spec
+    from arctic_platform.model import loader
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+
+    controls = {
+        "deepep_token_chunk_size": 16384,
+        "fused_lm_head_token_chunk_size": 1024,
+        "fused_lm_head_vocab_chunk_size": 8192,
+        "fp32_lm_head": fp32_head,
+    }
+    source = job(**({"prime_rl": controls} if nested else controls), sp_size=4)
+    source["training_config"].pop("model_provider")
+    original = deepcopy(source)
+    monkeypatch.setattr(loader, "_load_hf_config", lambda _: SimpleNamespace(model_type=model_type))
+    transported = json.loads(json.dumps(dss_moe_initialize_payload(source)))
+    before_resolution = deepcopy(transported)
+    training = transported["training_config"]
+    spec = _moe_model_spec(transported, training["prime_rl"])
+    assert spec.loader == expected_loader
+    assert training["model_provider"] == "prime_rl"
+    assert training["fused_lm_head_vocab_chunk_size"] == 8192
+    assert "fused_lm_head_vocab_chunk_size" not in spec.loader_options
+    expected = {key: value for key, value in controls.items() if key != "fused_lm_head_vocab_chunk_size"}
+    assert {key: spec.loader_options[key] for key in expected} == expected
+    observed = {}
+    model = nn.Identity()
+    ep_group, sp_group = object(), object()
+
+    def capture_construction(adapter, _load_model, **kwargs):
+        observed.update(kwargs)
+        observed["config"] = adapter.build_model_config(
+            kwargs["model_name"],
+            kwargs["ep_size"],
+            1,
+            kwargs["optimization_dtype"],
+            kwargs["attn_implementation"],
+            kwargs["options"],
+        )
+        return model
+
+    monkeypatch.setattr(qwen_ds, "_load_moe_model", capture_construction)
+    context = loader.LoaderContext(spec, parallel_groups={"ep_group": ep_group, "sp_group": sp_group})
+    loaded = loader.select_loader(context)(context)
+    assert loaded.model is model
+    assert observed["ep_size"] == 8
+    assert observed["sp_size"] == 4
+    assert observed["ep_group"] is ep_group
+    assert observed["sp_group"] is sp_group
+    assert observed["config"].seq_len == 262144
+    assert {key: getattr(observed["config"], key) for key in expected} == expected
+    assert transported == before_resolution
+    assert source == original
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_moe", "glm5_next", "qwen4_exp"])
+def test_installed_dss_consumer_preserves_transport_controls(monkeypatch, model_type):
+    pytest.importorskip("transformers.models.qwen3_5_moe")
+    dss_models = pytest.importorskip("dss.ray_dss.models")
+    dss_training = pytest.importorskip("dss.ray_dss.jobs.gpu.training")
+    dss_loader = pytest.importorskip("dss.ray_dss.jobs.gpu.model_loader")
+    import deepspeed.utils.groups as ds_groups
+
+    from arctic_platform import model as ap_model
+    from arctic_platform.model import loader
+
+    monkeypatch.setattr(loader, "_load_hf_config", lambda _: SimpleNamespace(model_type=model_type))
+    source = job(
+        deepep_token_chunk_size=16384,
+        fused_lm_head_token_chunk_size=1024,
+        fused_lm_head_vocab_chunk_size=8192,
+        fp32_lm_head=True,
+        attn_implementation=None,
+        sp_size=4,
+    )
+    transported = json.loads(json.dumps(dss_moe_initialize_payload(source)))
+    before_consumption = deepcopy(transported)
+    training = dss_models.TrainingConfig.model_validate(transported["training_config"]).model_dump(exclude_none=True)
+    prl = dss_training.prime_rl_config(transported, training, training["attn_implementation"])
+    observed = {}
+    expected_model = object()
+    ep_group, sp_group = object(), object()
+
+    def capture_build(spec, *, parallel_groups):
+        observed["spec"] = spec
+        observed["groups"] = parallel_groups
+        return SimpleNamespace(model=expected_model)
+
+    monkeypatch.setattr(ap_model, "build_model", capture_build)
+    monkeypatch.setattr(ds_groups, "_get_expert_parallel_group", lambda _: ep_group)
+    loaded = dss_loader.load_ap_moe(
+        model_name=transported["model_name"],
+        ep_size=training["ep_size"],
+        sp_size=training["sp_size"],
+        sp_group=sp_group,
+        prl_config=prl,
+    )
+    assert loaded is expected_model
+    assert observed["groups"] == {"ep_group": ep_group, "sp_group": sp_group}
+    assert observed["spec"].parallelism.expert_parallel == 8
+    assert observed["spec"].parallelism.sequence_parallel == 4
+    for key in ("deepep_token_chunk_size", "fused_lm_head_token_chunk_size", "fp32_lm_head"):
+        assert observed["spec"].loader_options[key] == source["training_config"][key]
+    assert "fused_lm_head_vocab_chunk_size" not in observed["spec"].loader_options
+    assert transported == before_consumption
