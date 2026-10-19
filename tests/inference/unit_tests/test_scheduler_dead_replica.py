@@ -84,3 +84,27 @@ def test_when_every_replica_died_the_error_reaches_the_caller(death):
         return await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=10)
 
     assert all(isinstance(result, death) for result in asyncio.run(run()))
+
+
+def test_a_request_that_kills_every_engine_it_reaches_takes_down_at_most_two_replicas():
+    sent = []
+
+    def poisoned(idx: int) -> MagicMock:
+        async def generate(prompt, params):
+            sent.append(idx)
+            await asyncio.sleep(0.01)
+            raise EngineDeadError()
+
+        worker = MagicMock()
+        worker.generate.remote = generate
+        return worker
+
+    async def run():
+        scheduler = Scheduler([poisoned(i) for i in range(5)])
+        result = await asyncio.wait_for(asyncio.gather(scheduler.submit("p", {}), return_exceptions=True), timeout=10)
+        return scheduler, result
+
+    scheduler, (result,) = asyncio.run(run())
+    assert isinstance(result, EngineDeadError)
+    assert len(sent) <= 2
+    assert sum(not scheduler.is_worker_available(i) for i in range(5)) <= 2

@@ -59,6 +59,7 @@ class _Request:
     prefix_hash: int | None = None
     routing_key: str | None = None
     strict: bool = False
+    rerouted: bool = False
 
 
 @dataclass
@@ -781,8 +782,9 @@ class Scheduler:
                     raise
                 # A replica whose actor or engine died never serves again: stop routing to it and re-route this request.
                 ws.quarantine()
-                if all(w.quarantined for w in self._workers):
-                    raise  # no replica left to re-route to: the caller must see the death
+                if req.rerouted or all(w.quarantined for w in self._workers):
+                    raise  # re-route once: a request that itself kills engines must not walk through every replica
+                req.rerouted = True
                 self._inflight_tasks[tracked_worker_idx].discard(current_task)
                 ws.active_requests = max(0, ws.active_requests - 1)
                 ws = tracked_worker_idx = None
