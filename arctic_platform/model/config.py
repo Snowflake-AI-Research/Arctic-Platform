@@ -272,8 +272,8 @@ class ModelSpec(BaseModel):
         # Existing DSS loaders carry AP controls in loader_options.debug.
         legacy_debug = self.loader_options.get("debug")
         if isinstance(legacy_debug, dict) and "gpu_mem_preallocate_gib" in legacy_debug:
-            if "debug" not in self.model_fields_set:
-                self.debug = {"gpu_mem_preallocate_gib": legacy_debug["gpu_mem_preallocate_gib"]}
+            if "gpu_mem_preallocate_gib" not in self.debug:
+                self.debug = {**self.debug, "gpu_mem_preallocate_gib": legacy_debug["gpu_mem_preallocate_gib"]}
             self.loader_options = {
                 **self.loader_options,
                 "debug": {key: value for key, value in legacy_debug.items() if key != "gpu_mem_preallocate_gib"},

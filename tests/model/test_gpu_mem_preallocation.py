@@ -15,6 +15,8 @@
 
 """CPU tests of capacity-guard configuration and allocation, with CUDA calls mocked."""
 
+import logging
+
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -76,7 +78,7 @@ def test_disabled_buffer_never_touches_cuda(monkeypatch):
     assert allocate_gpu_mem_preallocation({}) is None
 
 
-def test_byte_tensor_allocates_on_current_rank_device(monkeypatch, capsys):
+def test_byte_tensor_allocates_on_current_rank_device(monkeypatch, caplog, capsys):
     allocation = object()
     monkeypatch.setenv("RANK", "7")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
@@ -88,8 +90,10 @@ def test_byte_tensor_allocates_on_current_rank_device(monkeypatch, capsys):
         return allocation
 
     monkeypatch.setattr(torch, "empty", allocate)
-    assert allocate_gpu_mem_preallocation({"gpu_mem_preallocate_gib": 20}) is allocation
-    assert "rank=7 [gpu-mem-preallocate] bytes=21474836480" in capsys.readouterr().out
+    with caplog.at_level(logging.INFO, logger="arctic_platform.model.implementations.debug.gpu_memory"):
+        assert allocate_gpu_mem_preallocation({"gpu_mem_preallocate_gib": 20}) is allocation
+    assert "rank=7 [gpu-mem-preallocate] bytes=21474836480 size=20.000GiB" in caplog.text
+    assert capsys.readouterr().out == ""
 
 
 def test_oom_is_not_hidden(monkeypatch):
@@ -129,22 +133,32 @@ def test_model_spec_lifts_only_legacy_capacity_guard(stub_loader):
     assert ModelSpec.model_validate_json(spec.model_dump_json()).debug == spec.debug
 
 
-@pytest.mark.parametrize("top", [{}, {"gpu_mem_preallocate_gib": 2}])
-def test_model_spec_explicit_debug_overrides_legacy_guard(stub_loader, top):
+@pytest.mark.parametrize(
+    "top",
+    [{}, {"gradient_norms_per_param": True}, {"gpu_mem_preallocate_gib": 2}, {"gpu_mem_preallocate_gib": 0}],
+)
+def test_model_spec_only_explicit_reserve_overrides_legacy_guard(stub_loader, top):
     from arctic_platform.model import ModelSpec
 
+    options = {"debug": {"gpu_mem_preallocate_gib": 20, "random_init": True}}
+    original = deepcopy(options)
+    original_top = deepcopy(top)
     spec = ModelSpec(
         model_path_or_name="x",
         loader="capacity_guard_test",
         debug=top,
-        loader_options={"debug": {"gpu_mem_preallocate_gib": 20, "random_init": True}},
+        loader_options=options,
     )
-    assert spec.debug == top
+    assert spec.debug == {"gpu_mem_preallocate_gib": 20, **top}
     assert spec.loader_options["debug"] == {"random_init": True}
+    assert options == original
+    assert top == original_top
+    assert ModelSpec.model_validate_json(spec.model_dump_json()).debug == spec.debug
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_model_spec_rejects_invalid_guard(stub_loader, legacy):
+@pytest.mark.parametrize("top", [None, {}])
+def test_model_spec_rejects_invalid_guard(stub_loader, legacy, top):
     from arctic_platform.model import ModelSpec
 
     controls = (
@@ -154,6 +168,8 @@ def test_model_spec_rejects_invalid_guard(stub_loader, legacy):
             "debug": {"gpu_mem_preallocate_gib": -1},
         }
     )
+    if legacy and top is not None:
+        controls["debug"] = top
     with pytest.raises(ValueError, match="gpu_mem_preallocate_gib"):
         ModelSpec(model_path_or_name="x", loader="capacity_guard_test", **controls)
 

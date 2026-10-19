@@ -17,12 +17,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import Any
 from typing import Mapping
 
 from arctic_platform.model.implementations.debug.config import training_debug_config
+
+logger = logging.getLogger(__name__)
 
 
 def gpu_mem_preallocate_bytes(training_config: Mapping[str, Any]) -> int:
@@ -57,9 +60,10 @@ def allocate_gpu_mem_preallocation(debug: Mapping[str, Any], *, device=None):
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     allocation = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-    print(
-        f"rank={os.environ.get('RANK', '?')} [gpu-mem-preallocate] "
-        f"bytes={size_bytes} size={size_bytes / (1 << 30):.3f}GiB",
-        flush=True,
+    logger.info(
+        "rank=%s [gpu-mem-preallocate] bytes=%d size=%.3fGiB",
+        os.environ.get("RANK", "?"),
+        size_bytes,
+        size_bytes / (1 << 30),
     )
     return allocation
