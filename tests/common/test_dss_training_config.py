@@ -15,6 +15,7 @@
 
 """CPU-only tests of the explicit AP-owned DSS configuration bridge."""
 
+from collections import UserDict
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -139,6 +140,35 @@ def test_flat_head_controls_reach_loader_channel_without_mutation():
     }
     assert training["fused_lm_head_token_chunk_size"] == 1024
     assert training["fp32_lm_head"] is False
+    assert set(training) == {
+        "model_provider",
+        "ep_size",
+        "max_seq_len",
+        "fused_lm_head_token_chunk_size",
+        "fused_lm_head_vocab_chunk_size",
+        "fp32_lm_head",
+        "prime_rl",
+    }
+
+
+def test_exact_emitted_keys_for_dispatch_and_head_controls():
+    training = dss_moe_initialize_payload(
+        job(deepep_token_chunk_size=16384, fused_lm_head_token_chunk_size=1024, fp32_lm_head=True)
+    )["training_config"]
+    assert set(training) == {
+        "model_provider",
+        "ep_size",
+        "max_seq_len",
+        "fused_lm_head_token_chunk_size",
+        "fp32_lm_head",
+        "prime_rl",
+    }
+    assert set(training["prime_rl"]) == {
+        "deepep_token_chunk_size",
+        "fused_lm_head_token_chunk_size",
+        "fp32_lm_head",
+        "seq_len",
+    }
 
 
 @pytest.mark.parametrize(
@@ -206,6 +236,86 @@ def test_nested_head_also_rejects_unsupported_vocab_chunk():
                 fused_lm_head_vocab_chunk_size=4096,
             )
         )
+
+
+@pytest.mark.parametrize("vocab_chunk", [4096, None, True, "8192", 8192.0])
+@pytest.mark.parametrize("flat_vocab", [False, True])
+@pytest.mark.parametrize("flat_head", [False, True])
+def test_nested_vocab_guard_cannot_be_masked_by_flat_controls(vocab_chunk, flat_vocab, flat_head):
+    controls = {
+        "prime_rl": {
+            "fused_lm_head_token_chunk_size": 1024,
+            "fused_lm_head_vocab_chunk_size": vocab_chunk,
+        }
+    }
+    if flat_vocab:
+        controls["fused_lm_head_vocab_chunk_size"] = 8192
+    if flat_head:
+        controls["fused_lm_head_token_chunk_size"] = 1024
+    source = job(**controls)
+    original = deepcopy(source)
+    with pytest.raises(ValueError, match="prime_rl.fused_lm_head_vocab_chunk_size=8192"):
+        dss_moe_initialize_payload(source)
+    assert source == original
+
+
+@pytest.mark.parametrize("provider_omitted", [False, True])
+def test_supported_nested_vocab_is_normalized_before_loader_resolution(monkeypatch, provider_omitted):
+    from arctic_platform.model import loader
+
+    monkeypatch.setattr(loader, "_load_hf_config", lambda _: SimpleNamespace(model_type="qwen3_moe"))
+    source = job(
+        prime_rl={
+            "fused_cross_entropy": False,
+            "fused_lm_head_token_chunk_size": 1024,
+            "fused_lm_head_vocab_chunk_size": 8192,
+        }
+    )
+    if provider_omitted:
+        del source["training_config"]["model_provider"]
+    original = deepcopy(source)
+    training = dss_moe_initialize_payload(source)["training_config"]
+    assert source == original
+    assert training["fused_lm_head_vocab_chunk_size"] == 8192
+    assert training["prime_rl"] == {
+        "fused_cross_entropy": False,
+        "fused_lm_head_token_chunk_size": 1024,
+        "seq_len": 262144,
+    }
+
+
+@pytest.mark.parametrize("legacy", ["bad", True, 1, ["bad"], [["debug", {}]], False, 0, "", []])
+@pytest.mark.parametrize("provider_omitted", [False, True])
+@pytest.mark.parametrize("top_debug", [None, {}])
+def test_invalid_prime_rl_is_rejected_before_any_loader_inference(monkeypatch, legacy, provider_omitted, top_debug):
+    from arctic_platform.model import loader
+
+    monkeypatch.setattr(loader, "_load_hf_config", lambda _: pytest.fail("Malformed prime_rl must fail first"))
+    source = job(prime_rl=legacy, debug=top_debug)
+    if provider_omitted:
+        del source["training_config"]["model_provider"]
+    original = deepcopy(source)
+    with pytest.raises(TypeError, match="training_config.prime_rl must be a mapping"):
+        dss_moe_initialize_payload(source)
+    assert source == original
+
+
+def test_mapping_prime_rl_is_accepted_without_source_mutation():
+    source = job(prime_rl=UserDict({"fp32_lm_head": True}))
+    original = deepcopy(source)
+    assert dss_moe_initialize_payload(source)["training_config"]["prime_rl"] == {
+        "fp32_lm_head": True,
+        "seq_len": 262144,
+    }
+    assert source == original
+
+
+def test_explicit_dense_provider_preserves_nested_head_options():
+    source = job(
+        model_provider="huggingface",
+        prime_rl={"fused_lm_head_token_chunk_size": 1024, "fused_lm_head_vocab_chunk_size": 4096},
+    )
+    assert dss_moe_initialize_payload(source) == source
 
 
 @pytest.mark.parametrize(

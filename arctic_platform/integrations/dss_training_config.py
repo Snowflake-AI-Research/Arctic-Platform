@@ -51,6 +51,10 @@ def dss_moe_initialize_payload(payload: Mapping[str, Any]) -> dict:
     """Copy a single job's flat AP controls into the existing DSS MoE loader channel."""
     transport = deepcopy(dict(payload))
     training = transport["training_config"]
+    legacy = training.get("prime_rl")
+    if legacy is not None and not isinstance(legacy, Mapping):
+        raise TypeError("training_config.prime_rl must be a mapping")
+    legacy = dict(legacy or {})
     debug = training_debug_config(training)
     reserve_requested = debug.get("gpu_mem_preallocate_gib", 0) != 0
     chunk = training.get("deepep_token_chunk_size")
@@ -62,9 +66,25 @@ def dss_moe_initialize_payload(payload: Mapping[str, Any]) -> dict:
     fp32_head = training.get("fp32_lm_head")
     if fp32_head is not None and not isinstance(fp32_head, bool):
         raise ValueError("fp32_lm_head must be a boolean")
+    effective_head_chunk = head_chunk if head_chunk is not None else legacy.get("fused_lm_head_token_chunk_size")
+    if (
+        isinstance(effective_head_chunk, int)
+        and training.get("model_provider", "prime_rl") == "prime_rl"
+        and (training.get("ep_size") or 1) > 1
+    ):
+        # The carved MoE head fixes vocabulary tiles at 8192, without a loader option.
+        for location, controls in (("training_config", training), ("training_config.prime_rl", legacy)):
+            if "fused_lm_head_vocab_chunk_size" in controls:
+                vocab_chunk = controls["fused_lm_head_vocab_chunk_size"]
+                if type(vocab_chunk) is not int or vocab_chunk != 8192:
+                    raise ValueError(
+                        f"The AP MoE chunked head requires {location}.fused_lm_head_vocab_chunk_size=8192"
+                    )
+        if "fused_lm_head_vocab_chunk_size" in legacy:
+            training.setdefault("fused_lm_head_vocab_chunk_size", legacy.pop("fused_lm_head_vocab_chunk_size"))
     if "model_provider" not in training and (training.get("ep_size") or 1) > 1:
         # AP resolves loaders automatically; DSS otherwise selects its dense HF path.
-        spec = _moe_model_spec(transport, training.get("prime_rl") or {})
+        spec = _moe_model_spec(transport, legacy)
         if spec.loader not in _DSS_MOE_LOADERS:
             raise ValueError(f"The DSS compatibility bridge cannot map AP loader {spec.loader!r} to MoE training")
         training["model_provider"] = "prime_rl"
@@ -72,16 +92,14 @@ def dss_moe_initialize_payload(payload: Mapping[str, Any]) -> dict:
         if reserve_requested or chunk is not None or head_chunk is not None or fp32_head:
             raise ValueError("The DSS compatibility bridge requires a Prime-RL AP MoE loader with EP > 1")
         return transport
-    legacy = training.get("prime_rl")
-    if legacy is not None and not isinstance(legacy, dict):
-        raise TypeError("training_config.prime_rl must be a mapping")
-    legacy = dict(legacy or {})
     if chunk is not None:
         nested_chunk = legacy.get("deepep_token_chunk_size")
         if nested_chunk is not None and nested_chunk != chunk:
             raise ValueError("Conflicting top-level and prime_rl.deepep_token_chunk_size")
         legacy["deepep_token_chunk_size"] = chunk
     training.pop("deepep_token_chunk_size", None)
+    # DSS TrainingConfig declares these flat fields; its MoE loader reads prime_rl.
+    # Keep both spellings intentionally, unlike the nested-only dispatch chunk.
     for key, value in (
         ("fused_lm_head_token_chunk_size", head_chunk),
         ("fp32_lm_head", fp32_head),
@@ -91,11 +109,6 @@ def dss_moe_initialize_payload(payload: Mapping[str, Any]) -> dict:
             if nested is not None and (type(nested) is not type(value) or nested != value):
                 raise ValueError(f"Conflicting top-level and prime_rl.{key}")
             legacy[key] = value
-    # The carved MoE head fixes vocabulary tiles at 8192; it has no loader option for this.
-    if isinstance(legacy.get("fused_lm_head_token_chunk_size"), int):
-        vocab_chunk = training.get("fused_lm_head_vocab_chunk_size", 8192)
-        if isinstance(vocab_chunk, bool) or vocab_chunk != 8192:
-            raise ValueError("The AP MoE chunked head requires fused_lm_head_vocab_chunk_size=8192")
     if training.get("max_seq_len") is not None:
         legacy.setdefault("seq_len", training["max_seq_len"])
     if training.get("debug") is not None:
