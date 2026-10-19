@@ -54,6 +54,10 @@ OPS = frozenset(
         "wake-inference",
         "sleep-training",
         "wake-training",
+        # Streaming generate: submit, then poll the request for events or cancel it.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
     }
 )
 
