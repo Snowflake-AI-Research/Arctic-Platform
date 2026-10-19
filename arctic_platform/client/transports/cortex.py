@@ -235,7 +235,7 @@ def _unwrap_forward_payload(result: dict) -> dict:
     """
     if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
         return result
-    return wire.loads(base64.b64decode(result["payload_b64"]))
+    return _merge_transport_metrics(wire.loads(base64.b64decode(result["payload_b64"])), result)
 
 
 def _request_status(status: dict) -> dict:
@@ -331,7 +331,10 @@ class _Route:
         raise RuntimeError(f"cortex {operation_type or request.op} response carried no request_id: {reply}")
 
     def finish(self, chunks: list[bytes], result: dict) -> Any:
-        return self.normalize(wire.decode_result_chunks(chunks) if chunks else _decode_result(result))
+        decoded = (
+            _merge_transport_metrics(wire.decode_result_chunks(chunks), result) if chunks else _decode_result(result)
+        )
+        return self.normalize(decoded)
 
 
 class _NoopRoute(_Route):
@@ -791,5 +794,19 @@ def _result_chunk(event: Any) -> bytes | None:
 def _decode_result(result: dict) -> dict:
     """Decode a small inline result: a base64 DSSST1 frame, else pass-through JSON."""
     if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
-        return wire.loads(base64.b64decode(result["payload_b64"]))
+        return _merge_transport_metrics(wire.loads(base64.b64decode(result["payload_b64"])), result)
     return result
+
+
+def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
+    transport_metrics = envelope.get("metrics")
+    if not isinstance(transport_metrics, dict):
+        return decoded
+    payload_metrics = decoded.get("metrics")
+    return {
+        **decoded,
+        "metrics": {
+            **(payload_metrics if isinstance(payload_metrics, dict) else {}),
+            **transport_metrics,
+        },
+    }
