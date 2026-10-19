@@ -264,13 +264,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
         results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         return results
 
-    async def wake_inference(self, tags: list[str] | None = None, restore_weights: bool | None = None):
+    async def wake_inference(self, tags: list[str] | None = None):
         """Wake all inference engines, restoring GPU memory.
 
-        ``restore_weights`` overrides the default of restoring the CPU-offloaded
-        weights on a weights wake. Callers about to overwrite every weight (e.g.
-        the CUDA IPC sync) pass ``False`` to skip a redundant full-model CPU->GPU
-        copy that would otherwise double peak GPU memory at the wake.
+        The in-tree pool wakes by tag (``weights``, then ``kv_cache``). Weight
+        bytes come from the following sync, so this does not copy a CPU
+        checkpoint back onto the GPU.
         """
         if self.colocate:
             # Release cached GPU pages so cumem can remap.

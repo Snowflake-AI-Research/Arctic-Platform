@@ -39,7 +39,6 @@ from arctic_platform.common.utils.cuda_ipc import merge_cuda_ipc_payloads
 logger = logging.getLogger(__name__)
 
 # Optional async callback: await wake(["weights"]) / await wake(["kv_cache"]).
-# Extra kwargs (e.g. restore_weights=True) are forwarded for Ray's staged wake.
 WakeFn = Callable[..., Awaitable[Any]]
 
 
@@ -110,9 +109,7 @@ async def sync_weights_cuda_ipc_low_mem(
             replicas.append(p._workers[rid])
 
     if wake_inference is not None:
-        # restore_weights=True: sleep_inference may have replaced param.data with
-        # [1] stubs; backload full-shape storage before the IPC stream copies in.
-        await wake_inference(["weights"], restore_weights=True)
+        await wake_inference(["weights"])
 
     all_names: list = []
     for idx, name in enumerate(param_names):
