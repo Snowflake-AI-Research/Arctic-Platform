@@ -29,7 +29,6 @@ from torch import nn
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
-from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _packed_sequence_indices
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
@@ -357,6 +356,13 @@ def _linear_attention_forward(
         value_head_dim=self.head_dim,
         process_group=self._cp_group,
     )
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None:
+        global_cu_seqlens = torch.tensor(
+            [0, global_length],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
     mixed_qkv = torch.cat(
         [
             exchanged["query"].reshape(batch_size, global_length, -1),
@@ -365,12 +371,23 @@ def _linear_attention_forward(
         ],
         dim=-1,
     ).transpose(1, 2)
-    mixed_qkv = _fallback_depthwise_causal_convolution(
+    from causal_conv1d import causal_conv1d_fn
+
+    conv_bias = _shard_convolution_parameter(
+        self.conv1d.bias,
+        name="conv1d.bias",
+        num_key_heads=self.num_heads,
+        num_value_heads=self.num_heads,
+        key_head_dim=self.head_dim,
+        value_head_dim=self.head_dim,
+        process_group=self._cp_group,
+    )
+    mixed_qkv = causal_conv1d_fn(
         mixed_qkv,
         weight=conv_weight,
-        bias=None,
+        bias=conv_bias,
         activation=self.activation,
-        global_cu_seqlens=getattr(self, _GLOBAL_CU_SEQLENS),
+        seq_idx=_packed_sequence_indices(global_cu_seqlens),
     ).transpose(1, 2)
     local_width = local_heads * self.head_dim
     query, key, value = torch.split(
@@ -382,9 +399,9 @@ def _linear_attention_forward(
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
 
-    from transformers.models.glm5_next.modeling_glm5_next import chunk_kimi_delta_attention
+    from fla.ops.kda import chunk_kda
 
-    output, final_state = chunk_kimi_delta_attention(
+    output, final_state = chunk_kda(
         query,
         key,
         value,
@@ -393,7 +410,7 @@ def _linear_attention_forward(
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
-        cu_seqlens=getattr(self, _GLOBAL_CU_SEQLENS),
+        cu_seqlens=global_cu_seqlens,
     )
     if final_state is not None:
         raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")

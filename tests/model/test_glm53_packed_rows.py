@@ -251,3 +251,46 @@ def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row():
             rtol=3e-2,
             atol=3e-2,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")
+def test_glm53_head_parallel_kda_matches_local_path(tmp_path):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    created = not dist.is_initialized()
+    if created:
+        dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'group'}", world_size=1, rank=0)
+    try:
+        torch.manual_seed(29)
+        model = _tiny_glm_sparse_model(with_linear_attention=True).cuda()
+        attention = model.model.layers[1].self_attn
+        setattr(attention, cp._GLOBAL_CU_SEQLENS, torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda"))
+        attention._cp_group = dist.group.WORLD
+        attention._cp_world_size = 1
+        hidden_states = torch.randn(1, 8, model.model.config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def run(forward):
+            attention.zero_grad(set_to_none=True)
+            inputs = hidden_states.detach().requires_grad_(True)
+            output = forward(attention, inputs)
+            output.float().square().sum().backward()
+            gradients = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in attention.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach(), inputs.grad.detach(), gradients
+
+        local_output, local_input_gradient, local_gradients = run(cp._local_linear_attention_forward)
+        parallel_output, parallel_input_gradient, parallel_gradients = run(cp._linear_attention_forward)
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+    torch.testing.assert_close(parallel_output, local_output, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(parallel_input_gradient, local_input_gradient, rtol=3e-2, atol=3e-2)
+    assert parallel_gradients.keys() == local_gradients.keys()
+    for name, gradient in parallel_gradients.items():
+        torch.testing.assert_close(gradient, local_gradients[name], rtol=3e-2, atol=3e-2, msg=name)
