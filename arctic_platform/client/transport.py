@@ -43,7 +43,7 @@ OPS = frozenset(
         "forward",
         "step",
         "save",
-        "load-checkpoint",  # SFT resume; not in Cortex surface
+        "load-checkpoint",
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
