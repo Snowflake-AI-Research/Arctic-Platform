@@ -27,7 +27,8 @@ GatedDeltaNet layer the sequence-parallel wrapper adapts follows it. Its fused r
 weight instead of calling the norm, so with ``patches.liger`` only the first layer's input norm, of the decoder-layer
 and final norms, runs Liger's RMSNorm kernel. ``numerics.fp32_parity`` is supported here and maps to
 ``loader_options.fp32_parity``; it changes only the stock dense Qwen3.5 family and, with sequence parallelism, that
-beta gate.
+beta gate. With ``patches.zorro_train``, whose forward passes one tensor between decoder layers, it resolves to false
+and ``fp32_residual`` is refused.
 
 ``numerics.fp32_residual`` maps to ``loader_options.fp32_residual``, which is off by default, experimental, and
 accepted only with ``fp32_parity`` on. It keeps the residual stream of the patched dense forward in fp32 between

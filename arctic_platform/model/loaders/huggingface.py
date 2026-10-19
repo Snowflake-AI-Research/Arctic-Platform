@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -25,6 +27,8 @@ from transformers import AutoModelForCausalLM
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+
+logger = logging.getLogger(__name__)
 
 
 class HuggingfaceOptions(BaseModel):
@@ -44,7 +48,9 @@ class HuggingfaceOptions(BaseModel):
             " norm's weight, so with the liger patch, of the decoder-layer and final norms, only the first layer's"
             " input norm runs Liger's RMSNorm kernel. With sequence parallelism, the beta gate of every GatedDeltaNet"
             " layer the sequence-parallel wrapper adapts follows this option, in any model. False loads the stock"
-            " model unchanged and evaluates that beta gate in b's own dtype. Other models are unaffected."
+            " model unchanged and evaluates that beta gate in b's own dtype. Other models are unaffected. With the"
+            " zorro_train patch, whose forward passes one tensor from each decoder layer to the next, it resolves to"
+            " false."
         ),
     )
     fp32_residual: bool = Field(
@@ -54,8 +60,8 @@ class HuggingfaceOptions(BaseModel):
             " decoder layers, from the embeddings on, instead of rounding it to the dtype of the branch output after"
             " each fused add; the final norm still returns the hidden state in that dtype. Under full activation"
             " checkpointing the residual every decoder layer after the first holds at its boundary is then fp32"
-            " (4 bytes per hidden value instead of 2 for a bf16 model). Requires fp32_parity; other models are"
-            " unaffected."
+            " (4 bytes per hidden value instead of 2 for a bf16 model). Requires fp32_parity, and is refused with the"
+            " zorro_train patch; other models are unaffected."
         ),
     )
 
@@ -90,6 +96,28 @@ def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
     )
 
 
+def _resolve_fp32_parity(options: HuggingfaceOptions, *, zorro_train: bool) -> bool:
+    """The ``fp32_parity`` setting this load applies.
+
+    The fp32 parity decoder layers take and return ``(branch_output, residual)``, and only the parity text-model
+    forward carries that pair from layer to layer. The zorro_train patch replaces the text-model forward with its own
+    layer loop, which passes a single tensor, so the second patched layer would receive a tuple. Under zorro_train
+    ``fp32_parity`` therefore resolves to false, as before the option existed, and ``fp32_residual``, which needs it,
+    is refused before the weights load. ``ModelSpec`` stores the options with their defaults filled in, so an explicit
+    ``fp32_parity`` true cannot be told apart from the default here.
+    """
+    if not options.fp32_parity or not zorro_train:
+        return options.fp32_parity
+    if options.fp32_residual:
+        raise ValueError(
+            "huggingface loader option fp32_residual cannot be combined with the zorro_train patch: fp32_residual"
+            " needs fp32_parity, whose decoder layers pass (branch_output, residual), while the zorro_train forward"
+            " passes one tensor from each decoder layer to the next."
+        )
+    logger.info("zorro_train patch requested: the huggingface loader does not apply fp32_parity")
+    return False
+
+
 @register_loader("huggingface", default=True, options=HuggingfaceOptions)
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
@@ -103,7 +131,8 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         raise ValueError("huggingface sequence parallelism requires parallel_groups['sp_group']")
 
     options = HuggingfaceOptions.model_validate(ctx.spec.loader_options)
-    if options.fp32_parity and _is_local_qwen3_5_dense(str(ctx.spec.model_path_or_name)):
+    fp32_parity = _resolve_fp32_parity(options, zorro_train=ctx.spec.patches.zorro_train is not None)
+    if fp32_parity and _is_local_qwen3_5_dense(str(ctx.spec.model_path_or_name)):
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import check_stock_classes
 
         # Fail before the weights load when the installed transformers is not the one the patch is verified for.
@@ -113,7 +142,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         attn_implementation=ctx.spec.attn_implementation,
         dtype=ctx.spec.dtype,
     )
-    if options.fp32_parity:
+    if fp32_parity:
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
 
         apply_fp32_parity(
@@ -124,5 +153,5 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
             configure_transformers_sequence_parallel_model,
         )
 
-        configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
+        configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=fp32_parity)
     return LoadedModel(model=model)
