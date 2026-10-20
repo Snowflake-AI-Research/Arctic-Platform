@@ -202,14 +202,30 @@ def rms_norm_gated_fp32(
     """RMSNorm of ``x`` times ``weight`` times ``activation(gate)``, evaluated in fp32 and rounded once to ``x``'s dtype.
 
     This is vLLM's ``RMSNormGated`` with ``norm_before_gate=True``, the GatedDeltaNet output norm of the sampler. On
-    CUDA it runs fla's fused ``rms_norm_gated`` kernel, which computes the same way and has a fused backward; elsewhere
-    ``RMSNormGatedFp32``, which saves the same tensors for backward.
+    CUDA it runs fla's fused ``rms_norm_gated`` kernel, which computes the same way and has a fused backward. Under
+    torch.compile it runs the plain formula and the compiler builds the backward. Otherwise it runs
+    ``RMSNormGatedFp32``, which saves the same tensors for backward as fla's kernel.
     """
     if activation not in _GATE_ACTIVATIONS:
         raise ValueError(f"unsupported gate activation {activation!r}; expected one of {_GATE_ACTIVATIONS}")
     if _uses_fla_kernel(x):
         return fla_rms_norm_gated(x, gate, weight, None, activation, eps=eps)
+    if torch.compiler.is_compiling():
+        # RMSNormGatedFp32 compiled inside the sequence-parallel DSS trainer gave wrong gradients (2x in layers 0-34).
+        return _rms_norm_gated_formula(x, gate, weight, eps, activation)
     return RMSNormGatedFp32.apply(x, gate, weight, eps, activation)
+
+
+def _rms_norm_gated_formula(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float, activation: str
+) -> torch.Tensor:
+    compute_dtype = _compute_dtype(x)
+    hidden = x.to(compute_dtype)
+    hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + eps)
+    hidden = hidden * weight.to(compute_dtype)
+    gate = gate.to(compute_dtype)
+    activated = torch.sigmoid(gate) if activation == "sigmoid" else F.silu(gate)
+    return (hidden * activated).to(x.dtype)
 
 
 def _rms_norm_gated_once_forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

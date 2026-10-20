@@ -192,6 +192,25 @@ def test_compiled_norm_matches_eager_in_one_graph():
         torch.testing.assert_close(gradient, eager_gradient, rtol=1.6e-2, atol=1e-2)
 
 
+def test_compiled_norm_runs_the_plain_formula(monkeypatch):
+    def not_under_compile(*args):
+        raise AssertionError("RMSNormGatedFp32 must not run under torch.compile")
+
+    x, gate, weight = _bf16_inputs(rows=64)
+    for activation in ("silu", "sigmoid"):
+        torch_assert_equal(
+            vllm_rounding._rms_norm_gated_formula(x, gate, weight, 1e-6, activation),
+            _vllm_rms_norm_gated(x, gate, weight, 1e-6, activation),
+        )
+    monkeypatch.setattr(vllm_rounding.RMSNormGatedFp32, "forward", staticmethod(not_under_compile))
+    compiled = torch.compile(vllm_rounding.rms_norm_gated_fp32, fullgraph=True)
+    try:
+        compiled(x, gate, weight, 1e-6, "silu").float().sum().backward()
+    finally:
+        torch._dynamo.reset()
+    assert all(tensor.grad is not None for tensor in (x, gate, weight))
+
+
 def test_an_unsupported_gate_activation_is_refused():
     norm = _stock_norm(_QWEN4_EXP, "Qwen4ExpTextRMSNormGated", {"activation": "gelu"})
     with pytest.raises(RuntimeError, match="unsupported GatedDeltaNet output-norm gate activation 'gelu'"):
