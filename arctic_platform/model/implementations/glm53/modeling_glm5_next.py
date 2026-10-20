@@ -33,6 +33,7 @@ from .converting_glm5_next import convert_hf_layer_to_prime
 from .converting_glm5_next import convert_hf_to_prime
 from .converting_glm5_next import convert_prime_layer_to_hf
 from .converting_glm5_next import convert_prime_to_hf
+from .fused_norms import fuse_glm5_next_norms
 
 
 def _fp8_modules_to_skip(config) -> set[str]:
@@ -174,6 +175,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
+        fuse_glm5_next_norms(self)
         self._is_vlm = True
 
     @classmethod
