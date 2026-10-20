@@ -34,9 +34,11 @@ from transformers import Qwen3ForCausalLM
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.patches.peft import apply_peft_patch
 from arctic_platform.model.patches.peft import attach_unfused_expert_lora_factors
 from arctic_platform.model.patches.peft import cast_lora_adapters_off_fp8
@@ -299,6 +301,7 @@ def test_custom_moe_loaders_accept_peft(loader):
         loader=loader,
         patches=Patches(peft={"peft_type": "Lora"}),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.patches.peft == {"peft_type": "Lora"}
 
 

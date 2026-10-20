@@ -49,10 +49,12 @@ from arctic_platform.model.loader import canonical_parameter_name
 from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_model_spec
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
+from arctic_platform.model.platform import PlatformCapabilities
 from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
@@ -110,6 +112,7 @@ __all__ = [
     "model_parallelism_metadata_from_config",
     "ParallelismConfig",
     "Patches",
+    "PlatformCapabilities",
     "pretrained_config_of",
     "pretrained_module_for_hf_save",
     "read_checkpoint_weight_names",
@@ -125,6 +128,7 @@ __all__ = [
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
+    "resolve_model_spec",
     "ROUTER_REPLAY_FRESH",
     "save_exported_state_dict",
     "select_loader",
