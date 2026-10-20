@@ -179,3 +179,6 @@ recipes/*.json
 
 # Semi-persistence onboarding reports and job ledgers, written under the cwd.
 onboarding_reports/
+
+# Generated correctness reference records remain local.
+/arctic_platform/correctness/reference_data/
