@@ -26,7 +26,6 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.implementations.debug.config import RouterStatsStrides
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
@@ -35,8 +34,8 @@ from arctic_platform.model.loader import register_loader
 # Declarative options owned by the qwen3_5_moe loader.
 
 
-class DebugModelOptions(RouterStatsStrides):
-    """Loader debug options; includes ``RouterStatsStrides`` so training debug keys are not rejected."""
+class DebugModelOptions(BaseModel):
+    """Loader debug options (provider ``DebugModelConfig`` fields only)."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 

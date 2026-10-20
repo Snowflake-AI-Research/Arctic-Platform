@@ -28,7 +28,6 @@ from .model_builder import (
     get_model,
     load_dcp_from_hf,
 )
-from arctic_platform.model.implementations.debug.config import ROUTER_STATS_STRIDE_FIELDS
 from arctic_platform.model.implementations.moe.deepspeed_integration import (
     MoEDeepSpeedAdapter,
     apply_ep_with_mesh as _apply_ep_with_mesh,
@@ -243,13 +242,7 @@ def _build_model_config(
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
         fp32_parity=options.fp32_parity,
-        debug=(
-            DebugModelConfig(
-                **options.debug.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS)
-            )
-            if options.debug is not None
-            else DebugModelConfig()
-        ),
+        debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 
 

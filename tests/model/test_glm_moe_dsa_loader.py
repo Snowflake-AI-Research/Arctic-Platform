@@ -172,8 +172,6 @@ def test_runtime_config_is_derived_from_validated_options():
         debug={
             "num_layers": 6,
             "random_init": True,
-            "router_stats_sample_stride": 8,
-            "router_stats_call_stride": 2,
         },
     )
     config = _build_model_config(
@@ -195,8 +193,6 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac is options.ac_config
     assert config.debug.num_layers == 6
     assert config.debug.random_init is True
-    assert not hasattr(config.debug, "router_stats_sample_stride")
-    assert not hasattr(config.debug, "router_stats_call_stride")
 
 
 class TestStandaloneImports(TestCasePlus):

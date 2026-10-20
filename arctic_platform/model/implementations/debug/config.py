@@ -23,24 +23,19 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import StrictInt
-from pydantic import ValidationError
 
 
 class RouterStatsStrides(BaseModel):
     """Validated token/call strides for per-step router health statistics.
 
-    Composed into MoE loader debug options so ``extra="forbid"`` accepts the same keys.
-    These fields are training-callback config only; exclude them when building provider
-    ``DebugModelConfig`` dataclasses via ``model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS)``.
+    Training-callback config only (``training_config.debug``). Not loader options:
+    DSS filters these keys before building ``ModelSpec``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     router_stats_sample_stride: StrictInt = Field(0, ge=0)
     router_stats_call_stride: StrictInt = Field(1, ge=1)
-
-
-ROUTER_STATS_STRIDE_FIELDS = frozenset(RouterStatsStrides.model_fields)
 
 
 def training_debug_config(training_config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -69,15 +64,12 @@ def router_stats_strides(training_config: Mapping[str, Any]) -> tuple[int, int]:
     integers. Forward-only calls are included in the totals reported at the next optimizer step.
     """
     debug = training_debug_config(training_config)
-    try:
-        opts = RouterStatsStrides.model_validate(
-            {
-                "router_stats_sample_stride": debug.get("router_stats_sample_stride", 0),
-                "router_stats_call_stride": debug.get("router_stats_call_stride", 1),
-            }
-        )
-    except ValidationError as exc:
-        raise TypeError(str(exc)) from exc
+    opts = RouterStatsStrides.model_validate(
+        {
+            "router_stats_sample_stride": debug.get("router_stats_sample_stride", 0),
+            "router_stats_call_stride": debug.get("router_stats_call_stride", 1),
+        }
+    )
     return opts.router_stats_sample_stride, opts.router_stats_call_stride
 
 

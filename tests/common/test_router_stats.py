@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import merge_metrics
@@ -30,6 +31,7 @@ from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopK
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaDebugOptions
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
 from arctic_platform.model.router_stats import RouterStatsCallback
+from arctic_platform.model.router_stats import RouterStatsStrides
 
 EXPERTS, TOP_K, DIM = 4, 2, 8
 
@@ -252,10 +254,11 @@ def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
         {"debug": {"router_stats_sample_stride": True}},
         {"debug": {"router_stats_sample_stride": "3"}},
         {"debug": {"router_stats_call_stride": 2.7}},
+        {"debug": {"router_stats_call_stride": 0}},
     ],
 )
-def test_strides_reject_values_that_are_not_ints(config):
-    with pytest.raises(TypeError):
+def test_strides_reject_invalid_values_with_validation_error(config):
+    with pytest.raises(ValidationError):
         router_stats_strides(config)
 
 
@@ -265,11 +268,14 @@ def test_post_step_logs_even_an_all_zero_report():
     assert "router_stats" in callback.pending, "report() returns per-router zeros, which is still truthy"
 
 
-def test_public_facade_exports_the_callback():
+def test_public_facade_exports_the_callback_and_stride_schema():
     from arctic_platform.model import router_stats as facade
+    from arctic_platform.model.implementations.debug import config as debug_config
     from arctic_platform.model.implementations.moe import router_stats as impl
 
     assert facade.RouterStatsCallback is impl.RouterStatsCallback
+    assert facade.RouterStatsStrides is debug_config.RouterStatsStrides
+    assert RouterStatsStrides is facade.RouterStatsStrides
 
 
 def test_public_recompute_facade_shares_one_idempotent_detector():
@@ -291,32 +297,9 @@ def test_public_recompute_facade_shares_one_idempotent_detector():
     assert facade.in_recompute() is False
 
 
-def test_loader_debug_options_accept_router_stats_strides():
-    assert DebugModelOptions(router_stats_sample_stride=4, router_stats_call_stride=2).router_stats_sample_stride == 4
-    assert GlmMoeDsaDebugOptions(router_stats_sample_stride=8).router_stats_call_stride == 1
-    with pytest.raises(Exception):
-        DebugModelOptions(router_stats_sample_stride=True)
-    with pytest.raises(Exception):
-        GlmMoeDsaDebugOptions(router_stats_call_stride=0)
-
-
-def test_provider_debug_model_config_excludes_router_stats_strides():
-    """Training-only strides must not be splat into provider DebugModelConfig dataclasses."""
-    from dataclasses import fields
-
-    from arctic_platform.model.implementations.debug.config import ROUTER_STATS_STRIDE_FIELDS
-    from arctic_platform.model.implementations.glm52.config import DebugModelConfig as GlmDebug
-    from arctic_platform.model.implementations.qwen35.config import DebugModelConfig as QwenDebug
-
-    qwen = DebugModelOptions(num_layers=2, router_stats_sample_stride=4, router_stats_call_stride=2)
-    glm = GlmMoeDsaDebugOptions(num_layers=3, router_stats_sample_stride=8, router_stats_call_stride=2)
-
-    assert set(qwen.model_dump()) - ROUTER_STATS_STRIDE_FIELDS == {f.name for f in fields(QwenDebug)}
-    assert set(glm.model_dump()) - ROUTER_STATS_STRIDE_FIELDS == {f.name for f in fields(GlmDebug)}
-
-    QwenDebug(**qwen.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS))
-    GlmDebug(**glm.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS))
-    with pytest.raises(TypeError, match="router_stats_sample_stride"):
-        QwenDebug(**qwen.model_dump())
-    with pytest.raises(TypeError, match="router_stats_sample_stride"):
-        GlmDebug(**glm.model_dump())
+def test_loader_debug_options_reject_router_stats_strides():
+    """Training-only strides are not loader options; DSS filters them before ModelSpec."""
+    with pytest.raises(ValidationError, match="router_stats_sample_stride"):
+        DebugModelOptions(router_stats_sample_stride=4)
+    with pytest.raises(ValidationError, match="router_stats_call_stride"):
+        GlmMoeDsaDebugOptions(router_stats_call_stride=2)

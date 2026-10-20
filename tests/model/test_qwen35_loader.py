@@ -162,13 +162,9 @@ def test_runtime_config_is_derived_from_validated_options():
                 "pin_memory_max_size_gib": 0,
             },
         },
-        # Strides are training-callback-only; they must validate on loader options but not
-        # leak into the provider DebugModelConfig dataclass.
         debug={
             "num_layers": 4,
             "random_init": True,
-            "router_stats_sample_stride": 8,
-            "router_stats_call_stride": 2,
         },
     )
     config = _build_model_config(
@@ -191,8 +187,6 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac.offload_config.keep_last_n == 3
     assert config.debug.num_layers == 4
     assert config.debug.random_init is True
-    assert not hasattr(config.debug, "router_stats_sample_stride")
-    assert not hasattr(config.debug, "router_stats_call_stride")
 
 
 def test_legacy_qwen_types_are_shared():

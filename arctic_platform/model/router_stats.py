@@ -20,6 +20,7 @@ DSS and other clients must import from here rather than
 
 from __future__ import annotations
 
+from arctic_platform.model.implementations.debug.config import RouterStatsStrides
 from arctic_platform.model.implementations.moe.router_stats import RouterStatsCallback
 
-__all__ = ["RouterStatsCallback"]
+__all__ = ["RouterStatsCallback", "RouterStatsStrides"]
