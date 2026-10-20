@@ -50,9 +50,20 @@ git checkout per in-flight rollout. That checkout is the sandbox.
 
 ## Data
 
-Copy `train.parquet` and `validation.parquet` from CodeScout
-[`data/swe_smith`](https://github.com/18jeffreyma/codescout/tree/abab719e08a55dde78c6da864cd24d84fd47bdf2)
-at `abab719` to `~/data/swe-smith-localization`, or set `DATA_DIR`.
+The tasks are the SWE-smith split from CodeScout
+([`data/swe_smith`](https://github.com/18jeffreyma/codescout/tree/abab719e08a55dde78c6da864cd24d84fd47bdf2/data/swe_smith)
+at `abab719`): 39,187 training and 100 validation instances. Download them to
+the default location:
+
+```bash
+mkdir -p ~/data/swe-smith-localization
+for split in train validation; do
+  curl -fL -o ~/data/swe-smith-localization/$split.parquet \
+    https://raw.githubusercontent.com/18jeffreyma/codescout/abab719e08a55dde78c6da864cd24d84fd47bdf2/data/swe_smith/$split.parquet
+done
+```
+
+To keep them elsewhere, set `DATA_DIR` to that directory.
 
 Rows need `instance_id`, `repo`, `base_commit`, `problem_statement`, `patch`,
 `use_patch`, `file_changes`, and `prompt`.
