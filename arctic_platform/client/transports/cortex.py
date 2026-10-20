@@ -348,6 +348,7 @@ _ROUTES = {
     "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
+    "get-experiment-run": _Route(method="GET", path="/{job}/experiment-run", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
     "capacity": _Route(method="GET", path="/capacity", encode=_query, policy=_QUICK_READ, normalize=_capacity_result),
     "list-checkpoints": _Route(

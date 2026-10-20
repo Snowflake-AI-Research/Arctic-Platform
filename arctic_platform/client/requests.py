@@ -41,6 +41,10 @@ def get_job_request(job_id: JobId) -> Request:
     return Request("get-job", job_id)
 
 
+def get_experiment_run_request(job_id: JobId) -> Request:
+    return Request("get-experiment-run", job_id)
+
+
 def cancel_job_request(job_id: JobId) -> Request:
     return Request("cancel-job", job_id)
 

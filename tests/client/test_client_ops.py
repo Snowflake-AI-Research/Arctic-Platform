@@ -371,6 +371,10 @@ class TestClusterRequestBuilders:
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
@@ -402,6 +406,7 @@ class TestClusterRequestBuilders:
         requests = (
             cluster_requests.list_jobs_request(),
             cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
             cluster_requests.cancel_job_request("job"),
             cluster_requests.capacity_request(),
             cluster_requests.list_checkpoints_request("job"),

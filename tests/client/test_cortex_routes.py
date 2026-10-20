@@ -74,6 +74,12 @@ class TestClusterRoutes:
         [
             (client_requests.list_jobs_request("running"), "GET", "", cortex_module._DEFAULT),
             (client_requests.get_job_request(TRAINING), "GET", f"/{JOB}", cortex_module._DEFAULT),
+            (
+                client_requests.get_experiment_run_request(TRAINING),
+                "GET",
+                f"/{JOB}/experiment-run",
+                cortex_module._DEFAULT,
+            ),
             (client_requests.cancel_job_request(JOB), "POST", f"/{JOB}:cancel", cortex_module._DEFAULT),
             (client_requests.capacity_request("H200"), "GET", "/capacity", cortex_module._QUICK_READ),
             (client_requests.list_checkpoints_request(TRAINING), "GET", f"/{JOB}/checkpoints", cortex_module._DEFAULT),

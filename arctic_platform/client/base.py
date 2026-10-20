@@ -54,6 +54,7 @@ from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
 from arctic_platform.client.requests import generate_stream_request
+from arctic_platform.client.requests import get_experiment_run_request
 from arctic_platform.client.requests import get_job_request
 from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.requests import list_jobs_request
@@ -200,6 +201,9 @@ class ArcticClient(_ArcticClientCore):
 
     def get_job(self) -> dict:
         return self._call(get_job_request(self.jobs.require_any()))
+
+    def get_experiment_run(self) -> dict[str, str]:
+        return self._call(get_experiment_run_request(self.jobs.require_any()))
 
     def list_checkpoints(self) -> list[dict]:
         return self._call(list_checkpoints_request(self.jobs.require("training")))
@@ -417,6 +421,9 @@ class AsyncArcticClient(_ArcticClientCore):
 
     async def get_job(self) -> dict:
         return await self._acall(get_job_request(self.jobs.require_any()))
+
+    async def get_experiment_run(self) -> dict[str, str]:
+        return await self._acall(get_experiment_run_request(self.jobs.require_any()))
 
     async def list_checkpoints(self) -> list[dict]:
         return await self._acall(list_checkpoints_request(self.jobs.require("training")))
