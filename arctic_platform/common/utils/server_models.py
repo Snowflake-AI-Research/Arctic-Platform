@@ -188,6 +188,10 @@ def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=
     if isinstance(zorro, dict) and zorro.get("enable"):
         if "use_fca" in fields:
             out["use_fca"] = True
+        # In-tree ModelConfig names the engine kwarg directly. '{}' is the
+        # vLLM 0.31 forest-cascade default; the plugin installs the backend.
+        if "forest_cascade_attn_configs" in fields:
+            out["forest_cascade_attn_configs"] = "{}"
 
     spec = arctic_inference_config.get("speculative_decoding")
     if isinstance(spec, dict):
