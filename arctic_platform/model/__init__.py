@@ -57,11 +57,15 @@ from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
 from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
+from arctic_platform.model.weight_export import hf_checkpoint_name_map
 from arctic_platform.model.weight_export import hf_export_parameter_name
+from arctic_platform.model.weight_export import hf_sync_name_map
 from arctic_platform.model.weight_export import iter_lora_weights
 from arctic_platform.model.weight_export import iter_model_weights
 from arctic_platform.model.weight_export import pretrained_config_of
 from arctic_platform.model.weight_export import pretrained_module_for_hf_save
+from arctic_platform.model.weight_export import read_checkpoint_weight_names
+from arctic_platform.model.weight_export import requires_hf_weight_sync
 from arctic_platform.model.weight_export import save_exported_state_dict
 from arctic_platform.model.weight_export import save_hf_pretrained
 from arctic_platform.model.weight_export import save_peft_adapters
@@ -89,7 +93,9 @@ __all__ = [
     "gather_peft_adapter_state_dict",
     "get_language_model",
     "get_vision_encoder",
+    "hf_checkpoint_name_map",
     "hf_export_parameter_name",
+    "hf_sync_name_map",
     "iter_lora_weights",
     "iter_model_weights",
     "keeps_fp32",
@@ -106,6 +112,8 @@ __all__ = [
     "Patches",
     "pretrained_config_of",
     "pretrained_module_for_hf_save",
+    "read_checkpoint_weight_names",
+    "requires_hf_weight_sync",
     "save_hf_pretrained",
     "save_peft_adapters",
     "supports_weight_format",
