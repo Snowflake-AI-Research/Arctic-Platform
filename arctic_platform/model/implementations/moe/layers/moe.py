@@ -366,6 +366,33 @@ class GroupedExperts(nn.Module):
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
 
+    @staticmethod
+    def _grouped_lora_fn(
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        ab: dict,
+        deltas: tuple[torch.Tensor | None, ...],
+    ):
+        """Expert LoRA for tokens packed by expert: two grouped GEMMs per projection on CUDA.
+
+        The routed-token count is read once for all three projections. Fused PEFT deltas
+        and CPU tensors keep the per-expert path.
+        """
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora
+
+        if not ab or not x.is_cuda or any(d is not None for d in deltas):
+            return lambda inputs, name, delta: _packed_expert_linear(inputs, delta, num_tokens_per_expert, ab.get(name))
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        _offsets_must_cover_no_more_than_the_rows("fp8 lora", x, num_tokens_per_expert, offsets)
+        rows = int(offsets[-1])
+
+        def lora(inputs: torch.Tensor, name: str, delta: torch.Tensor | None):
+            if name not in ab:
+                return 0
+            return grouped_expert_lora(inputs, ab[name], offsets, rows)
+
+        return lora
+
     def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -384,16 +411,11 @@ class GroupedExperts(nn.Module):
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm:
-                gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
-                    x, d1, num_tokens_per_expert, ab.get("w1")
-                )
-                up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
-                    x, d3, num_tokens_per_expert, ab.get("w3")
-                )
+                lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
+                gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
+                up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w3", d3)
                 h = _apply_swiglu(gate, up, self.swiglu_limit)
-                return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + (
-                    _packed_expert_linear(h, d2, num_tokens_per_expert, ab.get("w2"))
-                )
+                return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + lora(h, "w2", d2)
             counts = num_tokens_per_expert.tolist()
             n_pad = x.shape[0] - sum(counts)
             splits = torch.split(x[: sum(counts)], counts, dim=0)
