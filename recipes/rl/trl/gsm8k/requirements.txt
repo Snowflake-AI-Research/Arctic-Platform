@@ -8,5 +8,6 @@ accelerate
 arctic-platform[rl]
 datasets
 kernels>=0.16.0,<0.17.0
+math-verify
 openai>=2.54.0
 wandb
