@@ -981,13 +981,9 @@ class ArcticRLRayServer:
             mode = "all"
         workers = self.training_workers
         if mode == "non_lp":
-            results = await self._gather_training_refs(
-                lambda: [w.offload_non_lp_states.remote() for w in workers]
-            )
+            results = await self._gather_training_refs(lambda: [w.offload_non_lp_states.remote() for w in workers])
         elif mode == "lp_params":
-            results = await self._gather_training_refs(
-                lambda: [w.offload_lp_params.remote() for w in workers]
-            )
+            results = await self._gather_training_refs(lambda: [w.offload_lp_params.remote() for w in workers])
         else:
             results = await self._gather_training_refs(lambda: [w.offload_to_cpu.remote() for w in workers])
         logger.info("Offload training (mode=%s): %s", mode, results)
@@ -1171,13 +1167,9 @@ class ArcticRLRayServer:
         self._verify_job(training_job_id, "training")
         self._verify_job(sampling_job_id, "sampling")
         async with self._training_op_lock:
-            training = (
-                await self._await_training_refs(lambda: [self.training_workers[0].weight_norm.remote()])
-            )[0]
+            training = (await self._await_training_refs(lambda: [self.training_workers[0].weight_norm.remote()]))[0]
             sampling = (
-                await self._await_training_refs(
-                    lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()]
-                )
+                await self._await_training_refs(lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()])
             )[0]
         return {
             "training_norm": training["norm"],
@@ -1231,9 +1223,7 @@ class ArcticRLRayServer:
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
-            max_param = (
-                await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()])
-            )[0]
+            max_param = (await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()]))[0]
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
