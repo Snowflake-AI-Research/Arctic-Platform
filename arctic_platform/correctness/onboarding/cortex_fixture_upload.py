@@ -21,11 +21,11 @@ import json
 import subprocess
 from pathlib import Path
 
-from ..harness.cortex_fixture import MANIFEST
-from ..harness.cortex_fixture import describe_fixture
-from ..harness.cortex_fixture import prepare_fixture
-from ..harness.cortex_fixture import validate_publication
-from ..harness.spec import TestSpec
+from ..harness.config import TestSpec
+from ..harness.cortex import MANIFEST
+from ..harness.cortex import describe_fixture
+from ..harness.cortex import prepare_fixture
+from ..harness.cortex import validate_publication
 
 
 def publish_fixture(

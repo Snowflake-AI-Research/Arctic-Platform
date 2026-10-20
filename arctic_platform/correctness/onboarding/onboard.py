@@ -29,8 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from pathlib import Path
 
-from arctic_platform.correctness.harness.workdir import correctness_workdir
-from arctic_platform.correctness.harness.workdir import require_data_fast_path
+from arctic_platform.correctness.harness.storage import correctness_workdir
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 # Sixteen reference executions over an eight-GPU node: two waves, so more samples cost the same wall
 # clock as two sequential runs.
@@ -195,9 +195,9 @@ def _probe_worker(args: argparse.Namespace) -> int:
     import torch
     from transformers import AutoConfig
 
+    from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.seeds import SEED
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.reference.hf_single_gpu import run as run_reference
 
@@ -276,12 +276,12 @@ def build_spec(
 
     from transformers import AutoConfig
 
-    from arctic_platform.correctness.harness.arms import correctness_microbatch_tokens
+    from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.batches import build_batch
+    from arctic_platform.correctness.harness.config import ArmSpec
+    from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
-    from arctic_platform.correctness.harness.seeds import SEED
-    from arctic_platform.correctness.harness.spec import ArmSpec
-    from arctic_platform.correctness.harness.spec import TestSpec
+    from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
@@ -340,7 +340,7 @@ def build_spec(
 
 
 def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dict | None) -> None:
-    from arctic_platform.correctness.harness.arms import arms_for
+    from arctic_platform.correctness.harness.config import arms_for
     from arctic_platform.correctness.harness.config import load_config
 
     config = load_config(args.config)
@@ -415,15 +415,15 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from transformers import AutoConfig
 
     from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
+    from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.batches import save
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.runner import materialize_dss_peft_adapter
     from arctic_platform.correctness.harness.runner import run_reference
-    from arctic_platform.correctness.harness.seeds import SEED
-    from arctic_platform.correctness.harness.spec import TestSpec
-    from arctic_platform.correctness.harness.spec import TestTolerance
 
     config = load_config(args.config)
     spec = TestSpec.read(args.test_spec)
@@ -697,9 +697,9 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
     from arctic_platform.correctness.checks.checkpoint_resume import TEST_ID
     from arctic_platform.correctness.checks.checkpoint_resume import loss_range_gate
     from arctic_platform.correctness.checks.checkpoint_resume import measure_undeterministic_loss_range
-    from arctic_platform.correctness.harness.arms import arms_for
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import arms_for
     from arctic_platform.correctness.harness.config import config_checksum
-    from arctic_platform.correctness.harness.spec import TestSpec
 
     test_id = args.test_id
     if test_id != TEST_ID:
@@ -789,9 +789,9 @@ def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
     so no model is materialized and nothing is written to ``test_settings``. What remains is to run the
     check the way regression will run it and, on a pass, list it in ``applicable_tests``.
     """
+    from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.registry import registered_tests
-    from arctic_platform.correctness.harness.spec import TestSpec
 
     test_id = args.test_id
     entry = registered_tests()[test_id]
@@ -870,7 +870,7 @@ def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
 
 def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
     """Add Test 2 with its own reduced reference while preserving Test 1 and its materialized cases."""
-    from arctic_platform.correctness.harness.spec import TestSpec
+    from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
 
     if not args.test_spec.exists():
@@ -945,7 +945,7 @@ def _parent(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import validate_against_host
     from arctic_platform.correctness.harness.dss_driver import available_gpus
-    from arctic_platform.correctness.harness.preflight import ensure_no_interrupted_builds
+    from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
 
     config = load_config(args.config)
     if config.is_rl:
@@ -963,9 +963,9 @@ def _parent(args: argparse.Namespace) -> int:
     args.source_checkpoint = _select_source_checkpoint(args.source_checkpoint, config)
     validate_against_host(config, available_gpus())
     ensure_no_interrupted_builds()
-    from arctic_platform.correctness.harness.arms import GAS1_TOKEN_CAP
-    from arctic_platform.correctness.harness.arms import correctness_microbatch_tokens
-    from arctic_platform.correctness.harness.arms import max_sequence_tokens
+    from arctic_platform.correctness.harness.config import GAS1_TOKEN_CAP
+    from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
+    from arctic_platform.correctness.harness.config import max_sequence_tokens
 
     requested_tokens = config.max_seq_len if args.tokens is None else min(args.tokens, config.max_seq_len)
     args.tokens = max_sequence_tokens(requested_tokens, config.n_gpus)
@@ -1103,13 +1103,13 @@ def _prepare_references(args: argparse.Namespace) -> int:
     from transformers import AutoConfig
 
     from arctic_platform.client import CortexConfig
-    from arctic_platform.correctness.harness.arms import ArmDefinition
+    from arctic_platform.correctness.harness.config import ArmDefinition
+    from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.reference_records import CRITERIA
     from arctic_platform.correctness.harness.reference_records import require_git_records_dir
     from arctic_platform.correctness.harness.runner import execute
-    from arctic_platform.correctness.harness.spec import TestSpec
 
     selection = args.reference_tests or [args.test_id]
     if any(test_id not in CRITERIA for test_id in selection):

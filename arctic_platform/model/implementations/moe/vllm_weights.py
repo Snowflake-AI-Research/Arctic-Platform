@@ -2,28 +2,33 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import torch
 import torch.nn as nn
 
-
-def named_weight_sync_tensors(model: nn.Module):
-    yield from model.named_parameters()
-    persistent_buffer_names = (
+_WEIGHT_SYNC_BUFFER_NAMES = frozenset(
+    {
         "layer_multipliers",
         "ngram_heads_vocab_sizes",
         "ngram_heads_offsets",
-    )
-    modules = dict(model.named_modules())
+    }
+)
+
+
+def named_weight_sync_tensors(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield parameters, expert biases and supported persistent model buffers."""
+    yield from model.named_parameters()
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
-        else:
-            module_name, _, buffer_name = name.rpartition(".")
-            if (
-                buffer_name in persistent_buffer_names
-                and buffer_name not in modules[module_name]._non_persistent_buffers_set
-            ):
-                yield name, buffer
+            continue
+        module_name, _, buffer_name = name.rpartition(".")
+        if buffer_name not in _WEIGHT_SYNC_BUFFER_NAMES:
+            continue
+        owning_module = model.get_submodule(module_name)
+        if buffer_name not in owning_module._non_persistent_buffers_set:
+            yield name, buffer
 
 
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:

@@ -28,16 +28,16 @@ from urllib.parse import urlsplit
 
 from arctic_platform.client import CortexConfig
 
+from .batches import SEED
 from .config import LoadedConfig
 from .cortex import CorrectnessClient as ArcticClient
 from .dss_driver import GatewaySession
 from .dss_driver import _training_client_config
 from .dss_driver import build_payload
 from .dss_driver import cortex_training_body
-from .seeds import SEED
+from .storage import correctness_workdir
+from .storage import require_data_fast_path
 from .transport import Checkpoint
-from .workdir import correctness_workdir
-from .workdir import require_data_fast_path
 
 _STAGE_CHECKPOINT_ID = re.compile(r"/checkpoints/(cp_[0-9a-fA-F-]+)/")
 _LOCAL_CHECKPOINT_TAG = re.compile(r"global_step(0|[1-9][0-9]*)")

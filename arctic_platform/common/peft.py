@@ -18,11 +18,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform.debug.lora import maybe_normalize_lora_initialization
+
 PEFT_LORA_DEFAULT_R = 8
 PEFT_LORA_DEFAULT_ALPHA = 8
 PEFT_LORA_DEFAULT_DROPOUT = 0.0
 PEFT_LORA_DEFAULT_BIAS = "none"
-DETERMINISTIC_LORA_RECIPE = "arctic-correctness-lora-init-v1"
 SUPPORTED_LORA_PEFT_CONFIG_KEYS = frozenset(
     {
         "peft_type",
@@ -36,20 +37,6 @@ SUPPORTED_LORA_PEFT_CONFIG_KEYS = frozenset(
         "deterministic_init",
     }
 )
-
-
-def normalize_lora_initialization(value: Any, *, location: str = "peft_config.deterministic_init") -> dict:
-    """Validate the opt-in, name-seeded CPU initializer without training imports."""
-    if not isinstance(value, dict) or set(value) != {"recipe_version", "global_seed", "dtype"}:
-        raise ValueError(f"{location} requires exactly recipe_version, global_seed, and dtype")
-    if value["recipe_version"] != DETERMINISTIC_LORA_RECIPE:
-        raise ValueError(f"{location}.recipe_version is unsupported")
-    seed = value["global_seed"]
-    if type(seed) is not int or not 0 <= seed < 2**63:
-        raise ValueError(f"{location}.global_seed must be an integer in [0, 2**63)")
-    if not isinstance(value["dtype"], str) or value["dtype"] not in {"float32", "float16", "bfloat16"}:
-        raise ValueError(f"{location}.dtype must be float32, float16, or bfloat16")
-    return dict(value)
 
 
 def normalize_lora_peft_config(
@@ -123,10 +110,4 @@ def normalize_lora_peft_config(
         "target_modules": target_modules,
         "target_parameters": target_parameters,
     }
-    if "deterministic_init" in peft_config:
-        if target_parameters:
-            raise ValueError(f"{location}.deterministic_init supports dense target_modules only")
-        result["deterministic_init"] = normalize_lora_initialization(
-            peft_config["deterministic_init"], location=f"{location}.deterministic_init"
-        )
-    return result
+    return maybe_normalize_lora_initialization(peft_config, result, location=location)

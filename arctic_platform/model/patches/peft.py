@@ -22,6 +22,9 @@ import torch
 from torch import nn
 
 from arctic_platform.common.config import validate_peft_config
+from arctic_platform.debug.lora import maybe_initialize_lora_factors
+from arctic_platform.debug.lora import maybe_prepare_lora_initialization
+from arctic_platform.debug.lora import maybe_validate_lora_parallelism
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 
@@ -153,19 +156,7 @@ def apply_peft(
     if peft_config is None:
         return model
 
-    initialization = None
-    if "deterministic_init" in peft_config:
-        from arctic_platform.common.peft import normalize_lora_initialization
-        from arctic_platform.common.peft import normalize_lora_peft_config
-
-        topology = dict(peft_config)
-        initialization = normalize_lora_initialization(topology.pop("deterministic_init"))
-        # The public DSS spelling is Lora; direct AP callers may use PEFT's LORA.
-        topology["peft_type"] = "Lora" if topology.get("peft_type") == "LORA" else topology.get("peft_type")
-        normalize_lora_peft_config({**topology, "deterministic_init": initialization})
-        if getattr(getattr(model, "config", None), "model_type", None) != "qwen3":
-            raise ValueError("deterministic LoRA initialization currently supports dense Qwen3 only")
-        peft_config = {key: value for key, value in peft_config.items() if key != "deterministic_init"}
+    peft_config, initialization_config = maybe_prepare_lora_initialization(model, peft_config)
 
     import peft
 
@@ -175,10 +166,7 @@ def apply_peft(
         cast_trainable_params_off_fp8(model, optimization_dtype)
     else:
         model = peft.get_peft_model(model, config)
-    if initialization is not None:
-        from arctic_platform.model.lora_initialization import initialize_lora_factors
-
-        initialize_lora_factors(model, initialization)
+    maybe_initialize_lora_factors(model, initialization_config)
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     from arctic_platform.model.patches.tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
@@ -189,13 +177,11 @@ def apply_peft(
 
 @register_patch("peft")
 def apply_peft_patch(model: nn.Module, ctx: LoaderContext) -> nn.Module:
-    if (ctx.spec.patches.peft or {}).get("deterministic_init") is not None:
-        if ctx.spec.parallelism.expert_parallel != 1 or ctx.spec.parallelism.sequence_parallel != 1:
-            raise ValueError("deterministic LoRA initialization currently requires dense EP1/SP1")
+    peft_config = ctx.spec.patches.peft or {}
+    maybe_validate_lora_parallelism(peft_config, ctx.spec.parallelism)
     dtype = torch.bfloat16 if ctx.spec.dtype == "auto" else getattr(torch, ctx.spec.dtype)
     fp8_base = model_has_fp8_weights(model)
     wrapped = apply_peft(model, ctx.spec.patches.peft, optimization_dtype=dtype)
-    peft_config = ctx.spec.patches.peft or {}
     if fp8_base and peft_config.get("target_parameters"):
         install_unfused_expert_lora_activation()
         attached = attach_unfused_expert_lora_factors(wrapped)

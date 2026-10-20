@@ -56,9 +56,10 @@ from typing import Sequence
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 
-from ..harness import gsm8k
-from ..harness.arms import correctness_microbatch_tokens
+from ..harness import sft as gsm8k
+from ..harness.batches import SEED
 from ..harness.batches import Batch
+from ..harness.config import correctness_microbatch_tokens
 from ..harness.cortex import CorrectnessClient
 from ..harness.cortex import CortexTrainingConfig
 from ..harness.dss_driver import UnsafeCleanupError
@@ -81,7 +82,6 @@ from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.seeds import SEED
 from ..harness.sft import TRAIN_SPLIT
 from ..harness.sft import VALIDATION_SPLIT
 from ..harness.sft import _assert_answer_span
@@ -89,8 +89,8 @@ from ..harness.sft import configured_learning_rate
 from ..harness.sft import configured_rows_per_step
 from ..harness.sft import cross_entropy
 from ..harness.sft import reference_answer_logprobs
-from ..harness.workdir import correctness_workdir
-from ..harness.workdir import require_data_fast_path
+from ..harness.storage import correctness_workdir
+from ..harness.storage import require_data_fast_path
 
 TEST_ID = "inference-checkpoint-loss"
 

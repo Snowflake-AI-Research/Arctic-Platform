@@ -13,20 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Intake for an operator-supplied Arctic Platform job config.
 
-The config arrives already sized for one node, so this validates and refuses rather than reshaping. A config
-that does not fit produces one message naming the constraint it missed.
-"""
+"Reviewed model configurations, test specifications, and placement arms."
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from decimal import ROUND_CEILING
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from typing import Dict
@@ -34,6 +35,155 @@ from typing import List
 from typing import Optional
 
 from arctic_platform.client.config import ArcticClientConfig
+
+
+@dataclass
+class ArmSpec:
+    """One global batch size, with the shape onboarding measured for it."""
+
+    name: str
+    global_batch_size: int
+    max_seq_len: int
+    total_tokens: int
+    active_tokens: int
+    dss_microbatches: int
+    pad_fraction: float
+
+    @property
+    def exercises_accumulation(self) -> bool:
+        return self.dss_microbatches > 1
+
+
+@dataclass
+class ModelSpec:
+    """The synthetic model recipe. Regenerable from the seed, so the path is a cache and not an input."""
+
+    source_checkpoint: str
+    num_hidden_layers: int
+    vision_depth: int
+    seed: int
+    param_count: int
+    cache_path: str
+    content_hash: str
+    sized_against_gib: float
+    measured_reference_peak_gib: Optional[float] = None
+
+
+@dataclass
+class TestTolerance:
+    """A frozen regression gate and the reference measurement that selected it."""
+
+    absolute: float
+    calibration_runs: Optional[int] = None
+    raw_max_same_tensor_range: Optional[float] = None
+    multiplier: Optional[float] = None
+    computed_gate: Optional[float] = None
+    rounding_quantum: float = 1e-3
+    minimum_gate: float = 1e-3
+    worst_tensor: Optional[str] = None
+    status: str = "uncalibrated"
+
+    def __post_init__(self) -> None:
+        if self.absolute <= 0:
+            raise ValueError(f"test tolerance must be positive, got {self.absolute}")
+        if self.rounding_quantum <= 0 or self.minimum_gate <= 0:
+            raise ValueError("test tolerance rounding quantum and minimum gate must be positive")
+        if self.computed_gate is None:
+            if self.absolute < self.minimum_gate:
+                raise ValueError(f"selected tolerance {self.absolute} is below minimum gate {self.minimum_gate}")
+            return
+        quantum = Decimal(str(self.rounding_quantum))
+        computed = Decimal(str(self.computed_gate))
+        minimum = Decimal(str(self.minimum_gate))
+        expected = max(
+            minimum,
+            (computed / quantum).to_integral_value(rounding=ROUND_CEILING) * quantum,
+        )
+        if Decimal(str(self.absolute)) != expected:
+            raise ValueError(
+                f"selected tolerance {self.absolute} does not equal upward-rounded calibrated gate {expected}"
+            )
+
+
+@dataclass
+class TestSpec:
+    config_id: str
+    config_path: str
+    model: ModelSpec
+    arms: List[ArmSpec]
+    attn_implementations: List[str]
+    applicable_tests: List[str]
+    config_checksum: str = ""
+    test_tolerances: Dict[str, TestTolerance] = field(default_factory=dict)
+    test_settings: Dict[str, dict] = field(default_factory=dict)
+    inapplicable: Dict[str, str] = field(default_factory=dict)
+    param_name_map: Dict[str, str] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    def tolerance_for(self, test_id: str) -> float:
+        try:
+            return self.test_tolerances[test_id].absolute
+        except KeyError as exc:
+            raise ValueError(
+                f"test {test_id!r} has no frozen tolerance in config spec {self.config_id!r}; "
+                "run config onboarding first"
+            ) from exc
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_json())
+
+    @staticmethod
+    def read(path: Path) -> "TestSpec":
+        raw = json.loads(Path(path).read_text())
+        return TestSpec(
+            config_id=raw["config_id"],
+            config_path=raw["config_path"],
+            model=ModelSpec(**raw["model"]),
+            arms=[ArmSpec(**a) for a in raw["arms"]],
+            attn_implementations=raw["attn_implementations"],
+            applicable_tests=raw["applicable_tests"],
+            config_checksum=raw.get("config_checksum", ""),
+            test_tolerances={
+                test_id: TestTolerance(**tolerance) for test_id, tolerance in raw.get("test_tolerances", {}).items()
+            },
+            test_settings=raw.get("test_settings", {}),
+            inapplicable=raw.get("inapplicable", {}),
+            param_name_map=raw.get("param_name_map", {}),
+            notes=raw.get("notes", []),
+        )
+
+
+NON_MODEL_PROCESSOR_SIDECARS = frozenset({"preprocessor_config.json", "video_preprocessor_config.json"})
+
+
+def hash_directory(path: Path, suffixes=(".safetensors", ".json"), *, exclude_names=()) -> str:
+    """Hash model and tokenizer assets while ignoring processor metadata that does not affect text execution."""
+    h = hashlib.sha256()
+    for f in sorted(Path(path).rglob("*")):
+        if (
+            f.is_file()
+            and f.suffix in suffixes
+            and f.name not in NON_MODEL_PROCESSOR_SIDECARS
+            and f.name not in exclude_names
+        ):
+            h.update(f.name.encode())
+            h.update(str(f.stat().st_size).encode())
+    return h.hexdigest()[:16]
+
+
+# Scratch probes retain the historical gate. Product tests read their frozen gate from TestSpec.
+STATED_CRITERION_ABS = 1e-3
+
+
+def tolerance_text(value: float) -> str:
+    """``1e-03`` rather than ``1.000e-03``, without rounding a value that needs its digits."""
+    mantissa, exponent = f"{value:.3e}".split("e")
+    return f"{mantissa.rstrip('0').rstrip('.')}e{exponent}"
+
 
 GPU_ATTENTION_IMPLEMENTATIONS = {
     "h200": "flash_attention_3",
@@ -462,3 +612,73 @@ def validate_against_host(cfg: LoadedConfig, available_gpus: int, *, check_gpu_t
         )
     if cfg.n_gpus % cfg.sp_size != 0:
         raise ValueError(f"{cfg.config_id}: sp_size={cfg.sp_size} does not divide n_gpus={cfg.n_gpus}")
+
+
+GAS1_TOKEN_CAP = 65_536
+
+
+@dataclass(frozen=True)
+class ArmDefinition:
+    name: str
+    global_batch_size: int
+    max_seq_len: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.global_batch_size * self.max_seq_len
+
+    def microbatches(self, max_tokens_per_mb: int, dp_size: int = 1) -> int:
+        """Maximum per-DP-shard model calls after distributing the global rows.
+
+        A row is never split, so an arm whose single row exceeds the budget is still one model call on the
+        shard that receives it. The global batch is balanced over data-parallel shards before packing.
+        """
+        rows_per_mb = max(1, max_tokens_per_mb // self.max_seq_len)
+        global_calls = math.ceil(self.global_batch_size / rows_per_mb)
+        return math.ceil(global_calls / dp_size)
+
+
+# Both cases use one padded width so batch-size effects are not confounded with sequence-length effects.
+# Active row lengths vary below that width, preserving sequence boundaries and padding coverage. GAS1 is the
+# control; GAS4 changes only the number of rows.
+GAS_VALUES = (1, 4)
+
+
+def max_sequence_tokens(config_max_seq_len: int, gpu_count: int) -> int:
+    """Largest padded row width that keeps the whole GAS1 batch within 64K slots."""
+    if gpu_count < 1:
+        raise ValueError(f"gpu_count must be positive, got {gpu_count}")
+    if config_max_seq_len < 1:
+        raise ValueError(f"max sequence length must be positive, got {config_max_seq_len}")
+    return min(config_max_seq_len, GAS1_TOKEN_CAP // gpu_count)
+
+
+def correctness_microbatch_tokens(configured_tokens: int) -> int:
+    """Training configs may lower the correctness budget but cannot raise it above 64K."""
+    if configured_tokens < 1:
+        raise ValueError(f"microbatch token budget must be positive, got {configured_tokens}")
+    return min(configured_tokens, GAS1_TOKEN_CAP)
+
+
+def scaled_for_placement(arms: List[ArmDefinition], multiple: int) -> List[ArmDefinition]:
+    """The reviewed cases with proportionally more rows, for a config placed on a multiple of its GPUs.
+
+    A wider placement widens data parallelism, and a data-parallel shard that receives no row has nothing
+    to reduce, so the row count has to grow with the width. Only the row count grows: the padded width of
+    each sequence, the case names, and the seed are the reviewed ones, so the wider run differs from the
+    declared-width run in how many sequences it carries and in nothing else.
+
+    Each width therefore has its own single-GPU reference, because the reference executes the rows of the
+    case it is compared against. A wider run costs one extra reference pass.
+    """
+    if multiple < 1:
+        raise ValueError(f"placement multiple must be at least 1, got {multiple}")
+    if multiple == 1:
+        return list(arms)
+    return [replace(arm, global_batch_size=arm.global_batch_size * multiple) for arm in arms]
+
+
+def arms_for(max_row_tokens: int, gpu_count: int) -> List[ArmDefinition]:
+    """One and four GAS groups, each with one variable-length row per configured GPU."""
+    row_tokens = max_sequence_tokens(max_row_tokens, gpu_count)
+    return [ArmDefinition(f"gas{gas}", gpu_count * gas, row_tokens) for gas in GAS_VALUES]

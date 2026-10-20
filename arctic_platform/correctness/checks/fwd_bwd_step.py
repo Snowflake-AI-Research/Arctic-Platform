@@ -22,12 +22,12 @@ import math
 from pathlib import Path
 from typing import List
 
+from ..harness.config import tolerance_text
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
 from ..harness.runner import OPTIMIZER_LEARNING_RATE
-from ..harness.spec import tolerance_text
 from .optimizer_state import OPTIMIZER_NORM_CRITERION
 from .optimizer_state import compare_optimizer_norms
 from .optimizer_state import summarize_optimizer_artifacts

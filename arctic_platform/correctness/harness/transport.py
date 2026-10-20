@@ -13,22 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The interface a check drives a Arctic Platform training job through, so one measurement runs on either transport.
 
-A check that trains a loss trajectory, writes a checkpoint and resumes a second job from it needs three
-operations and no knowledge of where the job runs: start a job, send one forward-backward followed by one
-optimizer step, and save weights together with optimizer and scheduler state. Both implementations provide
-exactly those -- ``dss_driver.GatewayTransport`` against a Ray gateway this process starts, and
-``hosted.HostedTransport`` against the hosted control plane.
-
-The checkpoint each mints is opaque to the caller, because the two transports name a checkpoint
-differently: the gateway returns the DeepSpeed tag a directory was written under, while the hosted server
-returns the durable ``cp_<uuid>`` resource its control plane catalogs. A check carries the value back to
-the transport that issued it and never reads inside it.
-"""
+"Training transport contracts and explicitly requested microbatch packing."
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import ContextManager
 from typing import Optional
@@ -70,3 +60,34 @@ class Transport(Protocol):
         With ``resume_from`` the job initializes its weights, optimizer moments and scheduler position from
         that checkpoint instead of from the base model.
         """
+
+
+def pack_microbatches(
+    batch,
+    microbatches: int,
+    *,
+    model_provider: str = "huggingface",
+    loss_fn: str = "sft",
+    processing_config=None,
+) -> dict:
+    """Pack an explicitly requested number of microbatches without changing the input config."""
+    from .dss_driver import pack
+
+    body = pack(batch, model_provider=model_provider)
+    body["processing"] = {"loss_fn": loss_fn}
+    if processing_config is not None:
+        body["processing"]["config"] = deepcopy(processing_config)
+    if microbatches <= 1:
+        return body
+    if batch.rows < microbatches:
+        raise ValueError(f"cannot split {batch.rows} row(s) into {microbatches} microbatches")
+    base_rows, extra_rows = divmod(batch.rows, microbatches)
+    tensors = body["batch"]
+    splits = []
+    start = 0
+    for index in range(microbatches):
+        end = start + base_rows + (index < extra_rows)
+        splits.append({key: value[start:end].contiguous() for key, value in tensors.items()})
+        start = end
+    body["batch"] = splits
+    return body

@@ -49,18 +49,18 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
-from ..harness import gsm8k
+from ..harness import sft as gsm8k
+from ..harness.batches import SEED
 from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import build_payload
+from ..harness.dss_driver import generate
+from ..harness.dss_driver import rl_batch
+from ..harness.dss_driver import rl_fwd_bwd
+from ..harness.dss_driver import running_rl_client
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.rl_driver import generate
-from ..harness.rl_driver import rl_batch
-from ..harness.rl_driver import rl_fwd_bwd
-from ..harness.rl_driver import running_rl_client
-from ..harness.seeds import SEED
 from ..harness.sft import TRAIN_SPLIT
 from ..harness.sft import configured_rows_per_step
 

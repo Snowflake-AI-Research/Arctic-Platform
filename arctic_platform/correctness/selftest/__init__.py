@@ -12,10 +12,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Checks for the correctness harness itself, run by ``python -m arctic_platform.correctness selftest``.
-
-These are named ``check_*.py`` rather than ``test_*.py`` on purpose. They belong to the standalone
-correctness environment, not to the repository's unit-test suite, and a default pytest collection must
-not pick them up; the selftest command names the pattern explicitly when it runs them.
-"""

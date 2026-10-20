@@ -39,217 +39,98 @@ def render(args: argparse.Namespace) -> str:
     vocab_chunk = lm_head_config.get("fused_lm_head_vocab_chunk_size", 8192)
     peft_config = training.get("peft_config")
     peft_adapter_path = getattr(args, "peft_adapter_path", None)
-    template = """\
-'Measure ten-run gradient-norm repeatability of the fixed reference.'
-
-from __future__ import annotations
-
-import hashlib
-import importlib.metadata
-import json
-import os
-import platform
-import time
-from decimal import Decimal, ROUND_CEILING
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-
-import torch
-from transformers import AutoConfig
-from tqdm.auto import tqdm
-
-from arctic_platform.correctness.harness.batches import build_batch, save as save_batch
-from arctic_platform.correctness.harness.runner import run_reference
-from arctic_platform.correctness.harness.seeds import SEED
-from arctic_platform.correctness.harness.spec import hash_directory
-from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
-
-SOURCE_PATH = __SOURCE__
-LAYERS = __LAYERS__
-MODEL_PATH = __MODEL__
-OUTPUT = Path(__OUTPUT__)
-SPEC_PATH = Path(__SPEC_PATH__)
-TEST_ID = __TEST_ID__
-CONFIG_CHECKSUM = __CONFIG_CHECKSUM__
-RUNS = 16
-TOKENS = __TOKENS__
-REFERENCE_TOKEN_BUDGET = __REFERENCE_TOKEN_BUDGET__
-GATE_QUANTUM = Decimal("0.001")
-# How far above the run-to-run variation the calibrated gate sits. Sixteen calibration runs measure the
-# tail imperfectly: on the CPU-offloaded Qwen3.8-27B config a factor of two produced a 2e-03 gate that the
-# validation run then exceeded at 2.929e-03, so a factor that only just covers the observed spread does not
-# survive the next run. Four keeps that measurement inside the gate with room, and stays far below the
-# disagreement a real defect produces -- a dropped microbatch gradient is a fraction of the correct norm,
-# not a per-mille difference.
-GATE_SAFETY_FACTOR = 4.0
-
-
-def _select_gate(raw_variation: float) -> tuple[float, float]:
-    computed_gate = GATE_SAFETY_FACTOR * raw_variation
-    rounded_gate = (
-        Decimal(str(computed_gate)) / GATE_QUANTUM
-    ).to_integral_value(rounding=ROUND_CEILING) * GATE_QUANTUM
-    return computed_gate, max(float(GATE_QUANTUM), float(rounded_gate))
-
-
-def _batch_hash(batch) -> str:
-    digest = hashlib.sha256()
-    for name in ("input_ids", "position_ids", "labels"):
-        tensor = getattr(batch, name).detach().cpu().contiguous()
-        digest.update(name.encode())
-        digest.update(str(tensor.dtype).encode())
-        digest.update(str(tuple(tensor.shape)).encode())
-        digest.update(tensor.numpy().tobytes())
-    return digest.hexdigest()
-
-
-def _environment() -> dict:
-    packages = {}
-    for distribution in ("torch", "transformers", "flash-attn", "flash-linear-attention"):
-        try:
-            packages[distribution] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            packages[distribution] = None
-    return {
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "cuda": torch.version.cuda,
-        "packages": packages,
-    }
-
-
-def main() -> int:
-    print(f"interpreter {sys.prefix}", flush=True)
-    materialize_pretrained(SOURCE_PATH, MODEL_PATH, LAYERS)
-    model_cfg = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    inner = getattr(model_cfg, "text_config", model_cfg)
-    layer_types = list(getattr(inner, "layer_types", ["full_attention"] * int(inner.num_hidden_layers)))
-    batch = build_batch("gas1", 1, TOKENS, inner.vocab_size, seed=SEED)
-    print(f"determinism: off, {RUNS} independent processes", flush=True)
-    run_dir = OUTPUT.parent / "calibration-runs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    batch_path = run_dir / "batch.pt"
-    save_batch(batch, batch_path)
-    lanes = max(1, min(RUNS, torch.cuda.device_count()))
-
-    def one_run(index: int) -> tuple[int, float, dict]:
-        started = time.monotonic()
-        result = run_reference(
-            MODEL_PATH,
-            batch_path,
-            run_dir / f"run-{index:02d}.json",
-            token_budget=REFERENCE_TOKEN_BUDGET,
-            ce_chunk=2048,
-            attn=__ATTENTION__,
-            fp32_lm_head=__FP32_LM_HEAD__,
-            fused_cross_entropy=__FUSED_CROSS_ENTROPY__,
-            matmul_precision=__MATMUL_PRECISION__,
-            peft_config=__PEFT_CONFIG__,
-            peft_adapter_path=__PEFT_ADAPTER_PATH__,
-            seed=SEED,
-            lm_head_token_chunk_size=__TOKEN_CHUNK__,
-            lm_head_vocab_chunk_size=__VOCAB_CHUNK__,
-            deterministic=False,
-            cuda_device=index % lanes,
-        )
-        return index, time.monotonic() - started, result
-
-    completed: dict[int, tuple[float, dict]] = {}
-    with tqdm(total=RUNS, desc="Finding tolerance", unit="run", dynamic_ncols=True) as progress:
-        with ThreadPoolExecutor(max_workers=lanes) as pool:
-            futures = [pool.submit(one_run, index) for index in range(RUNS)]
-            for future in as_completed(futures):
-                index, elapsed, result = future.result()
-                completed[index] = (elapsed, result)
-                progress.set_postfix_str(
-                    f"loss={result['loss']:.6f}, peak={result['peak_gib']:.1f}GiB, "
-                    f"last={elapsed:.1f}s, {lanes} per wave"
-                )
-                progress.update()
-    results = [{"loss": completed[i][1]["loss"], "grad_norms": completed[i][1]["grad_norms"],
-                "peak_gib": completed[i][1]["peak_gib"]} for i in range(RUNS)]
-
-    names = sorted(results[0]["grad_norms"])
-    for result in results[1:]:
-        if sorted(result["grad_norms"]) != names:
-            raise RuntimeError("reference runs returned different gradient parameter sets")
-    ranges = []
-    for name in names:
-        values = [result["grad_norms"][name] for result in results]
-        ranges.append(
-            {
-                "name": name,
-                "minimum": min(values),
-                "maximum": max(values),
-                "range": max(values) - min(values),
-                "values": values,
-            }
-        )
-    ranges.sort(key=lambda row: row["range"], reverse=True)
-    losses = [result["loss"] for result in results]
-    raw_variation = ranges[0]["range"]
-    computed_gate, selected_gate = _select_gate(raw_variation)
-    payload = {
-        "configuration": {
-            "model": f"{Path(SOURCE_PATH).name} {LAYERS}-layer hybrid slice",
-            "active_gdn_layers": layer_types.count("linear_attention"),
-            "active_full_attention_layers": layer_types.count("full_attention"),
-            "tokens": TOKENS,
-            "attention_implementation": __ATTENTION__,
-            "runs": RUNS,
-            "seed_reset_each_run": SEED,
-            "deterministic_algorithms": False,
-            "cudnn_deterministic": False,
-            "cublas_workspace_config": None,
-            "flash_attention_deterministic": False,
-            "config_checksum": CONFIG_CHECKSUM,
-            "model_hash": hash_directory(Path(MODEL_PATH)),
-            "batch_hash": _batch_hash(batch),
-        },
-        "environment": _environment(),
-        "losses": losses,
-        "peak_gib": [result["peak_gib"] for result in results],
-        "loss_range": max(losses) - min(losses),
-        "gradient_ranges": ranges,
-        "tolerance": {
-            "raw_max_same_tensor_range": raw_variation,
-            "multiplier": GATE_SAFETY_FACTOR,
-            "computed_gate": computed_gate,
-            "rounding_quantum": float(GATE_QUANTUM),
-            "minimum_gate": float(GATE_QUANTUM),
-            "selected_gate": selected_gate,
-        },
-    }
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")
-    print(f"loss range: {payload['loss_range']:.9e}")
-    print(f"raw variation: {raw_variation:.9e}")
-    print(f"computed {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")
-    print(f"selected gate: {selected_gate:.9e}")
-    print(f"{'tensor':64} {'minimum':>13} {'maximum':>13} {'range':>13}")
-    for row in ranges[:10]:
-        print(f"{row['name']:64} {row['minimum']:>13.9f} {row['maximum']:>13.9f} {row['range']:>13.6e}")
-
-    spec = json.loads(SPEC_PATH.read_text())
-    spec.setdefault("test_tolerances", {})[TEST_ID] = {
-        "absolute": selected_gate,
-        "calibration_runs": RUNS,
-        "raw_max_same_tensor_range": raw_variation,
-        "multiplier": GATE_SAFETY_FACTOR,
-        "computed_gate": computed_gate,
-        "rounding_quantum": float(GATE_QUANTUM),
-        "minimum_gate": float(GATE_QUANTUM),
-        "worst_tensor": ranges[0]["name"],
-        "status": f"calibrated from {RUNS} nondeterministic reference executions; {GATE_SAFETY_FACTOR:g}x rounded upward in 1e-3 units",
-    }
-    SPEC_PATH.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-"""
+    template = (
+        "'Measure ten-run gradient-norm repeatability of the fixed reference.'\n\nfrom __future__ import"
+        " annotations\n\nimport hashlib\nimport importlib.metadata\nimport json\nimport os\nimport platform\nimport"
+        " time\nfrom decimal import Decimal, ROUND_CEILING\nimport sys\nfrom concurrent.futures import"
+        " ThreadPoolExecutor, as_completed\nfrom pathlib import Path\n\nimport torch\nfrom transformers import"
+        " AutoConfig\nfrom tqdm.auto import tqdm\n\nfrom arctic_platform.correctness.harness.batches import"
+        " build_batch, save as save_batch\nfrom arctic_platform.correctness.harness.runner import run_reference\nfrom"
+        " arctic_platform.correctness.harness.batches import SEED\nfrom arctic_platform.correctness.harness.config"
+        " import hash_directory\nfrom arctic_platform.correctness.onboarding.synth_model import"
+        " materialize_pretrained\n\nSOURCE_PATH = __SOURCE__\nLAYERS = __LAYERS__\nMODEL_PATH = __MODEL__\nOUTPUT ="
+        " Path(__OUTPUT__)\nSPEC_PATH = Path(__SPEC_PATH__)\nTEST_ID = __TEST_ID__\nCONFIG_CHECKSUM ="
+        " __CONFIG_CHECKSUM__\nRUNS = 16\nTOKENS = __TOKENS__\nREFERENCE_TOKEN_BUDGET ="
+        ' __REFERENCE_TOKEN_BUDGET__\nGATE_QUANTUM = Decimal("0.001")\n# How far above the run-to-run variation the'
+        " calibrated gate sits. Sixteen calibration runs measure the\n# tail imperfectly: on the CPU-offloaded"
+        " Qwen3.8-27B config a factor of two produced a 2e-03 gate that the\n# validation run then exceeded at"
+        " 2.929e-03, so a factor that only just covers the observed spread does not\n# survive the next run. Four"
+        " keeps that measurement inside the gate with room, and stays far below the\n# disagreement a real defect"
+        " produces -- a dropped microbatch gradient is a fraction of the correct norm,\n# not a per-mille"
+        " difference.\nGATE_SAFETY_FACTOR = 4.0\n\n\ndef _select_gate(raw_variation: float) -> tuple[float, float]:\n "
+        "   computed_gate = GATE_SAFETY_FACTOR * raw_variation\n    rounded_gate = (\n       "
+        " Decimal(str(computed_gate)) / GATE_QUANTUM\n    ).to_integral_value(rounding=ROUND_CEILING) * GATE_QUANTUM\n"
+        "    return computed_gate, max(float(GATE_QUANTUM), float(rounded_gate))\n\n\ndef _batch_hash(batch) -> str:\n"
+        '    digest = hashlib.sha256()\n    for name in ("input_ids", "position_ids", "labels"):\n        tensor ='
+        " getattr(batch, name).detach().cpu().contiguous()\n        digest.update(name.encode())\n       "
+        " digest.update(str(tensor.dtype).encode())\n        digest.update(str(tuple(tensor.shape)).encode())\n       "
+        " digest.update(tensor.numpy().tobytes())\n    return digest.hexdigest()\n\n\ndef _environment() -> dict:\n   "
+        ' packages = {}\n    for distribution in ("torch", "transformers", "flash-attn", "flash-linear-attention"):\n '
+        "       try:\n            packages[distribution] = importlib.metadata.version(distribution)\n        except"
+        " importlib.metadata.PackageNotFoundError:\n            packages[distribution] = None\n    return {\n       "
+        ' "python": sys.version.split()[0],\n        "platform": platform.platform(),\n        "cuda":'
+        ' torch.version.cuda,\n        "packages": packages,\n    }\n\n\ndef main() -> int:\n    print(f"interpreter'
+        ' {sys.prefix}", flush=True)\n    materialize_pretrained(SOURCE_PATH, MODEL_PATH, LAYERS)\n    model_cfg ='
+        " AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)\n    inner = getattr(model_cfg,"
+        ' "text_config", model_cfg)\n    layer_types = list(getattr(inner, "layer_types", ["full_attention"] *'
+        ' int(inner.num_hidden_layers)))\n    batch = build_batch("gas1", 1, TOKENS, inner.vocab_size, seed=SEED)\n   '
+        ' print(f"determinism: off, {RUNS} independent processes", flush=True)\n    run_dir = OUTPUT.parent /'
+        ' "calibration-runs"\n    run_dir.mkdir(parents=True, exist_ok=True)\n    batch_path = run_dir / "batch.pt"\n '
+        "   save_batch(batch, batch_path)\n    lanes = max(1, min(RUNS, torch.cuda.device_count()))\n\n    def"
+        " one_run(index: int) -> tuple[int, float, dict]:\n        started = time.monotonic()\n        result ="
+        " run_reference(\n            MODEL_PATH,\n            batch_path,\n            run_dir /"
+        ' f"run-{index:02d}.json",\n            token_budget=REFERENCE_TOKEN_BUDGET,\n            ce_chunk=2048,\n    '
+        "        attn=__ATTENTION__,\n            fp32_lm_head=__FP32_LM_HEAD__,\n           "
+        " fused_cross_entropy=__FUSED_CROSS_ENTROPY__,\n            matmul_precision=__MATMUL_PRECISION__,\n          "
+        "  peft_config=__PEFT_CONFIG__,\n            peft_adapter_path=__PEFT_ADAPTER_PATH__,\n           "
+        " seed=SEED,\n            lm_head_token_chunk_size=__TOKEN_CHUNK__,\n           "
+        " lm_head_vocab_chunk_size=__VOCAB_CHUNK__,\n            deterministic=False,\n            cuda_device=index %"
+        " lanes,\n        )\n        return index, time.monotonic() - started, result\n\n    completed: dict[int,"
+        ' tuple[float, dict]] = {}\n    with tqdm(total=RUNS, desc="Finding tolerance", unit="run",'
+        " dynamic_ncols=True) as progress:\n        with ThreadPoolExecutor(max_workers=lanes) as pool:\n           "
+        " futures = [pool.submit(one_run, index) for index in range(RUNS)]\n            for future in"
+        " as_completed(futures):\n                index, elapsed, result = future.result()\n               "
+        " completed[index] = (elapsed, result)\n                progress.set_postfix_str(\n                   "
+        " f\"loss={result['loss']:.6f}, peak={result['peak_gib']:.1f}GiB, \"\n                   "
+        ' f"last={elapsed:.1f}s, {lanes} per wave"\n                )\n                progress.update()\n    results'
+        ' = [{"loss": completed[i][1]["loss"], "grad_norms": completed[i][1]["grad_norms"],\n               '
+        ' "peak_gib": completed[i][1]["peak_gib"]} for i in range(RUNS)]\n\n    names ='
+        ' sorted(results[0]["grad_norms"])\n    for result in results[1:]:\n        if sorted(result["grad_norms"]) !='
+        ' names:\n            raise RuntimeError("reference runs returned different gradient parameter sets")\n   '
+        ' ranges = []\n    for name in names:\n        values = [result["grad_norms"][name] for result in results]\n  '
+        '      ranges.append(\n            {\n                "name": name,\n                "minimum": min(values),\n'
+        '                "maximum": max(values),\n                "range": max(values) - min(values),\n               '
+        ' "values": values,\n            }\n        )\n    ranges.sort(key=lambda row: row["range"], reverse=True)\n  '
+        '  losses = [result["loss"] for result in results]\n    raw_variation = ranges[0]["range"]\n    computed_gate,'
+        ' selected_gate = _select_gate(raw_variation)\n    payload = {\n        "configuration": {\n           '
+        ' "model": f"{Path(SOURCE_PATH).name} {LAYERS}-layer hybrid slice",\n            "active_gdn_layers":'
+        ' layer_types.count("linear_attention"),\n            "active_full_attention_layers":'
+        ' layer_types.count("full_attention"),\n            "tokens": TOKENS,\n            "attention_implementation":'
+        ' __ATTENTION__,\n            "runs": RUNS,\n            "seed_reset_each_run": SEED,\n           '
+        ' "deterministic_algorithms": False,\n            "cudnn_deterministic": False,\n           '
+        ' "cublas_workspace_config": None,\n            "flash_attention_deterministic": False,\n           '
+        ' "config_checksum": CONFIG_CHECKSUM,\n            "model_hash": hash_directory(Path(MODEL_PATH)),\n          '
+        '  "batch_hash": _batch_hash(batch),\n        },\n        "environment": _environment(),\n        "losses":'
+        ' losses,\n        "peak_gib": [result["peak_gib"] for result in results],\n        "loss_range": max(losses)'
+        ' - min(losses),\n        "gradient_ranges": ranges,\n        "tolerance": {\n           '
+        ' "raw_max_same_tensor_range": raw_variation,\n            "multiplier": GATE_SAFETY_FACTOR,\n           '
+        ' "computed_gate": computed_gate,\n            "rounding_quantum": float(GATE_QUANTUM),\n           '
+        ' "minimum_gate": float(GATE_QUANTUM),\n            "selected_gate": selected_gate,\n        },\n    }\n   '
+        " OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n    OUTPUT.write_text(json.dumps(payload, indent=2,"
+        ' sort_keys=True) + "\\n")\n    print(f"loss range: {payload[\'loss_range\']:.9e}")\n    print(f"raw'
+        ' variation: {raw_variation:.9e}")\n    print(f"computed {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")\n'
+        "    print(f\"selected gate: {selected_gate:.9e}\")\n    print(f\"{'tensor':64} {'minimum':>13}"
+        " {'maximum':>13} {'range':>13}\")\n    for row in ranges[:10]:\n        print(f\"{row['name']:64}"
+        " {row['minimum']:>13.9f} {row['maximum']:>13.9f} {row['range']:>13.6e}\")\n\n    spec ="
+        ' json.loads(SPEC_PATH.read_text())\n    spec.setdefault("test_tolerances", {})[TEST_ID] = {\n       '
+        ' "absolute": selected_gate,\n        "calibration_runs": RUNS,\n        "raw_max_same_tensor_range":'
+        ' raw_variation,\n        "multiplier": GATE_SAFETY_FACTOR,\n        "computed_gate": computed_gate,\n       '
+        ' "rounding_quantum": float(GATE_QUANTUM),\n        "minimum_gate": float(GATE_QUANTUM),\n       '
+        ' "worst_tensor": ranges[0]["name"],\n        "status": f"calibrated from {RUNS} nondeterministic reference'
+        ' executions; {GATE_SAFETY_FACTOR:g}x rounded upward in 1e-3 units",\n    }\n   '
+        ' SPEC_PATH.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\\n")\n    return 0\n\n\nif __name__ =='
+        ' "__main__":\n    raise SystemExit(main())\n'
+    )
     replacements = {
         "__SOURCE__": repr(str(args.source_checkpoint)),
         "__LAYERS__": str(args.layers),

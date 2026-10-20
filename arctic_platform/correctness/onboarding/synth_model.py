@@ -34,10 +34,10 @@ from pathlib import Path
 from typing import List
 from typing import Tuple
 
-from ..harness.seeds import SEED
-from ..harness.spec import ModelSpec
-from ..harness.spec import hash_directory
-from ..harness.workdir import require_data_fast_path
+from ..harness.batches import SEED
+from ..harness.config import ModelSpec
+from ..harness.config import hash_directory
+from ..harness.storage import require_data_fast_path
 
 # A single H200 must hold the reference's weights, its fp32 gradient accumulator, the live gradients of
 # one backward pass, one microbatch of activations, and the chunked cross-entropy workspace. The margin

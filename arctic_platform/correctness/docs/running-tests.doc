@@ -23,7 +23,7 @@ export ARCTIC_CORTEX_SCHEMA=dev
 
 For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and `ARCTIC_CORTEX_PAT` instead of a direct URL. Supply the token through a protected environment or `--pat-file`, not through a configuration file or a pasted command. `--backend onprem` selects the existing on-premises backend; it still requires its installed runtime and available resources.
 
-**Fast-storage defaults are centralized.** Temporary work uses `/data-fast/tmp`; `DSS_CORRECTNESS_TMPDIR` can point to another directory under `/data-fast`. Each ordinary run gets a unique report directory there unless `--out` supplies one. Compact reference JSON files default to `arctic_platform/correctness/reference_data`; `--reference-records-dir` must select another Git-tracked directory, not scratch storage.
+**Fast-storage defaults are centralized.** Temporary work uses `/data-fast/tmp`; `DSS_CORRECTNESS_TMPDIR` can point to another directory under `/data-fast`. Each ordinary run gets a unique report directory there unless `--out` supplies one. Compact reference JSON files default to the locally retained, Git-ignored `arctic_platform/correctness/reference_data`; `--reference-records-dir` must select a directory inside the checkout, not scratch storage.
 
 ## Select And Run
 

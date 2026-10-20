@@ -13,17 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate the batches, materialize them, and assert the properties the comparison depends on.
 
-Both engines load the same file rather than seeding their own generators. Arctic Platform and the reference are
-separate processes that may hold different library versions, and any unrelated draw between them shifts
-global RNG state; loading bytes removes the question entirely.
-
-The invariants below are asserted on the materialized tensor rather than assumed from the sampling. Padding
-in particular is load-bearing: it is what makes rows contribute unequal token counts, and with sequence
-parallelism it gives each rank a different active-token count. A batch of uniformly full rows cannot
-distinguish a request-wide loss denominator from a per-row or per-rank one.
-"""
+"Deterministic comparison batches and their shared random seed."
 
 from __future__ import annotations
 
@@ -31,8 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from .seeds import SEED
-from .workdir import require_data_fast_path
+from .storage import require_data_fast_path
+
+SEED = 1234
+
 
 IGNORE_INDEX = -100
 

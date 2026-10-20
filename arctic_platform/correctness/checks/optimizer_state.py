@@ -27,13 +27,13 @@ from typing import Tuple
 
 import torch
 
+from ..harness.names import COMPARISON_STATE_KEYS
+from ..harness.names import OPTIMIZER_NORM_CRITERION
+from ..harness.names import STATE_KEYS
 from ..harness.names import CanonicalTensorGroup
 from ..harness.names import canonical_dss_tensor_groups
 from ..harness.names import normalize
-from ..harness.optimizer_norm_schema import COMPARISON_STATE_KEYS
-from ..harness.optimizer_norm_schema import OPTIMIZER_NORM_CRITERION
-from ..harness.optimizer_norm_schema import STATE_KEYS
-from ..harness.optimizer_norm_schema import validate_optimizer_norm_summary as _validate_optimizer_norm_summary
+from ..harness.names import validate_optimizer_norm_summary as _validate_optimizer_norm_summary
 
 
 @dataclass(frozen=True)

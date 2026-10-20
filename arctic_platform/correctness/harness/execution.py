@@ -38,20 +38,20 @@ from pydantic import SecretStr
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 
-from . import console
-from .arms import ArmDefinition
-from .arms import arms_for
-from .arms import scaled_for_placement
+from . import report as console
+from .config import ArmDefinition
+from .config import TestSpec
+from .config import arms_for
 from .config import config_checksum
 from .config import config_id
 from .config import load_config
 from .config import local_gpu_type
 from .config import placement_widths
+from .config import scaled_for_placement
 from .config import validate_against_host
 from .dss_driver import available_gpus
 from .hosted import read_pat
 from .hosted import require_local_cortex_gateway
-from .preflight import ensure_no_interrupted_builds
 from .registry import RL_INAPPLICABLE_REASON
 from .registry import TestOutcome
 from .registry import TestResult
@@ -63,9 +63,9 @@ from .runner import cortex_unavailable_reason
 from .runner import execute
 from .runner import execute_rl
 from .runner import validate_local_full_model
-from .spec import TestSpec
-from .workdir import correctness_workdir
-from .workdir import require_data_fast_path
+from .storage import correctness_workdir
+from .storage import ensure_no_interrupted_builds
+from .storage import require_data_fast_path
 
 CORRECTNESS_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -458,7 +458,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 gateway_url=backend.base_url,
             )
         if fixture_path is not None:
-            from .cortex_fixture import load_fixture
+            from .cortex import load_fixture
 
             try:
                 published_fixture = load_fixture(fixture_path, spec)
@@ -480,7 +480,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
         if local_fixture:
-            from .cortex_fixture import load_local_fixture
+            from .cortex import load_local_fixture
 
             try:
                 published_fixture = load_local_fixture(backend, spec)

@@ -39,8 +39,11 @@ from decimal import Decimal
 from typing import Dict
 from typing import List
 
+from ..harness.batches import SEED
 from ..harness.batches import Batch
 from ..harness.batches import build_batch
+from ..harness.config import TestTolerance
+from ..harness.config import tolerance_text
 from ..harness.dss_driver import GatewayTransport
 from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import pack
@@ -48,9 +51,6 @@ from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.seeds import SEED
-from ..harness.spec import TestTolerance
-from ..harness.spec import tolerance_text
 from ..harness.transport import TrainingJob
 from ..harness.transport import Transport
 

@@ -29,8 +29,8 @@ from typing import Mapping
 from arctic_platform.client import CortexConfig
 
 from ..harness.config import LoadedConfig
-from ..harness.spec import TestSpec
-from ..harness.workdir import require_data_fast_path
+from ..harness.config import TestSpec
+from ..harness.storage import require_data_fast_path
 
 
 @dataclass(frozen=True)

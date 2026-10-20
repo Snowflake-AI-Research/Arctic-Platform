@@ -74,7 +74,7 @@ def file_identity(path: Path | str) -> dict:
 
 def model_identity(path: Path | str) -> dict:
     """Hash asset contents, not machine-specific roots or file sizes alone."""
-    from .spec import NON_MODEL_PROCESSOR_SIDECARS
+    from .config import NON_MODEL_PROCESSOR_SIDECARS
 
     root = Path(path)
     if not root.is_dir():
@@ -129,7 +129,7 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         for path in [
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "batches.py",
-            root / "harness" / "gsm8k.py",
+            root / "harness" / "sft.py",
             root / "harness" / "names.py",
         ]
     }
@@ -150,7 +150,7 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         identity["gate"] = asdict(ctx.spec.test_tolerances[check_id])
     elif check_id == "single-step-optimizer":
         identity["norm_reduction_source"] = file_identity(root / "checks" / "optimizer_state.py")
-        identity["norm_schema_source"] = file_identity(root / "harness" / "optimizer_norm_schema.py")
+        identity["norm_schema_source"] = file_identity(root / "harness" / "names.py")
     elif check_id == "e2e-sft-train-validate":
         # Shared replay/scoring helpers affect the reference semantics. Older
         # records did not bind them, so do not silently relabel those measurements.
@@ -205,7 +205,7 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
                 raise ReferencePrerequisiteError("optimizer norm gate must be a finite nonnegative scalar")
             if not summary.get("parameters"):
                 raise ReferencePrerequisiteError("optimizer reference has no parameter norms")
-            from .optimizer_norm_schema import validate_optimizer_norm_summary
+            from .names import validate_optimizer_norm_summary
 
             validate_optimizer_norm_summary(summary)
     elif check == "e2e-sft-train-validate":

@@ -47,7 +47,7 @@ from typing import Optional
 
 import torch
 
-from arctic_platform.correctness.harness.workdir import require_data_fast_path
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 IGNORE_INDEX = -100
 

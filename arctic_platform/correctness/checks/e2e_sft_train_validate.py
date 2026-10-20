@@ -62,12 +62,14 @@ import torch
 from arctic_platform.client import CortexConfig
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
-from ..harness import gsm8k
 from ..harness import reference_records
-from ..harness.arms import correctness_microbatch_tokens
+from ..harness import sft as gsm8k
+from ..harness.batches import SEED
 from ..harness.batches import Batch
 from ..harness.batches import load
 from ..harness.batches import save
+from ..harness.config import correctness_microbatch_tokens
+from ..harness.config import tolerance_text
 from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import build_payload
 from ..harness.dss_driver import forward_logprobs
@@ -81,15 +83,13 @@ from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.seeds import SEED
 from ..harness.sft import TRAIN_SPLIT
 from ..harness.sft import VALIDATION_SPLIT
 from ..harness.sft import configured_learning_rate
 from ..harness.sft import configured_rows_per_step
 from ..harness.sft import cross_entropy
 from ..harness.sft import reference_answer_logprobs
-from ..harness.spec import tolerance_text
-from ..harness.workdir import require_data_fast_path
+from ..harness.storage import require_data_fast_path
 from ..reference.model_features import uses_mixer_packing
 
 TEST_ID = "e2e-sft-train-validate"
@@ -391,7 +391,7 @@ def run_dss_trajectory(
     learning_rate = configured_learning_rate(ctx.cfg)
     payload = build_payload(ctx.cfg.training, model_name, SEED, attn_implementation=ctx.attn_implementation)
     if peft_adapter_path is not None:
-        from ..harness.deterministic_lora import bind_payload
+        from ..harness.lora import bind_payload
 
         payload = bind_payload(payload, peft_adapter_path)
     if isinstance(backend, CortexConfig) and ctx.cfg.gpu_type is not None:
@@ -591,7 +591,7 @@ def dataset_paths() -> Tuple[Path, Path]:
 def _prepare_adapter(ctx, model_path: str, workdir: Path) -> Tuple[Path | None, dict]:
     if not ctx.cfg.effective_training.get("peft_config"):
         return None, {"kind": "base-model"}
-    from ..harness import deterministic_lora
+    from ..harness import lora as deterministic_lora
 
     adapter = deterministic_lora.materialize_adapter(ctx.cfg, model_path, workdir / "adapter-init")
     if adapter is None:

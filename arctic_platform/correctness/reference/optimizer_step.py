@@ -24,7 +24,7 @@ from typing import Dict
 
 import torch
 
-from arctic_platform.correctness.harness.workdir import require_data_fast_path
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 NO_DECAY_NAMES = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
 ADAMW_NAMES = {"adam", "adamw", "fusedadam", "fused_adam", "torch_adamw", "deepspeed_cpu_adam"}

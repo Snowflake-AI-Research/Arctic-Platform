@@ -34,12 +34,12 @@ from __future__ import annotations
 
 from typing import List
 
+from ..harness.config import tolerance_text
 from ..harness.names import align
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.spec import tolerance_text
 
 
 @correctness_test(
