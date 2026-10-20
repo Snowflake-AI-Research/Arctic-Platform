@@ -100,8 +100,12 @@ class FakeSend:
         return wire.decode_byte_chunks(frames, kind="request")
 
 
-def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
-    transport = CortexTransport(CortexConfig(base_url="http://gs.test"))
+def _transport(
+    result: dict | None = None, *, max_json_bytes: int = 16 * 1024 * 1024
+) -> tuple[CortexTransport, FakeSend]:
+    transport = CortexTransport(
+        CortexConfig(base_url="http://gs.test", forward_operation_max_json_bytes=max_json_bytes)
+    )
     transport.job_id = JOB
     transport.jobs = JobHandles(training=TRAINING, log_prob=LOG_PROB)
     send = FakeSend(result or {})
@@ -156,10 +160,9 @@ class TestForwardWire:
         assert len(send.posts) == 1
         assert wire.read_byte_chunk_metadata(send.operation_frame) is None
 
-    def test_oversized_frame_splits_across_envelopes(self, monkeypatch):
+    def test_oversized_frame_splits_across_envelopes(self):
         """Each POST carries a request-chunk frame the zone can reassemble."""
-        monkeypatch.setenv(cortex_module._OPERATION_MAX_JSON_BYTES_ENV, str(16 * 1024))
-        transport, send = _transport()
+        transport, send = _transport(max_json_bytes=16 * 1024)
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 
@@ -167,15 +170,14 @@ class TestForwardWire:
         assert {e["operation_type"] for e in send.envelopes} == {"forward"}
         assert wire.loads(send.operation_frame)["batch"]["input_ids"].shape == (1, 20_000)
 
-    def test_chunk_slices_respect_the_json_budget(self, monkeypatch):
+    def test_chunk_slices_respect_the_json_budget(self):
         """The cap is on the JSON body, which base64 inflates 4/3.
 
         Sizing the slice against the raw budget would overshoot by a third and be
         rejected by GS, so this pins the encoded payload under the cap.
         """
         budget = 16 * 1024
-        monkeypatch.setenv(cortex_module._OPERATION_MAX_JSON_BYTES_ENV, str(budget))
-        transport, send = _transport()
+        transport, send = _transport(max_json_bytes=budget)
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 

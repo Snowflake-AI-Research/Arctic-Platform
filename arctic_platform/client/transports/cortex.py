@@ -34,10 +34,10 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Any
 from typing import Iterator
 from urllib.parse import quote
-from urllib.parse import unquote
 
 from tenacity import AsyncRetrying
 from tenacity import retry_if_exception
@@ -67,17 +67,12 @@ _CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunke
 # `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
 # whose payload is the base64'd DSSST1 frame. The control plane's REST surface
 # marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
-# budget below is a JSON-body budget, not a frame budget. These mirror
-# dss_client's constants so both clients split at the same boundary.
-_OPERATION_MAX_JSON_BYTES_ENV = "CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES"
-_DEFAULT_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
-_MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
+# configured budget is a JSON-body budget, not a frame budget.
 # Room for the envelope's keys, the operation type and the sub-job token.
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_NOT_FOUND_CODE = "517601"
-_RECENTLY_CREATED_SECONDS = 120.0
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -85,6 +80,7 @@ _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
 
 Send = dict[str, Any]  # keyword arguments for one HTTP request
+Encode = Callable[[Request, dict, CortexConfig], list[Send]]
 
 
 def _parent_id(job_id: JobId) -> str:
@@ -92,22 +88,22 @@ def _parent_id(job_id: JobId) -> str:
 
 
 # ── encoders: a filtered body -> the HTTP sends that deliver it ─────────────
-def _no_body(request: Request, body: dict) -> list[Send]:
+def _no_body(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     return [{}]
 
 
-def _json(request: Request, body: dict) -> list[Send]:
+def _json(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     return [{"json": body}]
 
 
-def _query(request: Request, body: dict) -> list[Send]:
+def _query(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     return [{"params": body}]
 
 
-def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
+def _octet(wire_op: str, *, force_chunk: bool = False) -> Encode:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
-    def encode(request: Request, body: dict) -> list[Send]:
+    def encode(request: Request, body: dict, config: CortexConfig) -> list[Send]:
         frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
         chunks = wire.encode_byte_chunks(
             frame, kind="request", operation=wire_op, max_bytes=_MAX_OCTET_BYTES, force_chunk=force_chunk
@@ -117,7 +113,7 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     return encode
 
 
-def _unchunked_octet(request: Request, body: dict) -> list[Send]:
+def _unchunked_octet(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
     if len(frame) > _MAX_OCTET_BYTES:
@@ -128,21 +124,8 @@ def _unchunked_octet(request: Request, body: dict) -> list[Send]:
     return [{"data": frame, "headers": _OCTET_HEADERS}]
 
 
-def _status_query(request: Request, body: dict) -> list[Send]:
+def _status_query(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     return [{"params": {"max_events": body["max_events"]}}]
-
-
-def _operation_max_json_bytes() -> int:
-    raw = os.environ.get(_OPERATION_MAX_JSON_BYTES_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_OPERATION_MAX_JSON_BYTES
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_OPERATION_MAX_JSON_BYTES_ENV} must be an integer, got {raw!r}") from exc
-    if value < _MIN_OPERATION_MAX_JSON_BYTES:
-        raise ValueError(f"{_OPERATION_MAX_JSON_BYTES_ENV} must be at least {_MIN_OPERATION_MAX_JSON_BYTES} bytes")
-    return value
 
 
 def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
@@ -158,7 +141,7 @@ def _operation_body_json_bytes(body: dict) -> int:
     return len(json.dumps(empty).encode()) + len(raw)
 
 
-def _forward(request: Request, body: dict) -> list[Send]:
+def _forward(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     """One /operation envelope per slice of the forward frame.
 
     Unlike the octet routes, chunking here happens *inside* the envelope: each
@@ -168,7 +151,7 @@ def _forward(request: Request, body: dict) -> list[Send]:
     was cached -- so they must be posted in order and the last reply kept.
     """
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
-    max_json_bytes = _operation_max_json_bytes()
+    max_json_bytes = config.forward_operation_max_json_bytes
     chunks = wire.encode_byte_chunks(
         frame,
         kind="request",
@@ -193,7 +176,7 @@ def _forward(request: Request, body: dict) -> list[Send]:
     return sends
 
 
-def _save(request: Request, body: dict) -> list[Send]:
+def _save(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     checkpoint_type = body["checkpoint_type"].lower()
     if checkpoint_type not in ("resumable", "weights-only"):
         raise ValueError("checkpoint_type must be 'resumable' or 'weights-only'")
@@ -285,10 +268,20 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
-        if getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE:
-            return bool(getattr(exc, "retry_job_not_found", False))
+        if _is_job_not_found(exc):
+            return False
         return exc.status in _TRANSIENT_STATUSES
     return False
+
+
+def _is_job_not_found(exc: BaseException) -> bool:
+    import aiohttp
+
+    return isinstance(exc, aiohttp.ClientResponseError) and getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE
+
+
+def _is_transient_during_job_visibility(exc: BaseException) -> bool:
+    return _is_job_not_found(exc) or _is_transient(exc)
 
 
 def _is_connect_error(exc: BaseException) -> bool:
@@ -310,6 +303,8 @@ _DEFAULT = _SendPolicy()
 _NO_REPLAY = _SendPolicy(retry_on=_is_connect_error)
 # Control-plane read: answer fast or fail, as cortex-training does.
 _QUICK_READ = _SendPolicy(max_retries=0, timeout=30.0)
+# A newly created job may briefly be absent from the read path.
+_JOB_VISIBILITY_READ = _SendPolicy(retry_on=_is_transient_during_job_visibility)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -317,7 +312,7 @@ class _Route:
     method: str
     # Under the prefix. `{job}` is the parent of request.job_id; other fields come from the body.
     path: str
-    encode: Callable[[Request, dict], list[Send]] = _json
+    encode: Encode = _json
     poll: bool = False
     policy: _SendPolicy = _DEFAULT
     # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
@@ -328,10 +323,10 @@ class _Route:
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
 
-    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
+    def prepare(self, prefix: str, request: Request, config: CortexConfig) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
         job = None if request.job_id is None else _parent_id(request.job_id)
-        return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body)
+        return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body, config)
 
     def submitted(self, request: Request, reply: dict) -> str | dict:
         """The request_id to poll, or the reply itself for an inline type.
@@ -356,7 +351,7 @@ class _Route:
 class _NoopRoute(_Route):
     """Sends nothing and answers `{}`, whatever the body's shape."""
 
-    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
+    def prepare(self, prefix: str, request: Request, config: CortexConfig) -> tuple[str, list[Send]]:
         return "", []
 
 
@@ -496,7 +491,7 @@ def _response_error_code(body: Any) -> str | None:
     return None
 
 
-async def _raise_for_status(resp: Any, *, retry_job_not_found: bool = False) -> None:
+async def _raise_for_status(resp: Any) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
     GS explains a 4xx in the response body; the stock error shows only the status
@@ -519,7 +514,6 @@ async def _raise_for_status(resp: Any, *, retry_job_not_found: bool = False) -> 
         headers=resp.headers,
     )
     error.error_code = _response_error_code(body)
-    error.retry_job_not_found = retry_job_not_found
     raise error
 
 
@@ -542,7 +536,7 @@ class CortexTransport(Transport):
         self.job_id: str | None = None
         self._roles: list[str] = []
         self._owns_job = False
-        self._created_at: float | None = None
+        self._awaiting_job_visibility = False
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -582,7 +576,7 @@ class CortexTransport(Transport):
             body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
             self._owns_job = True
-            self._created_at = time.monotonic()
+            self._awaiting_job_visibility = True
             # Logged before the wait: a job can stay PLACING for a long time.
             logger.info("created cortex job %s", self.job_id)
         return self.jobs
@@ -606,20 +600,24 @@ class CortexTransport(Transport):
                 self.call(cancel_job_request(self.job_id))
             self.job_id = None
             self._owns_job = False
+            self._awaiting_job_visibility = False
         self._on_loop(self._close_session()).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
-        route, future = self._submit(request)
+        return self._call(request)
+
+    def _call(self, request: Request, route: _Route | None = None) -> Any:
+        route, future = self._submit(request, route)
         return route.finish(*future.result())
 
     async def acall(self, request: Request) -> Any:
         route, future = self._submit(request)
         return route.finish(*await asyncio.wrap_future(future))
 
-    def _submit(self, request: Request) -> tuple[_Route, Future]:
-        route = _route(request.op)
-        url, sends = route.prepare(self._prefix, request)
+    def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
+        route = route or _route(request.op)
+        url, sends = route.prepare(self._prefix, request, self.config)
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
     async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
@@ -739,14 +737,10 @@ class CortexTransport(Transport):
         }
 
     def _job(self) -> dict:
-        return self.call(get_job_request(self.job_id))
-
-    def _recent_job_url(self, url: str) -> bool:
-        return bool(
-            self._created_at is not None
-            and time.monotonic() - self._created_at <= _RECENTLY_CREATED_SECONDS
-            and f"/{self.job_id}" in unquote(url)
-        )
+        route = replace(_route("get-job"), policy=_JOB_VISIBILITY_READ) if self._awaiting_job_visibility else None
+        job = self._call(get_job_request(self.job_id), route)
+        self._awaiting_job_visibility = False
+        return job
 
     async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
@@ -764,7 +758,7 @@ class CortexTransport(Transport):
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
                 if resp.status >= 400:
-                    await _raise_for_status(resp, retry_job_not_found=self._recent_job_url(url))
+                    await _raise_for_status(resp)
                 body = await resp.read()
                 # `:cancel` answers 200 with an empty body. Decoding that as JSON
                 # would report an already-completed release as a failure.
