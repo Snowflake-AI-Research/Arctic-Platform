@@ -42,7 +42,7 @@ Same env as the sibling [`gsm8k/`](../gsm8k) recipe — if you've built that,
 
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
-git clone https://github.com/huggingface/trl && git -C trl checkout e7f6928cfc0f49df6e52b05eaab7a1bdf96973e3
+git clone https://github.com/huggingface/trl && git -C trl checkout 71a032503e58f21592b2b67befeb79393c8f8c7d
 cd Arctic-Platform/recipes/rl/trl/txt2sql
 
 conda create -y -n trl_arl python=3.12

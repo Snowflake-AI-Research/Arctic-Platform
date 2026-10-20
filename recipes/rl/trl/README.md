@@ -23,13 +23,13 @@ launchers, and README. Same env across both — build it once and either recipe
 launches from that env.
 
 1. **Clone this repo and TRL #6676.** The paired trainer is
-   [huggingface/trl#6676](https://github.com/huggingface/trl/pull/6676) at `e7f6928`
+   [huggingface/trl#6676](https://github.com/huggingface/trl/pull/6676) at `71a0325`
    (instantiated models, no `training_client` argument).
 
    ```bash
    git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
    git clone https://github.com/huggingface/trl
-   git -C trl checkout e7f6928cfc0f49df6e52b05eaab7a1bdf96973e3
+   git -C trl checkout 71a032503e58f21592b2b67befeb79393c8f8c7d
    cd Arctic-Platform/recipes/rl/trl
    ```
 
