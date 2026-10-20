@@ -219,8 +219,19 @@ def _fp8_linear_bwd_input(
     return dx
 
 
+def _decode_fp8_to_bf16(weight: Tensor, scale: Tensor, block_size: int) -> Tensor:
+    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM."""
+    from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
+
+    return dequantize_fp8_blocks(weight, scale, block_size)
+
+
 class _BlockFp8LinearFn(torch.autograd.Function):
-    """FP8 GEMM in forward; FP32 ``dX = dY @ W`` in backward (frozen weights)."""
+    """FP8 GEMM in forward; ``dX = dY @ W`` in backward (frozen weights).
+
+    On CUDA the backward decodes ``W`` to BF16 once and runs one BF16 GEMM with FP32
+    accumulation; elsewhere it falls back to the chunked FP32 path.
+    """
 
     @staticmethod
     def forward(ctx, x: Tensor, weight: Tensor, scale: Tensor, block_size: int) -> Tensor:
@@ -234,8 +245,11 @@ class _BlockFp8LinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         weight, scale = ctx.saved_tensors
-        go = grad_output.reshape(-1, grad_output.shape[-1]).float()
-        dx = _fp8_linear_bwd_input(go, weight, scale, ctx.block_size)
+        go = grad_output.reshape(-1, grad_output.shape[-1])
+        if go.is_cuda:
+            dx = go.bfloat16() @ _decode_fp8_to_bf16(weight, scale, ctx.block_size)
+        else:
+            dx = _fp8_linear_bwd_input(go.float(), weight, scale, ctx.block_size)
         return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None
 
 
@@ -394,6 +408,8 @@ class _GroupedBlockFp8MmFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         weight, scale, num_tokens_per_expert = ctx.saved_tensors
+        if grad_output.is_cuda:
+            return _GroupedBlockFp8MmFn._backward_decoded(ctx, grad_output, weight, scale, num_tokens_per_expert)
         counts = num_tokens_per_expert.tolist()
         n_real = int(sum(counts))
         go = grad_output[:n_real].float()
@@ -405,6 +421,21 @@ class _GroupedBlockFp8MmFn(torch.autograd.Function):
         n_tail = grad_output.shape[0] - n_real
         if n_tail:
             dx = torch.vstack((dx, dx.new_zeros((n_tail, dx.shape[-1]))))
+        return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None, None
+
+    @staticmethod
+    def _backward_decoded(ctx, grad_output: Tensor, weight: Tensor, scale: Tensor, num_tokens_per_expert: Tensor):
+        """``dX_e = dY_e @ W_e`` for every local expert as one BF16 grouped GEMM on the decoded experts.
+
+        ``ctx.counts`` was read on the host in forward, so the row count needs no device sync here.
+        Rows past the last expert are padding, which the grouped GEMM leaves unwritten.
+        """
+        n_real = int(sum(ctx.counts))
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        decoded = _decode_fp8_to_bf16(weight, scale, ctx.block_size)
+        dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
+        if n_real < dx.shape[0]:
+            dx[n_real:].zero_()
         return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None, None
 
 
