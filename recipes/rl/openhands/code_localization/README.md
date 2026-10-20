@@ -74,8 +74,8 @@ placement wait past the default hour.
 
 The script exits if `uv` is missing, `SKYRL_HOME` is wrong, a parquet is
 missing, credentials do not load, or the batch would exceed Cortex's 128 MiB
-response cap. Leave the process up. 100 steps takes about half a day. The log
-is `$CKPT_DIR/$RUN_NAME.log` (default
+response cap. Leave the process up until the run finishes. The log is
+`$CKPT_DIR/$RUN_NAME.log` (default
 `~/checkpoints/qwen35-4b-openhands-localization`).
 
 | Knob | Value |
