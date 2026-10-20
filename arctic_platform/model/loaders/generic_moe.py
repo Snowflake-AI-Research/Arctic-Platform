@@ -30,6 +30,7 @@ from arctic_platform.model.implementations.moe.config_validation import validate
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
@@ -43,7 +44,7 @@ class GenericMoeOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
@@ -69,8 +70,6 @@ def _matches(ctx: LoaderContext) -> bool:
 
 
 def _validate_spec(spec: ModelSpec) -> None:
-    if spec.attn_implementation is None:
-        spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("generic MoE dtype must be 'bfloat16' or 'float32'")
     if spec.patches.liger:
@@ -91,11 +90,24 @@ def _validate_spec(spec: ModelSpec) -> None:
         )
 
 
+def _resolve_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
+        ep_comm_backend="deepep",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    )
+
+
 @register_loader(
     "generic_moe",
     matches=_matches,
     options=GenericMoeOptions,
     validate_spec=_validate_spec,
+    resolve_spec=_resolve_spec,
 )
 def load_generic_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

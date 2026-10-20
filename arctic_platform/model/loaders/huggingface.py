@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 
 
 class HuggingfaceOptions(BaseModel):
@@ -90,7 +91,12 @@ def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
     )
 
 
-@register_loader("huggingface", default=True, options=HuggingfaceOptions)
+@register_loader(
+    "huggingface",
+    resolve_spec=resolve_spec_with_defaults,
+    default=True,
+    options=HuggingfaceOptions,
+)
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
     if parallelism.expert_parallel != 1:
