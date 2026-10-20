@@ -258,6 +258,7 @@ vLLM settings on `sampling`.
 | `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
 | `training_job_id` / `sampling_job_id` | `null` | Reattach to existing jobs |
 | `backend.request_timeout` / `backend.poll_timeout` / `backend.job_ready_timeout` | 1800 / 1800 / 1800 | Cortex-only HTTP, operation polling, and job readiness limits in seconds |
+| `backend.idle_timeout_seconds` / `backend.pending_timeout_seconds` | server default (1800 / 86400) | Cortex-only: the server reclaims an idle job, and fails one still waiting for capacity |
 
 The LR scheduler's total optimizer-step count is DeepSpeed's `total_num_steps`
 inside `ds_config`. Set it to the real step budget, not epoch count.
