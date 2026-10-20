@@ -6,7 +6,10 @@ import logging
 import os
 import random
 import re
+import shutil
 import stat
+import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -28,6 +31,10 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
 )
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
+)
+from arctic_platform.inference.vllm.startup_error import (
+    ENV_VAR as _STARTUP_ERROR_DIR_ENV,
+    earliest_startup_error,
 )
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
@@ -63,6 +70,25 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     replaces xgrammar's stop set rather than extending it.
     """
     eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
+    return _stop_token_ids(eos, tokenizer)
+
+
+def _semip_grammar_stop_token_ids(model: str, tokenizer: Any) -> tuple[int, ...]:
+    """``_grammar_stop_token_ids`` for a restored engine, which has no vllm_config.
+
+    Reads the same generation config vLLM's default ``generation_config="auto"``
+    does.
+    """
+    from transformers import GenerationConfig
+
+    try:
+        eos = GenerationConfig.from_pretrained(model).eos_token_id
+    except OSError:
+        eos = None
+    return _stop_token_ids(eos, tokenizer)
+
+
+def _stop_token_ids(eos: Any, tokenizer: Any) -> tuple[int, ...]:
     stop = set()
     if isinstance(eos, int):
         stop.add(eos)
@@ -288,6 +314,46 @@ def _console_tail(max_bytes: int = 4096) -> str:
         except OSError:
             continue
     return "\n".join(tails)
+
+
+def _begin_engine_startup_capture() -> str | None:
+    """Point this attempt's engine processes at a fresh directory for their startup failure."""
+    try:
+        directory = tempfile.mkdtemp(prefix="arctic-engine-startup-")
+    except OSError as exc:
+        logger.info("Engine startup failures are not recorded for this attempt: %s", exc)
+        return None
+    os.environ[_STARTUP_ERROR_DIR_ENV] = directory
+    return directory
+
+
+def _end_engine_startup_capture(directory: str | None) -> None:
+    os.environ.pop(_STARTUP_ERROR_DIR_ENV, None)
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeError | None:
+    """vLLM's generic startup error with the earliest engine process's own failure appended.
+
+    The root has to be in the message: Ray drops ``__cause__``, and dss-platform's
+    classifier matches on the error's type and ``str()``, which leaves out
+    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
+    replaced, so every other type keeps the type a classifier matches on. Returns
+    None, so the original is raised as it is, for any other type, when there is no
+    record, or when reading one fails; the last two are logged.
+    """
+    if directory is None or type(exc) is not RuntimeError:
+        return None
+    try:
+        root_cause = earliest_startup_error(directory)
+    except Exception:
+        logger.info("Engine startup root cause not appended: reading %s failed", directory, exc_info=True)
+        return None
+    if root_cause is None:
+        logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
+        return None
+    return RuntimeError(f"{exc}\n{root_cause}")
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -668,11 +734,64 @@ class WorkerLifecycleState(str, Enum):
     SLEEPING = "sleeping"
 
 
+_ACTOR_LOG_HANDLER_MARK = "_arctic_actor_handler"
+
+
+def _ensure_actor_logging(level: int = logging.INFO) -> str:
+    """Give the ``arctic_platform.inference`` logger somewhere to go inside this actor.
+
+    DSS installs its structured root pipeline in zone and driver processes, but
+    ``InferenceWorker`` is a plain ``@ray.remote`` actor and nothing configures
+    logging there.  The root logger keeps its default state, so
+    ``logging.lastResort`` takes over: WARNING and above, unformatted, and
+    everything at INFO discarded.  That is why no ``logger.info`` from
+    ``semip_engine`` has ever appeared in a collected log, including the
+    materialize timing it has emitted since that feature shipped.
+
+    **The level matters as much as the handler.**  ``arctic_platform.inference`` sits at
+    ``NOTSET``, so its effective level is inherited from root's ``WARNING`` and
+    INFO records are dropped before any handler is consulted.  Attaching a
+    handler alone changes nothing.
+
+    Returns a short description of what it did, for the caller to log.  Never
+    raises: losing the log costs evidence, not correctness, and this runs in
+    ``__init__`` where an exception would kill actor construction.
+    """
+    try:
+        if logging.getLogger().handlers:
+            # Something already configured the root pipeline (DSS's own
+            # setup_logging in a driver-hosted actor, or a prior call here), so
+            # propagation already reaches a sink.  Only the level may need help.
+            pkg = logging.getLogger("arctic_platform.inference")
+            if pkg.level == logging.NOTSET:
+                pkg.setLevel(level)
+            return "root already configured; level ensured"
+        pkg = logging.getLogger("arctic_platform.inference")
+        for h in pkg.handlers:
+            if getattr(h, _ACTOR_LOG_HANDLER_MARK, False):
+                return "already attached"
+        handler = logging.StreamHandler(sys.stdout)
+        setattr(handler, _ACTOR_LOG_HANDLER_MARK, True)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s "
+            "%(filename)s:%(lineno)d %(message)s"))
+        pkg.addHandler(handler)
+        pkg.setLevel(level)
+        return "attached stdout handler to arctic_platform.inference"
+    except Exception as exc:  # noqa: BLE001
+        return f"failed: {exc!r}"
+
+
 @ray.remote
 class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
 
     def __init__(self) -> None:
+        # First, so that everything below is loggable.  Reported rather than
+        # assumed: a StreamHandler here reaches Ray's worker log, which is not
+        # the file most semi-p debugging reads, so this line is how you find out
+        # whether the records land anywhere you collect.
+        logger.info("InferenceWorker logging: %s", _ensure_actor_logging())
         self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
@@ -766,6 +885,50 @@ class InferenceWorker(StreamingWorkerMixin):
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
 
+        # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
+        # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
+        # kwargs); if set, build the Instance-backed adapter and return early.
+        semi_p = bool(engine_kwargs.pop("semi_p", False))
+        # Popped unconditionally even though it is no longer a config field: a
+        # dss that predates the derived image cache still sends it, and
+        # BaseConfig's extra="allow" would carry it into AsyncEngineArgs.
+        engine_kwargs.pop("semi_p_model_dir", None)
+        # The other node-partitions of an engine whose TP group spans pods. Popped the
+        # same way and for the same reason: AsyncEngineArgs rejects what it
+        # does not know, and Ray actor handles are certainly that.
+        semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
+        if semi_p:
+            # A restored engine has neither, and serving without them returns
+            # plausible output that is wrong, so refuse before restoring.
+            if lora_adapter_path:
+                raise ValueError(
+                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
+                    "a restored engine serves the base weights it was dumped "
+                    "with. Disable semi_p for this job.")
+            if engine_kwargs.get("enable_return_routed_experts"):
+                raise ValueError(
+                    "semi_p does not capture routed experts, so router replay "
+                    "would get none. Disable semi_p for this job.")
+            from arctic_platform.inference.server.semip_engine import restore_and_wrap
+            self.llm = await asyncio.to_thread(
+                restore_and_wrap, engine_kwargs, semi_p_agents)
+            if not engine_kwargs.get("skip_tokenizer_init"):
+                self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
+                    engine_kwargs["model"], self.llm.get_tokenizer())
+            self.state = WorkerLifecycleState.READY
+            self._maybe_init_reasoning_parser(reasoning_parser_name)
+            logger.info(
+                "Worker %d initialized via semi_p restore: model=%s",
+                os.getpid(), engine_kwargs.get("model"),
+            )
+            return
+
+        from arctic_platform.inference.semi_persistence import matched_baseline
+        if matched_baseline.requested():
+            changed = matched_baseline.apply(engine_kwargs)
+            logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
+                        matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
+
         # Force-load vLLM general_plugins before constructing AsyncEngineArgs.
         # vLLM normally calls load_general_plugins() in
         # AsyncEngineArgs.__post_init__, which runs *after* __init__ has
@@ -797,6 +960,7 @@ class InferenceWorker(StreamingWorkerMixin):
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
         for attempt in range(1, max_attempts + 1):
+            startup_error_dir = _begin_engine_startup_capture()
             try:
                 attempt_kwargs = dict(engine_kwargs)
                 engine_args = _create_async_engine_args(
@@ -835,8 +999,13 @@ class InferenceWorker(StreamingWorkerMixin):
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
                 if attempt >= max_attempts or not _is_address_in_use_error(exc):
-                    if tail := _console_tail():
-                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                    tail = _console_tail()
+                    startup_exc = _engine_startup_error(exc, startup_error_dir)
+                    target = startup_exc if startup_exc is not None else exc
+                    if len(tail) > 0:
+                        target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                    if startup_exc is not None:
+                        raise startup_exc from exc
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
@@ -848,6 +1017,8 @@ class InferenceWorker(StreamingWorkerMixin):
                     exc_info=True,
                 )
                 await asyncio.sleep(delay_s)
+            finally:
+                _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
@@ -1248,6 +1419,10 @@ class InferenceWorker(StreamingWorkerMixin):
     def pid(self) -> int:
         return os.getpid()
 
+    def get_node_id(self) -> str:
+        """The Ray node (pod) this actor runs on, which ReplicaPool numbers slots by."""
+        return ray.get_runtime_context().get_node_id()
+
     async def init_router_replay(
         self,
         master_addr: str,
@@ -1551,6 +1726,10 @@ class InferenceWorker(StreamingWorkerMixin):
     def shutdown(self) -> None:
         self._cleanup_registered_router_replay_shm()
         if self.llm is not None:
+            # semi_p engine holds an out-of-process Instance; tear it down.
+            close = getattr(self.llm, "close", None)
+            if callable(close):
+                close()
             del self.llm
             self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
