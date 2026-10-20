@@ -1,29 +1,120 @@
-# OpenHands code localization on Cortex
+# Bring your own agent: OpenHands code localization
 
-Train Qwen3.5-4B to name the file, class, and function a bug touches. The
-driver is a CPU process. Cortex runs 4 training GPUs and 4 sampling GPUs.
-SkyRL runs GRPO. The agent is OpenHands: `terminal` to search, then
-`localization_finish` to submit.
+Train a model inside the agent you already run. The agent keeps its own loop,
+tools, and sandbox. Training changes where it sends model calls: each rollout
+gets its own OpenAI-compatible URL and API key, served by the policy being
+trained. This recipe is the worked example, with an unmodified
+[OpenHands](https://github.com/OpenHands/software-agent-sdk) agent.
 
-The reward is file F1 + module F1 + function F1 (maximum 3). A rollout that
-never submits within 10 turns is left out of the loss.
+The task is code localization: given a bug report, name the file, class, and
+function to change. The agent searches with `terminal` and submits with
+`localization_finish`. The reward is file F1 + module F1 + function F1
+(maximum 3). Qwen3.5-4B trains with GRPO. SkyRL drives the loop from a CPU
+machine, and Cortex runs 4 training and 4 sampling GPUs.
 
-Job setup goes through `arctic_platform.integrations.skyrl.entrypoint.launch_driver`.
-The branch is `karthik/openhands-cortex`.
+## How an agent plugs in
 
-This directory is one example. The chat endpoint and the episodes live in
-`arctic_platform.integrations.harness` and do not import a harness.
-`HarnessGenerator` calls `submit`, `get_status`, and `collect_output`. The
-request carries the dataset row, the phase, `base_url` from
-`ChatCompletionsProxy.url_for(routing_key)`, and a bearer token from `issue`.
-The proxy keeps each sampled response and splices it into the next prompt.
-The grader scores `collect_output`. The adapter does not return tokens or a
-reward. OpenHands, OpenCode, or Codex can supply those three methods.
+The agent connects in two places:
 
-`openhands_localization` is the OpenHands example: the sandbox, the tools,
-and `grade_localization`. A different task copies this directory and replaces
-those three. The launcher refuses to start when a cached wheel shadows
-`launch_driver`.
+1. **The model endpoint.** `submit` receives a `base_url` and an `api_key` for
+   the rollout. The agent's OpenAI client uses them. To the agent, a training
+   rollout looks like ordinary inference.
+2. **The rollout lifecycle.** An adapter with three methods:
+   `submit(request) -> rollout_id`, `get_status(rollout_id)` returning
+   `running`, `completed`, or `errored`, and `collect_output(rollout_id)`
+   returning the artifacts.
+
+A grader turns the artifacts into a reward. The agent never sees the reward.
+The endpoint records every model call with the token ids the policy sampled,
+and reuses them when the next call continues the conversation, so training
+sees exactly what the model generated.
+
+| Piece | This example |
+| --- | --- |
+| `submit` | Clones the task repository and starts an OpenHands conversation in a thread, with the rollout's `base_url` and `api_key` as its LLM settings |
+| `get_status` | The thread's state |
+| `collect_output` | The conversation and the `localization_finish` locations |
+| Grader | `grade_localization`: F1 sum. A rollout that uses all 10 turns without submitting is left out of the loss |
+
+The adapter and grader are in `openhands_localization/rollout.py`. The wiring
+is `get_generator` in `openhands_localization/entrypoint.py`. The endpoint
+(`ChatCompletionsProxy`) and the generator (`HarnessGenerator`) are in
+`arctic_platform.integrations.harness` and know nothing about OpenHands.
+
+## Use your own agent
+
+1. Copy this directory and rename the `openhands_localization` package.
+2. Write an adapter and a grader, then build them in `get_generator` in place
+   of `OpenHandsAdapter` and `grade_localization`. Keep the endpoint and
+   `HarnessGenerator`.
+3. In the run script, point `trainer.override_entrypoint` at your package and
+   replace the OpenHands `--with` packages with your agent's.
+4. Write `train.parquet` and `validation.parquet`. Each row needs a `prompt`
+   column of chat messages. The adapter and grader read the other columns from
+   `request.env_extra`.
+
+An adapter that runs the agent as a command:
+
+```python
+import os
+import subprocess
+import tempfile
+import threading
+
+from arctic_platform.integrations.harness.generator import Grade
+from arctic_platform.integrations.harness.generator import RolloutRequest
+
+
+class CommandAdapter:
+    """Runs the agent as a subprocess pointed at the rollout's model endpoint."""
+
+    def __init__(self, command: list[str]) -> None:
+        self.command = command
+        self.runs = {}
+        self.lock = threading.Lock()
+
+    def submit(self, request: RolloutRequest) -> str:
+        workdir = tempfile.mkdtemp(prefix="rollout-")
+        env = dict(os.environ, OPENAI_BASE_URL=request.base_url, OPENAI_API_KEY=request.api_key)
+        task = request.env_extra["problem_statement"]
+        process = subprocess.Popen([*self.command, task], cwd=workdir, env=env)
+        with self.lock:
+            self.runs[request.routing_key] = (process, workdir)
+        return request.routing_key
+
+    def get_status(self, rollout_id: str) -> str:
+        with self.lock:
+            process, _ = self.runs[rollout_id]
+        if process.poll() is None:
+            return "running"
+        return "completed" if process.returncode == 0 else "errored"
+
+    def collect_output(self, rollout_id: str) -> dict:
+        with self.lock:
+            _, workdir = self.runs.pop(rollout_id)
+        answer = os.path.join(workdir, "answer.txt")
+        if not os.path.exists(answer):
+            return {}
+        with open(answer) as f:
+            return {"answer": f.read().strip()}
+
+
+def grade(episodes, artifacts, request) -> Grade:
+    correct = artifacts.get("answer") == request.env_extra["expected_answer"]
+    return Grade(reward=float(correct), reward_detail={"correct": float(correct)})
+```
+
+- `submit` must return without waiting for the agent. Rollouts in a batch run
+  concurrently, and the methods are called from worker threads.
+- The endpoint takes OpenAI chat completions with `n=1` and no streaming.
+  `tools` work; Hermes JSON and Qwen3.5 XML tool calls come back as
+  `tool_calls`. `chat_template_kwargs` goes to the chat template.
+- `Grade(reward, reward_detail, exhausted=False)`. Numeric `reward_detail` keys
+  are logged as `reward/<key>`. `exhausted=True` drops the rollout from the
+  loss.
+- A call that does not continue the conversation, such as a compaction
+  summary or a subagent, starts a new context. Set
+  `generator.step_wise_trajectories=true` to train on every context.
 
 ## Install
 
@@ -83,10 +174,12 @@ the model cache and the wheel cache. `STARTUP_TIMEOUT=14400` extends the
 placement wait past the default hour.
 
 The script exits if `uv` is missing, `SKYRL_HOME` is wrong, a parquet is
-missing, credentials do not load, or the batch would exceed Cortex's 128 MiB
-response cap. Leave the process up until the run finishes. The log is
+missing, credentials do not load, the batch would exceed Cortex's 128 MiB
+response cap, or a cached Arctic Platform wheel would hide this checkout.
+Leave the process up until the run finishes. The log is
 `$CKPT_DIR/$RUN_NAME.log` (default
-`~/checkpoints/qwen35-4b-openhands-localization`).
+`~/checkpoints/qwen35-4b-openhands-localization`). Each rollout's conversation,
+reward, and submission are saved under `$CKPT_DIR/trajectories/step_<n>/`.
 
 | Knob | Value |
 | --- | --- |
