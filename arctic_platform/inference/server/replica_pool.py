@@ -21,7 +21,7 @@ from arctic_platform.inference.server.scheduler import (
     prefix_affinity_routing,
 )
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
-from arctic_platform.inference.server.worker import SPT_NOENV_ENV, WORKER_ACTOR_ID_ENV, InferenceWorker
+from arctic_platform.inference.server.worker import WORKER_ACTOR_ID_ENV, InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
 
@@ -186,40 +186,47 @@ def _kill_process_trees(
     tag_env: str = WORKER_ACTOR_ID_ENV,
     title_marker: str = "VLLM::",
     gpu_device_prefix: str = "/dev/nvidia",
-) -> dict[str, list[int]]:
+) -> dict[str, Any]:
     """SIGKILL the descendants of every ``(pid, started_by_s, kill_root)``
     root, the root itself when ``kill_root``, and the orphaned vLLM
     processes of the workers named in ``orphan_tags``.
 
     Runs on the node that owns the pids. Descendants are collected before
     anything is signalled, so a child cannot be reparented out of reach
-    first. A root created after ``started_by_s`` is a reused pid, not the
-    actor, and is skipped. One process that cannot be inspected or signalled
-    (``AccessDenied``, e.g. a helper running as another user) does not stop
-    the others; it is returned under ``denied``.
+    first, and they are signalled before the orphan scan starts, so nothing
+    the scan reads can hold them up. A root created after ``started_by_s``
+    is a reused pid, not the actor, and is skipped. One process that cannot
+    be inspected or signalled (``AccessDenied``, e.g. a helper running as
+    another user) does not stop the others; it is returned under ``denied``.
 
     The orphan scan finds what the tree walk cannot: processes whose parent
     died before this ran (the worker itself, or EngineCore under a live
     worker), and which were reparented away. A process is killed only if all
-    of these hold:
+    of these hold, checked in this order:
 
-    - its command line carries vLLM's process title (``title_marker``);
     - it is orphaned: its parent is pid 1, gone, or a zombie. A process
       whose parent is alive, a Ray worker for instance, is never touched;
     - it has a GPU device (``gpu_device_prefix`` + a number) open;
+    - its command line carries vLLM's process title (``title_marker``);
     - its environment names one of ``orphan_tags`` under ``tag_env``. The
       worker sets that to its own actor id before it starts the engine, and
       every vLLM process inherits it.
 
-    One that meets the first three but carries no tag, or whose environment
-    cannot be read, is not attributable to any worker. It is left alone and
-    returned under ``unattributed``.
+    The first two read only ``/proc/<pid>/stat`` and ``/proc/<pid>/fd``.
+    The last two read the process's memory, which can block on a process in
+    uninterruptible sleep, so they are done only for orphaned GPU holders.
+
+    Of the orphaned vLLM GPU holders that are not killed, one that carries
+    no tag, or whose environment cannot be read, is returned under
+    ``unattributed``; one that carries another tag (another worker's, or the
+    dumping worker's in a CRIU-restored semi-p tree) under ``foreign``, as
+    ``(pid, tag)``.
 
     Returns the pids signalled (``killed``, the orphans among them also
     under ``orphans``), those still running after ``wait_s`` (a process in
     uninterruptible sleep can outlive SIGKILL for a while, and its GPU memory
-    with it), and the ``denied`` and ``unattributed`` ones. A zombie counts
-    as gone: it holds no memory.
+    with it), and ``denied``, ``unattributed`` and ``foreign``. A zombie
+    counts as gone: it holds no memory.
 
     Self-contained (no module globals) so that it can run as a by-value
     task; see :func:`_by_value`.
@@ -228,6 +235,8 @@ def _kill_process_trees(
     import time
 
     import psutil
+
+    proc_fs = os.path.isdir("/proc/self/fd")
 
     def running(proc):
         try:
@@ -238,34 +247,53 @@ def _kill_process_trees(
         except psutil.Error:
             return True
 
-    def orphaned(proc):
-        ppid = proc.ppid()
+    def stat(pid):
+        """``(state, ppid)`` from /proc/<pid>/stat, or psutil off Linux."""
+        if not proc_fs:
+            proc = psutil.Process(pid)
+            return proc.status(), proc.ppid()
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            fields = f.read().rsplit(b")", 1)[1].split()
+        state = psutil.STATUS_ZOMBIE if fields[0] == b"Z" else "other"
+        return state, int(fields[1])
+
+    def orphaned(pid):
+        state, ppid = stat(pid)
+        if state == psutil.STATUS_ZOMBIE:
+            return False
         if ppid <= 1:
             return True
         try:
-            return psutil.Process(ppid).status() == psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
+            return stat(ppid)[0] == psutil.STATUS_ZOMBIE
+        except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
             return True
 
     def gpu_device(path):
         return path.startswith(gpu_device_prefix) and path[len(gpu_device_prefix):].isdigit()
 
-    def holds_gpu(proc):
-        fd_dir = f"/proc/{proc.pid}/fd"
-        if os.path.isdir("/proc"):
-            # psutil's open_files() lists regular files only on Linux, and
-            # GPU devices are character devices.
+    def holds_gpu(pid):
+        if not proc_fs:
+            return any(gpu_device(f.path) for f in psutil.Process(pid).open_files())
+        # Not psutil's open_files(): on Linux it lists regular files only,
+        # and GPU devices are character devices.
+        fd_dir = f"/proc/{pid}/fd"
+        for fd in os.listdir(fd_dir):
             try:
-                for fd in os.listdir(fd_dir):
-                    try:
-                        if gpu_device(os.readlink(os.path.join(fd_dir, fd))):
-                            return True
-                    except OSError:
-                        continue
+                if gpu_device(os.readlink(os.path.join(fd_dir, fd))):
+                    return True
             except OSError:
-                return False
-            return False
-        return any(gpu_device(f.path) for f in proc.open_files())
+                continue
+        return False
+
+    def signal(procs, killed, denied):
+        for pid, proc in procs.items():
+            try:
+                proc.kill()
+                killed.append(pid)
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                denied.add(pid)
 
     me = os.getpid()
     targets = {}
@@ -293,20 +321,25 @@ def _kill_process_trees(
         for proc in tree:
             if proc.pid not in (me, 1):
                 targets[proc.pid] = proc
+    killed = []
+    signal(targets, killed, denied)
+    signalled = dict(targets)
 
-    orphans = []
+    orphans = {}
     unattributed = []
+    foreign = []
     tags = set(orphan_tags)
     if len(tags) > 0:
-        for proc in psutil.process_iter():
-            if proc.pid in targets or proc.pid in (me, 1):
+        for pid in psutil.pids():
+            if pid in signalled or pid in (me, 1):
                 continue
             try:
+                if not orphaned(pid) or not holds_gpu(pid):
+                    continue
+                proc = psutil.Process(pid)
                 if title_marker not in " ".join(proc.cmdline()):
                     continue
-                if not orphaned(proc) or not holds_gpu(proc):
-                    continue
-            except psutil.Error:
+            except (OSError, ValueError, IndexError, psutil.Error):
                 continue
             try:
                 tag = proc.environ().get(tag_env)
@@ -315,23 +348,17 @@ def _kill_process_trees(
             except psutil.Error:
                 tag = None
             if tag in tags:
-                targets[proc.pid] = proc
-                orphans.append(proc.pid)
+                orphans[pid] = proc
             elif tag is None:
-                unattributed.append(proc.pid)
+                unattributed.append(pid)
+            else:
+                foreign.append((pid, tag))
+    signal(orphans, killed, denied)
+    signalled.update(orphans)
 
-    killed = []
-    for pid, proc in targets.items():
-        try:
-            proc.kill()
-            killed.append(pid)
-        except psutil.NoSuchProcess:
-            pass
-        except psutil.Error:
-            denied.add(pid)
     # Not psutil.wait_procs: that waits on a zombie until the timeout, and a
     # SIGKILLed child whose parent is still alive stays one.
-    alive = [targets[pid] for pid in killed]
+    alive = [signalled[pid] for pid in killed]
     end = time.monotonic() + wait_s
     while True:
         alive = [proc for proc in alive if running(proc)]
@@ -344,6 +371,7 @@ def _kill_process_trees(
         denied=sorted(denied),
         orphans=sorted(set(orphans) & set(killed)),
         unattributed=sorted(unattributed),
+        foreign=sorted(foreign),
     )
 
 
@@ -587,6 +615,15 @@ async def _kill_actor_trees(
                 names[node_id],
                 node_id,
             )
+        if len(result.get("foreign", [])) > 0:
+            logger.warning(
+                "Orphaned vLLM processes on node %s hold a GPU but carry another worker's id, so they were left "
+                "running while killing %s (pid, id): %s. A CRIU-restored semi-p engine carries the id of the "
+                "worker that dumped it",
+                node_id,
+                names[node_id],
+                [tuple(item) for item in result["foreign"]],
+            )
         if len(result.get("unattributed", [])) > 0:
             logger.error(
                 "Orphaned vLLM processes %s on node %s hold a GPU but name no worker, so they were left running "
@@ -653,20 +690,6 @@ async def _wait_until_dead(
                 label if label in seen else f"{label} (state unreadable)" for label, _, _ in pending
             ]
         await asyncio.sleep(min(_KILL_POLL_INTERVAL_S, remaining))
-
-
-def _runtime_env_vars(extra_env: dict[str, Any] | None) -> dict[str, str]:
-    """``extra_env`` as Ray runtime_env vars, plus ``SPT_NOENV=1`` unless the
-    caller set it.
-
-    On a placement-group path vLLM's Ray executor starts each rank's worker
-    with the coordinator's runtime_env, not its ``os.environ``, so what
-    InferenceWorker.initialize sets there does not reach them; see
-    :data:`~arctic_platform.inference.server.worker.SPT_NOENV_ENV`.
-    """
-    env_vars = {k: str(v) for k, v in (extra_env or {}).items()}
-    env_vars.setdefault(SPT_NOENV_ENV, "1")
-    return env_vars
 
 
 def ensure_ray() -> int:
@@ -842,7 +865,11 @@ class ReplicaPool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
-        options["runtime_env"] = {"env_vars": _runtime_env_vars(self._config.extra_env)}
+        worker_env = {
+            k: str(v) for k, v in (self._config.extra_env or {}).items()
+        }
+        if worker_env:
+            options["runtime_env"] = {"env_vars": worker_env}
         return options
 
     def _make_semip_agents(self) -> list[ray.actor.ActorHandle]:
@@ -898,7 +925,11 @@ class ReplicaPool:
             # runtime_env from extra_env at actor-creation time is what makes it
             # propagate cluster-wide. (Single-node mp workers inherit the
             # coordinator's os.environ directly, so they need no runtime_env.)
-            options["runtime_env"] = {"env_vars": _runtime_env_vars(self._config.extra_env)}
+            worker_env = {
+                k: str(v) for k, v in (self._config.extra_env or {}).items()
+            }
+            if worker_env:
+                options["runtime_env"] = {"env_vars": worker_env}
             return self._worker_cls.options(**options).remote()
         return self._worker_cls.options(
             num_gpus=self._ray_num_gpus,
@@ -1182,6 +1213,16 @@ class ReplicaPool:
         be read) is not killed; it is logged as an ERROR. The cluster-level
         backstop for those is Ray's
         ``RAY_kill_child_processes_on_worker_exit_with_raylet_subreaper``.
+
+        Semi-p limitation: a CRIU-restored engine's processes carry the actor
+        id of the worker that dumped the image, not of the worker that
+        restored it, so their orphans match no worker being killed. They are
+        logged as a WARNING with their pids and ids, and left running.
+
+        ``timeout_s`` bounds everything, the per-node task included, and
+        that task's scheduling. Under the short budget a cancelled caller
+        gets (``_CANCELLED_KILL_CONFIRM_TIMEOUT_S``), on a busy node the task
+        may not even start, and often only ``ray.kill`` lands.
         """
         try:
             await self._kill_workers_and_confirm_impl(

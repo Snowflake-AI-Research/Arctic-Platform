@@ -122,13 +122,13 @@ def _install(monkeypatch, gcs: _FakeGcs, *, ranks: list[dict] | None = None):
 
     async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
         if len(roots) == 0:
-            return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
+            return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
         tree_kills.append((node_id, list(roots)))
         by_pid = {row["Pid"]: actor_id for actor_id, row in gcs.rows.items()}
         for pid, _, kill_root in roots:
             if kill_root:
                 gcs.kill(by_pid[pid])
-        return dict(killed=[pid + 10_000 for pid, _, _ in roots], alive=[], denied=[], orphans=[], unattributed=[])
+        return dict(killed=[pid + 10_000 for pid, _, _ in roots], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
 
     def ray_kill(actor):
         killed.append(actor.actor_id)
@@ -580,7 +580,7 @@ def test_kill_process_trees_kills_descendants():
         result = replica_pool_mod._kill_process_trees([(root.pid, started, True)], wait_s=10.0)
 
         # Reported gone even if nothing has reaped the reparented grandchild yet.
-        assert result == dict(killed=sorted([root.pid, child_pid]), alive=[], denied=[], orphans=[], unattributed=[])
+        assert result == dict(killed=sorted([root.pid, child_pid]), alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
         assert _gone(child_pid)
     finally:
         root.kill()
@@ -592,7 +592,7 @@ def test_kill_process_trees_leaves_root_when_asked():
     try:
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, False)], wait_s=10.0)
 
-        assert result == dict(killed=[child_pid], alive=[], denied=[], orphans=[], unattributed=[])
+        assert result == dict(killed=[child_pid], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
         assert _gone(child_pid)
         assert root.poll() is None
     finally:
@@ -609,7 +609,7 @@ def test_kill_process_trees_skips_reused_pid():
 
         result = replica_pool_mod._kill_process_trees([(root.pid, started, True)], wait_s=1.0)
 
-        assert result == dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
+        assert result == dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
         assert root.poll() is None
     finally:
         root.kill()
@@ -628,7 +628,7 @@ def test_kill_process_trees_counts_a_zombie_as_gone():
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, False)], wait_s=5.0)
 
         # Signalled, then reported gone at once rather than after the wait.
-        assert result == dict(killed=[zombie_pid], alive=[], denied=[], orphans=[], unattributed=[])
+        assert result == dict(killed=[zombie_pid], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
         assert time.monotonic() - start < 2.0
         assert root.poll() is None
     finally:
@@ -649,7 +649,7 @@ def test_kill_process_trees_continues_past_access_denied(monkeypatch):
     try:
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, True)], wait_s=10.0)
 
-        assert result == dict(killed=[root.pid], alive=[], denied=[child_pid], orphans=[], unattributed=[])
+        assert result == dict(killed=[root.pid], alive=[], denied=[child_pid], orphans=[], unattributed=[], foreign=[])
         assert _gone(root.pid)
     finally:
         monkeypatch.undo()
@@ -757,6 +757,7 @@ def test_orphan_scan_kills_only_attributed_orphans(fake_gpu):
         assert result["killed"] == [orphan]
         assert result["alive"] == []
         assert result["unattributed"] == [untagged]
+        assert result["foreign"] == [(other, "actor8")]
         assert _gone(orphan)
         # Another worker's orphan, and a vLLM process whose parent is alive,
         # are never touched.
@@ -837,7 +838,7 @@ def test_restart_uses_the_slot_node_once_the_gcs_dropped_the_worker(monkeypatch)
 
     async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
         scans.append((node_id, list(roots), orphan_tags))
-        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
+        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[], foreign=[])
 
     monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
     monkeypatch.setattr(replica_pool_mod, "_read_actor_records", lambda ids: [{} for _ in ids])
@@ -861,7 +862,7 @@ def test_unattributed_orphans_are_logged_not_killed(monkeypatch, caplog):
     async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
         for pid, _, kill_root in roots:
             gcs.kill(worker.actor_id)
-        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[4242])
+        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[4242], foreign=[])
 
     monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
     caplog.set_level(logging.ERROR, logger=_LOGGER)
@@ -1017,7 +1018,89 @@ def test_initialize_sets_worker_id_and_spt_noenv_before_engine_start(monkeypatch
     assert seen_env == [dict(ARCTIC_INFERENCE_WORKER_ACTOR_ID="c0ffee01000000", SPT_NOENV=expected_noenv)]
 
 
-def test_placement_group_runtime_env_carries_spt_noenv():
-    assert replica_pool_mod._runtime_env_vars({"NCCL_X": 1}) == {"NCCL_X": "1", "SPT_NOENV": "1"}
-    assert replica_pool_mod._runtime_env_vars({"SPT_NOENV": "0"}) == {"SPT_NOENV": "0"}
-    assert replica_pool_mod._runtime_env_vars(None) == {"SPT_NOENV": "1"}
+def test_tree_is_signalled_before_the_scan_reads_any_process_memory(monkeypatch, fake_gpu):
+    """cmdline and environ read process memory and can block on a process in
+    uninterruptible sleep. Only orphaned GPU holders get those reads, and only
+    after the tree has been signalled."""
+    prefix = str(fake_gpu)[:-1]
+    root, child_pid = _spawn(_TREE)
+    _, orphan = _launch(fake_gpu, "actor7", stay=False)
+    reads = []
+    signalled = []
+    real_cmdline = psutil.Process.cmdline
+    real_kill = psutil.Process.kill
+
+    def kill(proc):
+        signalled.append(proc.pid)
+        return real_kill(proc)
+
+    def cmdline(proc):
+        reads.append((proc.pid, {root.pid, child_pid} <= set(signalled)))
+        if proc.pid != orphan:
+            raise psutil.AccessDenied(proc.pid)
+        time.sleep(0.5)  # a slow read must not hold up the tree
+        return real_cmdline(proc)
+
+    monkeypatch.setattr(psutil.Process, "kill", kill)
+    monkeypatch.setattr(psutil.Process, "cmdline", cmdline)
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [(root.pid, 0.0, True)], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        # Only the orphaned GPU holder was read, and only once the whole tree
+        # had been signalled.
+        assert reads == [(orphan, True)]
+        assert result["killed"] == sorted([root.pid, child_pid, orphan])
+        assert result["orphans"] == [orphan]
+    finally:
+        monkeypatch.undo()
+        _reap(orphan, child_pid)
+        root.kill()
+        root.wait()
+
+
+def test_a_failing_memory_read_does_not_stop_the_kill(monkeypatch, fake_gpu):
+    prefix = str(fake_gpu)[:-1]
+    root, child_pid = _spawn(_TREE)
+    _, orphan = _launch(fake_gpu, "actor7", stay=False)
+
+    def environ(proc):
+        raise psutil.AccessDenied(proc.pid)
+
+    monkeypatch.setattr(psutil.Process, "environ", environ)
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [(root.pid, 0.0, True)], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        assert result["killed"] == sorted([root.pid, child_pid])
+        assert result["unattributed"] == [orphan]
+        assert _gone(child_pid)
+    finally:
+        monkeypatch.undo()
+        _reap(orphan, child_pid)
+        root.kill()
+        root.wait()
+
+
+def test_foreign_orphans_are_warned_about_not_killed(monkeypatch, caplog):
+    gcs = _FakeGcs()
+    worker = _Actor(0)
+    gcs.add(worker.actor_id, pid=100)
+    _install(monkeypatch, gcs)
+
+    async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
+        gcs.kill(worker.actor_id)
+        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[], foreign=[(4242, "dumper-id")])
+
+    monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+
+    pool = ReplicaPool()
+    pool._workers = [worker]
+    asyncio.run(pool.shutdown())
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("(4242, 'dumper-id')" in m and "semi-p" in m for m in warnings)
+    assert _errors(caplog) == []

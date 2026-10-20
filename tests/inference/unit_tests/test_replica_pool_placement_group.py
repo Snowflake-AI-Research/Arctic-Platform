@@ -144,7 +144,7 @@ def test_placement_group_initializes_one_zero_gpu_coordinator(monkeypatch):
         options = worker_cls.options_calls[0]
         assert options["num_gpus"] == 0
         assert options["num_cpus"] == 0
-        assert options["runtime_env"] == {"env_vars": {"NCCL_TEST": "1", "SPT_NOENV": "1"}}
+        assert options["runtime_env"] == {"env_vars": {"NCCL_TEST": "1"}}
         strategy = options["scheduling_strategy"]
         assert strategy.placement_group is pg
         assert strategy.placement_group_bundle_index == 0
