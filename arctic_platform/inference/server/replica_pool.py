@@ -172,8 +172,10 @@ _KILL_POLL_INTERVAL_S = 0.5
 # stages (the TP-rank actors, the GCS confirmation) need.
 _TREE_KILL_WAIT_S = 5.0
 _TREE_KILL_TASK_TIMEOUT_S = 20.0
-# Class name of the per-rank actors vLLM's Ray executor creates.
-_VLLM_RAY_RANK_ACTOR_CLASS = "RayWorkerWrapper"
+# Class names of the per-rank actors vLLM's Ray executors create: the legacy
+# compiled-graph executor's RayWorkerWrapper, and RayExecutorV2's RayWorkerProc,
+# which vLLM 0.31 selects by default (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1).
+_VLLM_RAY_RANK_ACTOR_CLASSES = ("RayWorkerWrapper", "RayWorkerProc")
 # Slack when comparing a process's creation time with its actor's start time.
 _PID_REUSE_SLACK_S = 1.0
 # Extra time the rescan's kills get to exit, beyond the first wait's budget.
@@ -572,7 +574,7 @@ def _driver_actor_records(
             continue
         for record in _job_actor_records(job["JobID"]).values():
             if (
-                record.get("ActorClassName") == _VLLM_RAY_RANK_ACTOR_CLASS
+                record.get("ActorClassName") in _VLLM_RAY_RANK_ACTOR_CLASSES
                 and not record.get("IsDetached", False)
                 and not _actor_is_dead(record)
             ):

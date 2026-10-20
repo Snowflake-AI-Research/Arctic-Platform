@@ -501,6 +501,7 @@ def test_driver_actor_records_matches_engine_core_drivers(monkeypatch):
             "r0": rank("r0"),
             "r1": rank("r1", "DEAD"),
             "r2": rank("r2", IsDetached=True),
+            "r4": dict(ActorID="r4", ActorClassName="RayWorkerProc", State="ALIVE"),
             "o0": dict(ActorID="o0", ActorClassName="Other", State="ALIVE"),
         },
         "02000000": {"r3": rank("r3")},
@@ -516,7 +517,8 @@ def test_driver_actor_records_matches_engine_core_drivers(monkeypatch):
         [("node-a", "10.0.0.1", {500, 501})], started_after_s=5.0, killed_at_s=20.0
     )
 
-    assert [r["ActorID"] for r in records] == ["r0", "r6"]
+    # Both rank classes count, the detached and dead rows do not.
+    assert [r["ActorID"] for r in records] == ["r0", "r4", "r6"]
     assert replica_pool_mod._driver_actor_records([], started_after_s=0.0, killed_at_s=0.0) == []
 
 
