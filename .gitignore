@@ -182,3 +182,6 @@ onboarding_reports/
 
 # Generated correctness reference records remain local.
 /arctic_platform/correctness/reference_data/
+
+# Retired correctness code is kept locally, not shipped in the repository.
+/correctness-backup/
