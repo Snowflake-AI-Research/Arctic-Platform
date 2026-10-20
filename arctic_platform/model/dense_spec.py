@@ -29,8 +29,13 @@ def dense_model_spec(
     sequence_parallel: int,
     liger: bool,
     training_options: dict,
+    loader_options: dict | None = None,
 ) -> ModelSpec:
-    """Translate dense training options into one Hugging Face ``ModelSpec``."""
+    """Translate dense training options into one Hugging Face ``ModelSpec``.
+
+    ``loader_options`` is forwarded whole. The Hugging Face schema validates it;
+    this function does not read its keys.
+    """
     import arctic_platform.model.loaders  # noqa: F401  # registers the huggingface loader
 
     offload_config = (training_options.get("ac_config") or {}).get("offload_config") or {}
@@ -50,12 +55,6 @@ def dense_model_spec(
         }
     tiled_mlp_token_chunk_size = training_options.get("tiled_mlp_token_chunk_size")
     tiled_mlp = {"token_chunk_size": tiled_mlp_token_chunk_size} if tiled_mlp_token_chunk_size is not None else None
-    # Name only the loader options the job set. The Hugging Face schema fills the other default.
-    loader_options = {
-        name: training_options[name]
-        for name in ("fp32_parity", "fp32_residual")
-        if training_options.get(name) is not None
-    }
     return ModelSpec(
         model_path_or_name=model_path,
         dtype=dtype,

@@ -76,7 +76,20 @@ def test_dense_offload_omits_a_none_tensor_size_threshold():
     assert spec.patches.activation_offload.tensor_size_threshold == 1 << 20
 
 
-def test_unset_fp32_loader_options_are_not_passed(monkeypatch):
+def _spec(**kwargs):
+    args = {
+        "model_path": "Qwen/Qwen3-8B",
+        "dtype": "bfloat16",
+        "attn_implementation": "sdpa",
+        "sequence_parallel": 1,
+        "liger": False,
+        "training_options": {},
+    }
+    args.update(kwargs)
+    return dense_model_spec(**args)
+
+
+def test_omitted_loader_options_are_not_passed(monkeypatch):
     import arctic_platform.model.dense_spec as dense_spec
 
     seen = []
@@ -87,47 +100,35 @@ def test_unset_fp32_loader_options_are_not_passed(monkeypatch):
         return real(**kwargs)
 
     monkeypatch.setattr(dense_spec, "ModelSpec", recording)
-    dense_model_spec(
-        model_path="Qwen/Qwen3-8B",
-        dtype="bfloat16",
-        attn_implementation="sdpa",
-        sequence_parallel=1,
-        liger=False,
-        training_options={},
-    )
+    _spec(training_options={"fp32_parity": False, "fp32_residual": True})
 
     assert "loader_options" not in seen[0]
 
 
-def test_set_fp32_loader_options_are_forwarded():
-    parity_off = dense_model_spec(
-        model_path="Qwen/Qwen3-8B",
-        dtype="bfloat16",
-        attn_implementation="sdpa",
-        sequence_parallel=1,
-        liger=False,
-        training_options={"fp32_parity": False},
-    )
-    residual_on = dense_model_spec(
-        model_path="Qwen/Qwen3-8B",
-        dtype="bfloat16",
-        attn_implementation="sdpa",
-        sequence_parallel=1,
-        liger=False,
-        training_options={"fp32_residual": True},
-    )
+def test_loader_options_are_forwarded_whole(monkeypatch):
+    import arctic_platform.model.dense_spec as dense_spec
+
+    seen = []
+    real = dense_spec.ModelSpec
+
+    def recording(**kwargs):
+        seen.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(dense_spec, "ModelSpec", recording)
+    given = {"fp32_parity": False, "fp32_residual": False}
+    _spec(loader_options=given)
+
+    assert seen[0]["loader_options"] == given
+
+
+def test_loader_options_are_validated_by_the_huggingface_schema():
+    parity_off = _spec(loader_options={"fp32_parity": False})
+    residual_on = _spec(loader_options={"fp32_residual": True})
 
     assert parity_off.loader_options == {"fp32_parity": False, "fp32_residual": False}
     assert residual_on.loader_options == {"fp32_parity": True, "fp32_residual": True}
-
-
-def test_fp32_residual_without_fp32_parity_is_rejected():
     with pytest.raises(ValidationError, match="fp32_residual requires fp32_parity"):
-        dense_model_spec(
-            model_path="Qwen/Qwen3-8B",
-            dtype="bfloat16",
-            attn_implementation="sdpa",
-            sequence_parallel=1,
-            liger=False,
-            training_options={"fp32_parity": False, "fp32_residual": True},
-        )
+        _spec(loader_options={"fp32_parity": False, "fp32_residual": True})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _spec(loader_options={"not_a_loader_option": True})
