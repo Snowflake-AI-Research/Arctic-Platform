@@ -6,20 +6,25 @@ import logging
 import os
 import random
 import time
-from collections import Counter, OrderedDict
-from dataclasses import asdict, dataclass, field
-from typing import Any, Callable
+from collections import Counter
+from collections import OrderedDict
+from dataclasses import asdict
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
+from typing import Callable
 
 import ray
-from arctic_platform.inference.server.chat import ChatPrompt
-from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
-from arctic_platform.inference.server.token_prompts import is_token_tensor
 
-from arctic_platform.inference.server.metrics import (
-    ConcurrencyHistory,
-    RequestRecord,
-    _BoundedDeque,
-)
+from arctic_platform.inference.server.chat import ChatPrompt
+from arctic_platform.inference.server.metrics import ConcurrencyHistory
+from arctic_platform.inference.server.metrics import RequestRecord
+from arctic_platform.inference.server.metrics import _BoundedDeque
+from arctic_platform.inference.server.streaming import MAX_WORKER_STREAMS
+from arctic_platform.inference.server.streaming import ClientStream
+from arctic_platform.inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.streaming import validate_request
+from arctic_platform.inference.server.token_prompts import is_token_tensor
 
 logger = logging.getLogger("arctic_platform.inference.server")
 
@@ -140,10 +145,7 @@ def prefix_affinity_routing(request: _Request, workers: list[WorkerState]) -> in
     Falls back through a hash ring on overload and ultimately to
     ``least_loaded_routing`` when all candidates exceed the load threshold.
     """
-    candidates = [
-        i for i, ws in enumerate(workers)
-        if ws.schedulable and ws.concurrency_limit > 0
-    ]
+    candidates = [i for i, ws in enumerate(workers) if ws.schedulable and ws.concurrency_limit > 0]
     if not candidates:
         return least_loaded_routing(request, workers)
 
@@ -173,10 +175,7 @@ def strict_affinity_routing(request: _Request, workers: list[WorkerState]) -> in
     for multi-turn rollouts where cache reuse is more valuable than throughput
     smoothing.
     """
-    candidates = [
-        i for i, ws in enumerate(workers)
-        if ws.schedulable and ws.concurrency_limit > 0
-    ]
+    candidates = [i for i, ws in enumerate(workers) if ws.schedulable and ws.concurrency_limit > 0]
     if not candidates:
         return least_loaded_routing(request, workers)
     if request.prefix_hash is None:
@@ -252,10 +251,7 @@ class Scheduler:
         if not workers:
             raise ValueError("Scheduler requires at least one worker")
 
-        self._workers = [
-            WorkerState(handle=w, concurrency_limit=max(1, initial_concurrency))
-            for w in workers
-        ]
+        self._workers = [WorkerState(handle=w, concurrency_limit=max(1, initial_concurrency)) for w in workers]
         self._routing_fn = routing_fn
         self._concurrency_fn = concurrency_fn
         self._enable_prefix_hash = enable_prefix_hash
@@ -263,7 +259,8 @@ class Scheduler:
         self._adjust_interval = adjust_interval
         self._dynamic_concurrency = (
             _env_bool("ARCTIC_DYNAMIC_CONCURRENCY", False)
-            if dynamic_concurrency is None else bool(dynamic_concurrency)
+            if dynamic_concurrency is None
+            else bool(dynamic_concurrency)
         )
         self._next_id = 0
         self._streams = {}
@@ -289,9 +286,7 @@ class Scheduler:
         self._request_records: _BoundedDeque = _BoundedDeque(max_request_records)
         # Per-replica `concurrency_limit` history; used to back-fill
         # `max_concurrency` on per-step worker snapshots when draining.
-        self._concurrency_history: list[ConcurrencyHistory] = [
-            ConcurrencyHistory() for _ in workers
-        ]
+        self._concurrency_history: list[ConcurrencyHistory] = [ConcurrencyHistory() for _ in workers]
         # Seed the history so the first drain has something to look up.
         for h, ws in zip(self._concurrency_history, self._workers):
             h.record(ws.concurrency_limit)
@@ -302,6 +297,22 @@ class Scheduler:
                 w.set_replica_id.remote(idx)
             except Exception:
                 pass
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_pause_event"] = None
+        state["_poll_task"] = None
+        state["_adjust_task"] = None
+        state["_inflight_tasks"] = {i: set() for i in state.get("_inflight_tasks", {})}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._pause_event = asyncio.Event()
+        if not self._paused:
+            self._pause_event.set()
+        self._poll_task = None
+        self._adjust_task = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -357,7 +368,9 @@ class Scheduler:
         asyncio.create_task(self._process_request(req))
         return future
 
-    def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
+    def stream_generate(
+        self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False
+    ):
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
         if not isinstance(request_id, str) or not 0 < len(request_id) <= 128:
@@ -370,10 +383,17 @@ class Scheduler:
         if not isinstance(limits, StreamLimits):
             raise TypeError("limits must be StreamLimits")
         request = _Request(
-            id=self._next_id, prompt=prompt, sampling_params=params,
+            id=self._next_id,
+            prompt=prompt,
+            sampling_params=params,
             future=asyncio.get_running_loop().create_future(),
-            prefix_hash=hash(routing_key) if routing_key is not None else (_compute_prefix_hash(prompt) if self._enable_prefix_hash else None),
-            routing_key=routing_key, strict=strict,
+            prefix_hash=(
+                hash(routing_key)
+                if routing_key is not None
+                else (_compute_prefix_hash(prompt) if self._enable_prefix_hash else None)
+            ),
+            routing_key=routing_key,
+            strict=strict,
         )
         self._next_id += 1
         self._ensure_background_tasks()
@@ -387,7 +407,13 @@ class Scheduler:
         routing = strict_affinity_routing if request.strict and request.prefix_hash is not None else self._routing_fn
         index = routing(request, self._workers)
         if not request.strict and self._workers[index].streaming_requests >= MAX_WORKER_STREAMS:
-            candidates = [idx for idx, worker in enumerate(self._workers) if worker.schedulable and worker.streaming_requests < MAX_WORKER_STREAMS and worker.active_requests < worker.concurrency_limit]
+            candidates = [
+                idx
+                for idx, worker in enumerate(self._workers)
+                if worker.schedulable
+                and worker.streaming_requests < MAX_WORKER_STREAMS
+                and worker.active_requests < worker.concurrency_limit
+            ]
             if candidates:
                 return min(candidates, key=lambda idx: self._workers[idx].active_requests)
         return index
@@ -420,7 +446,9 @@ class Scheduler:
     async def abort_streams(self, worker_idx=None):
         worker = self._workers[worker_idx] if worker_idx is not None else None
         streams = [stream for stream in list(self._streams.values()) if worker_idx is None or stream.worker is worker]
-        results = await asyncio.gather(*(stream.abort("lifecycle_change") for stream in streams), return_exceptions=True)
+        results = await asyncio.gather(
+            *(stream.abort("lifecycle_change") for stream in streams), return_exceptions=True
+        )
         if any(isinstance(result, BaseException) or result["status"] == "cleanup_unconfirmed" for result in results):
             raise RuntimeError("Streaming cleanup unconfirmed")
 
@@ -434,8 +462,7 @@ class Scheduler:
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
                 raise ValueError(
-                    f"routing_key list length ({len(routing_key)}) must match "
-                    f"prompts length ({len(prompts)})"
+                    f"routing_key list length ({len(routing_key)}) must match prompts length ({len(prompts)})"
                 )
             keys: list[str | None] = list(routing_key)
         else:
@@ -443,8 +470,7 @@ class Scheduler:
         if isinstance(sampling_params, list):
             if len(sampling_params) != len(prompts):
                 raise ValueError(
-                    f"sampling_params list length ({len(sampling_params)}) must match "
-                    f"prompts length ({len(prompts)})"
+                    f"sampling_params list length ({len(sampling_params)}) must match prompts length ({len(prompts)})"
                 )
             params_list = [params or {} for params in sampling_params]
         else:
@@ -601,10 +627,7 @@ class Scheduler:
         )
 
     def _least_loaded_worker_idx(self) -> int:
-        candidates = [
-            i for i, ws in enumerate(self._workers)
-            if ws.schedulable and ws.concurrency_limit > 0
-        ]
+        candidates = [i for i, ws in enumerate(self._workers) if ws.schedulable and ws.concurrency_limit > 0]
         if not candidates:
             candidates = list(range(len(self._workers)))
         assignment_counts = Counter(
@@ -705,11 +728,7 @@ class Scheduler:
             routing_fn: RoutingFn | None = None
             routing_name = "group_affinity_routing"
         else:
-            routing_fn = (
-                strict_affinity_routing
-                if req.strict and req.prefix_hash is not None
-                else self._routing_fn
-            )
+            routing_fn = strict_affinity_routing if req.strict and req.prefix_hash is not None else self._routing_fn
             routing_name = routing_fn.__name__
 
         try:
@@ -740,8 +759,11 @@ class Scheduler:
                             "existing_assignment=%s active_before=%s "
                             "limits=%s assignments=%s "
                             "routing_key=%s",
-                            req.id, idx, req.prefix_hash,
-                            req.strict, routing_name,
+                            req.id,
+                            idx,
+                            req.prefix_hash,
+                            req.strict,
+                            routing_name,
                             route_diagnostics.reason if route_diagnostics is not None else None,
                             route_diagnostics.existing_assignment if route_diagnostics is not None else None,
                             route_diagnostics.active_requests if route_diagnostics is not None else None,
@@ -792,21 +814,19 @@ class Scheduler:
             # Record the per-request metric — only if we successfully
             # submitted to a worker. Skipping cancelled / failed requests
             # keeps the buffer clean for downstream analysis.
-            if (
-                tracked_worker_idx is not None
-                and submitted_time > 0.0
-                and isinstance(result, dict)
-            ):
-                self._request_records.push(RequestRecord(
-                    request_id=req.id,
-                    replica_id=tracked_worker_idx,
-                    arrival_time=req.created_at,
-                    submitted_time=submitted_time,
-                    completion_time=time.time(),
-                    prompt_len=int(result.get("prompt_len", 0) or 0),
-                    generation_len=int(result.get("generation_len", 0) or 0),
-                    prefix_cache_len=int(result.get("prefix_cache_len", 0) or 0),
-                ))
+            if tracked_worker_idx is not None and submitted_time > 0.0 and isinstance(result, dict):
+                self._request_records.push(
+                    RequestRecord(
+                        request_id=req.id,
+                        replica_id=tracked_worker_idx,
+                        arrival_time=req.created_at,
+                        submitted_time=submitted_time,
+                        completion_time=time.time(),
+                        prompt_len=int(result.get("prompt_len", 0) or 0),
+                        generation_len=int(result.get("generation_len", 0) or 0),
+                        prefix_cache_len=int(result.get("prefix_cache_len", 0) or 0),
+                    )
+                )
 
     async def _utilization_poll_loop(self) -> None:
         while not self._stopped:
@@ -865,33 +885,31 @@ class Scheduler:
         )
         for (idx, _), res in zip(worker_handles, results):
             if isinstance(res, Exception):
-                replicas_payload.append({
-                    "replica_id": idx,
-                    "snapshots": [],
-                    "error": str(res),
-                })
+                replicas_payload.append(
+                    {
+                        "replica_id": idx,
+                        "snapshots": [],
+                        "error": str(res),
+                    }
+                )
                 continue
             snaps = res.get("snapshots", []) if isinstance(res, dict) else []
-            history = (
-                self._concurrency_history[idx]
-                if idx < len(self._concurrency_history)
-                else None
-            )
+            history = self._concurrency_history[idx] if idx < len(self._concurrency_history) else None
             for s in snaps:
                 # Worker doesn't know its own concurrency_limit; back-fill
                 # from the scheduler's per-replica history.
                 s["replica_id"] = idx
                 if history is not None:
                     s["max_concurrency"] = history.at(s.get("timestamp", 0.0))
-            replicas_payload.append({
-                "replica_id": idx,
-                "snapshots": snaps,
-                "action_mask_replay_cache": (
-                    res.get("action_mask_replay_cache", {})
-                    if isinstance(res, dict)
-                    else {}
-                ),
-            })
+            replicas_payload.append(
+                {
+                    "replica_id": idx,
+                    "snapshots": snaps,
+                    "action_mask_replay_cache": (
+                        res.get("action_mask_replay_cache", {}) if isinstance(res, dict) else {}
+                    ),
+                }
+            )
 
         requests_payload = [r.to_dict() for r in self._request_records.drain()]
         return {

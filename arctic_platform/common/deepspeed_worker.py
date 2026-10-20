@@ -721,7 +721,7 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
-        from arctic_inference.server.weight_sync.sender import WeightSender
+        from arctic_platform.inference.server.weight_sync.sender import WeightSender
 
         self._weight_sender = WeightSender(
             group=group,
@@ -771,11 +771,13 @@ class DeepSpeedWorker:
         return {"status": "not_initialized"}
 
     def send_weights_ipc(self, group_id: int) -> dict:
-        """Save weights to shared memory for colocated (same-GPU) transfer."""
-        from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
+        """Colocated shared-memory transfer is not part of arctic_platform.inference.
 
-        weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
-        return save_weights_to_shm(weights, group_id)
+        Same-GPU sync uses ``WeightSender`` over the in-tree NCCL path.
+        """
+        raise RuntimeError(
+            f"send_weights_ipc is not implemented on arctic_platform.inference; use WeightSender (group_id={group_id})"
+        )
 
     def get_cuda_ipc_handles(self) -> dict:
         """Create CUDA IPC handles for all model parameters.

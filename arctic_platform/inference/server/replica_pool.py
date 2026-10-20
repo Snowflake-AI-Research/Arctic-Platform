@@ -13,12 +13,11 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from arctic_platform.inference.server.config import ModelConfig
-from arctic_platform.inference.server.scheduler import (
-    RoutingFn,
-    Scheduler,
-    prefix_affinity_routing,
-)
-from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
+from arctic_platform.inference.server.scheduler import RoutingFn
+from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.scheduler import prefix_affinity_routing
+from arctic_platform.inference.server.token_prompts import compact_token_tensor
+from arctic_platform.inference.server.token_prompts import is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
@@ -124,8 +123,9 @@ async def _worker_node_id(worker: Any) -> Any:
     try:
         return await _await_maybe(getter.remote())
     except Exception:
-        logger.warning("could not read a worker's Ray node id; numbering it as "
-                       "if it shared a pod with the others", exc_info=True)
+        logger.warning(
+            "could not read a worker's Ray node id; numbering it as if it shared a pod with the others", exc_info=True
+        )
         return None
 
 
@@ -135,10 +135,7 @@ def ensure_ray() -> int:
     nodes = [n for n in ray.nodes() if n["Alive"]]
     if not nodes:
         raise RuntimeError("No alive Ray nodes")
-    total = sum(
-        int(n["Resources"].get("GPU", torch.cuda.device_count()))
-        for n in nodes
-    )
+    total = sum(int(n["Resources"].get("GPU", torch.cuda.device_count())) for n in nodes)
     if total == 0:
         raise RuntimeError("No GPUs available in the Ray cluster")
     logger.info(f"{total} GPUs available across {len(nodes)} node(s)")
@@ -162,9 +159,7 @@ class ReplicaPool:
         enable_prefix_hash: bool | None = None,
     ) -> None:
         self._worker_cls = worker_cls
-        _opt_out = os.environ.get(
-            "ARCTIC_PREFIX_ROUTING_DISABLED", ""
-        ).lower() in ("1", "true", "yes")
+        _opt_out = os.environ.get("ARCTIC_PREFIX_ROUTING_DISABLED", "").lower() in ("1", "true", "yes")
         if _opt_out:
             self._routing_fn = None
             self._enable_prefix_hash = False
@@ -206,6 +201,26 @@ class ReplicaPool:
         # single-node path (the pool reserves ``world_size`` GPUs on one actor).
         # The pool does NOT create or remove this PG; lifetime is the caller's.
         self._engine_pg: Any | None = None
+        # Per-replica placement groups for colocated RL (fractional GPU share
+        # with a training actor on the same bundle). Distinct from _engine_pg,
+        # which is one cross-node group for a single pod-spanning engine.
+        self._colocate_pgs: list[Any] | None = None
+        self._colocate_bundles: list[int] | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The driver pulls this pool back across Ray. Locks and tasks are local
+        # to the actor that created them.
+        state = self.__dict__.copy()
+        state["_lock"] = None
+        state["_health_task"] = None
+        state["_scale_task"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = asyncio.Lock()
+        self._health_task = None
+        self._scale_task = None
 
     @property
     def config(self) -> ModelConfig:
@@ -285,8 +300,7 @@ class ReplicaPool:
         """GPUs one pod of a per-pod placement holds."""
         return self.world_size // max(self._nnodes(), 1)
 
-    def _node_bundle_options(self, bundle_index: int,
-                             num_gpus: int) -> dict[str, Any]:
+    def _node_bundle_options(self, bundle_index: int, num_gpus: int) -> dict[str, Any]:
         """Actor options pinning a node-partition to its own pod's bundle.
 
         ``capture_child_tasks`` is deliberately absent: this actor's children
@@ -302,9 +316,7 @@ class ReplicaPool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
-        worker_env = {
-            k: str(v) for k, v in (self._config.extra_env or {}).items()
-        }
+        worker_env = {k: str(v) for k, v in (self._config.extra_env or {}).items()}
         if worker_env:
             options["runtime_env"] = {"env_vars": worker_env}
         return options
@@ -315,14 +327,35 @@ class ReplicaPool:
 
         local = self._local_gpus()
         return [
-            SemipNodeAgent.options(
-                **self._node_bundle_options(k, local)
-            ).remote()
-            for k in range(1, self._nnodes())
+            SemipNodeAgent.options(**self._node_bundle_options(k, local)).remote() for k in range(1, self._nnodes())
         ]
 
-    def _make_worker(self) -> ray.actor.ActorHandle:
+    def _colocate_worker_options(self, replica_idx: int) -> dict[str, Any]:
+        """Pin one colocated replica onto its training bundle."""
+        opts: dict[str, Any] = {"max_concurrency": 2048}
+        groups = self._colocate_pgs or []
+        pg = groups[replica_idx % len(groups)]
+        bundles = self._colocate_bundles
+        if bundles is not None and replica_idx < len(bundles):
+            if self.tp_size > 1:
+                opts["num_gpus"] = 0
+                actor_bundle = bundles[replica_idx] * self.tp_size
+            else:
+                opts["num_gpus"] = self._ray_num_gpus
+                actor_bundle = bundles[replica_idx]
+            opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=actor_bundle,
+            )
+        else:
+            opts["num_gpus"] = self._ray_num_gpus
+        return opts
+
+    def _make_worker(self, replica_idx: int | None = None) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
+
+        Colocated RL passes per-replica placement groups; that path reserves a
+        fractional GPU on the training bundle instead of a whole engine.
 
         Single-node: the actor reserves ``tp_size`` GPUs and runs an mp-backed
         vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
@@ -336,10 +369,10 @@ class ReplicaPool:
         owns the other pod's. So the leader reserves ``world_size / nnodes``
         GPUs in bundle 0 and keeps the mp backend.
         """
+        if self._colocate_pgs and replica_idx is not None:
+            return self._worker_cls.options(**self._colocate_worker_options(replica_idx)).remote()
         if self._is_semip_per_node():
-            return self._worker_cls.options(
-                **self._node_bundle_options(0, self._local_gpus())
-            ).remote()
+            return self._worker_cls.options(**self._node_bundle_options(0, self._local_gpus())).remote()
         if self._is_multi_node():
             options: dict[str, Any] = dict(
                 num_gpus=0,
@@ -362,9 +395,7 @@ class ReplicaPool:
             # runtime_env from extra_env at actor-creation time is what makes it
             # propagate cluster-wide. (Single-node mp workers inherit the
             # coordinator's os.environ directly, so they need no runtime_env.)
-            worker_env = {
-                k: str(v) for k, v in (self._config.extra_env or {}).items()
-            }
+            worker_env = {k: str(v) for k, v in (self._config.extra_env or {}).items()}
             if worker_env:
                 options["runtime_env"] = {"env_vars": worker_env}
             return self._worker_cls.options(**options).remote()
@@ -379,25 +410,16 @@ class ReplicaPool:
         placement_group: Any,
     ) -> None:
         if getattr(config, "ray_num_gpus", None) is not None:
-            raise ValueError(
-                "ray_num_gpus cannot be combined with a caller-provided placement group"
-            )
+            raise ValueError("ray_num_gpus cannot be combined with a caller-provided placement group")
 
-        expected = (
-            int(config.tensor_parallel_size)
-            * int(getattr(config, "pipeline_parallel_size", 1))
-        )
+        expected = int(config.tensor_parallel_size) * int(getattr(config, "pipeline_parallel_size", 1))
         bundle_specs = getattr(placement_group, "bundle_specs", None)
         if callable(bundle_specs):
             bundle_specs = bundle_specs()
         if bundle_specs is None:
-            raise ValueError(
-                "caller-provided placement group must expose bundle_specs"
-            )
+            raise ValueError("caller-provided placement group must expose bundle_specs")
         total_gpus = sum(float(b.get("GPU", 0)) for b in bundle_specs)
-        per_node = (bool(getattr(config, "semi_p", False))
-                    and len(bundle_specs) != expected
-                    and total_gpus == expected)
+        per_node = bool(getattr(config, "semi_p", False)) and len(bundle_specs) != expected and total_gpus == expected
         if per_node:
             # Semi-p across pods places whole pods, not ranks: `nnodes`
             # bundles whose GPUs sum to the world size. The engine is restored
@@ -407,28 +429,24 @@ class ReplicaPool:
                 raise ValueError(
                     f"semi_p placement group has {len(bundle_specs)} bundles "
                     f"for a world size of {expected}, which does not divide "
-                    f"evenly; the node-partitions would hold different rank counts and "
-                    f"deadlock in their first collective"
+                    "evenly; the node-partitions would hold different rank counts and "
+                    "deadlock in their first collective"
                 )
             sizes = {float(b.get("GPU", 0)) for b in bundle_specs}
             if len(sizes) != 1:
                 raise ValueError(
-                    f"semi_p placement group bundles hold different GPU "
+                    "semi_p placement group bundles hold different GPU "
                     f"counts ({sorted(sizes)}); every pod of one engine must "
-                    f"hold the same number of ranks"
+                    "hold the same number of ranks"
                 )
             return
         if len(bundle_specs) != expected:
             raise ValueError(
-                "caller-provided placement group has "
-                f"{len(bundle_specs)} bundles; TP x PP requires exactly {expected}"
+                f"caller-provided placement group has {len(bundle_specs)} bundles; TP x PP requires exactly {expected}"
             )
         for index, bundle in enumerate(bundle_specs):
             if float(bundle.get("GPU", 0)) < 1:
-                raise ValueError(
-                    "caller-provided placement group bundle "
-                    f"{index} must reserve at least one GPU"
-                )
+                raise ValueError(f"caller-provided placement group bundle {index} must reserve at least one GPU")
 
     @staticmethod
     def _engine_kwargs_for(
@@ -452,9 +470,7 @@ class ReplicaPool:
             backend = kwargs.get("distributed_executor_backend")
             if backend not in (None, "ray"):
                 raise ValueError(
-                    "placement-group-backed engines require "
-                    "distributed_executor_backend='ray', "
-                    f"got {backend!r}"
+                    f"placement-group-backed engines require distributed_executor_backend='ray', got {backend!r}"
                 )
             kwargs["distributed_executor_backend"] = "ray"
         return kwargs
@@ -472,10 +488,7 @@ class ReplicaPool:
 
     def _check_model_id(self, model_id: str | None) -> None:
         if model_id is not None and self._model_id is not None and model_id != self._model_id:
-            raise ValueError(
-                f"model_id mismatch: got {model_id!r}, "
-                f"expected {self._model_id!r}"
-            )
+            raise ValueError(f"model_id mismatch: got {model_id!r}, expected {self._model_id!r}")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -510,6 +523,8 @@ class ReplicaPool:
         # The engine PG is owned by the caller (dss-platform); we only drop our
         # reference to it here and never remove it.
         self._engine_pg = None
+        self._colocate_pgs = None
+        self._colocate_bundles = None
         self._config = None
         self._model_id = None
         self._cached_weights_info = None
@@ -552,22 +567,13 @@ class ReplicaPool:
                     logger.warning("Worker %d shutdown failed: %r", idx, exc)
                     return exc
 
-        tasks = [
-            asyncio.create_task(_shutdown_one(idx, worker))
-            for idx, worker in enumerate(workers)
-        ]
+        tasks = [asyncio.create_task(_shutdown_one(idx, worker)) for idx, worker in enumerate(workers)]
         pending: set[asyncio.Task] = set(tasks)
         try:
             _done, pending = await asyncio.wait(tasks, timeout=timeout_s)
             if pending:
-                started_pending_indices = [
-                    idx for idx, task in enumerate(tasks)
-                    if task in pending and idx in started
-                ]
-                not_started_indices = [
-                    idx for idx, task in enumerate(tasks)
-                    if task in pending and idx not in started
-                ]
+                started_pending_indices = [idx for idx, task in enumerate(tasks) if task in pending and idx in started]
+                not_started_indices = [idx for idx, task in enumerate(tasks) if task in pending and idx not in started]
                 logger.warning(
                     "Timed out after %.3fs shutting down inference workers; "
                     "shutdown RPCs still running for workers %s; "
@@ -611,6 +617,7 @@ class ReplicaPool:
         slot: int,
         count: int,
         extra_env: dict[str, str] | None,
+        replica_idx: int | None = None,
     ) -> dict[str, str]:
         """The env one worker initializes with, for its pod-local ``slot``.
 
@@ -630,6 +637,18 @@ class ReplicaPool:
             worker_env["VLLM_PORT"] = str(port_base + slot * port_stride)
         worker_env["SEMIP_REPLICA_ID"] = str(slot)
         worker_env["SEMIP_NUM_REPLICAS"] = str(count)
+        bundles = self._colocate_bundles
+        if (
+            replica_idx is not None
+            and bundles is not None
+            and replica_idx < len(bundles)
+            and self.tp_size > 1
+            and "VLLM_RAY_PER_WORKER_GPUS" in worker_env
+        ):
+            group = bundles[replica_idx]
+            worker_env["VLLM_RAY_BUNDLE_INDICES"] = ",".join(
+                str(group * self.tp_size + rank) for rank in range(self.tp_size)
+            )
         return worker_env
 
     async def _place_new_worker(
@@ -644,10 +663,7 @@ class ReplicaPool:
         its old slot is ``preferred`` when the new actor lands in the same pod.
         """
         node = None if self._is_multi_node() else await _worker_node_id(worker)
-        taken = {
-            slot for i, (other, slot) in enumerate(self._slots)
-            if other == node and i != replacing
-        }
+        taken = {slot for i, (other, slot) in enumerate(self._slots) if other == node and i != replacing}
         slot = _free_slot(taken, preferred)
         return node, slot, len(taken) + 1
 
@@ -671,8 +687,7 @@ class ReplicaPool:
         if self._is_multi_node():
             node_ids: list[Any] = [None] * n
         else:
-            node_ids = list(await asyncio.gather(
-                *[_worker_node_id(w) for w in self._workers]))
+            node_ids = list(await asyncio.gather(*[_worker_node_id(w) for w in self._workers]))
         slots = _node_slots(node_ids)
         self._slots = [(node, slot) for node, (slot, _) in zip(node_ids, slots)]
 
@@ -681,8 +696,7 @@ class ReplicaPool:
             # so the handles have to reach it. They travel in engine_kwargs
             # beside the semi_p flag itself, and InferenceWorker.initialize
             # pops both before AsyncEngineArgs ever sees them.
-            engine_kwargs = {**engine_kwargs,
-                             "semi_p_agents": list(self._semip_agents)}
+            engine_kwargs = {**engine_kwargs, "semi_p_agents": list(self._semip_agents)}
 
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
@@ -690,9 +704,8 @@ class ReplicaPool:
             for offset, worker in enumerate(batch):
                 worker_idx = start + offset
                 slot, count = slots[worker_idx]
-                logger.info("Initializing worker %d/%d (slot %d of %d in its "
-                            "pod)", worker_idx + 1, n, slot, count)
-                worker_env = self._worker_env(slot, count, extra_env)
+                logger.info("Initializing worker %d/%d (slot %d of %d in its pod)", worker_idx + 1, n, slot, count)
+                worker_env = self._worker_env(slot, count, extra_env, replica_idx=worker_idx)
                 refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
@@ -704,6 +717,10 @@ class ReplicaPool:
         model_id: str | None = None,
         num_replicas: int | None = None,
         placement_group: Any | None = None,
+        ray_num_gpus: float | int | None = None,
+        placement_groups: list[Any] | None = None,
+        bundle_indices: list[int] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> int:
         """Set configuration, create worker actors, start scheduler.
 
@@ -722,17 +739,42 @@ class ReplicaPool:
                 capture_child_tasks. The pool does not create or remove the PG.
                 ``None`` keeps the single-node path (the pool reserves
                 ``world_size`` GPUs on one actor).
+            ray_num_gpus: ``num_gpus`` for each worker actor. A fraction lets
+                a sampling replica share a physical GPU with training.
+            placement_groups: Per-replica Ray placement groups for colocated
+                RL. Length 1 shares one group; length ``num_replicas`` gives
+                each replica its own. Paired with ``bundle_indices``.
+            bundle_indices: TP-group index of each replica inside its group.
+                For TP>1 the vLLM workers occupy bundles
+                ``[bundle_indices[r]*tp .. *tp+tp-1]``.
+            extra_env: Env merged into ``config.extra_env`` before workers
+                start. Colocated TP>1 sets ``VLLM_RAY_PER_WORKER_GPUS`` here.
 
         Returns the number of workers created.
         """
         if self._config is not None:
             raise RuntimeError("Already initialized. Call shutdown() first.")
 
+        if placement_groups is not None and placement_group is not None:
+            raise ValueError("pass placement_group or placement_groups, not both")
+        if ray_num_gpus is not None:
+            if placement_group is not None:
+                raise ValueError("ray_num_gpus cannot be combined with a caller-provided placement group")
+            if int(config.tensor_parallel_size) > 1 and not placement_groups:
+                raise ValueError(
+                    f"ray_num_gpus={ray_num_gpus} is not supported with "
+                    f"tensor_parallel_size={config.tensor_parallel_size}. "
+                    "Fractional GPU colocation requires a placement group for TP>1."
+                )
+            config.ray_num_gpus = float(ray_num_gpus)
+        if extra_env:
+            merged = {k: str(v) for k, v in (config.extra_env or {}).items()}
+            merged.update({k: str(v) for k, v in extra_env.items()})
+            config.extra_env = merged
+
         if placement_group is not None:
             if num_replicas not in (None, 1):
-                raise ValueError(
-                    "placement-group-backed pools require num_replicas=1"
-                )
+                raise ValueError("placement-group-backed pools require num_replicas=1")
             self._validate_placement_group(config, placement_group)
         engine_kwargs = self._engine_kwargs_for(
             config,
@@ -742,6 +784,8 @@ class ReplicaPool:
         self._config = config
         self._model_id = model_id
         self._engine_pg = placement_group
+        self._colocate_pgs = placement_groups
+        self._colocate_bundles = bundle_indices
 
         if self._engine_pg is not None:
             # A pod-spanning engine occupies its whole PG as a single replica;
@@ -758,23 +802,29 @@ class ReplicaPool:
                 )
 
         n = num_replicas
+        if bundle_indices is not None and len(bundle_indices) != n:
+            raise ValueError(f"bundle_indices length ({len(bundle_indices)}) must match num_replicas ({n})")
+        if placement_groups is not None and len(placement_groups) not in (1, n):
+            raise ValueError(
+                f"placement_groups length ({len(placement_groups)}) must be either 1 (shared) or num_replicas ({n})"
+            )
         multi_node = self._is_multi_node()
         per_node = self._is_semip_per_node()
         if per_node:
-            shape = (f"semi_p across {self._nnodes()} pods: leader + "
-                     f"{self._nnodes() - 1} agent(s), "
-                     f"{self._local_gpus()} GPUs each")
+            shape = (
+                f"semi_p across {self._nnodes()} pods: leader + "
+                f"{self._nnodes() - 1} agent(s), "
+                f"{self._local_gpus()} GPUs each"
+            )
         elif multi_node:
             shape = "multi-node: 0-GPU coordinator + cross-node PG"
         else:
             shape = "single-node"
         logger.info(
-            f"Creating {n} workers (TP={self.tp_size}, PP={self.pp_size}, "
-            f"world_size={self.world_size}, {shape})"
+            f"Creating {n} workers (TP={self.tp_size}, PP={self.pp_size}, world_size={self.world_size}, {shape})"
         )
         logger.info(
-            "clear_cache_on_weight_sync=%s (applies to strategy='pause', "
-            "pause_mode='keep' weight syncs)",
+            "clear_cache_on_weight_sync=%s (applies to strategy='pause', pause_mode='keep' weight syncs)",
             self._config.clear_cache_on_weight_sync,
         )
 
@@ -785,8 +835,8 @@ class ReplicaPool:
                 # Created before the leader initializes: its restore_and_wrap
                 # drives them, so they have to exist by the time it runs.
                 self._semip_agents = self._make_semip_agents()
-            for _ in range(n):
-                self._workers.append(self._make_worker())
+            for replica_idx in range(n):
+                self._workers.append(self._make_worker(replica_idx))
             await self._initialize_workers(engine_kwargs, extra_env)
         except asyncio.CancelledError:
             logger.info(
@@ -847,11 +897,15 @@ class ReplicaPool:
     # Inference
     # ------------------------------------------------------------------
 
-    def stream_generate(self, request_id, prompt, sampling_params=None, model_id=None, *, limits=None, routing_key=None, strict=False):
+    def stream_generate(
+        self, request_id, prompt, sampling_params=None, model_id=None, *, limits=None, routing_key=None, strict=False
+    ):
         self._check_model_id(model_id)
         if self._scheduler is None or self._stop_monitoring or self._sleeping or self._stream_admission_blocked:
             raise RuntimeError("ReplicaPool is not available for streaming")
-        return self._scheduler.stream_generate(request_id, prompt, sampling_params, limits=limits, routing_key=routing_key, strict=strict)
+        return self._scheduler.stream_generate(
+            request_id, prompt, sampling_params, limits=limits, routing_key=routing_key, strict=strict
+        )
 
     async def abort(self, request_id, model_id=None):
         self._check_model_id(model_id)
@@ -886,8 +940,10 @@ class ReplicaPool:
         """
         self._check_model_id(model_id)
         futures = self.submit_generate_futures(
-            prompts, sampling_params,
-            routing_key=routing_key, strict=strict,
+            prompts,
+            sampling_params,
+            routing_key=routing_key,
+            strict=strict,
         )
         return list(await asyncio.gather(*futures))
 
@@ -909,46 +965,54 @@ class ReplicaPool:
             if routing_key is None or isinstance(routing_key, str):
                 return routing_key
             if len(routing_key) != 1:
-                raise ValueError(
-                    f"Got {len(routing_key)} routing keys for a single prompt"
-                )
+                raise ValueError(f"Got {len(routing_key)} routing keys for a single prompt")
             return routing_key[0]
 
         def _single_params() -> dict[str, Any]:
             if not isinstance(params, list):
                 return params
             if len(params) != 1:
-                raise ValueError(
-                    f"Got {len(params)} sampling params for a single prompt"
-                )
+                raise ValueError(f"Got {len(params)} sampling params for a single prompt")
             return params[0] or {}
 
         if is_token_tensor(prompts):
             if prompts.dim() == 1:
-                return [self._scheduler.submit(
-                    compact_token_tensor(prompts), _single_params(),
-                    routing_key=_single_key(), strict=strict,
-                )]
+                return [
+                    self._scheduler.submit(
+                        compact_token_tensor(prompts),
+                        _single_params(),
+                        routing_key=_single_key(),
+                        strict=strict,
+                    )
+                ]
             if prompts.dim() != 2:
                 raise ValueError(
-                    "A token-id tensor must be 1-D (one prompt) or 2-D (a batch), "
-                    f"got shape {tuple(prompts.shape)}"
+                    f"A token-id tensor must be 1-D (one prompt) or 2-D (a batch), got shape {tuple(prompts.shape)}"
                 )
             prompts = list(prompts)
         if isinstance(prompts, str):
-            return [self._scheduler.submit(
-                prompts, _single_params(), routing_key=_single_key(), strict=strict,
-            )]
+            return [
+                self._scheduler.submit(
+                    prompts,
+                    _single_params(),
+                    routing_key=_single_key(),
+                    strict=strict,
+                )
+            ]
         if prompts and isinstance(prompts[0], int):
-            return [self._scheduler.submit(
-                prompts, _single_params(), routing_key=_single_key(), strict=strict,
-            )]
+            return [
+                self._scheduler.submit(
+                    prompts,
+                    _single_params(),
+                    routing_key=_single_key(),
+                    strict=strict,
+                )
+            ]
         prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
                 raise ValueError(
-                    f"routing_key list length ({len(routing_key)}) must match "
-                    f"prompts length ({len(prompts)})"
+                    f"routing_key list length ({len(routing_key)}) must match prompts length ({len(prompts)})"
                 )
             keys: list[str | None] = list(routing_key)
         else:
@@ -956,8 +1020,7 @@ class ReplicaPool:
         if isinstance(params, list):
             if len(params) != len(prompts):
                 raise ValueError(
-                    f"sampling_params list length ({len(params)}) must match "
-                    f"prompts length ({len(prompts)})"
+                    f"sampling_params list length ({len(params)}) must match prompts length ({len(prompts)})"
                 )
             params_list = [p or {} for p in params]
         else:
@@ -976,9 +1039,7 @@ class ReplicaPool:
         if target_count < 0:
             raise ValueError(f"target_count must be >= 0, got {target_count}")
         if self._is_multi_node() and target_count != 1:
-            raise ValueError(
-                "placement-group-backed pools must contain exactly one replica"
-            )
+            raise ValueError("placement-group-backed pools must contain exactly one replica")
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
 
@@ -1008,9 +1069,7 @@ class ReplicaPool:
         pool's worker list is left consistent.
         """
         if self._is_multi_node() and target_count != 1:
-            raise ValueError(
-                "placement-group-backed pools must contain exactly one replica"
-            )
+            raise ValueError("placement-group-backed pools must contain exactly one replica")
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
 
@@ -1019,12 +1078,13 @@ class ReplicaPool:
             extra_env = self._config.extra_env or None
 
             while len(self._workers) < target_count:
-                worker = self._make_worker()
+                replica_idx = len(self._workers)
+                worker = self._make_worker(replica_idx)
                 try:
                     node, slot, count = await self._place_new_worker(worker)
                     await worker.initialize.remote(
                         engine_kwargs,
-                        self._worker_env(slot, count, extra_env),
+                        self._worker_env(slot, count, extra_env, replica_idx=replica_idx),
                         self._model_id,
                     )
                 except asyncio.CancelledError:
@@ -1048,9 +1108,7 @@ class ReplicaPool:
                         ray.kill(worker)
                     except Exception:
                         pass
-                    logger.info(
-                        "scale_up aborted: pool was shut down during worker init"
-                    )
+                    logger.info("scale_up aborted: pool was shut down during worker init")
                     return
 
                 self._workers.append(worker)
@@ -1094,10 +1152,7 @@ class ReplicaPool:
             )
             self._sleeping = True
 
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
+            per_worker = [{"status": "error", "message": str(r)} if isinstance(r, Exception) else r for r in results]
             logger.info("ReplicaPool sleeping (%d workers, level=%d)", len(self._workers), level)
             return {"status": "sleeping", "level": level, "workers": per_worker}
 
@@ -1117,10 +1172,7 @@ class ReplicaPool:
             self._sleeping = False
             self._scheduler.resume()
 
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
+            per_worker = [{"status": "error", "message": str(r)} if isinstance(r, Exception) else r for r in results]
             logger.info("ReplicaPool awake (%d workers)", len(self._workers))
             return {"status": "ready", "workers": per_worker}
 
@@ -1139,9 +1191,7 @@ class ReplicaPool:
             "replica_states": list(states),
         }
 
-    async def get_chat_support(
-        self, model_id: str | None = None, *, timeout: float = 600.0
-    ) -> dict[str, bool]:
+    async def get_chat_support(self, model_id: str | None = None, *, timeout: float = 600.0) -> dict[str, bool]:
         """Report ``{"chat_prompt": bool, "thinking_optional": bool}`` for the loaded model.
 
         ``chat_prompt``: streams take a ``ChatPrompt``. ``thinking_optional``:
@@ -1190,15 +1240,14 @@ class ReplicaPool:
             raise RuntimeError("ReplicaPool not initialized")
         if self._cached_weights_info is None:
             from arctic_platform.inference.server.weight_sync import build_weights_info
+
             infos = build_weights_info(self._config.model)
             self._cached_weights_info = [wi.to_dict() for wi in infos]
         return self._cached_weights_info
 
     def _validate_weight_sync_strategy(self, strategy: str, pause_mode: str) -> None:
         if strategy not in WEIGHT_SYNC_STRATEGIES:
-            raise ValueError(
-                f"Unknown strategy: {strategy!r}. Use: pause, drain, skip, hotswap"
-            )
+            raise ValueError(f"Unknown strategy: {strategy!r}. Use: pause, drain, skip, hotswap")
         if pause_mode not in WEIGHT_SYNC_PAUSE_MODES:
             raise ValueError(f"Unknown pause_mode: {pause_mode!r}. Use: keep, abort")
 
@@ -1208,9 +1257,7 @@ class ReplicaPool:
         clear_cache: bool,
     ) -> bool:
         """Pause generation on every worker; return the clear_cache value sent."""
-        clear_cache = clear_cache or (
-            self.config.clear_cache_on_weight_sync and pause_mode == "keep"
-        )
+        clear_cache = clear_cache or (self.config.clear_cache_on_weight_sync and pause_mode == "keep")
         pause_results = await asyncio.gather(
             *[
                 worker.pause_generation.remote(
@@ -1250,38 +1297,25 @@ class ReplicaPool:
         *,
         require_success: bool,
     ) -> dict[str, Any]:
-        timeout_s = (
-            _env_float("ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_TIMEOUT_S", 30.0)
-            if require_success
-            else 0.0
-        )
+        timeout_s = _env_float("ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_TIMEOUT_S", 30.0) if require_success else 0.0
         retry_interval_s = _env_float(
             "ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_RETRY_INTERVAL_S",
             0.1,
             minimum=0.01,
         )
         results = await asyncio.gather(
-            *[
-                worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
-                for worker in self._workers
-            ],
+            *[worker.reset_prefix_cache.remote(timeout_s, retry_interval_s) for worker in self._workers],
             return_exceptions=True,
         )
         per_worker = [
-            {"status": "error", "message": str(result)}
-            if isinstance(result, Exception)
-            else result
+            {"status": "error", "message": str(result)} if isinstance(result, Exception) else result
             for result in results
         ]
-        reset_ok = all(
-            isinstance(result, dict) and bool(result.get("reset_ok"))
-            for result in per_worker
-        )
+        reset_ok = all(isinstance(result, dict) and bool(result.get("reset_ok")) for result in per_worker)
         payload = {"reset_ok": reset_ok, "workers": per_worker}
         if require_success and not reset_ok:
             raise RuntimeError(
-                "Prefix-cache reset failed after weight sync; refusing to resume "
-                "generation with stale prefix blocks."
+                "Prefix-cache reset failed after weight sync; refusing to resume generation with stale prefix blocks."
             )
         if not reset_ok:
             logger.warning(
@@ -1309,30 +1343,23 @@ class ReplicaPool:
                 await self._scheduler.drain()
             try:
                 results = await asyncio.gather(
-                    *[
-                        worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
-                        for worker in self._workers
-                    ],
+                    *[worker.reset_prefix_cache.remote(timeout_s, retry_interval_s) for worker in self._workers],
                     return_exceptions=True,
                 )
             finally:
                 if drain:
                     self._scheduler.resume()
             per_worker = [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
+                {"status": "error", "message": str(result)} if isinstance(result, Exception) else result
                 for result in results
             ]
             return {
-                "status": "ok" if all(
-                    isinstance(result, dict) and bool(result.get("reset_ok"))
-                    for result in per_worker
-                ) else "failed",
-                "reset_ok": all(
-                    isinstance(result, dict) and bool(result.get("reset_ok"))
-                    for result in per_worker
+                "status": (
+                    "ok"
+                    if all(isinstance(result, dict) and bool(result.get("reset_ok")) for result in per_worker)
+                    else "failed"
                 ),
+                "reset_ok": all(isinstance(result, dict) and bool(result.get("reset_ok")) for result in per_worker),
                 "workers": per_worker,
             }
 
@@ -1362,9 +1389,7 @@ class ReplicaPool:
         return {
             "n_replicas": len(self._workers),
             "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
+                {"status": "error", "message": str(result)} if isinstance(result, Exception) else result
                 for result in results
             ],
         }
@@ -1384,10 +1409,7 @@ class ReplicaPool:
             try:
                 await scheduler.drain()
                 replay_send = asyncio.gather(
-                    *[
-                        worker.send_router_replay.remote()
-                        for worker in self._workers
-                    ],
+                    *[worker.send_router_replay.remote() for worker in self._workers],
                     return_exceptions=True,
                 )
                 try:
@@ -1403,18 +1425,13 @@ class ReplicaPool:
                             continue
                     raise
             finally:
-                if (
-                    not scheduler_was_paused
-                    and (replay_send is None or replay_send.done())
-                ):
+                if not scheduler_was_paused and (replay_send is None or replay_send.done()):
                     scheduler.resume()
 
         return {
             "n_replicas": len(self._workers),
             "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
+                {"status": "error", "message": str(result)} if isinstance(result, Exception) else result
                 for result in results
             ],
         }
@@ -1423,10 +1440,7 @@ class ReplicaPool:
         if self._workers is None:
             raise RuntimeError("ReplicaPool not initialized")
         results = await asyncio.gather(
-            *[
-                worker.discard_router_replay.remote(sample_ids)
-                for worker in self._workers
-            ],
+            *[worker.discard_router_replay.remote(sample_ids) for worker in self._workers],
             return_exceptions=True,
         )
         removed = 0
@@ -1449,9 +1463,7 @@ class ReplicaPool:
         return {
             "n_replicas": len(self._workers),
             "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
+                {"status": "error", "message": str(result)} if isinstance(result, Exception) else result
                 for result in results
             ],
         }
@@ -1500,18 +1512,19 @@ class ReplicaPool:
         if groups is None:
             if master_addr is None or master_port is None:
                 raise ValueError(
-                    "Provide either 'groups' or legacy flat fields "
-                    "(master_addr, master_port, world_size)"
+                    "Provide either 'groups' or legacy flat fields (master_addr, master_port, world_size)"
                 )
             n = self.num_replicas
             tp = self.tp_size
-            groups = [{
-                "group_id": 0,
-                "master_addr": master_addr,
-                "master_port": master_port,
-                "world_size": world_size or (1 + n * tp),
-                "replica_ids": list(range(n)),
-            }]
+            groups = [
+                {
+                    "group_id": 0,
+                    "master_addr": master_addr,
+                    "master_port": master_port,
+                    "world_size": world_size or (1 + n * tp),
+                    "replica_ids": list(range(n)),
+                }
+            ]
 
         effective_strategy = "hotswap" if engine_only else strategy
 
@@ -1519,10 +1532,7 @@ class ReplicaPool:
             t0 = time.time()
             n = len(self._workers)
             scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
+            available_workers = [index for index in range(n) if self._scheduler.is_worker_available(index)]
             scheduler_paused = False
             skipped_workers = False
             generation_paused = False
@@ -1542,9 +1552,7 @@ class ReplicaPool:
                         self._scheduler.mark_worker_unavailable(i)
                 await self._scheduler.abort_streams()
                 if effective_strategy == "pause":
-                    pause_clear_cache = await self._pause_generation_for_weight_sync(
-                        pause_mode, clear_cache
-                    )
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
                     generation_paused = True
                     if pause_mode == "abort":
                         await self._scheduler.drain()
@@ -1579,9 +1587,14 @@ class ReplicaPool:
                     weight_update_started = True
                     tasks.append(
                         worker.sync_weights.remote(
-                            gcfg["master_addr"], gcfg["master_port"],
-                            gcfg["rank_offset"], gcfg["world_size"],
-                            bucket_size, engine_only, direct_mode, reverse,
+                            gcfg["master_addr"],
+                            gcfg["master_port"],
+                            gcfg["rank_offset"],
+                            gcfg["world_size"],
+                            bucket_size,
+                            engine_only,
+                            direct_mode,
+                            reverse,
                         )
                     )
 
@@ -1617,11 +1630,7 @@ class ReplicaPool:
                     for index in available_workers:
                         self._scheduler.mark_worker_available(index)
 
-
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
+            per_worker = [{"status": "error", "message": str(r)} if isinstance(r, Exception) else r for r in results]
             elapsed = time.time() - t0
             logger.info(f"Weight sync: {n} workers, {len(groups)} group(s) in {elapsed:.2f}s")
             response = {
@@ -1669,10 +1678,7 @@ class ReplicaPool:
             tp = self.tp_size
             world_size = 1 + n * tp
             scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
+            available_workers = [index for index in range(n) if self._scheduler.is_worker_available(index)]
             scheduler_paused = False
             skipped_workers = False
             generation_paused = False
@@ -1692,9 +1698,7 @@ class ReplicaPool:
                         self._scheduler.mark_worker_unavailable(i)
                 await self._scheduler.abort_streams()
                 if effective_strategy == "pause":
-                    pause_clear_cache = await self._pause_generation_for_weight_sync(
-                        pause_mode, clear_cache
-                    )
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
                     generation_paused = True
                     if pause_mode == "abort":
                         await self._scheduler.drain()
@@ -1706,9 +1710,7 @@ class ReplicaPool:
 
                 self._updating_workers = set(range(n))
                 weight_update_started = True
-                results = await asyncio.gather(
-                    *build_tasks(n, tp, world_size), return_exceptions=True
-                )
+                results = await asyncio.gather(*build_tasks(n, tp, world_size), return_exceptions=True)
                 failed_workers = _failed_worker_indices(results)
                 if failed_workers:
                     raise RuntimeError(
@@ -1740,14 +1742,15 @@ class ReplicaPool:
                     for index in available_workers:
                         self._scheduler.mark_worker_available(index)
 
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
+            per_worker = [{"status": "error", "message": str(r)} if isinstance(r, Exception) else r for r in results]
             elapsed = time.time() - t0
             logger.info(
                 "%s: %d replicas (world_size=%d)%s in %.2fs",
-                fail_label, n, world_size, log_extra, elapsed,
+                fail_label,
+                n,
+                world_size,
+                log_extra,
+                elapsed,
             )
             response = {
                 "elapsed": elapsed,
@@ -1776,10 +1779,12 @@ class ReplicaPool:
         weight_format: str = "vllm",
     ) -> dict[str, Any]:
         """Join one NCCL broadcast group (rank 0 = trainer) and load weights into all replicas."""
+
         def build_tasks(n, tp, world_size):
             return [
                 worker.sync_weights_broadcast.remote(
-                    master_addr, master_port,
+                    master_addr,
+                    master_port,
                     rank_offset=1 + i * tp,
                     world_size=world_size,
                     bucket_size=bucket_size,
@@ -1836,7 +1841,8 @@ class ReplicaPool:
         def build_tasks(n, tp, world_size):
             return [
                 worker.sync_lora_weights_broadcast.remote(
-                    master_addr, master_port,
+                    master_addr,
+                    master_port,
                     rank_offset=1 + i * tp,
                     world_size=world_size,
                     lora_int_id=lora_int_id,
@@ -1878,6 +1884,7 @@ class ReplicaPool:
             raise RuntimeError("No speculative_model configured")
         if self._cached_spec_weights_info is None:
             from arctic_platform.inference.server.weight_sync import build_weights_info
+
             infos = build_weights_info(spec_model)
             self._cached_spec_weights_info = [wi.to_dict() for wi in infos]
         return self._cached_spec_weights_info
@@ -1905,38 +1912,33 @@ class ReplicaPool:
         if groups is None:
             if master_addr is None or master_port is None:
                 raise ValueError(
-                    "Provide either 'groups' or legacy flat fields "
-                    "(master_addr, master_port, world_size)"
+                    "Provide either 'groups' or legacy flat fields (master_addr, master_port, world_size)"
                 )
             n = self.num_replicas
             tp = self.tp_size
-            groups = [{
-                "group_id": 0,
-                "master_addr": master_addr,
-                "master_port": master_port,
-                "world_size": world_size or (1 + n * tp),
-                "replica_ids": list(range(n)),
-            }]
+            groups = [
+                {
+                    "group_id": 0,
+                    "master_addr": master_addr,
+                    "master_port": master_port,
+                    "world_size": world_size or (1 + n * tp),
+                    "replica_ids": list(range(n)),
+                }
+            ]
 
         async with self._stream_lifecycle():
             t0 = time.time()
             n = len(self._workers)
 
             scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
+            available_workers = [index for index in range(n) if self._scheduler.is_worker_available(index)]
             if strategy == "drain":
                 self._scheduler.pause()
             elif strategy == "skip":
                 for i in range(n):
                     self._scheduler.mark_worker_unavailable(i)
             elif strategy != "hotswap":
-                raise ValueError(
-                    f"Unknown strategy: {strategy!r}. "
-                    "Use: drain, skip, hotswap"
-                )
+                raise ValueError(f"Unknown strategy: {strategy!r}. Use: drain, skip, hotswap")
 
             try:
                 await self._scheduler.abort_streams()
@@ -1971,14 +1973,18 @@ class ReplicaPool:
                 if gcfg is None:
                     raise RuntimeError(
                         f"Replica {i} not assigned to any group. "
-                        f"Groups cover replicas: "
+                        "Groups cover replicas: "
                         f"{[g['replica_ids'] for g in groups]}"
                     )
                 tasks.append(
                     worker.sync_spec_weights.remote(
-                        gcfg["master_addr"], gcfg["master_port"],
-                        gcfg["rank_offset"], gcfg["world_size"],
-                        bucket_size, engine_only, reverse,
+                        gcfg["master_addr"],
+                        gcfg["master_port"],
+                        gcfg["rank_offset"],
+                        gcfg["world_size"],
+                        bucket_size,
+                        engine_only,
+                        reverse,
                     )
                 )
 
@@ -1990,15 +1996,13 @@ class ReplicaPool:
                 for index in available_workers:
                     self._scheduler.mark_worker_available(index)
 
-            per_worker = [
-                {"status": "error", "message": str(r)}
-                if isinstance(r, Exception) else r
-                for r in results
-            ]
+            per_worker = [{"status": "error", "message": str(r)} if isinstance(r, Exception) else r for r in results]
             elapsed = time.time() - t0
             logger.info(
                 "Spec weight sync: %d workers, %d group(s) in %.2fs",
-                n, len(groups), elapsed,
+                n,
+                len(groups),
+                elapsed,
             )
             return {
                 "elapsed": elapsed,
@@ -2058,13 +2062,12 @@ class ReplicaPool:
                 ray.kill(old)
             except Exception:
                 pass
-            new_worker = self._make_worker()
+            new_worker = self._make_worker(idx)
             try:
-                node, slot, count = await self._place_new_worker(
-                    new_worker, preferred=preferred, replacing=idx)
+                node, slot, count = await self._place_new_worker(new_worker, preferred=preferred, replacing=idx)
                 await new_worker.initialize.remote(
                     engine_kwargs,
-                    self._worker_env(slot, count, extra_env),
+                    self._worker_env(slot, count, extra_env, replica_idx=idx),
                     self._model_id,
                 )
             except BaseException:
@@ -2099,12 +2102,8 @@ class ReplicaPool:
         engine_kwargs: dict[str, Any],
         extra_env: dict[str, str] | None,
     ) -> ray.actor.ActorHandle:
-        total_timeout = _env_float(
-            "ARCTIC_WORKER_RESTART_TIMEOUT_S", 600.0, minimum=0.001
-        )
-        retry_s = _env_float(
-            "ARCTIC_WORKER_RESTART_RETRY_S", 1.0, minimum=0.0
-        )
+        total_timeout = _env_float("ARCTIC_WORKER_RESTART_TIMEOUT_S", 600.0, minimum=0.001)
+        retry_s = _env_float("ARCTIC_WORKER_RESTART_RETRY_S", 1.0, minimum=0.0)
         deadline = time.monotonic() + total_timeout
         attempt = 0
 
@@ -2142,8 +2141,7 @@ class ReplicaPool:
                     raise
                 delay = min(retry_s, max(deadline - time.monotonic(), 0.0))
                 logger.warning(
-                    "Placement-group worker restart attempt %d failed; "
-                    "retrying in %.3fs",
+                    "Placement-group worker restart attempt %d failed; retrying in %.3fs",
                     attempt,
                     delay,
                     exc_info=True,

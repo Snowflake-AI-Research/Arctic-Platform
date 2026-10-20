@@ -4,21 +4,19 @@ import asyncio
 import time
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
-
 from test_review_regressions import local_worker
+
 from arctic_platform.inference.server.config import ModelConfig
 from arctic_platform.inference.server.replica_pool import ReplicaPool
-from arctic_platform.inference.server.scheduler import (
-    Scheduler,
-    least_loaded_routing,
-    prefix_affinity_routing,
-    strict_affinity_routing,
-)
+from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.scheduler import least_loaded_routing
+from arctic_platform.inference.server.scheduler import prefix_affinity_routing
+from arctic_platform.inference.server.scheduler import strict_affinity_routing
 from arctic_platform.inference.server.streaming import StreamLimits
-
 
 WEIGHT_METHODS = (
     "sync_weights",
@@ -36,8 +34,7 @@ MUTATIONS = [("sleep", None)] + [
 
 def make_pool():
     handle = MagicMock()
-    for method in (*WEIGHT_METHODS, "sleep", "wake_up", "pause_generation",
-                   "resume_generation", "abort_stream"):
+    for method in (*WEIGHT_METHODS, "sleep", "wake_up", "pause_generation", "resume_generation", "abort_stream"):
         getattr(handle, method).remote = AsyncMock(return_value={"status": "aborted"})
     handle.generate.remote = AsyncMock(return_value={"text": "legacy", "token_ids": [1]})
     pool = ReplicaPool()
@@ -77,9 +74,10 @@ def test_cancel_during_iterator_close_blocks_mutation(ignore_cancellation):
                 if self.sent:
                     raise StopAsyncIteration
                 self.sent = True
-                return SimpleNamespace(prompt_token_ids=[1], outputs=[SimpleNamespace(
-                    index=0, text="x", token_ids=[2], finish_reason="stop"
-                )])
+                return SimpleNamespace(
+                    prompt_token_ids=[1],
+                    outputs=[SimpleNamespace(index=0, text="x", token_ids=[2], finish_reason="stop")],
+                )
 
             async def aclose(self):
                 close_tasks.append(asyncio.current_task())
@@ -96,7 +94,10 @@ def test_cancel_during_iterator_close_blocks_mutation(ignore_cancellation):
         worker.llm.generate = lambda *args, **kwargs: ControlledOutput()
         worker.llm.pause_generation = AsyncMock()
         worker.start_stream(
-            "closing", "prompt", {"max_tokens": 1}, 20,
+            "closing",
+            "prompt",
+            {"max_tokens": 1},
+            20,
             asdict(StreamLimits(cleanup_timeout_s=0.05)),
         )
         session = worker._engine_streams["closing"]
@@ -118,9 +119,15 @@ def test_cancel_during_iterator_close_blocks_mutation(ignore_cancellation):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("routing", [
-    least_loaded_routing, prefix_affinity_routing, strict_affinity_routing, None,
-])
+@pytest.mark.parametrize(
+    "routing",
+    [
+        least_loaded_routing,
+        prefix_affinity_routing,
+        strict_affinity_routing,
+        None,
+    ],
+)
 def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(routing):
     async def scenario():
         pool, handle = make_pool()
@@ -256,7 +263,7 @@ def test_scale_up_keeps_stream_admission_open():
 
         new_handle = MagicMock()
         new_handle.initialize.remote = AsyncMock(side_effect=initialize)
-        pool._make_worker = lambda: new_handle
+        pool._make_worker = lambda *args, **kwargs: new_handle
         pool._engine_kwargs = lambda: {}
         scaling = asyncio.create_task(pool.scale_up(2))
         try:
@@ -313,19 +320,27 @@ def test_uncertain_stream_cleanup_prevents_engine_mutation(method, strategy):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("method,strategy,phase", [
-    ("sleep", None, "abort_streams"),
-    ("sleep", None, "drain"),
-] + [
-    (method, strategy, phase)
-    for method, strategy in MUTATIONS[1:]
-    for phase in ("abort_streams", "drain")
-    if phase == "abort_streams" or strategy == "drain"
-])
+@pytest.mark.parametrize(
+    "method,strategy,phase",
+    [
+        ("sleep", None, "abort_streams"),
+        ("sleep", None, "drain"),
+    ]
+    + [
+        (method, strategy, phase)
+        for method, strategy in MUTATIONS[1:]
+        for phase in ("abort_streams", "drain")
+        if phase == "abort_streams" or strategy == "drain"
+    ],
+)
 @pytest.mark.parametrize("initially_paused", [False, True])
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 def test_lifecycle_preparation_failure_restores_previous_state(
-    method, strategy, phase, initially_paused, failure,
+    method,
+    strategy,
+    phase,
+    initially_paused,
+    failure,
 ):
     async def scenario():
         pool, handle = make_pool()
@@ -379,9 +394,9 @@ def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, str
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("method,strategy", [
-    (method, strategy) for method, strategy in MUTATIONS if strategy != "hotswap"
-])
+@pytest.mark.parametrize(
+    "method,strategy", [(method, strategy) for method, strategy in MUTATIONS if strategy != "hotswap"]
+)
 def test_cancellation_after_engine_mutation_starts_does_not_restore_scheduling(method, strategy):
     async def scenario():
         pool, handle = make_pool()
@@ -450,6 +465,7 @@ class _OneEvent:
     async def __anext__(self):
         async def ref():
             return [self.event]
+
         return ref()
 
 
@@ -457,10 +473,15 @@ def _stream_with_terminal_error(scheduler, request_id):
     stream = scheduler.stream_generate(request_id, "prompt")
     stream.worker = scheduler._workers[0]
     stream.worker.active_requests = stream.worker.streaming_requests = 1
-    stream.remote_stream = _OneEvent({
-        "type": "terminal_error", "code": "context_length_exceeded",
-        "context_limit_source": "prompt", "sequence": 0, "version": 1,
-    })
+    stream.remote_stream = _OneEvent(
+        {
+            "type": "terminal_error",
+            "code": "context_length_exceeded",
+            "context_limit_source": "prompt",
+            "sequence": 0,
+            "version": 1,
+        }
+    )
     return stream
 
 
@@ -534,10 +555,15 @@ def test_unconfirmed_cleanup_drops_a_chat_error_param(monkeypatch):
         stream = scheduler.stream_generate("chat", ChatPrompt([{"role": "user", "content": "hi"}]))
         stream.worker = scheduler._workers[0]
         stream.worker.active_requests = stream.worker.streaming_requests = 1
-        stream.remote_stream = _OneEvent({
-            "type": "terminal_error", "code": "invalid_message_content",
-            "param": "messages[0]", "sequence": 0, "version": 1,
-        })
+        stream.remote_stream = _OneEvent(
+            {
+                "type": "terminal_error",
+                "code": "invalid_message_content",
+                "param": "messages[0]",
+                "sequence": 0,
+                "version": 1,
+            }
+        )
         try:
             event = await anext(stream)
             assert event["code"] == "cleanup_unconfirmed"
