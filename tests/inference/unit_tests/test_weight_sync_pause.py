@@ -73,7 +73,9 @@ class _FakeWorker:
         self.reset_prefix_cache = _RemoteMethod(self._reset_prefix_cache)
         self.sync_weights = _RemoteMethod(self._sync_weights)
         self.sync_weights_broadcast = _RemoteMethod(self._sync_weights_broadcast)
-        self.sync_lora_weights_broadcast = _RemoteMethod(self._sync_lora_weights_broadcast)
+        self.sync_lora_weights_broadcast = _RemoteMethod(
+            self._sync_lora_weights_broadcast
+        )
 
     async def _pause_generation(self, mode: str = "keep", clear_cache: bool = False):
         self.events.append(f"pause_generation:{mode}:{clear_cache}")
@@ -109,7 +111,9 @@ class _FakeWorker:
         staging: str,
         evict_first: bool,
     ):
-        self.events.append(f"sync_lora:{lora_int_id}:{lora_name}:{staging}:evict={evict_first}")
+        self.events.append(
+            f"sync_lora:{lora_int_id}:{lora_name}:{staging}:evict={evict_first}"
+        )
         return {
             "status": "done",
             "weight_format": "lora",
@@ -177,15 +181,13 @@ def _pool(
 
 
 def _groups():
-    return [
-        {
-            "group_id": 0,
-            "master_addr": "127.0.0.1",
-            "master_port": 12345,
-            "world_size": 2,
-            "replica_ids": [0],
-        }
-    ]
+    return [{
+        "group_id": 0,
+        "master_addr": "127.0.0.1",
+        "master_port": 12345,
+        "world_size": 2,
+        "replica_ids": [0],
+    }]
 
 
 def test_sync_weights_rejects_removed_strategies():
@@ -316,7 +318,9 @@ async def _run_sync(pool: ReplicaPool, path: str, **kwargs):
     if path == "sync_weights":
         return await pool.sync_weights(groups=_groups(), **kwargs)
     if path == "sync_weights_broadcast":
-        return await pool.sync_weights_broadcast(master_addr="127.0.0.1", master_port=12345, **kwargs)
+        return await pool.sync_weights_broadcast(
+            master_addr="127.0.0.1", master_port=12345, **kwargs
+        )
     return await pool.sync_lora_weights_broadcast(
         master_addr="127.0.0.1", master_port=12345, lora_config={"r": 8}, **kwargs
     )
@@ -329,7 +333,9 @@ SYNC_PATHS = ["sync_weights", "sync_weights_broadcast", "sync_lora_weights_broad
 def test_pause_keep_clears_cache_by_default(path):
     async def run():
         events: list[str] = []
-        out = await _run_sync(_pool(events), path, strategy="pause", pause_mode="keep", clear_cache=False)
+        out = await _run_sync(
+            _pool(events), path, strategy="pause", pause_mode="keep", clear_cache=False
+        )
         assert out["clear_cache"] is True
         assert "pause_generation:keep:True" in events
         assert "pause_generation:keep:False" not in events

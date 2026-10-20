@@ -30,14 +30,12 @@ import bisect
 import threading
 import time
 from collections import deque
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.v1.metrics.loggers import StatLoggerBase
-from vllm.v1.metrics.stats import IterationStats
-from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 # `MultiModalCacheStats` only exists on vLLM >= 0.16; older builds pass `None`
 # instead of the typed object.
@@ -58,9 +56,9 @@ class RequestRecord:
 
     request_id: int
     replica_id: int
-    arrival_time: float  # scheduler.submit() wall-clock
-    submitted_time: float  # routed to a worker and accepted (active_requests++)
-    completion_time: float  # worker future resolved
+    arrival_time: float          # scheduler.submit() wall-clock
+    submitted_time: float        # routed to a worker and accepted (active_requests++)
+    completion_time: float       # worker future resolved
     prompt_len: int
     generation_len: int
     prefix_cache_len: int
@@ -80,8 +78,8 @@ class ReplicaSnapshot:
     kv_cache_usage: float
     num_running_reqs: int
     num_waiting_reqs: int
-    max_concurrency: int  # scheduler-side WorkerState.concurrency_limit
-    num_tokens_in_step: int  # decode + prefill tokens scheduled this step
+    max_concurrency: int        # scheduler-side WorkerState.concurrency_limit
+    num_tokens_in_step: int     # decode + prefill tokens scheduled this step
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -158,7 +156,10 @@ class WorkerMetricsCollector:
         if scheduler_stats is None:
             return
         now = time.time()
-        if self.min_interval_s > 0 and now - self._last_record_time < self.min_interval_s:
+        if (
+            self.min_interval_s > 0
+            and now - self._last_record_time < self.min_interval_s
+        ):
             return
         self._last_record_time = now
 
@@ -173,22 +174,22 @@ class WorkerMetricsCollector:
                 prompt_tokens = pts.computed
             else:
                 prompt_tokens = getattr(iteration_stats, "num_prompt_tokens", 0)
-            tokens_in_step = iteration_stats.num_generation_tokens + prompt_tokens
-
-        self._snapshots.push(
-            ReplicaSnapshot(
-                replica_id=self.replica_id,
-                timestamp=now,
-                kv_cache_usage=float(scheduler_stats.kv_cache_usage),
-                num_running_reqs=int(scheduler_stats.num_running_reqs),
-                num_waiting_reqs=int(scheduler_stats.num_waiting_reqs),
-                # `max_concurrency` is owned by the scheduler (in the parent
-                # process). We stamp it later in `Scheduler.drain_metrics` from
-                # the per-replica concurrency-limit history.
-                max_concurrency=0,
-                num_tokens_in_step=int(tokens_in_step),
+            tokens_in_step = (
+                iteration_stats.num_generation_tokens + prompt_tokens
             )
-        )
+
+        self._snapshots.push(ReplicaSnapshot(
+            replica_id=self.replica_id,
+            timestamp=now,
+            kv_cache_usage=float(scheduler_stats.kv_cache_usage),
+            num_running_reqs=int(scheduler_stats.num_running_reqs),
+            num_waiting_reqs=int(scheduler_stats.num_waiting_reqs),
+            # `max_concurrency` is owned by the scheduler (in the parent
+            # process). We stamp it later in `Scheduler.drain_metrics` from
+            # the per-replica concurrency-limit history.
+            max_concurrency=0,
+            num_tokens_in_step=int(tokens_in_step),
+        ))
 
     def drain_snapshots(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._snapshots.drain()]
