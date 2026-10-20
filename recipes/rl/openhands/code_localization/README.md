@@ -50,23 +50,22 @@ git checkout per in-flight rollout. That checkout is the sandbox.
 
 ## Data
 
-The tasks are the SWE-smith split from CodeScout
-([`data/swe_smith`](https://github.com/18jeffreyma/codescout/tree/abab719e08a55dde78c6da864cd24d84fd47bdf2/data/swe_smith)
-at `abab719`): 39,187 training and 100 validation instances. Download them to
-the default location:
+The tasks come from the Hugging Face dataset
+[`OpenHands/SWE-smith-py-code-search`](https://huggingface.co/datasets/OpenHands/SWE-smith-py-code-search).
+From the `Arctic-Platform` checkout, download it and write the training files:
 
 ```bash
-mkdir -p ~/data/swe-smith-localization
-for split in train validation; do
-  curl -fL -o ~/data/swe-smith-localization/$split.parquet \
-    https://raw.githubusercontent.com/18jeffreyma/codescout/abab719e08a55dde78c6da864cd24d84fd47bdf2/data/swe_smith/$split.parquet
-done
+uv run recipes/rl/openhands/code_localization/prepare_data.py
 ```
 
-To keep them elsewhere, set `DATA_DIR` to that directory.
+That writes 39,187 training and 100 validation rows to
+`~/data/swe-smith-localization`, which is where the run script looks. To keep
+them elsewhere, pass `--out DIR` and set `DATA_DIR=DIR` when you run.
 
-Rows need `instance_id`, `repo`, `base_commit`, `problem_statement`, `patch`,
-`use_patch`, `file_changes`, and `prompt`.
+The script pins the dataset revision and reproduces CodeScout's `data/swe_smith`
+split. It adds the chat `prompt` and the `target` locations, sets `use_patch`
+because a SWE-smith patch introduces the bug, and holds out 100 shuffled rows
+for validation.
 
 ## Run
 
@@ -123,6 +122,7 @@ shorten that.
 
 | Piece | Source |
 | --- | --- |
+| Tasks | [`OpenHands/SWE-smith-py-code-search`](https://huggingface.co/datasets/OpenHands/SWE-smith-py-code-search) via CodeScout `src/build_dataset.py --use_patch` |
 | Finish tool, F1 reward, rollout, chat proxy, Hermes parser | [codescout@abab719](https://github.com/18jeffreyma/codescout/tree/abab719e08a55dde78c6da864cd24d84fd47bdf2) |
 | Qwen3.5 XML tool calls | [codescout@8184b42](https://github.com/18jeffreyma/codescout/commit/8184b42) |
 | OpenHands SDK | [software-agent-sdk@85ecfd93](https://github.com/OpenHands/software-agent-sdk/commit/85ecfd9333d2d2cc4404dd460fd38868d9b978e2) |

@@ -33,8 +33,7 @@ TRAIN_FILES="${DATA_DIR}/train.parquet"
 VAL_FILES="${DATA_DIR}/validation.parquet"
 if [[ ! -f "${TRAIN_FILES}" || ! -f "${VAL_FILES}" ]]; then
     echo "ERROR: localization parquets not found under ${DATA_DIR}." >&2
-    echo "       Download train.parquet and validation.parquet as shown under Data in" >&2
-    echo "       recipes/rl/openhands/code_localization/README.md, or set DATA_DIR." >&2
+    echo "       Run: uv run recipes/rl/openhands/code_localization/prepare_data.py --out ${DATA_DIR}" >&2
     exit 1
 fi
 
