@@ -325,13 +325,21 @@ def _kill_process_trees(
     signal(targets, killed, denied)
     signalled = dict(targets)
 
-    orphans = {}
-    unattributed = []
-    foreign = []
+    orphan_group = {}
+    # Keyed by pid: a process that is neither killed nor tagged is seen again
+    # by the rescan, and is reported once.
+    unattributed = {}
+    foreign = {}
     tags = set(orphan_tags)
-    if len(tags) > 0:
+
+    def find_orphans(skip):
+        """Orphaned vLLM GPU holders, as ``{pid: proc}`` for this worker's
+        tags, plus the unattributed and foreign ones."""
+        found = {}
+        unattr = {}
+        forn = {}
         for pid in psutil.pids():
-            if pid in signalled or pid in (me, 1):
+            if pid in skip or pid in (me, 1):
                 continue
             try:
                 if not orphaned(pid) or not holds_gpu(pid):
@@ -348,30 +356,93 @@ def _kill_process_trees(
             except psutil.Error:
                 tag = None
             if tag in tags:
-                orphans[pid] = proc
+                found[pid] = proc
             elif tag is None:
-                unattributed.append(pid)
+                unattr[pid] = None
             else:
-                foreign.append((pid, tag))
-    signal(orphans, killed, denied)
-    signalled.update(orphans)
+                forn[pid] = tag
+        return found, unattr, forn
 
-    # Not psutil.wait_procs: that waits on a zombie until the timeout, and a
-    # SIGKILLed child whose parent is still alive stays one.
-    alive = [signalled[pid] for pid in killed]
+    def children_of(parents, skip):
+        """Live descendants of ``parents`` that hold a GPU device and run
+        under vLLM's title, and carry one of this worker's tags if their
+        environment is readable.
+
+        A TP worker is a child of its EngineCore, which is alive while the
+        orphan check runs, so the orphan check never selects it. They are
+        found here instead, before anything is signalled, from the tagged
+        orphan they hang off.
+        """
+        found = {}
+        for parent in parents.values():
+            try:
+                descendants = parent.children(recursive=True)
+            except psutil.Error:
+                continue
+            for child in descendants:
+                if child.pid in skip or child.pid in found or child.pid in (me, 1):
+                    continue
+                try:
+                    if not holds_gpu(child.pid):
+                        continue
+                    if title_marker not in " ".join(child.cmdline()):
+                        continue
+                except (OSError, ValueError, IndexError, psutil.Error):
+                    continue
+                try:
+                    tag_here = child.environ().get(tag_env)
+                    readable = True
+                except psutil.NoSuchProcess:
+                    continue
+                except psutil.Error:
+                    readable = False
+                # An unreadable environment says nothing either way, so only a
+                # readable one that names another worker excludes the child.
+                if readable and tag_here not in tags:
+                    continue
+                found[child.pid] = child
+        return found
+
+    def reap_orphans():
+        """One cheap-first pass: signal the tagged orphans and their vLLM
+        children together. Returns the processes it signalled."""
+        if len(tags) == 0:
+            return {}
+        found, unattr, forn = find_orphans(signalled)
+        unattributed.update(unattr)
+        foreign.update(forn)
+        group = {**found, **children_of(found, signalled)}
+        signal(group, killed, denied)
+        signalled.update(group)
+        orphan_group.update(group)
+        return group
+
+    def wait_exit(procs, end):
+        """Poll until each process has exited, or ``end``. Returns those still
+        running. Not psutil.wait_procs: that waits on a zombie until the
+        timeout, and a SIGKILLed child whose parent is still alive stays one."""
+        alive = list(procs)
+        while True:
+            alive = [proc for proc in alive if running(proc)]
+            if len(alive) == 0 or time.monotonic() >= end:
+                return alive
+            time.sleep(0.05)
+
     end = time.monotonic() + wait_s
-    while True:
-        alive = [proc for proc in alive if running(proc)]
-        if len(alive) == 0 or time.monotonic() >= end:
-            break
-        time.sleep(0.05)
+    reap_orphans()
+    # Wait for the first group before rescanning, so that anything orphaned by
+    # that kill is caught by the rescan, not while its parent still runs.
+    wait_exit([signalled[pid] for pid in killed], end)
+    # Backstop: processes orphaned by the kill itself.
+    reap_orphans()
+    alive = wait_exit([signalled[pid] for pid in killed], end)
     return dict(
         killed=sorted(killed),
         alive=sorted(p.pid for p in alive),
         denied=sorted(denied),
-        orphans=sorted(set(orphans) & set(killed)),
+        orphans=sorted(set(orphan_group) & set(killed)),
         unattributed=sorted(unattributed),
-        foreign=sorted(foreign),
+        foreign=sorted(foreign.items()),
     )
 
 

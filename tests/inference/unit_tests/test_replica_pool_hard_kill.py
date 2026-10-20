@@ -1104,3 +1104,68 @@ def test_foreign_orphans_are_warned_about_not_killed(monkeypatch, caplog):
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("(4242, 'dumper-id')" in m and "semi-p" in m for m in warnings)
     assert _errors(caplog) == []
+
+
+# An EngineCore that titles itself and starts one TP worker, both holding the
+# fake GPU device. The launcher exits, orphaning the engine; the worker is then
+# a child of an orphan, which is the case the orphan check alone misses.
+_TP_WORKER = """
+import os, sys, time
+if sys.platform.startswith("linux"):
+    import setproctitle
+    setproctitle.setproctitle("VLLM::Worker_TP0")
+fd = open(sys.argv[1], "rb")
+print(os.getpid(), flush=True)
+time.sleep(60)
+"""
+
+_TP_ENGINE = """
+import os, subprocess, sys, time
+if sys.platform.startswith("linux"):
+    import setproctitle
+    setproctitle.setproctitle("VLLM::EngineCore")
+fd = open(sys.argv[1], "rb")
+worker = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[2], sys.argv[1]], stdout=subprocess.PIPE, text=True
+)
+print(os.getpid(), worker.stdout.readline().strip(), flush=True)
+time.sleep(60)
+"""
+
+_TP_LAUNCHER = """
+import subprocess, sys
+engine = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[2], sys.argv[1], sys.argv[3]], stdout=subprocess.PIPE, text=True
+)
+print(engine.stdout.readline().strip(), flush=True)
+"""
+
+
+def test_tagged_orphan_engine_and_its_tp_child_are_killed_in_one_call(fake_gpu):
+    prefix = str(fake_gpu)[:-1]
+    env = dict(os.environ, ARCTIC_INFERENCE_WORKER_ACTOR_ID="actor7", SPT_NOENV="1")
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", _TP_LAUNCHER, str(fake_gpu), _TP_ENGINE, _TP_WORKER],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    engine, worker = (int(pid) for pid in launcher.stdout.readline().split())
+    launcher.wait(timeout=30)
+    try:
+        # The launcher has exited, so the engine is an orphan; the worker is
+        # its child and its own parent is alive.
+        assert psutil.Process(engine).ppid() != launcher.pid
+        assert psutil.Process(worker).ppid() == engine
+        assert psutil.Process(worker).environ().get("ARCTIC_INFERENCE_WORKER_ACTOR_ID") == "actor7"
+
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        assert sorted(result["killed"]) == sorted([engine, worker])
+        assert sorted(result["orphans"]) == sorted([engine, worker])
+        assert result["alive"] == []
+        assert _gone(engine) and _gone(worker)
+    finally:
+        _reap(engine, worker)
