@@ -613,7 +613,14 @@ class CortexTransport(Transport):
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
     async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
-        reply = await self._send_group(route, url, sends)
+        import aiohttp
+
+        try:
+            reply = await self._send_group(route, url, sends)
+        except aiohttp.ClientResponseError as exc:
+            if request.body.get("operation_type") != "tail-logs" or not _is_job_not_found(exc):
+                raise
+            return [], {"entries": [], "next_cursor": None, "eof": True}
         if not route.poll:
             return [], reply
         return await self._poll(route.submitted(request, reply))

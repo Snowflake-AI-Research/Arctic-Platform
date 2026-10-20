@@ -126,7 +126,7 @@ def _next_poll_wait(got_items: bool, wait: float, poll_interval: float) -> float
 
 def _next_log_wait(page: dict, wait: float, poll_interval: float, follow: bool) -> float | None:
     """Seconds before `stream_logs` fetches again, or None to stop."""
-    if page["eof"] and not follow and not page["entries"]:
+    if not page["entries"] and (page["eof"] or not follow):
         return None
     return _next_poll_wait(bool(page["entries"]), wait, poll_interval)
 
