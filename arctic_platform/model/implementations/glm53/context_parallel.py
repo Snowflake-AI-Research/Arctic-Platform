@@ -28,9 +28,14 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    fused_sparse_mla_backward_available,
+)
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    sparse_mla_flashmla_fused_apply,
+)
 from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
-from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
@@ -352,6 +357,10 @@ def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
     )
 
 
+def _fused_sparse_mla_backward_available() -> bool:
+    return fused_sparse_mla_backward_available()
+
+
 def _use_flashmla(query: torch.Tensor, value_dim: int) -> bool:
     # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x.
     return (
@@ -366,6 +375,10 @@ def _select_sparse_mla_backend(requested: str, query: torch.Tensor, key_value: t
     if requested not in SPARSE_MLA_BACKENDS:
         raise ValueError(f"Unknown GLM-5.3 sparse attention backend {requested!r}; expected {SPARSE_MLA_BACKENDS}")
     if requested in ("sparse_mla", "flashinfer"):
+        # FlashInfer's forward pairs with the tiled reference backward; with the fused TileLang backward
+        # installed, FlashMLA's forward and that backward are the faster sparse_mla choice on Hopper too.
+        if requested == "sparse_mla" and _fused_sparse_mla_backward_available() and _use_flashmla(query, value_dim):
+            return "flashmla"
         if value_dim == 512 and _use_flashinfer(query, key_value):
             return "flashinfer"
         if requested == "flashinfer":
@@ -647,15 +660,18 @@ def _sparse_attention_forward(
         if padding:
             sparse_query = F.pad(sparse_query, (0, padding))
             sparse_kv = F.pad(sparse_kv, (0, padding))
-        absorbed_output = sparse_mla_flashmla_apply(
+        # The fused TileLang backward reads unused slots as the sentinel (last, zero) row, not -1;
+        # the FlashMLA forward maps them back to -1.
+        sentinel_indices = kernel_indices.masked_fill(kernel_indices < 0, sparse_kv.shape[1] - 1)
+        absorbed_output = sparse_mla_flashmla_fused_apply(
             sparse_query,
             sparse_kv,
-            kernel_indices.unsqueeze(2),
+            sentinel_indices.unsqueeze(2),
             self.scaling,
         )
         if not getattr(self, "_ap_flashmla_dispatch_reported", False):
             get_logger().info(
-                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=reference",
+                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=fused",
                 dist.get_rank() if dist.is_initialized() else 0,
                 576 - padding,
             )
