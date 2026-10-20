@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["pandas", "pyarrow"]
-# ///
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -16,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pandas", "pyarrow"]
+# ///
 """Write train.parquet and validation.parquet from the SWE-smith code-search set.
 
 Adapted from ``src/build_dataset.py --use_patch`` in
