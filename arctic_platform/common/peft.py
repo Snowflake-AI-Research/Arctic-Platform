@@ -113,7 +113,7 @@ def normalize_lora_peft_config(
     if not target_modules and not target_parameters:
         raise ValueError(f"{location} must specify target_modules, target_parameters, or both")
 
-    normalized = {
+    result = {
         "peft_type": "Lora",
         "task_type": "CAUSAL_LM",
         "r": rank,
@@ -126,7 +126,7 @@ def normalize_lora_peft_config(
     if "deterministic_init" in peft_config:
         if target_parameters:
             raise ValueError(f"{location}.deterministic_init supports dense target_modules only")
-        normalized["deterministic_init"] = normalize_lora_initialization(
+        result["deterministic_init"] = normalize_lora_initialization(
             peft_config["deterministic_init"], location=f"{location}.deterministic_init"
         )
-    return normalized
+    return result
