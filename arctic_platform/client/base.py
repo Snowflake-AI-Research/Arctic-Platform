@@ -46,16 +46,19 @@ from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.requests import bootstrap_router_replay_request
 from arctic_platform.client.requests import cancel_job_request
+from arctic_platform.client.requests import cancel_request_request
 from arctic_platform.client.requests import capacity_request
 from arctic_platform.client.requests import delete_checkpoint_request
 from arctic_platform.client.requests import export_checkpoint_request
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
+from arctic_platform.client.requests import generate_stream_request
 from arctic_platform.client.requests import get_job_request
 from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.requests import list_jobs_request
 from arctic_platform.client.requests import load_checkpoint_request
+from arctic_platform.client.requests import request_status_request
 from arctic_platform.client.requests import reset_prefix_cache_request
 from arctic_platform.client.requests import router_replay_discard_request
 from arctic_platform.client.requests import save_checkpoint_request
@@ -114,13 +117,23 @@ def _maybe_print_server_profile(op: str, out: dict | None) -> None:
         sft_profile.maybe_print(f"server {op}", prof)
 
 
+def _next_poll_wait(got_items: bool, wait: float, poll_interval: float) -> float:
+    """Seconds before polling again: 0 right after new items, else 1.25x backoff capped at 6s."""
+    return 0.0 if got_items else min(max(wait * 1.25, poll_interval), 6.0)
+
+
 def _next_log_wait(page: dict, wait: float, poll_interval: float, follow: bool) -> float | None:
-    """Seconds before `stream_logs` fetches again (0 after new entries), or None to stop."""
-    if page["entries"]:
-        return 0.0
-    if page["eof"] and not follow:
+    """Seconds before `stream_logs` fetches again, or None to stop."""
+    if page["eof"] and not follow and not page["entries"]:
         return None
-    return min(max(wait * 1.25, poll_interval), 6.0)
+    return _next_poll_wait(bool(page["entries"]), wait, poll_interval)
+
+
+def _stream_ended(status: dict, request_id: str) -> bool:
+    """Whether `generate_stream` is done: the request finished and its events are drained."""
+    if status["state"] == "failed":
+        raise RuntimeError(f"generate-stream request {request_id} failed: {status['error']}")
+    return status["state"] == "done" and not status["events"]
 
 
 class _ArcticClientCore:
@@ -296,6 +309,38 @@ class ArcticClient(_ArcticClientCore):
         self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None, strict: bool = False
     ) -> list:
         return self._call(generate_request(self.jobs, prompts, sampling_params, routing_key, strict))["results"]
+
+    def generate_stream(
+        self,
+        prompts: list,
+        sampling_params: dict | None = None,
+        routing_key: Any = None,
+        strict: bool = False,
+        *,
+        max_events: int = 64,
+        poll_interval: float = 0.5,
+    ) -> Iterator[dict]:
+        """Yield the server's ``result`` / ``error`` / ``done`` events as prompts finish (Cortex only).
+
+        Each ``result`` / ``error`` event carries the prompt's ``index``. Closing the iterator
+        before the request ends cancels it on the server.
+        """
+        job = self.jobs.require("sampling")
+        submitted = self._call(generate_stream_request(self.jobs, prompts, sampling_params, routing_key, strict))
+        request_id = submitted["request_id"]
+        running, wait = True, 0.0
+        try:
+            while True:
+                status = self._call(request_status_request(job, request_id, max_events))
+                running = status["state"] == "running"
+                yield from status["events"]
+                if _stream_ended(status, request_id):
+                    return
+                wait = _next_poll_wait(bool(status["events"]), wait, poll_interval)
+                time.sleep(wait)
+        finally:
+            if running:
+                self._call(cancel_request_request(job, request_id))
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(
@@ -483,6 +528,36 @@ class AsyncArcticClient(_ArcticClientCore):
         return (await self._acall(generate_request(self.jobs, prompts, sampling_params, routing_key, strict)))[
             "results"
         ]
+
+    async def generate_stream(
+        self,
+        prompts: list,
+        sampling_params: dict | None = None,
+        routing_key: Any = None,
+        strict: bool = False,
+        *,
+        max_events: int = 64,
+        poll_interval: float = 0.5,
+    ) -> AsyncIterator[dict]:
+        job = self.jobs.require("sampling")
+        submitted = await self._acall(
+            generate_stream_request(self.jobs, prompts, sampling_params, routing_key, strict)
+        )
+        request_id = submitted["request_id"]
+        running, wait = True, 0.0
+        try:
+            while True:
+                status = await self._acall(request_status_request(job, request_id, max_events))
+                running = status["state"] == "running"
+                for event in status["events"]:
+                    yield event
+                if _stream_ended(status, request_id):
+                    return
+                wait = _next_poll_wait(bool(status["events"]), wait, poll_interval)
+                await asyncio.sleep(wait)
+        finally:
+            if running:
+                await self._acall(cancel_request_request(job, request_id))
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(

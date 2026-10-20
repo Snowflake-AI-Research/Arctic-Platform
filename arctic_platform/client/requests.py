@@ -165,6 +165,26 @@ def generate_request(
     return Request("generate", jobs.require("sampling"), body)
 
 
+def generate_stream_request(
+    jobs: JobHandles,
+    prompts: list,
+    sampling_params: dict | None = None,
+    routing_key: Any = None,
+    strict: bool = False,
+) -> Request:
+    body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key, "strict": strict}
+    return Request("generate-stream", jobs.require("sampling"), body)
+
+
+def request_status_request(job_id: JobId, request_id: str, max_events: int) -> Request:
+    return Request("request-status", job_id, {"request_id": request_id, "max_events": max_events})
+
+
+def cancel_request_request(job_id: JobId, request_id: str) -> Request:
+    body = {"operation_type": "cancel-request", "sub_job_id": job_id, "payload": {"request_id": request_id}}
+    return Request("cancel-request", job_id, body)
+
+
 def log_probs_request(jobs: JobHandles, prompts: list, completions: list | None = None, top_k: int = 1) -> Request:
     body = {"prompts": prompts, "completions": completions, "top_k": top_k}
     return Request("log-probs", jobs.require("log_prob"), body)
