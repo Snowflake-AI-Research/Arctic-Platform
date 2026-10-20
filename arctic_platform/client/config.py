@@ -353,9 +353,27 @@ class ArcticClientConfig(BaseModel):
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
+        provider = worker.get("model_provider")
+        if provider == "liger":
+            raise ValueError(
+                "ds_worker_config.model_provider='liger' is not accepted. "
+                "Set use_liger=true to apply Liger kernels on a huggingface model."
+            )
+        if provider == "prime_rl":
+            provider = "arctic"
+        if provider and provider not in {"huggingface", "arctic"}:
+            raise ValueError(f"ds_worker_config.model_provider must be 'huggingface' or 'arctic', got {provider!r}.")
+        if worker.get("use_liger") and provider == "arctic":
+            raise ValueError(
+                "use_liger applies to huggingface models. On the arctic provider, "
+                "set model_options.lm_head.cross_entropy."
+            )
         if provider:
             training["model_provider"] = provider
+        if worker.get("use_liger"):
+            options = dict(training.get("model_options") or {})
+            options["liger"] = True
+            training["model_options"] = options
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
