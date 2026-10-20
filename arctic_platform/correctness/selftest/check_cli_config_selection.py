@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from arctic_platform.correctness import __main__ as cli
+from arctic_platform.correctness.harness import execution as cli
 from arctic_platform.correctness.selftest.config_factory import native_config
 
 

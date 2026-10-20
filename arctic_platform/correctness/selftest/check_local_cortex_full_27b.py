@@ -30,6 +30,7 @@ from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.registry import TestResult as Result
 from arctic_platform.correctness.harness.spec import TestSpec as Spec
+from arctic_platform.correctness.models import original
 
 BASE = Path(__file__).resolve().parents[1]
 CONFIG = BASE / "configs/qwen3.8-27b/b200/train-sft-8gpus-2k.config"
@@ -84,7 +85,7 @@ def full_model(tmp_path, monkeypatch):
             return SimpleNamespace(hexdigest=lambda: pins[data])
         return real_sha256(data)
 
-    monkeypatch.setattr(runner, "hashlib", SimpleNamespace(sha256=digest))
+    monkeypatch.setattr(original, "hashlib", SimpleNamespace(sha256=digest))
     monkeypatch.setenv("HF_HUB_CACHE", str(cache))
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("DSS_ALLOW_REMOTE_MODELS", "1")

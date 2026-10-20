@@ -204,6 +204,34 @@ def test_corrupt_record_cannot_fall_back_to_hf(ctx, monkeypatch):
         check._run(ctx)
 
 
+def test_shared_sft_source_is_bound_and_drift_requires_explicit_preparation(ctx, monkeypatch):
+    _, identity, _, _ = publish(ctx)
+    source = reference_records.file_identity(Path(check.__file__).parents[1] / "harness" / "sft.py")
+    assert identity["sft_source"] == source
+    original = reference_records.file_identity
+
+    def changed(path):
+        value = original(path)
+        return {**value, "sha256": "0" * 64} if Path(path).name == "sft.py" else value
+
+    monkeypatch.setattr(reference_records, "file_identity", changed)
+    guard_launches(monkeypatch)
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="prepared HF reference missing"):
+        check._run(ctx)
+
+
+def test_old_unbound_e2e_record_is_not_silently_relabelled(ctx, monkeypatch):
+    inputs = check.prepare_inputs(ctx)
+    identity = reference_records.workload_identity(ctx, check.TEST_ID, inputs.recipe)
+    old = {key: value for key, value in identity.items() if key != "sft_source"}
+    path = reference_records.publish_record(ctx, old, measurements(inputs))
+    before = path.read_bytes()
+    guard_launches(monkeypatch)
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="prepared HF reference missing"):
+        check._run(ctx)
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "key,value",
     [

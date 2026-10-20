@@ -31,9 +31,9 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
-from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.harness import cortex_fixture
 from arctic_platform.correctness.harness import cortex_optimizer_capture as capture
+from arctic_platform.correctness.harness import execution as cli
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.arms import ArmDefinition
 from arctic_platform.correctness.harness.config import load_config

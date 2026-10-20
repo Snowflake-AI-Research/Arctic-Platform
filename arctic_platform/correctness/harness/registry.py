@@ -76,6 +76,7 @@ class TestResult:
     mismatches: List[Mismatch] = field(default_factory=list)
     worst_name: Optional[str] = None
     metrics: Dict[str, float] = field(default_factory=dict)
+    error_type: Optional[str] = None
 
 
 @dataclass

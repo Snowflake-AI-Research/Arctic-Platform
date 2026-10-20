@@ -130,7 +130,7 @@ def to_markdown(
         published = bound_fixture and not local_fixture
         inference_model = metadata.get("inference_model_name") if remote else None
         if metadata:
-            lines.append(f"- execution backend: `{metadata['backend']}`")
+            lines.append(f"- execution backend: `{metadata.get('backend') or 'unknown'}`")
         if remote:
             label = "requested published reduced model" if published else "requested catalog model"
             if local_fixture:
@@ -236,6 +236,7 @@ def to_json(results: List[TestResult], specs: Dict[str, TestSpec], *, execution:
                 "outcome": r.outcome.value,
                 "summary": r.summary,
                 "reason": r.reason,
+                **({"error_type": r.error_type} if r.error_type is not None else {}),
                 "metrics": r.metrics,
                 "mismatches": [
                     {

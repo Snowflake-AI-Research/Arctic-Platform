@@ -151,6 +151,10 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
     elif check_id == "single-step-optimizer":
         identity["norm_reduction_source"] = file_identity(root / "checks" / "optimizer_state.py")
         identity["norm_schema_source"] = file_identity(root / "harness" / "optimizer_norm_schema.py")
+    elif check_id == "e2e-sft-train-validate":
+        # Shared replay/scoring helpers affect the reference semantics. Older
+        # records did not bind them, so do not silently relabel those measurements.
+        identity["sft_source"] = file_identity(root / "harness" / "sft.py")
     return identity
 
 

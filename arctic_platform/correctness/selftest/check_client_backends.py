@@ -33,10 +33,10 @@ from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
-from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.checks import inference_checkpoint_loss as inference
 from arctic_platform.correctness.harness import cortex_fixture
 from arctic_platform.correctness.harness import dss_driver
+from arctic_platform.correctness.harness import execution as cli
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
@@ -195,7 +195,8 @@ def test_remote_run_never_probes_local_allocation(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "ensure_no_interrupted_builds", forbidden)
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, *args, **kwargs: seen.append(cfg.config_id))
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
-    assert cli.main(["run", "--all-configs", "--config-dir", str(config_dir), "--base-url", _remote().base_url]) == 0
+    args = cli.parse_args(["run", "--all-configs", "--config-dir", str(config_dir), "--base-url", _remote().base_url])
+    assert cli._run_configs(args) == 0
     assert len(seen) == 2
 
 
@@ -525,7 +526,12 @@ def test_cortex_cli_fixture_provenance_keeps_e2e_and_full_inference_distinct(tmp
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, path, arms, **kwargs: (spec, []))
     monkeypatch.setattr(cortex_fixture, "load_fixture", lambda *args: fixture)
     monkeypatch.setattr(cli, "_run_vocab_size", lambda *args: 128)
-    monkeypatch.setattr(cli, "execute", lambda *args, **kwargs: calls.append(kwargs) or [])
+
+    def execute(cfg, *args, **kwargs):
+        calls.append(kwargs)
+        return [Result(test_id, cfg.config_id, Outcome.PASS) for test_id in kwargs["select"]]
+
+    monkeypatch.setattr(cli, "execute", execute)
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0)
     args = ["run", "--config", str(path), "--base-url", _remote().base_url, "--cortex-fixture", str(receipt)]
     for test_id in selected:
@@ -542,9 +548,8 @@ def test_cortex_cli_fixture_provenance_keeps_e2e_and_full_inference_distinct(tmp
     if include_inference:
         expected["inference_model_name"] = cfg.model_name
     assert metadata == {cfg.config_id: expected}
-    assert len(calls) == 1
-    assert calls[0]["select"] == selected
-    assert calls[0]["cortex_fixture"] == receipt
+    assert [call["select"] for call in calls] == [[test_id] for test_id in selected]
+    assert all(call["cortex_fixture"] == receipt for call in calls)
 
 
 @pytest.mark.parametrize("remote", [False, True])
@@ -636,7 +641,12 @@ def test_remote_cli_checkpoint_uses_catalog_and_explicit_placement_pool(tmp_path
     metadata = {}
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, path, arms, **kwargs: (spec, arms))
     monkeypatch.setattr(cli, "_catalog_vocab_size", lambda name: 128)
-    monkeypatch.setattr(cli, "execute", lambda cfg, *args, **kwargs: measured.append((cfg, kwargs)) or [])
+
+    def execute(cfg, *args, **kwargs):
+        measured.append((cfg, kwargs))
+        return [Result("checkpoint-resume-loss", cfg.config_id, Outcome.PASS, gpus=cfg.n_gpus)]
+
+    monkeypatch.setattr(cli, "execute", execute)
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0)
     assert (
         cli.main(

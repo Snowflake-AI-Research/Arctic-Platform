@@ -26,8 +26,8 @@ from safetensors.torch import save_file
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.harness import cortex_fixture
+from arctic_platform.correctness.harness import execution as cli
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome

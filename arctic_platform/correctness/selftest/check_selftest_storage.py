@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_platform.correctness import __main__ as cli
+from arctic_platform.correctness.harness import execution as cli
 
 
 def test_selftest_default_uses_unique_fast_scratch(monkeypatch):

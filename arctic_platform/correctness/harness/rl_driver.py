@@ -35,6 +35,7 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 
 from .dss_driver import GatewaySession
+from .dss_driver import UnsafeCleanupError
 from .dss_driver import _training_client_config
 
 
@@ -84,7 +85,10 @@ def running_rl_client(
     try:
         yield client
     finally:
-        client.shutdown()
+        try:
+            client.shutdown()
+        except Exception as exc:
+            raise UnsafeCleanupError("RL client shutdown failed; inspect owned resources before retrying") from exc
 
 
 def generate(client: ArcticClient, prompts: Sequence[Sequence[int]], sampling_params: Sequence[dict]) -> List[dict]:

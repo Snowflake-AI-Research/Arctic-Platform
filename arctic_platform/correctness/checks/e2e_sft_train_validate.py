@@ -68,6 +68,7 @@ from ..harness.arms import correctness_microbatch_tokens
 from ..harness.batches import Batch
 from ..harness.batches import load
 from ..harness.batches import save
+from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import build_payload
 from ..harness.dss_driver import forward_logprobs
 from ..harness.dss_driver import fwd_bwd_step
@@ -81,15 +82,15 @@ from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
 from ..harness.seeds import SEED
+from ..harness.sft import TRAIN_SPLIT
+from ..harness.sft import VALIDATION_SPLIT
+from ..harness.sft import configured_learning_rate
+from ..harness.sft import configured_rows_per_step
+from ..harness.sft import cross_entropy
+from ..harness.sft import reference_answer_logprobs
 from ..harness.spec import tolerance_text
 from ..harness.workdir import require_data_fast_path
 from ..reference.model_features import uses_mixer_packing
-from .inference_checkpoint_loss import TRAIN_SPLIT
-from .inference_checkpoint_loss import VALIDATION_SPLIT
-from .inference_checkpoint_loss import configured_learning_rate
-from .inference_checkpoint_loss import configured_rows_per_step
-from .inference_checkpoint_loss import cross_entropy
-from .inference_checkpoint_loss import reference_answer_logprobs
 
 TEST_ID = "e2e-sft-train-validate"
 GSM8K_DATA_ROOT_ENV = "DSS_CORRECTNESS_GSM8K_ROOT"
@@ -563,6 +564,8 @@ def run(ctx) -> List[TestResult]:
         return []
     try:
         return [_run(ctx)]
+    except UnsafeCleanupError:
+        raise
     except Exception as exc:  # noqa: BLE001 - a failure here is this check's verdict, not a crash
         logger.exception("E2E SFT check failed for %s", ctx.config_id)
         return [
@@ -571,6 +574,7 @@ def run(ctx) -> List[TestResult]:
                 config_id=ctx.config_id,
                 outcome=TestOutcome.FAIL,
                 summary=f"{type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__,
             )
         ]
 

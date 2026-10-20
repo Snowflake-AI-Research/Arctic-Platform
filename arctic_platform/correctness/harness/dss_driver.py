@@ -50,6 +50,10 @@ from .transport import Checkpoint
 from .workdir import require_data_fast_path
 
 
+class UnsafeCleanupError(RuntimeError):
+    """Owned resources may remain; do not start another correctness workload."""
+
+
 @dataclass
 class StepResult:
     avg_loss: float
@@ -154,16 +158,20 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
         yield
     finally:
         try:
-            if ray_cluster is not None:
-                ray_cluster._shutdown()
-        finally:
             try:
-                _stop_and_verify_gateway_runtime()
+                if ray_cluster is not None:
+                    ray_cluster._shutdown()
             finally:
-                if previous_master_port is None:
-                    os.environ.pop("MASTER_PORT", None)
-                else:
-                    os.environ["MASTER_PORT"] = previous_master_port
+                _stop_and_verify_gateway_runtime()
+        except Exception as exc:
+            raise UnsafeCleanupError(
+                "gateway runtime cleanup failed; inspect owned resources before retrying"
+            ) from exc
+        finally:
+            if previous_master_port is None:
+                os.environ.pop("MASTER_PORT", None)
+            else:
+                os.environ["MASTER_PORT"] = previous_master_port
 
 
 @contextlib.contextmanager
@@ -263,7 +271,10 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
         try:
             yield ArcticJob(client=client, job_type=job_type)
         finally:
-            client.shutdown()
+            try:
+                client.shutdown()
+            except Exception as exc:
+                raise UnsafeCleanupError("client shutdown failed; inspect owned resources before retrying") from exc
 
 
 def cortex_training_body(body: dict) -> dict:

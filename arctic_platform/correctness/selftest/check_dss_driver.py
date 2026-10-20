@@ -27,7 +27,6 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from arctic_platform.correctness.diagnostics.execution_controls import pack_microbatches
 from arctic_platform.correctness.harness.batches import Batch
 from arctic_platform.correctness.harness.dss_driver import _gateway_runtime
 from arctic_platform.correctness.harness.dss_driver import _globalize_expert_norms
@@ -37,6 +36,7 @@ from arctic_platform.correctness.harness.dss_driver import available_gpus
 from arctic_platform.correctness.harness.dss_driver import build_payload
 from arctic_platform.correctness.harness.dss_driver import copy_checkpoint_peft_adapter
 from arctic_platform.correctness.harness.dss_driver import pack
+from arctic_platform.correctness.harness.request_packing import pack_microbatches
 
 
 def test_globalize_expert_norms_replaces_rank_local_value() -> None:
@@ -61,7 +61,10 @@ def test_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> None:
         def step(self, learning_rate):
             return {
                 "metrics": {
-                    "gradient_norms_per_param": [{}, {"layers.0.input_layernorm.weight": 2.0}],
+                    "gradient_norms_per_param": [
+                        {},
+                        {"layers.0.input_layernorm.weight": 2.0},
+                    ],
                     "gradient_norms_per_expert": [],
                 }
             }
@@ -97,7 +100,9 @@ def test_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
     assert result.optimizer_state_manifest == "/tmp/manifest.json"
 
 
-def test_optimizer_capture_worker_patches_imported_server_worker_bindings(monkeypatch) -> None:
+def test_optimizer_capture_worker_patches_imported_server_worker_bindings(
+    monkeypatch,
+) -> None:
     import arctic_platform.common as common_package
     from arctic_platform.correctness.harness.optimizer_capture import _patched_deepspeed_worker_bindings
 
@@ -304,7 +309,9 @@ def test_runner_requires_data_fast_before_operational_side_effects(tmp_path, mon
         at_gpu_width=lambda *args: pytest.fail("unsafe workdir reached config preparation"),
     )
     monkeypatch.setattr(
-        runner.subprocess, "run", lambda *args, **kwargs: pytest.fail("unsafe output reached subprocess")
+        runner.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("unsafe output reached subprocess"),
     )
     with pytest.raises(ValueError, match="/data-fast"):
         if boundary == "execute":
@@ -368,12 +375,17 @@ def test_reference_allows_small_repo_report_with_data_fast_optimizer_output(tmp_
     assert not output.exists()
 
 
-def test_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path) -> None:
+def test_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(
+    tmp_path,
+) -> None:
     checkpoint_root = tmp_path / "checkpoint"
     source = checkpoint_root / "global_step0" / "default"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
+    save_file(
+        {"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)},
+        source / "adapter_model.safetensors",
+    )
     destination = tmp_path / "adapter"
 
     assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
@@ -387,7 +399,10 @@ def test_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -
     source = checkpoint_root / "hf"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
+    save_file(
+        {"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)},
+        source / "adapter_model.safetensors",
+    )
     destination = tmp_path / "adapter"
 
     assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
@@ -396,7 +411,9 @@ def test_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -
     ).read_bytes()
 
 
-def test_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy(tmp_path) -> None:
+def test_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy(
+    tmp_path,
+) -> None:
     source = tmp_path / "checkpoint" / "hf"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
@@ -418,7 +435,10 @@ def test_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypa
     source = tmp_path / "checkpoint" / "hf"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
+    save_file(
+        {"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)},
+        source / "adapter_model.safetensors",
+    )
     calls = []
 
     def save_checkpoint(**kwargs):
@@ -440,7 +460,12 @@ def test_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypa
 def test_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
     from arctic_platform.correctness.harness.dss_driver import save_weights_only_checkpoint
 
-    client = SimpleNamespace(save_checkpoint=lambda **kwargs: {"hf_path": str(tmp_path), "path": str(tmp_path)})
+    client = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: {
+            "hf_path": str(tmp_path),
+            "path": str(tmp_path),
+        }
+    )
     with pytest.raises(RuntimeError, match="no model config"):
         save_weights_only_checkpoint(None, SimpleNamespace(client=client), tmp_path)
 
@@ -488,15 +513,27 @@ def test_optimizer_capture_debug_config_defaults(job_config) -> None:
 def test_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
     from arctic_platform.correctness.harness.optimizer_capture import _optimizer_capture_debug_config
 
-    training_debug = {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    training_debug = {
+        "optimizer_state_output_dir": "/training",
+        "model_state_output_dir": "/model",
+    }
     worker_debug = {"optimizer_state_output_dir": "/worker"}
     debug = _optimizer_capture_debug_config(
-        {"training_config": {"debug": training_debug}, "ds_worker_config": {"debug": worker_debug}}
+        {
+            "training_config": {"debug": training_debug},
+            "ds_worker_config": {"debug": worker_debug},
+        }
     )
 
-    assert debug == {"optimizer_state_output_dir": "/worker", "model_state_output_dir": "/model"}
+    assert debug == {
+        "optimizer_state_output_dir": "/worker",
+        "model_state_output_dir": "/model",
+    }
     debug["optimizer_state_output_dir"] = "/changed"
-    assert training_debug == {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    assert training_debug == {
+        "optimizer_state_output_dir": "/training",
+        "model_state_output_dir": "/model",
+    }
     assert worker_debug == {"optimizer_state_output_dir": "/worker"}
 
 
@@ -577,11 +614,23 @@ def test_optimizer_capture_initialize_accepts_path_objects(optimizer_capture_ini
     assert worker._model_state_output_dir == str(tmp_path / "model")
 
 
-def test_optimizer_capture_initialize_worker_settings_can_disable_training_capture(optimizer_capture_initializer):
+def test_optimizer_capture_initialize_worker_settings_can_disable_training_capture(
+    optimizer_capture_initializer,
+):
     worker = optimizer_capture_initializer
     job_config = {
-        "training_config": {"debug": {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}},
-        "ds_worker_config": {"debug": {"optimizer_state_output_dir": None, "model_state_output_dir": None}},
+        "training_config": {
+            "debug": {
+                "optimizer_state_output_dir": "/training",
+                "model_state_output_dir": "/model",
+            }
+        },
+        "ds_worker_config": {
+            "debug": {
+                "optimizer_state_output_dir": None,
+                "model_state_output_dir": None,
+            }
+        },
     }
 
     assert worker.initialize("master", job_config) is True
@@ -689,7 +738,9 @@ def test_payload_does_not_choose_deepep_chunks() -> None:
     assert "deepep_token_chunk_size" not in payload["training_config"]
 
 
-def test_pool_is_the_local_devices_when_the_harness_owns_the_gateway(monkeypatch) -> None:
+def test_pool_is_the_local_devices_when_the_harness_owns_the_gateway(
+    monkeypatch,
+) -> None:
     """With no external gateway the harness starts one on this node, so its devices are the whole pool."""
     monkeypatch.delenv("DSS_GATEWAY_URL", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -768,7 +819,13 @@ def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch, auth
 
     def start(*, auto_attach, include_peers):
         events.append(
-            ("start", auto_attach, include_peers, os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE"))
+            (
+                "start",
+                auto_attach,
+                include_peers,
+                os.environ["MASTER_PORT"],
+                os.environ.get("RAY_AUTH_MODE"),
+            )
         )
 
     class RayCluster:
@@ -850,6 +907,11 @@ def test_gateway_runtime_restores_port_when_preflight_fails(monkeypatch) -> None
             raise RuntimeError("port is still bound")
 
     monkeypatch.setenv("MASTER_PORT", "12345")
+    monkeypatch.setattr(
+        dss_driver,
+        "_load_gateway_ray_cluster",
+        lambda: SimpleNamespace(init_ray_cluster=lambda **kwargs: None, _shutdown=lambda: None),
+    )
     monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
 
     with pytest.raises(RuntimeError, match="port is still bound"):
@@ -891,4 +953,63 @@ def test_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path
     with dss_driver.running_job(dss_driver.GatewaySession(tmp_path, 1), payload) as job:
         events.append(("job", job.job_id))
 
-    assert events == [("runtime-enter", 1), "client-start", ("job", 7), "client-shutdown", "runtime-exit"]
+    assert events == [
+        ("runtime-enter", 1),
+        "client-start",
+        ("job", 7),
+        "client-shutdown",
+        "runtime-exit",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["shutdown", "verify"])
+def test_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(monkeypatch, stage):
+    from arctic_platform.correctness.harness import dss_driver
+
+    failure = RuntimeError("owned runtime not clean")
+    calls = []
+
+    def cleanup():
+        calls.append("verify")
+        if stage == "verify" and len(calls) > 1:
+            raise failure
+
+    def shutdown():
+        if stage == "shutdown":
+            raise failure
+
+    ray = SimpleNamespace(init_ray_cluster=lambda **kwargs: None, _shutdown=shutdown)
+    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
+    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
+    monkeypatch.setenv("MASTER_PORT", "12345")
+    with pytest.raises(dss_driver.UnsafeCleanupError) as caught:
+        with dss_driver._gateway_runtime(1):
+            pass
+    assert caught.value.__cause__ is failure
+    assert os.environ["MASTER_PORT"] == "12345"
+    assert calls == ["verify", "verify"]
+
+
+def test_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
+    from arctic_platform.correctness.harness import dss_driver
+
+    failure = RuntimeError("cancel failed")
+
+    class Client:
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            raise failure
+
+    monkeypatch.setattr(dss_driver, "_gateway_runtime", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
+    payload = {
+        "model_name": "model",
+        "job_type": "training",
+        "training_config": {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1}},
+    }
+    with pytest.raises(dss_driver.UnsafeCleanupError) as caught:
+        with dss_driver.running_job(dss_driver.GatewaySession(tmp_path, 1), payload):
+            pass
+    assert caught.value.__cause__ is failure

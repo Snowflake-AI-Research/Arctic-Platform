@@ -41,6 +41,7 @@ _LOAD_BODY_ERROR = "^local checkpoint load accepts checkpoint_id/stage_info only
 _LOAD_ID_ERROR = "^local checkpoint load requires a durable cp_<uuid> checkpoint_id, not a FAST path or tag$"
 _LOAD_OWNER_ERROR = "^local checkpoint load requires this client's newly owned training child$"
 _LOCAL_GATEWAY_ERROR = "^local Cortex gateway requires an unauthenticated HTTP loopback base URL$"
+_CHECKPOINT_ID = "cp_00000000-0000-0000-0000-000000000001"
 
 
 def _response(payload):
@@ -88,7 +89,11 @@ def gateway(monkeypatch):
     def send(session, method, url, **kwargs):
         assert asyncio.get_running_loop() is session._loop
         assert session.trust_env is False
-        assert kwargs["allow_redirects"] is False
+        if url.startswith("http://127.0.0.1:8003/"):
+            assert kwargs["allow_redirects"] is False
+        else:
+            assert url.startswith(("https://127.0.0.1:8003/", "http://remote.example:8003/"))
+            assert "allow_redirects" not in kwargs
         assert "Authorization" not in session.headers
         state.calls.append((method, url, kwargs))
         state.exchanges.append((session, asyncio.get_running_loop()))
@@ -107,6 +112,16 @@ def gateway(monkeypatch):
         if method == "POST" and url.endswith("/owned-resume-parent:cancel"):
             state.cancelled = True
             return _response({})
+        if not url.startswith("http://127.0.0.1:8003/"):
+            if method == "POST" and url.endswith("/owned-resume-parent/load"):
+                return _response({"request_id": "production-load-request"})
+            if method == "GET" and url.endswith("/owned-resume-parent/requests/production-load-request"):
+                return _response(
+                    {
+                        "status": "REQUEST_STATE_DONE",
+                        "result": {"checkpoint_id": _CHECKPOINT_ID, "version": 1},
+                    }
+                )
         if method == "GET" and url.endswith("/owned-resume-parent"):
             segments = {"training": "training", "sampling": "sampling", "log_probability": "log_prob"}
             return _response(
@@ -179,7 +194,7 @@ def test_owned_fast_restore_is_unsupported_before_http_and_still_shuts_down(gate
     with client:
         with pytest.raises(ValueError, match=_LOAD_BODY_ERROR):
             if asynchronous:
-                asyncio.run(transport.acall(load_checkpoint_request(client.jobs, str(checkpoint))))
+                asyncio.run(transport.acall(load_checkpoint_request(client.jobs, path=str(checkpoint))))
             else:
                 client.load_checkpoint(path=str(checkpoint))
         assert state.calls == []
@@ -251,25 +266,21 @@ def test_explicit_step_does_not_enable_a_local_restore_fallback(gateway, checkpo
 
 
 @pytest.mark.parametrize(
-    "backend,exception,message",
+    "backend",
     [
-        ({"base_url": "https://127.0.0.1:8003"}, NotImplementedError, "^cortex has no load-checkpoint$"),
-        ({"base_url": "http://remote.example:8003"}, NotImplementedError, "^cortex has no load-checkpoint$"),
-        ({"base_url": "http://127.0.0.1:8003/path"}, ValueError, _LOCAL_GATEWAY_ERROR),
-        ({"base_url": "http://127.0.0.1:8003?query=1"}, ValueError, _LOCAL_GATEWAY_ERROR),
-        ({"base_url": "http://127.0.0.1:8003#fragment"}, ValueError, _LOCAL_GATEWAY_ERROR),
-        ({"base_url": "http://user:secret@127.0.0.1:8003"}, ValueError, _LOCAL_GATEWAY_ERROR),
-        ({"base_url": "http://127.0.0.1:8003", "host": "account.example"}, ValueError, _LOCAL_GATEWAY_ERROR),
-        ({"base_url": "http://127.0.0.1:8003", "pat": "synthetic-control-token"}, ValueError, _LOCAL_GATEWAY_ERROR),
+        {"base_url": "http://127.0.0.1:8003/path"},
+        {"base_url": "http://127.0.0.1:8003?query=1"},
+        {"base_url": "http://127.0.0.1:8003#fragment"},
+        {"base_url": "http://user:secret@127.0.0.1:8003"},
+        {"base_url": "http://127.0.0.1:8003", "host": "account.example"},
+        {"base_url": "http://127.0.0.1:8003", "pat": "synthetic-control-token"},
     ],
 )
-def test_hosted_authenticated_or_decorated_backend_cannot_enable_restore(
-    gateway, checkpoint, backend, exception, message
-):
+def test_authenticated_or_decorated_loopback_cannot_enable_restore(gateway, checkpoint, backend):
     state, create = gateway
     client = create()
     client.transport.config = client.transport.config.model_copy(update=backend)
-    with pytest.raises(exception, match=message):
+    with pytest.raises(ValueError, match=_LOCAL_GATEWAY_ERROR):
         client.load_checkpoint(path=str(checkpoint))
     assert state.calls == []
 
@@ -293,9 +304,37 @@ def test_unsupported_restore_never_enters_http_or_polling_even_with_retries(gate
     assert attempts == state.calls == []
 
 
-def test_production_cortex_route_remains_unsupported():
-    with pytest.raises(NotImplementedError, match="^cortex has no load-checkpoint$"):
-        _route("load-checkpoint")
+@pytest.mark.parametrize("base_url", ["https://127.0.0.1:8003", "http://remote.example:8003"])
+def test_nonlocal_resume_uses_production_checkpoint_id_and_source_job(gateway, base_url):
+    state, create = gateway
+    client = create()
+    client.transport.config = client.transport.config.model_copy(update={"base_url": base_url})
+    assert not client.transport._is_local_gateway()
+    assert client.load_checkpoint(checkpoint_id=_CHECKPOINT_ID, source_job_id="saving-parent") == {
+        "checkpoint_id": _CHECKPOINT_ID,
+        "version": 1,
+    }
+    prefix = client.transport._prefix
+    assert [(method, url) for method, url, _ in state.calls] == [
+        ("POST", f"{prefix}/owned-resume-parent/load"),
+        ("GET", f"{prefix}/owned-resume-parent/requests/production-load-request"),
+    ]
+    assert state.calls[0][2]["json"] == {"checkpoint_id": _CHECKPOINT_ID, "source_job_id": "saving-parent"}
+
+
+def test_production_cortex_resume_route_preserves_request_body():
+    route = _route("load-checkpoint")
+    assert route.method == "POST" and route.path == "/{job}/load" and route.poll is True
+    request = Request(
+        "load-checkpoint",
+        "restoring-parent:training:0",
+        {"checkpoint_id": _CHECKPOINT_ID, "source_job_id": "saving-parent", "path": None, "step": None},
+    )
+    assert route.prepare("https://account.example/cortex-training", request) == (
+        "https://account.example/cortex-training/restoring-parent/load",
+        [{"json": {"checkpoint_id": _CHECKPOINT_ID, "source_job_id": "saving-parent"}}],
+    )
+    assert route.submitted(request, {"request_id": "production-load-request"}) == "production-load-request"
 
 
 def test_hosted_training_uses_the_correctness_client():

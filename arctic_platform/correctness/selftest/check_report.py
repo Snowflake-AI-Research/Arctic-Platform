@@ -105,3 +105,41 @@ def test_local_cortex_fixture_report_does_not_require_publication_stage(tmp_path
     assert "local model/tokenizer SHA-256 binding: `fixture-hash`" in markdown
     assert "publication stage:" not in markdown
     assert "reviewed reference fixture (not loaded on Cortex)" not in markdown
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_backend"),
+    [
+        ({"gpus": 16}, "unknown"),
+        ({"gpus": 16, "backend": None}, "unknown"),
+        ({"gpus": 16, "backend": ""}, "unknown"),
+        ({"gpus": 16, "backend": "onprem"}, "onprem"),
+    ],
+    ids=["missing-backend", "null-backend", "empty-backend", "known-backend"],
+)
+def test_execution_error_report_preserves_original_failure_with_partial_metadata(
+    tmp_path, monkeypatch, metadata, expected_backend
+):
+    monkeypatch.setattr(report, "collect", lambda: {"host": "client-host"})
+    spec = _spec(["inference-checkpoint-loss"])
+    reason = "Traceback (most recent call last):\nRuntimeError: exported tensor inventory is incomplete"
+    result = Result(
+        test_id="inference-checkpoint-loss",
+        config_id="unit",
+        outcome=Outcome.FAIL,
+        summary="Checkpoint export failed before comparison",
+        reason=reason,
+    )
+    execution = {"unit": metadata}
+
+    write([result], {"unit": spec}, tmp_path, execution=execution)
+
+    markdown = (tmp_path / "report.md").read_text()
+    payload = json.loads((tmp_path / "report.json").read_text())
+    assert f"execution backend: `{expected_backend}`" in markdown
+    assert reason in markdown
+    assert payload["execution"] == execution
+    assert payload["results"][0]["reason"] == reason
+    assert payload["results"][0]["outcome"] == "fail"
+    assert payload["totals"]["fail"] == 1
+    assert payload["totals"]["pass"] == 0

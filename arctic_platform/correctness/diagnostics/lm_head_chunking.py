@@ -35,7 +35,7 @@ import sys
 from typing import List
 from typing import Optional
 
-from arctic_platform.correctness import __main__ as cli
+from arctic_platform.correctness import api
 from arctic_platform.correctness.harness.config import LoadedConfig
 
 KNOB = "fused_lm_head_token_chunk_size"
@@ -55,7 +55,8 @@ def without_chunked_head(cfg: LoadedConfig) -> LoadedConfig:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    execute = cli.execute
+    request, options = api.parse_run_args(sys.argv[1:] if argv is None else argv)
+    from arctic_platform.correctness.harness.runner import execute
 
     def execute_without_chunked_head(cfg, *args, **kwargs):
         print(
@@ -64,8 +65,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return execute(without_chunked_head(cfg), *args, **kwargs)
 
-    cli.execute = execute_without_chunked_head
-    return cli.main(["run", *(sys.argv[1:] if argv is None else argv)])
+    return api.run(request, options, executor=execute_without_chunked_head).exit_code
 
 
 if __name__ == "__main__":

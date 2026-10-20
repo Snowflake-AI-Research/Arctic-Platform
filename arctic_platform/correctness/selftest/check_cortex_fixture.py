@@ -419,7 +419,7 @@ def test_gradient_runner_loads_prepared_reference_and_routes_only_target_to_cort
 def test_fixture_cli_uses_local_vocab_and_records_published_target(tmp_path, monkeypatch):
     import transformers
 
-    from arctic_platform.correctness import __main__ as cli
+    from arctic_platform.correctness.harness import execution as cli
 
     spec, receipt, binding = _receipt(tmp_path)
     captured = []
@@ -433,7 +433,15 @@ def test_fixture_cli_uses_local_vocab_and_records_published_target(tmp_path, mon
         return SimpleNamespace(vocab_size=128)
 
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", local_vocab)
-    monkeypatch.setattr(cli, "execute", lambda cfg, *a, **k: captured.append(k) or [])
+
+    def execute_fixture(cfg, *args, **kwargs):
+        from arctic_platform.correctness.harness.registry import TestOutcome
+        from arctic_platform.correctness.harness.registry import TestResult
+
+        captured.append(kwargs)
+        return [TestResult("single-step-grads", cfg.config_id, TestOutcome.PASS)]
+
+    monkeypatch.setattr(cli, "execute", execute_fixture)
     monkeypatch.setattr(cli, "_finish", lambda *a, **k: metadata.update(k["execution"]) or 0)
     assert (
         cli.main(
@@ -447,6 +455,8 @@ def test_fixture_cli_uses_local_vocab_and_records_published_target(tmp_path, mon
                 str(receipt),
                 "--base-url",
                 "http://cortex.test",
+                "--out",
+                str(tmp_path / "report"),
             ]
         )
         == 0

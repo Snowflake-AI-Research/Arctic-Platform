@@ -42,6 +42,7 @@ from typing import List
 from ..harness.batches import Batch
 from ..harness.batches import build_batch
 from ..harness.dss_driver import GatewayTransport
+from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import pack
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
@@ -95,6 +96,8 @@ def run(ctx) -> List[TestResult]:
         try:
             with ctx.transport_for(workdir / arm.name) as transport:
                 results.append(_run_arm(ctx, transport, arm))
+        except UnsafeCleanupError:
+            raise
         except Exception as exc:  # noqa: BLE001 - one failing case must not hide the others
             traceback.print_exc()
             results.append(
@@ -104,6 +107,7 @@ def run(ctx) -> List[TestResult]:
                     arm=arm.name,
                     outcome=TestOutcome.FAIL,
                     summary=f"{type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
                 )
             )
     return results

@@ -43,6 +43,44 @@ from .check_rl_config import SPEC
 from .check_rl_config import TRAINING_CONFIG
 
 
+def test_rl_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
+    from arctic_platform.correctness.harness.dss_driver import UnsafeCleanupError
+
+    failure = RuntimeError("RL cancel failed")
+    cfg = load_config(CONFIG)
+
+    class Client:
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            raise failure
+
+    monkeypatch.setattr(rl_driver, "ArcticClient", Client)
+    payload = {"training_config": cfg.training, "model_name": cfg.model_name}
+    with pytest.raises(UnsafeCleanupError) as caught:
+        with rl_driver.running_rl_client(cfg, payload, cfg.model_name, tmp_path):
+            pass
+    assert caught.value.__cause__ is failure
+
+
+def test_rl_execution_retains_traceback_for_unwrapped_check_failure(monkeypatch, tmp_path, capsys):
+    from arctic_platform.correctness.harness import runner
+    from arctic_platform.correctness.harness.registry import registered_tests
+
+    cfg = load_config(CONFIG)
+    spec = Spec.read(SPEC)
+
+    def fail(ctx):
+        raise RuntimeError("synthetic check failed before returning")
+
+    monkeypatch.setattr(registered_tests()["rl-weight-sync"], "fn", fail)
+    results = runner.execute_rl(cfg, spec, vocab_size=128, select=["rl-weight-sync"], workdir=tmp_path)
+    assert len(results) == 1 and results[0].outcome is Outcome.FAIL
+    assert results[0].error_type == "RuntimeError"
+    assert "RuntimeError: synthetic check failed before returning" in capsys.readouterr().err
+
+
 def _entry(numel, digest):
     return {"shape": [numel], "dtype": "bfloat16", "numel": numel, "sha256": digest}
 

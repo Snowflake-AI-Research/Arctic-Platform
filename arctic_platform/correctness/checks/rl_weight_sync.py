@@ -36,12 +36,14 @@ parameter is written by no tensor.
 from __future__ import annotations
 
 import os
+import traceback
 from pathlib import Path
 from typing import Dict
 from typing import List
 from typing import Tuple
 
 from ..harness import gsm8k
+from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import build_payload
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
@@ -54,9 +56,9 @@ from ..harness.rl_driver import running_rl_client
 from ..harness.rl_driver import step
 from ..harness.rl_driver import sync_weights
 from ..harness.seeds import SEED
-from .inference_checkpoint_loss import TRAIN_SPLIT
-from .inference_checkpoint_loss import configured_learning_rate
-from .inference_checkpoint_loss import configured_rows_per_step
+from ..harness.sft import TRAIN_SPLIT
+from ..harness.sft import configured_learning_rate
+from ..harness.sft import configured_rows_per_step
 
 TEST_ID = "rl-weight-sync"
 
@@ -78,13 +80,17 @@ _MANIFEST_FIELDS = ("shape", "dtype", "numel", "sha256")
 def run(ctx) -> List[TestResult]:
     try:
         return [_run(ctx)]
+    except UnsafeCleanupError:
+        raise
     except Exception as exc:  # noqa: BLE001 - a failure here is this check's verdict, not a crash
+        traceback.print_exc()
         return [
             TestResult(
                 test_id=TEST_ID,
                 config_id=ctx.config_id,
                 outcome=TestOutcome.FAIL,
                 summary=f"{type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__,
             )
         ]
 
