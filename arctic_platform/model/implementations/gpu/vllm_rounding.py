@@ -211,7 +211,8 @@ def rms_norm_gated_fp32(
     if _uses_fla_kernel(x):
         return fla_rms_norm_gated(x, gate, weight, None, activation, eps=eps)
     if torch.compiler.is_compiling():
-        # RMSNormGatedFp32 compiled inside the sequence-parallel DSS trainer gave wrong gradients (2x in layers 0-34).
+        # RMSNormGatedFp32 compiled inside the sequence-parallel DSS trainer gave wrong gradients (2x in layers 0-34);
+        # the cause is not known (Arctic-Platform#259).
         return _rms_norm_gated_formula(x, gate, weight, eps, activation)
     return RMSNormGatedFp32.apply(x, gate, weight, eps, activation)
 

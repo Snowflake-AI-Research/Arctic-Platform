@@ -435,14 +435,10 @@ def test_loader_rounds_every_output_norm_once_on_cuda(monkeypatch):
         assert (stock_output != stock_expected).float().mean() > 0.1
 
 
-def test_loader_rounds_output_norms_once_behind_the_sequence_parallel_wrapper(monkeypatch, single_rank_group):
-    """The wrapper replaces the GatedDeltaNet forward and still calls the module's norm, which rounds once.
-
-    With one rank the all-to-all is the identity; the causal convolution and the gated delta rule need kernels this CPU
-    does not have, so they are replaced by stand-ins.
-    """
+def _stand_in_sequence_parallel_kernels(monkeypatch) -> None:
+    """With one rank the all-to-all is the identity; the causal convolution and the gated delta rule need kernels this
+    CPU does not have, so they are replaced by differentiable stand-ins."""
     from arctic_platform.model.implementations.gpu.sp import gated_delta_net as sp_gated_delta_net
-    from arctic_platform.model.loaders.huggingface import load_huggingface
 
     def convolution(*, x, weight, bias, activation, seq_idx):
         return F.silu(x + weight.mean())
@@ -456,6 +452,69 @@ def test_loader_rounds_output_norms_once_behind_the_sequence_parallel_wrapper(mo
         "_resolve_gated_delta_net_kernel",
         lambda module, attribute: gated_delta_rule if attribute == "chunk_gated_delta_rule" else convolution,
     )
+
+
+def _checkpointed_sequence_parallel_gradients(monkeypatch, group, stock: nn.Module) -> dict[str, torch.Tensor]:
+    from arctic_platform.model import Patches
+    from arctic_platform.model import build_model
+
+    model = copy.deepcopy(stock)
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+    spec = ModelSpec(
+        model_path_or_name="tiny",
+        loader="huggingface",
+        parallelism=ParallelismConfig(sequence_parallel=2),
+        patches=Patches(gradient_checkpointing=True),
+    )
+    built = build_model(spec, parallel_groups={"sp_group": group}).model
+    assert all(
+        getattr(layer.linear_attn, "_dss_gated_delta_net_sequence_parallel", False) for layer in built.model.layers[:3]
+    )
+    built.zero_grad(set_to_none=True)
+    hidden = built.model(input_ids=_input_ids(), position_ids=torch.arange(_SEQ).unsqueeze(0)).last_hidden_state
+    hidden.float().pow(2).mean().backward()
+    return {
+        name: parameter.grad.float().clone()
+        for name, parameter in built.named_parameters()
+        if parameter.grad is not None
+    }
+
+
+def test_fallback_matches_the_formula_behind_the_sequence_parallel_wrapper_with_checkpointing(
+    monkeypatch, single_rank_group
+):
+    """Eager, sequence-parallel wrapper, gradient checkpointing: RMSNormGatedFp32 gives the plain formula's gradients."""
+    _stand_in_sequence_parallel_kernels(monkeypatch)
+    backward_calls = []
+    backward = vllm_rounding.RMSNormGatedFp32.backward
+
+    def counted_backward(ctx, grad_out):
+        backward_calls.append(1)
+        return backward(ctx, grad_out)
+
+    monkeypatch.setattr(vllm_rounding.RMSNormGatedFp32, "backward", staticmethod(counted_backward))
+    stock = _tiny_model()
+    fallback = _checkpointed_sequence_parallel_gradients(monkeypatch, single_rank_group, stock)
+    assert len(backward_calls) == 3  # one per linear-attention layer
+    monkeypatch.setattr(vllm_rounding.RMSNormGatedFp32, "apply", staticmethod(vllm_rounding._rms_norm_gated_formula))
+    formula = _checkpointed_sequence_parallel_gradients(monkeypatch, single_rank_group, stock)
+    assert len(backward_calls) == 3
+
+    assert fallback.keys() == formula.keys()
+    for name in formula:
+        difference = (fallback[name] - formula[name]).norm() / formula[name].norm().clamp_min(1e-12)
+        assert difference < 1e-2, (name, difference.item())
+
+
+def test_loader_rounds_output_norms_once_behind_the_sequence_parallel_wrapper(monkeypatch, single_rank_group):
+    """The wrapper replaces the GatedDeltaNet forward and still calls the module's norm, which rounds once.
+
+    With one rank the all-to-all is the identity; the causal convolution and the gated delta rule need kernels this CPU
+    does not have, so they are replaced by stand-ins.
+    """
+    from arctic_platform.model.loaders.huggingface import load_huggingface
+
+    _stand_in_sequence_parallel_kernels(monkeypatch)
     model = _tiny_model()
     monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
     spec = ModelSpec(
