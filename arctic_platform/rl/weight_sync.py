@@ -39,7 +39,6 @@ require_any_dep_group("rl")
 
 from arctic_platform.inference.server.weight_sync.schedule import TransferSchedule  # noqa: E402
 from arctic_platform.inference.server.weight_sync.sender import WeightSender  # noqa: E402
-
 from arctic_platform.rl.config import WeightSyncConfig  # noqa: E402
 
 if TYPE_CHECKING:

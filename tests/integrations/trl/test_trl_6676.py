@@ -30,6 +30,9 @@ from transformers import PreTrainedModel
 
 pytest.importorskip("trl.experimental.async_grpo.async_grpo_trainer")
 
+from trl.experimental.async_grpo.async_grpo_trainer import DataCollatorForRollout  # noqa: E402
+from trl.experimental.async_grpo.packing import TreeRow  # noqa: E402
+
 from arctic_platform.integrations.trl.client import ArcticOptimizer  # noqa: E402
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
 from arctic_platform.integrations.trl.client import _to_server_bs  # noqa: E402
@@ -37,8 +40,6 @@ from arctic_platform.integrations.trl.client import clipped_surrogate_sum  # noq
 from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker  # noqa: E402
 from arctic_platform.integrations.trl.trainer import _FlatRolloutCollator  # noqa: E402
 from arctic_platform.integrations.trl.trainer import build_stub_model  # noqa: E402
-from trl.experimental.async_grpo.async_grpo_trainer import DataCollatorForRollout  # noqa: E402
-from trl.experimental.async_grpo.packing import TreeRow  # noqa: E402
 
 
 def _tiny_config() -> LlamaConfig:

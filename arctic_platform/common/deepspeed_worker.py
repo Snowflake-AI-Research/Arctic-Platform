@@ -778,8 +778,7 @@ class DeepSpeedWorker:
         Same-GPU sync uses ``WeightSender`` over the in-tree NCCL path.
         """
         raise RuntimeError(
-            "send_weights_ipc is not implemented on arctic_platform.inference; "
-            f"use WeightSender (group_id={group_id})"
+            f"send_weights_ipc is not implemented on arctic_platform.inference; use WeightSender (group_id={group_id})"
         )
 
     def get_cuda_ipc_handles(self) -> dict:

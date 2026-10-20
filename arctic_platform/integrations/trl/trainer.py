@@ -143,7 +143,9 @@ def _pad_rows(rows: list[dict[str, torch.Tensor]], width: int, pad_token_id: int
     dtypes = {key: rows[0][key].dtype for key in rows[0]}
     for row in rows:
         length = int(row["input_ids"].numel())
-        attention.append(torch.cat([torch.ones(length, dtype=torch.long), torch.zeros(width - length, dtype=torch.long)]))
+        attention.append(
+            torch.cat([torch.ones(length, dtype=torch.long), torch.zeros(width - length, dtype=torch.long)])
+        )
         for key, values in row.items():
             pad_value = fills[key]
             tail = torch.full((width - length,), pad_value, dtype=dtypes[key])
@@ -247,9 +249,7 @@ def _trainer_cls():
                     token_budget=max(self.args.token_budget or 0, 0),
                 )
             )
-            return self.accelerator.prepare(
-                DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=0)
-            )
+            return self.accelerator.prepare(DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=0))
 
         def _set_signature_columns_if_needed(self) -> None:
             if self._signature_columns is None:

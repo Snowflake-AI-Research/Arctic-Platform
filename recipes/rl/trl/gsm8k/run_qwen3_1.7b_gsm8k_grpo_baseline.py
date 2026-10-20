@@ -142,7 +142,9 @@ def main() -> None:
         server_env["CUDA_VISIBLE_DEVICES"] = _SERVER_GPU
         server_env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /pause,/resume,/*_weight_update (dev-only endpoints)
         print(f"[base] launching vllm serve on GPU {_SERVER_GPU}: {' '.join(server_cmd)}", flush=True)
-        print(f"[base] trainer on GPU {_TRAINER_GPU}; torch.cuda.device_count()={torch.cuda.device_count()}", flush=True)
+        print(
+            f"[base] trainer on GPU {_TRAINER_GPU}; torch.cuda.device_count()={torch.cuda.device_count()}", flush=True
+        )
         print(f"[base] server stdout/stderr -> {SERVER_LOG}", flush=True)
         logf = open(SERVER_LOG, "w")
         server = subprocess.Popen(
