@@ -60,7 +60,7 @@ class FakeTransport(Transport):
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"results": ["ok"], "loss": 0.0}
+        return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -75,6 +75,20 @@ def _call(client, method: str, *args, **kwargs):
     if inspect.isawaitable(result):
         return asyncio.run(result)
     return result
+
+
+def _stop_stream_after_one_event(stream) -> None:
+    """Read one event from a sync or async stream, then close it early."""
+    if not inspect.isasyncgen(stream):
+        next(stream)
+        stream.close()
+        return
+
+    async def drive():
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(drive())
 
 
 def _build(monkeypatch, cls):
@@ -154,7 +168,7 @@ class TestOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/x", "step": 2}
+        assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -315,6 +329,7 @@ class TestOpRegistry:
         _call(rl_client, "save_checkpoint")
         _call(rl_client, "load_checkpoint")
         _call(rl_client, "generate", ["hi"])
+        _stop_stream_after_one_event(rl_client.generate_stream(["hi"]))  # submit, poll, cancel
         _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
         n_before = len(rl_client.transport.calls)
@@ -396,6 +411,37 @@ class TestClusterRequestBuilders:
         )
         assert {request.op for request in requests} == CLUSTER_OPS
         assert CLUSTER_OPS.isdisjoint(OPS)
+
+
+class TestClusterClientMethods:
+    def test_account_ops_use_the_given_arguments(self, client):
+        """Account-level ops need no stored handle."""
+        _call(client, "list_jobs", "running")
+        assert _last(client) == cluster_requests.list_jobs_request("running")
+        _call(client, "capacity", "H200")
+        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "cancel_job", "job-9")
+        assert _last(client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, client):
+        _call(client, "get_job")
+        assert _last(client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, client):
+        _call(client, "list_checkpoints")
+        assert _last(client) == cluster_requests.list_checkpoints_request(TRAINING)
+        _call(client, "export_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        _call(client, "delete_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
 
 
 class TestTransportSelection:
@@ -682,7 +728,7 @@ class TestCortexCancelToleratesEmptyBody:
     release that had in fact succeeded as ``could not release <id>``, which
     points the operator at the GPU cap instead of at their freed GPUs."""
 
-    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
         pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
@@ -711,7 +757,7 @@ class TestCortexCancelToleratesEmptyBody:
 
         t._session = _Session()
 
-        t.cancel_job("job-abc")
+        t.call(cluster_requests.cancel_job_request("job-abc"))
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")

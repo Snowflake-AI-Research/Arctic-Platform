@@ -29,7 +29,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -95,6 +94,10 @@ def _json(request: Request, body: dict) -> list[Send]:
     return [{"json": body}]
 
 
+def _query(request: Request, body: dict) -> list[Send]:
+    return [{"params": body}]
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -106,6 +109,21 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
         return [{"data": chunk, "headers": _OCTET_HEADERS} for chunk in chunks]
 
     return encode
+
+
+def _unchunked_octet(request: Request, body: dict) -> list[Send]:
+    """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
+    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    if len(frame) > _MAX_OCTET_BYTES:
+        raise ValueError(
+            f"cortex {request.op} body is {len(frame) / 2**20:.1f} MiB, over the "
+            f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
+        )
+    return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _status_query(request: Request, body: dict) -> list[Send]:
+    return [{"params": {"max_events": body["max_events"]}}]
 
 
 def _forward(request: Request, body: dict) -> list[Send]:
@@ -141,6 +159,17 @@ def _identity(value: Any) -> Any:
     return value
 
 
+def _capacity_result(result: dict) -> dict:
+    return {
+        "has_reservation": bool(result.get("has_reservation", False)),
+        "max_total_gpus": int(result.get("max_total_gpus", 0)),
+        "reserved_gpus": int(result.get("reserved_gpus", 0)),
+        "in_use_gpus": int(result.get("in_use_gpus", 0)),
+        "pending_gpus": int(result.get("pending_gpus", 0)),
+        "available_gpus": int(result.get("available_gpus", 0)),
+    }
+
+
 def _fwd_bwd_result(result: dict) -> dict:
     if "post_process_outputs" not in result:
         return result
@@ -174,6 +203,20 @@ def _unwrap_forward_payload(result: dict) -> dict:
     return wire.loads(base64.b64decode(result["payload_b64"]))
 
 
+def _request_status(status: dict) -> dict:
+    """A poll reply -> ``{"state": "running"|"done"|"failed", "error", "events"}`` with results decoded."""
+    state = _short(status.get("status"))
+    events = [
+        {**event, "result": _to_python(_decode_result(event["result"]))} if event.get("type") == "result" else event
+        for event in status.get("events") or []
+    ]
+    return {
+        "state": "done" if state in _REQUEST_DONE else "failed" if state in _REQUEST_FAILED else "running",
+        "error": status.get("error", ""),
+        "events": events,
+    }
+
+
 def _to_python(obj: Any) -> Any:
     import torch
 
@@ -186,6 +229,38 @@ def _to_python(obj: Any) -> Any:
     return obj
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
+    import aiohttp
+
+    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in _TRANSIENT_STATUSES
+    return False
+
+
+def _is_connect_error(exc: BaseException) -> bool:
+    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
+    import aiohttp
+
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
+
+
+@dataclass(frozen=True)
+class _SendPolicy:
+    retry_on: Callable[[BaseException], bool] = _is_transient
+    max_retries: int | None = None  # None: config.max_retries
+    timeout: float | None = None  # caps config.request_timeout
+
+
+_DEFAULT = _SendPolicy()
+# Only failures before the request reached the server; a replay would duplicate it.
+_NO_REPLAY = _SendPolicy(retry_on=_is_connect_error)
+# Control-plane read: answer fast or fail, as cortex-training does.
+_QUICK_READ = _SendPolicy(max_retries=0, timeout=30.0)
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Route:
     method: str
@@ -193,8 +268,7 @@ class _Route:
     path: str
     encode: Callable[[Request, dict], list[Send]] = _json
     poll: bool = False
-    # False: retry only sends that provably never reached the server.
-    replay_safe: bool = True
+    policy: _SendPolicy = _DEFAULT
     # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
     # that stage chunks on the job's actor (forward-backward) send that code; it is not a
     # general retry flag.
@@ -243,9 +317,22 @@ _ROUTES = {
     "sleep-training": _NOOP,
     "wake-training": _NOOP,
     # A replayed create would spawn a second job.
-    "create-job": _Route(method="POST", path="", replay_safe=False),
+    "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
+    "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
+    "capacity": _Route(method="GET", path="/capacity", encode=_query, policy=_QUICK_READ, normalize=_capacity_result),
+    "list-checkpoints": _Route(
+        method="GET",
+        path="/{job}/checkpoints",
+        encode=_no_body,
+        normalize=lambda reply: reply.get("checkpoints", []),
+    ),
+    "export-checkpoint": _Route(method="POST", path="/{job}/checkpoints/{checkpoint_id}:export", encode=_no_body),
+    # A replayed delete answers 404 for a checkpoint the first send already removed.
+    "delete-checkpoint": _Route(
+        method="DELETE", path="/{job}/checkpoints/{checkpoint_id}", encode=_no_body, policy=_NO_REPLAY
+    ),
     # forward-backward always carries a chunk envelope, even when the frame fits: its
     # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
     # (GS restart) is recoverable only by re-posting the whole group.
@@ -261,14 +348,31 @@ _ROUTES = {
     "generate": _Route(
         method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
     ),
+    # Answers {request_id, count} at once; events are read with request-status. A replay
+    # would start a second generation nobody reads.
+    "generate-stream": _Route(
+        method="POST", path="/{job}/generate-stream", encode=_unchunked_octet, policy=_NO_REPLAY
+    ),
+    # Each poll drains the events it returns from the server.
+    "request-status": _Route(
+        method="GET", path="/{job}/requests/{request_id}", encode=_status_query, normalize=_request_status
+    ),
+    # An /operation that is never polled: its acknowledgement may name the cancelled request.
+    "cancel-request": _Route(method="POST", path="/{job}/operation"),
     "forward": _Route(
         method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
     ),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
     "save": _Route(method="POST", path="/{job}/save", poll=True),
-    # /operation is polymorphic: weight-sync is polled, reset-prefix-cache answers inline.
+    "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
+    # /operation is polymorphic: weight-sync is polled, the rest answer inline.
     "operation": _Route(
-        method="POST", path="/{job}/operation", poll=True, inline_types=frozenset({"reset-prefix-cache"})
+        method="POST",
+        path="/{job}/operation",
+        poll=True,
+        inline_types=frozenset(
+            {"reset-prefix-cache", "tail-logs", "bootstrap-router-replay", "router-replay-discard"}
+        ),
     ),
 }
 
@@ -277,24 +381,6 @@ def _route(op: str) -> _Route:
     if op not in _ROUTES:
         raise NotImplementedError(f"cortex has no {op}")
     return _ROUTES[op]
-
-
-def _is_transient(exc: BaseException) -> bool:
-    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
-    import aiohttp
-
-    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
-        return True
-    if isinstance(exc, aiohttp.ClientResponseError):
-        return exc.status in _TRANSIENT_STATUSES
-    return False
-
-
-def _is_connect_error(exc: BaseException) -> bool:
-    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
-    import aiohttp
-
-    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
 
 
 class _ChunkGroupError(Exception):
@@ -372,12 +458,24 @@ async def _raise_for_status(resp: Any) -> None:
     )
 
 
+def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dict:
+    """Job-create body. Unset fields and an empty comment are omitted."""
+    payload: dict[str, Any] = {"sub_job_configs": sub_job_configs}
+    if config.job_comment is not None and config.job_comment != "":
+        payload["comment"] = config.job_comment
+    for key in ("idle_timeout_seconds", "pending_timeout_seconds"):
+        value = getattr(config, key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
 class CortexTransport(Transport):
     def __init__(self, config: CortexConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.max_retries = config.max_retries
+        self._roles: list[str] = []
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -405,27 +503,29 @@ class CortexTransport(Transport):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        self.start(client_config)
+        return self.wait_until_ready()
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        self._roles = [role for role in JOB_TYPES if client_config.gpus_for(role) > 0]
         reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
             self.job_id = _parent_id(reconnect.require_any())
         else:
-            body: dict = {"sub_job_configs": client_config.to_cortex()}
-            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
-            comment = os.environ.get("CORTEX_JOB_COMMENT")
-            if comment:
-                body["comment"] = comment
+            body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
-            # Logged before the wait: a job can stay PLACING for a long time, and its id
-            # is the only way to cancel it if this process stops first.
-            logger.info("created cortex job %s; waiting for it to run", self.job_id)
+            # Logged before the wait: a job can stay PLACING for a long time.
+            logger.info("created cortex job %s", self.job_id)
+        return self.jobs
+
+    def wait_until_ready(self) -> JobHandles:
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
         # (e.g. weight-sync source/target) already carry Cortex-correct ids with no
         # transport-side rewrite -- exactly as on-prem does with plain job ids.
-        for role in JOB_TYPES:
-            if client_config.gpus_for(role) > 0:
-                self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
+        for role in self._roles:
+            self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
         return self.jobs
 
     def shutdown(self) -> None:
@@ -435,18 +535,8 @@ class CortexTransport(Transport):
             # Best-effort teardown, tolerating failure (the job may be gone).
             with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
                 self.call(cancel_job_request(self.job_id))
+            self.job_id = None
         self._on_loop(self._close_session()).result()
-
-    def list_jobs(self) -> list[dict]:
-        """Every Cortex job on this account, with its status."""
-        payload = self._on_loop(self._send("GET", self._prefix)).result()
-        if isinstance(payload, list):
-            return payload
-        return payload.get("jobs") or payload.get("data") or []
-
-    def cancel_job(self, job_id: str) -> None:
-        """Release one job's GPUs by id."""
-        self._on_loop(self._send("POST", f"{self._prefix}/{job_id}:cancel")).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
@@ -478,10 +568,9 @@ class CortexTransport(Transport):
 
     async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
-        retry_on = _is_transient if route.replay_safe else _is_connect_error
         reply: dict = {}
         for kwargs in sends:
-            reply = await self._send(route.method, url, retry_on=retry_on, **kwargs)
+            reply = await self._send(route.method, url, policy=route.policy, **kwargs)
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
@@ -579,17 +668,17 @@ class CortexTransport(Transport):
     def _job(self) -> dict:
         return self.call(get_job_request(self.job_id))
 
-    async def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs: Any) -> dict:
+    async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         import aiohttp
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
-                headers=self._auth_headers(),
-            )
+            self._session = aiohttp.ClientSession(headers=self._auth_headers())
         session = self._session
+        retries = self.config.max_retries if policy.max_retries is None else policy.max_retries
+        timeout = min(self.config.request_timeout, policy.timeout or self.config.request_timeout)
+        kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
@@ -601,8 +690,8 @@ class CortexTransport(Transport):
                 return json.loads(body) if body.strip() else {}
 
         retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + self.max_retries),
+            retry=retry_if_exception(policy.retry_on),
+            stop=stop_after_attempt(1 + retries),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )

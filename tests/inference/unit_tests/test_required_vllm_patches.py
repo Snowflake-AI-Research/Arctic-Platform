@@ -1,3 +1,4 @@
+from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
@@ -41,6 +42,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("glm5next_indexer_page"),
     )
     monkeypatch.setattr(
+        config,
+        "ensure_dflash_max_position_patch",
+        lambda: calls.append("dflash_max_position"),
+    )
+    monkeypatch.setattr(
         kv_group_size,
         "ensure_kv_group_size_patch",
         lambda: calls.append("kv_group_size"),
@@ -56,4 +62,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dflash2",
         "glm5next_indexer_page",
         "kv_group_size",
+        "dflash_max_position",
     ]
