@@ -115,6 +115,17 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     return encode
 
 
+def _generate_body(body: dict) -> dict:
+    return {**body, "prompts": wire.pack_token_prompts(body["prompts"])}
+
+
+_generate_octet = _octet("generate")
+
+
+def _generate(request: Request, body: dict) -> list[Send]:
+    return _generate_octet(request, _generate_body(body))
+
+
 def _unchunked_octet(request: Request, body: dict) -> list[Send]:
     """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
@@ -124,6 +135,10 @@ def _unchunked_octet(request: Request, body: dict) -> list[Send]:
             f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
         )
     return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _generate_stream(request: Request, body: dict) -> list[Send]:
+    return _unchunked_octet(request, _generate_body(body))
 
 
 def _status_query(request: Request, body: dict) -> list[Send]:
@@ -375,13 +390,11 @@ _ROUTES = {
         normalize=_fwd_bwd_result,
     ),
     # SnowAPI requires DSSST1 octet bodies here even though generate carries no tensors.
-    "generate": _Route(
-        method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
-    ),
+    "generate": _Route(method="POST", path="/{job}/generate", encode=_generate, poll=True, normalize=_to_python),
     # Answers {request_id, count} at once; events are read with request-status. A replay
     # would start a second generation nobody reads.
     "generate-stream": _Route(
-        method="POST", path="/{job}/generate-stream", encode=_unchunked_octet, policy=_NO_REPLAY
+        method="POST", path="/{job}/generate-stream", encode=_generate_stream, policy=_NO_REPLAY
     ),
     # Each poll drains the events it returns from the server.
     "request-status": _Route(
