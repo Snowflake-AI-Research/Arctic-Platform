@@ -55,7 +55,7 @@ def capacity_request(hardware: str | None = None, breakdown: str | Iterable[str]
     if hardware is not None:
         body["hardware"] = hardware
     if breakdown is not None:
-        body["breakdown"] = breakdown if isinstance(breakdown, str) else ",".join(breakdown)
+        body["breakdown"] = breakdown if isinstance(breakdown, str) else tuple(breakdown)
     return Request("capacity", body=body)
 
 

@@ -381,7 +381,7 @@ class TestClusterRequestBuilders:
                 cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
                 Request(
                     "capacity",
-                    body={"hardware": "H200", "breakdown": "job_type,submitted_by"},
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
                 ),
             ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
