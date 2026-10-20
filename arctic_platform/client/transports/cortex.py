@@ -67,7 +67,8 @@ _CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunke
 # `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
 # whose payload is the base64'd DSSST1 frame. The control plane's REST surface
 # marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
-# configured budget is a JSON-body budget, not a frame budget.
+# budget below is a JSON-body budget, not a frame budget.
+_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
 # Room for the envelope's keys, the operation type and the sub-job token.
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
@@ -80,7 +81,6 @@ _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
 
 Send = dict[str, Any]  # keyword arguments for one HTTP request
-Encode = Callable[[Request, dict, CortexConfig], list[Send]]
 
 
 def _parent_id(job_id: JobId) -> str:
@@ -88,22 +88,22 @@ def _parent_id(job_id: JobId) -> str:
 
 
 # ── encoders: a filtered body -> the HTTP sends that deliver it ─────────────
-def _no_body(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _no_body(request: Request, body: dict) -> list[Send]:
     return [{}]
 
 
-def _json(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _json(request: Request, body: dict) -> list[Send]:
     return [{"json": body}]
 
 
-def _query(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _query(request: Request, body: dict) -> list[Send]:
     return [{"params": body}]
 
 
-def _octet(wire_op: str, *, force_chunk: bool = False) -> Encode:
+def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
-    def encode(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+    def encode(request: Request, body: dict) -> list[Send]:
         frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
         chunks = wire.encode_byte_chunks(
             frame, kind="request", operation=wire_op, max_bytes=_MAX_OCTET_BYTES, force_chunk=force_chunk
@@ -113,7 +113,7 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Encode:
     return encode
 
 
-def _unchunked_octet(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _unchunked_octet(request: Request, body: dict) -> list[Send]:
     """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
     if len(frame) > _MAX_OCTET_BYTES:
@@ -124,7 +124,7 @@ def _unchunked_octet(request: Request, body: dict, config: CortexConfig) -> list
     return [{"data": frame, "headers": _OCTET_HEADERS}]
 
 
-def _status_query(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _status_query(request: Request, body: dict) -> list[Send]:
     return [{"params": {"max_events": body["max_events"]}}]
 
 
@@ -141,7 +141,7 @@ def _operation_body_json_bytes(body: dict) -> int:
     return len(json.dumps(empty).encode()) + len(raw)
 
 
-def _forward(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _forward(request: Request, body: dict) -> list[Send]:
     """One /operation envelope per slice of the forward frame.
 
     Unlike the octet routes, chunking here happens *inside* the envelope: each
@@ -151,7 +151,7 @@ def _forward(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     was cached -- so they must be posted in order and the last reply kept.
     """
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
-    max_json_bytes = config.forward_operation_max_json_bytes
+    max_json_bytes = _OPERATION_MAX_JSON_BYTES
     chunks = wire.encode_byte_chunks(
         frame,
         kind="request",
@@ -176,7 +176,7 @@ def _forward(request: Request, body: dict, config: CortexConfig) -> list[Send]:
     return sends
 
 
-def _save(request: Request, body: dict, config: CortexConfig) -> list[Send]:
+def _save(request: Request, body: dict) -> list[Send]:
     payload = {key: body[key] for key in ("checkpoint_id", "checkpoint_type") if key in body}
     return [{"json": payload}]
 
@@ -307,7 +307,7 @@ class _Route:
     method: str
     # Under the prefix. `{job}` is the parent of request.job_id; other fields come from the body.
     path: str
-    encode: Encode = _json
+    encode: Callable[[Request, dict], list[Send]] = _json
     poll: bool = False
     policy: _SendPolicy = _DEFAULT
     # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
@@ -318,10 +318,10 @@ class _Route:
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
 
-    def prepare(self, prefix: str, request: Request, config: CortexConfig) -> tuple[str, list[Send]]:
+    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
         job = None if request.job_id is None else _parent_id(request.job_id)
-        return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body, config)
+        return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body)
 
     def submitted(self, request: Request, reply: dict) -> str | dict:
         """The request_id to poll, or the reply itself for an inline type.
@@ -346,7 +346,7 @@ class _Route:
 class _NoopRoute(_Route):
     """Sends nothing and answers `{}`, whatever the body's shape."""
 
-    def prepare(self, prefix: str, request: Request, config: CortexConfig) -> tuple[str, list[Send]]:
+    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         return "", []
 
 
@@ -612,7 +612,7 @@ class CortexTransport(Transport):
 
     def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
         route = route or _route(request.op)
-        url, sends = route.prepare(self._prefix, request, self.config)
+        url, sends = route.prepare(self._prefix, request)
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
     async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:

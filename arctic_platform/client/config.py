@@ -104,11 +104,6 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     verify_ssl: bool = Field(True, description="cortex: verify HTTPS certificates.")
-    forward_operation_max_json_bytes: int = Field(
-        16 * 1024 * 1024,
-        ge=16 * 1024,
-        description="cortex: maximum JSON body size for one forward operation request.",
-    )
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
     request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
     poll_timeout: float = Field(
