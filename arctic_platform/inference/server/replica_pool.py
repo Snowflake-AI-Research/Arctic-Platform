@@ -176,6 +176,8 @@ _TREE_KILL_TASK_TIMEOUT_S = 20.0
 _VLLM_RAY_RANK_ACTOR_CLASS = "RayWorkerWrapper"
 # Slack when comparing a process's creation time with its actor's start time.
 _PID_REUSE_SLACK_S = 1.0
+# Extra time the rescan's kills get to exit, beyond the first wait's budget.
+_RESCAN_GRACE_S = 1.0
 
 
 def _kill_process_trees(
@@ -186,6 +188,7 @@ def _kill_process_trees(
     tag_env: str = WORKER_ACTOR_ID_ENV,
     title_marker: str = "VLLM::",
     gpu_device_prefix: str = "/dev/nvidia",
+    rescan_grace_s: float = _RESCAN_GRACE_S,
 ) -> dict[str, Any]:
     """SIGKILL the descendants of every ``(pid, started_by_s, kill_root)``
     root, the root itself when ``kill_root``, and the orphaned vLLM
@@ -363,59 +366,70 @@ def _kill_process_trees(
                 forn[pid] = tag
         return found, unattr, forn
 
-    def children_of(parents, skip):
-        """Live descendants of ``parents`` that hold a GPU device and run
-        under vLLM's title, and carry one of this worker's tags if their
-        environment is readable.
-
-        A TP worker is a child of its EngineCore, which is alive while the
-        orphan check runs, so the orphan check never selects it. They are
-        found here instead, before anything is signalled, from the tagged
-        orphan they hang off.
-        """
-        found = {}
+    def descendants_of(parents):
+        """Descendants of ``parents``, read from /proc stat only. Taken before
+        anything is signalled, so the list survives the parents' death."""
+        listed = {}
         for parent in parents.values():
             try:
-                descendants = parent.children(recursive=True)
+                for child in parent.children(recursive=True):
+                    listed.setdefault(child.pid, child)
             except psutil.Error:
                 continue
-            for child in descendants:
-                if child.pid in skip or child.pid in found or child.pid in (me, 1):
+        return list(listed.values())
+
+    def vllm_children(candidates, skip):
+        """The candidates that hold a GPU device and run under vLLM's title,
+        and carry one of this worker's tags if their environment is readable.
+
+        A TP worker is a child of its EngineCore, which is alive while the
+        orphan check runs, so the orphan check never selects it. It is found
+        here instead, from the descendants captured before the orphan was
+        signalled. Run after the orphans are signalled, so a worker stuck in
+        an uninterruptible read delays only its own kill.
+        """
+        found = {}
+        for child in candidates:
+            if child.pid in skip or child.pid in found or child.pid in (me, 1):
+                continue
+            try:
+                if not holds_gpu(child.pid):
                     continue
-                try:
-                    if not holds_gpu(child.pid):
-                        continue
-                    if title_marker not in " ".join(child.cmdline()):
-                        continue
-                except (OSError, ValueError, IndexError, psutil.Error):
+                if title_marker not in " ".join(child.cmdline()):
                     continue
-                try:
-                    tag_here = child.environ().get(tag_env)
-                    readable = True
-                except psutil.NoSuchProcess:
-                    continue
-                except psutil.Error:
-                    readable = False
-                # An unreadable environment says nothing either way, so only a
-                # readable one that names another worker excludes the child.
-                if readable and tag_here not in tags:
-                    continue
-                found[child.pid] = child
+            except (OSError, ValueError, IndexError, psutil.Error):
+                continue
+            try:
+                tag_here = child.environ().get(tag_env)
+                readable = True
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error:
+                readable = False
+            # An unreadable environment says nothing either way, so only a
+            # readable one that names another worker excludes the child.
+            if readable and tag_here not in tags:
+                continue
+            found[child.pid] = child
         return found
 
     def reap_orphans():
-        """One cheap-first pass: signal the tagged orphans and their vLLM
-        children together. Returns the processes it signalled."""
+        """One cheap-first pass: signal the tagged orphans, then their vLLM
+        children. Returns the processes it signalled."""
         if len(tags) == 0:
             return {}
         found, unattr, forn = find_orphans(signalled)
         unattributed.update(unattr)
         foreign.update(forn)
-        group = {**found, **children_of(found, signalled)}
-        signal(group, killed, denied)
-        signalled.update(group)
-        orphan_group.update(group)
-        return group
+        captured = descendants_of(found)
+        signal(found, killed, denied)
+        signalled.update(found)
+        orphan_group.update(found)
+        children = vllm_children(captured, signalled)
+        signal(children, killed, denied)
+        signalled.update(children)
+        orphan_group.update(children)
+        return {**found, **children}
 
     def wait_exit(procs, end):
         """Poll until each process has exited, or ``end``. Returns those still
@@ -428,13 +442,18 @@ def _kill_process_trees(
                 return alive
             time.sleep(0.05)
 
-    end = time.monotonic() + wait_s
-    reap_orphans()
+    start = time.monotonic()
+    end = start + wait_s
+    first = reap_orphans()
     # Wait for the first group before rescanning, so that anything orphaned by
     # that kill is caught by the rescan, not while its parent still runs.
     wait_exit([signalled[pid] for pid in killed], end)
-    # Backstop: processes orphaned by the kill itself.
-    reap_orphans()
+    if first:
+        # Backstop: processes orphaned by the kill itself. Its fresh kills get a
+        # short grace of their own, within the task's budget, so they are not
+        # reported as still running just because the first wait used up wait_s.
+        end = min(max(end, time.monotonic() + rescan_grace_s), start + wait_s + rescan_grace_s)
+        reap_orphans()
     alive = wait_exit([signalled[pid] for pid in killed], end)
     return dict(
         killed=sorted(killed),

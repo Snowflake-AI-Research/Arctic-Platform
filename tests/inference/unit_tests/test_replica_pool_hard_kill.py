@@ -6,6 +6,7 @@ against local process trees.
 """
 
 import asyncio
+import builtins
 import logging
 import os
 import subprocess
@@ -1169,3 +1170,104 @@ def test_tagged_orphan_engine_and_its_tp_child_are_killed_in_one_call(fake_gpu):
         assert _gone(engine) and _gone(worker)
     finally:
         _reap(engine, worker)
+
+
+def test_engine_is_signalled_before_its_tp_child_is_inspected(monkeypatch, fake_gpu):
+    """A TP child is read only after its tagged orphan is signalled, so a child
+    stuck in an uninterruptible read cannot delay the EngineCore kill."""
+    prefix = str(fake_gpu)[:-1]
+    env = dict(os.environ, ARCTIC_INFERENCE_WORKER_ACTOR_ID="actor7", SPT_NOENV="1")
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", _TP_LAUNCHER, str(fake_gpu), _TP_ENGINE, _TP_WORKER],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    engine, worker = (int(pid) for pid in launcher.stdout.readline().split())
+    launcher.wait(timeout=30)
+    events = []
+    real_kill = psutil.Process.kill
+    real_cmdline = psutil.Process.cmdline
+
+    def kill(proc):
+        events.append(("kill", proc.pid))
+        return real_kill(proc)
+
+    def cmdline(proc):
+        events.append(("cmdline", proc.pid))
+        if proc.pid == worker:
+            time.sleep(0.5)  # stands in for a read blocked in uninterruptible sleep
+        return real_cmdline(proc)
+
+    monkeypatch.setattr(psutil.Process, "kill", kill)
+    monkeypatch.setattr(psutil.Process, "cmdline", cmdline)
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        assert events.index(("kill", engine)) < events.index(("cmdline", worker))
+        assert sorted(result["killed"]) == sorted([engine, worker])
+    finally:
+        monkeypatch.undo()
+        _reap(engine, worker)
+
+
+def _count_orphan_scans(monkeypatch):
+    """Counts the orphan scans: each one lists the processes once, from
+    ``find_orphans``. psutil lists them internally too, so count by caller."""
+    scans = []
+    real_pids = psutil.pids
+
+    def pids():
+        if sys._getframe(1).f_code.co_name == "find_orphans":
+            scans.append(1)
+        return real_pids()
+
+    monkeypatch.setattr(psutil, "pids", pids)
+    return scans
+
+
+def test_rescan_is_skipped_when_the_first_pass_signals_nothing(monkeypatch, fake_gpu):
+    prefix = str(fake_gpu)[:-1]
+    scans = _count_orphan_scans(monkeypatch)
+
+    result = replica_pool_mod._kill_process_trees(
+        [], wait_s=1.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+    )
+    assert result["killed"] == []
+    assert len(scans) == 1  # the first pass only
+
+    _, orphan = _launch(fake_gpu, "actor7", stay=False)
+    scans.clear()
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+        assert result["killed"] == [orphan]
+        assert len(scans) == 2  # the first pass signalled something, so the rescan runs
+    finally:
+        _reap(orphan)
+
+
+def test_process_tree_task_body_uses_no_module_globals():
+    """The kill task is shipped by value, so its body, including the closures
+    it defines, may read only builtins, its own locals and its parameters: a
+    module global would be a NameError on the node. Parameter defaults are
+    evaluated at definition time, so they are allowed."""
+    import dis
+    import types as _types
+
+    def code_objects(code):
+        yield code
+        for const in code.co_consts:
+            if isinstance(const, _types.CodeType):
+                yield from code_objects(const)
+
+    global_loads = {
+        ins.argval
+        for code in code_objects(replica_pool_mod._kill_process_trees.__code__)
+        for ins in dis.get_instructions(code)
+        if ins.opname in ("LOAD_GLOBAL", "LOAD_NAME")
+    }
+    assert global_loads <= set(dir(builtins)), global_loads - set(dir(builtins))
