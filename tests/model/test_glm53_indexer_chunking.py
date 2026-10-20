@@ -19,9 +19,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
-# The shared fixture checks optional GLM support before importing AP model modules.
-from test_glm53_packed_rows import _tiny_glm_sparse_model
 from torch.nn import functional as F
 
 from arctic_platform.model.implementations.glm53 import context_parallel as cp
@@ -70,8 +67,8 @@ def _eager_reference(indexer, hidden, residual, mask, boundaries, *, packed, ran
     return output
 
 
-def _inputs(length, device):
-    model = _tiny_glm_sparse_model().to(device)
+def _inputs(length, device, tiny_glm_sparse_model):
+    model = tiny_glm_sparse_model().to(device)
     indexer = model.model.layers[0].self_attn.indexer
     hidden = torch.randn(2, length, 16, device=device, dtype=torch.bfloat16)
     residual = torch.randn(2, length, 8, device=device, dtype=torch.bfloat16)
@@ -83,9 +80,9 @@ def _inputs(length, device):
     return indexer, hidden, residual, mask, packed
 
 
-def _check_chunked_indices(rank, tail, device):
+def _check_chunked_indices(rank, tail, device, tiny_glm_sparse_model):
     set_seed(29)
-    indexer, hidden, residual, mask, packed = _inputs(24, device)
+    indexer, hidden, residual, mask, packed = _inputs(24, device, tiny_glm_sparse_model)
     indexer.index_kpool_always_select_tail = tail
     boundaries = torch.tensor([0, 3, 9, 17, 24], device=device, dtype=torch.int32)
     local = slice(rank * 8, (rank + 1) * 8)
@@ -117,20 +114,20 @@ def _check_chunked_indices(rank, tail, device):
 
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tail", [False, True])
-def test_chunked_indices_match_eager_with_packed_boundaries(rank, tail):
-    _check_chunked_indices(rank, tail, "cpu")
+def test_chunked_indices_match_eager_with_packed_boundaries(rank, tail, tiny_glm_sparse_model):
+    _check_chunked_indices(rank, tail, "cpu", tiny_glm_sparse_model)
 
 
 @require_torch_gpu
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tail", [False, True])
-def test_chunked_cuda_indices_match_eager_with_packed_boundaries(rank, tail):
-    _check_chunked_indices(rank, tail, "cuda")
+def test_chunked_cuda_indices_match_eager_with_packed_boundaries(rank, tail, tiny_glm_sparse_model):
+    _check_chunked_indices(rank, tail, "cuda", tiny_glm_sparse_model)
 
 
-def _check_model_parity(device):
+def _check_model_parity(device, tiny_glm_sparse_model):
     set_seed(31)
-    model = _tiny_glm_sparse_model().to(device).train()
+    model = tiny_glm_sparse_model().to(device).train()
     tokens = torch.arange(1, 17, device=device)[None]
     positions = torch.arange(16, device=device)[None]
 
@@ -159,20 +156,20 @@ def _check_model_parity(device):
         torch_assert_equal(gradient, expected_gradients[name], msg=name)
 
 
-def test_chunking_preserves_model_outputs_and_parameter_gradients():
-    _check_model_parity("cpu")
+def test_chunking_preserves_model_outputs_and_parameter_gradients(tiny_glm_sparse_model):
+    _check_model_parity("cpu", tiny_glm_sparse_model)
 
 
 @require_torch_gpu
-def test_cuda_chunking_preserves_model_outputs_and_parameter_gradients():
-    _check_model_parity("cuda")
+def test_cuda_chunking_preserves_model_outputs_and_parameter_gradients(tiny_glm_sparse_model):
+    _check_model_parity("cuda", tiny_glm_sparse_model)
 
 
 @require_torch_gpu
-def test_chunked_cuda_peak_is_lower_with_live_safety_reserve():
+def test_chunked_cuda_peak_is_lower_with_live_safety_reserve(tiny_glm_sparse_model):
     set_seed(37)
     reserve = torch.empty(20 * 1024**3, dtype=torch.uint8, device="cuda")
-    indexer, hidden, residual, mask, packed = _inputs(4096, "cuda")
+    indexer, hidden, residual, mask, packed = _inputs(4096, "cuda", tiny_glm_sparse_model)
     boundaries = torch.tensor([0, 4096], device="cuda", dtype=torch.int32)
 
     def peak(selector):
