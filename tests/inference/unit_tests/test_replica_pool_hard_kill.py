@@ -7,10 +7,12 @@ against local process trees.
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import threading
 import time
+import types
 from types import SimpleNamespace
 
 import psutil
@@ -664,22 +666,32 @@ def test_kill_process_trees_continues_past_access_denied(monkeypatch):
 # clean-shutdown check.
 # ----------------------------------------------------------------------
 
+# Titles itself as vLLM titles EngineCore and its TP workers: with
+# setproctitle on Linux, the platform that matters. On macOS psutil cannot read
+# the environment of a process that has called setproctitle at all (with or
+# without SPT_NOENV), so there the title comes from argv instead.
 _GPU_HOLDER = """
 import os, sys, time
 fd = open(sys.argv[1], "rb")
+if sys.platform.startswith("linux"):
+    import setproctitle
+    setproctitle.setproctitle("VLLM::EngineCore")
 print(os.getpid(), flush=True)
 time.sleep(60)
 """
 
-# Starts a GPU holder titled like a vLLM process with ``tag`` (if any) in its
-# environment, prints its pid, then either exits at once (orphaning it) or
-# stays alive as its parent.
+# Starts a GPU holder with ``tag`` (if any) in its environment, and
+# SPT_NOENV=1 unless ``noenv`` is "-", prints its pid, then either exits at
+# once (orphaning it) or stays alive as its parent.
 _LAUNCHER = """
 import os, subprocess, sys, time
-device, tag, stay = sys.argv[1], sys.argv[2], sys.argv[3] == "stay"
+device, tag, stay, noenv = sys.argv[1], sys.argv[2], sys.argv[3] == "stay", sys.argv[5] != "-"
 env = dict(os.environ)
+env.pop("SPT_NOENV", None)
 if tag != "-":
     env["ARCTIC_INFERENCE_WORKER_ACTOR_ID"] = tag
+if noenv:
+    env["SPT_NOENV"] = "1"
 child = subprocess.Popen(
     [sys.executable, "-c", sys.argv[4], device, "VLLM::EngineCore"], env=env, stdout=subprocess.PIPE, text=True
 )
@@ -689,9 +701,18 @@ if stay:
 """
 
 
-def _launch(device, tag, *, stay):
+def _launch(device, tag, *, stay, spt_noenv=True):
     launcher = subprocess.Popen(
-        [sys.executable, "-c", _LAUNCHER, str(device), tag, "stay" if stay else "go", _GPU_HOLDER],
+        [
+            sys.executable,
+            "-c",
+            _LAUNCHER,
+            str(device),
+            tag,
+            "stay" if stay else "go",
+            _GPU_HOLDER,
+            "1" if spt_noenv else "-",
+        ],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -715,6 +736,7 @@ def _reap(*pids):
 
 @pytest.fixture
 def fake_gpu(tmp_path):
+    pytest.importorskip("setproctitle", reason="the vLLM processes these tests imitate title themselves with it")
     device = tmp_path / "nvidia0"
     device.write_bytes(b"")
     return device
@@ -906,3 +928,96 @@ def test_shut_down_cleanly_rejects_a_returned_exception():
         return [replica_pool_mod._shut_down_cleanly(task, set()) for task in tasks]
 
     assert asyncio.run(run()) == [False, False, True]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the environ overwrite is setproctitle's Linux behaviour; on macOS psutil cannot read a retitled process's environment at all",
+)
+@pytest.mark.parametrize("spt_noenv", [False, True], ids=["without-SPT_NOENV", "with-SPT_NOENV"])
+def test_setproctitle_keeps_the_worker_id_only_with_spt_noenv(fake_gpu, spt_noenv):
+    """Why the worker sets SPT_NOENV: without it, the first setproctitle()
+    erases the id from /proc/<pid>/environ and every orphan is unattributed."""
+    prefix = str(fake_gpu)[:-1]
+    _, orphan = _launch(fake_gpu, "actor7", stay=False, spt_noenv=spt_noenv)
+    try:
+        assert "VLLM::EngineCore" in " ".join(psutil.Process(orphan).cmdline())
+        visible = psutil.Process(orphan).environ().get("ARCTIC_INFERENCE_WORKER_ACTOR_ID")
+        assert visible == ("actor7" if spt_noenv else None)
+
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        if spt_noenv:
+            assert (result["orphans"], result["unattributed"]) == ([orphan], [])
+        else:
+            assert (result["orphans"], result["unattributed"]) == ([], [orphan])
+    finally:
+        _reap(orphan)
+
+
+def _install_fake_engine(monkeypatch, seen_env):
+    from arctic_platform.inference.server import worker as worker_mod
+
+    class FakeEngineArgs:
+        def create_engine_config(self):
+            return SimpleNamespace(
+                structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
+                model_config=SimpleNamespace(skip_tokenizer_init=True, architecture="LlamaForCausalLM"),
+            )
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_vllm_config(cls, vllm_config, stat_loggers):
+            # What the engine's processes would inherit.
+            seen_env.append(
+                {k: os.environ.get(k) for k in ("ARCTIC_INFERENCE_WORKER_ACTOR_ID", "SPT_NOENV")}
+            )
+            return cls()
+
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.__path__ = []
+    plugins_mod = types.ModuleType("vllm.plugins")
+    plugins_mod.load_general_plugins = lambda: None
+    async_llm_mod = types.ModuleType("vllm.v1.engine.async_llm")
+    async_llm_mod.AsyncLLM = FakeAsyncLLM
+    vllm_mod.plugins = plugins_mod
+    for name, module in (
+        ("vllm", vllm_mod),
+        ("vllm.plugins", plugins_mod),
+        ("vllm.v1", types.ModuleType("vllm.v1")),
+        ("vllm.v1.engine", types.ModuleType("vllm.v1.engine")),
+        ("vllm.v1.engine.async_llm", async_llm_mod),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    for name in ("_ensure_arctic_vllm_patches", "_ensure_router_replay_vllm_patches"):
+        monkeypatch.setattr(worker_mod, name, lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_spec_decode_grammar_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "_create_async_engine_args", lambda kwargs, **_ignored: FakeEngineArgs())
+    monkeypatch.setattr(worker_mod.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        worker_mod.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_id=lambda: "c0ffee01000000")
+    )
+    monkeypatch.delenv("ARCTIC_INFERENCE_WORKER_ACTOR_ID", raising=False)
+    monkeypatch.delenv("SPT_NOENV", raising=False)
+    return worker_mod.InferenceWorker.__ray_metadata__.modified_class()
+
+
+@pytest.mark.parametrize(
+    "extra_env, expected_noenv", [({}, "1"), ({"SPT_NOENV": "0"}, "0")], ids=["default", "caller-wins"]
+)
+def test_initialize_sets_worker_id_and_spt_noenv_before_engine_start(monkeypatch, extra_env, expected_noenv):
+    seen_env: list[dict] = []
+    worker = _install_fake_engine(monkeypatch, seen_env)
+
+    asyncio.run(worker.initialize({"model": "test-model"}, extra_env, model_id="job-1"))
+
+    assert seen_env == [dict(ARCTIC_INFERENCE_WORKER_ACTOR_ID="c0ffee01000000", SPT_NOENV=expected_noenv)]
+
+
+def test_placement_group_runtime_env_carries_spt_noenv():
+    assert replica_pool_mod._runtime_env_vars({"NCCL_X": 1}) == {"NCCL_X": "1", "SPT_NOENV": "1"}
+    assert replica_pool_mod._runtime_env_vars({"SPT_NOENV": "0"}) == {"SPT_NOENV": "0"}
+    assert replica_pool_mod._runtime_env_vars(None) == {"SPT_NOENV": "1"}

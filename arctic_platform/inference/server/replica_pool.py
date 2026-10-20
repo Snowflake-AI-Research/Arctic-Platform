@@ -21,7 +21,7 @@ from arctic_platform.inference.server.scheduler import (
     prefix_affinity_routing,
 )
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
-from arctic_platform.inference.server.worker import WORKER_ACTOR_ID_ENV, InferenceWorker
+from arctic_platform.inference.server.worker import SPT_NOENV_ENV, WORKER_ACTOR_ID_ENV, InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
 
@@ -655,6 +655,20 @@ async def _wait_until_dead(
         await asyncio.sleep(min(_KILL_POLL_INTERVAL_S, remaining))
 
 
+def _runtime_env_vars(extra_env: dict[str, Any] | None) -> dict[str, str]:
+    """``extra_env`` as Ray runtime_env vars, plus ``SPT_NOENV=1`` unless the
+    caller set it.
+
+    On a placement-group path vLLM's Ray executor starts each rank's worker
+    with the coordinator's runtime_env, not its ``os.environ``, so what
+    InferenceWorker.initialize sets there does not reach them; see
+    :data:`~arctic_platform.inference.server.worker.SPT_NOENV_ENV`.
+    """
+    env_vars = {k: str(v) for k, v in (extra_env or {}).items()}
+    env_vars.setdefault(SPT_NOENV_ENV, "1")
+    return env_vars
+
+
 def ensure_ray() -> int:
     """Initialize Ray and return the total number of GPUs in the cluster."""
     ray.init(ignore_reinit_error=True, log_to_driver=True)
@@ -828,11 +842,7 @@ class ReplicaPool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
-        worker_env = {
-            k: str(v) for k, v in (self._config.extra_env or {}).items()
-        }
-        if worker_env:
-            options["runtime_env"] = {"env_vars": worker_env}
+        options["runtime_env"] = {"env_vars": _runtime_env_vars(self._config.extra_env)}
         return options
 
     def _make_semip_agents(self) -> list[ray.actor.ActorHandle]:
@@ -888,11 +898,7 @@ class ReplicaPool:
             # runtime_env from extra_env at actor-creation time is what makes it
             # propagate cluster-wide. (Single-node mp workers inherit the
             # coordinator's os.environ directly, so they need no runtime_env.)
-            worker_env = {
-                k: str(v) for k, v in (self._config.extra_env or {}).items()
-            }
-            if worker_env:
-                options["runtime_env"] = {"env_vars": worker_env}
+            options["runtime_env"] = {"env_vars": _runtime_env_vars(self._config.extra_env)}
             return self._worker_cls.options(**options).remote()
         return self._worker_cls.options(
             num_gpus=self._ray_num_gpus,
