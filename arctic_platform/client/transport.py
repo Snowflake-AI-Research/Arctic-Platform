@@ -43,7 +43,7 @@ OPS = frozenset(
         "forward",
         "step",
         "save",
-        "load-checkpoint",  # SFT resume; not in Cortex surface
+        "load-checkpoint",
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
@@ -54,6 +54,10 @@ OPS = frozenset(
         "wake-inference",
         "sleep-training",
         "wake-training",
+        # Streaming generate: submit, then poll the request for events or cancel it.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
     }
 )
 
@@ -76,14 +80,28 @@ def method_name(op: str) -> str:
     return op.replace("-", "_")
 
 
-def initialize_or_cleanup(transport: "Transport", client_config: ArcticClientConfig) -> "JobHandles":
+def initialize_or_cleanup(
+    transport: "Transport", client_config: ArcticClientConfig, *, wait: bool = True
+) -> "JobHandles":
     """``initialize(client_config)``, or clean up so a launched server is not orphaned.
 
-    ``shutdown`` is idempotent; safe even when the transport already self-cleaned.
+    ``wait=False`` runs only ``start``; finish with :func:`wait_or_cleanup`.
     """
+    return _or_cleanup(transport, transport.initialize if wait else transport.start, client_config)
+
+
+def wait_or_cleanup(transport: "Transport") -> "JobHandles":
+    """``wait_until_ready()``, or clean up so a started job is not orphaned."""
+    return _or_cleanup(transport, transport.wait_until_ready)
+
+
+def _or_cleanup(transport: "Transport", step: Any, *args: Any) -> "JobHandles":
+    # BaseException: Ctrl-C and SystemExit (SIGTERM under Ray) are the usual ways
+    # out of a long placement wait. ``shutdown`` is idempotent, so it is safe even
+    # when the transport already self-cleaned.
     try:
-        return transport.initialize(client_config)
-    except Exception:
+        return step(*args)
+    except BaseException:
         try:
             transport.shutdown()
         except Exception:
@@ -147,6 +165,18 @@ class Transport(ABC):
     @abstractmethod
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
         """Provision jobs from the stateful client config, or attach to its reconnect ids."""
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        """Request the jobs and return before they are ready.
+
+        Once this returns, ``shutdown`` releases what was requested. A transport
+        that cannot split requesting from waiting does all of ``initialize`` here.
+        """
+        return self.initialize(client_config)
+
+    def wait_until_ready(self) -> JobHandles:
+        """Block until the jobs from ``start`` accept ops."""
+        return self.jobs
 
     @abstractmethod
     def call(self, request: Request) -> Any:
