@@ -177,12 +177,7 @@ def _forward(request: Request, body: dict, config: CortexConfig) -> list[Send]:
 
 
 def _save(request: Request, body: dict, config: CortexConfig) -> list[Send]:
-    checkpoint_type = body["checkpoint_type"].lower()
-    if checkpoint_type not in ("resumable", "weights-only"):
-        raise ValueError("checkpoint_type must be 'resumable' or 'weights-only'")
-    payload = {"checkpoint_type": checkpoint_type}
-    if "checkpoint_id" in body:
-        payload["checkpoint_id"] = body["checkpoint_id"]
+    payload = {key: body[key] for key in ("checkpoint_id", "checkpoint_type") if key in body}
     return [{"json": payload}]
 
 
