@@ -606,3 +606,44 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     assert sparse_attention.q_a_proj.weight.grad is not None
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
     assert sparse_attention.indexer.wq_b.weight.grad is None
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")
+def test_glm53_fused_indexer_selects_the_general_paths_keys():
+    """One packed row takes the fused path; a batch of two identical rows takes the general path."""
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextIndexer
+
+    from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
+
+    config = _tiny_config().text_config
+    config.hidden_size, config.q_lora_rank = 64, 32
+    config.index_n_heads, config.index_head_dim, config.index_topk, config.index_kpool = 4, 128, 64, 4
+    config.index_kpool_always_select_tail = True
+    torch.manual_seed(0)
+    indexer = Glm5NextTextIndexer(config, layer_idx=3)
+    with torch.no_grad():
+        indexer.index_kpool_compress_ape.normal_()
+        indexer.index_kpool_compress_gate.normal_(std=0.1)
+    indexer = indexer.bfloat16().cuda()
+    length = 1030  # two packed documents; the second ends inside a pool
+    hidden = torch.randn(1, length, config.hidden_size, device="cuda").bfloat16()
+    q_resid = torch.randn(1, length, config.q_lora_rank, device="cuda").bfloat16()
+    cu_seqlens = torch.tensor([0, 600, length], dtype=torch.int32, device="cuda")
+
+    def select(rows):
+        return _select_sparse_indices(
+            indexer,
+            hidden.expand(rows, -1, -1),
+            q_resid.expand(rows, -1, -1),
+            torch.ones(rows, length, dtype=torch.bool, device="cuda"),
+            cu_seqlens,
+            cp_group=None,
+            cp_rank=0,
+        )[0]
+
+    fused, general = select(1), select(2)
+
+    assert fused.shape == general.shape
+    assert torch.equal((fused >= 0).sum(-1), (general >= 0).sum(-1))
+    # Same inputs; scores differ only in FP32 accumulation order, so only exact near-ties may swap.
+    rows_equal = (fused.sort(-1).values == general.sort(-1).values).all(-1).float().mean().item()
+    assert rows_equal > 0.995

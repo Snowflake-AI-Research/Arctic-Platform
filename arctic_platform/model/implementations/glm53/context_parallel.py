@@ -28,6 +28,7 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
@@ -44,6 +45,8 @@ _GLOBAL_CU_SEQLENS = "_ap_glm53_global_cu_seqlens"
 # Bound one fp32 gathered-key tile while recomputing reference sparse-MLA backward.
 _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
+# Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
+_SCORE_BUDGET_BYTES = 1 << 30
 SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
 
 
@@ -93,6 +96,65 @@ def _normalize_cu_seqlens(
     return cu_seqlens
 
 
+def _unpadded_segment_indices(
+    indexer: nn.Module,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    segment_states: torch.Tensor,
+    query_positions: torch.Tensor,
+    output_width: int,
+) -> torch.Tensor:
+    """``_select_sparse_indices`` for one segment without padding, minus its dense intermediates.
+
+    The general path builds ``[queries, heads, pools]`` FP32 scores and a ``[queries, keys]``
+    visibility mask -- hundreds of GB at 256K. With every key valid, pool ``i`` is visible to the query
+    at segment position ``t`` exactly when ``i < (t + 1) // kpool``, and the tail is the query's own
+    incomplete pool, so each query chunk is scored by the fused indexer kernel and picks its top-k
+    there. ``query`` is ``[queries, heads, dim]`` and ``weights`` ``[queries, heads]``; returns
+    segment-relative token indices in the general path's column layout, ``-1`` where unused.
+    """
+    kpool = indexer.index_kpool
+    pool_keys = indexer.get_pooled_states(packed_states=segment_states)[0][0].contiguous()
+    pools = pool_keys.shape[0]
+    select_k = min(indexer.index_topk // kpool, pools)
+    visible_pools = torch.div(query_positions + 1, kpool, rounding_mode="floor").clamp(max=pools).to(torch.int32)
+    # relu(scale * s) == scale * relu(s): the softmax scale folds into the head weights.
+    head_weights = (weights * indexer.softmax_scale).contiguous()
+    query_by_head = query.permute(1, 0, 2)
+    unit_key_scales = torch.ones(pools, dtype=torch.float32, device=query.device)
+    first_keys = torch.zeros_like(visible_pools)
+    pool_offsets = torch.arange(kpool, device=query.device)
+    tail_offsets = torch.arange(kpool - 1, device=query.device)
+
+    out = torch.full((query.shape[0], output_width), -1, dtype=torch.int32, device=query.device)
+    rows = max(1, _SCORE_BUDGET_BYTES // (4 * max(pools, 1)))
+    for start in range(0, query.shape[0], rows):
+        stop = min(start + rows, query.shape[0])
+        visible = visible_pools[start:stop]
+        width = max(int(visible.max()), 1)
+        scores = fp8_indexer.weighted_relu_scores(
+            query_by_head[:, start:stop],
+            pool_keys,
+            unit_key_scales,
+            head_weights[start:stop],
+            first_keys[start:stop],
+            visible,
+            width,
+        )
+        chosen = fp8_indexer.topk_indices(scores, min(select_k, width))
+        tokens = chosen[..., None] * kpool + pool_offsets
+        tokens = tokens.masked_fill((chosen >= visible[:, None])[..., None], -1).flatten(1)
+        pieces = [F.pad(tokens, (0, select_k * kpool - tokens.shape[1]), value=-1)]
+        if indexer.index_kpool_always_select_tail:
+            seen = query_positions[start:stop] + 1
+            tail_count = seen % kpool
+            tail = (seen - tail_count)[:, None] + tail_offsets
+            pieces.append(tail.masked_fill(tail_offsets >= tail_count[:, None], -1))
+        segment = torch.cat(pieces, dim=1)[:, :output_width]
+        out[start:stop, : segment.shape[1]] = segment.to(torch.int32)
+    return out
+
+
 @torch.no_grad()
 def _select_sparse_indices(
     indexer: nn.Module,
@@ -138,6 +200,26 @@ def _select_sparse_indices(
         segment_states = packed_states[:, start:end]
         valid_keys = segment_states[..., -1].bool()
         segment_length = end - start
+        segment_queries = slice(local_start - query_offset, local_end - query_offset)
+        if (
+            batch_size == 1
+            and hidden_states.is_cuda
+            # The fused scorer's tensor-core dot runs over a power-of-two head dim of at least 16.
+            and indexer.head_dim >= 16
+            and indexer.head_dim & (indexer.head_dim - 1) == 0
+            and bool(valid_keys.all())
+            and bool(attention_mask[:, segment_queries].all())
+        ):
+            segment_topk = _unpadded_segment_indices(
+                indexer,
+                query[0, segment_queries],
+                weights[0, segment_queries],
+                segment_states,
+                torch.arange(local_start - start, local_end - start, device=hidden_states.device),
+                output_width,
+            )
+            topk_indices[0, segment_queries] = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
+            continue
         key_positions = torch.arange(segment_length, device=hidden_states.device)
         pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
         pool_keys_transposed = pool_keys.transpose(-1, -2).float().unsqueeze(1)
