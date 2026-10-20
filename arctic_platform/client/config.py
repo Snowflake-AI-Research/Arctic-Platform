@@ -360,7 +360,7 @@ class ArcticClientConfig(BaseModel):
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
-        for key in ("ep_size", "mb_spec"):
+        for key in ("ep_size", "mb_spec", "router_replay"):
             if key in worker:
                 training[key] = worker[key]
         if ds:
@@ -375,7 +375,11 @@ class ArcticClientConfig(BaseModel):
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
         vllm.pop("tensor_parallel_size", None)  # owned by n_gpus on this wire
-        inference: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": n_gpus}
+        inference: dict[str, Any] = {
+            **(self.sampling.arctic_inference_config or {}),
+            "max_seq_len": self.max_seq_len,
+            "n_gpus": n_gpus,
+        }
         if vllm:
             inference["vllm_config"] = vllm
         if self.training.peft:
