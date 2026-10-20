@@ -45,6 +45,7 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
+from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self._gpu_mem_preallocation = None
         self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
@@ -175,9 +177,13 @@ class DeepSpeedWorker:
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
         # HF load + patches via ModelSpec (world_size already injected above).
-        spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
+        model_config = dict(ds_worker_config)
+        if job_config.get("training_config") is not None:
+            model_config["debug"] = gpu_memory_debug_config(job_config["training_config"])
+        spec = ModelSpec.from_ds_worker_config(model_name, model_config)
         loaded = build_model(spec)
         model = loaded.model
+        self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
@@ -1187,12 +1193,17 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
-        if self._weight_sender is not None:
-            self._weight_sender.destroy()
+        try:
+            if self._weight_sender is not None:
+                self._weight_sender.destroy()
+        finally:
             self._weight_sender = None
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        self.engine = None
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self.engine = None
+                self._gpu_mem_preallocation = None
         return True
 
 
