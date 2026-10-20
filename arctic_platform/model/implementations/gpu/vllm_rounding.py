@@ -26,8 +26,8 @@ import importlib
 import types
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from transformers.activations import ACT2FN
 
 try:
     from fla.modules import FusedRMSNormGated
@@ -150,21 +150,66 @@ def _uses_fla_kernel(x: torch.Tensor) -> bool:
     return fla_rms_norm_gated is not None and x.is_cuda and not torch.compiler.is_compiling()
 
 
+_GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
+
+
+def _gate_activation(gate: torch.Tensor, activation: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """``activation(gate)`` and its derivative, for the gate activations fla's kernel supports."""
+    sigmoid = torch.sigmoid(gate)
+    if activation == "sigmoid":
+        return sigmoid, sigmoid * (1.0 - sigmoid)
+    return F.silu(gate), sigmoid * (1.0 + gate * (1.0 - sigmoid))
+
+
+class RMSNormGatedFp32(torch.autograd.Function):
+    """RMSNorm of ``x`` times ``weight`` times ``activation(gate)``, in fp32, rounded once to ``x``'s dtype.
+
+    For backward it saves only the inputs as given (``x``, ``gate`` and ``weight``) and the per-row ``rstd``, and
+    recomputes the fp32 values from them, instead of keeping full-size fp32 activations alive until backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float, activation: str):
+        compute_dtype = _compute_dtype(x)
+        hidden = x.to(compute_dtype)
+        rstd = torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + eps)
+        activated, _ = _gate_activation(gate.to(compute_dtype), activation)
+        out = hidden * rstd * weight.to(compute_dtype) * activated
+        ctx.save_for_backward(x, gate, weight, rstd)
+        ctx.activation = activation
+        return out.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, gate, weight, rstd = ctx.saved_tensors
+        compute_dtype = _compute_dtype(x)
+        normed = x.to(compute_dtype) * rstd
+        scale = weight.to(compute_dtype)
+        activated, activation_grad = _gate_activation(gate.to(compute_dtype), ctx.activation)
+
+        grad = grad_out.to(compute_dtype)
+        grad_gate = grad * normed * scale * activation_grad
+        grad_weight = (grad * normed * activated).reshape(-1, weight.shape[-1]).sum(0)
+        # Gradient through normed = x * rstd(x), with rstd = (mean(x**2) + eps) ** -0.5.
+        grad_normed = grad * scale * activated
+        grad_x = rstd * (grad_normed - normed * (grad_normed * normed).mean(-1, keepdim=True))
+        return grad_x.to(x.dtype), grad_gate.to(gate.dtype), grad_weight.to(weight.dtype), None, None
+
+
 def rms_norm_gated_fp32(
     x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float, activation: str
 ) -> torch.Tensor:
     """RMSNorm of ``x`` times ``weight`` times ``activation(gate)``, evaluated in fp32 and rounded once to ``x``'s dtype.
 
     This is vLLM's ``RMSNormGated`` with ``norm_before_gate=True``, the GatedDeltaNet output norm of the sampler. On
-    CUDA it runs fla's fused ``rms_norm_gated`` kernel, which computes the same way and has a fused backward.
+    CUDA it runs fla's fused ``rms_norm_gated`` kernel, which computes the same way and has a fused backward; elsewhere
+    ``RMSNormGatedFp32``, which saves the same tensors for backward.
     """
+    if activation not in _GATE_ACTIVATIONS:
+        raise ValueError(f"unsupported gate activation {activation!r}; expected one of {_GATE_ACTIVATIONS}")
     if _uses_fla_kernel(x):
         return fla_rms_norm_gated(x, gate, weight, None, activation, eps=eps)
-    compute_dtype = _compute_dtype(x)
-    hidden = x.to(compute_dtype)
-    hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + eps)
-    hidden = hidden * weight.to(compute_dtype)
-    return (hidden * ACT2FN[activation](gate.to(compute_dtype))).to(x.dtype)
+    return RMSNormGatedFp32.apply(x, gate, weight, eps, activation)
 
 
 def _rms_norm_gated_once_forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -193,6 +238,8 @@ def round_gated_norm_once(norm: nn.Module) -> None:
             f"expected a stock transformers GatedDeltaNet output norm, got {type(norm).__module__}."
             f"{type(norm).__qualname__}; its rounding is unknown, so it cannot be made to round once"
         )
+    if norm.activation not in _GATE_ACTIVATIONS:
+        raise RuntimeError(f"unsupported GatedDeltaNet output-norm gate activation {norm.activation!r}")
     norm.forward = types.MethodType(_rms_norm_gated_once_forward, norm)
 
 

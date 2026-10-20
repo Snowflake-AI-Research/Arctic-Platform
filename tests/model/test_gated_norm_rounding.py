@@ -121,11 +121,81 @@ def test_rounded_norm_keeps_its_class_parameters_and_state_dict():
     torch_assert_equal(copied(x, gate), _vllm_rms_norm_gated(x, gate, norm.weight, norm.variance_epsilon, "silu"))
 
 
-def test_backward_matches_the_formula_in_fp64():
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+def test_backward_matches_the_formula_in_fp64(activation):
     x, gate = torch.randn(2, 6, 16, dtype=torch.float64).unbind(0)
     weight = torch.randn(16, dtype=torch.float64)
     inputs = tuple(tensor.requires_grad_() for tensor in (x, gate, weight))
-    assert torch.autograd.gradcheck(lambda *a: vllm_rounding.rms_norm_gated_fp32(*a, 1e-6, "silu"), inputs)
+    assert torch.autograd.gradcheck(lambda *a: vllm_rounding.rms_norm_gated_fp32(*a, 1e-6, activation), inputs)
+
+
+def _bf16_inputs(rows: int = 4096) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(4)
+    x, gate = torch.randn(2, rows, _HEAD_DIM, generator=generator).to(torch.bfloat16).unbind(0)
+    weight = torch.normal(0.95, 0.12, (_HEAD_DIM,), generator=generator).to(torch.bfloat16)
+    return tuple(tensor.requires_grad_() for tensor in (x, gate, weight))
+
+
+def test_backward_saves_only_the_inputs_and_rstd():
+    x, gate, weight = _bf16_inputs()
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda t: saved.append((str(t.dtype), tuple(t.shape))) or t, lambda t: t
+    ):
+        vllm_rounding.rms_norm_gated_fp32(x, gate, weight, 1e-6, "silu")
+    rows = x.shape[0]
+    assert sorted(saved) == sorted(
+        [
+            ("torch.bfloat16", (rows, _HEAD_DIM)),
+            ("torch.bfloat16", (rows, _HEAD_DIM)),
+            ("torch.bfloat16", (_HEAD_DIM,)),
+            ("torch.float32", (rows, 1)),
+        ]
+    )
+
+
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+def test_bf16_gradients_are_as_close_to_fp64_as_autograd_over_the_formula(activation):
+    inputs = _bf16_inputs()
+    output = vllm_rounding.rms_norm_gated_fp32(*inputs, 1e-6, activation)
+    torch_assert_equal(output, _vllm_rms_norm_gated(*inputs, 1e-6, activation))
+
+    upstream = torch.randn(output.shape, generator=torch.Generator().manual_seed(5)).to(torch.bfloat16)
+    gradients = torch.autograd.grad(output, inputs, upstream)
+    autograd_gradients = torch.autograd.grad(_vllm_rms_norm_gated(*inputs, 1e-6, activation), inputs, upstream)
+    inputs_fp64 = [tensor.detach().double().requires_grad_() for tensor in inputs]
+    reference = torch.autograd.grad(
+        _vllm_rms_norm_gated(*inputs_fp64, 1e-6, activation), inputs_fp64, upstream.double()
+    )
+    for name, gradient, autograd_gradient, exact in zip(
+        ("x", "gate", "weight"), gradients, autograd_gradients, reference
+    ):
+        assert gradient.dtype == torch.bfloat16, name
+        error = (gradient.double() - exact).abs().max()
+        autograd_error = (autograd_gradient.double() - exact).abs().max()
+        assert error <= 2 * autograd_error + 1e-6, (name, error.item(), autograd_error.item())
+
+
+def test_compiled_norm_matches_eager_in_one_graph():
+    x, gate, weight = _bf16_inputs(rows=256)
+    upstream = torch.randn(x.shape, generator=torch.Generator().manual_seed(6)).to(torch.bfloat16)
+    eager = vllm_rounding.rms_norm_gated_fp32(x, gate, weight, 1e-6, "silu")
+    eager_gradients = torch.autograd.grad(eager, (x, gate, weight), upstream)
+    compiled = torch.compile(vllm_rounding.rms_norm_gated_fp32, fullgraph=True)
+    try:
+        output = compiled(x, gate, weight, 1e-6, "silu")
+        gradients = torch.autograd.grad(output, (x, gate, weight), upstream)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(output, eager, rtol=2**-7, atol=2**-14)
+    for gradient, eager_gradient in zip(gradients, eager_gradients):
+        torch.testing.assert_close(gradient, eager_gradient, rtol=1.6e-2, atol=1e-2)
+
+
+def test_an_unsupported_gate_activation_is_refused():
+    norm = _stock_norm(_QWEN4_EXP, "Qwen4ExpTextRMSNormGated", {"activation": "gelu"})
+    with pytest.raises(RuntimeError, match="unsupported GatedDeltaNet output-norm gate activation 'gelu'"):
+        vllm_rounding.round_gated_norm_once(norm)
 
 
 def test_cuda_inputs_run_fla_kernel(monkeypatch):
