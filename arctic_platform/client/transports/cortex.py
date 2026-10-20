@@ -29,7 +29,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -459,11 +458,24 @@ async def _raise_for_status(resp: Any) -> None:
     )
 
 
+def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dict:
+    """Job-create body. Unset fields and an empty comment are omitted."""
+    payload: dict[str, Any] = {"sub_job_configs": sub_job_configs}
+    if config.job_comment is not None and config.job_comment != "":
+        payload["comment"] = config.job_comment
+    for key in ("idle_timeout_seconds", "pending_timeout_seconds"):
+        value = getattr(config, key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
 class CortexTransport(Transport):
     def __init__(self, config: CortexConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
+        self._roles: list[str] = []
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -491,27 +503,29 @@ class CortexTransport(Transport):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        self.start(client_config)
+        return self.wait_until_ready()
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        self._roles = [role for role in JOB_TYPES if client_config.gpus_for(role) > 0]
         reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
             self.job_id = _parent_id(reconnect.require_any())
         else:
-            body: dict = {"sub_job_configs": client_config.to_cortex()}
-            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
-            comment = os.environ.get("CORTEX_JOB_COMMENT")
-            if comment:
-                body["comment"] = comment
+            body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
-            # Logged before the wait: a job can stay PLACING for a long time, and its id
-            # is the only way to cancel it if this process stops first.
-            logger.info("created cortex job %s; waiting for it to run", self.job_id)
+            # Logged before the wait: a job can stay PLACING for a long time.
+            logger.info("created cortex job %s", self.job_id)
+        return self.jobs
+
+    def wait_until_ready(self) -> JobHandles:
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
         # (e.g. weight-sync source/target) already carry Cortex-correct ids with no
         # transport-side rewrite -- exactly as on-prem does with plain job ids.
-        for role in JOB_TYPES:
-            if client_config.gpus_for(role) > 0:
-                self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
+        for role in self._roles:
+            self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
         return self.jobs
 
     def shutdown(self) -> None:
@@ -521,6 +535,7 @@ class CortexTransport(Transport):
             # Best-effort teardown, tolerating failure (the job may be gone).
             with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
                 self.call(cancel_job_request(self.job_id))
+            self.job_id = None
         self._on_loop(self._close_session()).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
