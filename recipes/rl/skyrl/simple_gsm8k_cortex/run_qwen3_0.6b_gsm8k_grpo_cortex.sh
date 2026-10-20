@@ -18,6 +18,10 @@
 #
 #   trainer.arctic_rl.attn_implementation=flash_attention_3
 #     SkyRL defaults to FA2, which the Cortex image does not ship; it ships FA3.
+#   trainer.arctic_rl.use_liger=false
+#     SkyRL defaults this on. The Cortex training image then runs a logprob
+#     post-step that raises unless the forward returned logits. Off, the
+#     server uses the ordinary loss and the step completes.
 #   generator.inference_engine.external_server_urls=[http://cortex-managed, ...]
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
 #     which asserts one URL per engine. The URLs are placeholders -- generation
@@ -26,6 +30,9 @@
 #     Sampling goes through the shim, which has no vLLM logprob channel to read.
 #     Costs nothing: the Arctic generator hardcodes rollout_logprobs=None either
 #     way, so SkyRL's default of 1 would be discarded unused.
+#   generator.inference_engine.enable_ray_prometheus_stats=false
+#     vLLM runs inside Cortex, so the driver's metrics scraper has nothing to
+#     scrape, and on some machines it crashes the driver on a bad port.
 
 set -euo pipefail
 
@@ -34,8 +41,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This launcher ships inside the Arctic Platform checkout, so it can locate the
 # repo root rather than being told. Point ARCTIC_PLATFORM_SPEC at a released
 # version instead once one ships arctic_platform/integrations/ (0.1.3 does not).
+# [sft] carries the RL client's DeepSpeed/liger imports; [rl] would add
+# arctic-inference, which builds from source and is dead weight on a CPU driver.
 AP_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[sft,cortex]}"
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "ERROR: uv not found. Install it with:"
@@ -185,8 +194,9 @@ cortex_jobs() {
     # Deps come from uv, not the ambient interpreter: this runs before the
     # training invocation below, so there is no environment to inherit. Only
     # the client is needed, hence --no-project and the [cortex] extra alone.
-    uv run --isolated --no-project --with "${AP_ROOT}[cortex]" \
+    CORTEX_JOBS_MODEL="${MODEL}" uv run --isolated --no-project --with "${AP_ROOT}[cortex]" \
         -- python - "${mode}" "$@" <<'PY'
+import os
 import sys
 
 from arctic_platform.client.config import CortexConfig
@@ -197,12 +207,22 @@ from arctic_platform.client.transports.cortex import CortexTransport
 # Anything not in here still holds its GPUs.
 TERMINAL = {"failed", "done", "cancelled", "canceled", "succeeded", "terminated"}
 mode, wanted = sys.argv[1], set(sys.argv[2:])
+model = os.environ["CORTEX_JOBS_MODEL"]
+
+
+# The before/after diff alone also catches a teammate's job launched mid-run on
+# the same account; requiring every sub-job to be this run's model rules that out
+# unless they are training the same model.
+def is_this_model(job: dict) -> bool:
+    subs = job.get("sub_jobs") or []
+    return bool(subs) and all(s.get("model_name") == model for s in subs)
+
 
 transport = CortexTransport(CortexConfig())
 live = [
     j.get("job_id") or j.get("id") or j.get("name")
     for j in transport.call(list_jobs_request())
-    if str(j.get("status") or j.get("state") or "?").lower() not in TERMINAL
+    if str(j.get("status") or j.get("state") or "?").lower() not in TERMINAL and is_this_model(j)
 ]
 
 if mode == "list":
@@ -276,11 +296,11 @@ trap release_our_jobs EXIT
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
     --with "${ARCTIC_PLATFORM_SPEC}" \
-    --with 'transformers==4.57.6' \
     -- python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
     trainer.arctic_rl.attn_implementation=flash_attention_3 \
+    trainer.arctic_rl.use_liger=false \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \
@@ -294,6 +314,7 @@ uv run --isolated --extra skyrl-train \
     generator.inference_engine.run_engines_locally=false \
     "generator.inference_engine.external_server_urls=${ENGINE_URLS}" \
     "generator.sampling_params.logprobs=null" \
+    generator.inference_engine.enable_ray_prometheus_stats=false \
     generator.inference_engine.weight_sync_backend=nccl \
     generator.inference_engine.async_engine=true \
     generator.batched=true \
