@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from arctic_platform.model.dense_spec import dense_model_spec
 
 
@@ -71,3 +74,60 @@ def test_dense_offload_omits_a_none_tensor_size_threshold():
     )
 
     assert spec.patches.activation_offload.tensor_size_threshold == 1 << 20
+
+
+def test_unset_fp32_loader_options_are_not_passed(monkeypatch):
+    import arctic_platform.model.dense_spec as dense_spec
+
+    seen = []
+    real = dense_spec.ModelSpec
+
+    def recording(**kwargs):
+        seen.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(dense_spec, "ModelSpec", recording)
+    dense_model_spec(
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="sdpa",
+        sequence_parallel=1,
+        liger=False,
+        training_options={},
+    )
+
+    assert "loader_options" not in seen[0]
+
+
+def test_set_fp32_loader_options_are_forwarded():
+    parity_off = dense_model_spec(
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="sdpa",
+        sequence_parallel=1,
+        liger=False,
+        training_options={"fp32_parity": False},
+    )
+    residual_on = dense_model_spec(
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="sdpa",
+        sequence_parallel=1,
+        liger=False,
+        training_options={"fp32_residual": True},
+    )
+
+    assert parity_off.loader_options == {"fp32_parity": False, "fp32_residual": False}
+    assert residual_on.loader_options == {"fp32_parity": True, "fp32_residual": True}
+
+
+def test_fp32_residual_without_fp32_parity_is_rejected():
+    with pytest.raises(ValidationError, match="fp32_residual requires fp32_parity"):
+        dense_model_spec(
+            model_path="Qwen/Qwen3-8B",
+            dtype="bfloat16",
+            attn_implementation="sdpa",
+            sequence_parallel=1,
+            liger=False,
+            training_options={"fp32_parity": False, "fp32_residual": True},
+        )

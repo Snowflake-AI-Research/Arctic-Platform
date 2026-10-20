@@ -50,6 +50,12 @@ def dense_model_spec(
         }
     tiled_mlp_token_chunk_size = training_options.get("tiled_mlp_token_chunk_size")
     tiled_mlp = {"token_chunk_size": tiled_mlp_token_chunk_size} if tiled_mlp_token_chunk_size is not None else None
+    # Name only the loader options the job set. The Hugging Face schema fills the other default.
+    loader_options = {
+        name: training_options[name]
+        for name in ("fp32_parity", "fp32_residual")
+        if training_options.get(name) is not None
+    }
     return ModelSpec(
         model_path_or_name=model_path,
         dtype=dtype,
@@ -65,4 +71,5 @@ def dense_model_spec(
             lm_head=lm_head,
             peft=training_options.get("peft_config"),
         ),
+        **({"loader_options": loader_options} if loader_options else {}),
     )
