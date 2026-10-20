@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import Any
 
@@ -193,8 +194,8 @@ class ArcticClient(_ArcticClientCore):
     def list_jobs(self, status: str | None = None) -> list[dict]:
         return self._call(list_jobs_request(status))
 
-    def capacity(self, hardware: str | None = None) -> dict:
-        return self._call(capacity_request(hardware))
+    def capacity(self, hardware: str | None = None, *, breakdown: str | Iterable[str] | None = None) -> dict:
+        return self._call(capacity_request(hardware, breakdown))
 
     def cancel_job(self, job_id: JobId) -> None:
         self._call(cancel_job_request(job_id))
@@ -413,8 +414,8 @@ class AsyncArcticClient(_ArcticClientCore):
     async def list_jobs(self, status: str | None = None) -> list[dict]:
         return await self._acall(list_jobs_request(status))
 
-    async def capacity(self, hardware: str | None = None) -> dict:
-        return await self._acall(capacity_request(hardware))
+    async def capacity(self, hardware: str | None = None, *, breakdown: str | Iterable[str] | None = None) -> dict:
+        return await self._acall(capacity_request(hardware, breakdown))
 
     async def cancel_job(self, job_id: JobId) -> None:
         await self._acall(cancel_job_request(job_id))

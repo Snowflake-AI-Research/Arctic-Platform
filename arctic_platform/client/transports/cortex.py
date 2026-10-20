@@ -189,7 +189,7 @@ def _identity(value: Any) -> Any:
 
 
 def _capacity_result(result: dict) -> dict:
-    return {
+    totals = {
         "has_reservation": bool(result.get("has_reservation", False)),
         "max_total_gpus": int(result.get("max_total_gpus", 0)),
         "reserved_gpus": int(result.get("reserved_gpus", 0)),
@@ -197,6 +197,7 @@ def _capacity_result(result: dict) -> dict:
         "pending_gpus": int(result.get("pending_gpus", 0)),
         "available_gpus": int(result.get("available_gpus", 0)),
     }
+    return {**result, **totals}
 
 
 def _fwd_bwd_result(result: dict) -> dict:

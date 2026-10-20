@@ -377,6 +377,13 @@ class TestClusterRequestBuilders:
             ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": "job_type,submitted_by"},
+                ),
+            ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
             (
                 cluster_requests.export_checkpoint_request("job-1", "step-1"),
@@ -423,8 +430,8 @@ class TestClusterClientMethods:
         """Account-level ops need no stored handle."""
         _call(client, "list_jobs", "running")
         assert _last(client) == cluster_requests.list_jobs_request("running")
-        _call(client, "capacity", "H200")
-        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
         _call(client, "cancel_job", "job-9")
         assert _last(client) == cluster_requests.cancel_job_request("job-9")
 

@@ -109,9 +109,12 @@ class TestClusterRoutes:
     def test_account_filters_travel_as_query_params(self):
         transport, send = _transport()
         transport.call(client_requests.list_jobs_request("running"))
-        transport.call(client_requests.capacity_request("H200"))
+        transport.call(client_requests.capacity_request("H200", ("job_type", "submitted_by")))
 
-        assert [sent["params"] for sent in send.sent] == [{"status": "running"}, {"hardware": "H200"}]
+        assert [sent["params"] for sent in send.sent] == [
+            {"status": "running"},
+            {"hardware": "H200", "breakdown": "job_type,submitted_by"},
+        ]
 
     def test_path_only_routes_send_no_body(self):
         """checkpoint_id fills the URL and is not also sent as a body."""
@@ -129,11 +132,15 @@ class TestClusterRoutes:
         assert transport.call(client_requests.list_jobs_request()) == []
         assert transport.call(client_requests.list_checkpoints_request(TRAINING)) == []
 
-    def test_capacity_fills_omitted_fields(self):
+    def test_capacity_fills_omitted_fields_and_preserves_breakdown(self):
         """Proto3 JSON omits false and zero fields; every key is still returned, as cortex-training does."""
-        transport, _ = _transport({("GET", "/capacity"): {"max_total_gpus": 64, "in_use_gpus": 8}})
+        breakdown = {"job_count": 2, "by_job_type": {"status": "OK", "groups": []}}
+        transport, _ = _transport(
+            {("GET", "/capacity"): {"max_total_gpus": 64, "in_use_gpus": 8, "breakdown": breakdown}}
+        )
 
         assert transport.call(client_requests.capacity_request()) == {
+            "breakdown": breakdown,
             "has_reservation": False,
             "max_total_gpus": 64,
             "reserved_gpus": 0,
