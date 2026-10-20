@@ -1,0 +1,4075 @@
+{
+  "identity": {
+    "check_id": "e2e-sft-train-validate",
+    "config_checksum": "f773ada8eaccdebd36159ed52d691282494cf95fe16157199b88cbd26d3cd756",
+    "config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k",
+    "criterion": "sft-trajectory-ce-v1",
+    "dependencies": {
+      "flash-attn": null,
+      "liger-kernel": "0.8.4",
+      "peft": "0.21.2",
+      "safetensors": "0.8.0",
+      "torch": "2.13.0+cu130",
+      "transformers": "5.17.0"
+    },
+    "gpu_family": "h200",
+    "parameter_name_map": {},
+    "python": "3.12.15",
+    "recipe": {
+      "criterion": {
+        "absolute_tolerance": 0.03,
+        "gate_validation_loss": true,
+        "gated_training_steps": [
+          100
+        ],
+        "steps": 100
+      },
+      "dataset": {
+        "name": "gsm8k-extra-info-parquet",
+        "ordering": "file-order",
+        "source_files": {
+          "test": {
+            "sha256": "5392f1eb3fb71a1b8f27503e05420755167ef9570f63c68710ab37b20cbde4fe",
+            "size": 624923
+          },
+          "train": {
+            "sha256": "d319a0864fb6f6aefbf7301b8a255600acb15ad1d59565fd6aa21faad0a6f782",
+            "size": 3432989
+          }
+        },
+        "train": {
+          "count": 800,
+          "rows_per_step": 8,
+          "start": 0
+        },
+        "train_groups": [
+          {
+            "count": 8,
+            "start": 0
+          },
+          {
+            "count": 8,
+            "start": 8
+          },
+          {
+            "count": 8,
+            "start": 16
+          },
+          {
+            "count": 8,
+            "start": 24
+          },
+          {
+            "count": 8,
+            "start": 32
+          },
+          {
+            "count": 8,
+            "start": 40
+          },
+          {
+            "count": 8,
+            "start": 48
+          },
+          {
+            "count": 8,
+            "start": 56
+          },
+          {
+            "count": 8,
+            "start": 64
+          },
+          {
+            "count": 8,
+            "start": 72
+          },
+          {
+            "count": 8,
+            "start": 80
+          },
+          {
+            "count": 8,
+            "start": 88
+          },
+          {
+            "count": 8,
+            "start": 96
+          },
+          {
+            "count": 8,
+            "start": 104
+          },
+          {
+            "count": 8,
+            "start": 112
+          },
+          {
+            "count": 8,
+            "start": 120
+          },
+          {
+            "count": 8,
+            "start": 128
+          },
+          {
+            "count": 8,
+            "start": 136
+          },
+          {
+            "count": 8,
+            "start": 144
+          },
+          {
+            "count": 8,
+            "start": 152
+          },
+          {
+            "count": 8,
+            "start": 160
+          },
+          {
+            "count": 8,
+            "start": 168
+          },
+          {
+            "count": 8,
+            "start": 176
+          },
+          {
+            "count": 8,
+            "start": 184
+          },
+          {
+            "count": 8,
+            "start": 192
+          },
+          {
+            "count": 8,
+            "start": 200
+          },
+          {
+            "count": 8,
+            "start": 208
+          },
+          {
+            "count": 8,
+            "start": 216
+          },
+          {
+            "count": 8,
+            "start": 224
+          },
+          {
+            "count": 8,
+            "start": 232
+          },
+          {
+            "count": 8,
+            "start": 240
+          },
+          {
+            "count": 8,
+            "start": 248
+          },
+          {
+            "count": 8,
+            "start": 256
+          },
+          {
+            "count": 8,
+            "start": 264
+          },
+          {
+            "count": 8,
+            "start": 272
+          },
+          {
+            "count": 8,
+            "start": 280
+          },
+          {
+            "count": 8,
+            "start": 288
+          },
+          {
+            "count": 8,
+            "start": 296
+          },
+          {
+            "count": 8,
+            "start": 304
+          },
+          {
+            "count": 8,
+            "start": 312
+          },
+          {
+            "count": 8,
+            "start": 320
+          },
+          {
+            "count": 8,
+            "start": 328
+          },
+          {
+            "count": 8,
+            "start": 336
+          },
+          {
+            "count": 8,
+            "start": 344
+          },
+          {
+            "count": 8,
+            "start": 352
+          },
+          {
+            "count": 8,
+            "start": 360
+          },
+          {
+            "count": 8,
+            "start": 368
+          },
+          {
+            "count": 8,
+            "start": 376
+          },
+          {
+            "count": 8,
+            "start": 384
+          },
+          {
+            "count": 8,
+            "start": 392
+          },
+          {
+            "count": 8,
+            "start": 400
+          },
+          {
+            "count": 8,
+            "start": 408
+          },
+          {
+            "count": 8,
+            "start": 416
+          },
+          {
+            "count": 8,
+            "start": 424
+          },
+          {
+            "count": 8,
+            "start": 432
+          },
+          {
+            "count": 8,
+            "start": 440
+          },
+          {
+            "count": 8,
+            "start": 448
+          },
+          {
+            "count": 8,
+            "start": 456
+          },
+          {
+            "count": 8,
+            "start": 464
+          },
+          {
+            "count": 8,
+            "start": 472
+          },
+          {
+            "count": 8,
+            "start": 480
+          },
+          {
+            "count": 8,
+            "start": 488
+          },
+          {
+            "count": 8,
+            "start": 496
+          },
+          {
+            "count": 8,
+            "start": 504
+          },
+          {
+            "count": 8,
+            "start": 512
+          },
+          {
+            "count": 8,
+            "start": 520
+          },
+          {
+            "count": 8,
+            "start": 528
+          },
+          {
+            "count": 8,
+            "start": 536
+          },
+          {
+            "count": 8,
+            "start": 544
+          },
+          {
+            "count": 8,
+            "start": 552
+          },
+          {
+            "count": 8,
+            "start": 560
+          },
+          {
+            "count": 8,
+            "start": 568
+          },
+          {
+            "count": 8,
+            "start": 576
+          },
+          {
+            "count": 8,
+            "start": 584
+          },
+          {
+            "count": 8,
+            "start": 592
+          },
+          {
+            "count": 8,
+            "start": 600
+          },
+          {
+            "count": 8,
+            "start": 608
+          },
+          {
+            "count": 8,
+            "start": 616
+          },
+          {
+            "count": 8,
+            "start": 624
+          },
+          {
+            "count": 8,
+            "start": 632
+          },
+          {
+            "count": 8,
+            "start": 640
+          },
+          {
+            "count": 8,
+            "start": 648
+          },
+          {
+            "count": 8,
+            "start": 656
+          },
+          {
+            "count": 8,
+            "start": 664
+          },
+          {
+            "count": 8,
+            "start": 672
+          },
+          {
+            "count": 8,
+            "start": 680
+          },
+          {
+            "count": 8,
+            "start": 688
+          },
+          {
+            "count": 8,
+            "start": 696
+          },
+          {
+            "count": 8,
+            "start": 704
+          },
+          {
+            "count": 8,
+            "start": 712
+          },
+          {
+            "count": 8,
+            "start": 720
+          },
+          {
+            "count": 8,
+            "start": 728
+          },
+          {
+            "count": 8,
+            "start": 736
+          },
+          {
+            "count": 8,
+            "start": 744
+          },
+          {
+            "count": 8,
+            "start": 752
+          },
+          {
+            "count": 8,
+            "start": 760
+          },
+          {
+            "count": 8,
+            "start": 768
+          },
+          {
+            "count": 8,
+            "start": 776
+          },
+          {
+            "count": 8,
+            "start": 784
+          },
+          {
+            "count": 8,
+            "start": 792
+          }
+        ],
+        "validation": {
+          "count": 33,
+          "minimum_rows": 8,
+          "selection": "longest-leading-padded-rectangle-within-token-budget",
+          "source_rows": 1319,
+          "split": "test",
+          "start": 0,
+          "token_budget": 10240
+        }
+      },
+      "full_sft_width8_composition": {
+        "absolute_tolerance": 0.03,
+        "config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k",
+        "config_sha256": "35d4c02490fc237ea889c536f743a1f82e71b302b2c6e33f46988b9901bf369d",
+        "e2e_source": {
+          "sha256": "44d85a1a4af9619cce731c07989ea4df11ae2fbaa0ae8f96badc2ba158e901aa",
+          "size": 42458
+        },
+        "helper_source": {
+          "sha256": "a0efe8f93be6794992a7f8ee3bcff62c8d44ec838b2b682cc20a1d3d9b03f0ee",
+          "size": 11867
+        },
+        "initialization": "base-model",
+        "learning_rate": 2e-05,
+        "model": "Qwen/Qwen3-8B",
+        "model_layers": 36,
+        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "rows_per_step": 8,
+        "spec_sha256": "555607fddfb6f3b206b142cd5247e21972e0e24efc7258cb2fe95c7488785979",
+        "steps": 100,
+        "target_config": {
+          "dtype": "bfloat16",
+          "job_type": "training",
+          "model_name": "Qwen/Qwen3-8B",
+          "seed": 42,
+          "training_config": {
+            "activation_checkpointing": true,
+            "attn_implementation": "flash_attention_3",
+            "ds_config": {
+              "bf16": {
+                "enabled": true
+              },
+              "gradient_accumulation_steps": 1,
+              "gradient_clipping": 1,
+              "optimizer": {
+                "params": {
+                  "betas": [
+                    0.9,
+                    0.999
+                  ],
+                  "eps": 1e-08,
+                  "lr": 2e-05,
+                  "weight_decay": 0
+                },
+                "type": "AdamW"
+              },
+              "train_batch_size": 8,
+              "train_micro_batch_size_per_gpu": 1,
+              "zero_optimization": {
+                "stage": 2
+              }
+            },
+            "gradient_clipping": 1,
+            "max_seq_len": 32768,
+            "model_provider": "huggingface",
+            "n_gpus": 8,
+            "optimizer": {
+              "betas": [
+                0.9,
+                0.999
+              ],
+              "eps": 1e-08,
+              "lr": 2e-05,
+              "name": "AdamW",
+              "weight_decay": 0
+            },
+            "train_batch_size": 8
+          }
+        },
+        "training_gpus": 8,
+        "version": "original-full-sft-native8-e2e-v1",
+        "workload_seed": 1234
+      },
+      "initialization": {
+        "kind": "base-model"
+      },
+      "model": {
+        "assets": {
+          "config.json": {
+            "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+            "size": 728
+          },
+          "generation_config.json": {
+            "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+            "size": 239
+          },
+          "merges.txt": {
+            "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "size": 1671853
+          },
+          "model-00001-of-00005.safetensors": {
+            "sha256": "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f",
+            "size": 3996250744
+          },
+          "model-00002-of-00005.safetensors": {
+            "sha256": "5991236cea6fe21f3d43cab0f0e84448734fbbe0789816202989f2ddc9d18282",
+            "size": 3993160032
+          },
+          "model-00003-of-00005.safetensors": {
+            "sha256": "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
+            "size": 3959604768
+          },
+          "model-00004-of-00005.safetensors": {
+            "sha256": "b5ee7de71fbf17db3d5704e0c8f2bc7d005ca9e1d7ca2aeb19827b0cfcaa917a",
+            "size": 3187841392
+          },
+          "model-00005-of-00005.safetensors": {
+            "sha256": "20c2d6366ab85c90786ccdd829cd2b9e7d30ef3b2ebbb998280e7e4014b542ff",
+            "size": 1244659840
+          },
+          "model.safetensors.index.json": {
+            "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+            "size": 32878
+          },
+          "tokenizer.json": {
+            "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+            "size": 11422654
+          },
+          "tokenizer_config.json": {
+            "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+            "size": 9732
+          },
+          "vocab.json": {
+            "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "size": 2776833
+          }
+        },
+        "sha256": "dd573032cbe7073d51998086f1e07a8aa0b3579994c89fc44141ff266b3abadb"
+      },
+      "preprocessing": {
+        "add_special_tokens": true,
+        "answer_boundary": "longest-common-prefix-of-prompt-and-joined-tokenization",
+        "completion_template": " {answer}",
+        "forward_labels": "shifted-once-to-logit-alignment",
+        "ignore_index": -100,
+        "labels": "answer-only-huggingface",
+        "padding_side": "right",
+        "position_ids": "zero-based-with-zero-padded-tail",
+        "prompt_template": "Question: {question}\nAnswer:",
+        "truncation": false
+      },
+      "reference_options": {
+        "attn": "flash_attention_3",
+        "ce_chunk": 2048,
+        "deterministic": true,
+        "dtype": "bfloat16",
+        "fp32_lm_head": false,
+        "fused_cross_entropy": false,
+        "gradient_clipping": 1,
+        "learning_rate": 2e-05,
+        "lm_head_token_chunk_size": null,
+        "lm_head_vocab_chunk_size": 8192,
+        "matmul_precision": "highest",
+        "mixer_packing": false,
+        "optimizer_chunk_elements": 1048576,
+        "optimizer_config": {
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "lr": 2e-05,
+          "name": "AdamW",
+          "weight_decay": 0
+        },
+        "optimizer_dtype": "float32",
+        "peft_config": null,
+        "seed": 1234,
+        "token_budget": 10240
+      },
+      "scored_answer_tokens": 4043,
+      "tokenizer": {
+        "assets": {
+          "config.json": {
+            "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+            "size": 728
+          },
+          "generation_config.json": {
+            "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+            "size": 239
+          },
+          "merges.txt": {
+            "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "size": 1671853
+          },
+          "model.safetensors.index.json": {
+            "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+            "size": 32878
+          },
+          "tokenizer.json": {
+            "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+            "size": 11422654
+          },
+          "tokenizer_config.json": {
+            "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+            "size": 9732
+          },
+          "vocab.json": {
+            "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "size": 2776833
+          }
+        },
+        "bos_token_id": null,
+        "class": "transformers.models.qwen2.tokenization_qwen2.Qwen2Tokenizer",
+        "eos_token_id": 151645,
+        "pad_token_id": 151643,
+        "padding_side": "right",
+        "vocabulary_size": 151669
+      },
+      "train_batches": [
+        {
+          "active_tokens": 789,
+          "name": "train-step-001",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "bdaec2292a799a46d7ba6006379160117d1a3e006f8c5c45ddc148e364666983",
+              "shape": [
+                8,
+                231
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "83258523b5f128506161f2a5dbca924d5e70df1cb98f678313648549aefca7a2",
+              "shape": [
+                8,
+                231
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "44df056120c2a52dddd37ee895ce8aa32c7e38c94589a52dfe6b6f57726897a1",
+              "shape": [
+                8,
+                231
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1260,
+          "name": "train-step-002",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2537490bb0995efe81dc5042f461dce8f0cd4c6c01def038d33e92261202eb1d",
+              "shape": [
+                8,
+                437
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "760fabce4dc8f7b067c48b16dad3385a02faa38a1ab9a41f10fe9b6f6b02f0a9",
+              "shape": [
+                8,
+                437
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "20ac67187bb6601f18936684906aa2fe0cced3528aee77dd9d623d1c316dc888",
+              "shape": [
+                8,
+                437
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1074,
+          "name": "train-step-003",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "55eee430041cf3e57d1f5014bce057210d2d7accc5907f7fa0837901e7122d28",
+              "shape": [
+                8,
+                317
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "fde82ceb945b8258180979e0dc4ee08f84f489d7bc876591c6ca6a919ce71b54",
+              "shape": [
+                8,
+                317
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a9c4fad87bb4df5bdd6d54a0f6c161b0c5f36bd47f54c9f17e6092bbc977bf12",
+              "shape": [
+                8,
+                317
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1074,
+          "name": "train-step-004",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6accbf85fdf88a51b99c52a50eb71f9127cc960ab561f2d94c9b2cbbb3c4eb92",
+              "shape": [
+                8,
+                306
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "7a6b6445e7a4900a31f46b35e5ea6e019f98c7cbc5f7315c6f1c1981a1b1011e",
+              "shape": [
+                8,
+                306
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a730091af844b42b8444ac303900d5eb88fd7091038c473f89c291b89d0514ac",
+              "shape": [
+                8,
+                306
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 821,
+          "name": "train-step-005",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6fdd0722d70598d32d18b0311e9db8e5af511bc534a2c54fb6fa83dcc9cf99c9",
+              "shape": [
+                8,
+                263
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4ca6b88551dc4d19923c05794b03924e6cc8c2d3f9eb2c6bcfde2681cb59ebed",
+              "shape": [
+                8,
+                263
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d64e7e420bf267ffbcbdaf40362703f66d05df147593b9843a4d93807d7b454d",
+              "shape": [
+                8,
+                263
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1111,
+          "name": "train-step-006",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "10a4fb8243d2909609a8495d8399466d93a47541ec0f1a0f9b82db7b452ed2d7",
+              "shape": [
+                8,
+                241
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "2b5907d0d9c5fdb35b1f00bc5c7d5b6a111fc11588873aebcae730995e654db1",
+              "shape": [
+                8,
+                241
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6000969ca11501ad723f498ca6ee89c828faf383da6b0e06a06ab80230c2edb9",
+              "shape": [
+                8,
+                241
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 757,
+          "name": "train-step-007",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "59c16cbd33dcb6ea2454172769ba6c770e85050dde4061953e699374b53b9ad0",
+              "shape": [
+                8,
+                229
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "e3b3d65d7559a120bc4eab62ccc5c73596b919a47a8dfd1752582328adcf5d6f",
+              "shape": [
+                8,
+                229
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "435ad32e7a606f2ab916e45025cd2b0e84dfa8b4bf9dec40d1e3ff350599e32d",
+              "shape": [
+                8,
+                229
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1163,
+          "name": "train-step-008",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "741a32cef14aa0b97f9c52c8927caa9a8ff03682f4484b6dfec529323b4df823",
+              "shape": [
+                8,
+                282
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "e904390b728053da23da37ac1370cf8024f90bb310a6dcc4c9e5f0fc2dd68d39",
+              "shape": [
+                8,
+                282
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "8f6bb62446c652127c810036506553f4b541b54b829a602289dd85a7fb4469d1",
+              "shape": [
+                8,
+                282
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1142,
+          "name": "train-step-009",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ea5488ce800471802be928574a09c1d13ee27d7739da19323d5eef14418be0fc",
+              "shape": [
+                8,
+                326
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "c55c916ef492c9f1ce9fa79805a8ec91a4156cba9bd66e13af9b445f30f54081",
+              "shape": [
+                8,
+                326
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4d7b6da745b65a4c78e872ad99805ef6060010568d49fa8e130196c559c18ddd",
+              "shape": [
+                8,
+                326
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 763,
+          "name": "train-step-010",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "12db741931dec4e7ea8ac07dfb330cb390738c2aba1592768a26bd429bc37a54",
+              "shape": [
+                8,
+                248
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "b3fc8bb1a9f71ace3eb6a807fa4ae72d178b921c886fd9c51b8fa55455122481",
+              "shape": [
+                8,
+                248
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ab7e7718d262c42782ec22bc2f52d4872a1ce8cc7fcb2cc0f7be00eac24a139a",
+              "shape": [
+                8,
+                248
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 880,
+          "name": "train-step-011",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "08d9c1635978fba3a92ad47a00914adb24dc683d34cf82a08379502d8023b9bb",
+              "shape": [
+                8,
+                270
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "d6277ba40789a3f9b29175731e73d76522e3598b5abad3b03885764d4643680d",
+              "shape": [
+                8,
+                270
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e10197a8e3953db7a6b10ef94ec052bcff8f000eb1afdb19f6c00b408437a9ca",
+              "shape": [
+                8,
+                270
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1086,
+          "name": "train-step-012",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a7ccf0769e0f1fc95e7c9729b6038a6e8fa6864ff1f3bb9339c0e48ba2549d40",
+              "shape": [
+                8,
+                280
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "7e5f6837d44101dc0104338733bee1c8026aa0ee6244bc13e56f9b407bb33de4",
+              "shape": [
+                8,
+                280
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "f8c215dfab6e6fb6dc43caa771b1f223d7ee16a6543f57defa54fcbb7c4a136b",
+              "shape": [
+                8,
+                280
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 969,
+          "name": "train-step-013",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "dae4d66d65437bef6b00ee32536aca3f21331ef8d00fc1dcf6f444afb013e06a",
+              "shape": [
+                8,
+                350
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f275a294a64efc6ca93ebafd53edc64b9c07a904c3ec510a88934f3c2672106a",
+              "shape": [
+                8,
+                350
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "839bdd3531b34a4810f27dbf8ad58363436f122864167c9f2725dc7004b709e4",
+              "shape": [
+                8,
+                350
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 892,
+          "name": "train-step-014",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3f2b0b83a43697bde040d8ad7c04b78187c19885b757f231a47d4beddc24ac1b",
+              "shape": [
+                8,
+                302
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "20b66ef805402205d18d5a4717511e436a68e4f765e0919864e6a2b30c75b92e",
+              "shape": [
+                8,
+                302
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "32b30a2b591117adcddfba39d5ebe455e1c7dd0c72f61a5033dbd58bfc6a6141",
+              "shape": [
+                8,
+                302
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 993,
+          "name": "train-step-015",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4964ccab078d561d88574f4499157af78680b365b9288fe7f0c8be6248632470",
+              "shape": [
+                8,
+                287
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "7d0d2ab8a89af25b6a54c758f685e1a8c2bb9e5f75ec685553f5e12e8ed0b38e",
+              "shape": [
+                8,
+                287
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c891c0f51652633e3329a05f9914d48e1c1da89d226d960934700be10993cfba",
+              "shape": [
+                8,
+                287
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1101,
+          "name": "train-step-016",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "5866439256f767b9fea542551b8f86e75b76c7ae7d7e50fff127048843fc1cd5",
+              "shape": [
+                8,
+                379
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "aa4f13203b8ab2b4047a4276ed37e350a9719e0bea5e5ac4029ee12fdc2d59f9",
+              "shape": [
+                8,
+                379
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "29ae1d1d4f9a5767dac1821e25b59bc15c0fe03869e544c972c18c565b40aa29",
+              "shape": [
+                8,
+                379
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 858,
+          "name": "train-step-017",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e2fae9ec72f82b6032e1e5baced5c471f984ac12af20e7d69b9cb4046e0cad7c",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "3ded6f894d5926d0d7085705a41538fa008c423ad11b33dce2ddaf48ff5662da",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0c3aa26567b985ed6d5e5425f71776d2c7a3563bf860996cc0154241226db01b",
+              "shape": [
+                8,
+                261
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1033,
+          "name": "train-step-018",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d65e3dd2ab91562d6df15fefffa87b48c96c507bae781ae0bac452a30dfc8f95",
+              "shape": [
+                8,
+                306
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "95c95258a7a48b7d7f11877a60a5bd292925d080863359452385941e3f24488e",
+              "shape": [
+                8,
+                306
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4dfc8c34728300f90dad8811410501e6af1a083eb9666a44a24f283e7b6e22f4",
+              "shape": [
+                8,
+                306
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 837,
+          "name": "train-step-019",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "35382c20bf88919e34360f23584ca4ad555761570e44e7d7e08c5650f1d59fae",
+              "shape": [
+                8,
+                251
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "3f3678a5a3fd0d1d16784ad7411fd24f1422fd2a0752177968b5b36ea04113e5",
+              "shape": [
+                8,
+                251
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a2a61d1e855141b76d026124890961822d7672d82ae2b7283243c22a6d523c3d",
+              "shape": [
+                8,
+                251
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 869,
+          "name": "train-step-020",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1e0978068c64a8165c3be3ef339e024f6ecb747fc86828cc7e4d16468f4b386f",
+              "shape": [
+                8,
+                243
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "dfeb8f8b8b9fba94600abfe2debe1574c29bbb42c6c93936ed09c20fe2fc00c1",
+              "shape": [
+                8,
+                243
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d32b01fb6d4c4a8b5dbcde985fffc8456e6305e857db16a52e40bf5a2ac9642f",
+              "shape": [
+                8,
+                243
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1141,
+          "name": "train-step-021",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "386d094b5c3a8df5117d2fd5d9fbe288a26e7e4b3a70b1e530e409b1205dfb19",
+              "shape": [
+                8,
+                315
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "c3bea3d51a9745336d7af6d6601769b8e0fdc2f26d3dadeae81f0284299b9520",
+              "shape": [
+                8,
+                315
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c1b28062d5d56a4465e27efdec7c7387f837ec90c172f9b6e2a69202cc89930f",
+              "shape": [
+                8,
+                315
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 860,
+          "name": "train-step-022",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0ebb662dfeb1c293294a991e234ea3356621ac39222b25823b0f3d6062e85875",
+              "shape": [
+                8,
+                326
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "279304a3d3012aaf0a392bbb0bd425c8b1ab3182137b70fcebd8206fe4434d92",
+              "shape": [
+                8,
+                326
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "31951cbfed2c777cef26d6136ff72c7d7b59ab516917be80aec7a033c47ef4ac",
+              "shape": [
+                8,
+                326
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1295,
+          "name": "train-step-023",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0fe42859c663770875987479708de3d4ad5124abc4b05d139396eef04f41e387",
+              "shape": [
+                8,
+                334
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "887d68838a4ec7b220a1d18d8b38e30e841ab928016d5255a86e76b24fe8af00",
+              "shape": [
+                8,
+                334
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "9bb4cb3052704e04b38735524e27a18b15d002c722860b56f1c734c9a94ffbf2",
+              "shape": [
+                8,
+                334
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 989,
+          "name": "train-step-024",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1bd10aa40bbc78410a9a3a9f69a95469abc8876df4b16a9856b5be4ebee2032f",
+              "shape": [
+                8,
+                309
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "506153db6ac93921ad6e07ce96522b9be0d1c06224a76c747bd20aa97a81e199",
+              "shape": [
+                8,
+                309
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "5994f3dcf304b000110c776e443e53e3defc4ab3aab6a93ef45e155083173a8f",
+              "shape": [
+                8,
+                309
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1301,
+          "name": "train-step-025",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "902a23a9827dac103ec9c64829de632efcad48195afe6039546f77daba4827f9",
+              "shape": [
+                8,
+                363
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "18341b4493ad758578cd94d723c9726c9a91d42687a42e488c7c0d0ea2e107d3",
+              "shape": [
+                8,
+                363
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d85d6301fb21cdd70805b3d8bd83bed29f883804570e2ab14e54ce4cb0e7ba00",
+              "shape": [
+                8,
+                363
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 771,
+          "name": "train-step-026",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2a6e60676265f3e31e9c15b6b458f46789c61177ed1e2c67dec2994108266ead",
+              "shape": [
+                8,
+                241
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "c13f39e272db3b8eb9c843ecabf5d5a5dad826e6969416e544ae5ca64fd7ebde",
+              "shape": [
+                8,
+                241
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "489367bd115f053155f322a3838da77b04993363ea9f874451a2f1b764fc3812",
+              "shape": [
+                8,
+                241
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1292,
+          "name": "train-step-027",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "54ca4c5b1ae5704f531346451a4a60fbe924c88e0252e14aca646436d68f4a09",
+              "shape": [
+                8,
+                377
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "30963ac39287a93242684421edf3ee107bca66cb9a2a531922a84b6c35b082e5",
+              "shape": [
+                8,
+                377
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "46613cf50b29491156a5b8d61a49276869b6a5e729b047a0bfad7f0d53a10268",
+              "shape": [
+                8,
+                377
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 949,
+          "name": "train-step-028",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "18a756638b84c1858db1d66c554f68d1a8dc3889d13c1f20d854cec5182462d8",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "bf05ab83a09aeb9e2a1f8cd38471a575073cc27e78d66b6cfbec0cba161c3635",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b3a6560d897a0aeefc4204dcf33d2342f5927ba08a29a75beef5fdf9d6ff6478",
+              "shape": [
+                8,
+                252
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1114,
+          "name": "train-step-029",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "69449e80542b9d4fda08adb089c60301b14058db2ba8e05628d246d2c545eb3d",
+              "shape": [
+                8,
+                291
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "7b7a015e3bf773c951ebdb115139a746f6d10f684a550c7bf4d590de371ad006",
+              "shape": [
+                8,
+                291
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e6d82380b0af5d9ea0fdf1878b7b526dca1d67a12bab4a1f21f80c0bae05fa1e",
+              "shape": [
+                8,
+                291
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1299,
+          "name": "train-step-030",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "68dafb57fadc70060570fe27d8baffd54c1707d6d71f253f476ced91b6602a33",
+              "shape": [
+                8,
+                419
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "841f3b551c71e71e18dec93900ec8f5afb62f9504287446d848f70f5696e2d39",
+              "shape": [
+                8,
+                419
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ca42c9d963f80c8253e45a1fb5815eaa463e92dcdcf9cace04462188343e0fa7",
+              "shape": [
+                8,
+                419
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1028,
+          "name": "train-step-031",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3755c1331cae130be14f37bcd0efc2b3a4b60ee779b066dc388bb010ef85a13c",
+              "shape": [
+                8,
+                314
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "b63faf8ad635a1618b1cebbc9057c366690eea67153c783d45c9aca3827106d5",
+              "shape": [
+                8,
+                314
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "484ce47141a8a7ef104591476f90041642b681d6cefdf49fbf07fb4a7a398e10",
+              "shape": [
+                8,
+                314
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 860,
+          "name": "train-step-032",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "17b2b965b43b4b98ed7dd7b39a968806feb3120cb682c3beb231070e5a52c0a2",
+              "shape": [
+                8,
+                276
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f2504f54f42ee80d58837355d20342fab7e80ad575bf750de79ac8a820a10741",
+              "shape": [
+                8,
+                276
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c5a630e5c438d5369b8aa494380350737d969616f2970ba0c19bc5e3e734fb1e",
+              "shape": [
+                8,
+                276
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1165,
+          "name": "train-step-033",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6332051777f7dfa897e0da856d3a7362b07e89002b1f3664c4725ee671c9b495",
+              "shape": [
+                8,
+                368
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "9fb5f92f75a6b02cf036562786ae11489e2d714dd424ebe105e9791dfa34e927",
+              "shape": [
+                8,
+                368
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "501dd9ba198040b51aeb07b8a79dc863ee04c9d5b8e4b93628e6a152fbfbfc91",
+              "shape": [
+                8,
+                368
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 945,
+          "name": "train-step-034",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0ea7a53b5461d06311d9691a56a761b20a28bd5d6c75ca72ba21801ef4e7fbda",
+              "shape": [
+                8,
+                262
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "32658cf5ba31ee20713eca0745a09f281b4b22b607a125e0a8bdce4b77d39b8f",
+              "shape": [
+                8,
+                262
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "08aec5f971a047adcc101c6aaf8f22027a06c6b641297ce0b80f141105e508b4",
+              "shape": [
+                8,
+                262
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1302,
+          "name": "train-step-035",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "dfc29c7f2ee0830133bc9e2fec7c2f418c1c2f853b4ab0c7ec5530193b18ad44",
+              "shape": [
+                8,
+                344
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "6c33a1bfc1598584f014c339573326c33d09aad70d8b192d67605104b355b670",
+              "shape": [
+                8,
+                344
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2f7db720dbb0810e08b907c9ba19f101edf095686e97f355dd23264a05d3a69f",
+              "shape": [
+                8,
+                344
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 825,
+          "name": "train-step-036",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2a1b2d3ea2998a5b79e0f62b7f27c34e8a9ba79c32dd3b35cee2de0649155fcb",
+              "shape": [
+                8,
+                227
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "0dd3543766ef1d772db31b6142431ea836a42c82fe2adef4ecca813c6d7dfa41",
+              "shape": [
+                8,
+                227
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7a3fc656cd734dd92342ad3f9e2ee769d1f1c5c5efb1291c6e7e02a93da9efbf",
+              "shape": [
+                8,
+                227
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 980,
+          "name": "train-step-037",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "745587f98cf508eb012792d972c055116c499a1869a53d3ce232f4f15463d1dc",
+              "shape": [
+                8,
+                315
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "858d29024d2205dac792300448c930393a44816f2ce1d6eaff3c85c569c81467",
+              "shape": [
+                8,
+                315
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a255448450f09e2d5afeb609fb7cae4adeb20028dd3588a9b9f9e43545a9cd63",
+              "shape": [
+                8,
+                315
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1022,
+          "name": "train-step-038",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "91760b956c4531228442ca7a44fd2a53a19919e7c76e092cd2c42ca35f8c9557",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "e8a5b55197136357ff8f6d140735546af056e1bbbd2ec6238dee8c7a042139a4",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "926b93b3417a773c6c26f2a0093b63ead5aeca0a5c3293b02885ac434773bbdf",
+              "shape": [
+                8,
+                288
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1429,
+          "name": "train-step-039",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a20ca71a8a03d6ff58b3bbb269a80f2bce85ac13d18325cc8f13bf403a8be7de",
+              "shape": [
+                8,
+                539
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f7ecb7942096e4973e8cd8375608bdb0ebad9d7ce868ea12f1cc980bbb40135d",
+              "shape": [
+                8,
+                539
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0b25ec0b62d066ca88a9d74f9563f78252edbeef9ae1a386fe8cbeb6c686f3ce",
+              "shape": [
+                8,
+                539
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 857,
+          "name": "train-step-040",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "45997862fc042d5b5b6fb81a4a4153620569ce225433434465c267cb3e4a5750",
+              "shape": [
+                8,
+                218
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "0bec0717b91bbc423233268ffc8d27721ac1ef43ad6ca2598fdda463ff1e7775",
+              "shape": [
+                8,
+                218
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0f41f55ac95d0969f80431437768ec8dcbba614860c75597d204594d7e36336d",
+              "shape": [
+                8,
+                218
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1077,
+          "name": "train-step-041",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "458f28e9f3a517d6274ca562175a020674bb738f67b3c82f9e7ec2fd2e25b5c2",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "056f802837bfa4481dfc987d27d189ce7acf864266303f68b8914d130436c9e8",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1b52bb08bf725f3801b12ad860ad7c2fe3efc53e6e662007f968802b272b4f15",
+              "shape": [
+                8,
+                252
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1412,
+          "name": "train-step-042",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e29c0aa79d0472f29c4b03d66a8bb984ba91ce185c2b8f88de431f030ad3f4fb",
+              "shape": [
+                8,
+                393
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "b3fba9876972b1ac4070bf151f1e2d2927b8cc737123841f8c5f9f7b9eb61aa6",
+              "shape": [
+                8,
+                393
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "69cdcd100b7bf61d8460bcbef01ab22156ae90c804570cbfe9d926f75ca02c3a",
+              "shape": [
+                8,
+                393
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 839,
+          "name": "train-step-043",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "8e56748ae6150e866b49869f8b0b8bec6465a25f360cfb63b97336cde95c821a",
+              "shape": [
+                8,
+                253
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f0ff48f2028ea7f5981726058ba1eb262533e0980c3207ade22f7995a2985617",
+              "shape": [
+                8,
+                253
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "8de02b0e2f7a856d9f7599cc3b055c56c5024850e39572c85996b22b1f307772",
+              "shape": [
+                8,
+                253
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 802,
+          "name": "train-step-044",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "980c41eed51099f9529ea8315c501f41e793b5e3793ba83d9ba2a4859b360593",
+              "shape": [
+                8,
+                266
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "b434e5c94b1a6ce4baddb86e5d44c4d08521f58480a379a57e34eba51111ccc9",
+              "shape": [
+                8,
+                266
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1b9789c2e86c20dc4212a1865e5170782a82df4cd8d413fac4a49db159ed41b9",
+              "shape": [
+                8,
+                266
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 904,
+          "name": "train-step-045",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b7df269aa18c16d3d536de7b447364ad0655cca8a9d23e04a360b1227393d218",
+              "shape": [
+                8,
+                264
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4c6987d66f3421ea1c6e68dc4e3a836066ee5c815a76c473133e4c8d879f3bf0",
+              "shape": [
+                8,
+                264
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1f8408b8edc4e9a066b577327f21f7f67e1122275669e4e36a9b6f9ad6da04ff",
+              "shape": [
+                8,
+                264
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1108,
+          "name": "train-step-046",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "49b7dac97f90e2b3b1c2d02e7c4ea93967765e5e8d25f0e6fbb8760e1ee5c553",
+              "shape": [
+                8,
+                309
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "baf333e2b487b0819a28224007c622f2dfc5493742fa48a9d97fc7663e05090c",
+              "shape": [
+                8,
+                309
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "76952209ccf765b5a641dce66992a6cdd1e054b4056c18e19155269501427b94",
+              "shape": [
+                8,
+                309
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 797,
+          "name": "train-step-047",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "0e2ffef3eff89948f5e8c501e749eafc132a00783e06c035a534597660ab751d",
+              "shape": [
+                8,
+                275
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "e23382af19430648ee905117afe4dee66338052437e5b38c9dd8f42c89139673",
+              "shape": [
+                8,
+                275
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "895840b378b97ddd6198a5f8e17540ae050a5a94e2a34786f690ca772616c758",
+              "shape": [
+                8,
+                275
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 709,
+          "name": "train-step-048",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "170a4aa4411621484b873c2e4f150041fc9cb69c67ce1e022f2691d6faf14743",
+              "shape": [
+                8,
+                233
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "bb8cb6796926182636609367412fe8d70d819df6a20f846d96246be99dc3f434",
+              "shape": [
+                8,
+                233
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "f37efd61a4256210cfe2d2b6a2c038e07ab169965f933309b8f347d620d3f8c1",
+              "shape": [
+                8,
+                233
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1022,
+          "name": "train-step-049",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7920c3e34d40089985100f4c71bb14a787bf43a5c6317809d1b5413bb63130ea",
+              "shape": [
+                8,
+                293
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "a49a5122f510759550cb489271eba878155b2720c85574af83349c3788b4d7b4",
+              "shape": [
+                8,
+                293
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "27e03e8ce84d9e93ba1cc687a95357f85a907643c24bf2633d12422aaf1f7396",
+              "shape": [
+                8,
+                293
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1125,
+          "name": "train-step-050",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "eb907b647bead750220c9c86935cdd3e04d58d0cb42881cf172cbbd474712223",
+              "shape": [
+                8,
+                442
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "6bb6ceae02478d97439ce41d22d8b6037c72295a2afce177ba07abb578bfdba7",
+              "shape": [
+                8,
+                442
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c5304f2460b8ed7978255343e1c90ec0efb10ded222c228e26e51164e097fc58",
+              "shape": [
+                8,
+                442
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1362,
+          "name": "train-step-051",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1eccb31590142d8060bef15d77f7ce2e3c6c95e7025928452c26ff72933c7582",
+              "shape": [
+                8,
+                410
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "ab9a6f7b366cbc267f2c05b6ddf45cfa8530bc1234c7340eb34be28a89293e57",
+              "shape": [
+                8,
+                410
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "34b91497f19754e75053472fc49884ee9623a749329578620a5758d95ee50424",
+              "shape": [
+                8,
+                410
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1070,
+          "name": "train-step-052",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d77af449b42e305452b9479ad99b5d4c6c35acb1433a5604b07f2685d1d023b4",
+              "shape": [
+                8,
+                303
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "354589df2b725fedb828c2026f599b9487548c25ebf16d1ee7a60192e8ccf3c0",
+              "shape": [
+                8,
+                303
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "54e93619b903d1cb7a4e51d1581988fa531b3a0aea348d6900d94ec569b4624a",
+              "shape": [
+                8,
+                303
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 639,
+          "name": "train-step-053",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4e4406f86c2c8ba5c5b794be4de35e634a787055084d82e2d4ca904d35b26792",
+              "shape": [
+                8,
+                206
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "c4ac95a83c452fa606733544b97dfe6f08eb1fd1c0393d07930ef4d54655e1a7",
+              "shape": [
+                8,
+                206
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "285658d5738225c6aa046251c6254ca3c9f38be5f86d8f9de4532095dfbd2df8",
+              "shape": [
+                8,
+                206
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 976,
+          "name": "train-step-054",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2378786d0210931deaf7c177c0dee4eefa1f0c8c9bed44537ab53d612df9b134",
+              "shape": [
+                8,
+                294
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "1ee24f46a7e2e57470e64cc8a7a2e257bbc9743c4afdeff3aaccd34633cdd989",
+              "shape": [
+                8,
+                294
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "df7be02f0ba928e170d60c0faf32feb5a749d8f6d1d10bb3fcca4bfb945acd00",
+              "shape": [
+                8,
+                294
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 916,
+          "name": "train-step-055",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1c582719c0a8990eafb649fdab8884a27cbcde709b3a50edc190148b6d6fbf93",
+              "shape": [
+                8,
+                244
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "71b2022cdc18e4c55ec8fcc47fdc4ddf0d1e7cd89c22ce13d532b577409ce524",
+              "shape": [
+                8,
+                244
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2dcbd32b99332b7ba0dd87fcebd90e8e2525064781ad8c48c3ea01e527cc202f",
+              "shape": [
+                8,
+                244
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 955,
+          "name": "train-step-056",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a38f5ae3af2ba6659d358e17a067987b5f26af03fde131b7a415b114a5a203ed",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "0033fbc109d13ca3d1b63102d0dde6c3c5026cf7f7da6223411ed261cb1ddb3e",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "36589c05697b8e66f0e7499db26b16de9bf5c03717e358f0b7f84cff5e0997dc",
+              "shape": [
+                8,
+                288
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 662,
+          "name": "train-step-057",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "cb24de386f261f6dd29d29dc2933a2a4a59c97e574c8ac2d8e5f78df9619e6b0",
+              "shape": [
+                8,
+                167
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "1d0065413830c7121d6fbfcab1994f3cf1828758271cad2d65376e4cbc71d1bb",
+              "shape": [
+                8,
+                167
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e49b1ee79c194ffe50c83c0ac7b2574129a52007e59c368253e0208afe8dfa61",
+              "shape": [
+                8,
+                167
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1220,
+          "name": "train-step-058",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "9568bc8a033f4b4b306253a8a74cc205e07e205bd6caddb84caf1a9ed432c9cd",
+              "shape": [
+                8,
+                300
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "65e8f0796c90d9b931c153603eb56711aa90c922188e842e8a683140d468f1e6",
+              "shape": [
+                8,
+                300
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d56052874df40720f413fae4beae11d2c3d36a3e6f9dbdf273a46a62a4e0dd77",
+              "shape": [
+                8,
+                300
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1183,
+          "name": "train-step-059",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6c22e2a263e71959bb65ed2a958335e57872e1ced6f37c590261379bc8476d3e",
+              "shape": [
+                8,
+                362
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "fedbc59f10645d387b7ecfb23438455a0a78aa34d7d3986de9cac974f84c7c3a",
+              "shape": [
+                8,
+                362
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "f202d231f969876da62f554671eee311d46f710192cc85f6c1376963871d3ab3",
+              "shape": [
+                8,
+                362
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 772,
+          "name": "train-step-060",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7be02f279719554076bdf81c0915f6ce45af3c6648fb7ab45059ee368a3f8480",
+              "shape": [
+                8,
+                205
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "377760d5f45a2b44f19536acdbdcce28a42fae2e747e1ad3b74018d4dfe7abcb",
+              "shape": [
+                8,
+                205
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "09f18ad030b6ad43a90b78982f2579c604a7fb06f2ea3892f5ba07e5046e23d5",
+              "shape": [
+                8,
+                205
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1055,
+          "name": "train-step-061",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2a01c629132bedba51fb3ea6cddb6e801acd882b0fb2dd8c3d34239bdbbba58e",
+              "shape": [
+                8,
+                281
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "8bb402585e2dd5414f7085ec5f97680deae34fdf44fcbd366d40dda4195ca6e9",
+              "shape": [
+                8,
+                281
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "32fd89f29c8cbc6ea9bcc1691a068d8bdb0322c69f9f8f4198f5104f268927e7",
+              "shape": [
+                8,
+                281
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 821,
+          "name": "train-step-062",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "491a717fd0ffc69db1d625dbad8c5aa8ca93c03a0e9e17f28e73f17a756e85d5",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "d826b63dd23bd28435f0f3976d8db04cf34eb8d1ac5ee1372119bc9d93bee22f",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d5fdde877d63316ff404f06ce36189ac021ee244d138fa488e29e00bc459f506",
+              "shape": [
+                8,
+                261
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 712,
+          "name": "train-step-063",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3067c19108867caa6e9bbce81a7a8577b22a05598235398afaad2359aeb533c8",
+              "shape": [
+                8,
+                235
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "0848f527d2ed716c0ce49cc76627db14d19cb6d8f8a107bbd760bbc8a05b48af",
+              "shape": [
+                8,
+                235
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3d2503f6c3cc7d01990bbd4bcb0b73d862f5294be91fdd2f5e853292a6d5fd5c",
+              "shape": [
+                8,
+                235
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 791,
+          "name": "train-step-064",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "5370591eb0c69e1e786f8eebfd7801a1b04226a1948e756ab7e4fec953f2aecf",
+              "shape": [
+                8,
+                276
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "2dbb0cc8bcb10f008188ac56a7e8371ebf47a15d2c54bc01790b8f271dc6c388",
+              "shape": [
+                8,
+                276
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "66d7b328c22e038729f387655f3fcf466bdb9473b2d3f5ec92d6d5b3a8cbcb97",
+              "shape": [
+                8,
+                276
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 948,
+          "name": "train-step-065",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c39f07c4bbdb14f39b48147ebc5713038e99e8c1b9b1c8ab02cd0bd200ebe00d",
+              "shape": [
+                8,
+                318
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "c5cb5d302f06540aa20ecdba87a94873a1aaa8d5fd2b8213238cce20601a5475",
+              "shape": [
+                8,
+                318
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b0c50281cf2e91db89847be466c2772465f317887787da49f4488adb27d364c4",
+              "shape": [
+                8,
+                318
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 815,
+          "name": "train-step-066",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7948130006e8fddae2b9e13303230692e0706a1d8617adb720c2be1141540808",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "92f33ec63bb98493d2e9e1e9ba5c6d5e3be0250ff0a502be4aa3a990481b505e",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e3ed682e119662261a925b936d5fb8ff2e2f1d819b4c27c3ac0f85c48a6c58bc",
+              "shape": [
+                8,
+                285
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 742,
+          "name": "train-step-067",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "9719554ed3c05a7d58cbc6bc3f961ac22cb7097ba85301a4047434890aa1596c",
+              "shape": [
+                8,
+                216
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "3faf3d0c4588f43a735cf54821e2619af5d4fa7e100145d8068cb62e00d22543",
+              "shape": [
+                8,
+                216
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "09aeff85d12d501b8b1d47bc53afa6c3857898d42c89ed9c5728271a99f8ca4c",
+              "shape": [
+                8,
+                216
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 982,
+          "name": "train-step-068",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "eb0e9047cf37f358c2d7ef26c6fa6b9a5bcbdc0fef0b3cc320867f61378af596",
+              "shape": [
+                8,
+                295
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4ce7c0298db42b515c5958000a8536212e9bc93a0046d8e911d1ec27ab3dc9ca",
+              "shape": [
+                8,
+                295
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ebc99fd93f0532c5b20a51b2a24908d3b050bee1452fcc41a03f88c95fcf8885",
+              "shape": [
+                8,
+                295
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 865,
+          "name": "train-step-069",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d5767136fba4ce9198a9425862a36a5f438dfd725816ff4943a00c4972fcd787",
+              "shape": [
+                8,
+                263
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "550641e5a97ea1bcd3be579aa827cee4e0896a52b5f4688003b1f2d30714d8a1",
+              "shape": [
+                8,
+                263
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "5ae2e5ed245c2d57c4d702ebf8bd712dfa1129fdad94b0f620139e4697c629eb",
+              "shape": [
+                8,
+                263
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1181,
+          "name": "train-step-070",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "08ef61c2c94ea22166c7ade5dc412c7538175afa1d0656085bb9bfb29f8b0dec",
+              "shape": [
+                8,
+                319
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "6b1a279b26c2a6593baa2e8c35d6959ca980068eac2323959243a5ec15a3d290",
+              "shape": [
+                8,
+                319
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e6e1869e9bc8614c22be4452c98ceb9b4c6bc70135d14f72a738ac8b6973418b",
+              "shape": [
+                8,
+                319
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 863,
+          "name": "train-step-071",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "24242771758a780f70ee40499d65743140a3031842fa1938b729c4d09f9acc58",
+              "shape": [
+                8,
+                303
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4f93da9c01b7a3c0899aab03e2b4a1a93471b1338e954b0d1d75fd58f6d74d5c",
+              "shape": [
+                8,
+                303
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "27f152bd08137ec2d8b033a6c2a315505ea85726b218f737d076cb024d2d17f8",
+              "shape": [
+                8,
+                303
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1220,
+          "name": "train-step-072",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "766092bae7fae13783001ddd6ee9abcf30bda91b3330e15c85e9386935e0fefb",
+              "shape": [
+                8,
+                364
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "5c52aae05de9a8e90954a32ac950eae30aab21b4d6ff392e34d5583762b7c110",
+              "shape": [
+                8,
+                364
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "036cbfdc8d39757f8a9795b3afe4b7b4f99050ff3ab2bd8eec35a1c2f9d08894",
+              "shape": [
+                8,
+                364
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1051,
+          "name": "train-step-073",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a3f7e42b0d9e1766ec2061b9ae21198252a534e6e3af08cb5e3068c6a01a347e",
+              "shape": [
+                8,
+                307
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "d05353ea71bc22dfed4f8fdf8b9522552b020417dea927735c7c0ddc1c48b09c",
+              "shape": [
+                8,
+                307
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a300a726bcb60bc4d0144ae800203119f8cef2acc61ff03583f06018cc9546c7",
+              "shape": [
+                8,
+                307
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 695,
+          "name": "train-step-074",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c9eda85c6b43f5490f43cf2fd36fee52b40d6d2412c87d31cb0c1ea3b4a7ddeb",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "8ddffccfcd24fbf3d7c500796e5894280002a79ecd06ce2a992fdc34a1306999",
+              "shape": [
+                8,
+                252
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "63d59236e4e4800c40b8cf5959fd8f14990977f62b83ff0dfdd32eae437099a3",
+              "shape": [
+                8,
+                252
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1139,
+          "name": "train-step-075",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "00e947d6849560cf40fe6c032710cbbf779b34a6fa2999aac113acfca8054f8d",
+              "shape": [
+                8,
+                331
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "85418f623ca43d3077af0c5169ee9dc80a74968cd12963101089c55867a3867c",
+              "shape": [
+                8,
+                331
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "85c22dac1c79d18b922cbd1723aa2731f4569174eddbfecbc9ea9925f3ebf4ba",
+              "shape": [
+                8,
+                331
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 917,
+          "name": "train-step-076",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "423bbd69cb50e6b60502fea7abf5f046f9cde9921785143c98883d32000f350c",
+              "shape": [
+                8,
+                243
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "613e439bb9226ea74037f08f9bd19fa77d2450cadcd83bbfafe4f90a8ff2b670",
+              "shape": [
+                8,
+                243
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "504edd8004bac030a3f87815f4897f11f9c36ffe691f0908e76968003372f4ef",
+              "shape": [
+                8,
+                243
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 828,
+          "name": "train-step-077",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "fd2616e0c696f125211b01db250060a0e982d2e8ab3729443fea537755da270d",
+              "shape": [
+                8,
+                265
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "2a23b3b486347463b251798055ce55fd88f449d639df0b046e4aa466eaca2af8",
+              "shape": [
+                8,
+                265
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "f6dc97260bd614b3ae0ac879bc6810537499c15e9d87a77c127fd9e3a1614bfc",
+              "shape": [
+                8,
+                265
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1094,
+          "name": "train-step-078",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "552642d2d4230d3eec1b577a3f88c80fecefa7d1e54a32e79b3a8a21a8bb5970",
+              "shape": [
+                8,
+                396
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "fd72aa3de1a3ce0cf3b47e4f51be8a1fbdd176745697462291747215e132f0ca",
+              "shape": [
+                8,
+                396
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "48f243ba1bcbe4e30e1fbea5fb4ae7e462c5e10a97d7734c8a4ad8d39fc2f9f7",
+              "shape": [
+                8,
+                396
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 747,
+          "name": "train-step-079",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "efd41b738bd4590af79bf2ea190477029c9259b009dda7c82c4600adf41386be",
+              "shape": [
+                8,
+                194
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f931bcde6a1237e0ca2153c851f5fe649b72151016726e2a1c5937edf31c409d",
+              "shape": [
+                8,
+                194
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4c6bf54dc5854b636ab50879ce07ff7660bd38c609c568532a59452b07132dff",
+              "shape": [
+                8,
+                194
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 938,
+          "name": "train-step-080",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "fdde3f6088456db368242a04914b0a52318d7dae3c581ac54748d278d706f0a1",
+              "shape": [
+                8,
+                281
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f6ddcd22d8d77d9a58ab33e9a514b6830382b4cadd2d4c6416c5641dde08fd77",
+              "shape": [
+                8,
+                281
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "40798a23e659847ea5540a5287ab473909cec6e8b9ba24f2417177297e9ce4d6",
+              "shape": [
+                8,
+                281
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 985,
+          "name": "train-step-081",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "848523b7a382c02d506343430a89871c84c9676d53d12d3af365c39d5bc341d3",
+              "shape": [
+                8,
+                355
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "a62d7f621da354550b40983c48c51aa24a95f07f1d046cc0e1476f9d64af0f15",
+              "shape": [
+                8,
+                355
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2ec8603b169b813cf090266613670e92f5d28154a61c8ce0fe459f8184d38e97",
+              "shape": [
+                8,
+                355
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 777,
+          "name": "train-step-082",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c2a40111b4d509b25024db5f028b17ac8fd36fa3c19c5ab05db40b3ae7dc1174",
+              "shape": [
+                8,
+                221
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "662045c08c79ec4e5dd63f4d0d956b0923c1052f9bdf1290ce844771bf00516c",
+              "shape": [
+                8,
+                221
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ddab57fe2d7ddd562ee820bde31bea53207f48b1427f21f2ab91c7d6e596fd1f",
+              "shape": [
+                8,
+                221
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 999,
+          "name": "train-step-083",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "20262e825f674fca33cec2e6feb24536f79d10ad398bd8d873cdaf4475d3bf26",
+              "shape": [
+                8,
+                324
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "e2bd40ab814ce51cc7e531c6f16a254a8b1ab001ad1a55b3bf5d82bd22c83b19",
+              "shape": [
+                8,
+                324
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "8f3c7f0008c797bde4a503f806dd641c146727b7c5aa50abe496961f517e7070",
+              "shape": [
+                8,
+                324
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 993,
+          "name": "train-step-084",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b068fb198621ff1bf7823d23fdb24ae7ac9c649b5b1e4108d478a3ec8e8a4106",
+              "shape": [
+                8,
+                418
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "a1136ed20550d3daaf2829dedbbe557b91931297c322b0ad08d5ccc49fbf2326",
+              "shape": [
+                8,
+                418
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b7dd07ea93f40919fbabd627f933afcb50b03eb438e82820fc994ed8f03459cf",
+              "shape": [
+                8,
+                418
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 855,
+          "name": "train-step-085",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "09204921312cb9d4ef666ac9332bae1cad6d87278306efd7bd4ed6413a719c82",
+              "shape": [
+                8,
+                268
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "91e631ff6e2759f2cedb8d1d08427731ece10c742ad1df86b5742e3d646f99ba",
+              "shape": [
+                8,
+                268
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4b3d8ab55cd88ef1b92004504a0b2e1f36af835b6abeec63c3a44e8cf13eaebf",
+              "shape": [
+                8,
+                268
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 971,
+          "name": "train-step-086",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "72323149fb2bb6bba1a895d303f63d1bd774d7738de85341f62e39e46366a65f",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "014a98ca7b1e5be26b93687f7cbbd404cd90062f7195afadfd23c2f101508ec9",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3b6574e41ecbbac64fa38abf5a56803050d5ece98b72bdae0b47c3c8b5aed19d",
+              "shape": [
+                8,
+                288
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 799,
+          "name": "train-step-087",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "b39de78378339fe958f4ccde89deaf165b0ef29b11aca19eb5a6e228058fb917",
+              "shape": [
+                8,
+                248
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "6cf04cdd69dbf6a3ccc149fbd0506c13852f1aaa7ad37a964a1dc69a999bef7d",
+              "shape": [
+                8,
+                248
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ae57f7866ad085df93c201546d8fcbb040c2de706019d3c255d107b1a0d5ebef",
+              "shape": [
+                8,
+                248
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 847,
+          "name": "train-step-088",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c199b558e330a3bc98f54792cf17fcaf37adfa33c10e70253893160107cec086",
+              "shape": [
+                8,
+                374
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "73c85bfaa196b385e7a6d73c008cdbb9ed7c9ec6658567f3b067e2509e5f53d9",
+              "shape": [
+                8,
+                374
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e59622a8df87c7316016b10ec2b14809e6253dff652f55c7ebfa823df6514e49",
+              "shape": [
+                8,
+                374
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 654,
+          "name": "train-step-089",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d8ab5d447bb5a47979191f1a4e1f70025b9662e93ac757b2e4650bd421cdc103",
+              "shape": [
+                8,
+                242
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "83a99fa8eb6a81bfd1a3ee7bb00a0cb25cb990385bf63ca7fe56bf8a3a1735f5",
+              "shape": [
+                8,
+                242
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c88403560069117c0d51bb17291c38796c4c998914ab795a72d049b79f16af3e",
+              "shape": [
+                8,
+                242
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1013,
+          "name": "train-step-090",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7c0b21ce48e1338852c1127c342c0efb305f1514758f1fb815c225981ac62ff1",
+              "shape": [
+                8,
+                242
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "2fb4d9025c92985089ec2307e558e62c9e874f1aaee8f8e37b66e22fceb9f8b9",
+              "shape": [
+                8,
+                242
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "cf421bf894f94f396ab1b6290ec2844349d068072795a00877b6182c560f659c",
+              "shape": [
+                8,
+                242
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 793,
+          "name": "train-step-091",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "52122aab8ce03448292d697817146b1fe5c7def4d6835515538d37c49801eefb",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "efc555047dbf2c743293f49ccb9b1199fd0280de251b62ff57d3321c3bc9feba",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "80fd6a1151b7286cb3581e50bf4db87b26cadd514670fb7efcebb1be65aa6655",
+              "shape": [
+                8,
+                285
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 991,
+          "name": "train-step-092",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "d2f16170b96fa427589ccb082d44118b6d408ef3d8db437f42f3d33f234cd097",
+              "shape": [
+                8,
+                331
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4e872f50f7b67a3ef9a26cd6376ab7e879f2f6817d0a1026436fe72c68dff259",
+              "shape": [
+                8,
+                331
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "1efd8e2c44856eb260cc7856d0e0d8c121af94bc1ffa905f7cf5aa1db8d512c8",
+              "shape": [
+                8,
+                331
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 993,
+          "name": "train-step-093",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "08cc011df6b2daf1d55ad48108d4981060c9125d565160fef8261e309fb6dd4c",
+              "shape": [
+                8,
+                410
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "4bbba909b4d1332969f1c10e83f3dfb9abf0b11a1daa9ab8df4f710dd7bc71c4",
+              "shape": [
+                8,
+                410
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e5c1bd30524dd447e5cc6b78ecc4cf0c464f5501e754cdb300840f9e40758542",
+              "shape": [
+                8,
+                410
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 837,
+          "name": "train-step-094",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "4401096f192414f5e9248c3ba1da9bb00bc2e46c004aff7cfc69183b515c0339",
+              "shape": [
+                8,
+                308
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "67c61a6676da8bf0d6b8909ca56b440f5a1fc08de228c740da36cb2fa69b599d",
+              "shape": [
+                8,
+                308
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "23604e7d39856a222d8b5f6ec84f723d1b9f05dc5208bdeb52c2ff1571dacab3",
+              "shape": [
+                8,
+                308
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 977,
+          "name": "train-step-095",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7bb40b429c13aa433be456eba65dbcb8d8368037f0dca5d459274e0206de60b6",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "f4d2f18993d82d477b98ea7e268c4bf7fb678ad42ef080f65b66b4661321c8f1",
+              "shape": [
+                8,
+                285
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "74facf0b66c4fd30f96fc5a246947bc9b53aa3fb2633c2ee8fd4e843976fb423",
+              "shape": [
+                8,
+                285
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 823,
+          "name": "train-step-096",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "2c58d5646b21c5077471e4deee7483a9c8a54e8cd923722aeb57cb71c67cca84",
+              "shape": [
+                8,
+                244
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "7308ffec0974132f343614633f41bcbac65c64ea7eb2d15f50962e3757ab6da2",
+              "shape": [
+                8,
+                244
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "00baa9f0398181768a63ba6a0d53be2d2fc50c47800a267057d140226d7491b3",
+              "shape": [
+                8,
+                244
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 896,
+          "name": "train-step-097",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "3e04b5a785b0f9d172c69564e8266f2e4b7040e42dc4dcd803c1838c8da5999e",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "6652db816cc9573123e751496f950bdb175a2aba1906d8677ccc36f6effc1ea2",
+              "shape": [
+                8,
+                288
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c5c1c576fb3ed35a6d600dfa9719560fb93535718c264d97b7485d51f803cb35",
+              "shape": [
+                8,
+                288
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1081,
+          "name": "train-step-098",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "6f1dbc414fbd20a241d35cbd96dd43840bde6a5b4aa6e39a6e3c4980f5f2d04b",
+              "shape": [
+                8,
+                396
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "82ff91e8fb2083e8f850e1b6ff50ee1f94e46ef240544dc29aa75fa30a61eb58",
+              "shape": [
+                8,
+                396
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "ae0a03ddec3ea8470b3df5defc0b657d5d21b55b6a18be815d4c2d23fd4eee43",
+              "shape": [
+                8,
+                396
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 1010,
+          "name": "train-step-099",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "9773e843e06607004cf4024d26329d12b7ed54d4d67e0b73093842a11127322d",
+              "shape": [
+                8,
+                245
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "fd2ee9b73a871cfb53b737fcb41c242a2ae624803a234470f906fedb10e29ae5",
+              "shape": [
+                8,
+                245
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "446fe617c0969ad078842e6553613bb381f9312a1789cfbf9235ab228b156232",
+              "shape": [
+                8,
+                245
+              ]
+            }
+          }
+        },
+        {
+          "active_tokens": 949,
+          "name": "train-step-100",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "f1f29594d530492b851f1f1d26b394f7dd11422e4e85f807ed4698dd0a96f41a",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "82e9b700f5c007b5a4c4ce3dbcbd623d0839337198c379811c260de48f49472a",
+              "shape": [
+                8,
+                261
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "7c69695ffabdbb636783929a373b6019f51ca8fe70345b3fd9e1888ec86d3875",
+              "shape": [
+                8,
+                261
+              ]
+            }
+          }
+        }
+      ],
+      "validation_batch": {
+        "active_tokens": 4043,
+        "name": "validation",
+        "tensors": {
+          "input_ids": {
+            "dtype": "torch.int64",
+            "sha256": "4dae96e548181443a9cfdf4e7c8aea5a7ad176c943b6d013774bfbcd85e813a4",
+            "shape": [
+              33,
+              304
+            ]
+          },
+          "labels": {
+            "dtype": "torch.int64",
+            "sha256": "78eb3b85bc83b66d6648135a61916a428c448c218b118d54a41b9430a77e1838",
+            "shape": [
+              33,
+              304
+            ]
+          },
+          "position_ids": {
+            "dtype": "torch.int64",
+            "sha256": "cc20f16aae097e7380c0b7828bc07a63ffd69f395c434288866695fde9d602b2",
+            "shape": [
+              33,
+              304
+            ]
+          }
+        }
+      },
+      "validation_logit_aligned_labels": {
+        "dtype": "torch.int64",
+        "sha256": "a1272e6fd0207b50346651f3c96cd0edfe4db984576ac2ceca3bdf7df7569035",
+        "shape": [
+          33,
+          304
+        ]
+      },
+      "version": 1
+    },
+    "reference_sources": {
+      "harness/batches.py": {
+        "sha256": "e6cec4f241cd67320d7eed44e1416a98072651bda18bbf0b47b72cc8ebb2a638",
+        "size": 6800
+      },
+      "harness/gsm8k.py": {
+        "sha256": "a6d9a188aa54d46db37c4f1e356f513991a9197d693bc31f41a79d5e9b768cac",
+        "size": 11802
+      },
+      "harness/names.py": {
+        "sha256": "f5867110783b0b4ca41217b5ec4c6fbddb8e833c92f4074ceaea5fae5e27e6a7",
+        "size": 8312
+      },
+      "reference/__init__.py": {
+        "sha256": "230f7960387fb7399cab0a345b2e447f0004ade981cd735efa711172960697d4",
+        "size": 686
+      },
+      "reference/__main__.py": {
+        "sha256": "4fd3bcf53238b9f494953b7d9de9c86fb62a669ccdc384b861af3e9e18d28799",
+        "size": 5625
+      },
+      "reference/adamw_trajectory.py": {
+        "sha256": "bc2aa1cb63d5847ff210ef451e76cb568d7066e0e1968b1f1f9f568f64244e39",
+        "size": 11105
+      },
+      "reference/hf_single_gpu.py": {
+        "sha256": "0ec6f3bcaa2490309563d504ee6f55f1b9f3879dd97a62167c8f411cc8c376b1",
+        "size": 21376
+      },
+      "reference/model_features.py": {
+        "sha256": "6a002c4f2091062271ea94685b5caf062312c4a407f14b6725bad295d489b379",
+        "size": 1298
+      },
+      "reference/optimizer_step.py": {
+        "sha256": "9d13781d80961018cd6b0646642b9628d7d3f1add301714b7ba1b6e969359ef9",
+        "size": 6235
+      },
+      "reference/process_determinism.py": {
+        "sha256": "06f030498c261a04c34402bf5a54edfb3af9e0ccd7ebf1d7baabe2c797e3cafb",
+        "size": 4003
+      },
+      "reference/qwen4_reference.py": {
+        "sha256": "dbcb1345e9f80e108a10972d17f985880ee58865f5e0b7fe408d91ea777c3647",
+        "size": 2048
+      },
+      "reference/sft_trajectory.py": {
+        "sha256": "6b2e4c149760597db020e8fe83ecd803b5469167f4e96688f5b748e7f65de28a",
+        "size": 14863
+      }
+    },
+    "schema": 1
+  },
+  "measurements": {
+    "active_tokens": [
+      789,
+      1260,
+      1074,
+      1074,
+      821,
+      1111,
+      757,
+      1163,
+      1142,
+      763,
+      880,
+      1086,
+      969,
+      892,
+      993,
+      1101,
+      858,
+      1033,
+      837,
+      869,
+      1141,
+      860,
+      1295,
+      989,
+      1301,
+      771,
+      1292,
+      949,
+      1114,
+      1299,
+      1028,
+      860,
+      1165,
+      945,
+      1302,
+      825,
+      980,
+      1022,
+      1429,
+      857,
+      1077,
+      1412,
+      839,
+      802,
+      904,
+      1108,
+      797,
+      709,
+      1022,
+      1125,
+      1362,
+      1070,
+      639,
+      976,
+      916,
+      955,
+      662,
+      1220,
+      1183,
+      772,
+      1055,
+      821,
+      712,
+      791,
+      948,
+      815,
+      742,
+      982,
+      865,
+      1181,
+      863,
+      1220,
+      1051,
+      695,
+      1139,
+      917,
+      828,
+      1094,
+      747,
+      938,
+      985,
+      777,
+      999,
+      993,
+      855,
+      971,
+      799,
+      847,
+      654,
+      1013,
+      793,
+      991,
+      993,
+      837,
+      977,
+      823,
+      896,
+      1081,
+      1010,
+      949
+    ],
+    "optimizer_steps": 100,
+    "peak_gib": 122.22314310073853,
+    "scored_answer_tokens": 4043,
+    "train_gradient_norms": [
+      42.749046325683594,
+      7.9168806076049805,
+      4.764816761016846,
+      5.004977226257324,
+      7.111223220825195,
+      4.575885772705078,
+      4.941427230834961,
+      3.230930805206299,
+      3.598721742630005,
+      3.6783344745635986,
+      3.7336843013763428,
+      3.1293609142303467,
+      3.4432992935180664,
+      4.078885555267334,
+      3.8174705505371094,
+      4.266434192657471,
+      3.4367687702178955,
+      3.4444985389709473,
+      3.6134438514709473,
+      4.5815510749816895,
+      3.550931692123413,
+      3.815885305404663,
+      2.6995763778686523,
+      2.993164300918579,
+      2.5630781650543213,
+      3.7795848846435547,
+      3.168940782546997,
+      3.8444714546203613,
+      2.3237953186035156,
+      3.164229393005371,
+      3.3121418952941895,
+      4.0184760093688965,
+      3.0995917320251465,
+      3.5432026386260986,
+      2.08966326713562,
+      3.1033098697662354,
+      3.112657308578491,
+      3.226135730743408,
+      2.5202178955078125,
+      3.689789056777954,
+      3.1576058864593506,
+      2.7517640590667725,
+      3.3937621116638184,
+      3.6973719596862793,
+      3.5045886039733887,
+      2.84696364402771,
+      3.1691277027130127,
+      3.321882963180542,
+      3.419807195663452,
+      3.1446595191955566,
+      2.786902666091919,
+      2.9058055877685547,
+      3.9742836952209473,
+      2.569772481918335,
+      2.89796781539917,
+      2.9273452758789062,
+      3.2817134857177734,
+      2.688157081604004,
+      2.701463222503662,
+      3.4308574199676514,
+      3.3371944427490234,
+      3.1262128353118896,
+      3.1065287590026855,
+      3.3863253593444824,
+      3.0431272983551025,
+      2.9334585666656494,
+      2.722719192504883,
+      2.690843343734741,
+      2.867093086242676,
+      2.661428689956665,
+      2.5707523822784424,
+      2.5455102920532227,
+      2.369704484939575,
+      3.455049753189087,
+      2.4525580406188965,
+      2.5193021297454834,
+      3.0463905334472656,
+      2.6176915168762207,
+      3.6329505443573,
+      3.096081018447876,
+      2.4090402126312256,
+      2.7779388427734375,
+      2.5218026638031006,
+      2.058624744415283,
+      2.4499621391296387,
+      2.0874719619750977,
+      2.348139524459839,
+      2.74116849899292,
+      3.1421289443969727,
+      2.274986505508423,
+      2.4124104976654053,
+      2.5774800777435303,
+      2.273375988006592,
+      2.604684591293335,
+      2.66268253326416,
+      2.429163932800293,
+      2.3316075801849365,
+      2.4657065868377686,
+      2.4704983234405518,
+      2.4147939682006836
+    ],
+    "train_losses": [
+      1.0547690391540527,
+      0.5691031962633133,
+      0.4176345467567444,
+      0.4323527477681637,
+      0.4038420617580414,
+      0.32062968611717224,
+      0.30159223079681396,
+      0.3033435046672821,
+      0.34833717346191406,
+      0.316570520401001,
+      0.375340074300766,
+      0.4073971826583147,
+      0.40054425597190857,
+      0.5071338731795549,
+      0.44508885964751244,
+      0.49407871812582016,
+      0.3765888512134552,
+      0.3619520999491215,
+      0.3593478202819824,
+      0.49657949805259705,
+      0.37916817516088486,
+      0.39195995032787323,
+      0.2912442460656166,
+      0.33214398473501205,
+      0.39098457992076874,
+      0.32869818806648254,
+      0.4457165151834488,
+      0.580915629863739,
+      0.25512642227113247,
+      0.38626886904239655,
+      0.4568850249052048,
+      0.44521340931532905,
+      0.5119177848100662,
+      0.5020868182182312,
+      0.27694765478372574,
+      0.3402777314186096,
+      0.4776665223762393,
+      0.4298017546534538,
+      0.35755816102027893,
+      0.4881913661956787,
+      0.4383321702480316,
+      0.49004141986370087,
+      0.4338339865207672,
+      0.5133103132247925,
+      0.5096033215522766,
+      0.46041619777679443,
+      0.4265471398830414,
+      0.43438076972961426,
+      0.4972474128007889,
+      0.5189055502414703,
+      0.4636358618736267,
+      0.45134449377655983,
+      0.3145269453525543,
+      0.31915950775146484,
+      0.4137679636478424,
+      0.3776075579226017,
+      0.3132072985172272,
+      0.41954436898231506,
+      0.4881895035505295,
+      0.2814265489578247,
+      0.4561090189963579,
+      0.4352858364582062,
+      0.4442635774612427,
+      0.515327325090766,
+      0.5159086361527443,
+      0.3639581948518753,
+      0.3895457684993744,
+      0.3539041057229042,
+      0.36070093512535095,
+      0.4429628551006317,
+      0.3134811148047447,
+      0.3933671619743109,
+      0.3274909481406212,
+      0.433793306350708,
+      0.46544748544692993,
+      0.35833173990249634,
+      0.4442883147421526,
+      0.453941248357296,
+      0.40296250581741333,
+      0.461874283850193,
+      0.36778674274683,
+      0.4693572521209717,
+      0.3649109825491905,
+      0.32777321338653564,
+      0.37529638409614563,
+      0.34784527122974396,
+      0.2844832241535187,
+      0.4283708520233631,
+      0.5428623557090759,
+      0.30811023712158203,
+      0.3280756324529648,
+      0.4268401861190796,
+      0.3860713243484497,
+      0.47046368941664696,
+      0.4955050088465214,
+      0.3508848249912262,
+      0.3757748194038868,
+      0.3931867182254791,
+      0.4193481206893921,
+      0.3905046652216697
+    ],
+    "trainable_parameters": 399,
+    "validation_cross_entropy": 0.42082888929637696
+  },
+  "payload_sha256": "05eac53a0fd1fc449df4f75ddebb70bf6bb0e79088c80965086eb091af07ff54",
+  "schema": 1
+}

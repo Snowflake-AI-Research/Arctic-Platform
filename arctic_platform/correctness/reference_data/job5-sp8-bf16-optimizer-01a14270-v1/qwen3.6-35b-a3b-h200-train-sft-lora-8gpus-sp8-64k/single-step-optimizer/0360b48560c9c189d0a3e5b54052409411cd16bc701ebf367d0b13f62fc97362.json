@@ -1,0 +1,1448 @@
+{
+  "identity": {
+    "check_id": "single-step-optimizer",
+    "config_checksum": "4185aecb6200596080ec4b9774f08531b9e36d8409e6969d6201e4f5cc603cbe",
+    "config_id": "qwen3.6-35b-a3b-h200-train-sft-lora-8gpus-sp8-64k",
+    "criterion": "optimizer-state-l2-norm-v1",
+    "dependencies": {
+      "flash-attn": null,
+      "liger-kernel": "0.8.4",
+      "peft": "0.21.2",
+      "safetensors": "0.8.0",
+      "torch": "2.13.0+cu130",
+      "transformers": "5.17.0"
+    },
+    "gpu_family": "h200",
+    "norm_reduction_source": {
+      "sha256": "69f1787fca2bafee742f5240776c9f373f0de57eb6e1b57223af91fa7f69d2d1",
+      "size": 17910
+    },
+    "norm_schema_source": {
+      "sha256": "a9d97c50e11e60267ae84cede6074e95b370ca9555dc3db9a16bf313767df72d",
+      "size": 3040
+    },
+    "parameter_name_map": {},
+    "python": "3.12.15",
+    "recipe": {
+      "attention": "flash_attention_3",
+      "ce_chunk": 2048,
+      "complete_ap_source_pins": {
+        ".codex-run-state/job-scripts/check_job5_reduced_sp8_bf16_peft_01a14270_v1.py": "2879cc26f74341acacedf920c68ddb173caa147a78ba8ff8e67c9a7f0ab537e7",
+        ".codex-run-state/job-scripts/job5-sp8-bf16-initialization-policy-01a14270-v1.py": "5e3c042da5023b44576cbcea061f57d7bfa5a5a09fbc356854d6ed8f317671f6",
+        "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "README.md": "e083fa3226e78deabd10f96c772ef51f0b9955581c9805304d6ae6c385412a3e",
+        "arctic_platform/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/_dependency_groups.py": "d65368711f9612857bec0b62541465063cab7aba5350e783dfe15d5bda9b27f7",
+        "arctic_platform/client/UNIFICATION_NOTES.md": "f05b74359438ff02cf483172ca1d0560a672ff165cd1e391821bfd1f6ea1c2a7",
+        "arctic_platform/client/__init__.py": "257029be57ffc868a768f81cc9c7612950d3df6dad38f2a2f043802b9890e380",
+        "arctic_platform/client/base.py": "c35b1a7cfe6cb914c796cc481d2e1ce1fd5122a2610ff7a2841281da6739e355",
+        "arctic_platform/client/config.py": "b209fd921a9e4183a2be66c666dca48a5707850aeb794cb9cc83a05d40747ced",
+        "arctic_platform/client/requests.py": "a657415d2dfbc55b9c39bd71f8ea76affece102744e7684926c1e2f2818b4e19",
+        "arctic_platform/client/rl.py": "e73c841405f10680e67417bf03d92dee66dffea066fe141d6b057e35a247fecc",
+        "arctic_platform/client/sft.py": "5d101573ace39e21495c1d43649b7151a50c5c6180516a9c470afd00cd2e7ebe",
+        "arctic_platform/client/transport.py": "b6e8c49cacfd582a1b484a538c1a346863d08c3a95cd6da9b72efdd62eac5703",
+        "arctic_platform/client/transports/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/client/transports/cortex.py": "7e9e89598d09155cb781a3908a8dae72b6746c152e6713462ea507e9cdf87888",
+        "arctic_platform/client/transports/onprem.py": "227cf7cffbbc905f8c279fd6e6f3ff9c0fa85b670850cf252e2ac6baf636952c",
+        "arctic_platform/common/__init__.py": "c2c922f69c91e947c049a427b223d096c6f6a8a0c7ca0d3f00e8e2946af0ce51",
+        "arctic_platform/common/callbacks.py": "cdb960fe1d28ea2f385cd79b909a5fbfd564cc8c4628198878bce256601f2d84",
+        "arctic_platform/common/config.py": "e9e40902b4cbf8c8f07e4890011ddbbfdc19216051a44cf9ea04f6fdc196cbdb",
+        "arctic_platform/common/deepspeed_worker.py": "c251e24d51f5234cbeb11e3332f1b170351a05a4f7997669daaaee88cda54c16",
+        "arctic_platform/common/peft.py": "3fcc9ae0fd79dcaaa7208d5678224bed3c3586eb58d2f9882329dec336073b55",
+        "arctic_platform/common/ray_cluster.py": "c2019dda46c9c74d65431db6500b305fa5cca25fdb0b46722c91ae112b458770",
+        "arctic_platform/common/ray_server.py": "dce18f810c4dd19f943aa13ff8f88445b092994232b79cffa0a4797ebebfd053",
+        "arctic_platform/common/registry.py": "220edee876c0787bbd34f1caaa6b00f4edbdcfdbb718c263f3bdf56949269965",
+        "arctic_platform/common/server.py": "dc9a525a917332b54b0bfa9946baa03d77bbb95b22dc408c7634c98d0bf69c39",
+        "arctic_platform/common/utils/__init__.py": "7caf4ecf5fb7cbd4a768376138ab1d40b6d3ce3488c3d7a7b011abdecf89ec9c",
+        "arctic_platform/common/utils/batch.py": "55e9748f9dba886e555f2731a07c270caadb67beeafcadc5c6f37a619b2300de",
+        "arctic_platform/common/utils/bf16_zero_norm.py": "512aa615382fd50025060a53edfe7c774b98e836f1c95aaa18bb1b83bc4650dd",
+        "arctic_platform/common/utils/checkpoint.py": "3d0023f1ecedfd5bf7e7e5b6069ea9082195390164405bc5b51b93a9b2f3bf24",
+        "arctic_platform/common/utils/cuda_ipc.py": "bdfe469df06226824106cecb9ff956ca747bd304a5fcf625a8b2e9eeaf3207ae",
+        "arctic_platform/common/utils/debug.py": "464a080438ea97ea0361a1d79fb8fc3a39a5f711fc9688953753e497b0be9190",
+        "arctic_platform/common/utils/ray_pg.py": "a6bd24e7f41cafafd8b491dc00646ac8f6166297991d4b813f649aad513b0812",
+        "arctic_platform/common/utils/record_replay.py": "d4651cd1868060129f09ea437ac8e587288ba38416d1bb4c6afbde2e073a8c43",
+        "arctic_platform/common/utils/server_models.py": "1360e58f590b91128a94731278d79d00043ac5700568ac1b0b1464240845f644",
+        "arctic_platform/common/utils/tiled_logits.py": "de1513bfc19ab90dd7c1402771f2cf8e8c277e8fe3440bc6522fa3913de9bb0f",
+        "arctic_platform/common/utils/weight_sync.py": "4294dfd946fda1b51b134f05b26a7d526254c9122995997dae0463afa365301d",
+        "arctic_platform/correctness/AGENTS.md": "505399e391b5292c47255d8df3890158ed69f1f2a1a6d3e47cb6090b27b6f34b",
+        "arctic_platform/correctness/__init__.py": "a89ea0d0ebc195df6214c2c5cd690b2edcf76607ac67cc27e372b8442d4ee99b",
+        "arctic_platform/correctness/__main__.py": "988e5d220a3a01ce9b58218157bd7b157301d99f9e2c3625d038fbdece4f67bc",
+        "arctic_platform/correctness/checks/__init__.py": "89c1e1e5dc72e53732c9a38b0078861ee2610dc79f3cac7f0ec6c1b1d8e79bfc",
+        "arctic_platform/correctness/checks/checkpoint_resume.py": "560052353b98ca4a994c8d6bfd20339e993fdbc3220201732c2764d629277390",
+        "arctic_platform/correctness/checks/e2e_sft_train_validate.py": "9642c231814ff14991da3d06724392a78d7aae8275ce01b8cccd8d3d0fe5c797",
+        "arctic_platform/correctness/checks/fwd_bwd.py": "ef3bec031481f36103e3daecd12b8f8209de8d2e9309b5beeda229aef60b3749",
+        "arctic_platform/correctness/checks/fwd_bwd_step.py": "5bb813daddef76c90c28d679b4bc03900c3c0bcd419330c1ac5b8b7a5c549285",
+        "arctic_platform/correctness/checks/inference_checkpoint_loss.py": "60ba5c2e0120b614389084ca40170f4f6224fed0f0dd8c2aa89624afed8fc72f",
+        "arctic_platform/correctness/checks/optimizer_state.py": "69f1787fca2bafee742f5240776c9f373f0de57eb6e1b57223af91fa7f69d2d1",
+        "arctic_platform/correctness/checks/rl_router_replay.py": "4cf2d0ffddb907c2587ddf4d2656629f2f5b0e4cb60ebbfea49805ab8088f33e",
+        "arctic_platform/correctness/checks/rl_weight_sync.py": "86017c266f74321748d4e9bb2c2f94dc5d03ef37aacecf3e7d381fc6d8cf2380",
+        "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config": "35d4c02490fc237ea889c536f743a1f82e71b302b2c6e33f46988b9901bf369d",
+        "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-lora-4gpus-64k.config": "f271abbab197912a072e2dfa29d7977a43c9fa12f77258e7b85615ab958c989e",
+        "arctic_platform/correctness/configs/qwen3.6-35b-a3b/h200/train-rl-16gpus-64k.config": "40ea5f390ae25f994a0e0b6545159a0e8d3c6c17ff5ce664a0e29228b8b31359",
+        "arctic_platform/correctness/configs/qwen3.6-35b-a3b/h200/train-sft-8gpus-64k.config": "7f621872f17570a5fc64f71cba893e73ce76ea44c2b74849b585188f8c78b01b",
+        "arctic_platform/correctness/configs/qwen3.6-35b-a3b/h200/train-sft-full-8gpus-sp8-64k.config": "d6d16e81ec42bdf3245a9f84787e893e1743248334bbb8d6411a2a6ba1bfedaa",
+        "arctic_platform/correctness/configs/qwen3.6-35b-a3b/h200/train-sft-lora-8gpus-sp8-64k.config": "1662addea44a453b1505233c8b96fe60e793a99a3146c26b5e9f300117472719",
+        "arctic_platform/correctness/configs/qwen3.8-27b/b200/train-sft-8gpus-2k.config": "d7ac66455a81f679bc9666160cec9b3d165b7a9f6351acdd0de6a1a56ece1684",
+        "arctic_platform/correctness/configs/qwen3.8-27b/h200/train-sft-16gpus-64k.config": "ee775804fd64b2d300e69e3ba083e7010a977565df0ed0e2b6f0f5e49e7caf06",
+        "arctic_platform/correctness/configs/qwen3.8-27b/h200/train-sft-8gpus-2k.config": "afb4fb9eced7f4eb1e9ff9919d964553607770ba5b8cc9a18149cf8e60593520",
+        "arctic_platform/correctness/configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config": "ffe2be775c6e41163739f7dad630a8487e8a23b1cd620c7e113a3feb1e107d93",
+        "arctic_platform/correctness/diagnostics/attention_ablation.py": "8f18d09df593f7f5b04cae137295cc34a624eea8b463744d0b029f45bf44525e",
+        "arctic_platform/correctness/diagnostics/b200_gradient_boundary.py": "4f862b731d805285c415eedd1fb752daf827c3654674789960e1bb3f9ca3f870",
+        "arctic_platform/correctness/diagnostics/b200_gradient_control.py": "168285e7a7d9f2597e458287419f2bb363b652c0c4ade81d791a9344b6209299",
+        "arctic_platform/correctness/diagnostics/b200_post_metric_capture.py": "0896745966f59abcbefb84e176b94df0b3eaa81fa671e76821304b8fefb36df3",
+        "arctic_platform/correctness/diagnostics/b200_reduction_boundary.py": "da31a787783aead96ab2f05b626952887bcee170328f24fac57b85c365015396",
+        "arctic_platform/correctness/diagnostics/b200_reference_capture.py": "bd60673ae5faf3765401644f2f09cb708140f67675b7bf811556c7c686666186",
+        "arctic_platform/correctness/diagnostics/bias_source.py": "aa52b0276b8fd6e6db16dc805e6ff88509bce144e9ae6a59495546de8e1a56a1",
+        "arctic_platform/correctness/diagnostics/bias_vs_sp.py": "59bf3ae7ff2c38b2e300c4828a27ad4c554d56de3aef915913c9bd3ebe6cab35",
+        "arctic_platform/correctness/diagnostics/checkpoint_resume_state.py": "96b80753e504a212c631ed2256df820e079d36d4734c96d660f9ec4d763576bd",
+        "arctic_platform/correctness/diagnostics/clip_norm_nan.py": "4eb9e6559f1e74017d3d6d35ad9cc8e6e5f470d8c8baa771c630f58956b02651",
+        "arctic_platform/correctness/diagnostics/conv1d_kernels.py": "924649b30408ca33ac5e27488a5d57c2a842a7f0da79493796dcde030ba6b2d3",
+        "arctic_platform/correctness/diagnostics/deepep_trace.py": "ae2904276b9f567ebe4d1d28a88169647744b85e8a622b8bd4efa2eb9f67048b",
+        "arctic_platform/correctness/diagnostics/deepspeed_vs_plain.py": "01914435232feac38936014c352dbf96804374289552ccb0e1f7dd1fd0b6bd95",
+        "arctic_platform/correctness/diagnostics/delta_rule_cu_seqlens.py": "a5ea60303a5589554a032c23d704065412890f289b16c13aebd52e3bd371deb3",
+        "arctic_platform/correctness/diagnostics/depth_threshold.py": "e7fc7bc38fb2872d0840ca7f6f6b4a171120ec06b081f61e460b7ef0cdf2f3e5",
+        "arctic_platform/correctness/diagnostics/dp_gradient_sources.py": "9fa04955454148ee6ea2479985fbd12cb60362bf3745ae05afea7637ae422c92",
+        "arctic_platform/correctness/diagnostics/engine_knobs.py": "064f7c494e262a0ca555b0b58698187d57e45887dd90016cd4b45016cbe65841",
+        "arctic_platform/correctness/diagnostics/execution_controls.py": "af17165587c05d9b7c8ccd95a4014ae6d11c5be989823ca3d27248097870ba25",
+        "arctic_platform/correctness/diagnostics/floor_decomposition.py": "3ae78bd5684b4f2ec4333cbc08536cac1f2fcbdb11811a33a072ae9cc1f94310",
+        "arctic_platform/correctness/diagnostics/floor_variance.py": "8b87c750d0f9711be4e792f0124c8be98c5e9e870edaf14647c64c9c3d9357f7",
+        "arctic_platform/correctness/diagnostics/floor_vs_depth.py": "94e0ca3dc60baade7fd96c73e3b41aa3cc37e3b92ad0b6cb12070e0c5273850e",
+        "arctic_platform/correctness/diagnostics/floor_vs_row_tokens.py": "3444325a81eef15e10e08884bcc2725eb7d2f3e92eac579a3e90b01e130cc481",
+        "arctic_platform/correctness/diagnostics/gdn_invocation_full_model.py": "1ff335d4746c87e086be97505002faab76c5fadf6063ad01ed7daf533205fd2f",
+        "arctic_platform/correctness/diagnostics/gdn_varlen_vs_stock.py": "04bfaa04fd333967be4de443891270bf74755db762655ab656f5ec34aca9c8f3",
+        "arctic_platform/correctness/diagnostics/ladder.py": "233a022cf38e2b8eaa24676b44c4dcf9bd60afabe2754b74bbcc669596d5a680",
+        "arctic_platform/correctness/diagnostics/lm_head_chunking.py": "cd106957504c16b3f377c8d2b6ff7441eb2f4d86531dcce2005c3863423f7a4b",
+        "arctic_platform/correctness/diagnostics/nan_isolate.py": "e4085349c73b68573654ecc5f7cd5cdde7178c19ad5f3243ff6ec56eb03c23c7",
+        "arctic_platform/correctness/diagnostics/pretrained_vs_random.py": "efadab5037945055bf2dc8d54149dcde876d52b5147f7bd58d13dbde0be2306e",
+        "arctic_platform/correctness/diagnostics/qwen36_dp_width.py": "53c5166e24c2ddf800563650d5b6c6d606c0ccd6e8eda6816ae40ccb7dac8063",
+        "arctic_platform/correctness/diagnostics/qwen36_expert_grad_scaling.py": "b42ca920e52ec9f21c0525221f2c02fcf8e513176f9aef344c30685e22c6988f",
+        "arctic_platform/correctness/diagnostics/qwen36_expert_grad_telemetry.py": "23a07a12f0cc2e20016202e3481de84fc7d77cca2147c2092a2b9f58aad9a462",
+        "arctic_platform/correctness/diagnostics/qwen36_grouping_control.py": "66a2ca5da8ad0a9c6a076242dea6a775b8f59e0c33c18c295e7dbc3b5d10bbf8",
+        "arctic_platform/correctness/diagnostics/reduce_dtype_norm.py": "c1ca2ca8eb1a3ea1a890c8f4abdeae1f32a52d7cb565696e7332f225f3156149",
+        "arctic_platform/correctness/diagnostics/reference_mixer_packing.py": "90854874b8c332fbf968fef4843fda9ef2ed7764d73e9d19dc38b760ce4f0d75",
+        "arctic_platform/correctness/diagnostics/second_step_nan.py": "09a81bb5a2e78c249bc70d9a40d8eab9b8b02853215a886c8c77dd1d05fe2eaa",
+        "arctic_platform/correctness/diagnostics/seqlen_ab.py": "8dd791b3d32cf17fa447197faeafd3cf647799ae2c1b9dbc802ffd572ea16ae0",
+        "arctic_platform/correctness/diagnostics/step_corrupts_weights.py": "3abf8daa2ec1236ccfa09b94445e6a96e33b43fa1ed386398b324c5762bd6833",
+        "arctic_platform/correctness/docs/hf-reference-onboarding.md": "9f2696fa05220a36d42dc83b98583ea28f095cdf28fb670fc738d4f42cf6bd78",
+        "arctic_platform/correctness/harness/__init__.py": "e0529a5628bfb65bc1a12ac9d3547443ea26a88c17ae093c5d3b8135944a6650",
+        "arctic_platform/correctness/harness/arms.py": "f60530c8af9ea06a6853ac9918acf62ce2138f89bc6e1eb979f5f30db4622056",
+        "arctic_platform/correctness/harness/batches.py": "e6cec4f241cd67320d7eed44e1416a98072651bda18bbf0b47b72cc8ebb2a638",
+        "arctic_platform/correctness/harness/config.py": "8827b3b33344fd91913da47798732340a1efb1bd812711effc085634e558d48f",
+        "arctic_platform/correctness/harness/console.py": "13840ca5a7e3dc572029b4dc19d11d06aa1518c8b39f233efefab6acfe7d4413",
+        "arctic_platform/correctness/harness/cortex.py": "ccc768fa73999044c64081fac464155bddeae4263e72e300b6d3735f8c2066d8",
+        "arctic_platform/correctness/harness/cortex_checkpoint_export.py": "f0ead2a2aa5e9084236328ff868756b490272757b0d516b28ce7423e1daa273b",
+        "arctic_platform/correctness/harness/cortex_fixture.py": "aa4caf430f7d295e1793d2685da8444d3fb139cdbe3bb87d063b95bb34575ad9",
+        "arctic_platform/correctness/harness/cortex_optimizer_capture.py": "a3762a63b5a9e09b8d103ff685933cf36f8ba81f961f1364108382ace41b855a",
+        "arctic_platform/correctness/harness/cortex_optimizer_decode.py": "c48c3ee3838cc66f9d0c36de5df8d6e6d7ef15cc7f0d9aa0556a6ab86e2a551d",
+        "arctic_platform/correctness/harness/cortex_transport.py": "d37971cd432ac8489981e3d0514f75626a8a15260c06082bf56149711f96eacc",
+        "arctic_platform/correctness/harness/deterministic_lora.py": "f63ff4551e735f944bb2936038f5e59935c5fafe30155b1e1098d95a4cb2b907",
+        "arctic_platform/correctness/harness/dss_driver.py": "ee360e51d81455835e7cf2a058e84a2912819cb45583c260b80165e5f808c4a6",
+        "arctic_platform/correctness/harness/environment.py": "926431db57eb56214f4ad645c22968abbf5553094f15c869e0aac696067a2fca",
+        "arctic_platform/correctness/harness/gsm8k.py": "a6d9a188aa54d46db37c4f1e356f513991a9197d693bc31f41a79d5e9b768cac",
+        "arctic_platform/correctness/harness/hosted.py": "9d095de864fc8f067f25e91d66341f670091fd73d455f7c1e1755d6b7286ada7",
+        "arctic_platform/correctness/harness/hostfile.py": "84b1cc12c60ec11f47d7029b7f4ea773bc94167de952f84cc0bc616b833cb6a6",
+        "arctic_platform/correctness/harness/inference_export.py": "dc8e23dac08774868ca202b360c18c92c0c72b1eebbaf4363094845fe511b77f",
+        "arctic_platform/correctness/harness/lora_init.py": "8d6ee9f2da1425cb0814549e5bcf583f3e32272b81c2679aa6a917794bcab3b0",
+        "arctic_platform/correctness/harness/lora_save0.py": "8511499db35b8c2610473d2c4cdae8714ef197030cc796ab149072a48c24a6ff",
+        "arctic_platform/correctness/harness/model_state_capture.py": "ec4b3e1c8551bb42c1411eb2dfd3c8c603bfee5bab5d11f6e8648e6680a890a5",
+        "arctic_platform/correctness/harness/names.py": "f5867110783b0b4ca41217b5ec4c6fbddb8e833c92f4074ceaea5fae5e27e6a7",
+        "arctic_platform/correctness/harness/optimizer_capture.py": "3bbac69e089a250fa8d999e5cba89980c084e2e1af2dad6cd2f99a150d707724",
+        "arctic_platform/correctness/harness/optimizer_norm_schema.py": "a9d97c50e11e60267ae84cede6074e95b370ca9555dc3db9a16bf313767df72d",
+        "arctic_platform/correctness/harness/preflight.py": "5e4cf96245518dc2b7ea74cf311c22559f7776453dea799c904572718edf32ee",
+        "arctic_platform/correctness/harness/reference_records.py": "05cf26487af198fb15510a86fdbfef5adb0320f9596368215b98c08afb1259c1",
+        "arctic_platform/correctness/harness/registry.py": "c1eb7b210646aae08b10fc687e2523fe7e184184028cd6085b3993ba7c440b4c",
+        "arctic_platform/correctness/harness/report.py": "ebc970d6c7cbdab279c7fb240644ee89e39161e3f706b7e91ffb9e525f37bbf0",
+        "arctic_platform/correctness/harness/rl_driver.py": "c88f7c3ee3394f5660aff9bf221456f27d4bf3eed7f93634aa537a4bf3ce5d98",
+        "arctic_platform/correctness/harness/router_replay_trace.py": "38a4d4605e90977fb42092ea4530bcae3863b77994e0caa1baaefb445bf252ae",
+        "arctic_platform/correctness/harness/runner.py": "992d946a412c9045b3ad82028adb57a740e891361c6da62404d930ef0266d122",
+        "arctic_platform/correctness/harness/seeds.py": "906be877e76785c531988870077f0f50f9828df742be2f92aaa885e825641482",
+        "arctic_platform/correctness/harness/spec.py": "ca104bb6084f020382c2549c3da27232142f0e691a58df41a047d2dcef760896",
+        "arctic_platform/correctness/harness/transport.py": "1860e6086fdcc5e88338b87765ffc1c98e44116aed25e1962c33e0e3e95b815c",
+        "arctic_platform/correctness/harness/workdir.py": "b285e9c1c2098c6bfdc60e1cc31fb13d0a541c0d7b93ee920978b2bb3cf263f4",
+        "arctic_platform/correctness/onboarding/__init__.py": "3a07533ae1909208e3b9f6a7906f490ad5a375d64c8b4be48b76c4f759b72c3a",
+        "arctic_platform/correctness/onboarding/calibration.py": "566c6ee23c92c3d3952e6c491171a723e8904d4ee8b96deda7af8e7b892b8874",
+        "arctic_platform/correctness/onboarding/cortex_fixture_upload.py": "94b4aab25cba56305a838c7d5c2f2143493998664ca88e88482862b4a0544e7f",
+        "arctic_platform/correctness/onboarding/onboard.py": "3ffebffafea9b37d4ae75a413268f0c79ec88dd5d38663cf2d5cfb081bea6a22",
+        "arctic_platform/correctness/onboarding/synth_model.py": "b4e8af739dddd1741b2cd92f57a92fabe2edd8b1a1f79da08ac6cea35fe23fbd",
+        "arctic_platform/correctness/reference/__init__.py": "230f7960387fb7399cab0a345b2e447f0004ade981cd735efa711172960697d4",
+        "arctic_platform/correctness/reference/__main__.py": "4fd3bcf53238b9f494953b7d9de9c86fb62a669ccdc384b861af3e9e18d28799",
+        "arctic_platform/correctness/reference/adamw_trajectory.py": "bc2aa1cb63d5847ff210ef451e76cb568d7066e0e1968b1f1f9f568f64244e39",
+        "arctic_platform/correctness/reference/hf_single_gpu.py": "a3f1a1c1b31e7734e13f1d7bf230539b1c82b93aa28ae96287bfaac9cd784f58",
+        "arctic_platform/correctness/reference/model_features.py": "6a002c4f2091062271ea94685b5caf062312c4a407f14b6725bad295d489b379",
+        "arctic_platform/correctness/reference/optimizer_step.py": "9d13781d80961018cd6b0646642b9628d7d3f1add301714b7ba1b6e969359ef9",
+        "arctic_platform/correctness/reference/process_determinism.py": "06f030498c261a04c34402bf5a54edfb3af9e0ccd7ebf1d7baabe2c797e3cafb",
+        "arctic_platform/correctness/reference/qwen4_reference.py": "dbcb1345e9f80e108a10972d17f985880ee58865f5e0b7fe408d91ea777c3647",
+        "arctic_platform/correctness/reference/sft_trajectory.py": "6b2e4c149760597db020e8fe83ecd803b5469167f4e96688f5b748e7f65de28a",
+        "arctic_platform/correctness/reference_data/job5-coverage-evidence-01a14270-20261016T1752-model-v1/model-metadata.json": "20306531895150433059b75c65bab1311891a6e2eef0a32b584f4e3d22f573c5",
+        "arctic_platform/correctness/specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json": "555607fddfb6f3b206b142cd5247e21972e0e24efc7258cb2fe95c7488785979",
+        "arctic_platform/correctness/specs/qwen3-8b-h200-train-sft-lora-4gpus-64k.json": "cd54e9c03b9401a191a02dfa1176ebdd4b115d62b89ec2b2ec4842a06d3b7cc8",
+        "arctic_platform/correctness/specs/qwen3.6-35b-a3b-h200-train-rl-16gpus-64k.json": "a3b504221ef8c1dfa086013988c7b561e40877a8b60878fb7bf4825f56cd5f66",
+        "arctic_platform/correctness/specs/qwen3.6-35b-a3b-h200-train-sft-8gpus-64k.json": "21f2d1021fb1babb89216f7f94cedd1b6d0a5aa7d9200f0fcc10b458554932fa",
+        "arctic_platform/correctness/specs/qwen3.6-35b-a3b-h200-train-sft-full-8gpus-sp8-64k.json": "95fcdabf82abf450eb21c6e8b7035b1792a3b1d3ab1a913fa8875738329e0deb",
+        "arctic_platform/correctness/specs/qwen3.6-35b-a3b-h200-train-sft-lora-8gpus-sp8-64k.json": "a60bb4ca3a6fe87db51312ddf2770fce67968427857ab220a7c21fabf0e3e309",
+        "arctic_platform/correctness/specs/qwen3.8-27b-b200-train-sft-8gpus-2k.json": "87264d218d8abc4559ebaf8a00a8ab2c7f44041011bf16331aac6f11cf6a6a65",
+        "arctic_platform/correctness/specs/qwen3.8-27b-h200-train-sft-8gpus-2k.json": "a59799b04b2f39a6b40794d0e2a73402a044a7d8fd16d6f27ff92e690b2bc71d",
+        "arctic_platform/correctness/specs/qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k.json": "a596ed5e850107ebb52fc022a290dbf54bfec9d7f314294c6c8392567ad3bde7",
+        "arctic_platform/inference/INTERNAL_COMMIT.txt": "af1935479ddad1c4c73dbb903e9f8ac51e08c2e04bd478ab9d8d16a2c86ab70f",
+        "arctic_platform/inference/README.md": "e584732be453f3a8c641f3babd2acade6bef007b48d685d2e061096274f3f658",
+        "arctic_platform/inference/__init__.py": "061df7164491227e3d9816ec4a90fa2bc25c65ecb6471f249f1831f4240125c3",
+        "arctic_platform/inference/benchmark/embedding/README.md": "8ab6e6346896d3f028c0523f74da3faff2b338104cfd9484cc091b827c4e9aef",
+        "arctic_platform/inference/benchmark/embedding/benchmark.py": "caa0fd311fb39346c1d39a71dd295863a18f3204cbdee6829750791e0539f94f",
+        "arctic_platform/inference/benchmark/embedding/benchmark_http.py": "7c4cba008a4ec8c6f249e65c10556f224636ae4a0518224249a7a1f3897f8112",
+        "arctic_platform/inference/benchmark/embedding/run_benchmark.sh": "a18b655b6de399ad4c3eed71e14ecba16d4fe6d49b3d6b96e6dc6fb533efbb91",
+        "arctic_platform/inference/benchmark/reproducibility/README.md": "86b429195212e5bc321d3e233e54523b745fe247b3ba5e27b36748abf78d0bd2",
+        "arctic_platform/inference/benchmark/reproducibility/client.sh": "a34d62aa1b52144f897f292002ab55765891b77000adfcaac4e2a7dbfd83250b",
+        "arctic_platform/inference/benchmark/reproducibility/patches_v0.10.1/datasets.py": "c330057fa9b9dfe68fcfa16ae5d26bc1f9745adefc9e7d22e6c0e621417d8438",
+        "arctic_platform/inference/benchmark/reproducibility/patches_v0.10.1/serve.py": "0b8f3137a419e3bc92cfdd28954427d7fe78a713bec9ba6ae0c3307ecf5e87c6",
+        "arctic_platform/inference/benchmark/reproducibility/plot.py": "1dfee33ad162f999aef3a3254eef8319f658c06e2ba00fe0acb066f3d3926fa9",
+        "arctic_platform/inference/benchmark/reproducibility/read_trace.py": "bdb61f194afe739169558eaa621ea359301216b02c064ef5e9ac3c79b14c9ddc",
+        "arctic_platform/inference/benchmark/reproducibility/server.sh": "618c62a62ebb16f4623834cdbd3d1e77875ded90a82de61989351ba3e58065d1",
+        "arctic_platform/inference/benchmark/reproducibility/test.jsonl": "bcd7e96bc9810e54cf866e94b34e36fb87fe1b7bfd4592e1df879b2e0be41595",
+        "arctic_platform/inference/benchmark/reproducibility/vibe_test.py": "f440972983672efe97ecdf238b5688d7a9a6ceb124a3f95fc655b8b1aca03d11",
+        "arctic_platform/inference/benchmark/rollout/README.md": "f1bc59101d71a2d4b5eba03e52dcde891a8bfe4f1deca2b10f74a307ccd2e8f0",
+        "arctic_platform/inference/benchmark/rollout/parallel_sampling.patch": "b37f9ef518e4fb8cf6ed637801afd4aca83fe31cb7e21fd5047fbe368335309b",
+        "arctic_platform/inference/benchmark/rollout/patch_sampling.sh": "21fca487a2832070cb70094d5c3236a34342967d76cfe46064b1f0c66162fbb1",
+        "arctic_platform/inference/benchmark/rollout/sampling_params.patch": "636269e611ee2d656ba8c343b73e038c4e5004f73338748ee54538c42ac726af",
+        "arctic_platform/inference/benchmark/trace/README.md": "db90690b50b3e4200ab7aa30d9510a3cc0e3c298741a403f1df1c41607a1c88e",
+        "arctic_platform/inference/benchmark/trace/apply_vllm_bench_patch_v10p1.sh": "ebe08aabe46b58c48c4e886872e515bc307ced472a055f3dae193c9ebdde167f",
+        "arctic_platform/inference/benchmark/trace/example_trace.jsonl": "f289b19efc3e6954db2f9763ef3c737b20b2feac646b10a0202de45591d02c34",
+        "arctic_platform/inference/benchmark/trace/run_client.sh": "c4def73767a1497b6aa496baf7fbb711347a32395f7d345ff1aec5028dcf35ae",
+        "arctic_platform/inference/common/__init__.py": "061df7164491227e3d9816ec4a90fa2bc25c65ecb6471f249f1831f4240125c3",
+        "arctic_platform/inference/common/swiftkv/__init__.py": "4218e25763a4aeca334c5faacc0141d792b2f74f9f1a63742215354787c5da87",
+        "arctic_platform/inference/common/swiftkv/configs.py": "d1f78b8dc9a2b76af2fc93b3102ce3284d18fe15d1e5f757bf15004388e45b67",
+        "arctic_platform/inference/csrc/custom_ops/CMakeLists.txt": "0d01e8a0f3b368f93b2e847070af5a1d9eaa4714659601aafe3b504229d988c1",
+        "arctic_platform/inference/csrc/custom_ops/attention_generic.cuh": "9cfa0bf1971788d7afd10c90bb2f98384e6f83f0f0893cbeddabcf9d55f3f3e6",
+        "arctic_platform/inference/csrc/custom_ops/custom_ops.h": "f4077f1510455431a55fda4ad97547f9ddf413ff1dc02377a5f3c83b27c944c4",
+        "arctic_platform/inference/csrc/custom_ops/dispatch_utils.h": "27652d8b90b0b89c6d2762915e66d7f6f2049a6a7ff64c13ca2de1bd4c30216d",
+        "arctic_platform/inference/csrc/custom_ops/dtype_common.cuh": "aefcc4a974ed455912adf48821bbcea339f6b2fb813c7381dc535e663d2e1a87",
+        "arctic_platform/inference/csrc/custom_ops/dtype_fp8.cuh": "48d96c171edc835d6fbfdabd4deedc9c2709156555bc35201c59657ce4176e1c",
+        "arctic_platform/inference/csrc/custom_ops/quant_utils.cuh": "2bf006408836cc978cec47eb66ce6aa197f6b2e8b62ecfdefe8b6fe7d0df9b9e",
+        "arctic_platform/inference/csrc/custom_ops/reshape_and_cache_flash_bulk.cu": "609535c45e103493aa8caca5a96e44efa51f524ca5ed70488910512bdf470655",
+        "arctic_platform/inference/csrc/custom_ops/reshape_and_cache_flash_fp4.cu": "76e5fa555271f1ac32538dd37854db7fc5f283c2c3d5cb525070882be51f102b",
+        "arctic_platform/inference/csrc/custom_ops/speculator_ln.cu": "4b3f117c4ac218ba853c117f4c34b93b011d0efe1edd4c221a00a24e7ba507e3",
+        "arctic_platform/inference/csrc/custom_ops/sum_lstm.cu": "9b17ae6ff62274853dd49e9fb00c09ae949648caf98ebba0b9ae38c5e240e286",
+        "arctic_platform/inference/csrc/custom_ops/torch_bindings.cpp": "24204b085df80df516b8295822d62909f448e759995139361fc279f26c1f0ce6",
+        "arctic_platform/inference/csrc/custom_ops/vectorization.cuh": "36bc050e7e3923e9f8270d6773058c61dbf802850e5a7f6826f51f992c136baa",
+        "arctic_platform/inference/csrc/custom_ops/vectorization_utils.cuh": "2b4557657134be17d74937b85aa1de904637c4fb8cae6eb67fd8b948f9b31b79",
+        "arctic_platform/inference/csrc/suffix_decoding/CMakeLists.txt": "d0ba0a52b33dc97466f3fe17a2f0207c7e6e3e2cf8b42409e99c3d12ecf13ff2",
+        "arctic_platform/inference/csrc/suffix_decoding/bindings.cc": "4fbc28596b4cdfa898e3341468fc6debed5a33bb4d9df37566907071ae60f41d",
+        "arctic_platform/inference/csrc/suffix_decoding/int32_map.h": "49fd3c8ffb900630f145958211d2e121a3347583ef4cf42910572ad2166e54ef",
+        "arctic_platform/inference/csrc/suffix_decoding/suffix_tree.cc": "cbd8b63b13fbf0beaab4e8736a54d52891b1aac959c5d292d083d88ed37dfc7c",
+        "arctic_platform/inference/csrc/suffix_decoding/suffix_tree.h": "d3c9a51fc57a974d680510bee8cfb1ba0a6f5ce6c582ed472cb5ef975b2f5aec",
+        "arctic_platform/inference/docs/Makefile": "8b6587b859607f200f116e2cb043fc358e1c3a26c326b563bf348453cfc68307",
+        "arctic_platform/inference/docs/arctic-speculator.rst": "847f99ee5f635b4d87bbc832f847ac000fb48f34970621cb3c2ad78bda577198",
+        "arctic_platform/inference/docs/arctic-ulysses.rst": "d4f007de79d85622f31c01a6e12f3d63588d5ef3c5c228d878c83f5eb40663fc",
+        "arctic_platform/inference/docs/conf.py": "1440cf255277a601e4c30b640446cbfd447b08f5bfdef11ce4f17a4bdc132f42",
+        "arctic_platform/inference/docs/dflash2-nan-fix.rst": "215f85142e86cbea3b4b64bac378e8cf97a513a221f5f0cffdd68bc58f44cb8a",
+        "arctic_platform/inference/docs/embeddings.rst": "9bb48f05c6013f643b77827a8a1e79205af06a7bb78a811b7ac2fc250e6df78c",
+        "arctic_platform/inference/docs/images/arctic_inference_logo.svg": "2a8a108a4f96bee36404359c7a2e25843f6b49b9910191411aff9892b814de73",
+        "arctic_platform/inference/docs/images/lstm_speculator.png": "4dac2cee23104b2e508dc6a6d0a726a6cd919f0bf1000f2d86f591fcc9f22be2",
+        "arctic_platform/inference/docs/images/mlp_speculator.png": "35ea3578670902f7538a11b49cd4eb87c526b2517c727fd7d07b09bae26c79b8",
+        "arctic_platform/inference/docs/images/suffix_decoding.svg": "0a70c58f3eeb5b51c43c708f9477e8a87b8327759f51393c831aa97aff8d5322",
+        "arctic_platform/inference/docs/index.rst": "10f669b88ad8903294c803fed9c62b3b73b0afca2236b1e1541723a23eea0903",
+        "arctic_platform/inference/docs/make.bat": "bca6b3244f115b8f42cbc2bb866f1061b95eb6f01df1891e2ac68f03f7569d7b",
+        "arctic_platform/inference/docs/shift-parallel.rst": "a7470d2d5f2e04339bea299c0da0fe7bfda27392740c6448f67b5731f572983b",
+        "arctic_platform/inference/docs/suffix-decoding.rst": "25dd5db08eda96c51146d18798169f95a29d0b12e1e1627b2cf5d538fc675d72",
+        "arctic_platform/inference/docs/swiftkv.rst": "7a412664afc041699738e03f34f90a2e570d3fc2a2a0ac73e0418c51f69e056d",
+        "arctic_platform/inference/dynasor/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/inference/dynasor/cot.py": "eaa4462ac9ccf1544c930d97984ba653906596c3ef2e73b5f5826f674c1e3163",
+        "arctic_platform/inference/dynasor/entropy.py": "ed2c5b20a6fac3fa2a66eac7cd92b583b685f19e41122f154194d79473cf7698",
+        "arctic_platform/inference/dynasor/evaluator.py": "8ad33ac6cb9afeba1282b90ae9ca905f9493cf4768397dd6e3861c63bddfa37b",
+        "arctic_platform/inference/dynasor/openai_server.py": "42b6f870263e50f79b26c0a476fa2311f75ea9c5cbacb976e007a1aae993c4b6",
+        "arctic_platform/inference/dynasor/util.py": "d487fba0b071140d0e54ceccb184a80e0edcf3bda109a2a76fe5f09801e7599f",
+        "arctic_platform/inference/dynasor/vllm_server.py": "8360418e3767c4efae7bb5de3ae5675a81954ea7bc131f9582d06d20dbd912e4",
+        "arctic_platform/inference/embedding/README.md": "4964bcae49bcadb95bd45d5cdd2294c0bb0d99e5596d1c454cb8dd2111bb3bce",
+        "arctic_platform/inference/embedding/client.py": "9a046536d8db5a2bf4f47ffbfd06f2d139dd56baa09722e8da79d9b3080c8ecb",
+        "arctic_platform/inference/embedding/generate_proto.py": "00f9cb387f677178754481332c4a27a0e176fa2ac605e2f67293ccc3da6a0169",
+        "arctic_platform/inference/embedding/proto/inference.proto": "833d9be1a931be0e9443fa55f85c199e38f562f25d27ff57b456dce76b7fbb1e",
+        "arctic_platform/inference/embedding/replica.py": "fbfc925ffc24fa1e20ab76d49e9fe80e08ddefc510f0e98c006779bbe0012f4e",
+        "arctic_platform/inference/embedding/replica_manager.py": "5188632b218354cf54b780b3b4c30a86e3bc4686e779eae67eafdf84d1c6a5dc",
+        "arctic_platform/inference/envs.py": "e4e91728f9974646edee25dde38033b514f1e3a982c580093b266334eff2f567",
+        "arctic_platform/inference/op_builder/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/inference/op_builder/builder.py": "b565541e618ca4b70225e0d5b08543bbc88faf7eca7def4259f29a4b3a89e121",
+        "arctic_platform/inference/op_builder/swiftkv_ops_builder.py": "b5a5d59564297738bdf40fda4e7c39c81a792f7e2f9af78a15af99b61b6d92f7",
+        "arctic_platform/inference/patching.py": "89c16caf99911c7bde8a53cd44a7be22634d5e2743d92f36aa72c5e54285dd91",
+        "arctic_platform/inference/projects/arctic_inference/imgs/embedding.png": "34c16d20a80888955491dca4a711fa718b07fae8af16818150c6fb46eb52e72e",
+        "arctic_platform/inference/projects/arctic_inference/imgs/figure1.png": "355c1e2c4339076e9a7e944b423610ec2c6e21f25435dd30ace3bcae16d06bc4",
+        "arctic_platform/inference/projects/arctic_inference/imgs/trifecta.png": "ded1e19df6650696182a76455f419b11a7632f48358e3e50be3c3e3af87e16cc",
+        "arctic_platform/inference/projects/dynasor/README.md": "ded0844b597ee9112af93c14a412c9f130c94ece030731b2b271af679d6717d8",
+        "arctic_platform/inference/projects/dynasor/naive_client.py": "2b88dc5c2cee7ccbb8a7c878094f80d313bee20ca6e02556828e15d574645e15",
+        "arctic_platform/inference/projects/dynasor/openai_client.py": "0d302699af9841dc34481b7db83bdc1244fa2c42fdbb793c03baa2ce2ad9756f",
+        "arctic_platform/inference/projects/server/README.md": "d56bea99682b44d69b031ab7555eb1540bd907265d12e9611f06b060ba300236",
+        "arctic_platform/inference/projects/server/STREAMING.md": "39e7551a75ba87aa63df41c769522c159a1f79e995cedd996196fe9ff41764c6",
+        "arctic_platform/inference/projects/server/api_example.sh": "73c4d2d519b1aac8f52a89bd7e4b7f5b1e2fa6e8aac99caaa9423ebb76e1e545",
+        "arctic_platform/inference/projects/server/driver_example.py": "511ce88a221b173ba98ac1ef70380a83a326644262119f6d5a74ec3e437200e8",
+        "arctic_platform/inference/projects/server/driver_example_scaling.py": "a584a206385fab5b3524618174e6fe4ba014f8fbf90028c4d6cb87b54492331b",
+        "arctic_platform/inference/projects/server/kvcached_multimodel_example.py": "cb6d0523a18e440cac6f5ddd1d4769e73d1feddde771e676fd6dca214d331928",
+        "arctic_platform/inference/projects/server/pipeline_example.py": "d85dddb6de27c4812f2738819fa5a209875e15191cc0a07022272f1008038567",
+        "arctic_platform/inference/projects/spec_dec/Arctic Speculator Benchmarking.png": "e7824ec6623a71310935c15ec7dae377d6b9ce0d7668bca1ba9680c9b869a8b8",
+        "arctic_platform/inference/projects/spec_dec/README.md": "2b8932b1abedb6cf416f6a05f4598e1625476fd6cd8d30a7edf94275e364ad42",
+        "arctic_platform/inference/projects/spec_dec/offline_inference_spec_dec.py": "939fc8a959d044bcb0e192c7564958c8b8994ff86c1c6ad4eac907e15ff711a7",
+        "arctic_platform/inference/projects/swiftkv/README.md": "dc56d090fc2d54c5b990870510a27f8a28c3400ff11f89019abc04ae8fcaa8f2",
+        "arctic_platform/inference/projects/swiftkv/offline_inference_swiftkv.py": "198cba8e8fa6099d2c650c2887c87329b47dd0b4cca1bbbcef98fbc2866e221e",
+        "arctic_platform/inference/projects/ulysses/Llama-70B-performance.png": "761a53589a17cc264739e194f37e4eacedefe40170652422f65171842470c8b8",
+        "arctic_platform/inference/projects/ulysses/Llama-quality.png": "520cf18f536c3973dd05080301a0d2506202508e38a756249862f03f1e929394",
+        "arctic_platform/inference/projects/ulysses/README.md": "33d4d8a8d97a771d3b67e435643951b3746c713f88a079fcf341c9de3ec52da0",
+        "arctic_platform/inference/projects/ulysses/offline_inference_ulysses.py": "cd4981795041cedbf6fe369e6d3ed78b20d8bc295f73c660a77e69b1cc833a00",
+        "arctic_platform/inference/py_custom_ops.py": "f4d77496bfd7b6fb618a8299566fd6b7d8629b4f2b62f03ceeec25447f16eb36",
+        "arctic_platform/inference/semi_persistence/README.md": "5903b6305d3e3e48cf30e565724f9ea55a15e302679d06890504cc8348a7e406",
+        "arctic_platform/inference/semi_persistence/__init__.py": "59e79372a0769c3337a6485449c57daa7895ee676ded1e49238ec99958674371",
+        "arctic_platform/inference/semi_persistence/_semip_worker.py": "fb543a9c25ad1e554084224e21be8ff504bade6138b289da29590a6960f485b8",
+        "arctic_platform/inference/semi_persistence/abstract.py": "d2d0f9cbc2fff572f352e636a8e63bb65f82dbe04ca2a63442af344e3b5b9b30",
+        "arctic_platform/inference/semi_persistence/assets/figure1-sleep-wake-latency.png": "177dc39b77200ec3ecd2dab412d46b9119937997f695177b875c2c64a52ba0f4",
+        "arctic_platform/inference/semi_persistence/ca_graph_rebind.py": "3c7e6ff4f9e6bcc496e2ce146aca95b324644cfb6badf5231eb24253cd2ad99e",
+        "arctic_platform/inference/semi_persistence/client.py": "c2b002df53ee90723fe11a993f4e0549f05c2a32fa14e91d401ef1f7e34dae9b",
+        "arctic_platform/inference/semi_persistence/dashboard.py": "15e0c391044723bfe8537e8821694c1a8d8a30c6ee8bb82a761ac1408097bf71",
+        "arctic_platform/inference/semi_persistence/demuxer.py": "85afd147e66415c156a14088572644b99fab9a7621fc8ccc3a2952fe67170bba",
+        "arctic_platform/inference/semi_persistence/instance.py": "6ad9c7be72d385060ac2dd7e318fb798fde0e0d7670d3294890b431f320d0296",
+        "arctic_platform/inference/semi_persistence/orch_server.py": "ef8b983f87778d280d30c9ee09693539a904d79a40a1ca6317ae37e09b0c8138",
+        "arctic_platform/inference/semi_persistence/orchestrator.py": "53e370faadcac1427193a8d9394d90ea6aa7e93d429fdaaa56f095973a91cfe4",
+        "arctic_platform/inference/semi_persistence/pipeline.py": "669469d6ed2847e5b0558f5f94b41e11542f8976d77252235fd017c7fd9a45e6",
+        "arctic_platform/inference/semi_persistence/reproduce/README.md": "fe19d5030cc92f4ee53597ca830ac48c0f00bfc340540f2911eb37bc470255d2",
+        "arctic_platform/inference/semi_persistence/reproduce/example_full.py": "17c1715255ad5ae8cb256e98f0e98082810576324828290469034bb8393ded33",
+        "arctic_platform/inference/semi_persistence/scripts/imgdiff.py": "eded64a4a1be6982cd835308e1d3b63bd177a6d2d4825b4a8db3b8e95d0aad7e",
+        "arctic_platform/inference/semi_persistence/scripts/main_test.py": "3d72410eb83312c0c8e1b863c4b7765d53e4f80ba70906e723d1a14367af45ee",
+        "arctic_platform/inference/semi_persistence/scripts/pidcheck.py": "55912e8ee7fd620dc30afbe7c063ccd2c8592d3f882ceadcffea96835320157e",
+        "arctic_platform/inference/semi_persistence/scripts/register.py": "af78ff1a8d762a92a336a59fec0f2d49cca06e12dfb7c8a44cde09a349699d71",
+        "arctic_platform/inference/semi_persistence/scripts/test_copy.py": "c46a50f37a90442efd70a3addd0d7988007b73d4073ffc851b0e72cf0ced95e2",
+        "arctic_platform/inference/semi_persistence/scripts/test_env.py": "9af2c16489e5ca92345d7eced53fcb8a05d98733b1b972c8c97cba42d5d6cb14",
+        "arctic_platform/inference/semi_persistence/scripts/test_generate.py": "c633f1ad75326f0a4a63c11265760cd64ae500ec19e1363916a7e459ee52d24b",
+        "arctic_platform/inference/semi_persistence/scripts/test_image.py": "27b5144ce385e58d884544cff3ab39c607f7c9a1db962ae199c620554a93623d",
+        "arctic_platform/inference/semi_persistence/scripts/test_tp2.py": "258ed584893147490022001eb5275c033ce09d8e089a569811e587cab79d1430",
+        "arctic_platform/inference/semi_persistence/scripts/test_weights.py": "43970ab7d0dc8ec1393092a46adb85b317352c8bd0c87d4bc610ee7006df249b",
+        "arctic_platform/inference/semi_persistence/semip_logging.py": "4d3c690757d0fa3657c8d059ba65c4a709a9d7aa8260ce5cc865262bc528316e",
+        "arctic_platform/inference/semi_persistence/skills/CRIU_PLUMBING.md": "57f377b565fc2e08744fac671475ce8139100658cdbe60697c0f2288efa96ea7",
+        "arctic_platform/inference/semi_persistence/skills/CROSS_NODE_RESTORE.md": "494e456d1238ad1bae9ad6cb12198f5aada865d7f682389e4e4d66f5d2cc96b0",
+        "arctic_platform/inference/semi_persistence/skills/INSTALL.md": "c8b04c6c403ee8b5ebea496dab0e0df72951b4dc804af115889544d3dd62aea0",
+        "arctic_platform/inference/semi_persistence/skills/SKILL.md": "d4410d279c1356d22cb2eba633685b06e5c495accedefeb62433a312d42305b5",
+        "arctic_platform/inference/semi_persistence/skills/TEARDOWN_SCOPING.md": "06d567602d584866a448f0c03d58c2a35325bdcce6f8b099046f4a62f4a7d2f2",
+        "arctic_platform/inference/semi_persistence/skills/async_generate_DETAILS.md": "07fe88721829949a242b677fc261e322e0dee92259e0a1489c7cf2ec41f584ba",
+        "arctic_platform/inference/semi_persistence/skills/client_DESIGN.md": "b9e30cb0ddc7d36a15e798d1c6d5608d7f6a2768893d2cc6e70c9fc1a57df326",
+        "arctic_platform/inference/semi_persistence/skills/instance_DESIGN.md": "7b41a6a02a49c02b93ee1183c3732964188a69439c0992e26b8dedd7563a65b3",
+        "arctic_platform/inference/semi_persistence/skills/orchestrator_DESIGN.md": "e21c02719528dfbd937a560187ba2794a895f8406574537427a1f25f8e6bbc13",
+        "arctic_platform/inference/semi_persistence/skills/pipeline_DESIGN.md": "362b0584ff1c9adf9843181887d35300c7be507c590f68bc64d3af24350beb9a",
+        "arctic_platform/inference/semi_persistence/skills/reference.md": "4b91da18f7ce9ca901efa348de30850294117ca9d9c10d97b4291f78d9e7914d",
+        "arctic_platform/inference/semi_persistence/skills/semi-p_DESIGN.md": "e08902be28c6ded31dd909bf7fa7cd7b2eff5c1ad1b8d9caf5f9b172885ac6ef",
+        "arctic_platform/inference/semi_persistence/skills/slots_DESIGN.md": "64d075b73a64020dc674e3f0cc5331f63cdf26bca83b23ad6aca8883053af213",
+        "arctic_platform/inference/semi_persistence/skills/tp_DESIGN.md": "a85052ca830a9d3f32bdf87cd74374d8d390416aac5029539c68a70f9bbe7fe3",
+        "arctic_platform/inference/semi_persistence/slots.py": "ad3cad0aa97b5ceef3b64a06b0911320e293715e6fd64a29b4270c0ec26799e6",
+        "arctic_platform/inference/semi_persistence/state_server.py": "ea70446f656e0073f05659a7836b027bb3b19d22b906381e2538e8efffb51359",
+        "arctic_platform/inference/semi_persistence/tests/test_pipeline.py": "5a162d7edbe8f37475a59f8625f83c60a1d79a06ee32e1dcfb3123465f619f5e",
+        "arctic_platform/inference/semi_persistence/tests/test_slots.py": "09bcc635fd81f1e7e0e429ec5e5281539dfc4ba7f6cfe0baa763bb8d59f5ee4f",
+        "arctic_platform/inference/semi_persistence/vllm_child.py": "7c16cae1be70ab1389305227a13ba14587b81bd2846dbe7cb7738dccc60b0789",
+        "arctic_platform/inference/semi_persistence/worker.py": "bd574ffb5cacdcb58c75315e9d96ba712591d963e89d778bd77e3575fc7b170e",
+        "arctic_platform/inference/server/__init__.py": "74168a4be2c0fb228db0f04f7b682542c1d2ad7007d04be6ee39030fb9f2b45b",
+        "arctic_platform/inference/server/action_mask_replay.py": "bba7093555b22dc6d8b84ca240cc46dcbcd23b71d0b6d8ebc9d998978f2e95b3",
+        "arctic_platform/inference/server/action_masks.py": "e61cef6bf134b6b7e75aafd37593fc46a1107407e132497f09fd70c24c7642a0",
+        "arctic_platform/inference/server/api.py": "0f63d103223925e4e52b0dfb263df5f68fd022803ffcf0a71e866669991d74bd",
+        "arctic_platform/inference/server/chat.py": "c0db09a0023b948199f244bc7103f31b74ff4c6f7ca6ebf440af2710b95051fa",
+        "arctic_platform/inference/server/cli.py": "96fcd7ef67e6d9858f6c037baae6ef637cc518e429cfcb455f1206077612ce8a",
+        "arctic_platform/inference/server/config.py": "9036e5e455cb1f510810cb104f023ad47874526ac811b4e4219a08b0a20b1fad",
+        "arctic_platform/inference/server/metrics.py": "0a043a8f7cb883e7909184bab9df4d4d1ebc33ca65f677b3e40ee7b8f81f4f9b",
+        "arctic_platform/inference/server/multi_model.py": "d54f8fb223b8fd20ed8ca66a9ed8e7390c2b7532f3dd0efc4c0d283d1d2ca38a",
+        "arctic_platform/inference/server/pipeline.py": "76bb19ba5b333c71ca23fed8d80edba528929d5fc6dead9821c7c8a22c540503",
+        "arctic_platform/inference/server/replica_pool.py": "e784445ab290c28f10f5b9362dbfb0ac40eb738159e410614ef9845c14f41218",
+        "arctic_platform/inference/server/router_replay/__init__.py": "71f78ad31f55a75d89c91ff065c02138b13b482757b08488294bf29c2949c2ef",
+        "arctic_platform/inference/server/router_replay/all2all.py": "14a0e9e44461f11e20f88896dcf9fa44a53a9299126f4ac36a2ae9bc1f656d68",
+        "arctic_platform/inference/server/router_replay/cache.py": "a99e84de779321628ed130c817350a84e8654dd80afc3a2f7dead0166c88999e",
+        "arctic_platform/inference/server/router_replay/shm.py": "b9fb3fb3cd56e083ea7a8771f386e9c4948633b70a010f3bd0c80185dbbc832d",
+        "arctic_platform/inference/server/scheduler.py": "663ec643a9b180418f34d899b72af84d63ce47f62401ba04417637255da15278",
+        "arctic_platform/inference/server/streaming.py": "de7a6bef0dd792f4615937a2da203ee2b9aca2b5ed9fdfd159ec4aab888335d2",
+        "arctic_platform/inference/server/testing.py": "872fb854708b2ceb16cae65a4e6d3fba4e210fc4ebf7d5e7b1a1673e7556f413",
+        "arctic_platform/inference/server/token_prompts.py": "3c44e8d168a31ac31e009d51d8c9029930c28f88d159a208a8d52b985966c241",
+        "arctic_platform/inference/server/weight_sync/__init__.py": "8c1292871b2f37995a1fee739c166ccff51e943234fd8b0cdf61af0a3d76304a",
+        "arctic_platform/inference/server/weight_sync/broadcast.py": "976b8b73770d2bdd718905554ebde61c170967eac8766a7ab19c20562c6e4e26",
+        "arctic_platform/inference/server/weight_sync/engine.py": "ee70c772b866754b9ccd85a5e6e72ea4048da2fcb7ecba42e760d6384f8693b5",
+        "arctic_platform/inference/server/weight_sync/receiver.py": "1027dcd81a2067de8b02669dc1fdce2f239e7f22a3d0d0b8d8637518800c0776",
+        "arctic_platform/inference/server/weight_sync/schedule.py": "f8d5cfc37bbe151e8137b813c57defc259e4ba01f18d1de7701875c8b75344e6",
+        "arctic_platform/inference/server/weight_sync/sender.py": "6874faa77701c17ad3806d818eed122be0f4ba740128343135460510d2f760c6",
+        "arctic_platform/inference/server/weight_sync/utils.py": "fdd1e31dc5f3b6602143b7bf2af1b222e487c4bf3ee35d5f2adf5fca5c7f3586",
+        "arctic_platform/inference/server/worker.py": "0cf8e9e6e85b332bec13d11d2718ac3d7f73840c5ae3380afceb78ba43d1893b",
+        "arctic_platform/inference/setup.py": "57aa0ebf0e829208e04d6bdd6843481f3cf319a163bd51d744f3227b18b19c2e",
+        "arctic_platform/inference/suffix_decoding/__init__.py": "e2736d5f6d3472e74f2f25795de8f754ddb3279e9cf497b13f54e8fa164dd5bd",
+        "arctic_platform/inference/suffix_decoding/cache.py": "177f08ba7fa03dcd8d07902af7f59d613fdd1fdcae6e36772769c75428f72192",
+        "arctic_platform/inference/suffix_decoding/simulator.py": "9d8ca625c3ad91e65e2857127020a31061bd131beafbea7f1bc6afff999b1129",
+        "arctic_platform/inference/utils.py": "cfa7fa7ee7900f85d6fb6ebd10129768174c005288b7d6fbba0fa7cd1c151533",
+        "arctic_platform/inference/vllm/__init__.py": "061df7164491227e3d9816ec4a90fa2bc25c65ecb6471f249f1831f4240125c3",
+        "arctic_platform/inference/vllm/args.py": "0c633f25b32da0cd232cf24c7aea50b96b9f96d28a43e5cb433814a6d53c53c8",
+        "arctic_platform/inference/vllm/attention/README.md": "957d726ecadafccc82988aee175d6ebc210fddaa8c078888ce35efea37f7fb8c",
+        "arctic_platform/inference/vllm/attention/__init__.py": "36f80e6ffd785a7f0518e77703224c604692e54b7b0c44e484a6ccafcf16cc89",
+        "arctic_platform/inference/vllm/attention/flash_attn_forest_cascade.py": "158c62f099d92ac46fcb9603c8a935fc126f326d61437a2f90b375923ec0deb2",
+        "arctic_platform/inference/vllm/config.py": "33a55ae9faf04c4227a92016db44c57edf933036a914ea8bd068a1e1217c78b9",
+        "arctic_platform/inference/vllm/dense_prompt_logprobs.py": "73a86cc204d8898ffa96fdc2ed6e4f7f3d78d9896c6b8c91bf0eb7b38d3063f4",
+        "arctic_platform/inference/vllm/dflash2_nan_fix.py": "4c1491fc39b85fd9c206aecfb21882b6fde46492254c90267450d976276b27bf",
+        "arctic_platform/inference/vllm/fp32_lm_head.py": "94e0d26eaa05ab91fe9ead8369e73052e1680047963048db871436916dc8ca46",
+        "arctic_platform/inference/vllm/glm5next_indexer_page.py": "59ac6e1fdcbf05adc2f2bcb66b8ed607b0f7d4b286e28b2d5ad06c9bab973109",
+        "arctic_platform/inference/vllm/kvcached/__init__.py": "be47443d989346bf3252a90125bf9219a5c06bf443ca0c817154f8e38c595b83",
+        "arctic_platform/inference/vllm/kvcached/patches.py": "86f46ec7da54364c41ccb714e8a74bed71780c7e8aafb22f2559254e66603dca",
+        "arctic_platform/inference/vllm/kvcached/prefix_block_pool.py": "6c3a7e7a54d6dca0a25c9985a1776f3050f430410f8dec8a04fe776f3027cd74",
+        "arctic_platform/inference/vllm/model_runner.py": "868074cc8e71a7fd653771a661c39f915f1d4b7c70e090663c67766fa5eae7a0",
+        "arctic_platform/inference/vllm/patches.py": "9d08620d44125ae59bc301648ce43668140ef912757cac82281725f21acaa0d7",
+        "arctic_platform/inference/vllm/plugin.py": "8bcc965ed6bdba9a78c34732c439c5f727cff6f71996b5b17551e2dcf47afb39",
+        "arctic_platform/inference/vllm/required_patches.py": "a29f2b3a483859419a13d360344a1ba1518307cbbf2492cd2becbe5718e7a350",
+        "arctic_platform/inference/vllm/router_replay.py": "207aada368a66a32a66f8a4eb61767b0a0b3293ac976fe6a9762b261591f4fe0",
+        "arctic_platform/inference/vllm/spec_dec/__init__.py": "ffafc758a2a63f95d78247b26c5a3169d1395da79b44dc1b6a5a68011f0c79b3",
+        "arctic_platform/inference/vllm/spec_dec/arctic_proposer.py": "a25883d07a8115a8102761cc1b5de32ea7e29e96317cbe7f7077ad57988cc450",
+        "arctic_platform/inference/vllm/spec_dec/arctic_speculator.py": "4d231728ce2795f51f1950a398e8f028bb5074c18c37a3d96256bfc92e9b50e6",
+        "arctic_platform/inference/vllm/spec_dec/fp8.py": "fa6a0f8dfa8f0b5765991c012a41c8ffe8f31592581b0c17edc88dd62b7d4d7c",
+        "arctic_platform/inference/vllm/spec_dec/logits_processor_opt.py": "15c0764d3408e9e2ec83e901b53c64ecb0c07e621a2c869869ef7d28296be022",
+        "arctic_platform/inference/vllm/spec_dec/vocab_parallel_embedding.py": "a1154a0288c5a2586cf2c8f464fda35ccacc105e6c0fd1bc77be1e56af50f42a",
+        "arctic_platform/inference/vllm/spec_decode_grammar.py": "d95ecd404de7ec34e5e484260e3c9f97d6a455bd6babb3bd6baf3add042a4caf",
+        "arctic_platform/inference/vllm/stats.py": "9219a255661d307a201f17b0a58c67f26f7dd28566e1e48d5b34b25cfc409035",
+        "arctic_platform/inference/vllm/structured_output.py": "63a635e4f0b2118d2f83c4d0ffd0f1830989cb9921a1651a15c8d7930f4cb1dd",
+        "arctic_platform/inference/vllm/swiftkv/__init__.py": "8b19cf03ced93cd5b0e1015dc6f5975f508055b48c0f9cdff1616b2e7cb19ea6",
+        "arctic_platform/inference/vllm/swiftkv/llama_swiftkv.py": "94b018124dbf1958ba0329bb73611b2241a3dd35336cf51c0f54b71e140ef703",
+        "arctic_platform/inference/vllm/ulysses.py": "2f05617ebc20b08f8dc796d5989bbd7abd8b01895855cef4229410f7b52f80dc",
+        "arctic_platform/inference/vllm/xgrammar_stop_mask.py": "4f60aaa44f3a02ce19728d4c3319dcf2e9f92823cce9c9404b8f8209d4cd2d05",
+        "arctic_platform/integrations/__init__.py": "ed37e174396edc30458ca6f26f0c8e966a380f253d709c6bbff73761ff31a95b",
+        "arctic_platform/integrations/_cortex_dispatch.py": "376ca659af4f7d7cb3d94a6cc142d61fefdf312a67453df077ae24fc23ac902b",
+        "arctic_platform/integrations/_cortex_shared.py": "a3b6f4f46a264364141d5187eabacbfaad0616e9f00be9e8014ed31fc84104f0",
+        "arctic_platform/integrations/skyrl/__init__.py": "0e768766a0885a751dd6fe6f6c4cc12ce48a0e92d4819480d98a248b352cc5fe",
+        "arctic_platform/integrations/skyrl/entrypoint.py": "7b7f1ce20418b38e6548dd1d90550c62070eb8231fbf70db0aed5b803331d023",
+        "arctic_platform/integrations/tinker/README.md": "7c45bdc2456742cc4f279453502aaa6c3a1a9c14165c84b94a221b1409c700c1",
+        "arctic_platform/integrations/tinker/__init__.py": "8744a4e32f40025481e1adc78d26928cc4d86a903c3993e8fcb6baa38e924031",
+        "arctic_platform/integrations/tinker/convert.py": "99b73f13d8779ec056bda451f7ebdc022c30349e5ea472064635794699c21c10",
+        "arctic_platform/integrations/tinker/cortex.py": "0407b6a42ef401e8dac6cbad43247d8a8d031c705c943a6d4627976dfc5a4a61",
+        "arctic_platform/integrations/tinker/job.py": "c3ce408df7d5ff8c94c308fbcd5d7d88569f48d617e00503b78921e150e5719a",
+        "arctic_platform/integrations/tinker/run.py": "fa40755afe193d6878c891f02b8a8b0d7a4faad63f25170b7199c238f1ab327e",
+        "arctic_platform/integrations/tinker/snowflake_profile.py": "fefc4453401ab34ead5f2d621bdc82065b2d84a961861f664986df075aabd54a",
+        "arctic_platform/integrations/verl/README.md": "e6ae6b431a99fe1b2ba698ee0ad0168c39e9bd06dd7d5efddac18d25fdcaed7c",
+        "arctic_platform/integrations/verl/__init__.py": "1a6c95fd273c94a2de0df7d5191f32238b04429b188e9e3c201e4fdd66c71f20",
+        "arctic_platform/integrations/verl/adapter.py": "4466915e52bfbde3e8298f44aa5453611d364d3527f143bbbd30a4740bfd417b",
+        "arctic_platform/integrations/verl/config/remote_backend/arctic.yaml": "5fbafd348d0b98c914b09eedd72f50b13386b0b6777c947884f956c7b1393f65",
+        "arctic_platform/integrations/verl/examples/run_bird_grpo_arl.sh": "314efcaf7ed0141aa2a0b266819c8af5b79f8b0630ac0948c55e415961213525",
+        "arctic_platform/integrations/verl/examples/run_gsm8k_grpo_arl.sh": "25b64ea681f5b3568ab0cb8996b92ac5cbce7bc656ce742085f7e9e3bd0f881d",
+        "arctic_platform/integrations/verl/grpo_loss.py": "42940bf7e181d951d0bbe467f4fc8a8263bbd355edd5701f96c4a8939c3f0483",
+        "arctic_platform/integrations/verl/register.py": "472a984085cc483da4cc8d11eccce6869424571d0eca379798259cb934aa57cc",
+        "arctic_platform/integrations/verl/rollout.py": "9c7f68e6348cd727961818f345485330ccb9e4e761c1617f68fc389315d45ff1",
+        "arctic_platform/integrations/verl/worker.py": "3228b45d4ff1970447308069c5967fa8504e8a99eb9921854b69f3ff70fcbc25",
+        "arctic_platform/model/__init__.py": "4000ab7ac6e5560d4e658436a43064510d435e4642b7c41dedd420f9229e8908",
+        "arctic_platform/model/config.py": "fad56671c73c75613a0698f20584998576fb23b75a5273c232b6cb2917171464",
+        "arctic_platform/model/factory.py": "0e50d9bf6c16d3527c519237d3cbcd32ec2ad4239f02b74e41c48f50cf84cb83",
+        "arctic_platform/model/implementations/NOTICE": "4d0042453d04c9ac0ab62370503d48dadd4ccd608d7f353b3a3b62eca9939ada",
+        "arctic_platform/model/implementations/__init__.py": "6c64f1ee54c27f0be1e75adf0f0ab8df5e6e3623bee80a287a57264435e09a85",
+        "arctic_platform/model/implementations/afmoe/__init__.py": "117299b4880bec903cad4fec134a47618f324391a408f0d775d3471d9c193663",
+        "arctic_platform/model/implementations/afmoe/configuration_afmoe.py": "8c7289e16190c97589e2647e2e5ecfb3f095e229818b102b4c804a655c72de31",
+        "arctic_platform/model/implementations/afmoe/converting_afmoe.py": "3a41b9ada9574891d1f17d3fece0831bf5ce4cb736f23f6a44b959c567ae2290",
+        "arctic_platform/model/implementations/afmoe/modeling_afmoe.py": "d2bd3cc827f873e1b09a164053b5c82b0eef37de92b584dc3df5e1e40ebaa0ac",
+        "arctic_platform/model/implementations/debug/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/model/implementations/debug/config.py": "173449f694a551b90557b96a0165b22be127b9f541816f8adfb64285ab87672b",
+        "arctic_platform/model/implementations/debug/determinism.py": "2c2769fe228045569b7e2be57b535d9a551ba1632cb7afc62aca93009a2d194c",
+        "arctic_platform/model/implementations/debug/row_invariant_projection.py": "4cfbd6ce19e9946e3c6db26d25fa332e921f8f152ad9b3543b11da933a519ad1",
+        "arctic_platform/model/implementations/debug/token_combine.py": "72167d19e242a155be90a23c25bbb8e88e9d73e86fbce751bc259eb0fe5ec174",
+        "arctic_platform/model/implementations/fp8.py": "5a91ee6defe1e64f469694af0a5a937e1501aa434ffbc6b962913aacda4a726e",
+        "arctic_platform/model/implementations/glm4_moe/__init__.py": "f7b2a713df9de609c55ccbae0b6ca4b1965cd7c56cd8e2062905cbff8cc4fdc3",
+        "arctic_platform/model/implementations/glm4_moe/configuration_glm4_moe.py": "fb9de8d9a011e2d9bc57e98d59c06481f1cd593f5cb46ed2230240296111a23b",
+        "arctic_platform/model/implementations/glm4_moe/converting_glm4_moe.py": "d55d7db0c2311993ea0ede3a7eccc7ae16f27245c730e1a2ba37c766f899f101",
+        "arctic_platform/model/implementations/glm4_moe/modeling_glm4_moe.py": "1d2c24a746eb59e8d97b5c84081ff0384ca134063050eec7fc5d4f47a6d236ca",
+        "arctic_platform/model/implementations/glm52/INTERNAL_COMMIT.txt": "b01fa10e0ca8ddd927bb7487a630292da46df91b0e24f9c2bb46adb10339435b",
+        "arctic_platform/model/implementations/glm52/NOTICE": "07c9e36836f1558cc6d785e91a4e20357495f863c8375dd9529aab753f9dff75",
+        "arctic_platform/model/implementations/glm52/__init__.py": "b9a34c2d2ce1470c8de860e916d2305c5fae8e34aea67c357173725e49c2d25b",
+        "arctic_platform/model/implementations/glm52/config.py": "e6c5f981a2dee3d4b83d9098cdd3635bc385845233020103bc164532908e776d",
+        "arctic_platform/model/implementations/glm52/config_validation.py": "33166dc5cce47bcca48c67c6e35b0b753d65e4b3c32160602f2a1fd95ffef4f5",
+        "arctic_platform/model/implementations/glm52/deepspeed_integration.py": "0f8ac1561a3874e56ca757d02db42f142552b322c029325eb8d6eca7b19cc1bf",
+        "arctic_platform/model/implementations/glm52/model_builder.py": "f8f894439682224e2b74c2bf0aed5f99bd5585e23b653bd4149dbf6585a0217d",
+        "arctic_platform/model/implementations/glm52/models/__init__.py": "1b0779ec828015ef55967ae258bd6ce5e84ac89455ada35d26f70d554b147c5f",
+        "arctic_platform/model/implementations/glm52/models/fp8.py": "594f17495e1c68d155fa8d880d537251d3297835d3526cb6298d397c1a7bf46b",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/__init__.py": "920d711c662bdc15cc5d38546a19848c719d013ddc88a833db0a0a4fdba2554d",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/configuration_glm_moe_dsa.py": "3e20c71738da532f7b338d364317bd0e558477a7ceac836f34ef8724a9b63538",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/converting_glm_moe_dsa.py": "888e021dd32841fe2df90ea1731e9594257f880ee5335823db8ca40228ab5dac",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/debug_overrides.py": "6759ad2a8c4277c162aa7146bfa93bcf8d7e7762254a0af043785c84d421a572",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/modeling_glm_moe_dsa.py": "38361872878112e5da49adb5657330ea1f2a524702d6d6751cab7adb6f7b0d5b",
+        "arctic_platform/model/implementations/glm52/models/glm_moe_dsa/sparse_mla_attention.py": "462a0794f7e8721926c96f12ad591cee67eeff83fa66cb514c24f2b32b9b31d2",
+        "arctic_platform/model/implementations/glm52/models/kernels/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/model/implementations/glm52/models/kernels/fp8_indexer.py": "9b5a7a0d4178196ae07fc7f7f7a6bfc8880a38f14a584b70d8cb7935d7a831a9",
+        "arctic_platform/model/implementations/glm52/models/kernels/sparse_mla_bwd.py": "ec8c4e7c38be7363f399bba46c6dcc2bbd7797ce9e82c617857505a0850572bd",
+        "arctic_platform/model/implementations/glm52/models/kernels/sparse_mla_flashmla.py": "ff78dc50b3eefca2ca209680217017db86638b10c735afe14771f5a10973fa2a",
+        "arctic_platform/model/implementations/glm52/models/kernels/sparse_mla_fwd.py": "bbb9f859a326057351fa8cff4a50dc779d60058d0aeeef601a2782ffe5da7d49",
+        "arctic_platform/model/implementations/glm52/models/layers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/model/implementations/glm52/models/layers/mlp.py": "cfcad017a4213d63c9db4bb8e1e9acfd9ec8d5ccd01224572472f9438362d807",
+        "arctic_platform/model/implementations/glm52/models/layers/norms.py": "66f8d7f3b0572da14df1a084b2ffcb5a7238da79918c2c69b38b4f7352fec771",
+        "arctic_platform/model/implementations/glm52/models/layers/rotary_emb.py": "7e230fbd6422b427351cc194ea18874d1269ced6b9fa7ebdbc037490087eacf1",
+        "arctic_platform/model/implementations/glm52/utils/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/model/implementations/glm52/utils/cp.py": "51cb4d792773ee4f66308b28afbc157d4e0a3398ba6e501681e6baa44e41e2dc",
+        "arctic_platform/model/implementations/glm53/__init__.py": "04b7d9e47d98f5393f24c70690b2fbb64029e4bd9406efeb3d1bd26a7f856f41",
+        "arctic_platform/model/implementations/glm53/context_parallel.py": "4c83955e212465f2172305431a7f93bd5a6c63400939514336b3d98d99a56cf4",
+        "arctic_platform/model/implementations/glm53/converting_glm5_next.py": "93f9e527d8c6daf5ddd4e7e11dc1d51f54d6a3328bfa146332439ad09e596e37",
+        "arctic_platform/model/implementations/glm53/deepspeed_integration.py": "522a75d1d1db03cb459d1bcb152fc713aebfc80dc1ca20c303cb2161e14bbf16",
+        "arctic_platform/model/implementations/glm53/modeling_glm5_next.py": "05add0c150a0a4348ab2cf055563d62cac0b5b0885ef47666ec0366ac43ec22d",
+        "arctic_platform/model/implementations/glm53/vllm_weights.py": "543c34347f9d5f67e35a6e9cdcc3f5d47bc45c608751ff78ffd1369ee4975a5a",
+        "arctic_platform/model/implementations/gpu/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/model/implementations/gpu/action_masks.py": "a7d6f5e781d45ea54e9433096725ee504d67991ea315319c764f9339426cc0d6",
+        "arctic_platform/model/implementations/gpu/activation_offload.py": "02305dcae70a007cbf7a047fd67a5ca033cd5add4bc538666342b5962b092750",
+        "arctic_platform/model/implementations/gpu/grouped_lm_head.py": "4a9b38946bd7b2bb7a501946748878a3820a85f205b9c0ba7caded307e927a62",
+        "arctic_platform/model/implementations/gpu/lm_head.py": "4afdfc50ea579f66acb1177160a578d32df6a94d14009b42151b93a4176290c1",
+        "arctic_platform/model/implementations/gpu/packing.py": "a3744df14e7ef715c1f4e08db634fdde98c9893187b5bbb1db67cc819cd88bd7",
+        "arctic_platform/model/implementations/gpu/pinned_staging_cache.py": "7e4e988018c9e6f443523665fa1cba82e01dc4ad5b2c2a2255bc26d76798135a",
+        "arctic_platform/model/implementations/gpu/router_replay_recompute.py": "a26c1edce5960c82ffeaa55b58e0b1af83af5f8e94de825a552ea918a92994a4",
+        "arctic_platform/model/implementations/gpu/sp/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/model/implementations/gpu/sp/collectives.py": "a2093daa4c870bf758e82164daceda55cdb73c1de25386b47918f47fe5ca5407",
+        "arctic_platform/model/implementations/gpu/sp/gated_delta_net.py": "c5dd6a597c06e5417f40e7316fa0fe4b534c324f14d95645b2fdb9e444a4fa87",
+        "arctic_platform/model/implementations/gpu/sp/transformers.py": "b2097e2bac0c07ebc1881f4b7fff491c0c1c6aa19d14b79720941ce8e3118c00",
+        "arctic_platform/model/implementations/gpu/tiled_mlp.py": "2dd2941b96e568fe8761e32a163045bfc0afff88e4138e745e127f58d207f44f",
+        "arctic_platform/model/implementations/kernels/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/model/implementations/kernels/fp8_quant.py": "66bab23fcec356dc77a3dacca6a25144a8fce7ab44e7bafa5af7cc5d0ff5b0e9",
+        "arctic_platform/model/implementations/layers/__init__.py": "e8d67ec7c2147d2b518afffe3dba5a658dac478e3d53cb4a83f28233527fd0bc",
+        "arctic_platform/model/implementations/layers/attn.py": "e33f2c8c83c5c7d3a2919c11ac00b8e5e5494cba8354ea121fcdfcae18d4f068",
+        "arctic_platform/model/implementations/layers/cp_mamba.py": "f01bc676a7d88e2438448009966a3ce559e074786b1a716dddf7f6b293d52a05",
+        "arctic_platform/model/implementations/layers/mlp.py": "f44011c9615f0a90127ae89efbb4cfc5b7b10cc5726e18d8ec71315dd40fdff1",
+        "arctic_platform/model/implementations/layers/norms.py": "66f8d7f3b0572da14df1a084b2ffcb5a7238da79918c2c69b38b4f7352fec771",
+        "arctic_platform/model/implementations/layers/rms_norm.py": "c8afafe5b4836db11571f8f71e4791f8e83fa2afc3b30ab6b59fa6365594d980",
+        "arctic_platform/model/implementations/layers/rotary_emb.py": "9806b0e3e79dd4b507695d4c2f717b7749cf14e64aec979f3a188e7adadf428b",
+        "arctic_platform/model/implementations/layers/sequence.py": "90c6d1176c0417fe6a05d250066c9971b8da9b0db15b075bcf7ca24b7421c07b",
+        "arctic_platform/model/implementations/minimax_m2/__init__.py": "d09efa98bedd35b9985899efc0e02df68ca59a09ebcdc96a47bf3d5ebe40eebf",
+        "arctic_platform/model/implementations/minimax_m2/configuration_minimax_m2.py": "3f67d0a07d6189eaa245dfd44689f22834a120c18426bf37477861948d48e405",
+        "arctic_platform/model/implementations/minimax_m2/converting_minimax_m2.py": "be894939f3da7c1aa60e25088bb6add359c7ce579ce4c1ac48a0605ccbfe7030",
+        "arctic_platform/model/implementations/minimax_m2/modeling_minimax_m2.py": "d24afe5cb355cfb3dea515c7852c0a585a7f14c7360ffc3cdafd4db2479697c3",
+        "arctic_platform/model/implementations/minimax_m2/vllm_weights.py": "4b6449dcfb745148d48bea3e4302ed38922b768799c5b4b1251c0324a278dfdb",
+        "arctic_platform/model/implementations/moe/INTERNAL_COMMIT.txt": "6042847323d3f38eba0c26229ddcd6b1a6b97c181500b3baa6850ec0a4ecf3ee",
+        "arctic_platform/model/implementations/moe/NOTICE": "02e9dc9db4e4b249334678d6e2d92313925c901200fa794084a9846076e93f3d",
+        "arctic_platform/model/implementations/moe/__init__.py": "95fe4e41e9774718bfd7488c056373e87f31eb2e14b61c065f2d39b830dcbc8a",
+        "arctic_platform/model/implementations/moe/base.py": "f09367707212ea1da5781e5e397a7c2810ff389c987de7cf07366deb69395194",
+        "arctic_platform/model/implementations/moe/config.py": "6d8ca034428084af6d0cc4df495efd4d5f5972fea24f9ee7bbeec80a2c8cc6fd",
+        "arctic_platform/model/implementations/moe/config_validation.py": "9373c2c2fa81b0942405dfde2113ef871f7f9b0f0a29ce727ad05df524202325",
+        "arctic_platform/model/implementations/moe/conversion_cache.py": "9352f67a061b27d709c259d244fc2c9d54cbb150f9a3afce971a80a9713eaccd",
+        "arctic_platform/model/implementations/moe/deepspeed_integration.py": "a115e9f1d4d69c2779fab7ef1e30e66fd4c70b9d5cbf082b7c088880960b8aee",
+        "arctic_platform/model/implementations/moe/distributed/__init__.py": "08871cbb38a903c2d3a20761f32224efe9d2a8680cabefa928321833435410d9",
+        "arctic_platform/model/implementations/moe/distributed/deepep.py": "c8c8a04731f780fb6082059e4dc8a58baba4801ee9166f9e44300c1feeaa9295",
+        "arctic_platform/model/implementations/moe/distributed/ep_backend.py": "95919dadb479035c1ab881c703768286b4c0147dc8bd80daed263f688f79b4d3",
+        "arctic_platform/model/implementations/moe/distributed/expert_parallel.py": "7e0686a0a1e9d18c168ec5d28a6998fe3789c5243ce27135010d6d85970f98c4",
+        "arctic_platform/model/implementations/moe/distributed/token_permute.py": "a4bbbef92322da38ff68185e7b9ac71ebd73d6e90cc84203fd7179601112a1b0",
+        "arctic_platform/model/implementations/moe/distributed/uccl_ep/__init__.py": "1dbeb0349ef2b5ff7cd6a31ebb0ccf605b897b812dff2bcfe2a40a2424d18140",
+        "arctic_platform/model/implementations/moe/distributed/uccl_ep/bootstrap.py": "c4913ecf8c7e69578c31942e53aad68832c1ccd0924dcdcad666483bcb9eafd0",
+        "arctic_platform/model/implementations/moe/distributed/uccl_ep/buffer.py": "d48a01db6b82bd7553451e168c6543998af25a02a4c5381b84de4576d6d3d7a6",
+        "arctic_platform/model/implementations/moe/distributed/ucclep.py": "79dc717885a80c09081bb19144be455fbce4a44f34ff6757aaa12da0566cc523",
+        "arctic_platform/model/implementations/moe/layers/__init__.py": "97e8087613e17a61cf5e6e0c083d8697b3e7a4869dfe14e69055c157b61fdb89",
+        "arctic_platform/model/implementations/moe/layers/checkpointing.py": "1745f45a101e9673764ba47de7eac764cb00d8cef5b738dce4b277947af13bc8",
+        "arctic_platform/model/implementations/moe/layers/lm_head.py": "07485717b15f98ea4fdc796f609dc0234ee07607fbb7787ff11f8501c6445089",
+        "arctic_platform/model/implementations/moe/layers/moe.py": "aa1ac196b78a0d95b1ff2dd56aa613c44eb4752724b63ad9e17bc6ff7527d873",
+        "arctic_platform/model/implementations/moe/logging_utils.py": "c3d833c84c91ab4a5e17984e4544cfaeed98605383c19b9a527e125c8918cf75",
+        "arctic_platform/model/implementations/moe/parallel_dims.py": "fc3bdd496a6ecf3ac749363b70ad1d0a5f4b99a5a3eab26d4e00e2aae73b4282",
+        "arctic_platform/model/implementations/moe/sequence_parallel.py": "8ef4c008823142a81c16c7460bb72484d303427986e758d39a29af0fed813e90",
+        "arctic_platform/model/implementations/moe/token_combine.py": "b3ae2dfdfb3ba5e26991c67dc8c98f58ed3d7f389b1cc06f7ac6cef291826708",
+        "arctic_platform/model/implementations/moe/vllm_weights.py": "3e11b127cf8b0351a8a40339f65c907a5bed69c1f154a32d991131c1568553c9",
+        "arctic_platform/model/implementations/moe/vlm.py": "2aee3c148990ee6989b604f3a74f05e8a7ce6aab6326ca3bb4bd368d36645fec",
+        "arctic_platform/model/implementations/moe/weights.py": "feff4eac7170f65a590eb42d3a0dfac9e904867381fe044a9c1f5b3862216c54",
+        "arctic_platform/model/implementations/moe/world.py": "014ce19765d80c4ffc6e67eb87017f5e8c4b2d096347932f9a58c30f6ee763db",
+        "arctic_platform/model/implementations/nemotron_h/__init__.py": "7a7bfabb1bb36d430ad8d9bf61198aa4da6ff4436ce80deb172b854b230b0192",
+        "arctic_platform/model/implementations/nemotron_h/configuration_nemotron_h.py": "661794f8a9a42eb0abccd977c774ebe0d6a8bf3ef1ee9f56e473419a7427842a",
+        "arctic_platform/model/implementations/nemotron_h/converting_nemotron_h.py": "b32636f5cf41e19f89ce8227224f3ccb72ea6bc40bd52bfa1fafc24000e6d69d",
+        "arctic_platform/model/implementations/nemotron_h/modeling_nemotron_h.py": "738318e599ee32bd2446c60d46153504e2120f43cf79e6167c681caf25f97021",
+        "arctic_platform/model/implementations/nemotron_h/vllm_weights.py": "1397252d504bf917993045245fb702304b9a4153b272c13a19c2169a53e7886d",
+        "arctic_platform/model/implementations/qwen35/INTERNAL_COMMIT.txt": "6042847323d3f38eba0c26229ddcd6b1a6b97c181500b3baa6850ec0a4ecf3ee",
+        "arctic_platform/model/implementations/qwen35/NOTICE": "12ad7b6b4573344e92f259bd9ae138e151a5065b14e89208069a404d0b8da5bb",
+        "arctic_platform/model/implementations/qwen35/__init__.py": "4e179de2e6a3976caca9e76c24273b9e1862d5e5e02de6dd2cc35815b774d9c5",
+        "arctic_platform/model/implementations/qwen35/config.py": "fbc0cafe746b503d1483bee8eb6bf7b3c7aad601cf85e8a561b6f3a0e11f8ac3",
+        "arctic_platform/model/implementations/qwen35/config_validation.py": "926cba6c637c141c35945cc601a4e949447f9c5df9194ec237172cb65c95452f",
+        "arctic_platform/model/implementations/qwen35/conversion_cache.py": "71fd971369aee683ab7cea8013dac6aa38ed1311b524f94b7f9afab5a0eb4f97",
+        "arctic_platform/model/implementations/qwen35/deepspeed_integration.py": "a8963ab03a903099f97b8d08f82be3c79705f3ff256f0d506f38dbceafa8f9c9",
+        "arctic_platform/model/implementations/qwen35/distributed/__init__.py": "f4f63aef417d45bd86509dcd1e38b437b8cba9769f029cfbf577cf9c4d6e8298",
+        "arctic_platform/model/implementations/qwen35/distributed/deepep.py": "6546c4a71cc2c06b5909bce62dea566bf4560b72bca26866cef61ea2b237ffa8",
+        "arctic_platform/model/implementations/qwen35/distributed/ep_backend.py": "d8dff4b1335189a1f8133d92b3142b1d5515e64124d90443b98c1d6d0523e327",
+        "arctic_platform/model/implementations/qwen35/distributed/expert_parallel.py": "f708d3b2746edea8e1737b80ac94691d75c69bf2327865cf27435be7da32e373",
+        "arctic_platform/model/implementations/qwen35/distributed/token_permute.py": "783c844b1fa9225ad58f76136c805c7d61cdd9ea50c9365b7daa534819b83bd8",
+        "arctic_platform/model/implementations/qwen35/distributed/uccl_ep/__init__.py": "a83399f84ad4bdf78427308454e59de8aadd4904ed29c347f666be176975c3bd",
+        "arctic_platform/model/implementations/qwen35/distributed/uccl_ep/bootstrap.py": "d15e0e747cd1b7db7de3ba5affaacce1a3766886a5bc23e5dcd967587e3f9af4",
+        "arctic_platform/model/implementations/qwen35/distributed/uccl_ep/buffer.py": "ffd6c5281ccca53aa6e8d30839283b1dd10dcd52d030096c4b46ee16330f1e7a",
+        "arctic_platform/model/implementations/qwen35/distributed/ucclep.py": "69b24fadbd64c30d2511bf88fb4ed61a2e8aaade4f9bcfbfa2add3e839a39fa1",
+        "arctic_platform/model/implementations/qwen35/logging_utils.py": "53baf5a20184935d7c447763e414379f5656fa9d4d99d0e4f686a4a0128aa190",
+        "arctic_platform/model/implementations/qwen35/model_builder.py": "6676df2538b28df47adc02e5d868945709b6ad121e4a6488c544741cecdac37d",
+        "arctic_platform/model/implementations/qwen35/models/__init__.py": "6457e2e4abd3db7eb87ea4375df34a35056b2a2c9262ee69f0ce846a2d213486",
+        "arctic_platform/model/implementations/qwen35/models/base.py": "b180ba089ce34fdbffab2086e86d960c182928b2c5567f482990f0d3224313f5",
+        "arctic_platform/model/implementations/qwen35/models/layers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "arctic_platform/model/implementations/qwen35/models/layers/checkpointing.py": "d0615827abf2e7428fdf7ae81229fa208570480bf0a493fc0ddeb5c09cb6cfde",
+        "arctic_platform/model/implementations/qwen35/models/layers/lm_head.py": "5c091fe88ffcb45d3f5dd5301cca08ce0bbce78c5e1c8a31fc2e60043817163b",
+        "arctic_platform/model/implementations/qwen35/models/layers/moe.py": "57b2ec091835b87610c253a8370a1d6d52187fa1d63ec1195392dafe7e9f2186",
+        "arctic_platform/model/implementations/qwen35/models/layers/rotary_emb.py": "674c54c086868935dbd64698a761b37e84fdb6b04ab232bc3f3792aa43e84595",
+        "arctic_platform/model/implementations/qwen35/models/qwen3_5_moe/__init__.py": "ef9c8b3965bb4d093b9fe623ea85f6b2dbae07d2bf551df1f5c9cc6778dab648",
+        "arctic_platform/model/implementations/qwen35/models/qwen3_5_moe/configuration_qwen3_5_moe.py": "070b5e1113826efa342f3f8da365a7918c5f897b77ae24eac74476af0be78b9c",
+        "arctic_platform/model/implementations/qwen35/models/qwen3_5_moe/converting_qwen3_5_moe.py": "bb2d510c530fb2bce58bbc0b2e51d33a18032b049275b5decf46f297e7b8c8bd",
+        "arctic_platform/model/implementations/qwen35/models/qwen3_5_moe/modeling_qwen3_5_moe.py": "069880acdabf274fc101fe6888d423302d3d34295bd07abc14b892785e17f911",
+        "arctic_platform/model/implementations/qwen35/parallel_dims.py": "663f5e5a0b591400639e5ef749e64115849f4a604aaefbd6c8beb6680c53c6c9",
+        "arctic_platform/model/implementations/qwen35/sequence_parallel.py": "41418f4c43e257c408d50ee68b65493a0e7a3b64e9ef4b0978f553d600ca3d53",
+        "arctic_platform/model/implementations/qwen35/vlm.py": "e485453df354d6ff6cfa14b11b3d31b26d227083738068c2a5a98da7a263b852",
+        "arctic_platform/model/implementations/qwen35/weights.py": "26641ef80aafa7f3a8e2762776bf46af641ba1e52c6f8ffc3393802737138102",
+        "arctic_platform/model/implementations/qwen35/world.py": "e478a59854d8714d8c1888fe641e0a414c5a4a18915ecb327dc52df65af9972d",
+        "arctic_platform/model/implementations/qwen38/__init__.py": "437955377e0630a1c4e8adccac5de85a98fa1f22500278ae89ac34bfc4719d3b",
+        "arctic_platform/model/implementations/qwen38/context_parallel.py": "d2231725785b7373d35910048b49112864c2a44c66fa74aafa34fce98d7bc947",
+        "arctic_platform/model/implementations/qwen38/converting_qwen4_exp.py": "abb218399bf6987c941af2d14302a8e46ff654f03dfa3f0c19ae1f4a7fb8e50d",
+        "arctic_platform/model/implementations/qwen38/deepspeed_integration.py": "82e6f10a664e64369be0254c81c3b77625cc4d4fc974f72f5411ed392c4ab3c5",
+        "arctic_platform/model/implementations/qwen38/modeling_qwen4_exp.py": "a4a6b4852bf99f87b9114f222b29ef03851feb2aeb961495de6f650609c54b10",
+        "arctic_platform/model/implementations/qwen38/qsa_flex.py": "3d810ac0e54cd33cf3a191f684892794e8dc7ebdef10dabcfed25756282c6f95",
+        "arctic_platform/model/implementations/qwen3_moe/__init__.py": "3ffa0cc2da9e2acae84d99784eb323e98789e520abd528727966c52d5b9b9d65",
+        "arctic_platform/model/implementations/qwen3_moe/configuration_qwen3_moe.py": "faef1b968338f15f374c0de6aab1986d3ace2d809249fca760bc1c39ea872aaa",
+        "arctic_platform/model/implementations/qwen3_moe/converting_qwen3_moe.py": "51cfa71962715701fbc49ce44830a1e8cb31b0c966287ef661b9c9b9008c5c9b",
+        "arctic_platform/model/implementations/qwen3_moe/modeling_qwen3_moe.py": "051d396688b83fb008159aa9dd6aaf4b968c99a6f16ea3d3165961ffc4c4d084",
+        "arctic_platform/model/loader.py": "e2128f9f16e7c0b6f1efc41191721c1a00ffb0835e5d8d7ef84814ae810b6cd3",
+        "arctic_platform/model/loaders/__init__.py": "d969b74f012bd978cd016a65e9d8c03bd0f4e7af06afe039d738c3e7ea0fed8e",
+        "arctic_platform/model/loaders/flash_moe.py": "7407d10af7182d27b88f53839812ff1184311bf19da297ca759ff603a5b47736",
+        "arctic_platform/model/loaders/generic_moe.py": "5341cfc4181d4a9e73753bb2f85b14976e23497db4e9907837841efd945b0374",
+        "arctic_platform/model/loaders/glm_moe_dsa.py": "9c25477fa882c32f2602461428a4468ee0d90c0ccacd685ece67c52d6e64d5ff",
+        "arctic_platform/model/loaders/huggingface.py": "e830b73feac7b49a6186f671195374a74e033d6cd7702b9f00597cbb43955b50",
+        "arctic_platform/model/loaders/qwen3_5_moe.py": "991a94d4f6bf42a53717575aba9b2b60be7f8f3d2bbfc3b7cd64aa4850a89e78",
+        "arctic_platform/model/lora_initialization.py": "2e4a9a5c3eefdf8230e425165117ce571033a94720e7aa206f86473eaa993549",
+        "arctic_platform/model/patch.py": "a6e72a5dd510faaa8513abbb217ff3a32dcbc42e6c06188a0823b2135b41b355",
+        "arctic_platform/model/patches/__init__.py": "471b99b8ec01339f1b3e1c4fb2f7ef85b472ca823c4aa6640fde1b0120794025",
+        "arctic_platform/model/patches/activation_offload.py": "0f38496456f16533d0e480994e9052327fe88df76dae750820a8fafac300ed2e",
+        "arctic_platform/model/patches/compile.py": "1673583cd511b5d12d753343aa66cd7ebaccbd5ad63e21a30dcfc539505ae64b",
+        "arctic_platform/model/patches/gradient_checkpointing.py": "c899b59368a6f853fd54fbd5c41dcb64d263a7d09f02fdf9d8831506214b34f3",
+        "arctic_platform/model/patches/liger.py": "4ff8f75aafdac881e6c495de4a6b010d2243476fa857f81baa336801b1c7e1b0",
+        "arctic_platform/model/patches/lm_head.py": "df0c2dee81c1a43a8f55ea9e43bcd6d71cb265fe5d5670fed92dc612a128a91c",
+        "arctic_platform/model/patches/peft.py": "1feca6cf71f2d831382936a1c4a0a31662283ac6d7700f0628a38e0ce69202d1",
+        "arctic_platform/model/patches/tiled_mlp.py": "617803f1f97599ceb93ae6868231e9b51143a3efbb28fc72bd6728fac087cbf0",
+        "arctic_platform/model/patches/utils.py": "119c74072ad81d04999d5f0d70d4d26293483531db9ae7a99df3d28b5b3fbd64",
+        "arctic_platform/model/patches/zorro_train.py": "eabb3f2b967a8810f23e8f4113d3b94bf682051af87fb82a9713afebb31fc786",
+        "arctic_platform/model/weight_export.py": "bcd8102398776d5a67680272db78c7e518cfb84527560bc5a07bab112aa15b9f",
+        "arctic_platform/registry.py": "303907ca1d4905eb63789c3cad7c4934e1daa705bd2a3ff4c2c365af60e79b9f",
+        "arctic_platform/rl/__init__.py": "ce10dd2d5fbee27cc53470866728473785b0f59a61b528e762818c376d5b61ce",
+        "arctic_platform/rl/client.py": "53ffc81f02ab73d15b9eef11191b9f8c16b65cf8948f7074fecc09695fb2dcc8",
+        "arctic_platform/rl/config.py": "20eecebb4e97b9c931e5f28f09967435a9b609cb677c964abacaee1c5bd4b0ea",
+        "arctic_platform/rl/deepspeed_worker.py": "c6224f940b9fbc175ddd52457cbf2a2ee28db9efb4191f062f402e0bab31de97",
+        "arctic_platform/rl/examples/inference_example.py": "45765115deca9bfa3a21c4b089713b33fcf8e62d5679bf47927e8014fa38b5b6",
+        "arctic_platform/rl/examples/local_server_example.py": "318f3e9877753a8783dd55cdad2271ceb7559cf8b285fa4a0c16e452ce92c7eb",
+        "arctic_platform/rl/examples/weight_sync_example.py": "730f21a9ebcc16d86f425d66853214358972e33246205f567a47c3fdf4769f4f",
+        "arctic_platform/rl/processors/__init__.py": "4681ecf1f614312b99905a9fb0498027d26bc38d3891821e43fa1727be8e8cb4",
+        "arctic_platform/rl/processors/base_loss.py": "470745099c0d2d5c72a8ce29f8870d16399db1aa53bbc5e5b2146188a95e8673",
+        "arctic_platform/rl/processors/causal_cross_entropy.py": "4713ff9b3fbd8aa4ea0512fdd2c2a5c6a296cc36919d531a0538107fdeede30a",
+        "arctic_platform/rl/processors/compute_logprobs.py": "1334c086dc426c72971e34b844cfae4de11ff0186079942dc05d27cc6fd176e7",
+        "arctic_platform/rl/processors/cortex_grpo.py": "5e52987e327fca408af6d160ef3cf8838ac5a28cb20907095d6581cb8dd9fd12",
+        "arctic_platform/rl/processors/functional.py": "97db117f86d1b53ae07c892377e0412050b1f7484ee6ad7c8011a1f4c1c78b96",
+        "arctic_platform/rl/processors/grouped_distillation.py": "f014223de7767879dcbc8e90656ec18af7d2859956db70386187eb4cf9eaaac0",
+        "arctic_platform/rl/processors/grpo.py": "4445d7adfab92b6823c4e8fa881671a10e29094e09646ec387e66c0c8b6cd9b3",
+        "arctic_platform/rl/processors/microbatch.py": "7e3762b1d15ba3e0de48123cd9414bcaa01778afcdc1bfa374cf4c86091e6e7b",
+        "arctic_platform/rl/processors/packed_reduction.py": "4e7c4029a671e38bc128007169e06e84cb2e3dc75745c04a0629c69060ad5f86",
+        "arctic_platform/rl/processors/packing.py": "ecf45ea4d5343b0da5e92adcdd06b73d2af8f2adb5a2f300a62dcc987dd0bbfe",
+        "arctic_platform/rl/processors/pipeline.py": "03215dc167203d1b6d9f09e1080b82742d8e94e406ab83612a28684cbd664299",
+        "arctic_platform/rl/processors/sft.py": "620c7b13925b408ec9c1bb93dc7a3efeeafa474dea98a8d881bee8bb2b34ac81",
+        "arctic_platform/rl/processors/stats_tracker.py": "5ba87a62eb923af00581805e5b6e23571f6166a518d0942fcf098762eb81421b",
+        "arctic_platform/rl/processors/verl_grpo.py": "a9976263d2e996c1e26f6903adb47402ea129d33649cd51f08dd015d22f86db1",
+        "arctic_platform/rl/ray_client.py": "2db0fabbaf401180afe45c38fd39e239d8d27279550cb79a2291b5f7ab5687a7",
+        "arctic_platform/rl/ray_cluster.py": "284f244964b035a6f393fc9f0da1d850f84ee5388c8fa55337d67c2dc146082e",
+        "arctic_platform/rl/ray_server.py": "cd4d0e8a077f05dee82628295354142e8f0068c418397729e89cda4069fe4e12",
+        "arctic_platform/rl/server.py": "da8aa7e4c6e24f840d89b8d3edef8ac60c47e6bfd75da54a3ef52c882733ceb9",
+        "arctic_platform/rl/utils/__init__.py": "9d70269baa1f87d35a43c9d01aec25710a5188c80279ed148c9069f21e038847",
+        "arctic_platform/rl/utils/batch.py": "4e479efbbb92b966d045ab208669fd84c58c4c9b1a7745961255b87b967f09c8",
+        "arctic_platform/rl/utils/cuda_ipc.py": "87bb74d7343dbb56ec9ce46fcfe9ee1e123e797bed489a80bbac67ba032eafae",
+        "arctic_platform/rl/utils/debug.py": "7b5ace2bfd89996a4d82164a0ad351afed330c0eccae5970ddc2c8c553cbfe75",
+        "arctic_platform/rl/utils/ray_pg.py": "6780233bfe0162984abd6a171c6d4d5a60c9563fe455e4515fff6b3218d1767e",
+        "arctic_platform/rl/utils/record_replay.py": "8f4953734882c0b12e281db72365ae3f1ac65edf6a0db34162c083c567124c64",
+        "arctic_platform/rl/utils/server_models.py": "53591566767ff8a16587199a4d9b1790971664ece18af42a2a595a095d08d2ee",
+        "arctic_platform/rl/weight_sync.py": "d4d593f2760a8a201ac8d185a73b7752a0f3c7aa8d5faf8d7accb88a44620cfd",
+        "arctic_platform/rl/zorro_train/README.md": "1e2c2f7023658138b88b613eecf692537acfa2a9ba708a9a7bb96230f2fbcb3a",
+        "arctic_platform/rl/zorro_train/__init__.py": "4d0495200780764b13d3ac6ec31789777f597b49276b34dc7e8615b275f904aa",
+        "arctic_platform/rl/zorro_train/actor.py": "c2152820b03ce6720cad6d3b773bbdb5b6f386ea1d7c16a7d7f62c39d31df4bd",
+        "arctic_platform/rl/zorro_train/demo.py": "43d912b8f804a6a822a5a50036278c9398a2308aec87ff65922e0210cac12ff6",
+        "arctic_platform/rl/zorro_train/module_patcher.py": "5d139108296f7ae19be1caa4f7b3a001f042862e1eacb5a38687955dd55a3180",
+        "arctic_platform/rl/zorro_train/qwen_attention_patcher.py": "13b3c60dba50b01fa47940aeab4226dfcdf4c5a5df8f36c6197e59fe1d58359b",
+        "arctic_platform/rl/zorro_train/qwen_model_patcher.py": "39d1751fa2446102e1c777d87e58e4c7811b278f6f1cb25b93e3e7cd77d188ca",
+        "arctic_platform/rl/zorro_train/seqlen_balancing.py": "daf2e182a7e4b23c454c1768bfeb42d1caf900b81449b928ec2e0209024202f5",
+        "arctic_platform/rl/zorro_train/test_perf-g1.sh": "9f90c5255e39d3c66efdf9238135049cbbc4b1a3ea9ca0adb814af5cf8ef6e04",
+        "arctic_platform/rl/zorro_train/test_perf-g8.sh": "8fbea8616318c489f099fcb2a5a3a474d8f32803c98ff834e9a9c257e1767cc5",
+        "arctic_platform/rl/zorro_train/test_perf.py": "89825b7c74b85d2c2c3556849af8efa18069b742787975977fc4afd02407cc76",
+        "arctic_platform/rl/zorro_train/tests.py": "72104c1484e0ff005f334a4d72727fff0aac4403d075386e409a5050da12cbdf",
+        "arctic_platform/rl/zorro_train/zorro_train.py": "830ea164ea321f7f7a4d5822ad44fba67c1edc4925e4296eb214f64f226405ee",
+        "arctic_platform/sft/__init__.py": "dfc62bb96997dd23b35e27103c9875c1cb213492244a981c69384e412afa84df",
+        "arctic_platform/sft/examples/__init__.py": "968ae11ed35c09a54df46f71e85c70746211cda0bc5f365c4a46d4456497ce97",
+        "arctic_platform/sft/examples/run_sft_ckpt_resume_demo.py": "532c5558bc84d0805fa0712ed399853238c4a019df22951e6d5d57d0f0e013f9",
+        "arctic_platform/sft/examples/run_sft_demo.py": "cc30099840a804fb000dd1e487b3e818780581baf89026153d2d57734f799e8c",
+        "arctic_platform/sft/examples/run_sft_generate_demo.py": "8f8fdc8898654c9be9d2c4ca907f808061c499066265216511083a4549131429",
+        "arctic_platform/sft/examples/sft_example.py": "cf316b48fde05f02e2092e80fc665a9b7bf3b8633b2e179c163b91eec6836bf4",
+        "arctic_platform/sft/processor.py": "f6d73987d795b996dd3ed6fed86cc04184bd568e3bed151360ef04950602a25f",
+        "arctic_platform/sft_profile.py": "d8e21207c47975f738ab5ed843e08ce0ecf78de5bcb19d7fc6c12cdeac207bf3",
+        "arctic_platform/testing_utils.py": "1fb6224af8efa395e1ff3ca9bdfd66c9d687c1b8f0a8af232397d744e8c92fd3",
+        "arctic_platform/wire.py": "e48e42328ba32dcef4ff8b787f53353d7ae35fab48a3ae1026873def38067e17",
+        "hatch_build.py": "ab751d3d119296e434185eeb6ae6d52df99e3564b1a025a699a3962c6a9d1796",
+        "pyproject.toml": "bf1a717197f6ed59ee82b7f8d9d59cb72ac169d6170cc9b0ca8fcc0580b1e178"
+      },
+      "initialization": {
+        "adapter_config_sha256": "97e0bc3fa11393f1c28cba22e6cc69f82c37a90e96078a44e9a9587fa09cb07d",
+        "initialization": {
+          "byte_order": "little",
+          "cast": "torch.Tensor.to(output_dtype)",
+          "generation_dtype": "float32",
+          "generator": {
+            "algorithm": "torch-cpu-mt19937",
+            "device": "cpu",
+            "torch_version": "2.13.0+cu130"
+          },
+          "global_seed": 42,
+          "identity_sha256": "97e96740c80629c63bcd24939850dcbf64d3d57e7f182e3e75940403476dd722",
+          "recipe_version": "arctic-correctness-lora-init-v1",
+          "seed_derivation": {
+            "domain": "arctic-correctness-lora-tensor-seed-v1",
+            "encoding": "canonical-json-utf8",
+            "hash": "sha256"
+          },
+          "tensors": [
+            {
+              "distribution": {
+                "a": 2.23606797749979,
+                "fan_in": 2048,
+                "mode": "fan_in",
+                "name": "kaiming_uniform",
+                "nonlinearity": "leaky_relu"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_A.weight",
+              "seed": 5182619603970100322,
+              "sha256": "5d8e52c54810e28b14ba1ad1352a1441ee47eeab0976b5fb9ebdc0e20a610867",
+              "shape": [
+                32,
+                2048
+              ]
+            },
+            {
+              "distribution": {
+                "name": "zeros"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_B.weight",
+              "seed": 5089244249540156962,
+              "sha256": "774f374fa2625c9c7245dec2a88f5ac5995aa7262c8a8d917efeda94aaeffdbe",
+              "shape": [
+                512,
+                32
+              ]
+            },
+            {
+              "distribution": {
+                "a": 2.23606797749979,
+                "fan_in": 4096,
+                "mode": "fan_in",
+                "name": "kaiming_uniform",
+                "nonlinearity": "leaky_relu"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_A.weight",
+              "seed": 7748419240668440308,
+              "sha256": "77f7f41f7ea8b65a4ed11279d6f66a0af2bea0ff5ba94b0c7339c08ebe7537ab",
+              "shape": [
+                32,
+                4096
+              ]
+            },
+            {
+              "distribution": {
+                "name": "zeros"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_B.weight",
+              "seed": 2831338380554949925,
+              "sha256": "b0fe99f12b53c382aea8bc1b43db3a7d3636bf7ab66b407a265450f0694d1021",
+              "shape": [
+                2048,
+                32
+              ]
+            },
+            {
+              "distribution": {
+                "a": 2.23606797749979,
+                "fan_in": 2048,
+                "mode": "fan_in",
+                "name": "kaiming_uniform",
+                "nonlinearity": "leaky_relu"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight",
+              "seed": 1898039738343172760,
+              "sha256": "d756b693d76df5988816b0a2031f8bb0bf4b55642daa48d7cd7265b5bf3bf4ec",
+              "shape": [
+                32,
+                2048
+              ]
+            },
+            {
+              "distribution": {
+                "name": "zeros"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_B.weight",
+              "seed": 5618630516340738346,
+              "sha256": "8aba44dcabdfc6e8be06beb7575d15163b1503ecfecf9f385bff0981181e3acd",
+              "shape": [
+                8192,
+                32
+              ]
+            },
+            {
+              "distribution": {
+                "a": 2.23606797749979,
+                "fan_in": 2048,
+                "mode": "fan_in",
+                "name": "kaiming_uniform",
+                "nonlinearity": "leaky_relu"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_A.weight",
+              "seed": 5197162602443826036,
+              "sha256": "d12a0485172b66b9f35a65774cf14ba86b8236d97b2d64f0fc47b1ea54ee95a1",
+              "shape": [
+                32,
+                2048
+              ]
+            },
+            {
+              "distribution": {
+                "name": "zeros"
+              },
+              "dtype": "bfloat16",
+              "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_B.weight",
+              "seed": 4516647892410096713,
+              "sha256": "312b24e5fd69453689726a066c548171ec13c84a1c46462f2d1fd42728e04c05",
+              "shape": [
+                512,
+                32
+              ]
+            }
+          ]
+        },
+        "initialization_policy": {
+          "adapter_dtype": "bfloat16",
+          "base_dtype": "bfloat16",
+          "expected_factors": 8,
+          "expected_optimizer_norms": 24,
+          "identity_sha256": "77930e5cb4562e5ab67b5a867e0b8304771b87efff5f76d12075866b754117a5",
+          "initialization": {
+            "byte_order": "little",
+            "cast": "torch.Tensor.to(output_dtype)",
+            "generation_dtype": "float32",
+            "generator": {
+              "algorithm": "torch-cpu-mt19937",
+              "device": "cpu",
+              "torch_version": "2.13.0+cu130"
+            },
+            "global_seed": 42,
+            "identity_sha256": "97e96740c80629c63bcd24939850dcbf64d3d57e7f182e3e75940403476dd722",
+            "recipe_version": "arctic-correctness-lora-init-v1",
+            "seed_derivation": {
+              "domain": "arctic-correctness-lora-tensor-seed-v1",
+              "encoding": "canonical-json-utf8",
+              "hash": "sha256"
+            },
+            "tensors": [
+              {
+                "distribution": {
+                  "a": 2.23606797749979,
+                  "fan_in": 2048,
+                  "mode": "fan_in",
+                  "name": "kaiming_uniform",
+                  "nonlinearity": "leaky_relu"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_A.weight",
+                "seed": 5182619603970100322,
+                "sha256": "5d8e52c54810e28b14ba1ad1352a1441ee47eeab0976b5fb9ebdc0e20a610867",
+                "shape": [
+                  32,
+                  2048
+                ]
+              },
+              {
+                "distribution": {
+                  "name": "zeros"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_B.weight",
+                "seed": 5089244249540156962,
+                "sha256": "774f374fa2625c9c7245dec2a88f5ac5995aa7262c8a8d917efeda94aaeffdbe",
+                "shape": [
+                  512,
+                  32
+                ]
+              },
+              {
+                "distribution": {
+                  "a": 2.23606797749979,
+                  "fan_in": 4096,
+                  "mode": "fan_in",
+                  "name": "kaiming_uniform",
+                  "nonlinearity": "leaky_relu"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_A.weight",
+                "seed": 7748419240668440308,
+                "sha256": "77f7f41f7ea8b65a4ed11279d6f66a0af2bea0ff5ba94b0c7339c08ebe7537ab",
+                "shape": [
+                  32,
+                  4096
+                ]
+              },
+              {
+                "distribution": {
+                  "name": "zeros"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_B.weight",
+                "seed": 2831338380554949925,
+                "sha256": "b0fe99f12b53c382aea8bc1b43db3a7d3636bf7ab66b407a265450f0694d1021",
+                "shape": [
+                  2048,
+                  32
+                ]
+              },
+              {
+                "distribution": {
+                  "a": 2.23606797749979,
+                  "fan_in": 2048,
+                  "mode": "fan_in",
+                  "name": "kaiming_uniform",
+                  "nonlinearity": "leaky_relu"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight",
+                "seed": 1898039738343172760,
+                "sha256": "d756b693d76df5988816b0a2031f8bb0bf4b55642daa48d7cd7265b5bf3bf4ec",
+                "shape": [
+                  32,
+                  2048
+                ]
+              },
+              {
+                "distribution": {
+                  "name": "zeros"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_B.weight",
+                "seed": 5618630516340738346,
+                "sha256": "8aba44dcabdfc6e8be06beb7575d15163b1503ecfecf9f385bff0981181e3acd",
+                "shape": [
+                  8192,
+                  32
+                ]
+              },
+              {
+                "distribution": {
+                  "a": 2.23606797749979,
+                  "fan_in": 2048,
+                  "mode": "fan_in",
+                  "name": "kaiming_uniform",
+                  "nonlinearity": "leaky_relu"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_A.weight",
+                "seed": 5197162602443826036,
+                "sha256": "d12a0485172b66b9f35a65774cf14ba86b8236d97b2d64f0fc47b1ea54ee95a1",
+                "shape": [
+                  32,
+                  2048
+                ]
+              },
+              {
+                "distribution": {
+                  "name": "zeros"
+                },
+                "dtype": "bfloat16",
+                "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_B.weight",
+                "seed": 4516647892410096713,
+                "sha256": "312b24e5fd69453689726a066c548171ec13c84a1c46462f2d1fd42728e04c05",
+                "shape": [
+                  512,
+                  32
+                ]
+              }
+            ]
+          },
+          "model_config_sha256": "14cc10f07d82945f7e855b726a1201d52cee82811119c5ddb186ff4adbdd237b",
+          "model_name": "Qwen/Qwen3.6-35B-A3B",
+          "peft_config": {
+            "bias": "none",
+            "lora_alpha": 32,
+            "lora_dropout": 0.0,
+            "peft_type": "Lora",
+            "r": 32,
+            "target_modules": [
+              "q_proj",
+              "k_proj",
+              "v_proj",
+              "o_proj"
+            ],
+            "target_parameters": [],
+            "task_type": "CAUSAL_LM"
+          },
+          "policy": "qwen36-reduced4-attention-bf16-8gpu-sp8-ep4-zero2-v1",
+          "process_seed": 1234,
+          "schema_version": 1,
+          "scope": "initialization-only-not-workload-identity-or-save0-proof",
+          "token_budget": 10240,
+          "topology": {
+            "ep": 4,
+            "gpus": 8,
+            "layers": 4,
+            "sp": 8,
+            "zero_stage": 2
+          }
+        },
+        "native_peft_autocast_adapter_dtype": false,
+        "recipe_version": "job5-sp8-bf16-full-reduced-workload-v1",
+        "schema_version": 1
+      },
+      "initialization_prerequisite": {
+        "all_rank_equality_proven": false,
+        "controller_sha256": "9af96aadba49d07e5a4c19b839c05ffb7649915ebdc3ef598c0161971adbb0f2",
+        "full_model_numerical_comparison_proven": false,
+        "initialization_identity_sha256": "97e96740c80629c63bcd24939850dcbf64d3d57e7f182e3e75940403476dd722",
+        "scope": "exported-adapter-pack-not-all-rank-equality",
+        "verified_tensors": [
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_A.weight",
+            "sha256": "5d8e52c54810e28b14ba1ad1352a1441ee47eeab0976b5fb9ebdc0e20a610867"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_B.weight",
+            "sha256": "774f374fa2625c9c7245dec2a88f5ac5995aa7262c8a8d917efeda94aaeffdbe"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_A.weight",
+            "sha256": "77f7f41f7ea8b65a4ed11279d6f66a0af2bea0ff5ba94b0c7339c08ebe7537ab"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_B.weight",
+            "sha256": "b0fe99f12b53c382aea8bc1b43db3a7d3636bf7ab66b407a265450f0694d1021"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight",
+            "sha256": "d756b693d76df5988816b0a2031f8bb0bf4b55642daa48d7cd7265b5bf3bf4ec"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_B.weight",
+            "sha256": "8aba44dcabdfc6e8be06beb7575d15163b1503ecfecf9f385bff0981181e3acd"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_A.weight",
+            "sha256": "d12a0485172b66b9f35a65774cf14ba86b8236d97b2d64f0fc47b1ea54ee95a1"
+          },
+          {
+            "dtype": "bfloat16",
+            "name": "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_B.weight",
+            "sha256": "312b24e5fd69453689726a066c548171ec13c84a1c46462f2d1fd42728e04c05"
+          }
+        ]
+      },
+      "materializer_sources": {
+        "author_inputs": {
+          "sha256": "40ce6a5729e9df635deb34fd15ff68642de1e8b704c0e35d0773bfaae18ecbd8",
+          "size": 5550
+        },
+        "helper": {
+          "sha256": "d59014ae2204603f7df74667b02b02f91d19f88ef7ea26b7cf601ea2cd15d5af",
+          "size": 29543
+        },
+        "initialization_policy": {
+          "sha256": "5e3c042da5023b44576cbcea061f57d7bfa5a5a09fbc356854d6ed8f317671f6",
+          "size": 7999
+        },
+        "meta_declaration_successor": {
+          "sha256": "5fdb0916b5d636f5d689df57b4deae28693ecdc809654d6465d44db39821e8f2",
+          "size": 18200
+        }
+      },
+      "meta_factor_dtype_declaration": "new-meta-adapter-leaves-only-bfloat16-v1",
+      "model": {
+        "assets": {
+          "config.json": {
+            "sha256": "14cc10f07d82945f7e855b726a1201d52cee82811119c5ddb186ff4adbdd237b",
+            "size": 2364
+          },
+          "generation_config.json": {
+            "sha256": "df6f86c3fdce573ecdb55cec35f502ddda70e70abe78288a78164aef120232e7",
+            "size": 214
+          },
+          "merges.txt": {
+            "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+            "size": 3353259
+          },
+          "model-00001-of-00002.safetensors": {
+            "sha256": "f1b8b3e3b88069952024877f3d25f0579f8e409adb58ec2efd7c8808dcc499ea",
+            "size": 4323955448
+          },
+          "model-00002-of-00002.safetensors": {
+            "sha256": "70083b2f43ee3e59b5ac49b81242af960b84e4017d5038c2cabbf7a5bcc23e25",
+            "size": 4570164640
+          },
+          "model.safetensors.index.json": {
+            "sha256": "fd2a4a6ec2c195de53483b36025ed898b097f2ce3d1c7ff26ab96d39c8702430",
+            "size": 9863
+          },
+          "tokenizer.json": {
+            "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "size": 12807982
+          },
+          "tokenizer_config.json": {
+            "sha256": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+            "size": 16718
+          }
+        },
+        "sha256": "79f31b8c99bc7f982eefac686dc45c6a9ca64c85c63e41dd4f36355611dd636a"
+      },
+      "optimizer": {
+        "config": {
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "lr": 0.0001,
+          "name": "AdamW",
+          "weight_decay": 0
+        },
+        "dtype": "float32",
+        "gradient_clipping": 1,
+        "learning_rate": 0.01
+      },
+      "process_seed": 1234,
+      "recipe_version": "job5-sp8-bf16-full-reduced-workload-v2",
+      "scope": "full-reduced-numerical-workload-not-original-full40-model",
+      "synthetic_inputs": {
+        "batch": {
+          "active_tokens": 34513,
+          "name": "gas1",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "a35336fd7d226f87483d8ca34de8917cf68fa3535bb2feb76cb5ddd4b0990594",
+              "shape": [
+                8,
+                8192
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "b7c07ed240669c7d5899cbf8361fc7b7dd390dfbe3dd8117941dd7e82749dd3c",
+              "shape": [
+                8,
+                8192
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "e1f6123da8e436a367c427cb4d9c816ed1bd795e5e3023326c4dc99fc6f21081",
+              "shape": [
+                8,
+                8192
+              ]
+            }
+          }
+        },
+        "max_seq_len": 8192,
+        "rows": 8,
+        "seed": 1234,
+        "version": "private-cpu-generator-v1",
+        "vocab_size": 248320
+      },
+      "target_topology": {
+        "ep": 4,
+        "gpus": 8,
+        "layers": 4,
+        "sp": 8,
+        "zero_stage": 2
+      },
+      "token_budget": 10240,
+      "training": {
+        "deterministic": true,
+        "fp32_lm_head": false,
+        "fused_cross_entropy": "liger",
+        "lm_head_token_chunk_size": null,
+        "lm_head_vocab_chunk_size": 8192,
+        "matmul_precision": "highest",
+        "mixer_packing": true,
+        "peft_config": {
+          "bias": "none",
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "peft_type": "Lora",
+          "r": 32,
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ],
+          "target_parameters": [],
+          "task_type": "CAUSAL_LM"
+        }
+      }
+    },
+    "reference_sources": {
+      "harness/batches.py": {
+        "sha256": "e6cec4f241cd67320d7eed44e1416a98072651bda18bbf0b47b72cc8ebb2a638",
+        "size": 6800
+      },
+      "harness/gsm8k.py": {
+        "sha256": "a6d9a188aa54d46db37c4f1e356f513991a9197d693bc31f41a79d5e9b768cac",
+        "size": 11802
+      },
+      "harness/names.py": {
+        "sha256": "f5867110783b0b4ca41217b5ec4c6fbddb8e833c92f4074ceaea5fae5e27e6a7",
+        "size": 8312
+      },
+      "reference/__init__.py": {
+        "sha256": "230f7960387fb7399cab0a345b2e447f0004ade981cd735efa711172960697d4",
+        "size": 686
+      },
+      "reference/__main__.py": {
+        "sha256": "4fd3bcf53238b9f494953b7d9de9c86fb62a669ccdc384b861af3e9e18d28799",
+        "size": 5625
+      },
+      "reference/adamw_trajectory.py": {
+        "sha256": "bc2aa1cb63d5847ff210ef451e76cb568d7066e0e1968b1f1f9f568f64244e39",
+        "size": 11105
+      },
+      "reference/hf_single_gpu.py": {
+        "sha256": "a3f1a1c1b31e7734e13f1d7bf230539b1c82b93aa28ae96287bfaac9cd784f58",
+        "size": 21335
+      },
+      "reference/model_features.py": {
+        "sha256": "6a002c4f2091062271ea94685b5caf062312c4a407f14b6725bad295d489b379",
+        "size": 1298
+      },
+      "reference/optimizer_step.py": {
+        "sha256": "9d13781d80961018cd6b0646642b9628d7d3f1add301714b7ba1b6e969359ef9",
+        "size": 6235
+      },
+      "reference/process_determinism.py": {
+        "sha256": "06f030498c261a04c34402bf5a54edfb3af9e0ccd7ebf1d7baabe2c797e3cafb",
+        "size": 4003
+      },
+      "reference/qwen4_reference.py": {
+        "sha256": "dbcb1345e9f80e108a10972d17f985880ee58865f5e0b7fe408d91ea777c3647",
+        "size": 2048
+      },
+      "reference/sft_trajectory.py": {
+        "sha256": "6b2e4c149760597db020e8fe83ecd803b5469167f4e96688f5b748e7f65de28a",
+        "size": 14863
+      }
+    },
+    "schema": 1
+  },
+  "measurements": {
+    "active_tokens": 34513,
+    "grad_norms": {
+      "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_A.default.weight": 0.0,
+      "base_model.model.model.language_model.layers.3.self_attn.k_proj.lora_B.default.weight": 0.032626256346702576,
+      "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_A.default.weight": 0.0,
+      "base_model.model.model.language_model.layers.3.self_attn.o_proj.lora_B.default.weight": 0.09486670047044754,
+      "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.default.weight": 0.0,
+      "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_B.default.weight": 0.12406441569328308,
+      "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_A.default.weight": 0.0,
+      "base_model.model.model.language_model.layers.3.self_attn.v_proj.lora_B.default.weight": 0.3670802712440491
+    },
+    "loss": 14.285312414169312,
+    "microbatches": 8,
+    "optimizer_gradient_norm": 0.4002549946308136,
+    "optimizer_norm_gate": {
+      "absolute": 0.001,
+      "criterion": "optimizer-state-l2-norm-v1",
+      "provenance": {
+        "calibration_runs": 16,
+        "maximum_pairwise_norm_delta": 1.1641532182693481e-09,
+        "minimum_gate": 0.001,
+        "multiplier": 4,
+        "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
+        "worst_quantity": "layers.3.self_attn.k_proj.lora_B.default.weight::exp_avg"
+      },
+      "status": "reviewed"
+    },
+    "optimizer_norms": {
+      "criterion": "optimizer-state-l2-norm-v1",
+      "optimizer_values_count": 24,
+      "parameter_count": 8,
+      "parameters": {
+        "layers.3.self_attn.k_proj.lora_A.default.weight": {
+          "exp_avg": 0.0,
+          "exp_avg_sq": 0.0,
+          "parameter_update_residual": 0.0,
+          "shape": [
+            32,
+            2048
+          ]
+        },
+        "layers.3.self_attn.k_proj.lora_B.default.weight": {
+          "exp_avg": 0.003262625541538,
+          "exp_avg_sq": 5.347592590965178e-08,
+          "parameter_update_residual": 1.0111399717516178e-07,
+          "shape": [
+            512,
+            32
+          ]
+        },
+        "layers.3.self_attn.o_proj.lora_A.default.weight": {
+          "exp_avg": 0.0,
+          "exp_avg_sq": 0.0,
+          "parameter_update_residual": 0.0,
+          "shape": [
+            32,
+            4096
+          ]
+        },
+        "layers.3.self_attn.o_proj.lora_B.default.weight": {
+          "exp_avg": 0.009486671537160873,
+          "exp_avg_sq": 2.5881925580506504e-07,
+          "parameter_update_residual": 2.017846583157734e-07,
+          "shape": [
+            2048,
+            32
+          ]
+        },
+        "layers.3.self_attn.q_proj.lora_A.default.weight": {
+          "exp_avg": 0.0,
+          "exp_avg_sq": 0.0,
+          "parameter_update_residual": 0.0,
+          "shape": [
+            32,
+            2048
+          ]
+        },
+        "layers.3.self_attn.q_proj.lora_B.default.weight": {
+          "exp_avg": 0.01240626722574234,
+          "exp_avg_sq": 7.688097980462771e-07,
+          "parameter_update_residual": 4.0183809346672206e-07,
+          "shape": [
+            8192,
+            32
+          ]
+        },
+        "layers.3.self_attn.v_proj.lora_A.default.weight": {
+          "exp_avg": 0.0,
+          "exp_avg_sq": 0.0,
+          "parameter_update_residual": 0.0,
+          "shape": [
+            32,
+            2048
+          ]
+        },
+        "layers.3.self_attn.v_proj.lora_B.default.weight": {
+          "exp_avg": 0.036708030849695206,
+          "exp_avg_sq": 5.598049028776586e-06,
+          "parameter_update_residual": 1.024793405690616e-07,
+          "shape": [
+            512,
+            32
+          ]
+        }
+      },
+      "state_keys": [
+        "parameter_update_residual",
+        "exp_avg",
+        "exp_avg_sq"
+      ],
+      "step": 1
+    },
+    "peak_gib": 10.771319389343262,
+    "skipped_no_grad": [
+      "base_model.model.model.visual.patch_embed.proj.weight",
+      "base_model.model.model.visual.patch_embed.proj.bias",
+      "base_model.model.model.visual.pos_embed.weight",
+      "base_model.model.model.visual.blocks.0.norm1.weight",
+      "base_model.model.model.visual.blocks.0.norm1.bias",
+      "base_model.model.model.visual.blocks.0.norm2.weight",
+      "base_model.model.model.visual.blocks.0.norm2.bias",
+      "base_model.model.model.visual.blocks.0.attn.qkv.weight",
+      "base_model.model.model.visual.blocks.0.attn.qkv.bias",
+      "base_model.model.model.visual.blocks.0.attn.proj.weight",
+      "base_model.model.model.visual.blocks.0.attn.proj.bias",
+      "base_model.model.model.visual.blocks.0.mlp.linear_fc1.weight",
+      "base_model.model.model.visual.blocks.0.mlp.linear_fc1.bias",
+      "base_model.model.model.visual.blocks.0.mlp.linear_fc2.weight",
+      "base_model.model.model.visual.blocks.0.mlp.linear_fc2.bias",
+      "base_model.model.model.visual.blocks.1.norm1.weight",
+      "base_model.model.model.visual.blocks.1.norm1.bias",
+      "base_model.model.model.visual.blocks.1.norm2.weight",
+      "base_model.model.model.visual.blocks.1.norm2.bias",
+      "base_model.model.model.visual.blocks.1.attn.qkv.weight",
+      "base_model.model.model.visual.blocks.1.attn.qkv.bias",
+      "base_model.model.model.visual.blocks.1.attn.proj.weight",
+      "base_model.model.model.visual.blocks.1.attn.proj.bias",
+      "base_model.model.model.visual.blocks.1.mlp.linear_fc1.weight",
+      "base_model.model.model.visual.blocks.1.mlp.linear_fc1.bias",
+      "base_model.model.model.visual.blocks.1.mlp.linear_fc2.weight",
+      "base_model.model.model.visual.blocks.1.mlp.linear_fc2.bias",
+      "base_model.model.model.visual.merger.norm.weight",
+      "base_model.model.model.visual.merger.norm.bias",
+      "base_model.model.model.visual.merger.linear_fc1.weight",
+      "base_model.model.model.visual.merger.linear_fc1.bias",
+      "base_model.model.model.visual.merger.linear_fc2.weight",
+      "base_model.model.model.visual.merger.linear_fc2.bias",
+      "base_model.model.model.language_model.embed_tokens.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.dt_bias",
+      "base_model.model.model.language_model.layers.0.linear_attn.A_log",
+      "base_model.model.model.language_model.layers.0.linear_attn.conv1d.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.norm.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.out_proj.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.in_proj_z.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.in_proj_b.weight",
+      "base_model.model.model.language_model.layers.0.linear_attn.in_proj_a.weight",
+      "base_model.model.model.language_model.layers.0.mlp.gate.weight",
+      "base_model.model.model.language_model.layers.0.mlp.experts.gate_up_proj",
+      "base_model.model.model.language_model.layers.0.mlp.experts.down_proj",
+      "base_model.model.model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+      "base_model.model.model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+      "base_model.model.model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+      "base_model.model.model.language_model.layers.0.mlp.shared_expert_gate.weight",
+      "base_model.model.model.language_model.layers.0.input_layernorm.weight",
+      "base_model.model.model.language_model.layers.0.post_attention_layernorm.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.dt_bias",
+      "base_model.model.model.language_model.layers.1.linear_attn.A_log",
+      "base_model.model.model.language_model.layers.1.linear_attn.conv1d.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.norm.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.out_proj.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.in_proj_qkv.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.in_proj_z.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.in_proj_b.weight",
+      "base_model.model.model.language_model.layers.1.linear_attn.in_proj_a.weight",
+      "base_model.model.model.language_model.layers.1.mlp.gate.weight",
+      "base_model.model.model.language_model.layers.1.mlp.experts.gate_up_proj",
+      "base_model.model.model.language_model.layers.1.mlp.experts.down_proj",
+      "base_model.model.model.language_model.layers.1.mlp.shared_expert.gate_proj.weight",
+      "base_model.model.model.language_model.layers.1.mlp.shared_expert.up_proj.weight",
+      "base_model.model.model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+      "base_model.model.model.language_model.layers.1.mlp.shared_expert_gate.weight",
+      "base_model.model.model.language_model.layers.1.input_layernorm.weight",
+      "base_model.model.model.language_model.layers.1.post_attention_layernorm.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.dt_bias",
+      "base_model.model.model.language_model.layers.2.linear_attn.A_log",
+      "base_model.model.model.language_model.layers.2.linear_attn.conv1d.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.norm.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.out_proj.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.in_proj_z.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.in_proj_b.weight",
+      "base_model.model.model.language_model.layers.2.linear_attn.in_proj_a.weight",
+      "base_model.model.model.language_model.layers.2.mlp.gate.weight",
+      "base_model.model.model.language_model.layers.2.mlp.experts.gate_up_proj",
+      "base_model.model.model.language_model.layers.2.mlp.experts.down_proj",
+      "base_model.model.model.language_model.layers.2.mlp.shared_expert.gate_proj.weight",
+      "base_model.model.model.language_model.layers.2.mlp.shared_expert.up_proj.weight",
+      "base_model.model.model.language_model.layers.2.mlp.shared_expert.down_proj.weight",
+      "base_model.model.model.language_model.layers.2.mlp.shared_expert_gate.weight",
+      "base_model.model.model.language_model.layers.2.input_layernorm.weight",
+      "base_model.model.model.language_model.layers.2.post_attention_layernorm.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.q_proj.base_layer.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.k_proj.base_layer.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.v_proj.base_layer.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.o_proj.base_layer.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.q_norm.weight",
+      "base_model.model.model.language_model.layers.3.self_attn.k_norm.weight",
+      "base_model.model.model.language_model.layers.3.mlp.gate.weight",
+      "base_model.model.model.language_model.layers.3.mlp.experts.gate_up_proj",
+      "base_model.model.model.language_model.layers.3.mlp.experts.down_proj",
+      "base_model.model.model.language_model.layers.3.mlp.shared_expert.gate_proj.weight",
+      "base_model.model.model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
+      "base_model.model.model.language_model.layers.3.mlp.shared_expert.down_proj.weight",
+      "base_model.model.model.language_model.layers.3.mlp.shared_expert_gate.weight",
+      "base_model.model.model.language_model.layers.3.input_layernorm.weight",
+      "base_model.model.model.language_model.layers.3.post_attention_layernorm.weight",
+      "base_model.model.model.language_model.norm.weight",
+      "base_model.model.lm_head.weight"
+    ]
+  },
+  "payload_sha256": "267bd2053756d16ae184ee1321f07ad7e98f71d303f863c90e81cf888d75e0a1",
+  "schema": 1
+}

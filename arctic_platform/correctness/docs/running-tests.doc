@@ -1,0 +1,134 @@
+# Running Correctness Tests
+
+**Run these commands from the repository root on a prepared compute node.** Use the Python environment in which Arctic Platform and the required model runtimes are installed. The operator provides enough nodes, CPU memory, GPUs, GPU memory, and fast storage for the selected configuration. The harness does not allocate machines, install software, or start a gateway. Multi-node tests must use nodes within one allocation, never nodes from separate jobs.
+
+## Before Running
+
+**A regression needs a reviewed configuration and its prerequisites.** Confirm:
+
+- The selected configuration has a reviewed specification under `arctic_platform/correctness/specs/`.
+- The installed runtime supports the model, attention implementation, training topology, and checkpoint operations required by the test.
+- Required model files and checkpoints are accessible from this allocation.
+- Hugging Face reference measurements are already prepared for tests that need them. Regression never creates or replaces a missing baseline.
+- `/data-fast/tmp` is writable. Large temporary files, model files, and checkpoints belong on fast storage, not in the checkout.
+- The target backend is configured. The default backend is Cortex; a direct development gateway must already be running.
+
+**Connection defaults come from environment variables; command-line options override them.** For an existing direct development gateway, for example:
+
+```bash
+export ARCTIC_CORTEX_BASE_URL=http://127.0.0.1:8003
+export ARCTIC_CORTEX_DATABASE=dev
+export ARCTIC_CORTEX_SCHEMA=dev
+```
+
+For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and `ARCTIC_CORTEX_PAT` instead of a direct URL. Supply the token through a protected environment or `--pat-file`, not through a configuration file or a pasted command. `--backend onprem` selects the existing on-premises backend; it still requires its installed runtime and available resources.
+
+**Fast-storage defaults are centralized.** Temporary work uses `/data-fast/tmp`; `DSS_CORRECTNESS_TMPDIR` can point to another directory under `/data-fast`. Each ordinary run gets a unique report directory there unless `--out` supplies one. Compact reference JSON files default to `arctic_platform/correctness/reference_data`; `--reference-records-dir` must select another Git-tracked directory, not scratch storage.
+
+## Select And Run
+
+**List available configuration IDs and test IDs first.**
+
+```bash
+python -m arctic_platform.correctness list
+```
+
+**Run one configuration/test pair.** `--config` accepts an exact listed ID or an existing `.config` file path:
+
+```bash
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k \
+  --test checkpoint-resume-loss
+```
+
+**Omit `--test` to run all registered tests for one configuration.**
+
+```bash
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k
+```
+
+**Omit `--config` to run one test across every active reviewed configuration.**
+
+```bash
+python -m arctic_platform.correctness run --test inference-checkpoint-loss
+```
+
+**Selections run sequentially in configuration-ID order.** Tests within a configuration use test-ID order; single-step tests run together to preserve their combined reference identity. Repeating a test ID does not repeat the comparison. Tests that do not apply remain visible; insufficient resources and missing prerequisites are reported as blocked, not silently omitted. An argument-free `run` is rejected. Explicit `--all-configs` selects the full reviewed catalog, and repeatable `--test` flags select a subset.
+
+**Use the local full-model mode only for supported, pinned original models.** It requires an existing loopback gateway and a populated offline model cache, and supports only `e2e-sft-train-validate` and `inference-checkpoint-loss`:
+
+```bash
+export HF_HUB_OFFLINE=1
+export DSS_ALLOW_REMOTE_MODELS=1
+export HF_HUB_CACHE=/data-fast/path/to/populated/hub
+
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k \
+  --test inference-checkpoint-loss \
+  --local-gateway-full-model \
+  --out /data-fast/tmp/qwen3-8b-inference-report
+```
+
+For reviewed reduced-fixture single-step checks, `--local-cortex-fixture` binds the existing loopback gateway to matching local weights. A published reduced fixture instead uses `--cortex-fixture <publication.json>`. These modes validate identity; they do not download files or start a server. `--gpu-pool` describes available target placement capacity and does not reserve or acquire GPUs. Do not use `--any-gpu` to bypass a hardware mismatch without separately reviewing the configuration.
+
+## Explicit Preparation
+
+**Onboarding is a deliberate preparation operation, not a regression fallback.** Use a configuration path for onboarding. Preparing references requires the existing reviewed specification, matching assets, and enough resources; preparation does not run the target test.
+
+```bash
+CONFIG=arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config
+
+python -m arctic_platform.correctness onboard --config "$CONFIG" \
+  --prepare-references --test-id single-step-grads
+```
+
+**Prepare gradients and optimizer together when regression selects both.** A combined workload has a different identity from independently prepared scalar checks:
+
+```bash
+python -m arctic_platform.correctness onboard --config "$CONFIG" \
+  --prepare-references \
+  --reference-tests single-step-grads single-step-optimizer \
+  --reference-calibration-runs 16 --reference-calibration-workers 8
+```
+
+The calibration example needs eight available reference GPUs. Calibration establishes an optimizer-norm gate; it is not a target pass. For detailed reference identity, original-model admission, and calibration requirements, see [HF reference onboarding](hf-reference-onboarding.md). Changing a specification or reference to hide a mismatch is not a valid remedy.
+
+**Source moves can invalidate older references.** The current E2E identity also binds shared training helpers in `harness/sft.py`. Historical records remain unchanged; a record without the current identity cannot be used as if it measured the new source. Resolve missing or incompatible records through explicit, reviewed preparation, never an automatic migration during regression.
+
+## Read Results
+
+**The terminal prints one short result row per selected pair and the report directory.** Detailed arm and placement results are saved in `report.md` and the report's JSON file. `batch.json` records each selected pair, its reason, counts, elapsed time, and whether the batch stopped for safety. `full.log` retains detailed execution output and full Python tracebacks; individual execution groups also have reports under `cases/`.
+
+| Status | Meaning |
+| --- | --- |
+| `PASS` | The selected numerical comparison passed. |
+| `FAIL` | At least one comparison failed. Read the detailed measurements. |
+| `BLOCKED` | A required specification, asset, reference, resource, or connection setting is missing or incompatible. |
+| `ERROR` | Execution raised an unexpected error, or the operator interrupted the run. |
+| `INAPPLICABLE` | The test does not apply to this configuration. This is not a pass. |
+
+**Exit code zero requires a pass and no failed, blocked, or errored comparison.** An entirely inapplicable batch is nonzero because it measured nothing. Invalid selectors produce exit code `2`. Missing prerequisites do not prevent independent cases from running; an unexpected escaping error or interruption stops the remaining cases conservatively.
+
+**Interrupt with Ctrl-C and inspect cleanup before starting another run.** The harness attempts the existing backend's owned-context cleanup, saves the interruption traceback, and blocks the remaining batch. A stopped batch is not proof that all remote resources were released. Check retained cleanup detail and use the backend's supported cleanup procedure for resources owned by that run; do not stop another user's processes.
+
+## Library Checks And Diagnostics
+
+**Check the harness implementation without a model or GPU test.**
+
+```bash
+CUDA_VISIBLE_DEVICES= python -m arctic_platform.correctness selftest
+```
+
+This runs maintained `check_*.py` controls using installed test dependencies. Implementation passes do not establish a full-model numerical pass.
+
+**Maintained experiments use one diagnostic command.**
+
+```bash
+python -m arctic_platform.correctness.diagnostics list
+python -m arctic_platform.correctness.diagnostics run <diagnostic-id> --help
+```
+
+Diagnostics have their own resource requirements and are not substitutes for the reviewed regression tests.
+
+**This guide is static.** Onboarding and test execution never append results, status, receipts, or logs here. Run artifacts belong in the selected report directory.
