@@ -118,13 +118,15 @@ def _install(monkeypatch, gcs: _FakeGcs, *, ranks: list[dict] | None = None):
     killed: list[str] = []
     driver_calls: list[tuple] = []
 
-    async def kill_trees_on_node(node_id, roots, timeout_s):
+    async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
+        if len(roots) == 0:
+            return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
         tree_kills.append((node_id, list(roots)))
         by_pid = {row["Pid"]: actor_id for actor_id, row in gcs.rows.items()}
         for pid, _, kill_root in roots:
             if kill_root:
                 gcs.kill(by_pid[pid])
-        return dict(killed=[pid + 10_000 for pid, _, _ in roots], alive=[], denied=[])
+        return dict(killed=[pid + 10_000 for pid, _, _ in roots], alive=[], denied=[], orphans=[], unattributed=[])
 
     def ray_kill(actor):
         killed.append(actor.actor_id)
@@ -372,10 +374,12 @@ def _ready_pool(monkeypatch, worker_cls, workers):
     pool._scheduler = _Scheduler()
     hard_kills: list[list[int]] = []
     pool.kill_roots_seen = []
+    pool.kill_calls = []
 
-    async def kill_workers_and_confirm(workers, kill_roots=None):
+    async def kill_workers_and_confirm(workers, kill_roots=None, *, node_hints=None, timeout_s=None):
         hard_kills.append([worker.index for worker in workers])
         pool.kill_roots_seen.append(kill_roots)
+        pool.kill_calls.append(dict(node_hints=node_hints, timeout_s=timeout_s))
         pool._scheduler.events.append(f"hard-killed {[worker.index for worker in workers]}")
 
     monkeypatch.setattr(pool, "_kill_workers_and_confirm", kill_workers_and_confirm)
@@ -574,7 +578,7 @@ def test_kill_process_trees_kills_descendants():
         result = replica_pool_mod._kill_process_trees([(root.pid, started, True)], wait_s=10.0)
 
         # Reported gone even if nothing has reaped the reparented grandchild yet.
-        assert result == dict(killed=sorted([root.pid, child_pid]), alive=[], denied=[])
+        assert result == dict(killed=sorted([root.pid, child_pid]), alive=[], denied=[], orphans=[], unattributed=[])
         assert _gone(child_pid)
     finally:
         root.kill()
@@ -586,7 +590,7 @@ def test_kill_process_trees_leaves_root_when_asked():
     try:
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, False)], wait_s=10.0)
 
-        assert result == dict(killed=[child_pid], alive=[], denied=[])
+        assert result == dict(killed=[child_pid], alive=[], denied=[], orphans=[], unattributed=[])
         assert _gone(child_pid)
         assert root.poll() is None
     finally:
@@ -603,7 +607,7 @@ def test_kill_process_trees_skips_reused_pid():
 
         result = replica_pool_mod._kill_process_trees([(root.pid, started, True)], wait_s=1.0)
 
-        assert result == dict(killed=[], alive=[], denied=[])
+        assert result == dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
         assert root.poll() is None
     finally:
         root.kill()
@@ -622,7 +626,7 @@ def test_kill_process_trees_counts_a_zombie_as_gone():
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, False)], wait_s=5.0)
 
         # Signalled, then reported gone at once rather than after the wait.
-        assert result == dict(killed=[zombie_pid], alive=[], denied=[])
+        assert result == dict(killed=[zombie_pid], alive=[], denied=[], orphans=[], unattributed=[])
         assert time.monotonic() - start < 2.0
         assert root.poll() is None
     finally:
@@ -643,7 +647,7 @@ def test_kill_process_trees_continues_past_access_denied(monkeypatch):
     try:
         result = replica_pool_mod._kill_process_trees([(root.pid, 0.0, True)], wait_s=10.0)
 
-        assert result == dict(killed=[root.pid], alive=[], denied=[child_pid])
+        assert result == dict(killed=[root.pid], alive=[], denied=[child_pid], orphans=[], unattributed=[])
         assert _gone(root.pid)
     finally:
         monkeypatch.undo()
@@ -653,3 +657,252 @@ def test_kill_process_trees_continues_past_access_denied(monkeypatch):
             except psutil.NoSuchProcess:
                 pass
         root.wait()
+
+
+# ----------------------------------------------------------------------
+# Review follow-ups: orphans of a dead parent, cancellation budget, and the
+# clean-shutdown check.
+# ----------------------------------------------------------------------
+
+_GPU_HOLDER = """
+import os, sys, time
+fd = open(sys.argv[1], "rb")
+print(os.getpid(), flush=True)
+time.sleep(60)
+"""
+
+# Starts a GPU holder titled like a vLLM process with ``tag`` (if any) in its
+# environment, prints its pid, then either exits at once (orphaning it) or
+# stays alive as its parent.
+_LAUNCHER = """
+import os, subprocess, sys, time
+device, tag, stay = sys.argv[1], sys.argv[2], sys.argv[3] == "stay"
+env = dict(os.environ)
+if tag != "-":
+    env["ARCTIC_INFERENCE_WORKER_ACTOR_ID"] = tag
+child = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[4], device, "VLLM::EngineCore"], env=env, stdout=subprocess.PIPE, text=True
+)
+print(child.stdout.readline().strip(), flush=True)
+if stay:
+    time.sleep(60)
+"""
+
+
+def _launch(device, tag, *, stay):
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", _LAUNCHER, str(device), tag, "stay" if stay else "go", _GPU_HOLDER],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    pid = int(launcher.stdout.readline())
+    if not stay:
+        launcher.wait()
+        deadline = time.monotonic() + 10.0
+        while psutil.Process(pid).ppid() == launcher.pid:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+    return launcher, pid
+
+
+def _reap(*pids):
+    for pid in pids:
+        try:
+            psutil.Process(pid).kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
+@pytest.fixture
+def fake_gpu(tmp_path):
+    device = tmp_path / "nvidia0"
+    device.write_bytes(b"")
+    return device
+
+
+def test_orphan_scan_kills_only_attributed_orphans(fake_gpu):
+    prefix = str(fake_gpu)[: -len("0")]
+    _, orphan = _launch(fake_gpu, "actor7", stay=False)
+    _, untagged = _launch(fake_gpu, "-", stay=False)
+    _, other = _launch(fake_gpu, "actor8", stay=False)
+    parent, parented = _launch(fake_gpu, "actor7", stay=True)
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=5.0, orphan_tags=("actor7",), gpu_device_prefix=prefix
+        )
+
+        assert result["orphans"] == [orphan]
+        assert result["killed"] == [orphan]
+        assert result["alive"] == []
+        assert result["unattributed"] == [untagged]
+        assert _gone(orphan)
+        # Another worker's orphan, and a vLLM process whose parent is alive,
+        # are never touched.
+        assert not _gone(other)
+        assert not _gone(parented)
+    finally:
+        _reap(orphan, untagged, other, parented)
+        parent.kill()
+        parent.wait()
+
+
+def test_orphan_scan_needs_a_gpu_device(fake_gpu, tmp_path):
+    not_a_gpu = tmp_path / "nvidia-config"
+    not_a_gpu.write_bytes(b"")
+    _, orphan = _launch(not_a_gpu, "actor7", stay=False)
+    try:
+        result = replica_pool_mod._kill_process_trees(
+            [], wait_s=1.0, orphan_tags=("actor7",), gpu_device_prefix=str(fake_gpu)[:-1]
+        )
+
+        assert result["killed"] == [] and result["unattributed"] == []
+        assert not _gone(orphan)
+    finally:
+        _reap(orphan)
+
+
+def test_restart_reaps_orphans_of_a_worker_that_died_first(monkeypatch, fake_gpu, caplog):
+    """The old worker is already dead (its root killed first), so there is no
+    tree to walk; its orphaned vLLM process still holds the GPU."""
+    prefix = str(fake_gpu)[:-1]
+    _, orphan = _launch(fake_gpu, "actor99", stay=False)
+    parent, parented = _launch(fake_gpu, "actor99", stay=True)
+    gcs = _FakeGcs()
+    old = _Actor(99)
+    gcs.add(old.actor_id, pid=999_999)
+    gcs.rows[old.actor_id]["State"] = "DEAD"
+    _install(monkeypatch, gcs)
+    scans = []
+
+    async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
+        scans.append((node_id, list(roots), orphan_tags))
+        return replica_pool_mod._kill_process_trees(roots, 5.0, orphan_tags=orphan_tags, gpu_device_prefix=prefix)
+
+    monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+
+    worker_cls = _WorkerClass(fail_init_index=-1)
+    pool = ReplicaPool(worker_cls=worker_cls)
+    pool._config = _config()
+    pool._workers = [old]
+    pool._slots = [("node-a", 0)]
+    pool._scheduler = _Scheduler()
+    reaped_before_replacement = []
+    make_worker = pool._make_worker
+
+    def make_worker_checked():
+        reaped_before_replacement.append(_gone(orphan))
+        return make_worker()
+
+    monkeypatch.setattr(pool, "_make_worker", make_worker_checked)
+    try:
+        asyncio.run(pool._restart_worker(0))
+
+        assert scans == [("node-a", [], ("actor99",))]
+        assert reaped_before_replacement == [True]
+        assert not _gone(parented)
+        assert any("orphaned vLLM processes" in r.getMessage() for r in caplog.records)
+    finally:
+        _reap(orphan, parented)
+        parent.kill()
+        parent.wait()
+
+
+def test_restart_uses_the_slot_node_once_the_gcs_dropped_the_worker(monkeypatch):
+    gcs = _FakeGcs()
+    _install(monkeypatch, gcs)
+    scans = []
+
+    async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
+        scans.append((node_id, list(roots), orphan_tags))
+        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[])
+
+    monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
+    monkeypatch.setattr(replica_pool_mod, "_read_actor_records", lambda ids: [{} for _ in ids])
+
+    pool = ReplicaPool(worker_cls=_WorkerClass(fail_init_index=-1))
+    pool._config = _config()
+    pool._workers = [_Actor(99)]
+    pool._slots = [("node-h", 0)]
+    pool._scheduler = _Scheduler()
+    asyncio.run(pool._restart_worker(0))
+
+    assert scans == [("node-h", [], ("actor99",))]
+
+
+def test_unattributed_orphans_are_logged_not_killed(monkeypatch, caplog):
+    gcs = _FakeGcs()
+    worker = _Actor(0)
+    gcs.add(worker.actor_id, pid=100)
+    _install(monkeypatch, gcs)
+
+    async def kill_trees_on_node(node_id, roots, timeout_s, orphan_tags=()):
+        for pid, _, kill_root in roots:
+            gcs.kill(worker.actor_id)
+        return dict(killed=[], alive=[], denied=[], orphans=[], unattributed=[4242])
+
+    monkeypatch.setattr(replica_pool_mod, "_kill_trees_on_node", kill_trees_on_node)
+    caplog.set_level(logging.ERROR, logger=_LOGGER)
+
+    pool = ReplicaPool()
+    pool._workers = [worker]
+    asyncio.run(pool.shutdown())
+
+    (message,) = _errors(caplog)
+    assert "[4242]" in message
+    assert "RAY_kill_child_processes_on_worker_exit_with_raylet_subreaper" in message
+
+
+def test_cancelled_scale_up_kills_with_short_budget(monkeypatch):
+    class _CancelledActor(_Actor):
+        async def _initialize(self, *args, **kwargs):
+            raise asyncio.CancelledError()
+
+    class _Cls(_WorkerClass):
+        def remote(self):
+            actor = _CancelledActor(len(self.actors))
+            self.actors.append(actor)
+            return actor
+
+    pool, hard_kills = _ready_pool(monkeypatch, _Cls(fail_init_index=-1), [])
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(pool.scale_up(1))
+
+    assert hard_kills == [[0]]
+    assert pool.kill_calls == [dict(node_hints=None, timeout_s=replica_pool_mod._CANCELLED_KILL_CONFIRM_TIMEOUT_S)]
+
+
+def test_failed_scale_up_keeps_the_default_budget(monkeypatch):
+    pool, _ = _ready_pool(monkeypatch, _WorkerClass(fail_init_index=0), [])
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(pool.scale_up(1))
+
+    assert pool.kill_calls == [dict(node_hints=None, timeout_s=None)]
+
+
+def test_short_budget_still_ray_kills_and_returns_quickly(monkeypatch):
+    gcs = _FakeGcs(dies_after_reads=None)
+    worker = _Actor(0)
+    gcs.add(worker.actor_id, pid=100)
+    seen = _install(monkeypatch, gcs)
+
+    pool = ReplicaPool()
+    start = time.monotonic()
+    asyncio.run(pool._kill_workers_and_confirm([worker], timeout_s=0.2))
+
+    assert time.monotonic() - start < 1.5
+    assert seen.killed == ["actor0"]
+
+
+def test_shut_down_cleanly_rejects_a_returned_exception():
+    async def run():
+        async def returns(value):
+            return value
+
+        tasks = [asyncio.create_task(returns(v)) for v in (SystemExit(), RuntimeError(), {"status": "ok"})]
+        await asyncio.gather(*tasks)
+        return [replica_pool_mod._shut_down_cleanly(task, set()) for task in tasks]
+
+    assert asyncio.run(run()) == [False, False, True]

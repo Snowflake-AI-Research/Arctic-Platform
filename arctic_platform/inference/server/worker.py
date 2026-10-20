@@ -45,6 +45,10 @@ _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
+# Set to the worker's Ray actor id before the engine starts, so every vLLM
+# process inherits it. Shutdown reads it to tell whose orphans an orphaned
+# vLLM process is, once its parent is gone; see ReplicaPool's hard kill.
+WORKER_ACTOR_ID_ENV = "ARCTIC_INFERENCE_WORKER_ACTOR_ID"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
     "eaddrinuse",
@@ -820,6 +824,9 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> None:
         if extra_env:
             os.environ.update(extra_env)
+        actor_id = ray.get_runtime_context().get_actor_id() if ray.is_initialized() else None
+        if actor_id:
+            os.environ[WORKER_ACTOR_ID_ENV] = actor_id
 
         # Multi-node coordinators use num_gpus=0 (CVD=''). Clear before any CUDA
         # touch so router-replay NCCL can use a local GPU.
