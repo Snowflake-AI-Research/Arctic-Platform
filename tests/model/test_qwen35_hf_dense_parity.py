@@ -23,7 +23,8 @@ attention of models with two full-attention layers, and with stock and patched m
 with fp32 weights under bf16 autocast. The
 experimental ``fp32_residual`` setting, which carries the residual stream in fp32 between decoder layers, is checked
 against the same reference loop and under the same checkpointing, offload and compile paths.
-The huggingface loader's ``fp32_parity`` set to false installs nothing, so the model is the stock one. The copied stock
+The huggingface loader's ``fp32_parity`` set to false installs nothing but the GatedDeltaNet output norms that round
+once, which the loader installs whatever the option is (``test_gated_norm_rounding.py``). The copied stock
 forward is pinned against the stock source of the verified transformers version, and the patch is applied only to the
 dense Qwen3.5 text model, once, and can be removed.
 
@@ -53,6 +54,7 @@ from arctic_platform.model import Patches
 from arctic_platform.model.implementations.gpu import activation_offload
 from arctic_platform.model.implementations.gpu import qwen3_5_dense_parity as hf_dense_parity
 from arctic_platform.model.implementations.gpu.activation_offload import ActivationOffloadManager
+from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
 from arctic_platform.testing_utils import set_seed
@@ -143,6 +145,12 @@ def _patched(model: nn.Module, *, sequence_parallel: bool = False, fp32_residual
     assert (
         hf_dense_parity.apply_fp32_parity(model, sequence_parallel=sequence_parallel, fp32_residual=fp32_residual) == 1
     )
+    return model
+
+
+def _rounded_norms(model: nn.Module) -> nn.Module:
+    """``model`` with the GatedDeltaNet output norms the huggingface loader installs, as a loaded model has them."""
+    assert round_gated_norms_once(model) == 3
     return model
 
 
@@ -843,10 +851,10 @@ def test_loader_applies_the_patch_only_when_the_option_is_on(monkeypatch, loader
     assert loaded.model is model
     assert getattr(model.model, "_arctic_fp32_parity", False) is patched
     if not patched:
-        # Off installs nothing: the model is the stock one.
-        assert _instance_forwards(model) == []
+        # Off installs nothing but the output norms that round once: the model is otherwise the stock one.
+        assert _instance_forwards(model) == [f"model.layers.{i}.linear_attn.norm" for i in range(3)]
         assert _beta_hooks(model) == 0
-        expected_output, expected_grads = _forward_backward(_tiny_model())
+        expected_output, expected_grads = _forward_backward(_rounded_norms(_tiny_model()))
         _assert_same_run(*_forward_backward(model), expected_output, expected_grads)
 
 
@@ -943,7 +951,7 @@ def _build(monkeypatch, model: nn.Module, **patches):
 
 def test_liger_patch_with_the_default_runs_liger_rmsnorm_only_in_the_first_input_norm(monkeypatch):
     liger_calls = _cpu_liger(monkeypatch)
-    reference = _patched(_tiny_model())
+    reference = _rounded_norms(_patched(_tiny_model()))
     model = _build(monkeypatch, copy.deepcopy(_tiny_model()), liger=True)
 
     assert getattr(model.model, "_arctic_fp32_parity", False)
@@ -961,7 +969,7 @@ def test_a_dense_model_built_after_a_liger_patch_loads_with_the_default(monkeypa
     from arctic_platform.model.loaders.huggingface import load_huggingface
 
     liger_calls = _cpu_liger(monkeypatch)
-    stock = _patched(_tiny_model())
+    stock = _rounded_norms(_patched(_tiny_model()))
     _build(monkeypatch, _tiny_model(), liger=True)
     # The liger patch replaced the module's norm class, so this second model is built with Liger's norm.
     second = _tiny_model()

@@ -33,6 +33,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseM
 from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
 from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
 
+from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norm_once
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
@@ -334,6 +335,8 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
+            if layer.layer_type == "linear_attention":
+                round_gated_norm_once(layer.linear_attn.norm)
             if isinstance(layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
