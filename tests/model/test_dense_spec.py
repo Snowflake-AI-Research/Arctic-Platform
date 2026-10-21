@@ -100,9 +100,16 @@ def test_omitted_loader_options_are_not_passed(monkeypatch):
         return real(**kwargs)
 
     monkeypatch.setattr(dense_spec, "ModelSpec", recording)
-    _spec(training_options={"fp32_parity": False, "fp32_residual": True})
+    _spec()
 
     assert "loader_options" not in seen[0]
+
+
+def test_loader_fields_in_training_options_are_rejected():
+    with pytest.raises(ValueError, match="not in training_options; move fp32_parity"):
+        _spec(training_options={"fp32_parity": False})
+    with pytest.raises(ValueError, match="not in training_options; move fp32_parity, fp32_residual"):
+        _spec(training_options={"fp32_parity": False, "fp32_residual": True})
 
 
 def test_loader_options_are_forwarded_whole(monkeypatch):
