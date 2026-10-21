@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -315,22 +317,43 @@ def _fp8_linear_bwd_input(
     return dx
 
 
+_DECODE_WORKSPACES: dict[torch.device, Tensor] = {}
+
+
+def _decode_workspace(shape: tuple[int, ...], device: torch.device) -> Tensor:
+    """A BF16 view of ``shape`` on ``device``'s decode workspace, grown to the largest decode seen.
+
+    Frozen block-FP8 weights are decoded for one GEMM at a time on the current stream (expert stacks of up to
+    512 MiB at Qwen3.6 EP2), so one reused buffer replaces a fresh allocation per GEMM. Those large requests,
+    made in backward when activations fill most of the GPU, are what made the caching allocator map new memory
+    mid-step; mapping blocks the host for up to seconds on H200. The view is valid until the next decode.
+    """
+    numel = math.prod(shape)
+    buffer = _DECODE_WORKSPACES.get(device)
+    if buffer is None or buffer.numel() < numel:
+        _DECODE_WORKSPACES.pop(device, None)
+        buffer = torch.empty(numel, dtype=torch.bfloat16, device=device)
+        _DECODE_WORKSPACES[device] = buffer
+    return buffer[:numel].view(shape)
+
+
 def _decode_fp8_to_bf16(
     weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
 ) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM.
+    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM on the current stream.
 
-    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack.
+    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack. CUDA
+    decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
     """
     from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
 
-    if not isinstance(weight, tuple):
-        return dequantize_fp8_blocks(weight, scale, block_size)
-    first = weight[0]
-    rows = sum(w.shape[-2] for w in weight)
-    out = torch.empty((*first.shape[:-2], rows, first.shape[-1]), dtype=torch.bfloat16, device=first.device)
+    stacks = weight if isinstance(weight, tuple) else (weight,)
+    scales = scale if isinstance(scale, tuple) else (scale,)
+    first = stacks[0]
+    rows = sum(w.shape[-2] for w in stacks)
+    out = _decode_workspace((*first.shape[:-2], rows, first.shape[-1]), first.device)
     row = 0
-    for w, sc in zip(weight, scale):
+    for w, sc in zip(stacks, scales):
         dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
         row += w.shape[-2]
     return out
