@@ -393,8 +393,10 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 fallback_layer_types.add(type(transformer_block).__name__)
             if ac_config.router_replay_recompute:
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
+            # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
+            # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
             transformer_block = checkpoint_wrapper(
-                transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE
+                transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
             )
             full_layers += 1
 
