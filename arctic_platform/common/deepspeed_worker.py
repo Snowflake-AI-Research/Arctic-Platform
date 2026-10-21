@@ -125,6 +125,32 @@ class DeepSpeedWorker:
     def get_ip(self) -> str:
         return self.my_addr
 
+    def get_sequence_parallel_info(self) -> dict:
+        """Return the initialized rank's actual ordered SP membership for batch routing."""
+        if self.engine is None or not dist.is_initialized():
+            raise RuntimeError("sequence-parallel routing requires an initialized worker")
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        if (rank, world_size) != (self.rank, self.world_size):
+            raise RuntimeError("worker rank/world size disagrees with its process group")
+        if self.sp_size > 1:
+            if self.sp_group is None:
+                raise RuntimeError("sequence-parallel worker has no SP group")
+            ranks = list(dist.get_process_group_ranks(self.sp_group))
+            size, sp_rank = dist.get_world_size(self.sp_group), dist.get_rank(self.sp_group)
+        else:
+            ranks, size, sp_rank = [rank], 1, 0
+        if (
+            size != self.sp_size
+            or sp_rank != self.sp_rank
+            or len(ranks) != size
+            or len(set(ranks)) != size
+            or not 0 <= sp_rank < size
+            or ranks[sp_rank] != rank
+            or any(not 0 <= peer < world_size for peer in ranks)
+        ):
+            raise RuntimeError("sequence-parallel membership disagrees with the initialized worker")
+        return {"rank": rank, "world_size": world_size, "sp_size": size, "sp_rank": sp_rank, "sp_ranks": ranks}
+
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
         os.environ.update(
@@ -166,8 +192,15 @@ class DeepSpeedWorker:
 
         ds_worker_config = deepcopy(job_config.get("ds_worker_config") or {})
         ds_worker_config["world_size"] = self.world_size
+        if "sp_size" in ds_worker_config:
+            if (
+                "sequence_parallel" in ds_worker_config
+                and ds_worker_config["sequence_parallel"] != ds_worker_config["sp_size"]
+            ):
+                raise ValueError("worker sp_size conflicts with sequence_parallel")
+            ds_worker_config["sequence_parallel"] = ds_worker_config["sp_size"]
         self.ds_worker_config = ds_worker_config
-        self.sp_size = sp_size_from_job_config(job_config)
+        self.sp_size = sp_size_from_job_config({**job_config, "ds_worker_config": ds_worker_config})
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -184,6 +217,7 @@ class DeepSpeedWorker:
 
         # HF load + patches via ModelSpec (world_size already injected above).
         model_config = dict(ds_worker_config)
+        model_config["sp_size"] = self.sp_size
         if job_config.get("training_config") is not None:
             model_config["debug"] = gpu_memory_debug_config(job_config["training_config"])
         spec = ModelSpec.from_ds_worker_config(model_name, model_config)

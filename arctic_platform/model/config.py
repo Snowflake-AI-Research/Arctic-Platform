@@ -245,7 +245,7 @@ class ModelSpec(BaseModel):
             if checkpointing is True and options.get("ac_config") is None:
                 options["ac_config"] = ActivationCheckpointConfig().model_dump()
             model_options = cfg.get("model_options") or {}
-            if set(model_options) - {"lm_head"}:
+            if set(model_options) - {"lm_head", "moe"}:
                 raise ValueError("unsupported expert-parallel worker model_options")
             lm_head = model_options.get("lm_head") or {}
             head_keys = {
@@ -259,6 +259,20 @@ class ModelSpec(BaseModel):
                 target = head_keys[key]
                 if target in options and options[target] != value:
                     raise ValueError(f"conflicting model_options.lm_head.{key} and prime_rl.{target}")
+                options[target] = value
+            moe = model_options.get("moe") or {}
+            moe_keys = {
+                "comm_backend": "ep_comm_backend",
+                "comm_sms": "deepep_num_sms",
+                "comm_token_chunk": "deepep_token_chunk_size",
+                "grouped_mm": "moe_use_grouped_mm",
+            }
+            if set(moe) - moe_keys.keys():
+                raise ValueError("unsupported expert-parallel worker moe options")
+            for key, value in moe.items():
+                target = moe_keys[key]
+                if target in options and options[target] != value:
+                    raise ValueError(f"conflicting model_options.moe.{key} and prime_rl.{target}")
                 options[target] = value
             if "attn" in options and options["attn"] != cfg["attn_implementation"]:
                 raise ValueError("conflicting prime_rl.attn and attn_implementation")

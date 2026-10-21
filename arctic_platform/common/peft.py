@@ -97,7 +97,7 @@ def normalize_lora_peft_config(
     if not target_modules and not target_parameters:
         raise ValueError(f"{location} must specify target_modules, target_parameters, or both")
 
-    result = {
+    return {
         "peft_type": "Lora",
         "task_type": "CAUSAL_LM",
         "r": rank,
@@ -107,4 +107,3 @@ def normalize_lora_peft_config(
         "target_modules": target_modules,
         "target_parameters": target_parameters,
     }
-    return result
