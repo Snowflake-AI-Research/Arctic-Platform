@@ -1,11 +1,25 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Training-worker RPCs must await ObjectRefs (not ``ray.get``) and stay single-flight."""
 
 from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 from unittest.mock import patch
 
 from arctic_platform.common.ray_server import ArcticRLRayServer
@@ -136,9 +150,7 @@ class TestGatherTrainingRefs(TestCasePlus):
                 await asyncio.sleep(0)
             self.assertEqual(log.count("step-1"), 2)
             sleep_task = asyncio.create_task(server.sleep_training(1))
-            sync_task = asyncio.create_task(
-                server.weight_sync(1, {"source_sub_job_id": 1, "target_sub_job_ids": [2]})
-            )
+            sync_task = asyncio.create_task(server.weight_sync(1, {"source_sub_job_id": 1, "target_sub_job_ids": [2]}))
             empty_task = asyncio.create_task(server.empty_training_cache(1))
             for _ in range(10):
                 await asyncio.sleep(0)
@@ -204,17 +216,16 @@ class TestGatherTrainingRefs(TestCasePlus):
 
         server = _server([_Fail(), _Hang()])
         server._training_ref_grace_s = 0.05
-        hold = asyncio.Event()
-        hold.set()
 
         async def _run():
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 await server.step(1)
             self.assertLess(time.monotonic() - started, 2.0)
-            server.training_workers = [_Worker(log, hold)]
-            out = await asyncio.wait_for(server.step(1), timeout=1.0)
-            self.assertEqual(out["job_id"], 1)
+            self.assertTrue(server._training_failed)
+            self.assertFalse(server._training_op_lock.locked())
+            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                await server.step(1)
 
         asyncio.run(_run())
 
@@ -250,6 +261,56 @@ class TestGatherTrainingRefs(TestCasePlus):
                 await server.step(1)
             self.assertLess(time.monotonic() - started, 0.5)
             self.assertEqual(log.count("stubborn"), 1)
+
+        asyncio.run(_run())
+
+    def test_caller_cancel_cancels_worker_refs_and_marks_failed(self):
+        cancelled: list[Any] = []
+
+        class _Ref:
+            def __init__(self):
+                self._started = asyncio.Event()
+
+            def __await__(self):
+                return self._wait().__await__()
+
+            async def _wait(self):
+                self._started.set()
+                await asyncio.Event().wait()
+
+        class _RemoteRef:
+            def __init__(self, ref):
+                self._ref = ref
+
+            def remote(self):
+                return self._ref
+
+        refs = [_Ref(), _Ref()]
+        server = _server([])
+        server.training_workers = [type("W", (), {"step": _RemoteRef(ref)})() for ref in refs]
+
+        async def _run():
+            with (
+                patch("arctic_platform.common.ray_server.ray.ObjectRef", _Ref),
+                patch(
+                    "arctic_platform.common.ray_server.ray.cancel",
+                    side_effect=lambda ref, force=False: cancelled.append(ref),
+                ),
+            ):
+                task = asyncio.create_task(server.step(1))
+                for _ in range(50):
+                    if all(ref._started.is_set() for ref in refs):
+                        break
+                    await asyncio.sleep(0)
+                self.assertTrue(all(ref._started.is_set() for ref in refs))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(cancelled, refs)
+            self.assertTrue(server._training_failed)
+            self.assertFalse(server._training_op_lock.locked())
+            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                await server.step(1)
 
         asyncio.run(_run())
 
