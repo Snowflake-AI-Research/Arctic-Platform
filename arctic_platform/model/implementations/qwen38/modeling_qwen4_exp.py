@@ -159,6 +159,14 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
 
 
 class Qwen4ExpTextNGramEmbeddingPrimeRL(Qwen4ExpTextNGramEmbedding):
+    _dss_weight_export_buffers = frozenset(
+        {
+            "layer_multipliers",
+            "ngram_heads_vocab_sizes",
+            "ngram_heads_offsets",
+        }
+    )
+
     def forward(
         self, input_ids: torch.Tensor, past_key_values: Cache | None, position_ids: Tensor | None = None
     ) -> torch.Tensor:
