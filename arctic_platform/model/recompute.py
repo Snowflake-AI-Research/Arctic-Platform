@@ -22,9 +22,7 @@ The underlying installer is idempotent and stashes the canonical thread-local on
 
 from __future__ import annotations
 
-from arctic_platform.model.implementations.gpu.router_replay_recompute import (
-    _in_recompute as in_recompute,
-)
+from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute as in_recompute
 from arctic_platform.model.implementations.gpu.router_replay_recompute import (
     _install_recompute_detector as install_recompute_detector,
 )

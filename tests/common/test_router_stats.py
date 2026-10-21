@@ -155,7 +155,9 @@ def test_fresh_replay_rows_do_not_inflate_replay_agreement():
     model.router.enable_fresh_replay_routing()
     x = torch.randn(4, DIM, generator=torch.Generator().manual_seed(7))
     # Rows 0-1: deliberate wrong replay (should disagree). Rows 2-3: FRESH (would agree by construction).
-    wrong = torch.tensor([[0, 1], [1, 2], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH]])
+    wrong = torch.tensor(
+        [[0, 1], [1, 2], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH]]
+    )
     model.router(x, None, routed_experts=wrong)
 
     stats = _reported(hooked)
