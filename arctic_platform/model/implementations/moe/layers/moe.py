@@ -308,6 +308,33 @@ def _run_experts_grouped_mm_impl(
     return out
 
 
+class _AddIntoRows(torch.autograd.Function):
+    """``out[:rows, cols] += delta`` in place, with the gradient passed straight through.
+
+    Adding into a slice of ``out`` under autograd records ``CopySlices``, whose backward clones the whole gradient of
+    ``out`` (a [rows, out features] copy per projection, and strided ones for the gate or up half of a stacked
+    gate|up output). ``out`` here is an expert GEMM's output that its own backward does not read, so marking it
+    dirty is enough.
+    """
+
+    @staticmethod
+    def forward(ctx, out: torch.Tensor, delta: torch.Tensor, rows: int, col_start: int, col_end: int) -> torch.Tensor:
+        out[:rows, col_start:col_end].add_(delta)
+        ctx.mark_dirty(out)
+        ctx.bounds = (rows, col_start, col_end)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        rows, col_start, col_end = ctx.bounds
+        return grad, grad[:rows, col_start:col_end], None, None, None
+
+
+def _add_into_rows(out: torch.Tensor, delta: torch.Tensor, rows: int, cols: slice | None = None) -> torch.Tensor:
+    cols = cols or slice(0, out.shape[1])
+    return _AddIntoRows.apply(out, delta, rows, cols.start, cols.stop)
+
+
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -414,7 +441,7 @@ class GroupedExperts(nn.Module):
             out = grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
             if name in ab:
                 # In place on the routed rows: the decoded GEMM saves nothing it returns.
-                out[:rows] += grouped_expert_lora_rows(inputs, ab[name], offsets, rows)
+                out = _add_into_rows(out, grouped_expert_lora_rows(inputs, ab[name], offsets, rows), rows)
             return out
 
         h = fused_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
