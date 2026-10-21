@@ -43,8 +43,10 @@ class HuggingfaceOptions(BaseModel):
             " are not available. The residual add and the following norm are one fused fp32 operation that reads the"
             " norm's weight, so with the liger patch, of the decoder-layer and final norms, only the first layer's"
             " input norm runs Liger's RMSNorm kernel. With sequence parallelism, the beta gate of every GatedDeltaNet"
-            " layer the sequence-parallel wrapper adapts follows this option, in any model. False loads the stock"
-            " model unchanged and evaluates that beta gate in b's own dtype. Other models are unaffected."
+            " layer the sequence-parallel wrapper adapts follows this option, in any model. False keeps these"
+            " operations stock and evaluates that beta gate in b's own dtype. Other models are unaffected. The"
+            " GatedDeltaNet output norm of the Qwen3.5 and Qwen3-Next families is evaluated in fp32 and rounded once,"
+            " as vLLM does, whatever this option is."
         ),
     )
     fp32_residual: bool = Field(
@@ -113,6 +115,9 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         attn_implementation=ctx.spec.attn_implementation,
         dtype=ctx.spec.dtype,
     )
+    from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
+
+    round_gated_norms_once(model)
     if options.fp32_parity:
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
 
