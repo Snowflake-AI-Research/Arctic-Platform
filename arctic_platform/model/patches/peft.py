@@ -171,10 +171,10 @@ def apply_peft(
 
 @register_patch("peft")
 def apply_peft_patch(model: nn.Module, ctx: LoaderContext) -> nn.Module:
-    peft_config = ctx.spec.patches.peft or {}
     dtype = torch.bfloat16 if ctx.spec.dtype == "auto" else getattr(torch, ctx.spec.dtype)
     fp8_base = model_has_fp8_weights(model)
     wrapped = apply_peft(model, ctx.spec.patches.peft, optimization_dtype=dtype)
+    peft_config = ctx.spec.patches.peft or {}
     if fp8_base and peft_config.get("target_parameters"):
         install_unfused_expert_lora_activation()
         attached = attach_unfused_expert_lora_factors(wrapped)
