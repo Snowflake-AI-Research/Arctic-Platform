@@ -90,8 +90,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_2"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("glm_moe_dsa dtype must be 'bfloat16' or 'float32'")
-    if spec.parallelism.sequence_parallel > 1:
-        raise ValueError("glm_moe_dsa does not support sequence parallelism")
     if spec.patches.liger:
         raise ValueError(
             "the glm_moe_dsa loader does not support the liger patch; "

@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from arctic_platform.model.implementations.glm52.models.fp8 import compute_weight, make_linear
@@ -14,6 +15,7 @@ from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flash
 )
 from arctic_platform.model.implementations.glm52.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from arctic_platform.model.implementations.glm52.models.layers.rotary_emb import apply_rotary_pos_emb_interleave
+from arctic_platform.model.implementations.glm52.utils.cp import gather_for_cp
 
 try:
     from arctic_platform.model.implementations.glm52.models.kernels.fp8_indexer import fp8_indexer
@@ -169,7 +171,13 @@ class Indexer(nn.Module):
         ke: torch.Tensor,
         index_topk: int,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cp: tuple[dist.ProcessGroup, int, int] | None = None,
     ) -> torch.Tensor:
+        """Top-k key indices for this rank's queries.
+
+        Under ``cp`` the keys are every rank's, gathered, and ``ks``/``ke`` describe the whole
+        sequence; ``hidden_states``, ``q_latent`` and ``position_embeddings`` are this rank's.
+        """
         total_tokens = hidden_states.shape[1]
         assert index_topk % 64 == 0, f"index_topk must be divisible by 64 (block_I), got {index_topk}"
 
@@ -191,10 +199,15 @@ class Indexer(nn.Module):
 
         q_idx = torch.cat([q_pe, q_nope], dim=-1)
         k_idx = torch.cat([k_pe, k_nope], dim=-1)
-
         if fp8_indexer is None:
             raise ImportError("triton is required for the GLM-5.2 FP8 indexer")
-        indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
+        if cp is not None:
+            group, rank, _world = cp
+            k_idx = gather_for_cp(k_idx.unsqueeze(0), group).squeeze(0)
+            local = slice(rank * q_idx.shape[0], (rank + 1) * q_idx.shape[0])
+            indices = fp8_indexer(q_idx, k_idx, w, ks[local], ke[local], index_topk, self.weight_scale)
+        else:
+            indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
         return indices.view(1, total_tokens, 1, index_topk)
 
 
@@ -255,7 +268,9 @@ class GlmMoeDsaAttention(nn.Module):
         k_compressed_normed: torch.Tensor,
         k_rope: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cp_group: dist.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Absorbed queries and sparse KV; under ``cp_group`` the KV is every rank's keys, in order."""
         batch_size, total_tokens, _ = q_latent.shape
         q_full = self.q_b_proj(q_latent).view(batch_size, total_tokens, self.num_heads, self.qk_head_dim)
         q_nope, q_rope = q_full.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -276,6 +291,9 @@ class GlmMoeDsaAttention(nn.Module):
 
         sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
         sparse_kv = torch.cat([k_compressed_normed, k_rope], dim=-1).unsqueeze(2)
+        if cp_group is not None:
+            # Keys were roped at their own positions above, so gathering them gives the global keys.
+            sparse_kv = gather_for_cp(sparse_kv, cp_group)
 
         sentinel = torch.zeros(batch_size, 1, 1, sparse_kv.shape[-1], dtype=sparse_kv.dtype, device=sparse_kv.device)
         sparse_kv = torch.cat([sparse_kv, sentinel], dim=1)
@@ -297,18 +315,33 @@ class GlmMoeDsaAttention(nn.Module):
         ks: torch.Tensor | None = None,
         ke: torch.Tensor | None = None,
         cached_indices: torch.Tensor | None = None,
+        cp: tuple[dist.ProcessGroup, int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sparse MLA for ``hidden_states``; with ``cp`` they are this rank's contiguous query shard.
+
+        ``position_embeddings``, ``ks`` and ``ke`` always describe the whole
+        sequence. Under context parallelism only the 576-wide compressed KV and
+        the 128-wide indexer keys are gathered; queries stay local, apart from the
+        indexer queries ranks trade to balance top-k selection.
+        """
+        cp_group = None
+        if cp is not None:
+            cp_group, cp_rank, _ = cp
+            local = slice(cp_rank * hidden_states.shape[1], (cp_rank + 1) * hidden_states.shape[1])
+            position_embeddings = tuple(t[:, local] for t in position_embeddings)
         q_latent, k_compressed_normed, k_rope = self.attn_projections(hidden_states)
 
         indices = cached_indices
         if sparse_mla_backend() == "dense":
+            if cp is not None:
+                raise NotImplementedError("dense sparse MLA indices assume local positions; use tilelang or flashmla")
             batch_size, seq_len = hidden_states.shape[:2]
             indices = make_dense_causal_indices(
                 batch_size, seq_len, self.args.index_topk, hidden_states.device
             )
         elif not self.skip_topk:
             indices = self.indexer.compute_sparse_indices(
-                hidden_states, q_latent, ks, ke, self.args.index_topk, position_embeddings
+                hidden_states, q_latent, ks, ke, self.args.index_topk, position_embeddings, cp=cp
             )
         elif indices is None:
             raise ValueError(
@@ -321,6 +354,7 @@ class GlmMoeDsaAttention(nn.Module):
             k_compressed_normed,
             k_rope,
             position_embeddings=position_embeddings,
+            cp_group=cp_group,
         )
 
         out = sparse_mla_apply(sparse_q, sparse_kv, indices, self.scaling)
