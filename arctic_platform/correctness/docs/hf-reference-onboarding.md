@@ -1,6 +1,6 @@
 # HF Reference Onboarding (Agent Guide)
 
-Internal preparation, regression, and provenance notes for agents maintaining the correctness harness. User-facing results remain in [the correctness report](../../../docs/correctness.md).
+Internal preparation, regression, and provenance notes for agents maintaining the correctness harness. [The correctness documentation index](../../../docs/correctness.md) points to the operator and maintainer guides. Working results remain in the local, uncommitted `correctness-progress.md` at the repository root.
 
 **All three dense-Qwen3-8B HF-backed checks pass using cached references at the original 4-GPU placement.** Both gradient arms pass all 47 norms at absolute `0.005`, and both optimizer arms pass all 141 norms under the weaker `optimizer-state-l2-norm-v1` absolute `0.001` criterion. These one-step checks use the reduced four-layer fixture, not the full configured model.
 
@@ -8,7 +8,7 @@ Internal preparation, regression, and provenance notes for agents maintaining th
 
 **The E2E pass is terminal, with bounded cleanup evidence.** Its [controller](../../../.codex-run-state/dense-qwen8-fleet-stas-dev-8-0-target-e2e-sft-train-validate-1792098536308642448/controller.json) records semantic exit `0`, numerical pass, unchanged sources, no error traceback or cleanup errors, and no HF remeasurement. The owner confirms termination at `21:14:36Z`, shell exit `0`, and exact absence at `21:14:44Z`. Owned gateway/child groups are empty and reaped, but strict zone/Ray and detached verification remain `false`, not full-resource release proof; keep-alive `211452` restores the archived payload.
 
-**The final integrated CPU suite passes with both cancellation and Torch-identity fixes.** The [JUnit receipt](/data-fast/tmp/hf-onboard-final-01a13767-20261015T2117.xml) covers 1,844 collected tests: 1,843 passed, one Ray-dependent skip, and 275 warnings in `21.98s`, with terminal exit `0`. The test environment used `DS_ACCELERATOR=cuda` and empty `CUDA_VISIBLE_DEVICES`; this is implementation coverage, not another numerical target pass. The earlier 1,804-pass suite receipt remains retained in [Progress Status](../../../docs/correctness.md#progress-status).
+**The final integrated CPU suite passes with both cancellation and Torch-identity fixes.** The [JUnit receipt](/data-fast/tmp/hf-onboard-final-01a13767-20261015T2117.xml) covers 1,844 collected tests: 1,843 passed, one Ray-dependent skip, and 275 warnings in `21.98s`, with terminal exit `0`. The test environment used `DS_ACCELERATOR=cuda` and empty `CUDA_VISIBLE_DEVICES`; this is implementation coverage, not another numerical target pass. The earlier 1,804-pass suite receipt remains retained in the Progress Status section of the local `correctness-progress.md`.
 
 **The final-build runner10 gradients and optimizer both pass from cached references.** Handle `211340` ran gradients before optimizer, both GAS arms at the original 4-GPU placement. The [published gradient controller](../../../.codex-run-state/dense-qwen8-fleet-stas-dev-10-0-target-single-step-grads-1792098823201745393/controller.json) confirms both arms pass `47/47` at absolute `0.005`, with exact maximum absolute norm differences `0.0007724761962890625` and `0.0019488334655761719`; HF time is `0.0/0.0`. Semantic exit is `0`, numerical pass is `true`, sources are unchanged, and cleanup errors are empty. Owned gateway `1135005` and child `1134658` groups are empty and reaped without escalation; strict zone/Ray and detached verification remain `false`. Gradient CLI wall time remains `4m48.4s`, without a runtime-tally update.
 
@@ -30,7 +30,7 @@ Internal preparation, regression, and provenance notes for agents maintaining th
 
 **The parent reproduced the failed key with one Torch metadata-field change.** Changing only `identity.dependencies.torch` from `2.13.0+cu130` to distribution metadata `2.13.0` gives `3ec1443d`. The current [identity implementation](../harness/reference_records.py) binds the loaded Torch build through `torch.__version__`, not varying distribution metadata. The [durable controls note](../../../.codex-run-state/analysis/hf-torch-build-identity-20261015.md) retains 126 reference-record and 61 affected CPU passes, including no-HF reuse and drift rejection, plus the earlier collection traceback and test-environment-only correction.
 
-**Earlier failures and historical optimizer criteria remain evidence, not erased outcomes.** [Progress Status](../../../docs/correctness.md#progress-status) retains both failures, terminal cancellation and bounded cleanup receipts, and historical full-tensor optimizer passes without adding pass slots or runtime.
+**Earlier failures and historical optimizer criteria remain evidence, not erased outcomes.** The Progress Status section of the local `correctness-progress.md` retains both failures, terminal cancellation and bounded cleanup receipts, and historical full-tensor optimizer passes without adding pass slots or runtime.
 
 ## Prepare Once
 
