@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform.debug.lora import maybe_normalize_lora_initialization
+
 PEFT_LORA_DEFAULT_R = 8
 PEFT_LORA_DEFAULT_ALPHA = 8
 PEFT_LORA_DEFAULT_DROPOUT = 0.0
@@ -32,6 +34,7 @@ SUPPORTED_LORA_PEFT_CONFIG_KEYS = frozenset(
         "bias",
         "target_modules",
         "target_parameters",
+        "deterministic_init",
     }
 )
 
@@ -97,7 +100,7 @@ def normalize_lora_peft_config(
     if not target_modules and not target_parameters:
         raise ValueError(f"{location} must specify target_modules, target_parameters, or both")
 
-    return {
+    result = {
         "peft_type": "Lora",
         "task_type": "CAUSAL_LM",
         "r": rank,
@@ -107,3 +110,4 @@ def normalize_lora_peft_config(
         "target_modules": target_modules,
         "target_parameters": target_parameters,
     }
+    return maybe_normalize_lora_initialization(peft_config, result, location=location)

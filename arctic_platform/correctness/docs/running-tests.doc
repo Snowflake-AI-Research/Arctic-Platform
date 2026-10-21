@@ -1,0 +1,81 @@
+# Running The First Two Correctness Checks
+
+**Run these commands from an already prepared, allocated head node.** The library does not allocate machines, install a runtime, download a missing reference during regression, or modify reviewed numerical gates. The default backend is `onprem`.
+
+## Prerequisites
+
+- Install the project and its compatible PyTorch, DeepSpeed, Transformers, and PEFT dependencies in the selected interpreter.
+- For CPU selftests, also install `pytest` and `pytest-instafail`, provided by the project's `testing` extra.
+- Make the allocation's GPU family and available devices match the supplied configuration. For multiple nodes, provide the allocated hostfile through `DSS_GATEWAY_HOSTFILE` and working allocation-local `ds_ssh`.
+- Make the reviewed model and tokenizer assets readable at the paths recorded in the test specification.
+- Keep model weights, adapter packs, optimizer snapshots, input tensors, and work directories under `/data-fast`. `DSS_CORRECTNESS_TMPDIR` can select a directory under `/data-fast`.
+- Supply a native Arctic Platform job configuration (`.config` or `.json`), its reviewed test specification, and compatible prepared Hugging Face reference records. No real configurations, specifications, or measurements are bundled.
+
+## Checks
+
+**Only two numerical checks are registered.** Both exercise the synthetic input arms recorded in the specification; the arms include gradient accumulation settings.
+
+| Check ID | Comparison |
+| --- | --- |
+| `single-step-grads` | Named per-parameter gradient L2 norms against the prepared single-GPU Hugging Face reference. |
+| `single-step-optimizer` | Step-one parameter-update residual, Adam first-moment, and Adam second-moment L2 norms, with matching parameter names and shapes. |
+
+**Optimizer norm agreement is not elementwise agreement.** Equal L2 norms can hide a sign change, permutation, or directional error. Regression uses the reviewed criterion and calibrated gate stored in the prepared record; regression never widens that gate.
+
+## Prepare References
+
+**Onboarding and regression are separate operations.** Onboarding prepares model fixtures and reviewed specifications, then explicitly measures independent Hugging Face references. See [HF reference onboarding](hf-reference-onboarding.md) for preparation commands and record identity requirements.
+
+## Select A Workload
+
+**A config-only selection runs both checks; a test-only selection runs every config in the supplied directory.** Catalog discovery accepts `.config` and `.json`, excludes archive/spec directories, and rejects duplicate config IDs. Configs and specs can live outside the package.
+
+```bash
+CONFIG=/data-fast/operator-inputs/model/h200/train.config
+SPEC=/data-fast/operator-inputs/specs/model-h200-train.json
+CONFIG_DIR=/data-fast/operator-inputs/configs
+RECORDS="$PWD/local-correctness-records"
+
+# One config and one check.
+python -m arctic_platform.correctness run \
+  --config "$CONFIG" --test single-step-grads --test-spec "$SPEC" \
+  --reference-records-dir "$RECORDS" --out /data-fast/tmp/grads-report
+
+# One config and both checks.
+python -m arctic_platform.correctness run \
+  --config "$CONFIG" --test-spec "$SPEC" \
+  --reference-records-dir "$RECORDS" --out /data-fast/tmp/config-report
+
+# One check and every externally supplied config.
+python -m arctic_platform.correctness run \
+  --config-dir "$CONFIG_DIR" --test single-step-optimizer \
+  --reference-records-dir "$RECORDS" --out /data-fast/tmp/optimizer-report
+
+# Every config and both checks.
+python -m arctic_platform.correctness run \
+  --config-dir "$CONFIG_DIR" --all-configs \
+  --reference-records-dir "$RECORDS" --out /data-fast/tmp/all-report
+```
+
+**`--test-spec` is restricted to one explicit `--config`.** Multi-config selection resolves each matching generated specification from the package's local `specs/<config-id>.json` location. These specs must have been generated and reviewed locally; the package supplies none. Use separate explicit config/spec invocations when specifications are stored elsewhere.
+
+**Use `--backend cortex` only with an explicitly prepared Cortex target.** Hosted execution requires the account connection and a verified fixture publication receipt supplied with `--cortex-fixture`. Existing unauthenticated loopback DSS gateways use `--base-url http://127.0.0.1:<port> --local-cortex-fixture`; local fixture admission verifies the reviewed assets and does not start a new gateway. The default `onprem` execution uses the allocated Arctic Platform runtime instead.
+
+## Results And Diagnostics
+
+**Reports retain comparison results and complete execution errors.** Read the report directory's `report.md`, `report.json`, `batch.json`, and `full.log`. A missing reference, an execution exception, an unsafe cleanup, or an empty selection is not a numerical pass. Unsafe cleanup stops the remaining batch.
+
+**The LM-head diagnostic changes the workload and is not a canonical result.** It removes `fused_lm_head_token_chunk_size` from a copied in-memory config without editing the source config or spec. Compatible diagnostic reference records are still required; do not relabel canonical records.
+
+```bash
+python -m arctic_platform.correctness.diagnostics list
+python -m arctic_platform.correctness.diagnostics run lm_head_chunking \
+  --config "$CONFIG" --test single-step-grads --test-spec "$SPEC" \
+  --reference-records-dir "$RECORDS"
+```
+
+**CPU selftests validate the library, not a model's numerical correctness.**
+
+```bash
+python -m arctic_platform.correctness selftest
+```

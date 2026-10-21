@@ -179,3 +179,12 @@ recipes/*.json
 
 # Semi-persistence onboarding reports and job ledgers, written under the cwd.
 onboarding_reports/
+
+# Locally generated correctness inputs, measurements, and execution state.
+/.correctness-tmp/
+/.codex-run-state/
+/correctness-progress.md
+/local-correctness-records/
+/arctic_platform/correctness/configs/
+/arctic_platform/correctness/specs/
+/arctic_platform/correctness/reference_data/
