@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Literal
 from typing import cast
 
@@ -301,6 +302,7 @@ def _run_experts_grouped_mm_impl(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
@@ -309,6 +311,11 @@ def _run_experts_grouped_mm_impl(
 
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
+    if gate.is_cuda and scores is not None and not w2.requires_grad:
+        from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
+
+        rows = int(offsets[-1])
+        return scored_swiglu_down(gate, up, scores, w2, None, offsets, rows, limit=swiglu_limit).type_as(x)
     if gate.is_cuda:
         from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
 
@@ -317,7 +324,7 @@ def _run_experts_grouped_mm_impl(
         h = _apply_swiglu(gate, up, swiglu_limit)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
-    return out
+    return out if scores is None else apply_routing_weights(out, scores)
 
 
 class GroupedExperts(nn.Module):
@@ -405,15 +412,18 @@ class GroupedExperts(nn.Module):
         weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ab: dict,
+        scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Block-FP8 experts decoded to BF16 for each grouped GEMM (W8A16), plus grouped expert LoRA.
 
         One routed-token count serves every projection; tokens need no per-expert padding and
-        activations are not quantized.
+        activations are not quantized. Routing ``scores`` without down-projection LoRA are folded
+        into the down projection, which then keeps no copy of its output for their gradient.
         """
         from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
         from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
         from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+        from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
 
         offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
         _offsets_must_cover_no_more_than_the_rows("fp8", x, num_tokens_per_expert, offsets)
@@ -429,10 +439,18 @@ class GroupedExperts(nn.Module):
                 out[:rows] += grouped_expert_lora_rows(inputs, ab[name], offsets, rows)
             return out
 
-        h = fused_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
-        return project(h, "w2")
+        gate, up = project(x, "w1"), project(x, "w3")
+        if scores is not None and "w2" not in ab:
+            weight, scale = projections["w2"]
+            return scored_swiglu_down(gate, up, scores, weight, scale, offsets, rows, block_size, self.swiglu_limit)
+        out = project(fused_swiglu(gate, up, self.swiglu_limit), "w2")
+        return out if scores is None else apply_routing_weights(out, scores)
 
-    def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+    def _forward_deepep(
+        self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if scores is not None and not (self.use_grouped_mm and x.is_cuda):
+            return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
             from arctic_platform.model.implementations.fp8 import grouped_fp8_mm
@@ -450,13 +468,14 @@ class GroupedExperts(nn.Module):
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
-                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab)
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab, scores)
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
                 up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w3", d3)
                 h = _apply_swiglu(gate, up, self.swiglu_limit)
-                return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + lora(h, "w2", d2)
+                out = grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + lora(h, "w2", d2)
+                return out if scores is None else apply_routing_weights(out, scores)
             counts = num_tokens_per_expert.tolist()
             n_pad = x.shape[0] - sum(counts)
             splits = torch.split(x[: sum(counts)], counts, dim=0)
@@ -500,19 +519,21 @@ class GroupedExperts(nn.Module):
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
+            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
 
     def forward(
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs."""
         if not uses_dispatch_ep(self.ep_comm_backend):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
             )
-        return self._forward_deepep(x, num_tokens_per_expert)
+        return self._forward_deepep(x, num_tokens_per_expert, scores)
 
     def init_weights(self, init_std: float):
         if self.fp8_block_size is not None:
@@ -730,8 +751,9 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.experts(x, num_tokens_per_expert)
+        return self.experts(x, num_tokens_per_expert, scores)
 
     def _run_routed_experts(
         self,
@@ -787,10 +809,13 @@ class MoE(nn.Module):
 
         def run_pending_chunk(pending_state):
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert)
+            # Routing weights still owed after the experts are applied by them, which can fold them into the
+            # down projection; combine then only sums.
+            scores = dispatch_state.permuted_scores
+            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
-            return combine_tokens(routed_output, dispatch_state)
+            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None))
 
         # dispatch/combine are collectives over the EP group: every rank must issue the
         # same number of calls in both forward and backward or heavier ranks hang on
