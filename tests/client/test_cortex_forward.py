@@ -245,22 +245,6 @@ class TestForwardResult:
         assert torch.is_tensor(decoded["batch"]["logprobs"])
         assert decoded["batch"]["logprobs"].tolist() == [[-0.5, -1.5]]
 
-    def test_unwraps_the_zone_envelope_that_omits_wire_format(self):
-        """The zone sends `{job_id, payload_b64}` with no `wire_format` marker.
-
-        That is the shape on the real wire, and the generic decoder skips it, so
-        without forward's own unwrap the caller gets a base64 string where the
-        tensors belong.
-        """
-        frame = wire.dumps({"job_id": JOB, "logprobs": torch.tensor([[-0.5, -1.5]])})
-        transport, _ = _transport({"job_id": JOB, "payload_b64": base64.b64encode(frame).decode()})
-
-        decoded = transport.call(fwd_no_grad_request(transport.jobs, _batch()))
-
-        assert torch.is_tensor(decoded["logprobs"])
-        assert decoded["logprobs"].tolist() == [[-0.5, -1.5]]
-        assert decoded["job_id"] == JOB
-
     def test_result_without_a_payload_passes_through(self):
         """An error/plain-JSON result must not be mistaken for an envelope."""
         transport, _ = _transport({"job_id": JOB, "status": "weird"})

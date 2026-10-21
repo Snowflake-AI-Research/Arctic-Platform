@@ -32,6 +32,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from dataclasses import replace
@@ -67,7 +68,8 @@ _CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunke
 # `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
 # whose payload is the base64'd DSSST1 frame. The control plane's REST surface
 # marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
-# budget below is a JSON-body budget, not a frame budget.
+# budget below is a JSON-body budget, not a frame budget. 16 MiB is dss_client's
+# conservative default, not a measured server limit.
 _OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
 # Room for the envelope's keys, the operation type and the sub-job token.
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
@@ -215,21 +217,6 @@ def _fwd_bwd_result(result: dict) -> dict:
     return canonical
 
 
-def _unwrap_forward_payload(result: dict) -> dict:
-    """Unwrap forward's DSSST1 frame from the JSON result envelope.
-
-    The zone base64s `wire.dumps({job_id, logprobs})` into `payload_b64`, but
-    without the `wire_format` marker `_decode_result` keys off, so the generic
-    path passes the envelope through and the caller gets a base64 string where
-    the tensors should be. Nothing between here and the zone unwraps it: the
-    only code that does is the standalone dev gateway, which the Cortex path
-    does not go through.
-    """
-    if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
-        return result
-    return _merge_transport_metrics(wire.loads(base64.b64decode(result["payload_b64"])), result)
-
-
 def _request_status(status: dict) -> dict:
     """A poll reply -> ``{"state": "running"|"done"|"failed", "error", "events"}`` with results decoded."""
     state = _short(status.get("status"))
@@ -337,10 +324,7 @@ class _Route:
         raise RuntimeError(f"cortex {operation_type or request.op} response carried no request_id: {reply}")
 
     def finish(self, chunks: list[bytes], result: dict) -> Any:
-        decoded = (
-            _merge_transport_metrics(wire.decode_result_chunks(chunks), result) if chunks else _decode_result(result)
-        )
-        return self.normalize(decoded)
+        return self.normalize(_decode_result(result, chunks))
 
 
 class _NoopRoute(_Route):
@@ -403,9 +387,7 @@ _ROUTES = {
     ),
     # An /operation that is never polled: its acknowledgement may name the cancelled request.
     "cancel-request": _Route(method="POST", path="/{job}/operation"),
-    "forward": _Route(
-        method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
-    ),
+    "forward": _Route(method="POST", path="/{job}/operation", encode=_forward, poll=True),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
     "save": _Route(method="POST", path="/{job}/save", encode=_save, poll=True),
     "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
@@ -818,22 +800,19 @@ def _result_chunk(event: Any) -> bytes | None:
     return payload
 
 
-def _decode_result(result: dict) -> dict:
-    """Decode a small inline result: a base64 DSSST1 frame, else pass-through JSON."""
-    if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
-        return _merge_transport_metrics(wire.loads(base64.b64decode(result["payload_b64"])), result)
-    return result
+def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
+    """A result envelope plus any result chunks -> the decoded result; plain JSON passes through.
 
-
-def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
-    transport_metrics = envelope.get("metrics")
-    if not isinstance(transport_metrics, dict):
-        return decoded
-    payload_metrics = decoded.get("metrics")
-    return {
-        **decoded,
-        "metrics": {
-            **(payload_metrics if isinstance(payload_metrics, dict) else {}),
-            **transport_metrics,
-        },
-    }
+    The zone attaches its own transport metrics (router-replay tx stats) to the
+    JSON envelope instead of re-encoding the DSSST1 frame, so they are folded
+    into the payload's `metrics` here; envelope keys win.
+    """
+    if chunks:
+        decoded = wire.decode_result_chunks(chunks)
+    elif result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
+        decoded = wire.loads(base64.b64decode(result["payload_b64"]))
+    else:
+        return result
+    if "metrics" in result:
+        decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
+    return decoded
