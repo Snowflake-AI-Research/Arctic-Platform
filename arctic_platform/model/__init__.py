@@ -28,9 +28,11 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
+from arctic_platform.model.dense_spec import dense_model_spec
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
 from arctic_platform.model.implementations.gpu.lm_head import mark_lm_head_targets_validated
 from arctic_platform.model.implementations.gpu.lm_head import validated_lm_head_targets_to
@@ -50,6 +52,12 @@ from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
+from arctic_platform.model.moe_spec import build_moe_model
+from arctic_platform.model.moe_spec import hf_text_model_type
+from arctic_platform.model.moe_spec import is_glm_moe_model
+from arctic_platform.model.moe_spec import moe_model_spec
+from arctic_platform.model.parallel.validation import validate_expert_parallel
+from arctic_platform.model.parallel.validation import validate_sequence_parallel
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
@@ -57,11 +65,15 @@ from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
 from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
+from arctic_platform.model.weight_export import hf_checkpoint_name_map
 from arctic_platform.model.weight_export import hf_export_parameter_name
+from arctic_platform.model.weight_export import hf_sync_name_map
 from arctic_platform.model.weight_export import iter_lora_weights
 from arctic_platform.model.weight_export import iter_model_weights
 from arctic_platform.model.weight_export import pretrained_config_of
 from arctic_platform.model.weight_export import pretrained_module_for_hf_save
+from arctic_platform.model.weight_export import read_checkpoint_weight_names
+from arctic_platform.model.weight_export import requires_hf_weight_sync
 from arctic_platform.model.weight_export import save_exported_state_dict
 from arctic_platform.model.weight_export import save_hf_pretrained
 from arctic_platform.model.weight_export import save_peft_adapters
@@ -84,13 +96,18 @@ __all__ = [
     "checkpoint_peft_adapter_dir",
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
+    "dense_model_spec",
     "effective_fused_cross_entropy",
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
     "get_language_model",
+    "hf_text_model_type",
     "get_vision_encoder",
+    "hf_checkpoint_name_map",
     "hf_export_parameter_name",
+    "hf_sync_name_map",
     "iter_lora_weights",
+    "is_glm_moe_model",
     "iter_model_weights",
     "keeps_fp32",
     "LoadedModel",
@@ -102,10 +119,14 @@ __all__ = [
     "ModelParallelismMetadata",
     "ModelSpec",
     "model_parallelism_metadata_from_config",
+    "moe_model_spec",
     "ParallelismConfig",
     "Patches",
+    "preserve_fp8_params_through_ds_cast",
     "pretrained_config_of",
     "pretrained_module_for_hf_save",
+    "read_checkpoint_weight_names",
+    "requires_hf_weight_sync",
     "save_hf_pretrained",
     "save_peft_adapters",
     "supports_weight_format",
@@ -114,6 +135,7 @@ __all__ = [
     "apply_patches",
     "apply_peft",
     "build_model",
+    "build_moe_model",
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
@@ -121,6 +143,8 @@ __all__ = [
     "save_exported_state_dict",
     "select_loader",
     "validate_lora_sync_trainable_parameters",
+    "validate_expert_parallel",
+    "validate_sequence_parallel",
     "validate_lm_head_fused_ce_config",
     "validated_lm_head_targets_to",
     "weight_export_contract",

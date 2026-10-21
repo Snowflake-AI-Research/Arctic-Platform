@@ -19,9 +19,14 @@ from vllm.platforms import current_platform
 
 import arctic_platform.inference.envs as envs
 from arctic_platform.inference.utils import require_supported_vllm_version
+from arctic_platform.inference.vllm.startup_error import install_startup_error_handler
 
 
 def arctic_inference_plugin():
+    # First, and regardless of ARCTIC_INFERENCE_ENABLED, so that an engine process
+    # failing to start after this point, inside this plugin too, records why.
+    install_startup_error_handler()
+
     if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
         require_supported_vllm_version("Arctic Inference plugin")
 
