@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import inspect
 import io
 import json
@@ -148,6 +149,932 @@ def test_clean_port_sampling_does_not_select_gdn_backend_to_match_training():
 
 
 # Cli config selection.
+
+
+@pytest.fixture
+def _inference_export_allocation_cli(tmp_path):
+    descriptor = {"allocation_id": "synthetic-allocation", "nodes": [{"host": "127.0.0.1", "slots": 16}]}
+    path = tmp_path / "allocation.json"
+    path.write_text(json.dumps(descriptor))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(tmp_path / "external.config"),
+            "--test",
+            "inference-checkpoint-loss",
+            "--backend",
+            "cortex",
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--inference-export-allocation",
+            str(path),
+            "--inference-export-allocation-sha256",
+            digest,
+        ]
+    )
+    return args, descriptor
+
+
+@pytest.mark.parametrize("command", ["run", "onboard"])
+def test_inference_export_allocation_parser_preserves_original_pair(_inference_export_allocation_cli, command):
+    args, descriptor = _inference_export_allocation_cli
+    selected = (
+        ["--test", "inference-checkpoint-loss"] if command == "run" else ["--test-id", "inference-checkpoint-loss"]
+    )
+    argv = [
+        command,
+        "--config",
+        str(args.config),
+        "--backend",
+        "cortex",
+        "--base-url",
+        args.base_url,
+        *selected,
+        "--inference-export-allocation",
+        str(args.inference_export_allocation),
+        "--inference-export-allocation-sha256",
+        args.inference_export_allocation_sha256,
+    ]
+    parsed = execution.parse_args(argv)
+    assert parsed.inference_export_allocation == args.inference_export_allocation
+    assert isinstance(parsed.inference_export_allocation, Path)
+    assert parsed.inference_export_allocation_sha256 == args.inference_export_allocation_sha256
+    if command == "onboard":
+        parsed.test = [parsed.test_id]
+    else:
+        request, options = api.parse_run_args(argv[1:])
+        assert options.inference_export_allocation == args.inference_export_allocation
+        assert options.inference_export_allocation_sha256 == args.inference_export_allocation_sha256
+        namespace = api._namespace(request, options)
+        assert execution._load_inference_export_allocation(namespace) == descriptor
+    assert execution._load_inference_export_allocation(parsed) == descriptor
+
+
+def test_inference_export_allocation_absent_pair_preserves_default():
+    assert execution._load_inference_export_allocation(Namespace()) is None
+    assert api.RunOptions().inference_export_allocation is None
+    assert api.RunOptions().inference_export_allocation_sha256 is None
+
+
+@pytest.mark.parametrize("missing", ["inference_export_allocation", "inference_export_allocation_sha256"])
+def test_inference_export_allocation_pair_guard_precedes_setup(_inference_export_allocation_cli, monkeypatch, missing):
+    args, _ = _inference_export_allocation_cli
+    setattr(args, missing, None)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: pytest.fail("invalid pair reached configs"))
+    monkeypatch.setattr(execution, "correctness_workdir", lambda *a: pytest.fail("invalid pair allocated a workdir"))
+    with pytest.raises(ValueError, match="required together"):
+        execution._run_configs(args)
+
+
+@pytest.mark.parametrize("digest", ["0" * 64, "0" * 63, "A" * 64, "g" * 64, 123])
+def test_inference_export_allocation_rejects_bad_pin_before_json(_inference_export_allocation_cli, digest):
+    args, _ = _inference_export_allocation_cli
+    args.inference_export_allocation.write_bytes(b"not JSON")
+    args.inference_export_allocation_sha256 = digest
+    with pytest.raises(ValueError, match="SHA256"):
+        execution._load_inference_export_allocation(args)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"allocation_id":"first","allocation_id":"second"}',
+        b'{"nodes":[{"host":"first","host":"second"}]}',
+    ],
+)
+def test_inference_export_allocation_rejects_duplicate_keys(_inference_export_allocation_cli, raw):
+    args, _ = _inference_export_allocation_cli
+    args.inference_export_allocation.write_bytes(raw)
+    args.inference_export_allocation_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="duplicate"):
+        execution._load_inference_export_allocation(args)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_inference_export_allocation_rejects_nonfinite_metadata(_inference_export_allocation_cli, value):
+    args, _ = _inference_export_allocation_cli
+    raw = ('{"nodes":[{"slots":' + value + "}]}").encode()
+    args.inference_export_allocation.write_bytes(raw)
+    args.inference_export_allocation_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError):
+        execution._load_inference_export_allocation(args)
+
+
+@pytest.mark.parametrize("raw", [b"[]", b"null", b'"allocation"'])
+def test_inference_export_allocation_rejects_nonobject_metadata(_inference_export_allocation_cli, raw):
+    args, _ = _inference_export_allocation_cli
+    args.inference_export_allocation.write_bytes(raw)
+    args.inference_export_allocation_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="JSON object"):
+        execution._load_inference_export_allocation(args)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("config", None),
+        ("all_configs", True),
+        ("test", None),
+        ("test", ["single-step-grads"]),
+        ("test", ["inference-checkpoint-loss", "single-step-grads"]),
+        ("backend", "onprem"),
+        ("base_url", "https://unowned.invalid"),
+        ("base_url", None),
+        ("prepare_references", True),
+        ("probe_layers", 4),
+        ("local_cortex_fixture", True),
+        ("cortex_fixture", Path("foreign-fixture.json")),
+    ],
+)
+def test_inference_export_allocation_rejects_unowned_selection_before_setup(
+    _inference_export_allocation_cli, monkeypatch, field, value
+):
+    args, _ = _inference_export_allocation_cli
+    setattr(args, field, value)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: pytest.fail("invalid route reached configs"))
+    monkeypatch.setattr(execution, "correctness_workdir", lambda *a: pytest.fail("invalid route allocated a workdir"))
+    with pytest.raises(ValueError):
+        execution._run_configs(args)
+
+
+@pytest.mark.parametrize("rl", [False, True])
+def test_inference_export_allocation_execution_forwards_descriptor(_inference_export_allocation_cli, monkeypatch, rl):
+    args, descriptor = _inference_export_allocation_cli
+    path = Path(args.config)
+    native = _config_factory_native_config(
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        sampling={"n_gpus": 16, "max_seq_len": 256} if rl else None,
+    )
+    path.write_text(json.dumps(native))
+    cfg = execution.load_config(path)
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["inference-checkpoint-loss"])
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, *positional, **kwargs):
+        captured.append((config, reviewed, kwargs))
+        return []
+
+    monkeypatch.setattr(execution, "execute_rl", capture)
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    config, reviewed, kwargs = captured[0]
+    assert config == cfg
+    assert reviewed is spec
+    assert kwargs["select"] == ["inference-checkpoint-loss"]
+    assert kwargs["inference_export_allocation"] == descriptor
+    assert args.local_gateway_full_model is False
+
+
+def test_inference_export_allocation_onboarding_forwards_original_pair(
+    _inference_export_allocation_cli, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, _ = _inference_export_allocation_cli
+    args.test_id = "inference-checkpoint-loss"
+    args.output_dir = tmp_path / "onboarding"
+    args.checkout_root = tmp_path
+    args.test_spec = tmp_path / "reviewed.json"
+    args.test_spec.write_bytes(b"unchanged gates")
+    before = args.test_spec.read_bytes()
+    captured = []
+
+    def child(command, **kwargs):
+        captured.append((command, kwargs))
+        report_path = args.output_dir / "validation" / "4-layers" / "report.json"
+        report_path.write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO("synthetic child output\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    result = onboard._run_final_regression(args, {"layers": 4})
+    assert result["status"] == "pass"
+    command, kwargs = captured[0]
+    assert command[:4] == [sys.executable, "-m", "arctic_platform.correctness", "run"]
+    for flag, value in (
+        ("--config", args.config),
+        ("--test", args.test_id),
+        ("--test-spec", args.test_spec),
+        ("--inference-export-allocation", args.inference_export_allocation),
+        ("--inference-export-allocation-sha256", args.inference_export_allocation_sha256),
+    ):
+        assert command.count(flag) == 1
+        assert command[command.index(flag) + 1] == str(value)
+    assert "--local-gateway-full-model" not in command
+    assert args.test_spec.read_bytes() == before
+    assert kwargs["cwd"] == args.checkout_root
+
+
+@pytest.mark.parametrize("field,value", [("prepare_references", True), ("probe_layers", 4)])
+def test_inference_export_allocation_onboarding_refuses_nonfinal_mode_before_storage(
+    _inference_export_allocation_cli, monkeypatch, field, value
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, _ = _inference_export_allocation_cli
+    args.test_id = "inference-checkpoint-loss"
+    setattr(args, field, value)
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: pytest.fail("invalid mode reached storage"))
+    with pytest.raises(ValueError):
+        onboard.run(args)
+
+
+def test_inference_export_allocation_onboarding_relative_caller_path_survives_checkout_cwd(
+    _inference_export_allocation_cli, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, descriptor = _inference_export_allocation_cli
+    original = args.inference_export_allocation
+    original_sha = args.inference_export_allocation_sha256
+    checkout = tmp_path / "different-checkout"
+    checkout.mkdir()
+    (checkout / original.name).write_text('{"allocation_id":"foreign-checkout"}')
+    args.config = Path(args.config)
+    args.inference_export_allocation = Path(original.name)
+    args.test_id = "inference-checkpoint-loss"
+    args.prepare_references = False
+    args.probe_layers = None
+    args.checkout_root = checkout
+    monkeypatch.chdir(tmp_path)
+    load = execution._load_inference_export_allocation
+    admitted = []
+
+    def observe_initial_admission(namespace):
+        assert namespace.inference_export_allocation == original
+        assert namespace.inference_export_allocation_sha256 == original_sha
+        assert Path.cwd() == tmp_path
+        admitted.append(load(namespace))
+        return admitted[-1]
+
+    def parent(namespace):
+        assert namespace.inference_export_allocation == original
+        assert namespace.inference_export_allocation_sha256 == original_sha
+        monkeypatch.chdir(namespace.checkout_root)
+        assert load(namespace) == descriptor
+        return 19
+
+    monkeypatch.setattr(execution, "_load_inference_export_allocation", observe_initial_admission)
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(onboard, "_parent", parent)
+    assert onboard.run(args) == 19
+    assert admitted == [descriptor]
+    assert args.inference_export_allocation_sha256 == original_sha
+
+
+@pytest.mark.parametrize("command", ["run", "onboard"])
+def test_inference_initial_model_dir_parser_and_api_keep_training_root(
+    _inference_export_allocation_cli, tmp_path, command
+):
+    args, _ = _inference_export_allocation_cli
+    root = tmp_path / "full-model"
+    root.mkdir()
+    selection = (
+        ["--test", "inference-checkpoint-loss"] if command == "run" else ["--test-id", "inference-checkpoint-loss"]
+    )
+    argv = [
+        command,
+        "--config",
+        str(args.config),
+        "--backend",
+        "cortex",
+        "--base-url",
+        args.base_url,
+        *selection,
+        "--inference-export-allocation",
+        str(args.inference_export_allocation),
+        "--inference-export-allocation-sha256",
+        args.inference_export_allocation_sha256,
+        "--inference-initial-model-dir",
+        str(root),
+    ]
+    parsed = execution.parse_args(argv)
+    assert parsed.inference_initial_model_dir == root
+    if command == "onboard":
+        parsed.test = [parsed.test_id]
+    else:
+        request, options = api.parse_run_args(argv[1:])
+        assert options.inference_initial_model_dir == root
+        assert api.RunOptions(inference_initial_model_dir=root).inference_initial_model_dir == root
+        assert execution._load_inference_initial_model_dir(api._namespace(request, options)) == root
+    assert execution._load_inference_initial_model_dir(parsed) == root
+
+
+def test_inference_initial_model_dir_absence_is_unchanged():
+    assert api.RunOptions().inference_initial_model_dir is None
+    assert execution._load_inference_initial_model_dir(Namespace()) is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("config", None),
+        ("all_configs", True),
+        ("test", ["single-step-grads"]),
+        ("test", ["inference-checkpoint-loss", "e2e-sft-train-validate"]),
+        ("backend", "onprem"),
+        ("base_url", "https://example.invalid"),
+        ("pat_file", Path("synthetic-pat.txt")),
+        ("prepare_references", True),
+        ("probe_layers", 4),
+        ("local_cortex_fixture", True),
+        ("cortex_fixture", Path("fixture.json")),
+        ("inference_export_allocation", None),
+        ("inference_export_allocation_sha256", None),
+        ("inference_initial_model_dir", Path("relative-model")),
+    ],
+)
+def test_inference_initial_model_dir_refuses_unowned_route_before_setup(
+    _inference_export_allocation_cli, tmp_path, monkeypatch, field, value
+):
+    args, _ = _inference_export_allocation_cli
+    root = tmp_path / "full-model"
+    root.mkdir()
+    args.inference_initial_model_dir = root
+    setattr(args, field, value)
+    monkeypatch.setattr(execution, "read_pat", lambda path: "synthetic-not-a-credential")
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: pytest.fail("invalid root reached configs"))
+    monkeypatch.setattr(execution, "correctness_workdir", lambda *a: pytest.fail("invalid root allocated work"))
+    with pytest.raises(ValueError):
+        execution._run_configs(args)
+
+
+@pytest.mark.parametrize("rl", [False, True])
+def test_inference_initial_model_dir_execution_preserves_config_and_descriptor(
+    _inference_export_allocation_cli, monkeypatch, tmp_path, rl
+):
+    args, descriptor = _inference_export_allocation_cli
+    root = tmp_path / "full-model"
+    root.mkdir()
+    args.inference_initial_model_dir = root
+    path = Path(args.config)
+    native = _config_factory_native_config(
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        sampling={"n_gpus": 16, "max_seq_len": 256} if rl else None,
+    )
+    path.write_text(json.dumps(native))
+    cfg = execution.load_config(path)
+    checksum = execution.config_checksum(cfg)
+    original = path.read_bytes()
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["inference-checkpoint-loss"])
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, *positional, **kwargs):
+        captured.append(kwargs)
+        assert config == cfg
+        assert config.model_name == cfg.model_name
+        assert execution.config_checksum(config) == checksum
+        assert reviewed is spec
+        assert kwargs["select"] == ["inference-checkpoint-loss"]
+        assert kwargs["inference_initial_model_dir"] == root
+        assert kwargs["inference_export_allocation"] == descriptor
+        return []
+
+    monkeypatch.setattr(execution, "execute_rl", capture)
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    assert path.read_bytes() == original
+
+
+def test_inference_initial_model_dir_onboarding_keeps_absolute_root_across_caller_cwd(
+    _inference_export_allocation_cli, tmp_path, monkeypatch
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, descriptor = _inference_export_allocation_cli
+    root = tmp_path / "full-model"
+    root.mkdir()
+    checkout = tmp_path / "other-checkout"
+    checkout.mkdir()
+    args.inference_initial_model_dir = root
+    args.inference_export_allocation = Path(args.inference_export_allocation.name)
+    original_pin = args.inference_export_allocation_sha256
+    args.config = Path(args.config)
+    args.test_id = "inference-checkpoint-loss"
+    args.prepare_references = False
+    args.probe_layers = None
+    args.checkout_root = checkout
+    args.output_dir = tmp_path / "onboarding"
+    args.test_spec = tmp_path / "reviewed.json"
+    args.test_spec.write_bytes(b"unchanged spec and gates")
+    monkeypatch.chdir(tmp_path)
+    captured = []
+
+    def child(command, **kwargs):
+        captured.append(command)
+        assert kwargs["cwd"] == checkout
+        report_path = args.output_dir / "validation" / "4-layers" / "report.json"
+        report_path.write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
+
+    def parent(namespace):
+        assert namespace.inference_initial_model_dir == root
+        assert namespace.inference_export_allocation == tmp_path / "allocation.json"
+        monkeypatch.chdir(checkout)
+        assert execution._load_inference_initial_model_dir(namespace) == root
+        assert execution._load_inference_export_allocation(namespace) == descriptor
+        return onboard._run_final_regression(namespace, {"layers": 4})
+
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(onboard, "_parent", parent)
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    assert onboard.run(args)["status"] == "pass"
+    command = captured[0]
+    for flag, value in (
+        ("--inference-initial-model-dir", root),
+        ("--inference-export-allocation", tmp_path / "allocation.json"),
+        ("--inference-export-allocation-sha256", original_pin),
+        ("--config", args.config),
+        ("--test-spec", args.test_spec),
+    ):
+        assert command.count(flag) == 1
+        assert command[command.index(flag) + 1] == str(value)
+    assert args.test_spec.read_bytes() == b"unchanged spec and gates"
+
+
+@pytest.fixture
+def _historical_gradient_cli(tmp_path):
+    path = tmp_path / "receipts" / "bindings.json"
+    path.parent.mkdir()
+    value = {
+        "schema": "reviewed-gradient-references-v1",
+        "records": {
+            arm: {
+                "record_path": f"records/{arm}.json" if arm == "gas1" else str(tmp_path / "absolute-record.json"),
+                "record_sha256": hashlib.sha256(arm.encode()).hexdigest(),
+                "review": f"Reviewed historical {arm} gradient names only",
+            }
+            for arm in ("gas1", "gas4")
+        },
+    }
+    path.write_text(json.dumps(value))
+    config = tmp_path / "external.config"
+    config.write_text(
+        json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"}))
+    )
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(config),
+            "--test",
+            "single-step-grads",
+            "--backend",
+            "cortex",
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--out",
+            str(tmp_path / "out"),
+            "--historical-gradient-references",
+            str(path),
+            "--historical-gradient-references-sha256",
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        ]
+    )
+    return args, value
+
+
+def test_historical_gradient_cli_api_preserve_original_pinned_pair(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    request, options = api.parse_run_args(
+        [
+            "--config",
+            str(args.config),
+            "--test",
+            "single-step-grads",
+            "--historical-gradient-references",
+            str(args.historical_gradient_references),
+            "--historical-gradient-references-sha256",
+            args.historical_gradient_references_sha256,
+        ]
+    )
+    assert options.historical_gradient_references == args.historical_gradient_references
+    assert isinstance(options.historical_gradient_references, Path)
+    assert options.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+    namespace = api._namespace(request, options)
+    assert namespace.historical_gradient_references == args.historical_gradient_references
+    assert namespace.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+    expected_selection = object()
+    result = object()
+    monkeypatch.setattr(
+        api, "select", lambda actual: expected_selection if actual == request else pytest.fail("request changed")
+    )
+
+    def capture(actual, *, selected, executor):
+        assert actual.historical_gradient_references == args.historical_gradient_references
+        assert actual.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+        assert selected is expected_selection and executor is None
+        return result
+
+    monkeypatch.setattr(execution, "run_batch", capture)
+    assert api.run(request, options) is result
+
+
+def test_historical_gradient_absent_pair_keeps_default():
+    assert execution._load_historical_gradient_references(Namespace()) is None
+    assert api.RunOptions().historical_gradient_references is None
+    assert api.RunOptions().historical_gradient_references_sha256 is None
+
+
+@pytest.mark.parametrize("missing", ["historical_gradient_references", "historical_gradient_references_sha256"])
+def test_historical_gradient_pair_rejected_before_setup(_historical_gradient_cli, monkeypatch, missing):
+    args, _ = _historical_gradient_cli
+    setattr(args, missing, None)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: pytest.fail("invalid pair reached configs"))
+    monkeypatch.setattr(execution, "correctness_workdir", lambda *a: pytest.fail("invalid pair allocated workdir"))
+    with pytest.raises(ValueError, match="required together"):
+        execution._run_configs(args)
+
+
+@pytest.mark.parametrize("digest", ["0" * 64, "0" * 63, "A" * 64, "g" * 64, 123])
+def test_historical_gradient_pin_checked_before_json(_historical_gradient_cli, monkeypatch, digest):
+    args, _ = _historical_gradient_cli
+    args.historical_gradient_references.write_bytes(b"not JSON")
+    args.historical_gradient_references_sha256 = digest
+    monkeypatch.setattr(execution.json, "loads", lambda *a, **kw: pytest.fail("bad pin reached JSON parsing"))
+    with pytest.raises(ValueError, match="SHA256"):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"schema":"first","schema":"second","records":{}}',
+        b'{"schema":"reviewed-gradient-references-v1","records":{"gas1":{},"gas1":{}}}',
+        b'{"schema":"reviewed-gradient-references-v1","records":{"gas1":{"review":"first","review":"second"}}}',
+    ],
+)
+def test_historical_gradient_duplicate_keys_rejected(_historical_gradient_cli, raw):
+    args, _ = _historical_gradient_cli
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="duplicate"):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_historical_gradient_nonfinite_metadata_rejected(_historical_gradient_cli, number):
+    args, _ = _historical_gradient_cli
+    raw = ('{"schema":"reviewed-gradient-references-v1","records":{"gas1":{"review":' + number + "}}}").encode()
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "root-list",
+        "root-null",
+        "schema",
+        "extra-root",
+        "missing-records",
+        "empty-records",
+        "records-list",
+        "empty-arm",
+        "binding-list",
+        "extra-binding",
+        "missing-review",
+        "path-type",
+        "empty-path",
+        "record-pin",
+        "review-type",
+        "blank-review",
+    ],
+)
+def test_historical_gradient_descriptor_schema_is_strict(_historical_gradient_cli, corruption):
+    args, value = _historical_gradient_cli
+    binding = value["records"]["gas1"]
+    if corruption == "root-list":
+        value = []
+    elif corruption == "root-null":
+        value = None
+    elif corruption == "schema":
+        value["schema"] = "unreviewed"
+    elif corruption == "extra-root":
+        value["ignored"] = True
+    elif corruption == "missing-records":
+        del value["records"]
+    elif corruption == "empty-records":
+        value["records"] = {}
+    elif corruption == "records-list":
+        value["records"] = []
+    elif corruption == "empty-arm":
+        value["records"][""] = value["records"].pop("gas1")
+    elif corruption == "binding-list":
+        value["records"]["gas1"] = []
+    elif corruption == "extra-binding":
+        binding["ignored"] = True
+    elif corruption == "missing-review":
+        del binding["review"]
+    elif corruption == "path-type":
+        binding["record_path"] = 1
+    elif corruption == "empty-path":
+        binding["record_path"] = ""
+    elif corruption == "record-pin":
+        binding["record_sha256"] = "A" * 64
+    elif corruption == "review-type":
+        binding["review"] = True
+    else:
+        binding["review"] = " \n\t "
+    raw = json.dumps(value).encode()
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="schema|binding"):
+        execution._load_historical_gradient_references(args)
+
+
+def test_historical_gradient_descriptor_size_bounded(_historical_gradient_cli):
+    args, _ = _historical_gradient_cli
+    raw = b" " * (1024 * 1024 + 1)
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="exceeds 1 MiB"):
+        execution._load_historical_gradient_references(args)
+
+
+def test_historical_gradient_relative_paths_use_caller_and_descriptor_directory(
+    _historical_gradient_cli, monkeypatch, tmp_path
+):
+    args, value = _historical_gradient_cli
+    original = args.historical_gradient_references
+    pin = args.historical_gradient_references_sha256
+    args.historical_gradient_references = original.relative_to(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    bindings = execution._load_historical_gradient_references(args)
+    assert bindings["gas1"]["record_path"] == str(original.parent / "records" / "gas1.json")
+    assert bindings["gas4"]["record_path"] == str(tmp_path / "absolute-record.json")
+    for arm in value["records"]:
+        assert bindings[arm]["record_sha256"] == value["records"][arm]["record_sha256"]
+        assert bindings[arm]["review"] == value["records"][arm]["review"]
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == pin
+    assert args.historical_gradient_references == original.relative_to(tmp_path)
+    assert args.historical_gradient_references_sha256 == pin
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("config", None),
+        ("all_configs", True),
+        ("test", None),
+        ("test", []),
+        ("test", ["single-step-optimizer"]),
+        ("test", ["single-step-grads", "single-step-optimizer"]),
+        ("test", ["single-step-grads", "single-step-grads"]),
+        ("prepare_references", True),
+        ("probe_layers", 0),
+        ("probe_layers", 4),
+    ],
+)
+def test_historical_gradient_runbatch_checks_original_selection_before_narrowing(
+    _historical_gradient_cli, monkeypatch, tmp_path, field, value
+):
+    args, _ = _historical_gradient_cli
+    selected = [api.SelectedCase("synthetic", Path(args.config), "single-step-grads")]
+    setattr(args, field, value)
+    args.out = None
+    monkeypatch.setattr(execution, "_run_configs", lambda *a, **kw: pytest.fail("invalid selection narrowed"))
+    monkeypatch.setattr(
+        execution, "correctness_workdir", lambda *a: pytest.fail("invalid selection allocated workdir")
+    )
+    with pytest.raises(ValueError, match="one explicit config and only single-step-grads"):
+        execution.run_batch(args, selected=selected)
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("selection", ["all-configs", "all-tests", "optimizer", "mixed"])
+def test_historical_gradient_api_guard_precedes_catalog(_historical_gradient_cli, monkeypatch, selection):
+    args, _ = _historical_gradient_cli
+    request = api.RunRequest(
+        config=None if selection == "all-configs" else args.config,
+        tests={
+            "all-configs": ("single-step-grads",),
+            "all-tests": (),
+            "optimizer": ("single-step-optimizer",),
+            "mixed": ("single-step-grads", "single-step-optimizer"),
+        }[selection],
+        all_configs=selection == "all-configs",
+    )
+    options = api.RunOptions(
+        historical_gradient_references=args.historical_gradient_references,
+        historical_gradient_references_sha256=args.historical_gradient_references_sha256,
+    )
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid selection reached catalog"))
+    with pytest.raises(ValueError, match="one explicit config and only single-step-grads"):
+        api.run(request, options)
+
+
+def test_historical_gradient_runbatch_forwards_original_pair(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    expected = execution._load_historical_gradient_references(args)
+    captured = []
+    selected = [api.SelectedCase("synthetic", Path(args.config), "single-step-grads")]
+    monkeypatch.setattr(execution, "write_report", lambda *a, **kw: None)
+
+    def capture(child, *, executor, snapshot):
+        assert child.historical_gradient_references == args.historical_gradient_references
+        assert child.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+        assert child.test == ["single-step-grads"]
+        captured.append(execution._load_historical_gradient_references(child))
+        snapshot([Result("single-step-grads", "synthetic", Outcome.PASS)], {}, {})
+
+    monkeypatch.setattr(execution, "_run_configs", capture)
+    result = execution.run_batch(args, selected=selected)
+    assert captured == [expected]
+    assert result.exit_code == 0
+
+
+def test_historical_gradient_execution_forwards_exact_bindings(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["single-step-grads"])
+    expected = execution._load_historical_gradient_references(args)
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, definitions, **kwargs):
+        assert config == cfg and reviewed is spec and definitions == arms
+        captured.append(kwargs)
+        return []
+
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    assert captured[0]["historical_gradient_references"] == expected
+    assert captured[0]["select"] == ["single-step-grads"]
+
+
+def test_historical_gradient_execution_refuses_rl_before_separate_dispatch(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    Path(args.config).write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"},
+                sampling={"n_gpus": 4, "max_seq_len": 16},
+            )
+        )
+    )
+    assert execution.load_config(Path(args.config)).is_rl
+    recorded = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: pytest.fail("RL rejection reached frozen spec"))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: pytest.fail("RL rejection read model metadata"))
+    monkeypatch.setattr(
+        execution, "execute_rl", lambda *a, **kw: pytest.fail("historical bindings reached RL dispatch")
+    )
+
+    def finish(results, *a, **kw):
+        recorded.extend(results)
+        return 1
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    assert execution._run_configs(args, executor=lambda *a, **kw: pytest.fail("RL reached SFT executor")) == 1
+    assert len(recorded) == 1
+    assert recorded[0].outcome is Outcome.FAIL
+    assert recorded[0].test_id == "-"
+    assert recorded[0].reason == "historical gradient references require a supervised config"
+
+
+def test_historical_gradient_execution_keeps_declared_width_with_larger_pool(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    config_bytes = Path(args.config).read_bytes()
+    cfg = execution.load_config(Path(args.config))
+    args.gpu_pool = cfg.n_gpus * 4
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["single-step-grads"])
+    bindings = execution._load_historical_gradient_references(args)
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, definitions, **kwargs):
+        captured.append((config.n_gpus, definitions, kwargs))
+        assert reviewed is spec
+        return []
+
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    width, definitions, kwargs = captured[0]
+    assert width == cfg.n_gpus == 4
+    assert definitions == arms
+    assert kwargs["historical_gradient_references"] == bindings
+    assert kwargs["select"] == ["single-step-grads"]
+    assert Path(args.config).read_bytes() == config_bytes
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing-arm", "extra-arm", "empty", "type", "optimizer", "mixed", "prep", "rl"]
+)
+def test_historical_gradient_runner_guard_precedes_workdir_and_target(
+    _historical_gradient_cli, monkeypatch, corruption
+):
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    bindings = execution._load_historical_gradient_references(args)
+    select = ["single-step-grads"]
+    if corruption == "missing-arm":
+        bindings.pop("gas4")
+    elif corruption == "extra-arm":
+        bindings["foreign"] = bindings["gas1"]
+    elif corruption == "empty":
+        bindings = {}
+    elif corruption == "type":
+        bindings = []
+    elif corruption == "optimizer":
+        select = ["single-step-optimizer"]
+    elif corruption == "mixed":
+        select.append("single-step-optimizer")
+    elif corruption == "rl":
+        Path(args.config).write_text(
+            json.dumps(
+                _config_factory_native_config(
+                    {"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"},
+                    sampling={"n_gpus": 4, "max_seq_len": 16},
+                )
+            )
+        )
+        cfg = execution.load_config(Path(args.config))
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("invalid binding reached workdir"))
+    monkeypatch.setattr(runner, "gateway", lambda *a, **kw: pytest.fail("invalid binding reached target"))
+    with pytest.raises(ValueError, match="exactly the selected SFT arms"):
+        runner.execute(
+            cfg,
+            None,
+            [SimpleNamespace(name=arm) for arm in ("gas1", "gas4")],
+            vocab_size=128,
+            select=select,
+            prepare_references=corruption == "prep",
+            historical_gradient_references=bindings,
+        )
+
+
+def test_historical_gradient_runner_records_provenance_before_target_and_keeps_bindings(
+    _historical_gradient_cli, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.harness import reference_records
+    from arctic_platform.correctness.harness.config import ArmDefinition
+
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    bindings = execution._load_historical_gradient_references(args)
+    before = copy.deepcopy(bindings)
+    definitions = [ArmDefinition("gas1", 2, 8), ArmDefinition("gas4", 4, 8)]
+    spec = SimpleNamespace(
+        applicable_tests=["single-step-grads"],
+        test_settings={},
+        model=SimpleNamespace(cache_path="/data-fast/tmp/unmaterialized-synthetic-model"),
+    )
+    loaded = []
+    provenance = {}
+    work = tmp_path / "runner"
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
+    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *a: False)
+    monkeypatch.setattr(runner, "run_reference", lambda *a, **kw: pytest.fail("historical binding rebuilt HF"))
+    monkeypatch.setattr(reference_records, "model_identity", lambda *a: {"synthetic": True})
+    monkeypatch.setattr(reference_records, "workload_identity", lambda ctx, check, recipe: recipe)
+
+    def load(ctx, identity, *, historical_binding):
+        arm = "gas1" if identity["synthetic_inputs"]["rows"] == 2 else "gas4"
+        assert historical_binding == before[arm]
+        provenance[arm] = copy.deepcopy(historical_binding)
+        ctx.reference_record_provenance[arm] = provenance[arm]
+        loaded.append(arm)
+        historical_binding["review"] = "mutated loader-local copy"
+        return {"loss": 1.0, "grad_norms": {"synthetic.weight": 0.5}}
+
+    def no_target(*a, **kw):
+        assert loaded == ["gas1", "gas4"]
+        assert json.loads((work / "reference-record-provenance.json").read_text()) == provenance
+        assert bindings == before
+        raise RuntimeError("test-only stop before target allocation")
+
+    monkeypatch.setattr(reference_records, "load_record", load)
+    monkeypatch.setattr(runner, "gateway", no_target)
+    with pytest.raises(RuntimeError, match="test-only stop before target allocation"):
+        runner.execute(
+            cfg,
+            spec,
+            definitions,
+            vocab_size=128,
+            select=["single-step-grads"],
+            workdir=work,
+            historical_gradient_references=bindings,
+        )
+    assert bindings == before
+
 
 _inference_forwarding_config = (
     Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
@@ -1351,3 +2278,300 @@ def test_workdir_root_correctness_workdir_rejects_unsafe_explicit_override(monke
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match=CORRECTNESS_TMPDIR_ENV):
         workdir.correctness_workdir("dss-correctness-")
+
+
+@pytest.fixture
+def _native_optimizer_scope_runner(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.correctness.harness import reference_records
+    from arctic_platform.correctness.harness.config import ArmDefinition
+    from arctic_platform.correctness.harness.config import load_config
+
+    config = tmp_path / "synthetic-native.config"
+    config.write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {
+                    "n_gpus": 16,
+                    "max_seq_len": 8,
+                    "sp_size": 16,
+                    "attn_implementation": "sdpa",
+                    "mb_spec": {"max_tokens_per_mb": 32},
+                    "optimizer": {"name": "AdamW", "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                }
+            )
+        )
+    )
+    cfg = load_config(config)
+    model = str(tmp_path / "synthetic-unmaterialized-model")
+    spec = SimpleNamespace(
+        applicable_tests=["single-step-optimizer"],
+        test_settings={"single-step-optimizer": {"reference_token_budget": 32}},
+        model=SimpleNamespace(cache_path=model),
+    )
+    state = SimpleNamespace(
+        events=[],
+        verified=[],
+        captures=[],
+        error=None,
+        fault=None,
+        scope_source={"path": str(Path(__file__).resolve()), "sha256": "a" * 64},
+        supplier_source=None,
+        session=object(),
+        job=SimpleNamespace(client=SimpleNamespace(transport=SimpleNamespace(job_id="synthetic-parent"))),
+    )
+    helper = ModuleType("arctic_platform.correctness.harness.cortex_optimizer")
+
+    def supplier(root, *, step):
+        state.events.append(f"supply-{step}")
+        return {"synthetic": True, "root": str(root), "step": step}
+
+    @contextmanager
+    def scope(session, job):
+        assert session is state.session and job is state.job
+        state.events.append("scope-enter")
+        try:
+            if state.fault == "enter":
+                raise RuntimeError("synthetic scope enter failure")
+            yield None if state.fault == "noncallable-supplier" else supplier
+        finally:
+            state.events.append("scope-exit")
+            if state.fault == "exit":
+                raise RuntimeError("synthetic scope exit failure")
+
+    state.scope = scope
+    state.supplier = supplier
+
+    def verify(callback, descriptor):
+        state.verified.append((callback, descriptor))
+        expected = (
+            state.scope_source
+            if callback is scope
+            else state.supplier_source if state.supplier_source is not None else state.scope_source
+        )
+        if not callable(callback) or descriptor != expected:
+            raise ValueError("synthetic native callback source rejected")
+        scope_checks = sum(function is scope for function, _ in state.verified)
+        if state.fault == "before-source" and callback is scope and scope_checks == 2:
+            raise ValueError("synthetic scope source drift before entry")
+        if state.fault == "supplier-source" and callback is supplier:
+            raise ValueError("synthetic supplier source drift")
+        if state.fault == "after-source" and callback is scope and scope_checks == 3:
+            raise ValueError("synthetic scope source drift after exit")
+
+    def capture(session, job, body, **kwargs):
+        assert session is state.session and job is state.job
+        state.events.append("capture")
+        state.captures.append((body, kwargs))
+        if state.error is not None:
+            raise state.error
+        actual = kwargs.get("native_layout_supplier")
+        if actual is not None:
+            assert actual is supplier
+            assert kwargs["native_layout_supplier_source"] is (
+                state.scope_source if state.supplier_source is None else state.supplier_source
+            )
+            for step in (0, 1):
+                assert actual(tmp_path / f"synthetic-save-{step}", step=step)["step"] == step
+        return SimpleNamespace(optimizer_state_manifest="synthetic-unread-manifest")
+
+    helper.verify_native_callback = verify
+    helper.capture_optimizer_step = capture
+    monkeypatch.setitem(sys.modules, helper.__name__, helper)
+
+    @contextmanager
+    def gateway(*args, **kwargs):
+        assert args[1] == cfg.n_gpus
+        state.events.append("gateway-enter")
+        try:
+            yield state.session
+        finally:
+            state.events.append("gateway-exit")
+
+    @contextmanager
+    def job(*args, **kwargs):
+        state.events.append("job-enter")
+        try:
+            yield state.job
+        finally:
+            state.events.append("job-exit")
+
+    def judge(context, arm):
+        assert context._target[arm.name].optimizer_state_manifest == "synthetic-unread-manifest"
+        return Result("single-step-optimizer", context.config_id, Outcome.PASS, arm=arm.name)
+
+    entry = SimpleNamespace(
+        test_id="single-step-optimizer", compares_to_reference=True, per_arm=judge, fn=lambda ctx: []
+    )
+    monkeypatch.setattr(runner, "registered_tests", lambda: {"single-step-optimizer": entry})
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
+    monkeypatch.setattr(runner, "run_reference", lambda *args, **kwargs: pytest.fail("no live HF reference"))
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: {"model_name": model})
+    monkeypatch.setattr(reference_records, "model_identity", lambda *args: {"synthetic": True})
+    monkeypatch.setattr(reference_records, "workload_identity", lambda ctx, check, recipe: recipe)
+    monkeypatch.setattr(reference_records, "load_record", lambda *args: {"synthetic": True})
+    monkeypatch.setattr(runner, "gateway", gateway)
+    monkeypatch.setattr(runner, "running_job", job)
+
+    def run(**overrides):
+        options = {
+            "vocab_size": 128,
+            "select": ["single-step-optimizer"],
+            "workdir": tmp_path / "work",
+            "client_backend": CortexConfig(base_url="http://127.0.0.1:8003", host=None, pat=None),
+            "local_cortex_fixture": True,
+            "native_optimizer_scope": scope,
+            "native_optimizer_scope_source": state.scope_source,
+        }
+        options.update(overrides)
+        return runner.execute(cfg, spec, [ArmDefinition("gas1", 2, 8), ArmDefinition("gas4", 4, 8)], **options)
+
+    state.cfg, state.run = cfg, run
+    return state
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["no-local", "prepare", "onprem", "hosted", "pat", "selection", "grads", "later", "rl"],
+)
+def test_native_optimizer_scope_rejects_invalid_route_before_fixture_or_work(
+    _native_optimizer_scope_runner, monkeypatch, route
+):
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.client import OnPremConfig
+
+    state = _native_optimizer_scope_runner
+    options = {
+        "no-local": {"local_cortex_fixture": False},
+        "prepare": {"prepare_references": True},
+        "onprem": {"client_backend": OnPremConfig()},
+        "hosted": {"client_backend": CortexConfig(base_url="https://hosted.invalid", host=None, pat=None)},
+        "pat": {"client_backend": CortexConfig(base_url="http://127.0.0.1:8003", pat="synthetic-not-a-credential")},
+        "selection": {"select": None},
+        "grads": {"select": ["single-step-grads"]},
+        "later": {"select": ["single-step-optimizer", "checkpoint-resume"]},
+        "rl": {},
+    }[route]
+    if route == "rl":
+        monkeypatch.setattr(type(state.cfg), "is_rl", property(lambda self: True))
+    monkeypatch.setattr(
+        cortex_fixture, "load_local_fixture", lambda *args: pytest.fail("invalid route reached fixture")
+    )
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *args: pytest.fail("invalid route allocated work"))
+    with pytest.raises(ValueError):
+        state.run(workdir=None, **options)
+    assert state.events == [] and state.captures == []
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing-scope", "missing-source", "noncallable", "foreign", "orphan-supplier"]
+)
+def test_native_optimizer_scope_rejects_invalid_source_before_fixture(
+    _native_optimizer_scope_runner, monkeypatch, corruption
+):
+    state = _native_optimizer_scope_runner
+    options = {
+        "missing-scope": {"native_optimizer_scope": None},
+        "missing-source": {"native_optimizer_scope_source": None},
+        "noncallable": {"native_optimizer_scope": object()},
+        "foreign": {"native_optimizer_scope_source": {"path": "/synthetic/foreign.py", "sha256": "b" * 64}},
+        "orphan-supplier": {
+            "native_optimizer_scope": None,
+            "native_optimizer_scope_source": None,
+            "native_optimizer_supplier_source": state.scope_source,
+        },
+    }[corruption]
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: pytest.fail("bad source reached fixture"))
+    with pytest.raises(ValueError):
+        state.run(**options)
+    assert state.events == [] and state.captures == []
+
+
+@pytest.mark.parametrize("order", ["batched", "per-arm"])
+@pytest.mark.parametrize("separate_source", [False, True])
+def test_native_optimizer_scope_forwards_owned_supplier_and_full_sp_worker_width(
+    _native_optimizer_scope_runner, order, separate_source
+):
+    state = _native_optimizer_scope_runner
+    options = {}
+    if separate_source:
+        state.supplier_source = {"path": "/synthetic/other-owner.py", "sha256": "b" * 64}
+        options["native_optimizer_supplier_source"] = state.supplier_source
+    results = state.run(order=order, **options)
+    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
+    assert state.cfg.dp_size == 1 and state.cfg.n_gpus == 16
+    assert len(state.captures) == 2
+    for body, kwargs in state.captures:
+        assert body["processing"] == {"loss_fn": "sft"}
+        assert kwargs["local_checkpoint"] is True and kwargs["expected_dp_world_size"] == 16
+        assert kwargs["learning_rate"] == runner.OPTIMIZER_LEARNING_RATE
+        assert kwargs["optimizer_config"] == state.cfg.training["optimizer"]
+        assert kwargs["native_layout_supplier"] is state.supplier
+    assert state.events.count("scope-enter") == state.events.count("scope-exit") == 2
+    assert state.events.count("job-enter") == state.events.count("job-exit") == 2
+    assert state.events.count("supply-0") == state.events.count("supply-1") == 2
+    assert state.events[-1] == "gateway-exit"
+
+
+def test_native_optimizer_scope_ordinary_capture_remains_callback_free(_native_optimizer_scope_runner):
+    state = _native_optimizer_scope_runner
+    results = state.run(native_optimizer_scope=None, native_optimizer_scope_source=None)
+    assert all(result.outcome is Outcome.PASS for result in results)
+    assert state.verified == [] and "scope-enter" not in state.events
+    assert len(state.captures) == 2
+    for _, kwargs in state.captures:
+        assert kwargs["expected_dp_world_size"] == state.cfg.dp_size
+        assert "native_layout_supplier" not in kwargs and "native_layout_supplier_source" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "fault", ["enter", "exit", "noncallable-supplier", "before-source", "supplier-source", "after-source"]
+)
+def test_native_optimizer_scope_failure_retains_traceback_and_owned_cleanup(
+    _native_optimizer_scope_runner, capsys, fault
+):
+    state = _native_optimizer_scope_runner
+    state.fault = fault
+    results = state.run(fail_fast=True)
+    assert len(results) == 1 and results[0].outcome is Outcome.FAIL
+    assert results[0].arm == "gas1"
+    assert state.events.count("job-exit") == 1 and state.events[-1] == "gateway-exit"
+    if fault == "before-source":
+        assert "scope-enter" not in state.events
+    else:
+        assert state.events.count("scope-enter") == state.events.count("scope-exit") == 1
+    assert "Traceback (most recent call last):" in capsys.readouterr().err
+    assert state.verified[-1] == (state.scope, state.scope_source)
+
+
+@pytest.mark.parametrize("failure", ["capture", "capture-and-source", "interrupt", "unsafe-cleanup"])
+def test_native_optimizer_scope_preserves_primary_error_and_closes_context(
+    _native_optimizer_scope_runner, capsys, failure
+):
+    state = _native_optimizer_scope_runner
+    if failure == "interrupt":
+        state.error = KeyboardInterrupt("synthetic interrupted capture")
+    elif failure == "unsafe-cleanup":
+        state.error = UnsafeCleanupError("synthetic unsafe capture")
+    else:
+        state.error = RuntimeError("synthetic primary capture failure")
+    if failure == "capture-and-source":
+        state.fault = "after-source"
+    if failure in {"interrupt", "unsafe-cleanup"}:
+        with pytest.raises(type(state.error)) as caught:
+            state.run(fail_fast=True)
+        assert caught.value is state.error
+    else:
+        results = state.run(fail_fast=True)
+        assert len(results) == 1 and results[0].reason == str(state.error)
+        assert results[0].error_type == "RuntimeError"
+        traceback = capsys.readouterr().err
+        assert "synthetic primary capture failure" in traceback
+        if failure == "capture-and-source":
+            assert "source verification also failed" in traceback
+            assert len(state.error.__notes__) == 1
+    assert state.events.count("scope-enter") == state.events.count("scope-exit") == 1
+    assert state.events.count("job-exit") == 1 and state.events[-1] == "gateway-exit"

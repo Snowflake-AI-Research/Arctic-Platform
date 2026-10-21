@@ -966,7 +966,7 @@ def test_names_qwen4_shared_expert_tensor_groups_preserve_original_names(source:
     original = f"model.layers.2.mlp.qwen_shared_expert.{source}.weight"
     groups = canonical_dss_tensor_groups([original])
     group = groups[f"layers.2.mlp.shared_expert.{target}.weight"]
-    assert group.originals == (f"layers.2.mlp.qwen_shared_expert.{source}.weight",)
+    assert group.originals == (original,)
     assert group.concatenate_dim is None
 
 
@@ -987,6 +987,66 @@ def test_names_qwen4_unequal_shared_expert_aliases_fail_coverage() -> None:
     assert pairs == [("layers.0.mlp.shared_expert.gate_proj.weight", 2.0, 2.0)]
     assert only_dss == ["model.layers.0.shared_expert.w1.weight"]
     assert not only_reference
+
+
+def test_names_glm53_bare_shared_expert_norms_follow_the_weight_conversion() -> None:
+    dss = {
+        "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w1": 6.0,
+        "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w2": 7.0,
+        "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w3": 8.0,
+    }
+    reference = {
+        "model.language_model.layers.3.mlp.shared_experts.gate_proj.weight": 6.0,
+        "model.language_model.layers.3.mlp.shared_experts.down_proj.weight": 7.0,
+        "model.language_model.layers.3.mlp.shared_experts.up_proj.weight": 8.0,
+    }
+    pairs, only_dss, only_reference = align(dss, reference)
+    assert pairs == [
+        ("layers.3.mlp.shared_experts.down_proj.weight", 7.0, 7.0),
+        ("layers.3.mlp.shared_experts.gate_proj.weight", 6.0, 6.0),
+        ("layers.3.mlp.shared_experts.up_proj.weight", 8.0, 8.0),
+    ]
+    assert not only_dss
+    assert not only_reference
+
+
+@pytest.mark.parametrize("source,target", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")])
+def test_names_glm53_bare_shared_expert_tensor_groups_preserve_raw_originals(source: str, target: str) -> None:
+    original = f"model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.{source}"
+    group = canonical_dss_tensor_groups([original])[f"layers.3.mlp.shared_experts.{target}.weight"]
+    assert group.originals == (original,)
+    assert group.concatenate_dim is None
+
+
+@pytest.mark.parametrize("source,target", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")])
+def test_names_glm53_bare_shared_expert_mapping_preserves_numerical_differences(source: str, target: str) -> None:
+    pairs, only_dss, only_reference = align(
+        {f"model.language_model.layers.3.mlp.shared_expert.{source}": 2.0},
+        {f"model.language_model.layers.3.mlp.shared_experts.{target}.weight": 3.0},
+    )
+    assert pairs == [(f"layers.3.mlp.shared_experts.{target}.weight", 2.0, 3.0)]
+    assert not only_dss
+    assert not only_reference
+
+
+def test_names_glm53_bare_shared_expert_mapping_does_not_drop_unmatched_indexer() -> None:
+    indexer = "model.language_model.layers.3._checkpoint_wrapped_module.self_attn.indexer.index_kpool_compress_ape"
+    pairs, only_dss, only_reference = align(
+        {"model.language_model.layers.3.mlp.shared_expert.w1": 2.0, indexer: 1.0},
+        {"model.language_model.layers.3.mlp.shared_experts.gate_proj.weight": 2.0},
+    )
+    assert pairs == [("layers.3.mlp.shared_experts.gate_proj.weight", 2.0, 2.0)]
+    assert only_dss == [indexer]
+    assert not only_reference
+
+
+def test_names_glm53_bare_shared_expert_does_not_match_singular_hf_container() -> None:
+    original = "model.language_model.layers.3.mlp.shared_expert.w1"
+    reference = "model.language_model.layers.3.mlp.shared_expert.gate_proj.weight"
+    pairs, only_dss, only_reference = align({original: 2.0}, {reference: 2.0})
+    assert not pairs
+    assert only_dss == [original]
+    assert only_reference == [reference]
 
 
 # Original models.

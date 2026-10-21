@@ -185,3 +185,9 @@ onboarding_reports/
 
 # Working correctness results and fleet progress remain local.
 /correctness-progress.md
+
+# Temporary checks, execution state, and retired code are not maintained source.
+/.correctness-tmp/
+/.codex-run-state/
+/correctness-backup/
+/.onprem-cleanup-backup/

@@ -58,6 +58,17 @@ DIMENSION_FIELDS = (
 QWEN4_INTEGER_BUFFERS = frozenset({"layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"})
 
 
+def validate_initial_training_model_dir(value: str | Path) -> Path:
+    """Validate local storage, not model identity or readiness on other allocation nodes."""
+    if not isinstance(value, (str, Path)):
+        raise ValueError("inference initial model directory must be an absolute path")
+    path = Path(value)
+    canonical = require_data_fast_path(path, label="inference initial model directory")
+    if not path.is_absolute() or path != canonical or path.is_symlink() or not path.is_dir():
+        raise ValueError("inference initial model directory must be a canonical regular FAST directory")
+    return canonical
+
+
 def schema_sha(schema):
     raw = json.dumps(schema, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
     return hashlib.sha256(raw).hexdigest()

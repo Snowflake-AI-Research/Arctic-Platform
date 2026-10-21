@@ -595,6 +595,13 @@ def _run(ctx) -> TestResult:
 
         require_local_cortex_gateway(backend)
         validate_local_inference_allocation(getattr(ctx, "inference_export_allocation", None))
+    initial_model_dir = getattr(ctx, "inference_initial_model_dir", None)
+    if initial_model_dir is not None:
+        from ..harness.inference_export import validate_initial_training_model_dir
+
+        if not local:
+            raise ValueError("initial training model directory requires local Cortex inference")
+        initial_model_dir = validate_initial_training_model_dir(initial_model_dir)
     model_path = _full_model_name(ctx)
     gateway_slots = (
         max(ctx.cfg.n_gpus, sampling_gpus)
@@ -643,6 +650,8 @@ def _run(ctx) -> TestResult:
     )
     if managed and ctx.cfg.gpu_type is not None:
         payload["hardware"] = ctx.cfg.gpu_type.upper()
+    if initial_model_dir is not None:
+        payload["local_model_dir"] = str(initial_model_dir)
     provider = str(ctx.cfg.training.get("model_provider", "huggingface"))
     # The forward-only route is the one that does not shift, so the validation request carries logit
     # aligned labels while the training requests carry the convention the provider's dispatch expects.

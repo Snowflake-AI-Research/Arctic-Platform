@@ -59,6 +59,56 @@ from arctic_platform.correctness.reference import optimizer_step
 from .check_catalog_configuration import _applicable_tests_spec
 from .helpers import _config_factory_native_config
 
+
+@pytest.fixture
+def _onboarding_checkout_roots(tmp_path, monkeypatch):
+    library = tmp_path / "published-library"
+    onboarding = library / "arctic_platform" / "correctness" / "onboarding"
+    onboarding.mkdir(parents=True)
+    harness = onboarding.parent / "harness"
+    harness.mkdir()
+    external = tmp_path / "operator-inputs"
+    external.mkdir()
+    monkeypatch.setattr(onboard, "__file__", str(onboarding / "onboard.py"))
+    monkeypatch.setattr(reference_records, "__file__", str(harness / "reference_records.py"))
+    return library, external
+
+
+@pytest.mark.parametrize("suffix", [".config", ".json"])
+@pytest.mark.parametrize("foreign_checkout", [False, True])
+def test_onboarding_checkout_root_uses_library_for_external_configs(
+    _onboarding_checkout_roots, suffix, foreign_checkout
+):
+    library, external = _onboarding_checkout_roots
+    onboard.subprocess.run(["git", "init", "--quiet", str(library)], check=True)
+    if foreign_checkout:
+        onboard.subprocess.run(["git", "init", "--quiet", str(external)], check=True)
+    config = external / ("train" + suffix)
+    raw = b'{"synthetic":"external config, no model execution"}\n'
+    config.write_bytes(raw)
+
+    assert onboard._checkout_root(config) == library
+    assert config.read_bytes() == raw
+    assert reference_records.require_git_records_dir(library / "generated-records") == library / "generated-records"
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="Git checkout"):
+        reference_records.require_git_records_dir(external / "generated-records")
+    assert not (library / "generated-records").exists()
+    assert not (external / "generated-records").exists()
+
+
+def test_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_not_git(
+    _onboarding_checkout_roots,
+):
+    library, external = _onboarding_checkout_roots
+    onboard.subprocess.run(["git", "init", "--quiet", str(external)], check=True)
+    config = external / "train.config"
+    config.write_text('{"synthetic":"no published library Git checkout"}\n')
+
+    with pytest.raises(onboard.subprocess.CalledProcessError):
+        onboard._checkout_root(config)
+    assert not (library / ".git").exists()
+
+
 # Data fast storage.
 
 
@@ -3079,3 +3129,224 @@ def test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before
         onboard._parent(state.args)
     assert state.events == []
     assert state.args.test_spec.read_bytes() == state.previous
+
+
+def _optimizer_child_files(args, tmp_path):
+    bootstrap = tmp_path / "caller.py"
+    bootstrap.write_text("# Synthetic child source; never executed by these CPU controls.\n")
+    config = tmp_path / "caller.json"
+    config.write_text('{"private_token": "never include configuration contents in the receipt"}\n')
+    for name, path in (
+        ("optimizer_validation_bootstrap", bootstrap),
+        ("optimizer_validation_config", config),
+    ):
+        setattr(args, name, path)
+        setattr(args, name + "_sha256", hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+@pytest.fixture
+def _optimizer_validation_child(tmp_path):
+    parser = argparse.ArgumentParser()
+    onboard.add_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--config",
+            str(tmp_path / "job.config"),
+            "--backend",
+            "cortex",
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--database",
+            "dev",
+            "--schema",
+            "dev",
+            "--test-id",
+            "single-step-optimizer",
+            "--local-cortex-fixture",
+            "--test-spec",
+            str(tmp_path / "reviewed.json"),
+            "--reference-records-dir",
+            str(tmp_path / "fresh-records"),
+        ]
+    )
+    args.output_dir = tmp_path / "out"
+    args.checkout_root = tmp_path
+    _optimizer_child_files(args, tmp_path)
+    return args
+
+
+def test_optimizer_validation_child_forwards_original_regression_and_retains_source_receipt(
+    _optimizer_validation_child, monkeypatch
+):
+    from arctic_platform.correctness.harness.execution import parse_args
+
+    args = _optimizer_validation_child
+    admission = onboard._optimizer_validation_bootstrap(args)
+    args._admitted_optimizer_validation_bootstrap = admission
+    captured = []
+
+    def process(command, **kwargs):
+        captured.append((command, kwargs))
+        out = Path(command[command.index("--out") + 1])
+        (out / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
+        return SimpleNamespace(stdout=iter(["synthetic child\n"]), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    result = onboard._run_final_regression(args, {"layers": 4})
+    command, kwargs = captured[0]
+    assert command[:9] == [
+        sys.executable,
+        "-B",
+        "-u",
+        str(args.optimizer_validation_bootstrap),
+        "--bridge-config",
+        str(args.optimizer_validation_config),
+        "--config-sha",
+        args.optimizer_validation_config_sha256,
+        "--",
+    ]
+    parsed = parse_args(command[9:])
+    assert parsed.test == ["single-step-optimizer"]
+    assert parsed.test_spec == args.test_spec
+    assert parsed.reference_records_dir == args.reference_records_dir
+    assert parsed.local_cortex_fixture is True
+    assert parsed.backend == "cortex"
+    assert parsed.base_url == args.base_url
+    assert kwargs["cwd"] == args.checkout_root
+    assert kwargs["env"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert result["status"] == "pass"
+    assert result["optimizer_validation_bootstrap"] == admission
+    persisted = (args.output_dir / "validation/4-layers/validation.json").read_text()
+    assert json.loads(persisted) == result
+    assert "private_token" not in persisted
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "optimizer_validation_bootstrap",
+        "optimizer_validation_bootstrap_sha256",
+        "optimizer_validation_config",
+        "optimizer_validation_config_sha256",
+    ],
+)
+def test_optimizer_validation_child_rejects_incomplete_source_pins(_optimizer_validation_child, missing):
+    setattr(_optimizer_validation_child, missing, None)
+    with pytest.raises(ValueError, match="both bootstrap/config"):
+        onboard._optimizer_validation_bootstrap(_optimizer_validation_child)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("test_id", "single-step-grads"),
+        ("backend", "onprem"),
+        ("local_cortex_fixture", False),
+        ("prepare_references", True),
+        ("probe_layers", 4),
+        ("local_gateway_full_model", True),
+        ("reference_tests", ["single-step-optimizer"]),
+    ],
+)
+def test_optimizer_validation_child_rejects_other_modes_before_storage_or_reference(
+    _optimizer_validation_child, monkeypatch, name, value
+):
+    args = _optimizer_validation_child
+    setattr(args, name, value)
+    monkeypatch.setattr(
+        onboard, "_validate_storage", lambda *a: pytest.fail("unsupported child route reached storage")
+    )
+    with pytest.raises(ValueError, match="only local Cortex Test 2"):
+        onboard.run(args)
+
+
+@pytest.mark.parametrize("role", ["bootstrap", "config"])
+@pytest.mark.parametrize("fault", ["changed-bytes", "replacement", "symlink", "hardlink", "bad-sha"])
+def test_optimizer_validation_child_rejects_source_faults_before_target(
+    _optimizer_validation_child, monkeypatch, role, fault
+):
+    args = _optimizer_validation_child
+    args._admitted_optimizer_validation_bootstrap = onboard._optimizer_validation_bootstrap(args)
+    path = getattr(args, "optimizer_validation_" + role)
+    if fault == "changed-bytes":
+        path.write_text("different source\n")
+    elif fault == "replacement":
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+    elif fault == "symlink":
+        moved = path.with_suffix(".original")
+        path.rename(moved)
+        path.symlink_to(moved)
+    elif fault == "hardlink":
+        path.with_suffix(".linked").hardlink_to(path)
+    else:
+        setattr(args, "optimizer_validation_" + role + "_sha256", "bad")
+    monkeypatch.setattr(onboard.subprocess, "Popen", lambda *a, **k: pytest.fail("source fault reached target child"))
+    with pytest.raises(ValueError, match="optimizer validation"):
+        onboard._run_final_regression(args, {"layers": 4})
+    assert not args.output_dir.exists()
+
+
+@pytest.mark.parametrize("role", ["bootstrap", "config"])
+def test_optimizer_validation_child_rejects_source_drift_after_child_exit(
+    _optimizer_validation_child, monkeypatch, role
+):
+    args = _optimizer_validation_child
+
+    def process(command, **kwargs):
+        out = Path(command[command.index("--out") + 1])
+        (out / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
+
+        def wait():
+            getattr(args, "optimizer_validation_" + role).write_text("drift while target ran\n")
+            return 0
+
+        return SimpleNamespace(stdout=iter([]), wait=wait)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    with pytest.raises(ValueError, match="optimizer validation.*changed"):
+        onboard._run_final_regression(args, {"layers": 4})
+    assert not (args.output_dir / "validation/4-layers/validation.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["pre-calibration-pin", "pre-child-drift", "child-failure", "child-interrupt"])
+def test_optimizer_validation_child_failure_restores_exact_test1_without_reference_replay(
+    request, monkeypatch, tmp_path, failure
+):
+    final_regression = onboard._run_final_regression
+    state = request.getfixturevalue("_local_cortex_optimizer_onboarding")
+    state.args.checkout_root = tmp_path
+    _optimizer_child_files(state.args, tmp_path)
+    monkeypatch.setattr(onboard, "_run_final_regression", final_regression)
+    calibrations = []
+
+    def calibration(args, cfg, spec):
+        calibrations.append("synthetic calibration, no runner/HF call")
+        spec.applicable_tests.append("single-step-optimizer")
+        spec.write(args.test_spec)
+        if failure == "pre-child-drift":
+            args.optimizer_validation_bootstrap.write_text("changed after synthetic calibration\n")
+        return args.output_dir / "not-consumed-on-failure.json"
+
+    def process(command, **kwargs):
+        if failure == "child-interrupt":
+            raise KeyboardInterrupt()
+        assert failure == "child-failure"
+        return SimpleNamespace(stdout=iter(["synthetic child failure\n"]), wait=lambda: 1)
+
+    monkeypatch.setattr(onboard, "_run_local_optimizer_calibration", calibration)
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    if failure == "pre-calibration-pin":
+        state.args.optimizer_validation_bootstrap_sha256 = "0" * 64
+    expected = (
+        KeyboardInterrupt
+        if failure == "child-interrupt"
+        else RuntimeError if failure == "child-failure" else ValueError
+    )
+    with pytest.raises(expected):
+        onboard._onboard_optimizer_test(state.args, state.cfg)
+    assert state.args.test_spec.read_bytes() == state.previous
+    assert len(calibrations) == (0 if failure == "pre-calibration-pin" else 1)
+    assert state.events == []
+    assert not (state.args.output_dir / "onboarding-t02.json").exists()

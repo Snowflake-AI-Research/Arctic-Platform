@@ -2710,6 +2710,295 @@ def test_local_cortex_inference_local_execution_preserves_recipe_and_closes_owne
 
 # Qwen4 inference schema.
 
+
+@pytest.mark.parametrize("as_string", [False, True])
+def test_inference_initial_model_dir_validates_without_model_materialization(tmp_path, as_string):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    value = str(root) if as_string else root
+    assert export.validate_initial_training_model_dir(value) == root
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "file", "relative", "outside_fast", "symlink", "ancestor_symlink", "dotdot", "boolean"]
+)
+def test_inference_initial_model_dir_storage_refuses_unvalidated_paths(tmp_path, invalid):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    value = root
+    if invalid == "missing":
+        value = tmp_path / "missing"
+    elif invalid == "file":
+        value = tmp_path / "not-a-directory"
+        value.write_bytes(b"synthetic")
+    elif invalid == "relative":
+        value = Path(root.name)
+    elif invalid == "outside_fast":
+        value = Path("/tmp")
+    elif invalid == "symlink":
+        value = tmp_path / "alias"
+        value.symlink_to(root, target_is_directory=True)
+    elif invalid == "ancestor_symlink":
+        alias = tmp_path / "alias"
+        alias.symlink_to(tmp_path, target_is_directory=True)
+        value = alias / root.name
+    elif invalid == "dotdot":
+        value = root / ".." / root.name
+    elif invalid == "boolean":
+        value = True
+    with pytest.raises(ValueError):
+        export.validate_initial_training_model_dir(value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_inference_initial_model_dir_public_training_subjob_preserves_canonical_model(tmp_path, enabled):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    payload = rl_driver.build_payload({"n_gpus": 4, "max_seq_len": 128}, "Qwen/canonical-full", SEED)
+    if enabled:
+        payload["local_model_dir"] = str(root)
+    before = deepcopy(payload)
+    config = rl_driver._training_client_config(SimpleNamespace(backend=backend), payload)
+    baseline = rl_driver._training_client_config(
+        SimpleNamespace(backend=backend), {key: value for key, value in payload.items() if key != "local_model_dir"}
+    ).to_cortex()[0]
+    public = config.to_cortex()[0]
+    assert payload == before
+    assert config.model_name == "Qwen/canonical-full"
+    assert public["model_name"] == "Qwen/canonical-full"
+    assert public["training_config"]["n_gpus"] == 4
+    assert config.initial_training_model_dir == (str(root) if enabled else None)
+    if enabled:
+        assert public.pop("local_model_dir") == str(root)
+    else:
+        assert "local_model_dir" not in public
+    assert public == baseline
+    assert "local_model_dir" not in public["training_config"]
+
+
+@pytest.mark.parametrize(
+    "invalid", ["onprem", "nonlocal", "authenticated", "no_training", "sampling", "log_prob", "checkpoint_source"]
+)
+def test_inference_initial_model_dir_typed_config_refuses_other_roles(tmp_path, invalid):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    base = rl_driver._training_client_config(
+        SimpleNamespace(backend=backend), rl_driver.build_payload({"n_gpus": 4}, "Qwen/canonical-full", SEED)
+    ).model_dump()
+    base["initial_training_model_dir"] = str(root)
+    if invalid == "onprem":
+        base["backend"] = OnPremConfig()
+    elif invalid == "nonlocal":
+        base["backend"] = CortexConfig(base_url="https://example.invalid")
+    elif invalid == "authenticated":
+        base["backend"] = CortexConfig(base_url="http://127.0.0.1:8003", pat="synthetic-not-a-credential")
+    elif invalid == "no_training":
+        base["training_gpus"] = 0
+    elif invalid == "sampling":
+        base["sampling_gpus"] = 1
+    elif invalid == "log_prob":
+        base["log_prob_gpus"] = 1
+    elif invalid == "checkpoint_source":
+        base["source_checkpoint_info"] = {"checkpoint_id": "cp_saved", "source_job_id": "owned-parent"}
+    with pytest.raises(ValueError):
+        CortexTrainingConfig.model_validate(base)
+
+
+def test_inference_initial_model_dir_onprem_payload_refuses_silent_drop(tmp_path):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    payload = rl_driver.build_payload({"n_gpus": 4}, "Qwen/canonical-full", SEED)
+    payload["local_model_dir"] = str(root)
+    with pytest.raises(ValueError):
+        rl_driver._training_client_config(SimpleNamespace(backend=OnPremConfig(), workdir=tmp_path), payload)
+
+
+def test_inference_initial_model_dir_rl_context_keeps_config_identity(
+    _inference_export_prescribed_hostfile, tmp_path, monkeypatch
+):
+    cfg = _rl_config_write(
+        tmp_path,
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        {"n_gpus": 16, "max_seq_len": 256},
+    )
+    root = tmp_path / "full-model"
+    root.mkdir()
+    spec = SimpleNamespace(applicable_tests=["inference-checkpoint-loss"], arms=[], test_settings={})
+    admission = _inference_export_prescribed_hostfile
+    before = deepcopy(admission)
+    original = cfg.native.model_dump()
+    captured = []
+
+    def inspect_context(ctx):
+        captured.append(ctx)
+        assert ctx.inference_initial_model_dir == root
+        assert ctx.cfg.model_name == cfg.model_name
+        assert ctx.cfg.native.model_dump() == original
+        assert ctx.cfg.n_gpus == ctx.cfg.native.sampling_gpus == 16
+        assert ctx.inference_export_allocation == before
+        assert ctx.inference_export_allocation is not admission
+        assert ctx.spec is spec
+        return []
+
+    monkeypatch.setattr(registered_tests()["inference-checkpoint-loss"], "fn", inspect_context)
+    monkeypatch.setattr(runner, "gateway", lambda *a, **kw: pytest.fail("no native allocation"))
+    assert (
+        runner.execute_rl(
+            cfg,
+            spec,
+            vocab_size=128,
+            select=["inference-checkpoint-loss"],
+            workdir=tmp_path,
+            client_backend=CortexConfig(base_url="http://127.0.0.1:8003"),
+            inference_export_allocation=admission,
+            inference_initial_model_dir=root,
+        )
+        == []
+    )
+    assert len(captured) == 1
+    assert admission == before
+    assert cfg.native.model_dump() == original
+
+
+@pytest.mark.parametrize("rl", [False, True])
+def test_inference_initial_model_dir_runner_refuses_missing_allocation_before_work(tmp_path, monkeypatch, rl):
+    cfg = _rl_config_write(tmp_path, {"n_gpus": 4}, {"n_gpus": 4} if rl else None)
+    root = tmp_path / "full-model"
+    root.mkdir()
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("invalid root allocated work"))
+    monkeypatch.setattr(runner, "registered_tests", lambda: pytest.fail("invalid root reached checks"))
+    kwargs = {
+        "vocab_size": 128,
+        "select": ["inference-checkpoint-loss"],
+        "client_backend": CortexConfig(base_url="http://127.0.0.1:8003"),
+        "inference_initial_model_dir": root,
+    }
+    with pytest.raises(ValueError, match="allocation"):
+        if rl:
+            runner.execute_rl(cfg, SimpleNamespace(), **kwargs)
+        else:
+            runner.execute(cfg, SimpleNamespace(), [], **kwargs)
+
+
+@pytest.mark.parametrize("invalid", ["onprem", "nonlocal", "authenticated", "missing_directory"])
+def test_inference_initial_model_dir_check_rejects_before_tokenizer(
+    _inference_export_prescribed_hostfile, tmp_path, monkeypatch, invalid
+):
+    root = tmp_path / "full-model"
+    root.mkdir()
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    if invalid == "onprem":
+        backend = OnPremConfig()
+    elif invalid == "nonlocal":
+        backend = CortexConfig(base_url="https://example.invalid")
+    elif invalid == "authenticated":
+        backend = CortexConfig(base_url="http://127.0.0.1:8003", pat="synthetic-not-a-credential")
+    ctx = _local_cortex_inference_context(tmp_path, backend)
+    ctx.inference_initial_model_dir = tmp_path / "missing" if invalid == "missing_directory" else root
+    ctx.inference_export_allocation = _inference_export_prescribed_hostfile
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", lambda *a: pytest.fail("invalid root loaded tokenizer"))
+    monkeypatch.setattr(check, "gateway", lambda *a, **kw: pytest.fail("invalid root allocated gateway"))
+    with pytest.raises(ValueError):
+        check._run(ctx)
+
+
+def test_inference_initial_model_dir_actual_check_binds_training_only_and_samples_export(
+    _inference_export_prescribed_hostfile, _local_cortex_inference_export_factory, tmp_path, monkeypatch
+):
+    root = tmp_path / "initial-full-model"
+    root.mkdir()
+    ctx = _local_cortex_inference_context(tmp_path)
+    ctx.inference_initial_model_dir = root
+    ctx.inference_export_allocation = _inference_export_prescribed_hostfile
+    weights = _local_cortex_inference_export_factory(tmp_path / "global_step10")
+    original = ctx.cfg.native.model_dump()
+    events = []
+    steps = []
+    tokenizers = []
+
+    def load_tokenizer(model):
+        tokenizers.append(model)
+        return object()
+
+    def read_rows(path, count=None):
+        return (
+            [
+                gsm8k.Example(question=f"train{i}", prompt="p", completion=" a", input_ids=(1, 2, 3), n_prompt=1)
+                for i in range(count)
+            ]
+            if count is not None
+            else _local_cortex_inference_ROWS
+        )
+
+    @contextmanager
+    def gateway(directory, slots, **kwargs):
+        assert slots == 5
+        assert kwargs["backend"] is ctx.client_backend
+        yield SimpleNamespace(backend=ctx.client_backend)
+
+    @contextmanager
+    def training(session, payload):
+        assert payload["model_name"] == ctx.cfg.model_name
+        assert payload["local_model_dir"] == str(root)
+        public = rl_driver._training_client_config(session, payload).to_cortex()[0]
+        assert public["model_name"] == ctx.cfg.model_name
+        assert public["local_model_dir"] == str(root)
+        assert public["training_config"]["n_gpus"] == 4
+        events.append("training-enter")
+        try:
+            yield SimpleNamespace(client=object())
+        finally:
+            events.append("training-exit")
+
+    @contextmanager
+    def sampling(config):
+        assert events[-1] == "training-exit"
+        assert config.model_name == str(weights)
+        assert config.initial_training_model_dir is None
+        assert config.source_checkpoint_info is None
+        assert "local_model_dir" not in config.to_cortex()[0]
+        events.append("sampling-enter")
+        results = [
+            {
+                "prompt_len": row.length,
+                "prompt_logprobs": [None, *[{str(token): {"logprob": -1.0}} for token in row.input_ids[1:]]],
+            }
+            for row in _local_cortex_inference_ROWS
+        ]
+        try:
+            yield SimpleNamespace(generate=lambda *a, **kw: results)
+        finally:
+            events.append("sampling-exit")
+
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", load_tokenizer)
+    monkeypatch.setattr(check.gsm8k, "read_rows", read_rows)
+    monkeypatch.setattr(check.gsm8k, "tokenize_examples", lambda tokenizer, rows: rows)
+    monkeypatch.setattr(check.gsm8k, "padding_token_id", lambda tokenizer: 0)
+    monkeypatch.setattr(check.gsm8k, "select_by_token_budget", lambda *a: (_local_cortex_inference_ROWS, 3))
+    monkeypatch.setattr(check, "gateway", gateway)
+    monkeypatch.setattr(check, "running_job", training)
+    monkeypatch.setattr(check, "CorrectnessClient", sampling)
+    monkeypatch.setattr(
+        check,
+        "fwd_bwd_step",
+        lambda *a, **kw: steps.append(kw["learning_rate"]) or SimpleNamespace(avg_loss=2.0),
+    )
+    monkeypatch.setattr(check, "forward_logprobs", lambda *a: torch.full((2, 3), -1.0))
+    monkeypatch.setattr(check, "save_local_inference_checkpoint", lambda *a: weights)
+    monkeypatch.setattr(export, "require_local_inference_export_locality", lambda actual_ctx, path: None)
+    result = check._run(ctx)
+    assert result.outcome is TestOutcome.PASS
+    assert result.metrics["train_steps"] == 10
+    assert result.metrics["stated_criterion_abs"] == 0.001
+    assert tokenizers == [ctx.cfg.model_name]
+    assert steps == [check.configured_learning_rate(ctx.cfg)] * 10
+    assert ctx.cfg.native.model_dump() == original
+    assert events == ["training-enter", "training-exit", "sampling-enter", "sampling-exit"]
+
+
 _qwen4_inference_schema_PREFIX = "model.language_model.layers.0.ple.ple_embedding."
 
 
@@ -2951,6 +3240,105 @@ def test_qwen4_inference_schema_local_qwen4_export_validates_real_mixed_headers(
 
 
 # Rl config.
+
+
+def test_inference_export_allocation_rl_context_preserves_declared_width_and_deepcopy(
+    _inference_export_prescribed_hostfile, monkeypatch, tmp_path
+):
+    cfg = _rl_config_write(
+        tmp_path,
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        {"n_gpus": 16, "max_seq_len": 256},
+    )
+    spec = SimpleNamespace(applicable_tests=["inference-checkpoint-loss"], arms=[], test_settings={})
+    admission = _inference_export_prescribed_hostfile
+    before = deepcopy(admission)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    captured = []
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(runner, "gateway", lambda *a, **kw: pytest.fail("no gateway allocation"))
+
+    def inspect_context(ctx):
+        captured.append(ctx)
+        assert ctx.cfg.n_gpus == 16
+        assert ctx.cfg.native.sampling_gpus == 16
+        assert ctx.cfg.model_name == cfg.model_name
+        assert ctx.client_backend is backend
+        assert ctx.inference_export_allocation == before
+        assert ctx.inference_export_allocation is not admission
+        assert ctx.inference_export_allocation["nodes"] is not admission["nodes"]
+        assert ctx.inference_export_allocation["nodes"][0] is not admission["nodes"][0]
+        ctx.inference_export_allocation["nodes"][0]["slots"] = -1
+        return []
+
+    monkeypatch.setattr(registered_tests()["inference-checkpoint-loss"], "fn", inspect_context)
+    assert (
+        runner.execute_rl(
+            cfg,
+            spec,
+            vocab_size=128,
+            select=["inference-checkpoint-loss"],
+            workdir=tmp_path,
+            client_backend=backend,
+            inference_export_allocation=admission,
+        )
+        == []
+    )
+    assert len(captured) == 1
+    assert admission == before
+
+
+@pytest.mark.parametrize(
+    "invalid", ["onprem", "nonlocal", "authenticated", "other_check", "all_checks", "mixed_checks"]
+)
+def test_inference_export_allocation_rl_refuses_unowned_route_before_work(
+    _inference_export_prescribed_hostfile, monkeypatch, invalid
+):
+    backend = CortexConfig(base_url="http://localhost:8003")
+    selected = ["inference-checkpoint-loss"]
+    if invalid == "onprem":
+        backend = OnPremConfig()
+    elif invalid == "nonlocal":
+        backend = CortexConfig(base_url="https://unowned.invalid")
+    elif invalid == "authenticated":
+        backend = CortexConfig(base_url="http://localhost:8003", pat="synthetic-test-token")
+    elif invalid == "other_check":
+        selected = ["single-step-grads"]
+    elif invalid == "all_checks":
+        selected = None
+    elif invalid == "mixed_checks":
+        selected = ["inference-checkpoint-loss", "rl-weight-sync"]
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("invalid route allocated a workdir"))
+    monkeypatch.setattr(runner, "registered_tests", lambda: pytest.fail("invalid route reached model/check setup"))
+    with pytest.raises(ValueError):
+        runner.execute_rl(
+            None,
+            None,
+            vocab_size=128,
+            select=selected,
+            client_backend=backend,
+            inference_export_allocation=_inference_export_prescribed_hostfile,
+        )
+
+
+def test_inference_export_allocation_rl_checks_live_hostfile_before_work(
+    _inference_export_prescribed_hostfile, monkeypatch
+):
+    admission = _inference_export_prescribed_hostfile
+    before = deepcopy(admission)
+    export._LOCAL_HOSTFILE_TARGET.write_text("127.0.0.1 slots=4\n")
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("drifted allocation created a workdir"))
+    monkeypatch.setattr(runner, "registered_tests", lambda: pytest.fail("drifted allocation reached checks"))
+    with pytest.raises(ValueError, match="hostfile"):
+        runner.execute_rl(
+            None,
+            None,
+            vocab_size=128,
+            select=["inference-checkpoint-loss"],
+            client_backend=CortexConfig(base_url="http://localhost:8003"),
+            inference_export_allocation=admission,
+        )
+    assert admission == before
 
 
 _rl_config_ROOT = Path(__file__).resolve().parents[1]

@@ -63,7 +63,9 @@ def _replica_pool_cls():
     require_any_dep_group("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
 
-    return ReplicaPool
+    from arctic_platform.debug.lora_replica_pool_routing import maybe_lora_replica_pool
+
+    return maybe_lora_replica_pool(ReplicaPool)
 
 
 def _transfer_schedule_cls():
@@ -1118,18 +1120,26 @@ class ArcticRLRayServer:
     async def _sync_weights_nccl(self, workers, pool: ReplicaPool) -> dict:
         """Non-colocated weight sync via NCCL (original path)."""
         await self.arctic_rl_ray_server_state.wake_inference.remote()
-        schedule = _transfer_schedule_cls().build(
+        from arctic_platform.debug.lora_sync_hooks import maybe_lora_transfer_schedule
+
+        schedule = maybe_lora_transfer_schedule(
+            _transfer_schedule_cls(),
             training_sharding="dp",
             training_gpus=len(workers),
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
+        from arctic_platform.debug.lora_sync_hooks import maybe_prepare_lora_training
+
+        await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
         sender_ips = await asyncio.gather(*[workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
-            max_param = await workers[0].max_param_bytes.remote()
+            from arctic_platform.debug.lora_sync_hooks import maybe_lora_max_param_bytes
+
+            max_param = await maybe_lora_max_param_bytes(self, workers[0])
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
@@ -1179,9 +1189,11 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        await asyncio.gather(receive_task, *send_tasks)
+        from arctic_platform.debug.lora_sync_hooks import maybe_collect_lora_sync
+
+        results = await maybe_collect_lora_sync(self, receive_task, send_tasks)
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
-        return {"status": "ok"}
+        return results
 
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         self._verify_job(job_id, "log_prob")

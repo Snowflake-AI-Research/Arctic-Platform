@@ -203,6 +203,8 @@ def _ds_optimizer(value: Any) -> dict | None:
 
 
 def _training_client_config(session: GatewaySession, payload: dict) -> ArcticClientConfig:
+    if "local_model_dir" in payload and not isinstance(getattr(session, "backend", None), CortexConfig):
+        raise ValueError("initial training model directory requires local Cortex")
     tc = deepcopy(payload["training_config"])
     n_gpus = int(tc.pop("n_gpus"))
     max_seq_len = int(tc.pop("max_seq_len", 8192))
@@ -243,6 +245,11 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
         ),
         backend=backend,
         **({"hardware": payload.get("hardware")} if isinstance(backend, CortexConfig) else {}),
+        **(
+            {"initial_training_model_dir": payload["local_model_dir"]}
+            if "local_model_dir" in payload and isinstance(backend, CortexConfig)
+            else {}
+        ),
     )
 
 
@@ -283,7 +290,25 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
     runtime = (
         _gateway_runtime(session.slots) if isinstance(session.backend, OnPremConfig) else contextlib.nullcontext()
     )
-    with runtime:
+    shared_adapter = (payload.get("training_config", {}).get("debug") or {}).get("shared_peft_adapter")
+    overlay = contextlib.nullcontext()
+    if shared_adapter is not None:
+        if not isinstance(session.backend, OnPremConfig):
+            raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
+        from .optimizer_capture import optimizer_capture_worker
+
+        overlay = optimizer_capture_worker()
+    with runtime, overlay:
+        if shared_adapter is not None:
+            import ray
+
+            from .shared_lora_adapter import adapter_files
+
+            files = adapter_files(shared_adapter["path"], shared_adapter["identity"])
+            config.training.ds_worker_config["debug"]["shared_peft_adapter"] = {
+                "object_ref": ray.put(files),
+                "identity": shared_adapter["identity"],
+            }
         client = ArcticClient(config)
         try:
             yield ArcticJob(client=client, job_type=job_type)

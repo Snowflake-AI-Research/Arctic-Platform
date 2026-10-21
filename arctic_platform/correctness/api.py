@@ -62,11 +62,17 @@ class RunOptions:
     case: tuple[str, ...] = ()
     out: Path | None = None
     reference_records_dir: Path | None = None
+    peft_adapter: Path | None = None
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
     local_gateway_full_model: bool = False
     test_spec: Path | None = None
     inference_sampling_topology: tuple[int, int, int] | None = None
+    inference_export_allocation: Path | None = None
+    inference_export_allocation_sha256: str | None = None
+    inference_initial_model_dir: Path | None = None
+    historical_gradient_references: Path | None = None
+    historical_gradient_references_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +183,9 @@ def options_from_args(args: Namespace) -> RunOptions:
 
 def run(request: RunRequest, options: RunOptions | None = None, *, executor: Callable | None = None) -> BatchResult:
     """Run selected cases sequentially with short output and complete saved logs."""
+    from .harness.execution import _load_historical_gradient_references
+    from .harness.execution import _load_inference_export_allocation
+    from .harness.execution import _load_inference_initial_model_dir
     from .harness.execution import run_batch
 
     options = options or RunOptions()
@@ -186,8 +195,12 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
         request.config is None or request.all_configs or request.tests != ("inference-checkpoint-loss",)
     ):
         raise ValueError("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
+    args = _namespace(request, options)
+    _load_inference_export_allocation(args)
+    _load_inference_initial_model_dir(args)
+    _load_historical_gradient_references(args)
     selected = select(request)
-    return run_batch(_namespace(request, options), selected=selected, executor=executor)
+    return run_batch(args, selected=selected, executor=executor)
 
 
 def aggregate_exit_code(results: Sequence[TestResult]) -> int:

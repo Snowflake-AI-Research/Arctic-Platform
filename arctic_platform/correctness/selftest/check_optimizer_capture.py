@@ -3089,6 +3089,591 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
     return SimpleNamespace(before=roots[0], after=roots[1], layout=layout, expected=expected, expert_name=expert_name)
 
 
+def _maintained_native_save_rows(pair, root, step):
+    rows = []
+    world = pair.layout["world_size"]
+    routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
+    source = pair.before if step == 0 else pair.after
+    for rank in range(world):
+        ep_rank = next(index for index, route in enumerate(routes) if rank in route)
+        edp_rank = routes[ep_rank].index(rank)
+        optimizer = f"bf16_zero_pp_rank_{rank}_mp_rank_{pair.layout['optimizer_mp_ranks'][rank]:02d}_optim_states.pt"
+        names = [optimizer]
+        if rank == 0:
+            names.append("mp_rank_00_model_states.pt")
+        if edp_rank == 0:
+            names.append(f"experts_ep_rank_{ep_rank:03d}.pt")
+        files = [source / f"global_step{step}" / name for name in names]
+        rows.append(
+            {
+                "schema": "native-ep-zero2-worker-save-v1",
+                "parent_job_id": "actual-parent",
+                "training_child_id": "actual-child",
+                "step": step,
+                "tag": f"global_step{step}",
+                "checkpoint_root": str(root),
+                "nonce": f"{rank:032x}",
+                "written_files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
+                "written_file_sizes": {path.name: path.stat().st_size for path in files},
+                "layout": {
+                    "checkpoint_rank": rank,
+                    "global_rank": rank,
+                    "dp_order": list(range(world)),
+                    "world_size": world,
+                    "ep_size": pair.layout["ep_size"],
+                    "sp_size": pair.layout["sp_size"],
+                    "model_mp_world_size": pair.layout["model_mp_world_size"],
+                    "ep_rank": ep_rank,
+                    "edp_rank": edp_rank,
+                    "optimizer_mp_rank": pair.layout["optimizer_mp_ranks"][rank],
+                    "optimizer_filename": optimizer,
+                    "source_files": pair.layout["source_files"],
+                    "ds_config": pair.layout["ds_config"],
+                    "groups": [
+                        {"name": None, "moe": False, "ranks": list(range(world)), "ep_rank": None},
+                        {"name": "native-experts", "moe": True, "ranks": routes[ep_rank], "ep_rank": ep_rank},
+                    ],
+                },
+            }
+        )
+    return rows
+
+
+@pytest.fixture
+def _maintained_native_capture(tmp_path, monkeypatch):
+    (tmp_path / "source").mkdir()
+    pair = _native_ep_bf16_pair(tmp_path / "source")
+    events, saved = [], []
+    state = SimpleNamespace(step=0, failure=None, damage=None)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+
+    class Client:
+        def save_checkpoint(self, *, path, checkpoint_type, export_hf):
+            assert checkpoint_type == "resumable" and export_hf is False
+            root = Path(path)
+            assert not root.exists()
+            tag = f"global_step{state.step}"
+            rows = _maintained_native_save_rows(pair, root, state.step)
+            (root / tag).mkdir(parents=True)
+            source = pair.before if state.step == 0 else pair.after
+            # Head SAVE contains only rank0 files; remaining actual fixture bytes require consolidation.
+            for name in rows[0]["written_files"]:
+                shutil.copyfile(source / tag / name, root / tag / name)
+            events.append(f"save-{state.step}")
+            saved.append(root)
+            if state.failure == events[-1]:
+                raise RuntimeError("injected completed-save failure")
+            return {
+                "checkpoint_path": path,
+                "checkpoint_tag": tag,
+                "version": 2 if state.failure == "save-metadata" else state.step,
+                "stage_path": "",
+            }
+
+        def fwd_bwd(self, body):
+            torch.testing.assert_close(body["input_ids"], torch.tensor([[1, 2]]), rtol=0, atol=0)
+            events.append("fwd_bwd")
+            if state.failure == "fwd_bwd":
+                raise RuntimeError("injected target failure")
+            return {"avg_loss": 2.0, "metrics": {"sft_model_calls": 1, "sft_packed_rows": 1}}
+
+        def step(self, learning_rate):
+            assert learning_rate == 0.01
+            events.append("step")
+            if state.failure == "step":
+                raise RuntimeError("injected optimizer failure")
+            state.step += 1
+            return {"gradient_norms_per_param": {"dense.weight": 1.0}}
+
+        def shutdown(self):
+            events.append("release")
+
+    client = Client()
+    client.config = SimpleNamespace(backend=backend)
+    client.transport = SimpleNamespace(job_id="actual-parent")
+    client.jobs = SimpleNamespace(training="actual-parent:train:0")
+    descriptor = {"path": __file__, "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+
+    def supplier(root, *, step):
+        assert saved[-1] == root and state.step == step
+        events.append(f"supply-{step}")
+        source = pair.before if step == 0 else pair.after
+        rows = _maintained_native_save_rows(pair, root, step)
+        if state.damage is not None:
+            state.damage(rows, root, step)
+
+        def read_worker(rank, filename, *, offset, length):
+            row = rows[rank]
+            assert filename in row["written_files"]
+            events.append(f"read-{step}-{rank}")
+            data = (source / f"global_step{step}" / filename).read_bytes()
+            return {
+                "offset": offset,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": data[offset : offset + length],
+            }
+
+        decoder.consolidate_native_optimizer_checkpoints(
+            root,
+            rows,
+            step=step,
+            read_worker=read_worker,
+            read_worker_source=descriptor,
+            reserve_bytes=0,
+        )
+        layout = decoder.assemble_native_optimizer_layout(
+            root,
+            step=step,
+            parent_job_id="actual-parent",
+            training_child_id="actual-child",
+            expected_world_size=8,
+            source_files=pair.layout["source_files"],
+        )
+        if state.failure == "source-after-supply":
+            path = Path(pair.layout["source_files"]["training"]["path"])
+            path.write_text(path.read_text() + "# changed during supplier\n")
+        return layout
+
+    session = GatewaySession(tmp_path, 8, backend)
+    job = ArcticJob(client, "training")
+    case = SimpleNamespace(
+        pair=pair,
+        events=events,
+        saved=saved,
+        state=state,
+        client=client,
+        session=session,
+        job=job,
+        supplier=supplier,
+        descriptor=descriptor,
+        output=tmp_path / "output",
+    )
+    return case
+
+
+def _maintained_native_run(case, **options):
+    return capture.capture_optimizer_step(
+        case.session,
+        case.job,
+        {"input_ids": torch.tensor([[1, 2]])},
+        learning_rate=0.01,
+        output_dir=case.output,
+        expected_dp_world_size=8,
+        optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
+        local_checkpoint=True,
+        native_layout_supplier=case.supplier,
+        native_layout_supplier_source=case.descriptor,
+        **options,
+    )
+
+
+def _maintained_native_unpublished(case):
+    assert not (case.output / "states").exists()
+    assert not list(case.output.glob("snapshots-*"))
+    assert all(not root.exists() for root in case.saved)
+    assert case.pair.before.is_dir() and case.pair.after.is_dir()
+
+
+def test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_actual_child(
+    _maintained_native_capture,
+):
+    case = _maintained_native_capture
+    result = _maintained_native_run(case)
+    manifest = Path(result.optimizer_state_manifest)
+    record = json.loads(manifest.read_text())
+    assert manifest == case.output / "states" / "manifest.json"
+    assert result.avg_loss == 2 and result.model_calls == result.packed_rows == 1
+    assert [event for event in case.events if not event.startswith("read-")] == [
+        "save-0",
+        "supply-0",
+        "fwd_bwd",
+        "step",
+        "save-1",
+        "supply-1",
+    ]
+    assert any(event.startswith("read-0-") for event in case.events)
+    assert any(event.startswith("read-1-") for event in case.events)
+    for label, step in (("before", 0), ("after", 1)):
+        rows = record["native_save_receipts"][label]
+        assert len(rows) == 8
+        assert [row["layout"]["checkpoint_rank"] for row in rows] == list(range(8))
+        assert all(row["training_child_id"] == "actual-child" and row["step"] == step for row in rows)
+        assert len({row["nonce"] for row in rows}) == 8
+    for entry in record["parameters"]:
+        value = torch.load(manifest.parent / entry["file"], weights_only=True)
+        torch.testing.assert_close(value["parameter_update"], case.pair.expected[entry["name"]], rtol=0, atol=0)
+    assert not list(case.output.glob("snapshots-*"))
+    assert all(not root.exists() for root in case.saved)
+
+
+@pytest.mark.parametrize("failure", ["save-0", "save-metadata", "fwd_bwd", "step", "save-1", "source-after-supply"])
+def test_maintained_native_optimizer_failed_stage_never_publishes_or_uses_unadmitted_baseline(
+    _maintained_native_capture, failure
+):
+    case = _maintained_native_capture
+    case.state.failure = failure
+    with pytest.raises((RuntimeError, ValueError)):
+        _maintained_native_run(case)
+    if failure in ("save-0", "save-metadata"):
+        assert case.events == ["save-0"]
+    if failure in ("save-0", "save-metadata", "source-after-supply"):
+        assert "fwd_bwd" not in case.events
+    _maintained_native_unpublished(case)
+
+
+@pytest.mark.parametrize("descriptor", ["missing", "wrong-origin", "bad-hash", "orphan"])
+def test_maintained_native_optimizer_requires_selected_supplier_source_before_save(
+    _maintained_native_capture, descriptor
+):
+    case = _maintained_native_capture
+    if descriptor == "missing":
+        case.descriptor = None
+    elif descriptor == "wrong-origin":
+        case.descriptor = case.pair.layout["source_files"]["training"]
+    elif descriptor == "bad-hash":
+        case.descriptor = {**case.descriptor, "sha256": "0" * 64}
+    else:
+        case.supplier = None
+    with pytest.raises(ValueError, match="callback|source"):
+        _maintained_native_run(case)
+    assert case.events == []
+    _maintained_native_unpublished(case)
+
+
+@pytest.mark.parametrize("damage", ["parent", "child", "nonce", "missing-rank", "rank", "world", "write-hash"])
+def test_maintained_native_optimizer_rejects_completed_save_receipt_binding_damage(_maintained_native_capture, damage):
+    case = _maintained_native_capture
+
+    def alter(rows, root, step):
+        if damage in ("parent", "child"):
+            rows[0][f"{damage}_job_id" if damage == "parent" else "training_child_id"] = "wrong"
+        elif damage == "nonce":
+            rows[1]["nonce"] = rows[0]["nonce"]
+        elif damage == "missing-rank":
+            rows.pop()
+        elif damage == "rank":
+            rows[1]["layout"]["checkpoint_rank"] = 0
+        elif damage == "world":
+            rows[0]["layout"]["world_size"] = 16
+        else:
+            name = next(iter(rows[0]["written_files"]))
+            rows[0]["written_files"][name] = "0" * 64
+
+    case.state.damage = alter
+    with pytest.raises(ValueError):
+        _maintained_native_run(case)
+    assert "fwd_bwd" not in case.events
+    _maintained_native_unpublished(case)
+
+
+def test_maintained_native_optimizer_rejects_nonce_change_between_completed_saves(_maintained_native_capture):
+    case = _maintained_native_capture
+
+    def alter(rows, root, step):
+        if step == 1:
+            rows[0]["nonce"] = "f" * 32
+
+    case.state.damage = alter
+    with pytest.raises(ValueError, match="between saves"):
+        _maintained_native_run(case)
+    assert "step" in case.events
+    _maintained_native_unpublished(case)
+
+
+@pytest.mark.parametrize("damage", ["parent", "selector", "source", "receipt", "tensor"])
+def test_maintained_native_optimizer_rechecks_owner_sources_receipts_and_inputs_before_publication(
+    _maintained_native_capture, monkeypatch, damage
+):
+    case = _maintained_native_capture
+    original = decoder.decode_optimizer_capture
+
+    def decode(before, after, output, **kwargs):
+        manifest = original(before, after, output, **kwargs)
+        if damage == "parent":
+            case.client.transport.job_id = "wrong"
+        elif damage == "selector":
+            case.client.jobs.training = "wrong"
+        elif damage == "source":
+            path = Path(case.pair.layout["source_files"]["training"]["path"])
+            path.write_text("# changed after decoder\n")
+        elif damage == "receipt":
+            path = after / "global_step1" / "native_optimizer_layout" / "rank00000.json"
+            record = json.loads(path.read_text())
+            record["nonce"] = "f" * 32
+            path.write_text(json.dumps(record))
+        else:
+            with next((after / "global_step1").glob("*optim_states.pt")).open("ab") as stream:
+                stream.write(b"changed after decode")
+        return manifest
+
+    monkeypatch.setattr(decoder, "decode_optimizer_capture", decode)
+    with pytest.raises(ValueError):
+        _maintained_native_run(case)
+    _maintained_native_unpublished(case)
+
+
+def test_maintained_native_optimizer_baseline_decoder_rejects_before_target(_maintained_native_capture):
+    case = _maintained_native_capture
+    path = next((case.pair.before / "global_step0").glob("*optim_states.pt"))
+    record = torch.load(path, weights_only=False)
+    record["optimizer_state_dict"]["group_paddings"][0] += 1
+    torch.save(record, path)
+    with pytest.raises(ValueError):
+        _maintained_native_run(case)
+    assert "fwd_bwd" not in case.events
+    _maintained_native_unpublished(case)
+
+
+@pytest.mark.parametrize("phase", ["baseline", "target", "mutable-descriptor"])
+def test_maintained_native_optimizer_supplier_authority_drift_blocks_next_operation(
+    _maintained_native_capture, monkeypatch, phase
+):
+    case = _maintained_native_capture
+    path = case.output.parent / "selected_supplier.py"
+    text = "def supplier(root, *, step):\n    return delegate(root, step=step)\n"
+    path.write_text(text)
+    namespace = {"delegate": case.supplier}
+    exec(compile(text, str(path), "exec"), namespace)
+    case.supplier = namespace["supplier"]
+    case.descriptor = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def drift():
+        path.write_text(text + "# supplier source changed\n")
+        if phase == "mutable-descriptor":
+            case.descriptor["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    if phase == "baseline":
+        original = decoder._snapshot
+
+        def snapshot(*args, **kwargs):
+            result = original(*args, **kwargs)
+            drift()
+            return result
+
+        monkeypatch.setattr(decoder, "_snapshot", snapshot)
+    else:
+        original = case.client.step
+
+        def step(learning_rate):
+            result = original(learning_rate)
+            drift()
+            return result
+
+        monkeypatch.setattr(case.client, "step", step)
+    with pytest.raises(ValueError, match="source drift"):
+        _maintained_native_run(case)
+    assert "save-1" not in case.events
+    if phase == "baseline":
+        assert "fwd_bwd" not in case.events
+    else:
+        assert "step" in case.events
+    _maintained_native_unpublished(case)
+
+
+def _maintained_native_scope(case, monkeypatch, *, split):
+    descriptor = case.descriptor
+    helper_source = {
+        "path": decoder.__file__,
+        "sha256": hashlib.sha256(Path(decoder.__file__).read_bytes()).hexdigest(),
+    }
+    workers = []
+
+    class Parent:
+        pass
+
+    class Child:
+        pass
+
+    class Manager:
+        def get_job(self, child_id):
+            assert child_id == "actual-child"
+            return info
+
+    class RemoteCall:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def remote(self, function, *args, **kwargs):
+            try:
+                return SimpleNamespace(value=function(self.owner, *args, **kwargs), error=None)
+            except BaseException as exc:
+                return SimpleNamespace(value=None, error=exc)
+
+    def get(reference, *, timeout):
+        assert timeout == 30
+        if reference.error is not None:
+            raise reference.error
+        return reference.value
+
+    def is_initialized():
+        return True
+
+    for rank in range(8):
+        worker = SimpleNamespace(rank=rank, world_size=8, job_id="actual-child")
+        worker.__ray_call__ = RemoteCall(worker)
+        worker._actor_id = SimpleNamespace(hex=lambda rank=rank: f"worker-{rank}")
+        workers.append(worker)
+    actor = SimpleNamespace(_actor_id=SimpleNamespace(hex=lambda: "training-actor"))
+    actor.__ray_call__ = RemoteCall(actor)
+    info = SimpleNamespace(
+        actor=actor,
+        job_id="actual-child",
+        zone_id="actual-zone",
+        layout=[
+            SimpleNamespace(host="head", gpu_ids=list(range(4))),
+            SimpleNamespace(host="peer", gpu_ids=list(range(4))),
+        ],
+    )
+    snow = ModuleType("dss.ray_dss.gateway_snowapi")
+    snow.__file__ = __file__
+    snow.ParentRecord, snow.ChildRecord = Parent, Child
+    child = Child()
+    child.role, child.job_id = "training", "actual-child"
+    parent = Parent()
+    parent.parent_id, parent.state, parent.cancel_requested = "actual-parent", "running", False
+    parent.children = {"training": child}
+    snow._parents = {"actual-parent": parent}
+    gateway = ModuleType("dss.ray_dss.gateway_server")
+    gateway.__file__ = __file__
+    gateway._jobs, gateway._zones = {"actual-child": "actual-zone"}, {"actual-zone": object()}
+    manager_module = ModuleType("dss.ray_dss.zones.manager")
+    manager_module.__file__, manager_module.ZoneManager = __file__, Manager
+    manager = Manager()
+    manager.zone_type, manager.zone_id = SimpleNamespace(value="training"), "actual-zone"
+    ray = ModuleType("ray")
+    ray.get, ray.is_initialized = get, is_initialized
+    modules = {module.__name__: module for module in (snow, gateway, manager_module, ray)}
+    original_import = decoder.importlib.import_module
+    monkeypatch.setattr(
+        decoder.importlib,
+        "import_module",
+        lambda name, *args, **kwargs: modules[name] if name in modules else original_import(name, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        decoder,
+        "_native_scope_actor_workers",
+        lambda owner, child_id, source: {
+            "workers": workers,
+            "rank_hosts": ["head"] * 4 + ["peer"] * 4,
+            "actor_ids": [worker._actor_id.hex() for worker in workers],
+        },
+    )
+
+    def arm(worker, *, nonce, rank, world_size, lease, source_files, helper_source):
+        assert worker.rank == rank and world_size == 8
+        checkpointer = SimpleNamespace()
+        hook = object()
+        checkpointer.save_resumable = hook
+        vars(worker)[decoder._COLLECTOR_STATE] = {
+            "nonce": nonce,
+            "checkpointer": checkpointer,
+            "hook": hook,
+            "restore": lambda: vars(checkpointer).pop("save_resumable"),
+            "roots": {},
+            "checkpoint_lease": lease,
+        }
+        return nonce
+
+    def receipt(worker, nonce, root, step, helper_source):
+        assert Path(root) in case.saved and step == case.state.step
+        row = _maintained_native_save_rows(case.pair, Path(root), step)[worker.rank]
+        assert vars(worker)[decoder._COLLECTOR_STATE]["nonce"] == nonce
+        row["nonce"] = nonce
+        return row
+
+    def read(worker, nonce, root, *, step, filename, offset, length):
+        assert vars(worker)[decoder._COLLECTOR_STATE]["nonce"] == nonce
+        source = case.pair.before if step == 0 else case.pair.after
+        data = (source / f"global_step{step}" / filename).read_bytes()
+        return {
+            "offset": offset,
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": data[offset : offset + length],
+        }
+
+    monkeypatch.setattr(decoder, "_native_scope_arm_worker", arm)
+    monkeypatch.setattr(decoder, "_native_scope_save_receipt", receipt)
+    monkeypatch.setattr(decoder, "read_native_optimizer_checkpoint", read)
+    request = {
+        "schema": "native-optimizer-scope-request-v1",
+        "source_files": case.pair.layout["source_files"],
+        "route_sources": {
+            role: dict(descriptor) for role in ("gateway_snowapi", "gateway", "manager", "ray_get", "ray_actor")
+        },
+        "helper_source": helper_source,
+        "allocation_hosts": ["head", "peer"],
+        "checkpoint_parent": str(case.output.parent),
+        "reserve_bytes": 0,
+        "rpc_timeout_seconds": 30,
+    }
+    if split:
+        request["schema"] = "native-optimizer-owner-split-request-v1"
+        request["expected_world_size"] = 8
+        request["route_sources"]["ray_is_initialized"] = dict(descriptor)
+        request["verify_parent_binding_source"] = dict(descriptor)
+        binding = decoder.resolve_native_optimizer_parent(
+            request, "actual-parent", gateway_snowapi=snow, gateway=gateway
+        )
+
+        def verify_parent_binding(received):
+            assert received == binding
+            return decoder.resolve_native_optimizer_parent(
+                request, "actual-parent", gateway_snowapi=snow, gateway=gateway
+            )
+
+        scope = decoder.open_native_optimizer_zone_scope(
+            request, binding, manager=manager, ray=ray, verify_parent_binding=verify_parent_binding
+        )
+    else:
+        factory = decoder.make_native_optimizer_scope(
+            request, gateway_snowapi=snow, gateway=gateway, manager=manager, ray=ray
+        )
+        scope = factory(case.session, case.job)
+    return SimpleNamespace(scope=scope, workers=workers, child=child, helper_source=helper_source)
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
+@pytest.mark.parametrize("failure", [None, "target", "source-after", "route-after"])
+def test_maintained_native_optimizer_scopes_integrate_capture_and_restore_before_release(
+    _maintained_native_capture, monkeypatch, split, failure
+):
+    case = _maintained_native_capture
+    fixture = _maintained_native_scope(case, monkeypatch, split=split)
+    if failure == "target":
+        case.state.failure = "fwd_bwd"
+
+    def run():
+        with fixture.scope as supplier:
+            case.supplier, case.descriptor = supplier, fixture.helper_source
+            if not split:
+                with pytest.raises(RuntimeError, match="child release is blocked"):
+                    case.client.shutdown()
+            result = _maintained_native_run(case)
+            assert Path(result.optimizer_state_manifest).is_file()
+            if failure == "source-after":
+                Path(case.pair.layout["source_files"]["training"]["path"]).write_text("# scope drift\n")
+            elif failure == "route-after":
+                fixture.child.job_id = "wrong"
+
+    if failure:
+        with pytest.raises((RuntimeError, ValueError)):
+            run()
+    else:
+        run()
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+    assert all(decoder._CLEANUP_STATE not in vars(worker) for worker in fixture.workers)
+    assert decoder._SCOPE_STATE not in vars(case.client)
+    assert all(not root.exists() for root in case.saved)
+    if split:
+        assert fixture.scope.cleanup_complete is True
+    case.client.shutdown()
+    assert case.events[-1] == "release"
+    if failure == "target":
+        _maintained_native_unpublished(case)
+
+
 def _native_ep_bf16_decode(pair, output):
     return decoder.decode_optimizer_capture(
         pair.before,

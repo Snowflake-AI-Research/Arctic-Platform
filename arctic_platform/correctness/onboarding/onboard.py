@@ -25,6 +25,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,9 +59,11 @@ def _validate_storage(args: argparse.Namespace) -> None:
 
 
 def _checkout_root(config_path: Path) -> Path:
+    """Resolve the executing library's Git checkout, not the operator config's directory."""
+    source_root = Path(__file__).resolve().parents[3]
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
-        cwd=config_path.resolve().parent,
+        cwd=source_root,
         check=True,
         capture_output=True,
         text=True,
@@ -459,20 +462,50 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
     spec.write(args.test_spec)
 
 
+def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
+    from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+
+    path = getattr(args, "peft_adapter", None)
+    if not config.training.get("peft_config"):
+        if path is not None:
+            raise ValueError("--peft-adapter requires a LoRA training config")
+        return None
+    if path is None:
+        from arctic_platform.correctness.harness.shared_lora_adapter import generate_adapter
+
+        if model_path is None:
+            return None
+        generated = getattr(args, "_generated_shared_adapters", {})
+        key = str(model_path.resolve())
+        if key not in generated:
+            generated[key] = generate_adapter(
+                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
+            )
+        args._generated_shared_adapters = generated
+        identity = adapter_identity(generated[key], config.training["peft_config"])
+        identities = getattr(args, "_generated_shared_adapter_identities", {})
+        if key in identities and identities[key] != identity:
+            raise ValueError("shared adapter changed during onboarding")
+        identities[key] = identity
+        args._generated_shared_adapter_identities = identities
+        return generated[key]
+    path = require_data_fast_path(path, label="shared PEFT adapter").resolve(strict=True)
+    identity = adapter_identity(path, config.training["peft_config"])
+    expected = getattr(args, "_admitted_shared_adapter_identity", identity)
+    if identity != expected:
+        raise ValueError("shared adapter changed during onboarding")
+    args._admitted_shared_adapter_identity = identity
+    return path
+
+
 def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Path:
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.runner import materialize_dss_peft_adapter
 
     from .calibration import render
 
     model_path = args.cache_root / f"{Path(args.source_checkpoint).name}-{selected['layers']}L"
     config = load_config(args.config)
-    peft_adapter_path = materialize_dss_peft_adapter(
-        config,
-        str(model_path),
-        args.output_dir / "calibration-adapter-init",
-        attn_implementation=config.attention_implementation,
-    )
+    peft_adapter_path = _shared_adapter(args, config, model_path)
     calibration_json = args.output_dir / "reference-repeatability.json"
     calibration_script = args.output_dir / "reference_repeatability.py"
     render_args = argparse.Namespace(
@@ -491,6 +524,7 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
     calibration_script.write_text(render(render_args))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     subprocess.run([sys.executable, str(calibration_script)], cwd=args.checkout_root, env=env, check=True)
+    _shared_adapter(args, config, model_path)
     return calibration_json
 
 
@@ -514,7 +548,6 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.runner import materialize_dss_peft_adapter
     from arctic_platform.correctness.harness.runner import run_reference
 
     config = load_config(args.config)
@@ -533,12 +566,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     optimizer_config = config.training.get("optimizer")
     if not isinstance(optimizer_config, dict):
         raise ValueError("optimizer calibration requires an explicit optimizer config")
-    adapter_path = materialize_dss_peft_adapter(
-        config,
-        str(model_path),
-        args.output_dir / "optimizer-calibration-adapter",
-        attn_implementation=config.attention_implementation,
-    )
+    adapter_path = _shared_adapter(args, config, model_path)
 
     lanes = max(1, min(CALIBRATION_RUNS, torch.cuda.device_count()))
     calibration_root = correctness_workdir("optimizer-calibration-")
@@ -703,8 +731,69 @@ def _validation_outcome(returncode: int, output: str, report: dict | None) -> st
     return "pass"
 
 
+def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
+    """Admit the caller-owned child bootstrap without importing its native scope."""
+    names = (
+        "optimizer_validation_bootstrap",
+        "optimizer_validation_bootstrap_sha256",
+        "optimizer_validation_config",
+        "optimizer_validation_config_sha256",
+    )
+    values = [getattr(args, name, None) for name in names]
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError("optimizer validation requires both bootstrap/config paths and their full SHA256 pins")
+    if (
+        getattr(args, "backend", "onprem") != "cortex"
+        or not getattr(args, "local_cortex_fixture", False)
+        or args.test_id != "single-step-optimizer"
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
+        or getattr(args, "reference_tests", None)
+    ):
+        raise ValueError("optimizer validation bootstrap requires only local Cortex Test 2 onboarding")
+    admitted = {}
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    for role, value, digest in (
+        ("bootstrap", values[0], values[1]),
+        ("config", values[2], values[3]),
+    ):
+        path = Path(value)
+        if (
+            not path.is_absolute()
+            or path.resolve() != path
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"optimizer validation {role} requires a canonical absolute path and full SHA256")
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 1 << 20:
+            raise ValueError(f"optimizer validation {role} must be a bounded single-link regular file")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            raw = stream.read((1 << 20) + 1)
+            after = os.fstat(stream.fileno())
+        identity = [getattr(before, field) for field in fields]
+        if (
+            any(
+                [getattr(snapshot, field) for field in fields] != identity
+                for snapshot in (opened, after, path.lstat())
+            )
+            or hashlib.sha256(raw).hexdigest() != digest
+        ):
+            raise ValueError(f"optimizer validation {role} changed or SHA256 differs")
+        admitted[role] = {"path": str(path), "sha256": digest, "file_identity": identity}
+    return admitted
+
+
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "phase 3/3") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
+    bootstrap = _optimizer_validation_bootstrap(args)
+    if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
+        raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
     layers = int(selected["layers"])
     out_dir = args.output_dir / "validation" / f"{layers}-layers"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -737,6 +826,30 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             command += ["--reference-records-dir", str(args.reference_records_dir)]
     if getattr(args, "inference_sampling_topology", None) is not None:
         command += ["--inference-sampling-topology", *map(str, args.inference_sampling_topology)]
+    if getattr(args, "peft_adapter", None) is not None:
+        command += ["--peft-adapter", str(args.peft_adapter)]
+    if getattr(args, "inference_export_allocation", None) is not None:
+        command += [
+            "--inference-export-allocation",
+            str(args.inference_export_allocation),
+            "--inference-export-allocation-sha256",
+            str(args.inference_export_allocation_sha256),
+        ]
+    if getattr(args, "inference_initial_model_dir", None) is not None:
+        command += ["--inference-initial-model-dir", str(args.inference_initial_model_dir)]
+    if bootstrap is not None:
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            bootstrap["bootstrap"]["path"],
+            "--bridge-config",
+            bootstrap["config"]["path"],
+            "--config-sha",
+            bootstrap["config"]["sha256"],
+            "--",
+            *command[3:],
+        ]
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     description = selected.get("model_description", f"frozen {layers}-layer regression")
     print(f"{phase}: validating {description}", flush=True)
@@ -757,6 +870,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             log.write(line)
             lines.append(line)
         returncode = process.wait()
+    if bootstrap is not None and _optimizer_validation_bootstrap(args) != bootstrap:
+        raise ValueError("optimizer validation bootstrap/config changed during target validation")
     output = "".join(lines)
     report_path = out_dir / "report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else None
@@ -768,6 +883,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "log": str(log_path),
         "report": str(report_path) if report_path.exists() else None,
     }
+    if bootstrap is not None:
+        result["optimizer_validation_bootstrap"] = bootstrap
     (out_dir / "validation.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
@@ -1101,6 +1218,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
             reference_calibration_runs=runs,
             reference_calibration_workers=workers,
             client_backend=_client_backend(args),
+            peft_adapter=_shared_adapter(args, config),
         )
         if results:
             raise ValueError(
@@ -1112,9 +1230,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         expected_model = model_identity(args.optimizer_model_path)
         initialization = "external-model"
         if config.training.get("peft_config"):
-            from arctic_platform.correctness.harness.lora import adapter_identity
+            from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
 
-            initialization = adapter_identity(args.output_dir / "reference-adapter-init")
+            initialization = adapter_identity(_shared_adapter(args, config, args.optimizer_model_path))
         training = config.effective_training
         expected_training = {
             "fp32_lm_head": bool(training.get("fp32_lm_head", False)),
@@ -1233,6 +1351,7 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
         raise ValueError(f"spec {spec.config_id!r} does not describe config {config.config_id!r}")
     if spec.config_checksum != config_checksum(config):
         raise ValueError("the existing spec does not match the config; onboard Test 1 before Test 2")
+    args._admitted_optimizer_validation_bootstrap = _optimizer_validation_bootstrap(args)
     optimizer_model_path, optimizer_layers = _optimizer_reference_model(spec, args.cache_root)
     local_fixture = getattr(args, "local_cortex_fixture", False)
     if local_fixture and "single-step-grads" not in spec.applicable_tests:
@@ -1488,6 +1607,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar=("GPUS", "TP", "PP"),
         help="explicit original Flash-Next16 sampling allocation, TP and PP for final inference validation",
     )
+    parser.add_argument("--inference-export-allocation", type=Path, help="same-job local inference allocation JSON")
+    parser.add_argument("--inference-export-allocation-sha256", help="full SHA256 of the allocation JSON bytes")
+    parser.add_argument(
+        "--inference-initial-model-dir",
+        type=Path,
+        help="already admitted absolute FAST model directory for initial local Cortex inference training only",
+    )
     parser.add_argument("--test-id", default="single-step-grads")
     parser.add_argument(
         "--reference-tests",
@@ -1516,6 +1642,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=Path(__file__).resolve().parents[1] / "reference_data",
     )
     parser.add_argument("--reference-calibration-runs", type=int, default=16)
+    parser.add_argument(
+        "--peft-adapter",
+        type=Path,
+        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
+    )
     parser.add_argument("--reference-calibration-workers", type=int, default=1)
     parser.add_argument(
         "--local-gateway-full-model",
@@ -1527,6 +1658,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="validate the reduced supervised gradient or optimizer fixture through a local DSS gateway",
     )
+    parser.add_argument(
+        "--optimizer-validation-bootstrap",
+        type=Path,
+        help="source-pinned caller bootstrap for final local Cortex optimizer validation only",
+    )
+    parser.add_argument("--optimizer-validation-bootstrap-sha256", help="full SHA256 of the caller bootstrap")
+    parser.add_argument("--optimizer-validation-config", type=Path, help="private caller bootstrap configuration")
+    parser.add_argument("--optimizer-validation-config-sha256", help="full SHA256 of the private caller configuration")
 
 
 def _prepare_references(args: argparse.Namespace) -> int:
@@ -1574,11 +1713,20 @@ def _prepare_references(args: argparse.Namespace) -> int:
         reference_calibration_workers=args.reference_calibration_workers,
         client_backend=backend,
         local_gateway_full_model=args.local_gateway_full_model,
+        peft_adapter=_shared_adapter(args, config),
     )
     return 0
 
 
 def run(args: argparse.Namespace) -> int:
+    from arctic_platform.correctness.harness.execution import _load_inference_export_allocation
+    from arctic_platform.correctness.harness.execution import _load_inference_initial_model_dir
+
+    if getattr(args, "inference_export_allocation", None) is not None:
+        args.inference_export_allocation = Path(args.inference_export_allocation).resolve()
+    _load_inference_export_allocation(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
+    _load_inference_initial_model_dir(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
+    _optimizer_validation_bootstrap(args)
     if getattr(args, "local_cortex_fixture", False) and (
         getattr(args, "prepare_references", False) or args.probe_layers is not None
     ):
@@ -1602,6 +1750,18 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("sizing reuse is only supported for gradient onboarding, not probes or reference prep")
     _validate_storage(args)
     args.config = args.config.resolve()
+    from arctic_platform.correctness.harness.config import load_config
+
+    if getattr(args, "peft_adapter", None) is not None:
+        if (
+            args.test_id not in {"single-step-grads", "single-step-optimizer"}
+            or getattr(args, "reference_tests", None)
+            and not set(args.reference_tests) <= {"single-step-grads", "single-step-optimizer"}
+            or not getattr(args, "prepare_references", False)
+            and getattr(args, "backend", "onprem") != "onprem"
+        ):
+            raise ValueError("--peft-adapter requires on-prem first-two SFT onboarding or reference preparation")
+        args.peft_adapter = _shared_adapter(args, load_config(args.config))
     if getattr(args, "prepare_references", False):
         if args.probe_layers is not None:
             raise ValueError("reference preparation cannot be combined with model sizing")

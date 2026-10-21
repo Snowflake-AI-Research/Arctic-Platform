@@ -34,6 +34,16 @@ Internal preparation, regression, and provenance notes for agents maintaining th
 
 ## Prepare Once
 
+### Automatic LoRA Initialization
+
+**First-two on-premises LoRA checks need no pre-generated adapter or agent intervention.** [The operator guide](running-tests.doc#lora-without-adapter-inputs) gives a complete config addition to its copyable example. Onboarding and regression generate one standard adapter using upstream PEFT's default initializer and seed `42`. The base architecture is created on the metadata-only device; only adapter factors allocate CPU storage. Production PEFT code does not call a correctness initializer.
+
+**Compact records bind generated values, not filesystem paths.** The initialization identity contains the recipe, exact dependency versions, topology, tensor shapes/dtypes and content hashes. Regression reconstructs those factors and requires the original reviewed reference identity; it never measures HF again to accommodate changed factors. Store only compact records/config/specification in Git, never adapter, model or optimizer tensors.
+
+**Worker-local transport does not assume `/data-fast` is shared.** The on-premises runner transfers verified adapter bytes through the allocation's existing Ray object store; each worker stages, verifies, loads and removes its own temporary copy before completing initialization. Model weights and installed code still require the runtime's supported per-node distribution. Optional `--peft-adapter` overrides automatic generation and must be supplied consistently during preparation and regression. Generation supports dense `target_modules` LoRA with upstream default initialization; unsupported expert-parameter layouts and advanced initializers fail explicitly.
+
+**For a new model with no existing config or spec, start with the complete first-two example in the [operator guide](running-tests.doc#complete-first-two-example).** It checks out the full-suite branch, downloads the actual weights and tokenizer, writes a complete native config and generates a reduced-fixture specification. A specification records model/input settings and reviewed tolerances; compact reference records contain the independent HF measurements. The commands below instead use the bundled, already reviewed Qwen config and spec.
+
 **Hugging Face (HF) reference measurements are prepared explicitly during onboarding, not regenerated during regression.** Use `onboard --prepare-references` with a matching reviewed SFT (supervised fine-tuning) config and frozen test specification. Preparation does not resize the fixture, rewrite historical gates, or run the target backend. Matching records are reused; missing records require HF computation, while incompatible or corrupt records must be resolved explicitly.
 
 **The three supported check IDs select different compact measurements.**
@@ -47,16 +57,17 @@ Internal preparation, regression, and provenance notes for agents maintaining th
 **Prepare each required check with its exact CLI ID.** These examples use the reviewed dense Qwen3-8B config; gradient and optimizer preparation use the fixtures selected by its frozen spec.
 
 ```bash
-CONFIG=arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config
-
-python -m arctic_platform.correctness onboard --config "$CONFIG" \
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references --test-id single-step-grads
 
-python -m arctic_platform.correctness onboard --config "$CONFIG" \
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references --test-id single-step-optimizer \
   --reference-calibration-runs 16 --reference-calibration-workers 8
 
-python -m arctic_platform.correctness onboard --config "$CONFIG" \
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references --test-id e2e-sft-train-validate \
   --local-gateway-full-model
 ```
@@ -64,7 +75,8 @@ python -m arctic_platform.correctness onboard --config "$CONFIG" \
 **Prepare gradients and optimizer together when regression selects both checks.** The prep-only `--reference-tests` option replaces the scalar `--test-id` selection and prepares both records for the combined workload; use the full check IDs, not `grads` or `optimizer` aliases. Selecting optimizer enables an optimizer step and its frozen model/token-budget settings, which also enter the gradient record's workload identity. Separate scalar preparations are therefore not interchangeable with combined preparation; regression must find records matching its actual selection.
 
 ```bash
-python -m arctic_platform.correctness onboard --config "$CONFIG" \
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer \
   --reference-calibration-runs 16 --reference-calibration-workers 8
@@ -76,6 +88,8 @@ Full-model mode admits only explicitly pinned original snapshots. [validate_loca
 
 ## Calibrate Optimizer Norms
 
+**Each HF worker reports its arm, run name, device, start and completion or failure, with elapsed time.** Calibration consumes completed workers immediately but retains the original run order for gate calculation. After each subprocess exits, the [runner](../harness/runner.py) saves complete stdout, stderr and the exit code beside its `ref-<run>.json` as `ref-<run>.stdout.log`, `ref-<run>.stderr.log` and `ref-<run>.returncode`, on success as well as failure. The console prints the actual paths; logs are under the FAST work directory, not the compact-record directory. If the requested output directory is outside FAST storage, only these logs use a separate `/data-fast` work directory. These messages cover future executions and do not establish progress for an already-running worker whose source lacks this logging.
+
 **`optimizer-state-l2-norm-v1` compares scalar magnitudes, not full tensors.** For each named parameter and comparison state, the criterion is `abs(target_norm - reference_norm)`. The update residual subtracts the Adam update explained by each backend's own moments before taking the norm. Parameter coverage, shapes, and finite nonnegative norms must agree; zero and near-zero norms have no exemption. See [optimizer_state.py](../checks/optimizer_state.py) and the [optimizer check](../checks/fwd_bwd_step.py).
 
 **Equal norms can hide sign, permutation, or directional errors.** `abs(||target||2 - ||reference||2)` is weaker than the full-tensor difference `||target - reference||2`; a norm pass does not establish elementwise optimizer-state equivalence.
@@ -84,13 +98,34 @@ Full-model mode admits only explicitly pinned original snapshots. [validate_loca
 
 ## Run Regression
 
+### Native Multi-Rank Optimizer Capture
+
+**A local optimizer checkpoint must include every actual training rank, not just the rank-zero response from the save API.** Expert parallelism (EP) partitions experts across workers; sequence parallelism (SP) partitions a sequence across workers. The optimizer checkpoint can therefore span all configured GPUs even when the config's data-parallel width is one. The optional [runner integration](../harness/runner.py) uses `cfg.n_gpus` for native collection; ordinary capture continues to use `cfg.dp_size`.
+
+**This integration is an internal Python callback interface, not a new CLI flag or automatic runtime discovery.** Pass `native_optimizer_scope`, `native_optimizer_scope_source`, and optionally `native_optimizer_supplier_source` to `runner.execute(...)`. A source descriptor has exactly `{"path": "/absolute/loaded/source.py", "sha256": "<full-file-sha256>"}` and must describe the callback's actual loaded source. If scope and supplier come from different files, provide both descriptors; otherwise the supplier uses the scope descriptor.
+
+**The scope owns collection and cleanup for one target arm.** `native_optimizer_scope(session, job)` returns a context manager whose entered value is a callable `supplier(checkpoint_root, *, step)`. The [capture helper](../harness/cortex_optimizer.py) invokes that supplier after each existing save, at step zero and step one. The supplier gathers the already-saved rank files and returns the validated native layout with the actual parent, training child and worker bindings. It must not initiate another optimizer step or substitute expert sidefiles for optimizer tensors. Context exit must restore owned hooks and finish owned cleanup before the training child is released.
+
+**Admission remains explicit and narrow.** The runner requires target execution with a loopback `CortexConfig`, `local_cortex_fixture=True`, and an explicit selection containing `single-step-optimizer` and no checks beyond the first two supervised-reference checks. Reference preparation and reinforcement-learning configs cannot use this callback. Existing model identity, parameter coverage, dtype, partition ordering, snapshot integrity and numerical gates still apply. Installing these hooks or passing CPU controls does not establish a live worker route, a complete checkpoint, successful resource cleanup or a numerical pass.
+
 **Regression consumes a compatible prepared record or stops with a prerequisite error; it never falls back to a fresh HF reference run.** Regenerate a baseline only through explicit onboarding and review, not to hide a target mismatch. The record loader may hash assets and reconstruct input identities; that validation is not a reference-model training run. The [E2E check](../checks/e2e_sft_train_validate.py) loads the stored trajectory and validation cross-entropy before running the target.
 
 ```bash
-python -m arctic_platform.correctness run --config "$CONFIG" \
+python -m arctic_platform.correctness run \
+  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --test e2e-sft-train-validate --backend cortex \
   --base-url http://127.0.0.1:8003 --database dev --schema dev \
   --local-gateway-full-model --out /data-fast/tmp/qwen3-8b-e2e-report
 ```
+
+### Reviewed Historical Gradients
+
+**New-model onboarding does not need historical-reference options.** The optional `run --historical-gradient-references <descriptor.json> --historical-gradient-references-sha256 <full-sha256>` pair is for maintainers who already hold reviewed, original gradient records. An identity mismatch alone does not authorize reuse.
+
+**Only the reviewed DSS shared-expert alias change is accepted.** The [loader](../harness/reference_records.py) permits `harness/names.py` to change from SHA-256 `a5c941eb9592fabe042c8f48a28bfe7e650f5b65d3b8b7a6fd3824397c63ba09` (9,905 bytes) to `4d6cd215ef4639ab2d85f5928ca2df83954012878c39366c74e29207cc92725c` (10,294 bytes). Every other workload field must match exactly, including HF sources, dependencies, model files, input tensors, initialization, config, parameter-name map and gradient tolerance. The installed naming source must match the current pin. Reuse does not exclude tensors, widen a tolerance or rerun HF measurements.
+
+**The descriptor binds every selected arm to its original record bytes.** The JSON object has exactly two fields: `schema`, whose value is `"reviewed-gradient-references-v1"`, and `records`. Each key in `records` names a selected arm, such as `gas1` or `gas4`. Each arm has exactly `record_path` (the original JSON filename), `record_sha256` (64 lowercase hexadecimal characters hashing the entire original file) and `review` (a nonempty string identifying the source review). Relative record paths resolve against the descriptor's directory. The record filename must remain its historical workload-identity digest; renaming the record to the current lookup key is rejected. The second CLI option separately pins the descriptor's complete bytes.
+
+**Reuse supports one explicit supervised-fine-tuning config and only `single-step-grads`.** Optimizer or mixed selections, all-config runs, reference preparation, reinforcement-learning configs, and unknown or missing arm bindings are rejected. The [runner](../harness/runner.py) writes `reference-record-provenance.json` in the run's work directory before target work, retaining both complete identities, the original record path and raw hash, and the review string. A rejected binding never falls back to another record or fresh HF computation. Historical gradient reuse does not admit optimizer references or establish a model pass.
 
 **Only compact records belong in the reference directory.** Model weights, adapter artifacts, optimizer captures, replay tensors, and calibration intermediates stay under `/data-fast`; use onboarding `--output-dir /data-fast/tmp/<unique-run>` when an explicit work directory is needed. Otherwise [storage.py](../harness/storage.py) selects `/data-fast/tmp`, with `DSS_CORRECTNESS_TMPDIR` as a fast-storage override. Reference preparation, CPU controls, and gateway admission alone do not justify new pass cells in the historical report.

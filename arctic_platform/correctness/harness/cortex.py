@@ -64,6 +64,7 @@ class CortexTrainingConfig(ReviewedClientConfig):
     hardware: str | None = None
     source_checkpoint_info: dict[str, str] | None = None
     inference_tensor_parallel_size: StrictInt | None = None
+    initial_training_model_dir: str | None = None
 
     @classmethod
     def from_reviewed(cls, native: ArcticClientConfig, **updates) -> Self:
@@ -78,6 +79,20 @@ class CortexTrainingConfig(ReviewedClientConfig):
 
     @model_validator(mode="after")
     def _check_source(self) -> Self:
+        if self.initial_training_model_dir is not None:
+            from .hosted import require_local_cortex_gateway
+            from .inference_export import validate_initial_training_model_dir
+
+            if (
+                not isinstance(self.backend, CortexConfig)
+                or not self.training_gpus
+                or self.sampling_gpus
+                or self.log_prob_gpus
+                or self.source_checkpoint_info is not None
+            ):
+                raise ValueError("initial training model directory requires training-only local Cortex")
+            require_local_cortex_gateway(self.backend)
+            validate_initial_training_model_dir(self.initial_training_model_dir)
         if self.training_gpus and self.sampling_gpus:
             formats = (self.training.weight_format, self.sampling.weight_format)
             if any(value is not None for value in formats) and (formats[0] or "vllm") != (formats[1] or "vllm"):
@@ -150,6 +165,8 @@ class CortexTrainingConfig(ReviewedClientConfig):
         sub["training_config"] = {**extra, **sub["training_config"]}
         if self.source_checkpoint_info is not None:
             sub["source_checkpoint_info"] = dict(self.source_checkpoint_info)
+        if self.initial_training_model_dir is not None:
+            sub["local_model_dir"] = self.initial_training_model_dir
         return sub
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict:

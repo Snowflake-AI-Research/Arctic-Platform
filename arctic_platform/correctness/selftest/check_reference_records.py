@@ -31,6 +31,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Barrier
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -705,6 +706,243 @@ def _reference_records_no_hf(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+
+@pytest.fixture
+def _historical_gradient_record(_reference_records_ctx, monkeypatch):
+    historical = {
+        "schema": records.SCHEMA_VERSION,
+        "check_id": _reference_records_GRADS,
+        "criterion": records.CRITERIA[_reference_records_GRADS],
+        "config_id": _reference_records_ctx.config_id,
+        "config_checksum": _reference_records_ctx.spec.config_checksum,
+        "parameter_name_map": {},
+        "gpu_family": "H200",
+        "reference_sources": {
+            "reference/hf_single_gpu.py": {"sha256": "a" * 64, "size": 10},
+            "harness/names.py": copy.deepcopy(records._REVIEWED_GRADIENT_NAMES_TRANSITION["historical"]),
+        },
+        "dependencies": {"torch": "unit-torch", "transformers": "unit-transformers"},
+        "python": "3.12.15",
+        "recipe": {
+            "arm": "gas1",
+            "model": {"sha256": "b" * 64},
+            "batch": {"sha256": "d" * 64},
+            "token_budget": 10240,
+        },
+        "gate": {"absolute": 0.011, "calibration_runs": 16},
+    }
+    current = copy.deepcopy(historical)
+    current["reference_sources"]["harness/names.py"] = copy.deepcopy(
+        records._REVIEWED_GRADIENT_NAMES_TRANSITION["current"]
+    )
+    measurements = {**_reference_records_measurements(), "skipped_no_grad": ["visual.patch_embed.weight"]}
+    path = records.publish_record(_reference_records_ctx, historical, measurements)
+    raw = path.read_bytes()
+    binding = {
+        "record_path": str(path),
+        "record_sha256": hashlib.sha256(raw).hexdigest(),
+        "review": "Exact DSS-only shared-expert alias transition reviewed; HF source unchanged.",
+    }
+    _reference_records_ctx.reference_record_paths.clear()
+    _reference_records_no_hf(monkeypatch)
+    return SimpleNamespace(
+        ctx=_reference_records_ctx,
+        historical=historical,
+        current=current,
+        measurements=measurements,
+        path=path,
+        raw=raw,
+        binding=binding,
+    )
+
+
+def _historical_gradient_rewrite(fixture, record):
+    raw = records._json(record)
+    fixture.path.write_bytes(raw)
+    fixture.binding["record_sha256"] = hashlib.sha256(raw).hexdigest()
+
+
+def test_historical_gradient_record_explicit_binding_preserves_original_and_both_identities(
+    _historical_gradient_record,
+):
+    fixture = _historical_gradient_record
+    before = fixture.path.stat()
+    with pytest.raises(records.ReferencePrerequisiteError, match="missing"):
+        records.load_record(fixture.ctx, fixture.current)
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+    loaded = records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert loaded == fixture.measurements
+    assert fixture.path.read_bytes() == fixture.raw
+    assert fixture.path.stat().st_ino == before.st_ino
+    assert fixture.path.stat().st_mtime_ns == before.st_mtime_ns
+    assert list(fixture.ctx.reference_records_dir.rglob("*.json")) == [fixture.path]
+    key = records._digest(fixture.current)
+    assert fixture.ctx.reference_record_paths == {key: str(fixture.path)}
+    assert fixture.ctx.reference_record_provenance == {
+        key: {
+            "historical_identity": fixture.historical,
+            "current_identity": fixture.current,
+            **fixture.binding,
+        }
+    }
+    fixture.current["gate"]["absolute"] = 99.0
+    fixture.binding["review"] = "mutated caller"
+    provenance = fixture.ctx.reference_record_provenance[key]
+    assert provenance["current_identity"]["gate"]["absolute"] == 0.011
+    assert provenance["historical_identity"]["gate"]["absolute"] == 0.011
+    assert provenance["review"] != "mutated caller"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema",
+        "check_id",
+        "criterion",
+        "config_id",
+        "config_checksum",
+        "parameter_name_map",
+        "gpu_family",
+        "reference_sources",
+        "dependencies",
+        "python",
+        "recipe",
+        "gate",
+        "extra_field",
+    ],
+)
+def test_historical_gradient_record_rejects_every_other_workload_field(_historical_gradient_record, field):
+    fixture = _historical_gradient_record
+    if field == "schema":
+        fixture.current[field] = True
+    elif field == "check_id":
+        fixture.current[field] = _reference_records_OPTIMIZER
+    elif field == "parameter_name_map":
+        fixture.current[field] = {"wrong": "alias"}
+    elif field == "reference_sources":
+        fixture.current[field]["reference/hf_single_gpu.py"]["sha256"] = "e" * 64
+    elif field == "dependencies":
+        fixture.current[field]["torch"] = "different-torch"
+    elif field == "recipe":
+        fixture.current[field]["batch"]["sha256"] = "e" * 64
+    elif field == "gate":
+        fixture.current[field]["absolute"] = 0.025
+    else:
+        fixture.current[field] = "different"
+    with pytest.raises(records.ReferencePrerequisiteError, match="another workload field|gradients only"):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {},
+        {"extra": "waiver"},
+        {"record_sha256": "0" * 64},
+        {"record_sha256": "A" * 64},
+        {"record_sha256": "abc"},
+        {"review": ""},
+        {"review": " "},
+        {"review": {"override": True}},
+        {"review": True},
+        {"record_path": ""},
+        {"record_path": 7},
+    ],
+)
+def test_historical_gradient_record_requires_exact_binding_and_raw_pin(_historical_gradient_record, invalid):
+    fixture = _historical_gradient_record
+    binding = {**fixture.binding, **invalid} if invalid else {}
+    with pytest.raises(records.ReferencePrerequisiteError):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=binding)
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+
+
+@pytest.mark.parametrize("side", ["historical", "current"])
+def test_historical_gradient_record_rejects_unreviewed_names_transition(_historical_gradient_record, side):
+    fixture = _historical_gradient_record
+    if side == "current":
+        fixture.current["reference_sources"]["harness/names.py"]["sha256"] = "0" * 64
+    else:
+        record = json.loads(fixture.raw)
+        record["identity"]["reference_sources"]["harness/names.py"]["sha256"] = "0" * 64
+        renamed = fixture.path.with_name(f"{records._digest(record['identity'])}.json")
+        fixture.path.rename(renamed)
+        fixture.path = renamed
+        fixture.binding["record_path"] = str(renamed)
+        _historical_gradient_rewrite(fixture, record)
+    with pytest.raises(records.ReferencePrerequisiteError, match="transition is not reviewed"):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+
+
+def test_historical_gradient_record_revalidates_actual_current_names_source(_historical_gradient_record, monkeypatch):
+    fixture = _historical_gradient_record
+    monkeypatch.setattr(records, "file_identity", lambda path: {"sha256": "0" * 64, "size": 10294})
+    with pytest.raises(records.ReferencePrerequisiteError, match="current names.py source mismatch"):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+
+
+@pytest.mark.parametrize("corruption", ["schema", "filename", "payload", "measurements"])
+def test_historical_gradient_record_validates_original_record(_historical_gradient_record, corruption):
+    fixture = _historical_gradient_record
+    record = json.loads(fixture.raw)
+    if corruption == "schema":
+        record["schema"] = True
+    elif corruption == "filename":
+        renamed = fixture.path.with_name(f"{records._digest(fixture.current)}.json")
+        fixture.path.rename(renamed)
+        fixture.path = renamed
+        fixture.binding["record_path"] = str(renamed)
+    elif corruption == "payload":
+        record["measurements"]["loss"] += 1
+    else:
+        record["measurements"]["grad_norms"] = {}
+        record["payload_sha256"] = records._digest(record["measurements"])
+    _historical_gradient_rewrite(fixture, record)
+    with pytest.raises(records.ReferencePrerequisiteError, match="schema|filename|payload|gradient norms"):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+
+
+@pytest.mark.parametrize("bad_json", ["duplicate", "nested_duplicate", "nan", "overflow", "malformed"])
+def test_historical_gradient_record_strict_json(_historical_gradient_record, bad_json):
+    fixture = _historical_gradient_record
+    text = fixture.raw.decode()
+    if bad_json == "duplicate":
+        text = '{"schema":1,' + text[1:]
+    elif bad_json == "nested_duplicate":
+        text = text.replace('"loss":1.25', '"loss":1.25,"loss":1.25')
+    elif bad_json == "nan":
+        text = text.replace('"loss":1.25', '"loss":NaN')
+    elif bad_json == "overflow":
+        text = text.replace('"loss":1.25', '"loss":1e999')
+    else:
+        text = "{"
+    raw = text.encode()
+    fixture.path.write_bytes(raw)
+    fixture.binding["record_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(records.ReferencePrerequisiteError):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
+
+
+def test_historical_gradient_record_never_falls_back_to_current_record(_historical_gradient_record):
+    fixture = _historical_gradient_record
+    current_path = records.publish_record(fixture.ctx, fixture.current, fixture.measurements)
+    fixture.ctx.reference_record_paths.clear()
+    fixture.binding["record_sha256"] = "0" * 64
+    with pytest.raises(records.ReferencePrerequisiteError, match="raw SHA256 mismatch"):
+        records.load_record(fixture.ctx, fixture.current, historical_binding=fixture.binding)
+    assert current_path.exists()
+    assert not fixture.ctx.reference_record_paths
+    assert not hasattr(fixture.ctx, "reference_record_provenance")
 
 
 @pytest.mark.parametrize("check_id", [_reference_records_GRADS, _reference_records_OPTIMIZER, _reference_records_E2E])
@@ -1476,3 +1714,248 @@ def test_reference_records_model_identity_requires_complete_external_assets(tmp_
         (root / missing).unlink()
     with pytest.raises(records.ReferencePrerequisiteError, match="assets unavailable|complete model"):
         records.model_identity(root)
+
+
+@pytest.mark.parametrize("returncode", [0, 17])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_reference_observability_subprocess_retains_complete_logs_and_returncode(
+    tmp_path, monkeypatch, capsys, returncode, fallback
+):
+    output = Path("/tmp") / tmp_path.name / "reference.json" if fallback else tmp_path / "reference.json"
+    log_dir = tmp_path / "fallback" if fallback else tmp_path
+    stdout = "reference first output\n" + "s" * 6000 + "\nreference last output\n"
+    stderr = "Traceback (most recent call last):\n" + "e" * 6000 + "\nRuntimeError: child failure\n"
+    payload = {"loss": 2.0, "microbatches": 3, "grad_norms": {"layer.weight": 4.0}}
+    commands = []
+    fallbacks = []
+    read_text = Path.read_text
+
+    def read_output(path, *args, **kwargs):
+        return json.dumps(payload) if path == output else read_text(path, *args, **kwargs)
+
+    def child(command, **kwargs):
+        commands.append((command, kwargs))
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def fast_fallback(prefix):
+        fallbacks.append(prefix)
+        return log_dir
+
+    monkeypatch.setattr(runner.subprocess, "run", child)
+    monkeypatch.setattr(runner, "correctness_workdir", fast_fallback)
+    monkeypatch.setattr(Path, "read_text", read_output)
+    options = {"token_budget": 64, "ce_chunk": 8, "attn": "sdpa", "fp32_lm_head": False, "cuda_device": 0}
+    if returncode:
+        with pytest.raises(RuntimeError, match=r"reference failed \(17\)") as failure:
+            runner.run_reference("read-only-model", tmp_path / "batch.pt", output, **options)
+        assert str(log_dir / f"{output.stem}.stdout.log") in str(failure.value)
+        assert str(log_dir / f"{output.stem}.stderr.log") in str(failure.value)
+        assert stdout[-4000:] in str(failure.value)
+        assert stderr[-4000:] in str(failure.value)
+    else:
+        assert runner.run_reference("read-only-model", tmp_path / "batch.pt", output, **options) == payload
+    assert len(commands) == 1
+    command, subprocess_options = commands[0]
+    assert command[command.index("--out") + 1] == str(output)
+    assert command[command.index("--seed") + 1] == str(SEED)
+    assert "--deterministic" in command
+    assert subprocess_options["capture_output"] is True
+    assert subprocess_options["text"] is True
+    assert subprocess_options["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+    assert fallbacks == (["hf-reference-logs-"] if fallback else [])
+    assert (log_dir / f"{output.stem}.stdout.log").read_text() == stdout
+    assert (log_dir / f"{output.stem}.stderr.log").read_text() == stderr
+    assert (log_dir / f"{output.stem}.returncode").read_text() == f"{returncode}\n"
+    assert str(log_dir.resolve()).startswith("/data-fast/")
+    assert not output.exists()
+    message = capsys.readouterr().out
+    assert f"run={output.stem}" in message
+    assert f"returncode={returncode}" in message
+    for suffix in ("stdout.log", "stderr.log", "returncode"):
+        assert str(log_dir / f"{output.stem}.{suffix}") in message
+
+
+def test_reference_observability_keeps_successful_process_logs_when_result_json_is_invalid(tmp_path, monkeypatch):
+    output = tmp_path / "reference.json"
+    calls = []
+
+    def child(command, **kwargs):
+        calls.append(command)
+        output.write_text("{not valid JSON}")
+        return SimpleNamespace(returncode=0, stdout="child completed\n", stderr="child warning\n")
+
+    monkeypatch.setattr(runner.subprocess, "run", child)
+    with pytest.raises(json.JSONDecodeError):
+        runner.run_reference(
+            "read-only-model",
+            tmp_path / "batch.pt",
+            output,
+            token_budget=64,
+            ce_chunk=8,
+            attn="sdpa",
+            fp32_lm_head=False,
+        )
+    assert len(calls) == 1
+    assert (tmp_path / "reference.stdout.log").read_text() == "child completed\n"
+    assert (tmp_path / "reference.stderr.log").read_text() == "child warning\n"
+    assert (tmp_path / "reference.returncode").read_text() == "0\n"
+    assert output.read_text() == "{not valid JSON}"
+
+
+def test_reference_observability_calibration_consumes_completed_runs_without_changing_records(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+):
+    from arctic_platform.correctness.checks import optimizer_state
+
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.add(("single-step-optimizer", "gas1"))
+    control.record_overrides["single-step-grads", "gas1"] = {"grad_norms": {"layer.weight": 9.0}, "loss": 9.0}
+    original_cfg = deepcopy(control.cfg.training)
+    original_gate = deepcopy(control.spec.test_tolerances["single-step-grads"])
+    release_slow = Event()
+    calls = []
+    consumed = []
+    reductions = []
+
+    class CompletionTrackingPool(ThreadPoolExecutor):
+        def submit(self, function, *args, **kwargs):
+            future = super().submit(function, *args, **kwargs)
+            original_result = future.result
+
+            def result(timeout=None):
+                value = original_result(timeout)
+                consumed.append(kwargs["output_name"])
+                if kwargs["output_name"] == "gas1-calibration-1":
+                    release_slow.set()
+                return value
+
+            future.result = result
+            return future
+
+    def reference(model, batch, output, **kwargs):
+        assert model == control.spec.model.cache_path
+        assert batch.name == "batch-gas1.pt"
+        assert kwargs["optimizer_config"] == original_cfg["optimizer"]
+        assert kwargs["learning_rate"] == runner.OPTIMIZER_LEARNING_RATE
+        calls.append((output.stem, kwargs["deterministic"], kwargs["cuda_device"]))
+        if output.stem == "ref-gas1-calibration-0":
+            assert release_slow.wait(5), "completed calibration run was blocked behind a pending earlier run"
+        return {
+            "loss": 3.0,
+            "microbatches": 1,
+            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(
+                control.target_manifest if kwargs["deterministic"] else output.with_suffix(".manifest.json")
+            ),
+        }
+
+    def norm_delta(manifests, **kwargs):
+        reductions.append((list(manifests), kwargs))
+        return SimpleNamespace(delta_norm=0.0021, name="layer.weight", state="exp_avg")
+
+    monkeypatch.setattr(runner, "ThreadPoolExecutor", CompletionTrackingPool)
+    monkeypatch.setattr(runner, "run_reference", reference)
+    monkeypatch.setattr(optimizer_state, "max_pairwise_optimizer_norm_delta", norm_delta)
+    try:
+        assert (
+            control.execute(
+                selected_arms=control.arms[:1],
+                prepare_references=True,
+                reference_calibration_runs=3,
+                reference_calibration_workers=2,
+            )
+            == []
+        )
+    finally:
+        release_slow.set()
+
+    assert calls[0] == ("ref-gas1", True, None)
+    assert sorted(calls[1:]) == [
+        ("ref-gas1-calibration-0", False, 0),
+        ("ref-gas1-calibration-1", False, 1),
+        ("ref-gas1-calibration-2", False, 0),
+    ]
+    assert consumed == ["gas1-calibration-1", "gas1-calibration-0", "gas1-calibration-2"]
+    assert reductions == [
+        (
+            [control.contexts[0].workdir / f"ref-gas1-calibration-{index}.manifest.json" for index in range(3)],
+            {"optimizer_config": original_cfg["optimizer"], "learning_rate": runner.OPTIMIZER_LEARNING_RATE},
+        )
+    ]
+    assert control.cfg.training == original_cfg
+    assert control.spec.test_tolerances["single-step-grads"] == original_gate
+    assert [event for event in control.events if event[0] == "publish"] == [
+        ("publish", "single-step-optimizer", "gas1")
+    ]
+    assert not any(event[0] in {"gateway-enter", "job-enter", "target"} for event in control.events)
+    identity, measurements = control.published[0]
+    assert identity["check_id"] == "single-step-optimizer"
+    assert measurements["loss"] == 3.0
+    assert measurements["grad_norms"] == {"layer.weight": 3.0}
+    assert "optimizer_state_manifest" not in measurements
+    assert measurements["optimizer_norm_gate"] == {
+        "criterion": "optimizer-state-l2-norm-v1",
+        "absolute": 0.009,
+        "status": "reviewed",
+        "provenance": {
+            "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
+            "calibration_runs": 3,
+            "maximum_pairwise_norm_delta": 0.0021,
+            "worst_quantity": "layer.weight::exp_avg",
+            "multiplier": 4,
+            "minimum_gate": 0.001,
+        },
+    }
+    cached = control.contexts[0]._reference_by_check["gas1"]
+    assert cached["single-step-grads"]["loss"] == 9.0
+    assert cached["single-step-grads"]["grad_norms"] == {"layer.weight": 9.0}
+    assert cached["single-step-optimizer"] == measurements
+    lines = capsys.readouterr().out.splitlines()
+    for run, device in [(0, 0), (1, 1), (2, 0)]:
+        matching = [line for line in lines if "gas1" in line and f"gas1-calibration-{run}" in line]
+        assert any("start" in line and f"device={device}" in line for line in matching)
+        assert any("done" in line and f"device={device}" in line for line in matching)
+        assert not any("failed" in line for line in matching)
+
+
+def test_reference_observability_calibration_error_keeps_existing_record_and_does_not_publish(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.add(("single-step-optimizer", "gas1"))
+    control.record_overrides["single-step-grads", "gas1"] = {"grad_norms": {"layer.weight": 9.0}, "loss": 9.0}
+    calls = []
+
+    def reference(model, batch, output, **kwargs):
+        calls.append((output.stem, kwargs["deterministic"], kwargs["cuda_device"]))
+        if not kwargs["deterministic"]:
+            raise RuntimeError("synthetic calibration childreturncode=17")
+        return {
+            "loss": 3.0,
+            "microbatches": 1,
+            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    with pytest.raises(RuntimeError, match="synthetic calibration childreturncode=17"):
+        control.execute(
+            selected_arms=control.arms[:1],
+            prepare_references=True,
+            reference_calibration_runs=2,
+            reference_calibration_workers=1,
+        )
+    assert calls == [("ref-gas1", True, None), ("ref-gas1-calibration-0", False, 0)]
+    assert not control.published
+    assert not any(event[0] in {"gateway-enter", "job-enter", "target"} for event in control.events)
+    assert control.record_overrides["single-step-grads", "gas1"] == {
+        "grad_norms": {"layer.weight": 9.0},
+        "loss": 9.0,
+    }
+    lines = capsys.readouterr().out.splitlines()
+    matching = [line for line in lines if "gas1-calibration-0" in line]
+    assert any("start" in line and "device=0" in line for line in matching)
+    assert any("failed" in line and "device=0" in line for line in matching)
+    assert not any("done" in line for line in matching)

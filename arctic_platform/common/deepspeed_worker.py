@@ -23,6 +23,7 @@ import numbers
 import os
 import socket
 import time
+from copy import deepcopy
 from typing import Any
 
 import deepspeed
@@ -45,6 +46,7 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
+from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,10 @@ class DeepSpeedWorker:
         self.engine = None
         self._gpu_mem_preallocation = None
         self.sp_size = 1
+        self.sp_group = None
+        self.sp_rank = 0
+        self.mpu = None
+        self.ep_group = None
         self._weight_sender = None
         self._on_gpu = True
 
@@ -153,12 +159,12 @@ class DeepSpeedWorker:
         deepspeed.init_distributed()
 
         model_name = job_config["model_name"]
-        ds_config = job_config.get("ds_config") or {}
+        ds_config = deepcopy(job_config.get("ds_config") or {})
         self.job_type = job_config.get("job_type")
         pr0(f"{self.job_type=} {job_config=}")
         pr0(f"ds_worker[before_modify]: {self.job_type=} {ds_config=}")
 
-        ds_worker_config = job_config.get("ds_worker_config") or {}
+        ds_worker_config = deepcopy(job_config.get("ds_worker_config") or {})
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
         self.sp_size = sp_size_from_job_config(job_config)
@@ -181,7 +187,12 @@ class DeepSpeedWorker:
         if job_config.get("training_config") is not None:
             model_config["debug"] = gpu_memory_debug_config(job_config["training_config"])
         spec = ModelSpec.from_ds_worker_config(model_name, model_config)
-        loaded = build_model(spec)
+        if spec.parallelism.sequence_parallel != self.sp_size:
+            raise ValueError("worker sp_size disagrees with the resolved ModelSpec")
+        parallel_groups = self._setup_model_parallel_groups(spec, ds_config, ds_worker_config)
+        loaded = (
+            build_model(spec, parallel_groups=parallel_groups) if parallel_groups is not None else build_model(spec)
+        )
         model = loaded.model
         self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
 
@@ -189,10 +200,14 @@ class DeepSpeedWorker:
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
         init_kwargs = dict(model=model, config=ds_config)
+        if self.mpu is not None:
+            init_kwargs["mpu"] = self.mpu
         if self._has_optimizer:
             # Forward-only (log-prob) engines are initialized without an
             # optimizer so DeepSpeed allocates no optimizer state.
             init_kwargs["model_parameters"] = model.parameters()
+        if spec.parallelism.expert_parallel > 1:
+            preserve_fp8_params_through_ds_cast(model)
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -207,6 +222,48 @@ class DeepSpeedWorker:
         )
 
         return True
+
+    def _setup_model_parallel_groups(self, spec: ModelSpec, ds_config: dict, worker_config: dict):
+        from arctic_platform.model.parallel.groups import expert_parallel_group
+        from arctic_platform.model.parallel.groups import setup_parallel_groups
+        from arctic_platform.model.parallel.validation import validate_expert_parallel
+
+        ep_size = spec.parallelism.expert_parallel
+        sp_size = spec.parallelism.sequence_parallel
+        self.mpu, self.sp_group, self.sp_rank, self.ep_group = None, None, 0, None
+        if ep_size == sp_size == 1:
+            return None
+        validate_expert_parallel(
+            ep_size, self.world_size, zero_stage=(ds_config.get("zero_optimization") or {}).get("stage")
+        )
+        dp_sp_world_size(self.world_size, sp_size)
+        gpus_per_node = None
+        if sp_size > 1:
+            if ds_config.get("sequence_parallel_size", sp_size) != sp_size:
+                raise ValueError("ds_config.sequence_parallel_size disagrees with worker sp_size")
+            # Ray can expose one device per actor. Derive rank placement from all participating hosts.
+            hosts = [None] * self.world_size
+            dist.all_gather_object(hosts, socket.gethostname())
+            if any(not isinstance(host, str) or not host for host in hosts):
+                raise ValueError("incomplete training-rank host placement")
+            counts = {host: hosts.count(host) for host in hosts}
+            if len(set(counts.values())) != 1:
+                raise ValueError("sequence parallelism requires uniform training ranks per host")
+            gpus_per_node = next(iter(counts.values()))
+            blocks = [hosts[start : start + gpus_per_node] for start in range(0, len(hosts), gpus_per_node)]
+            if any(len(set(block)) != 1 for block in blocks):
+                raise ValueError("sequence parallelism requires contiguous training-rank host blocks")
+            ds_config["sequence_parallel_size"] = sp_size
+        groups = setup_parallel_groups(
+            sp_size,
+            ep_size,
+            world_size=self.world_size,
+            gpus_per_node=gpus_per_node,
+            ep_group_layout=worker_config.get("ep_group_layout", "auto"),
+        )
+        self.mpu, self.sp_group, _, self.sp_rank = groups
+        self.ep_group = expert_parallel_group(ep_size) if ep_size > 1 else None
+        return {"ep_group": self.ep_group, "sp_group": self.sp_group}
 
     def ds_training_config(self, job_config: dict, ds_config: dict, ds_worker_config: dict) -> dict:
         """Build the DeepSpeed config for a trainable engine (with optimizer).
@@ -737,6 +794,9 @@ class DeepSpeedWorker:
             device=torch.device(self._device),
             bucket_size=bucket_size,
         )
+        from arctic_platform.debug.lora_sync_hooks import maybe_record_lora_sender
+
+        maybe_record_lora_sender(self, group, schedule, base_port)
         return True
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
@@ -770,11 +830,15 @@ class DeepSpeedWorker:
             num_params += 1
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
+    def prepare_lora_weights(self, request: dict) -> dict:
+        from arctic_platform.debug.lora_sync_hooks import maybe_prepare_lora_worker
+
+        return maybe_prepare_lora_worker(self, request)
+
     def send_weights(self) -> dict:
-        weights = self.get_weights()
-        if self._weight_sender is not None:
-            return self._weight_sender.send(weights)
-        return {"status": "not_initialized"}
+        from arctic_platform.debug.lora_sync_hooks import maybe_send_lora_worker
+
+        return maybe_send_lora_worker(self)
 
     def send_weights_ipc(self, group_id: int) -> dict:
         """Save weights to shared memory for colocated (same-GPU) transfer."""
@@ -1193,6 +1257,9 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
+        from arctic_platform.debug.lora_sync_hooks import maybe_release_lora_worker
+
+        maybe_release_lora_worker(self)
         if self._weight_sender is not None:
             self._weight_sender.destroy()
             self._weight_sender = None

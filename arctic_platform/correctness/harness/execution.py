@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import sys
@@ -281,6 +282,129 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     return CortexConfig(**options)
 
 
+def _load_inference_export_allocation(args) -> dict | None:
+    """Read pinned allocation metadata only for one explicit local inference check."""
+    path = getattr(args, "inference_export_allocation", None)
+    expected = getattr(args, "inference_export_allocation_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--inference-export-allocation and --inference-export-allocation-sha256 are required together"
+        )
+    if path is None:
+        return None
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or getattr(args, "test", None) != ["inference-checkpoint-loss"]
+        or getattr(args, "backend", "cortex") != "cortex"
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+    ):
+        raise ValueError("export allocation requires one explicit local Cortex inference-checkpoint-loss config")
+    require_local_cortex_gateway(_client_backend(args))
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("export allocation requires a full lowercase SHA256")
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("inference export allocation SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate inference export allocation key: {key}")
+            result[key] = value
+        return result
+
+    admission = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(admission, dict):
+        raise ValueError("inference export allocation must be a JSON object")
+    json.dumps(admission, allow_nan=False)
+    return admission
+
+
+def _load_inference_initial_model_dir(args) -> Path | None:
+    """Forward an explicit initial training root without changing the configured model identity."""
+    value = getattr(args, "inference_initial_model_dir", None)
+    if value is None:
+        return None
+    if _load_inference_export_allocation(args) is None:
+        raise ValueError("inference initial model directory requires a pinned local inference export allocation")
+    from .inference_export import validate_initial_training_model_dir
+
+    return validate_initial_training_model_dir(value)
+
+
+def _load_historical_gradient_references(args) -> dict | None:
+    """Load explicit raw-pinned bindings before batch grouping can narrow a selection."""
+    path = getattr(args, "historical_gradient_references", None)
+    expected = getattr(args, "historical_gradient_references_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--historical-gradient-references and --historical-gradient-references-sha256 are required together"
+        )
+    if path is None:
+        return None
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or getattr(args, "test", None) != ["single-step-grads"]
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        raise ValueError("historical gradient references require one explicit config and only single-step-grads")
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("historical gradient references require a full lowercase SHA256")
+    descriptor = Path(path).resolve()
+    with descriptor.open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("historical gradient references descriptor exceeds 1 MiB")
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("historical gradient references descriptor SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate historical gradient references key: {key}")
+            result[key] = value
+        return result
+
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    json.dumps(value, allow_nan=False)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "records"}
+        or value["schema"] != "reviewed-gradient-references-v1"
+        or not isinstance(value["records"], dict)
+        or not value["records"]
+    ):
+        raise ValueError("invalid historical gradient references descriptor schema")
+    bindings = {}
+    for arm, binding in value["records"].items():
+        if (
+            not arm
+            or not isinstance(binding, dict)
+            or set(binding) != {"record_path", "record_sha256", "review"}
+            or not isinstance(binding["record_path"], str)
+            or not binding["record_path"]
+            or not isinstance(binding["record_sha256"], str)
+            or len(binding["record_sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in binding["record_sha256"])
+            or not isinstance(binding["review"], str)
+            or not binding["review"].strip()
+        ):
+            raise ValueError(f"invalid historical gradient reference binding for arm {arm}")
+        record_path = Path(binding["record_path"])
+        if not record_path.is_absolute():
+            record_path = descriptor.parent / record_path
+        bindings[arm] = {**binding, "record_path": str(record_path.resolve())}
+    return bindings
+
+
 def _run_vocab_size(
     cfg, spec, select, backend, published_fixture: dict | None = None, *, local_full_model_path: Path | None = None
 ) -> int:
@@ -316,6 +440,9 @@ def _run_vocab_size(
 
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    inference_export_allocation = _load_inference_export_allocation(args)
+    inference_initial_model_dir = _load_inference_initial_model_dir(args)
+    historical_gradient_references = _load_historical_gradient_references(args)
     test_spec = getattr(args, "test_spec", None)
     topology = getattr(args, "inference_sampling_topology", None)
     if test_spec is not None and (not args.config or args.all_configs):
@@ -359,6 +486,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)
     if test_spec is not None and len(config_paths) != 1:
         raise SystemExit("--test-spec requires exactly one resolved config")
+    if inference_export_allocation is not None and len(config_paths) != 1:
+        raise ValueError("export allocation requires exactly one resolved config")
     results: List[TestResult] = []
     specs: Dict[str, TestSpec] = {}
     execution: Dict[str, dict] = {}
@@ -373,6 +502,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     for path in config_paths:
         try:
             cfg = load_config(path)
+            if historical_gradient_references is not None and cfg.is_rl:
+                raise ValueError("historical gradient references require a supervised config")
             if topology is not None:
                 from types import SimpleNamespace
 
@@ -395,7 +526,13 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
             widths = (
                 [cfg.n_gpus]
-                if local_fixture or local_full_model or topology is not None
+                if (
+                    local_fixture
+                    or local_full_model
+                    or topology is not None
+                    or inference_export_allocation is not None
+                    or historical_gradient_references is not None
+                )
                 else placement_widths(cfg.n_gpus, pool)
             )
         except (ValueError, KeyError) as exc:
@@ -454,6 +591,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     select=args.test or None,
                     attn=args.attn[0] if args.attn else None,
                     client_backend=backend,
+                    **(
+                        {"inference_export_allocation": inference_export_allocation}
+                        if inference_export_allocation is not None
+                        else {}
+                    ),
+                    **(
+                        {"inference_initial_model_dir": inference_initial_model_dir}
+                        if inference_initial_model_dir is not None
+                        else {}
+                    ),
                 )
             )
             continue
@@ -567,8 +714,28 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     **({"local_gateway_full_model": True} if local_full_model else {}),
                     **({"inference_sampling_topology": topology} if topology is not None else {}),
                     **(
+                        {"inference_export_allocation": inference_export_allocation}
+                        if inference_export_allocation is not None
+                        else {}
+                    ),
+                    **(
+                        {"inference_initial_model_dir": inference_initial_model_dir}
+                        if inference_initial_model_dir is not None
+                        else {}
+                    ),
+                    **(
                         {"reference_records_dir": Path(args.reference_records_dir)}
                         if getattr(args, "reference_records_dir", None) is not None
+                        else {}
+                    ),
+                    **(
+                        {"peft_adapter": Path(args.peft_adapter)}
+                        if getattr(args, "peft_adapter", None) is not None
+                        else {}
+                    ),
+                    **(
+                        {"historical_gradient_references": historical_gradient_references}
+                        if historical_gradient_references is not None
                         else {}
                     ),
                 )
@@ -641,6 +808,7 @@ def run_batch(args, *, selected, executor=None):
     from .reference_records import ReferencePrerequisiteError
 
     started = time.monotonic()
+    _load_historical_gradient_references(args)
     out = Path(args.out) if args.out is not None else correctness_workdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
     specs = {}
@@ -898,12 +1066,28 @@ def parse_args(argv=None):
         "--test-spec", type=Path, help="reviewed private spec for one explicit config; integrity checks apply"
     )
     r.add_argument(
+        "--peft-adapter",
+        type=Path,
+        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
+    )
+    r.add_argument(
         "--inference-sampling-topology",
         type=int,
         nargs=3,
         metavar=("GPUS", "TP", "PP"),
         help="explicit original Flash-Next16 sampling allocation, tensor parallelism and pipeline parallelism",
     )
+    r.add_argument("--inference-export-allocation", type=Path, help="same-job local inference allocation JSON")
+    r.add_argument("--inference-export-allocation-sha256", help="full SHA256 of the allocation JSON bytes")
+    r.add_argument(
+        "--inference-initial-model-dir",
+        type=Path,
+        help="already admitted absolute FAST model directory for initial local Cortex inference training only",
+    )
+    r.add_argument(
+        "--historical-gradient-references", type=Path, help="explicit reviewed historical gradient bindings JSON"
+    )
+    r.add_argument("--historical-gradient-references-sha256", help="full SHA256 of the historical bindings JSON bytes")
     r.add_argument("--test", action="append", help="test id (repeatable); default every applicable test")
     r.add_argument(
         "--case",
