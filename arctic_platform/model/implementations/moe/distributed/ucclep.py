@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ..routing_weights import apply_routing_weights
+from ..token_combine import gather_token_rows
 from ..token_combine import sum_rows_by_token
 from .uccl_ep import Buffer
 from .uccl_ep import EventOverlap
@@ -255,7 +256,7 @@ def _permute_tokens(
     permuted_indices = torch.arange(len(hidden_states), device=hidden_states.device).repeat_interleave(
         mask.sum(dim=1)
     )[sort_order]
-    permuted_hidden_states = hidden_states.index_select(0, permuted_indices)
+    permuted_hidden_states = gather_token_rows(hidden_states, permuted_indices)
     permuted_scores = valid_scores[sort_order]
     return permuted_hidden_states, permuted_scores, permuted_indices
 
