@@ -127,17 +127,24 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         swiglu_limit: float | None = None,
+        fp8_block_size: int | None = None,
     ) -> None:
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        from arctic_platform.model.implementations.fp8 import make_linear
+
+        # ``fp8_block_size`` makes the projections frozen block-FP8 ``BlockFp8Linear``s (``w*.weight_scale_inv``).
+        self.fp8_block_size = fp8_block_size
+        self.w1 = make_linear(dim, hidden_dim, fp8_block_size=fp8_block_size)
+        self.w2 = make_linear(hidden_dim, dim, fp8_block_size=fp8_block_size)
+        self.w3 = make_linear(dim, hidden_dim, fp8_block_size=fp8_block_size)
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(_apply_swiglu(self.w1(x), self.w3(x), self.swiglu_limit))
 
     def init_weights(self, init_std: float = 0.02):
+        if self.fp8_block_size is not None:
+            return
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
