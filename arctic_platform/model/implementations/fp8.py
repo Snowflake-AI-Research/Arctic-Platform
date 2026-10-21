@@ -49,6 +49,97 @@ def keeps_fp32(tensor: Tensor) -> bool:
     return bool(getattr(tensor, KEEP_FP32_ATTR, False))
 
 
+_FP8_STORAGE_DTYPES = ("float8_e4m3fn", "float8_e5m2")
+
+
+def _fp8_storage_dtypes() -> tuple:
+    return tuple(getattr(torch, name) for name in _FP8_STORAGE_DTYPES if hasattr(torch, name))
+
+
+def _keeps_source_dtype(tensor, fp8_dtypes) -> bool:
+    """FP8 codes and the FP32 block scales that restore their magnitude."""
+    return tensor.dtype in fp8_dtypes or keeps_fp32(tensor)
+
+
+def _remark_fp8_scales(model) -> int:
+    """Re-apply the keep-FP32 marker to every block scale, by name.
+
+    The marker is an attribute on the parameter object, so a rebuild between
+    construction and ``deepspeed.initialize`` drops it.
+    """
+    marked = 0
+    for name, param in model.named_parameters():
+        if name.endswith("_scale_inv") and param.dtype == torch.float32:
+            mark_keep_fp32(param)
+            marked += 1
+    return marked
+
+
+def _cast_module_tensors_keeping_fp8(module, dtype, fp8_dtypes):
+    return nn.Module._apply(
+        module,
+        lambda tensor: (
+            tensor
+            if _keeps_source_dtype(tensor, fp8_dtypes)
+            else (tensor.to(dtype) if tensor.is_floating_point() else tensor)
+        ),
+    )
+
+
+def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
+    """Skip e4m3/e5m2 in DeepSpeed's per-parameter mixed-precision cast."""
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    if getattr(DeepSpeedEngine, "_ap_fp8_param_cast_guard", False):
+        return False
+    original = getattr(DeepSpeedEngine, "_cast_module_mixed_precision", None)
+    if original is None:
+        return False
+
+    def _cast_module_mixed_precision(self, param_dtype, buffer_dtype, is_zero_init_model):
+        if param_dtype is not None and not is_zero_init_model:
+            for param in self.module.parameters(recurse=True):
+                if (
+                    param.is_floating_point()
+                    and param.dtype != param_dtype
+                    and not _keeps_source_dtype(param, fp8_dtypes)
+                ):
+                    param.data = param.data.to(param_dtype)
+        if buffer_dtype is not None:
+            original(self, None, buffer_dtype, is_zero_init_model)
+
+    DeepSpeedEngine._cast_module_mixed_precision = _cast_module_mixed_precision
+    DeepSpeedEngine._ap_fp8_param_cast_guard = True
+    return True
+
+
+def preserve_fp8_params_through_ds_cast(model) -> tuple[int, int]:
+    """Keep frozen FP8 weights and FP32 block scales out of DeepSpeed's dtype cast.
+
+    Returns ``(fp8 parameter count, remarked scale count)``. A model with no FP8
+    parameters is left unchanged.
+    """
+    import types
+
+    fp8_dtypes = _fp8_storage_dtypes()
+    if not fp8_dtypes:
+        return 0, 0
+    fp8_params = sum(1 for param in model.parameters() if param.dtype in fp8_dtypes)
+    if not fp8_params:
+        return 0, 0
+
+    model.bfloat16 = types.MethodType(
+        lambda module: _cast_module_tensors_keeping_fp8(module, torch.bfloat16, fp8_dtypes),
+        model,
+    )
+    model.half = types.MethodType(
+        lambda module: _cast_module_tensors_keeping_fp8(module, torch.float16, fp8_dtypes),
+        model,
+    )
+    _install_deepspeed_fp8_param_cast_guard(fp8_dtypes)
+    return fp8_params, _remark_fp8_scales(model)
+
+
 def carry_keep_fp32(src: Tensor, dst: nn.Parameter) -> nn.Parameter:
     """Re-mark ``dst`` when it replaces ``src``."""
     if keeps_fp32(src):

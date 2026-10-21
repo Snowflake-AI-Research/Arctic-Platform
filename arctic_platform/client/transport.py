@@ -35,16 +35,15 @@ JOB_TYPES = ("training", "sampling", "log_prob")
 # NCCL root) rendezvouses last.
 JOB_CREATE_ORDER = ("sampling", "log_prob", "training")
 
-# The canonical op vocabulary: every op the client can lower to a Request. A
-# transport is expected to resolve all of these; `unresolved_ops` lets it check
-# its own coverage up front instead of failing with an AttributeError mid-run.
+# Live-engine operations that every initialized client transport must resolve.
+# `unresolved_ops` checks on-prem server coverage before work starts.
 OPS = frozenset(
     {
         "forward-backward",
         "forward",
         "step",
         "save",
-        "load-checkpoint",  # SFT resume; not in Cortex surface
+        "load-checkpoint",
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
@@ -55,6 +54,23 @@ OPS = frozenset(
         "wake-inference",
         "sleep-training",
         "wake-training",
+        # Streaming generate: submit, then poll the request for events or cancel it.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
+    }
+)
+
+CLUSTER_OPS = frozenset(
+    {
+        "list-jobs",
+        "get-job",
+        "cancel-job",
+        "capacity",
+        "list-checkpoints",
+        "export-checkpoint",
+        "delete-checkpoint",
+        "download-artifacts",
     }
 )
 
@@ -64,14 +80,28 @@ def method_name(op: str) -> str:
     return op.replace("-", "_")
 
 
-def initialize_or_cleanup(transport: "Transport") -> "JobHandles":
-    """``initialize()``, or ``shutdown()`` + re-raise so a launched server is not orphaned.
+def initialize_or_cleanup(
+    transport: "Transport", client_config: ArcticClientConfig, *, wait: bool = True
+) -> "JobHandles":
+    """``initialize(client_config)``, or clean up so a launched server is not orphaned.
 
-    ``shutdown`` is idempotent; safe even when the transport already self-cleaned.
+    ``wait=False`` runs only ``start``; finish with :func:`wait_or_cleanup`.
     """
+    return _or_cleanup(transport, transport.initialize if wait else transport.start, client_config)
+
+
+def wait_or_cleanup(transport: "Transport") -> "JobHandles":
+    """``wait_until_ready()``, or clean up so a started job is not orphaned."""
+    return _or_cleanup(transport, transport.wait_until_ready)
+
+
+def _or_cleanup(transport: "Transport", step: Any, *args: Any) -> "JobHandles":
+    # BaseException: Ctrl-C and SystemExit (SIGTERM under Ray) are the usual ways
+    # out of a long placement wait. ``shutdown`` is idempotent, so it is safe even
+    # when the transport already self-cleaned.
     try:
-        return transport.initialize()
-    except Exception:
+        return step(*args)
+    except BaseException:
         try:
             transport.shutdown()
         except Exception:
@@ -107,14 +137,20 @@ class JobHandles:
             raise ValueError(f"No {job_type} job initialized.")
         return job_id
 
+    def require_any(self) -> JobId:
+        for job_type in JOB_TYPES:
+            job_id = getattr(self, job_type)
+            if job_id is not None:
+                return job_id
+        raise ValueError("No job initialized.")
+
 
 @dataclass
 class Request:
-    """A canonical op call, built by the client.
+    """A canonical backend operation, built without knowing its transport.
 
-    The client owns job identity (it holds `JobHandles` after `initialize`), so it
-    resolves and sets `job_id` here directly; `body` carries everything else.
-    Transports may normalize deployment-specific responses into the canonical API.
+    A transport may fulfill one operation with one request, several requests, or
+    a client-side workflow. ``job_id`` is absent for account-level operations.
     """
 
     op: str  # canonical op name, e.g. "forward-backward"
@@ -127,19 +163,28 @@ class Transport(ABC):
     jobs: JobHandles
 
     @abstractmethod
-    def initialize(self) -> JobHandles:
-        """Create jobs (or attach to reconnect ids) and return their handles."""
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        """Provision jobs from the stateful client config, or attach to its reconnect ids."""
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        """Request the jobs and return before they are ready.
+
+        Once this returns, ``shutdown`` releases what was requested. A transport
+        that cannot split requesting from waiting does all of ``initialize`` here.
+        """
+        return self.initialize(client_config)
+
+    def wait_until_ready(self) -> JobHandles:
+        """Block until the jobs from ``start`` accept ops."""
+        return self.jobs
 
     @abstractmethod
-    def call(self, request: Request) -> dict:
-        """Deliver one op to this deployment; return a canonical response dict."""
+    def call(self, request: Request) -> Any:
+        """Deliver one operation to this deployment."""
 
     @abstractmethod
-    async def acall(self, request: Request) -> dict:
-        """Async delivery of one op; return a canonical response dict."""
-
-    async def aclose(self) -> None:
-        """Release async resources (e.g. an aiohttp session); no-op by default."""
+    async def acall(self, request: Request) -> Any:
+        """Async delivery of one operation to this deployment."""
 
     @abstractmethod
     def shutdown(self) -> None:

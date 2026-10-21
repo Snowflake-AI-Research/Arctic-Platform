@@ -56,6 +56,13 @@ class ModelConfig(BaseModel):
     # is a serving-layer concept, not an AsyncEngineArgs field, so the worker
     # pops it before building the engine.
     reasoning_parser: str | None = None
+    # Chat-mode overrides of chat.CHAT_MODELS, which picks parsers by
+    # architecture. tool_call_parser is vllm serve's --tool-call-parser.
+    # chat_reasoning_parser applies to chat streams only, so /generate keeps
+    # reasoning_parser; an engine that already has a reasoner must name the
+    # same one. Either field enables chat on an architecture not listed there.
+    tool_call_parser: str | None = None
+    chat_reasoning_parser: str | None = None
     # When true, include parsed `reasoning` / `content` fields in generate
     # responses. The parser may still be used internally when this is false.
     return_reasoning_content: bool = False
@@ -72,10 +79,33 @@ class ModelConfig(BaseModel):
     # does not error).
     forest_cascade_attn_configs: str | None = "{}"
 
+    # Semi-persistence: restore a pre-warmed CRIU image via
+    # semi_persistence.Instance instead of a cold vLLM load. Popped by
+    # InferenceWorker.initialize before AsyncEngineArgs is built.
+    # The image directory is not a job field: it is derived from a hash of this
+    # config and of the container image, under a cache root semip_engine
+    # defaults (SEMIP_IMAGE_CACHE in ``extra_env`` still overrides it). That is
+    # what lets a dump and a later restore agree on a path, and it is why a job
+    # that names its own directory would be naming a cache key it cannot
+    # compute.
+    semi_p: bool = False
+
     extra_engine_kwargs: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
     ray_num_gpus: float | None = Field(default=None, exclude=True)
     lora_sync_staging: Literal["cpu", "gpu"] = Field(default="cpu", exclude=True)
+    # Clear the prefix cache when a weight sync pauses generation with
+    # strategy="pause", pause_mode="keep", so requests after the sync never
+    # read KV computed under the old weights. A request's clear_cache=True
+    # still forces clearing; set this to False for the run to opt out.
+    # Clearing preempts in-flight requests (they re-prefill) and discards
+    # reusable prefix KV; False leaves clearing to the best-effort post-load
+    # reset, so the cache may be kept across syncs at the cost of possibly
+    # reading KV computed under the old weights.
+    # pause_mode="abort" is unaffected (it already requires the post-load
+    # reset), and drain/skip/hotswap/engine_only syncs issue no pause, so
+    # this has no effect on them either. Not an AsyncEngineArgs field.
+    clear_cache_on_weight_sync: bool = Field(default=True, exclude=True)
 
     @model_validator(mode="after")
     def validate_sequence_parallelism(self) -> ModelConfig:

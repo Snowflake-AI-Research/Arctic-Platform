@@ -38,13 +38,12 @@ SAMPLING = 2
 
 class FakeTransport(Transport):
     def __init__(self, config, server_state=None) -> None:
-        self.config = config
         self.jobs = JobHandles()
         self.calls: list[Request] = []
         self.shutdown_calls = 0
 
-    def initialize(self) -> JobHandles:
-        sampling = SAMPLING if self.config.sampling_gpus else None
+    def initialize(self, client_config) -> JobHandles:
+        sampling = SAMPLING if client_config.sampling_gpus else None
         self.jobs = JobHandles(training=TRAINING, sampling=sampling)
         return self.jobs
 
@@ -162,7 +161,7 @@ class TestSFTOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/ckpt", "step": 3}
+        assert req.body == {"path": "/tmp/ckpt", "step": 3, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling(self, sampling_client):
         out = sampling_client.generate(["hi"], sampling_params={"max_tokens": 8})
@@ -223,7 +222,7 @@ class TestSFTLifecycle:
         """A launched local server must not be orphaned if initialize() fails."""
 
         class BoomTransport(FakeTransport):
-            def initialize(self):
+            def initialize(self, client_config):
                 raise RuntimeError("init failed")
 
         monkeypatch.setattr(base_module, "make_transport", BoomTransport)
