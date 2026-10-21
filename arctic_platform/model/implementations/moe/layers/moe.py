@@ -309,7 +309,12 @@ def _run_experts_grouped_mm_impl(
 
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    h = _apply_swiglu(gate, up, swiglu_limit)
+    if gate.is_cuda:
+        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+
+        h = fused_swiglu(gate, up, swiglu_limit)
+    else:
+        h = _apply_swiglu(gate, up, swiglu_limit)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
     return out
