@@ -30,6 +30,7 @@ import json
 import re
 import sqlite3
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
@@ -179,7 +180,8 @@ def _execute_sql(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozen
 # Shared pool: a fresh executor per query leaked threads into the SQL timeout.
 _SQL_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="bird-sql")
 _GOLD_LOCK = threading.Lock()
-_GOLD_RESULTS: dict[tuple[str, str], frozenset | Exception] = {}
+_GOLD_CACHE_MAX = 4096
+_GOLD_RESULTS: OrderedDict[tuple[str, str], frozenset] = OrderedDict()
 
 
 def _execute_with_timeout(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozenset | Exception:
@@ -194,16 +196,27 @@ def _execute_with_timeout(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) 
 
 
 def _cached_gold_result(db_path: str, gold_sql: str, timeout: float) -> frozenset | Exception:
-    """Gold SQL is identical across a GRPO group; execute it once per (db, sql)."""
+    """Gold SQL is identical across a GRPO group; cache a successful result per (db, sql).
+
+    Timeouts and other exceptions are not cached. One slow query must not score 0
+    for every later rollout against that gold. The cache is an LRU capped at
+    ``_GOLD_CACHE_MAX`` entries.
+    """
     limited = _add_limit_to_query(gold_sql)
     key = (db_path, limited)
     with _GOLD_LOCK:
         hit = _GOLD_RESULTS.get(key)
         if hit is not None:
+            _GOLD_RESULTS.move_to_end(key)
             return hit
     result = _execute_with_timeout(db_path, limited, timeout)
+    if isinstance(result, Exception):
+        return result
     with _GOLD_LOCK:
         _GOLD_RESULTS[key] = result
+        _GOLD_RESULTS.move_to_end(key)
+        while len(_GOLD_RESULTS) > _GOLD_CACHE_MAX:
+            _GOLD_RESULTS.popitem(last=False)
     return result
 
 
