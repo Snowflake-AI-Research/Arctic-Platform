@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.debug.gpu_memory import allocate_gpu_mem_preallocation
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import freeze_fp8_weights_and_scales
@@ -28,8 +29,12 @@ from arctic_platform.model.patch import apply_patches
 
 def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
     """Run the spec's resolved loader, apply its patches, and return the result."""
+    allocation = allocate_gpu_mem_preallocation(spec.debug)
     ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)
     loaded = select_loader(ctx)(ctx)
     apply_patches(loaded, ctx)
     freeze_fp8_weights_and_scales(loaded.model)
+    if allocation is not None:
+        # An ordinary attribute stays live but is neither checkpointed nor moved by model.to().
+        loaded.model._arctic_gpu_mem_preallocation = allocation
     return loaded
