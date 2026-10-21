@@ -309,13 +309,16 @@ def _run_experts_grouped_mm_impl(
     assert x.dim() == 2
     _offsets_must_cover_no_more_than_the_rows("gated", x, num_tokens_per_expert, offsets)
 
-    gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-    up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    if gate.is_cuda and scores is not None and not w2.requires_grad:
+    if x.is_cuda and scores is not None and not (w1.requires_grad or w2.requires_grad or w3.requires_grad):
         from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
 
+        # Frozen gate and up stacked: one GEMM each way instead of two plus a sum of their input gradients.
+        w13 = torch.cat([w1, w3], dim=-2).bfloat16()
+        gate_up = torch._grouped_mm(x.bfloat16(), w13.transpose(-2, -1), offs=offsets)
         rows = int(offsets[-1])
-        return scored_swiglu_down(gate, up, scores, w2, None, offsets, rows, limit=swiglu_limit).type_as(x)
+        return scored_swiglu_down(gate_up, scores, w2, None, offsets, rows, limit=swiglu_limit).type_as(x)
+    gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+    up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
     if gate.is_cuda:
         from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
 
@@ -417,8 +420,9 @@ class GroupedExperts(nn.Module):
         """Block-FP8 experts decoded to BF16 for each grouped GEMM (W8A16), plus grouped expert LoRA.
 
         One routed-token count serves every projection; tokens need no per-expert padding and
-        activations are not quantized. Routing ``scores`` without down-projection LoRA are folded
-        into the down projection, which then keeps no copy of its output for their gradient.
+        activations are not quantized. Routing ``scores`` without down-projection LoRA are folded into
+        the down projection, which then keeps no copy of its output for their gradient, and gate and up
+        are decoded side by side for one GEMM each way.
         """
         from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
         from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
@@ -439,10 +443,15 @@ class GroupedExperts(nn.Module):
                 out[:rows] += grouped_expert_lora_rows(inputs, ab[name], offsets, rows)
             return out
 
-        gate, up = project(x, "w1"), project(x, "w3")
         if scores is not None and "w2" not in ab:
-            weight, scale = projections["w2"]
-            return scored_swiglu_down(gate, up, scores, weight, scale, offsets, rows, block_size, self.swiglu_limit)
+            (w1, s1), (w2, s2), (w3, s3) = projections["w1"], projections["w2"], projections["w3"]
+            gate_up = grouped_fp8_decoded_mm(x, (w1, w3), (s1, s3), offsets, rows, block_size)
+            hidden = w1.shape[-2]
+            for name, cols in (("w1", slice(0, hidden)), ("w3", slice(hidden, 2 * hidden))):
+                if name in ab:
+                    gate_up[:rows, cols] += grouped_expert_lora_rows(x, ab[name], offsets, rows)
+            return scored_swiglu_down(gate_up, scores, w2, s2, offsets, rows, block_size, self.swiglu_limit)
+        gate, up = project(x, "w1"), project(x, "w3")
         out = project(fused_swiglu(gate, up, self.swiglu_limit), "w2")
         return out if scores is None else apply_routing_weights(out, scores)
 

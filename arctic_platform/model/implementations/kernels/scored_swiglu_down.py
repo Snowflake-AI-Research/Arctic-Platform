@@ -17,20 +17,35 @@
 Scaling the expert outputs afterwards (``apply_routing_weights``) keeps each ``[rows, dim]`` output alive for the
 score gradient ``<grad, y>``: at 256K tokens over 8 GPUs and top-8 routing, 1 GiB per MoE layer. With ``W2`` frozen
 the same gradient is ``<grad @ W2, h>``, and backward computes ``grad @ W2`` for the input gradient anyway; ``h`` is
-rebuilt from the gate and up projections that SwiGLU keeps regardless. So only ``gate``, ``up`` and the scores are
-saved, and one Triton pass per row turns ``grad @ W2`` into the gate, up and score gradients. The forward output is
-the same as the unfused path's: the same GEMM on the same BF16 ``h``, then the same per-row scaling.
+rebuilt from the gate and up projections that SwiGLU keeps regardless. So only the gate and up projections and the
+scores are saved, and one Triton pass per row turns ``grad @ W2`` into the gate, up and score gradients. The forward
+output is the same as the unfused path's: the same GEMM on the same BF16 ``h``, then the same per-row scaling.
+
+Gate and up arrive packed in one ``[rows, 2 * hidden]`` tensor, the output of one grouped GEMM against the stacked
+gate|up weights, and their gradient leaves in the same layout, so the input gradient is one GEMM too.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-from arctic_platform.model.implementations.kernels.fused_swiglu import _BLOCK
-from arctic_platform.model.implementations.kernels.fused_swiglu import _swiglu_fwd_kernel
 from arctic_platform.model.implementations.moe.routing_weights import scale_rows
 
 _BLOCK_D = 1024
+
+
+@triton.jit
+def _packed_swiglu_fwd_kernel(gu_ptr, out_ptr, D, stride_gu, limit, HAS_LIMIT: tl.constexpr, BLOCK_D: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    for start in range(0, D, BLOCK_D):
+        cols = start + tl.arange(0, BLOCK_D)
+        mask = cols < D
+        g = tl.load(gu_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + row * stride_gu + D + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_LIMIT:
+            g = tl.minimum(g, limit)
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+        tl.store(out_ptr + row * D + cols, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -43,6 +58,7 @@ def _scored_swiglu_bwd_kernel(
     dup_ptr,
     ds_ptr,
     D,
+    stride_gu,
     stride_gh,
     limit,
     HAS_LIMIT: tl.constexpr,
@@ -55,8 +71,8 @@ def _scored_swiglu_bwd_kernel(
     for start in range(0, D, BLOCK_D):
         cols = start + tl.arange(0, BLOCK_D)
         mask = cols < D
-        g = tl.load(gate_ptr + row * D + cols, mask=mask, other=0.0).to(tl.float32)
-        u = tl.load(up_ptr + row * D + cols, mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(gate_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(up_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
         gh = tl.load(gh_ptr + row * stride_gh + cols, mask=mask, other=0.0).to(tl.float32)
         if HAS_LIMIT:
             pass_g = g <= limit
@@ -73,8 +89,8 @@ def _scored_swiglu_bwd_kernel(
         if HAS_LIMIT:
             dg = tl.where(pass_g, dg, 0.0)
             du = tl.where(pass_u, du, 0.0)
-        tl.store(dgate_ptr + row * D + cols, dg.to(dgate_ptr.dtype.element_ty), mask=mask)
-        tl.store(dup_ptr + row * D + cols, du.to(dup_ptr.dtype.element_ty), mask=mask)
+        tl.store(dgate_ptr + row * stride_gu + cols, dg.to(dgate_ptr.dtype.element_ty), mask=mask)
+        tl.store(dup_ptr + row * stride_gu + cols, du.to(dup_ptr.dtype.element_ty), mask=mask)
     tl.store(ds_ptr + row, tl.sum(acc, axis=0))
 
 
@@ -88,17 +104,18 @@ def _down_weight(weight: torch.Tensor, scale: torch.Tensor | None, block_size: i
 
 class _ScoredSwiGLUDownFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gate, up, scores, weight, scale, offsets, rows, block_size, limit):
-        gate, up = gate.contiguous(), up.contiguous()
+    def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit):
+        gate_up = gate_up.contiguous()
+        hidden = gate_up.shape[1] // 2
         # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
         ctx.weights = (weight, scale)
         ctx.rows, ctx.block_size, ctx.limit = rows, block_size, limit
-        ctx.save_for_backward(gate, up, scores, offsets)
-        h = torch.empty_like(gate)
-        n = gate.numel()
-        if n:
-            _swiglu_fwd_kernel[(triton.cdiv(n, _BLOCK),)](
-                gate, up, h, n, 0.0 if limit is None else float(limit), HAS_LIMIT=limit is not None, BLOCK=_BLOCK
+        ctx.save_for_backward(gate_up, scores, offsets)
+        h = torch.empty(gate_up.shape[0], hidden, dtype=gate_up.dtype, device=gate_up.device)
+        if h.numel():
+            _packed_swiglu_fwd_kernel[(h.shape[0],)](
+                gate_up, h, hidden, gate_up.stride(0), 0.0 if limit is None else float(limit),
+                HAS_LIMIT=limit is not None, BLOCK_D=_BLOCK_D,
             )
         y = torch._grouped_mm(h, _down_weight(weight, scale, block_size).transpose(-2, -1), offs=offsets)
         del h
@@ -108,40 +125,40 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        gate, up, scores, offsets = ctx.saved_tensors
+        gate_up, scores, offsets = ctx.saved_tensors
         weight, scale = ctx.weights
         rows = ctx.rows
+        hidden = gate_up.shape[1] // 2
         grad_h = torch._grouped_mm(
-            grad.contiguous().to(gate.dtype), _down_weight(weight, scale, ctx.block_size), offs=offsets
+            grad.contiguous().to(gate_up.dtype), _down_weight(weight, scale, ctx.block_size), offs=offsets
         )
-        dgate, dup = torch.empty_like(gate), torch.empty_like(up)
-        dscores = torch.empty(scores.shape[0], dtype=torch.float32, device=gate.device)
+        d_gate_up = torch.empty_like(gate_up)
+        dscores = torch.empty(scores.shape[0], dtype=torch.float32, device=gate_up.device)
         if rows:
             limit = ctx.limit
             _scored_swiglu_bwd_kernel[(rows,)](
-                gate,
-                up,
+                gate_up,
+                gate_up[:, hidden:],
                 grad_h,
                 scores.reshape(-1).contiguous(),
-                dgate,
-                dup,
+                d_gate_up,
+                d_gate_up[:, hidden:],
                 dscores,
-                gate.shape[1],
+                hidden,
+                gate_up.stride(0),
                 grad_h.stride(0),
                 0.0 if limit is None else float(limit),
                 HAS_LIMIT=limit is not None,
                 BLOCK_D=_BLOCK_D,
             )
-        if rows < gate.shape[0]:
-            dgate[rows:].zero_()
-            dup[rows:].zero_()
+        if rows < gate_up.shape[0]:
+            d_gate_up[rows:].zero_()
             dscores[rows:].zero_()
-        return dgate, dup, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None
+        return d_gate_up, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None
 
 
 def scored_swiglu_down(
-    gate: torch.Tensor,
-    up: torch.Tensor,
+    gate_up: torch.Tensor,
     scores: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor | None,
@@ -152,13 +169,13 @@ def scored_swiglu_down(
 ) -> torch.Tensor:
     """``scores[:, None] * (swiglu(gate, up) @ W2_e.T)`` per expert for rows packed by expert, ``W2`` frozen.
 
-    ``weight`` is the ``[experts, dim, hidden]`` down-projection stack, BF16 or block FP8 with ``scale`` (decoded per
-    GEMM). ``offsets`` is the cumulative row count per expert and ``rows`` its last value; rows past it are padding
-    and come out zero. Gradients flow to ``gate``, ``up`` and ``scores``.
+    ``gate_up`` is ``[rows, 2 * hidden]``: gate in the first half of each row, up in the second. ``weight`` is the
+    ``[experts, dim, hidden]`` down-projection stack, BF16 or block FP8 with ``scale`` (decoded per GEMM).
+    ``offsets`` is the cumulative row count per expert and ``rows`` its last value; rows past it are padding and
+    come out zero. Gradients flow to ``gate_up`` (same layout) and ``scores``.
     """
-    if gate.shape != up.shape or gate.dtype != up.dtype or scores.numel() != gate.shape[0]:
+    if gate_up.ndim != 2 or gate_up.shape[1] % 2 or scores.numel() != gate_up.shape[0]:
         raise ValueError(
-            f"gate {tuple(gate.shape)} {gate.dtype}, up {tuple(up.shape)} {up.dtype} and {scores.numel()} scores "
-            "must describe the same rows"
+            f"gate_up {tuple(gate_up.shape)} must be [rows, 2 * hidden] with one score per row, got {scores.numel()}"
         )
-    return _ScoredSwiGLUDownFn.apply(gate, up, scores, weight, scale, offsets, rows, block_size, limit)
+    return _ScoredSwiGLUDownFn.apply(gate_up, scores, weight, scale, offsets, rows, block_size, limit)
