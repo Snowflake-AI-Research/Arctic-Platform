@@ -500,6 +500,11 @@ def flex_sparse_gqa_attention(
 ) -> torch.Tensor:
     if not query.is_cuda or any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise RuntimeError("Qwen3.8 QSA FlexAttention requires CUDA BF16 Q/K/V tensors")
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_attention
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_supported
+
+    if fused_sparse_gqa_supported(query, key):
+        return fused_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale)
     return _SparseGQAAttention.apply(
         query,
         key,
