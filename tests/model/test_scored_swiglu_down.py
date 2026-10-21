@@ -99,8 +99,8 @@ def test_scored_experts_match_scaling_the_outputs_and_keep_no_output_copy(fp8_bl
     out.backward(grad)
 
     assert type(out.grad_fn).__name__ == "_ScoredSwiGLUDownFnBackward"
-    # Same GEMM on the same BF16 SwiGLU output, then the same row scaling: the outputs are identical.
-    torch.testing.assert_close(out[:routed], expected[:routed], rtol=0, atol=0)
+    # The same math as scaling afterwards; gate and up come from one stacked GEMM instead of two.
+    assert _rel(out[:routed], expected[:routed]) < 1e-3
     assert _rel(x.grad[:routed], expected_dx[:routed]) < 1e-2
     assert _rel(scores.grad[:routed], expected_ds[:routed]) < 1e-2
     assert (out[routed:] == 0).all() and (scores.grad[routed:] == 0).all()
@@ -119,14 +119,15 @@ def test_scored_swiglu_down_gradients_match_autograd_reference(limit):
     offsets = torch.cumsum(counts, 0, dtype=torch.int32)
     rows = int(offsets[-1])
     weight = (torch.randn(_EXPERTS, _DIM, _HIDDEN, device="cuda") * 0.05).bfloat16()
-    gate = (torch.randn(rows, _HIDDEN, device="cuda") * 2).bfloat16().requires_grad_(True)
-    up = (torch.randn(rows, _HIDDEN, device="cuda") * 2).bfloat16().requires_grad_(True)
+    gate_up = (torch.randn(rows, 2 * _HIDDEN, device="cuda") * 2).bfloat16().requires_grad_(True)
     scores = torch.rand(rows, device="cuda").requires_grad_(True)
     grad = torch.randn(rows, _DIM, device="cuda").bfloat16()
 
-    out = scored_swiglu_down(gate, up, scores, weight, None, offsets, rows, limit=limit)
+    out = scored_swiglu_down(gate_up, scores, weight, None, offsets, rows, limit=limit)
     out.backward(grad)
+    gate_grad, up_grad = gate_up.grad[:, :_HIDDEN], gate_up.grad[:, _HIDDEN:]
 
+    gate, up = gate_up.detach()[:, :_HIDDEN], gate_up.detach()[:, _HIDDEN:]
     g64, u64, s64 = (t.detach().double().requires_grad_(True) for t in (gate, up, scores))
     g_c, u_c = (g64, u64) if limit is None else (g64.clamp(max=limit), u64.clamp(min=-limit, max=limit))
     h = torch.nn.functional.silu(g_c) * u_c
@@ -135,8 +136,8 @@ def test_scored_swiglu_down_gradients_match_autograd_reference(limit):
     (s64[:, None] * y).backward(grad.double())
 
     assert _rel(out, s64[:, None].detach() * y.detach()) < 1e-2
-    assert _rel(gate.grad, g64.grad) < 2e-2
-    assert _rel(up.grad, u64.grad) < 2e-2
+    assert _rel(gate_grad, g64.grad) < 2e-2
+    assert _rel(up_grad, u64.grad) < 2e-2
     assert _rel(scores.grad, s64.grad) < 1e-2
 
 
@@ -153,3 +154,23 @@ def test_down_projection_lora_keeps_scaling_the_outputs():
 
     assert type(out.grad_fn).__name__ == "_ApplyRoutingWeightsBackward"
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_gate_up_lora_without_down_lora_keeps_the_scored_path():
+    experts = _experts(128)
+    rank = 8
+    weight_a = torch.randn(_EXPERTS * rank, _DIM, device="cuda").bfloat16() * 0.1
+    weight_b = torch.randn(_HIDDEN, _EXPERTS * rank, device="cuda").bfloat16() * 0.1
+    experts._ap_lora_ab = {"w1": (weight_a, weight_b, rank, 0.5)}
+    counts, x, scores, grad = _inputs(0)
+
+    expected = apply_routing_weights(experts(x, counts), scores)
+    expected.backward(grad)
+    expected_dx = x.grad.clone()
+    x.grad = None
+    out = experts(x, counts, scores)
+    out.backward(grad)
+
+    assert type(out.grad_fn).__name__ == "_ScoredSwiGLUDownFnBackward"
+    assert _rel(out, expected) < 1e-3
+    assert _rel(x.grad, expected_dx) < 1e-2

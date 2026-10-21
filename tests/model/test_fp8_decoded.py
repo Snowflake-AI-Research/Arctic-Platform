@@ -92,3 +92,27 @@ def test_grouped_fp8_decoded_mm_matches_decoded_weights_and_zeroes_padding_rows(
     assert _rel(out[:routed], expected) < 1e-2
     assert _rel(x.grad[:routed], expected_dx) < 1e-2
     assert (out[routed:] == 0).all() and (x.grad[routed:] == 0).all()
+
+
+def test_grouped_fp8_decoded_mm_stacks_side_by_side():
+    torch.manual_seed(0)
+    w1, s1 = _quantized(4, 256, 768)
+    w3, s3 = _quantized(4, 384, 768)
+    counts = torch.tensor([100, 0, 37, 255], device="cuda")
+    offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+    routed = int(counts.sum())
+    x = torch.randn(routed + 9, 768, device="cuda").bfloat16().requires_grad_(True)
+    out = fp8.grouped_fp8_decoded_mm(x, (w1, w3), (s1, s3), offsets, routed, 128)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    stacked_dx = x.grad.clone()
+
+    x.grad = None
+    gate = fp8.grouped_fp8_decoded_mm(x, w1, s1, offsets, routed, 128)
+    up = fp8.grouped_fp8_decoded_mm(x, w3, s3, offsets, routed, 128)
+    (gate * grad[:, :256]).sum().add((up * grad[:, 256:]).sum()).backward()
+
+    assert out.shape == (routed + 9, 640)
+    assert _rel(out[:routed], torch.cat([gate, up], 1)[:routed]) < 1e-3
+    assert _rel(stacked_dx[:routed], x.grad[:routed]) < 1e-2
+    assert (out[routed:] == 0).all() and (stacked_dx[routed:] == 0).all()

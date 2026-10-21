@@ -310,11 +310,25 @@ def _fp8_linear_bwd_input(
     return dx
 
 
-def _decode_fp8_to_bf16(weight: Tensor, scale: Tensor, block_size: int) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM."""
+def _decode_fp8_to_bf16(
+    weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
+) -> Tensor:
+    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM.
+
+    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack.
+    """
     from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
 
-    return dequantize_fp8_blocks(weight, scale, block_size)
+    if not isinstance(weight, tuple):
+        return dequantize_fp8_blocks(weight, scale, block_size)
+    first = weight[0]
+    rows = sum(w.shape[-2] for w in weight)
+    out = torch.empty((*first.shape[:-2], rows, first.shape[-1]), dtype=torch.bfloat16, device=first.device)
+    row = 0
+    for w, sc in zip(weight, scale):
+        dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
+        row += w.shape[-2]
+    return out
 
 
 class _BlockFp8LinearFn(torch.autograd.Function):
@@ -561,11 +575,12 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
     """Grouped ``x_e @ W_e.T`` against block-FP8 experts decoded to BF16; gradients flow to ``x``.
 
     The decoded ``[E, rows, cols]`` weights exist for one GEMM and are decoded again in
-    backward. Rows of ``x`` past the last expert offset are padding and stay zero.
+    backward. Rows of ``x`` past the last expert offset are padding and stay zero. ``weight``
+    and ``scale`` may be tuples of stacks sharing ``x`` (gate and up): one GEMM each way.
     """
 
     @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int) -> Tensor:
+    def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, block_size: int) -> Tensor:
         # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
         ctx.weights = (weight, scale)
         ctx.rows = rows
@@ -589,15 +604,22 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
 
 def grouped_fp8_decoded_mm(
-    x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int
+    x: Tensor,
+    weight: Tensor | tuple[Tensor, ...],
+    scale: Tensor | tuple[Tensor, ...],
+    offsets: Tensor,
+    rows: int,
+    block_size: int,
 ) -> Tensor:
     """Grouped GEMM of tokens packed by expert against block-FP8 experts decoded to BF16 per call (W8A16).
 
     Unlike ``grouped_fp8_mm`` on Hopper, activations stay BF16 and tokens need no per-expert padding.
-    ``offsets`` is the cumulative token count per expert and ``rows`` its last value.
+    ``offsets`` is the cumulative token count per expert and ``rows`` its last value. Tuples of expert
+    stacks give their outputs side by side, ``[rows, sum of out features]``, from one GEMM.
     """
-    if offsets.numel() != weight.shape[0]:
-        raise ValueError(f"{offsets.numel()} expert offsets for {weight.shape[0]} FP8 experts")
+    experts = weight[0].shape[0] if isinstance(weight, tuple) else weight.shape[0]
+    if offsets.numel() != experts:
+        raise ValueError(f"{offsets.numel()} expert offsets for {experts} FP8 experts")
     return _GroupedDecodedFp8MmFn.apply(x, weight, scale, offsets, rows, block_size)
 
 
