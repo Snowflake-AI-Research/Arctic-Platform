@@ -65,18 +65,23 @@ def _rows(t: torch.Tensor) -> torch.Tensor:
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
+def scale_rows(hidden_states: torch.Tensor, scores: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """``hidden_states * scores[:, None]`` with FP32 math, cast to ``out_dtype``; not differentiable."""
+    if not _fused(hidden_states, scores) or hidden_states.shape[0] == 0:
+        return (hidden_states.float() * scores.float().reshape(-1, 1)).to(out_dtype)
+    x = _rows(hidden_states)
+    out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
+    _scale_rows_kernel[(x.shape[0],)](
+        x, scores.reshape(-1).contiguous(), out, x.shape[1], x.stride(0), out.stride(0), BLOCK_D=_BLOCK_D
+    )
+    return out
+
+
 class _ApplyRoutingWeights(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden_states: torch.Tensor, scores: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         ctx.save_for_backward(hidden_states, scores)
-        if not _fused(hidden_states, scores) or hidden_states.shape[0] == 0:
-            return (hidden_states.float() * scores.float().reshape(-1, 1)).to(out_dtype)
-        x = _rows(hidden_states)
-        out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
-        _scale_rows_kernel[(x.shape[0],)](
-            x, scores.reshape(-1).contiguous(), out, x.shape[1], x.stride(0), out.stride(0), BLOCK_D=_BLOCK_D
-        )
-        return out
+        return scale_rows(hidden_states, scores, out_dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
