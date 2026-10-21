@@ -301,9 +301,31 @@ def test_routing_weights_cuda_retained_memory():
     assert reserve.numel() == reserve_bytes
     assert reference_retained - retained >= 8 * hidden.numel() * 4
     assert peak < reference_peak
-    for actual, expected in zip(gradients, reference_gradients, strict=True):
-        torch_assert_equal(actual, expected)
+    torch_assert_equal(gradients[0], reference_gradients[0])
+    # The fused kernel sums each row's FP32 products in its own order.
+    torch_assert_close(gradients[1], reference_gradients[1], rtol=1e-5, atol=1e-5)
     print(
         f"CUDA_ROUTING_WEIGHTS_MEMORY reserve_gib=20 retained_saving_bytes={reference_retained - retained} "
         f"reference_peak_bytes={reference_peak} optimized_peak_bytes={peak}"
     )
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("hidden_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("out_dtype", [None, torch.float32])
+def test_routing_weights_cuda_kernel_matches_reference(hidden_dtype, out_dtype):
+    rows, width = 3000, 4096
+    hidden = torch.randn(rows, 2 * width, dtype=hidden_dtype, device="cuda")[:, ::2].requires_grad_()
+    scores = torch.rand(rows // 2, 2, device="cuda", requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_scores = scores.detach().clone().requires_grad_()
+    dtype = hidden_dtype if out_dtype is None else out_dtype
+    actual = apply_routing_weights(hidden, scores, out_dtype=out_dtype)
+    expected = (reference_hidden.float() * reference_scores.reshape(-1, 1)).to(dtype)
+    torch_assert_equal(actual, expected)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch_assert_equal(hidden.grad, reference_hidden.grad)
+    torch_assert_close(scores.grad, reference_scores.grad, rtol=1e-5, atol=1e-4)
+
