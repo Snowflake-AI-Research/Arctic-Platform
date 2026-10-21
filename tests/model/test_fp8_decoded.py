@@ -133,3 +133,16 @@ def test_mn_major_activation_quant_matches_the_per_group_kernel_and_layout(rows,
 
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert torch.equal(s, s_ref) and s.stride() == s_ref.stride()
+
+
+def test_decodes_reuse_one_workspace_per_device():
+    torch.manual_seed(0)
+    small, small_scale = _quantized(2, 256, 384)
+    large, large_scale = _quantized(2, 512, 768)
+    first = fp8._decode_fp8_to_bf16(large, large_scale, 128)
+    expected = fp8.dequantize_from_fp8_blockwise(small, small_scale, dtype=torch.float32)
+    second = fp8._decode_fp8_to_bf16(small, small_scale, 128)
+
+    # The smaller decode lands in the buffer the larger one grew; each result is right when it is used.
+    assert second.data_ptr() == first.data_ptr()
+    torch.testing.assert_close(second.float(), expected, rtol=8e-3, atol=1e-6)
