@@ -117,6 +117,10 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     }
     if spec.seed is not None:
         ds_config["seed"] = int(spec.seed)
+    if spec.sequence_parallel > 1:
+        # A DeepSpeedConfig built from this dict without the SP mpu reads this key for the dp degree;
+        # without it DeepSpeed checks ``train_batch_size`` against the full world size and asserts.
+        ds_config["sequence_parallel_size"] = spec.sequence_parallel
     if spec.zero_bucket_size is not None:
         zero_config = ds_config["zero_optimization"]
         zero_config["reduce_bucket_size"] = spec.zero_bucket_size

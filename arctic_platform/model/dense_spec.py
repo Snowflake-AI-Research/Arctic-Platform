@@ -20,6 +20,8 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 
+_LOADER_OPTION_KEYS_IN_TRAINING = ("fp32_parity", "fp32_residual")
+
 
 def dense_model_spec(
     *,
@@ -29,9 +31,23 @@ def dense_model_spec(
     sequence_parallel: int,
     liger: bool,
     training_options: dict,
+    loader_options: dict | None = None,
 ) -> ModelSpec:
-    """Translate dense training options into one Hugging Face ``ModelSpec``."""
+    """Translate dense training options into one Hugging Face ``ModelSpec``.
+
+    ``loader_options`` is forwarded whole. The Hugging Face schema validates it;
+    this function does not read its keys. Hugging Face loader fields left in
+    ``training_options`` are rejected so a misplaced key cannot change numerics
+    silently.
+    """
     import arctic_platform.model.loaders  # noqa: F401  # registers the huggingface loader
+
+    misplaced = [name for name in _LOADER_OPTION_KEYS_IN_TRAINING if name in training_options]
+    if misplaced:
+        raise ValueError(
+            "dense_model_spec takes Hugging Face loader fields only as loader_options, "
+            f"not in training_options; move {', '.join(misplaced)}"
+        )
 
     offload_config = (training_options.get("ac_config") or {}).get("offload_config") or {}
     activation_offload = None
@@ -65,4 +81,5 @@ def dense_model_spec(
             lm_head=lm_head,
             peft=training_options.get("peft_config"),
         ),
+        **({"loader_options": loader_options} if loader_options else {}),
     )

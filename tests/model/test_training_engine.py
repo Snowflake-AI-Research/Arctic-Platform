@@ -54,6 +54,7 @@ def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
     assert ds_config["train_batch_size"] == 4
     assert ds_config["zero_optimization"] == {"stage": 2}
     assert "seed" not in ds_config
+    assert "sequence_parallel_size" not in ds_config
 
 
 def test_float32_job_disables_reduced_precision_and_leaves_the_reduction_unset():
@@ -77,6 +78,7 @@ def test_sequence_parallel_shrinks_the_data_parallel_batch():
     ds_config = build_deepspeed_config(_spec(world_size=8, sequence_parallel=2))
 
     assert ds_config["train_batch_size"] == 4
+    assert ds_config["sequence_parallel_size"] == 2
 
 
 def test_sequence_parallel_must_divide_the_world():
