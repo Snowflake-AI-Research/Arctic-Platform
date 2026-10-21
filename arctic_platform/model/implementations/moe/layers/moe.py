@@ -406,8 +406,9 @@ class GroupedExperts(nn.Module):
         One routed-token count serves every projection; tokens need no per-expert padding and
         activations are not quantized.
         """
-        from arctic_platform.model.implementations.fp8 import grouped_expert_lora
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
         from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
+        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
 
         offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
         _offsets_must_cover_no_more_than_the_rows("fp8", x, num_tokens_per_expert, offsets)
@@ -419,10 +420,11 @@ class GroupedExperts(nn.Module):
             weight, scale = projections[name]
             out = grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
             if name in ab:
-                out = out + grouped_expert_lora(inputs, ab[name], offsets, rows)
+                # In place on the routed rows: the decoded GEMM saves nothing it returns.
+                out[:rows] += grouped_expert_lora_rows(inputs, ab[name], offsets, rows)
             return out
 
-        h = _apply_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
+        h = fused_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
         return project(h, "w2")
 
     def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:

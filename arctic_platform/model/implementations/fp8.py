@@ -313,13 +313,22 @@ def grouped_expert_lora(x: Tensor, ab: tuple[Tensor, Tensor, int, float], offset
     ``offsets`` is the cumulative token count per expert and ``rows`` its last value;
     only those rows are multiplied and padding rows get zeros.
     """
+    return F.pad(grouped_expert_lora_rows(x, ab, offsets, rows), (0, 0, 0, x.shape[0] - rows))
+
+
+def grouped_expert_lora_rows(x: Tensor, ab: tuple[Tensor, Tensor, int, float], offsets: Tensor, rows: int) -> Tensor:
+    """``grouped_expert_lora`` for the ``rows`` routed tokens only, ``[rows, out]``.
+
+    The LoRA scale is applied to the rank-``r`` intermediate rather than to the full-width output.
+    """
     weight_a, weight_b, rank, scaling = ab
     experts = weight_a.shape[0] // rank
     a = weight_a.to(x.dtype).view(experts, rank, weight_a.shape[1]).transpose(-2, -1)
     b = weight_b.to(x.dtype).view(weight_b.shape[0], rank, experts).permute(2, 1, 0).contiguous()
     down = torch._grouped_mm(x[:rows], a, offs=offsets)
-    out = torch._grouped_mm(down, b, offs=offsets) * scaling
-    return F.pad(out, (0, 0, 0, x.shape[0] - rows))
+    if scaling != 1.0:
+        down = down * scaling
+    return torch._grouped_mm(down, b, offs=offsets)
 
 
 def fp8_linear_with_expert_lora(
