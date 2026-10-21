@@ -277,7 +277,9 @@ def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
     w = (w * q_scales).contiguous()
     k_scales = k_scales.view(N)
 
-    mqa_logits = _deep_gemm_mqa_logits(torch.cuda.get_device_capability(device)[0]) if q.is_cuda else None
+    # DeepGEMM's MQA-logits kernel is built for 32 or 64 heads (GLM-5.2/5.3 index with 32).
+    deep_gemm_heads = q.is_cuda and H in (32, 64)
+    mqa_logits = _deep_gemm_mqa_logits(torch.cuda.get_device_capability(device)[0]) if deep_gemm_heads else None
     if mqa_logits is None:
         q_fp8 = q_fp8.view(M, H, D).permute(1, 0, 2).contiguous()
     else:
