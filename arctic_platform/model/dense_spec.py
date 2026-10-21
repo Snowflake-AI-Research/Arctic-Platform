@@ -20,7 +20,6 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 
-
 _LOADER_OPTION_KEYS_IN_TRAINING = ("fp32_parity", "fp32_residual")
 
 
