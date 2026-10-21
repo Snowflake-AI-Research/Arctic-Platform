@@ -28,7 +28,9 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -83,6 +85,7 @@ class RunContext:
     prepare_references: bool = False
     reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
     reference_record_paths: Dict[str, str] = field(default_factory=dict)
+    reference_record_provenance: Dict[str, dict] = field(default_factory=dict)
     _reference: Dict[str, dict] = field(default_factory=dict)
     _reference_by_check: Dict[str, Dict[str, dict]] = field(default_factory=dict)
     _target: Dict[str, object] = field(default_factory=dict)
@@ -204,17 +207,24 @@ def run_reference(
         # One reference per GPU lets independent runs proceed concurrently; the run itself is single-GPU
         # either way, so pinning changes only which device it lands on.
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
+    try:
+        log_dir = require_data_fast_path(out_path.parent, label="reference logs")
+    except ValueError:
+        log_dir = correctness_workdir("hf-reference-logs-")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = require_data_fast_path(log_dir / f"{out_path.stem}.stdout.log", label="reference stdout")
+    stderr_log = require_data_fast_path(log_dir / f"{out_path.stem}.stderr.log", label="reference stderr")
+    returncode_log = require_data_fast_path(log_dir / f"{out_path.stem}.returncode", label="reference return code")
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    stdout_log.write_text(proc.stdout)
+    stderr_log.write_text(proc.stderr)
+    returncode_log.write_text(f"{proc.returncode}\n")
+    print(
+        f"HF reference process: run={out_path.stem}, returncode={proc.returncode}, "
+        f"stdout={stdout_log}, stderr={stderr_log}, returncode_file={returncode_log}",
+        flush=True,
+    )
     if proc.returncode != 0:
-        try:
-            log_dir = require_data_fast_path(out_path.parent, label="reference failure logs")
-        except ValueError:
-            log_dir = correctness_workdir("hf-reference-failure-")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_log = require_data_fast_path(log_dir / f"{out_path.stem}.stdout.log", label="reference stdout")
-        stderr_log = require_data_fast_path(log_dir / f"{out_path.stem}.stderr.log", label="reference stderr")
-        stdout_log.write_text(proc.stdout)
-        stderr_log.write_text(proc.stderr)
         raise RuntimeError(
             f"reference failed ({proc.returncode}); full stdout: {stdout_log}; full stderr: {stderr_log}:\n"
             f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
@@ -369,9 +379,11 @@ def execute(
     local_cortex_fixture: bool = False,
     local_gateway_lora_save0: bool = False,
     prepare_references: bool = False,
+    peft_adapter: Path | None = None,
     reference_records_dir: Path | None = None,
     reference_calibration_runs: int = 16,
     reference_calibration_workers: int = 1,
+    historical_gradient_references: dict | None = None,
 ) -> List[TestResult]:
     """Use the config's upstream reference attention unless explicitly overridden.
 
@@ -382,6 +394,19 @@ def execute(
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
+    if historical_gradient_references is not None:
+        if (
+            select != ["single-step-grads"]
+            or prepare_references
+            or cfg.is_rl
+            or not isinstance(historical_gradient_references, dict)
+            or not historical_gradient_references
+            or set(historical_gradient_references) != {arm.name for arm in arm_defs}
+        ):
+            raise ValueError(
+                "historical gradient references require only single-step-grads and exactly the selected SFT arms"
+            )
+        historical_gradient_references = deepcopy(historical_gradient_references)
     if (
         prepare_references
         and select is not None
@@ -390,33 +415,23 @@ def execute(
         raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
     if local_gateway_lora_save0:
+        raise ValueError("deterministic LoRA SAVE0 execution is retired; use --peft-adapter on-prem")
+    shared_adapter_identity = None
+    if peft_adapter is not None:
+        from .shared_lora_adapter import adapter_identity
+
         if (
-            not isinstance(client_backend, CortexConfig)
-            or not local_cortex_fixture
-            or cortex_fixture is not None
-            or prepare_references
-            or reference_records_dir is None
-            or (
-                select is not None
-                and (not select or not set(select) <= {"single-step-grads", "single-step-optimizer"})
-            )
-            or cfg.config_id != "qwen3-8b-h200-train-sft-lora-4gpus-64k"
-            or spec.config_id != cfg.config_id
-            or cfg.model_name != "Qwen/Qwen3-8B"
-            or cfg.n_gpus != 4
-            or cfg.is_rl
+            cfg.is_rl
             or not cfg.training.get("peft_config")
-            or spec.model.source_checkpoint != cfg.model_name
-            or spec.model.num_hidden_layers != 4
-            or any(cfg.training.get(key, 1) != 1 for key in ("ep_size", "sp_size"))
+            or select is not None
+            and (not select or not set(select) <= {"single-step-grads", "single-step-optimizer"})
+            or (not prepare_references and not isinstance(client_backend, OnPremConfig))
         ):
             raise ValueError(
-                "LoRA SAVE0 requires cached-only original four-GPU dense Qwen3-8B LoRA "
-                "grads/optimizer with the reviewed four-layer local Cortex fixture"
+                "supplied PEFT adapter requires on-prem first-two SFT checks or their reference preparation"
             )
-        from .hosted import require_local_cortex_gateway
-
-        require_local_cortex_gateway(client_backend)
+        peft_adapter = require_data_fast_path(peft_adapter, label="shared PEFT adapter").resolve(strict=True)
+        shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
     tests = registered_tests()
     assert_applicable_tests_registered(spec, cfg.config_id)
     chosen = [t for t in tests.values() if select is None or t.test_id in select]
@@ -577,9 +592,10 @@ def execute(
             if cfg.gpu_type is not None:
                 payload["hardware"] = cfg.gpu_type.upper()
         if context.reference_adapter_path is not None and not local_gateway_lora_save0:
-            from .lora import bind_payload
-
-            payload = bind_payload(payload, context.reference_adapter_path)
+            payload["training_config"]["debug"]["shared_peft_adapter"] = {
+                "path": str(context.reference_adapter_path),
+                "identity": deepcopy(shared_adapter_identity),
+            }
         return payload
 
     def measure_target(session, job, arm: ArmSpec):
@@ -611,10 +627,17 @@ def execute(
 
     reference_training = cfg.effective_training
     if per_arm_tests and cfg.training.get("peft_config"):
-        with console.activity("Preparing LoRA adapter"):
-            from .lora import materialize_adapter
+        if peft_adapter is None:
+            from .shared_lora_adapter import adapter_identity
+            from .shared_lora_adapter import generate_adapter
 
-            reference_adapter_path = materialize_adapter(cfg, reference_model_path, tmp / "reference-adapter-init")
+            if not prepare_references and not isinstance(client_backend, OnPremConfig):
+                raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
+            peft_adapter = generate_adapter(
+                reference_model_path, cfg.training["peft_config"], tmp / "initial-adapter", seed=SEED
+            )
+            shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
+        reference_adapter_path = peft_adapter
     else:
         reference_adapter_path = None
     context.reference_adapter_path = reference_adapter_path
@@ -630,12 +653,8 @@ def execute(
                 save0_metadata,
             )
         else:
-            from .lora import bind_payload
-
-            bind_payload(
-                build_payload(cfg.training, target_model, SEED, weight_format=cfg.sub_job.get("weight_format")),
-                reference_adapter_path,
-            )
+            if not isinstance(client_backend, OnPremConfig):
+                raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
     if local_gateway_lora_save0 and save0_metadata is None:
         raise ValueError("LoRA SAVE0 requires a verified deterministic reference adapter")
 
@@ -650,37 +669,64 @@ def execute(
     ) -> dict:
         started = time.monotonic()
         output_name = output_name or arm.name
+        device = cuda_device if cuda_device is not None else os.environ.get("CUDA_VISIBLE_DEVICES", "default")
+        print(
+            f"HF reference start: arm={arm.name}, run={output_name}, device={device}, deterministic={deterministic}",
+            flush=True,
+        )
         optimizer_output_dir = None
         if stepping:
             optimizer_output_dir = require_data_fast_path(
                 tmp / "optimizer" / "reference" / output_name / "states", label="reference optimizer output"
             )
             optimizer_output_dir.parent.mkdir(parents=True, exist_ok=True)
-        ref = run_reference(
-            reference_model_path,
-            batch_paths[arm.name],
-            tmp / f"ref-{output_name}.json",
-            token_budget=reference_token_budget,
-            ce_chunk=ce_chunk,
-            attn=reference_attn or cfg.reference_attention_implementation,
-            fp32_lm_head=bool(reference_training.get("fp32_lm_head", False)),
-            seed=SEED,
-            fused_cross_entropy=cfg.fused_cross_entropy,
-            mixer_packing=uses_mixer_packing(reference_model_path),
-            matmul_precision=reference_training.get("matmul_precision", "highest"),
-            peft_config=reference_training.get("peft_config"),
-            peft_adapter_path=reference_adapter_path,
-            lm_head_token_chunk_size=cfg.lm_head_token_chunk_size,
-            lm_head_vocab_chunk_size=reference_training.get("fused_lm_head_vocab_chunk_size", 8192),
-            optimizer_config=optimizer_config,
-            learning_rate=OPTIMIZER_LEARNING_RATE if stepping else None,
-            gradient_clipping=cfg.training.get("gradient_clipping"),
-            optimizer_dtype=cfg.optimizer_dtype,
-            optimizer_output_dir=optimizer_output_dir,
-            cuda_device=cuda_device,
-            deterministic=deterministic,
-        )
+        try:
+            if reference_adapter_path is not None:
+                from .shared_lora_adapter import adapter_identity
+
+                if adapter_identity(reference_adapter_path) != shared_adapter_identity:
+                    raise ValueError("shared adapter changed before HF reference execution")
+            ref = run_reference(
+                reference_model_path,
+                batch_paths[arm.name],
+                tmp / f"ref-{output_name}.json",
+                token_budget=reference_token_budget,
+                ce_chunk=ce_chunk,
+                attn=reference_attn or cfg.reference_attention_implementation,
+                fp32_lm_head=bool(reference_training.get("fp32_lm_head", False)),
+                seed=SEED,
+                fused_cross_entropy=cfg.fused_cross_entropy,
+                mixer_packing=uses_mixer_packing(reference_model_path),
+                matmul_precision=reference_training.get("matmul_precision", "highest"),
+                peft_config=reference_training.get("peft_config"),
+                peft_adapter_path=reference_adapter_path,
+                lm_head_token_chunk_size=cfg.lm_head_token_chunk_size,
+                lm_head_vocab_chunk_size=reference_training.get("fused_lm_head_vocab_chunk_size", 8192),
+                optimizer_config=optimizer_config,
+                learning_rate=OPTIMIZER_LEARNING_RATE if stepping else None,
+                gradient_clipping=cfg.training.get("gradient_clipping"),
+                optimizer_dtype=cfg.optimizer_dtype,
+                optimizer_output_dir=optimizer_output_dir,
+                cuda_device=cuda_device,
+                deterministic=deterministic,
+            )
+            if (
+                reference_adapter_path is not None
+                and adapter_identity(reference_adapter_path) != shared_adapter_identity
+            ):
+                raise ValueError("shared adapter changed during HF reference execution")
+        except Exception:
+            print(
+                f"HF reference failed: arm={arm.name}, run={output_name}, device={device}, "
+                f"elapsed={time.monotonic() - started:.1f}s",
+                flush=True,
+            )
+            raise
         elapsed = time.monotonic() - started
+        print(
+            f"HF reference done: arm={arm.name}, run={output_name}, device={device}, elapsed={elapsed:.1f}s",
+            flush=True,
+        )
         context._reference[arm.name] = ref
         context._timing.setdefault(arm.name, {})["reference"] = elapsed
         return ref
@@ -696,9 +742,7 @@ def execute(
         batch = load_batch(batch_paths[arm.name])
         initialization = "external-model"
         if reference_adapter_path is not None:
-            from .lora import adapter_identity
-
-            initialization = adapter_identity(reference_adapter_path)
+            initialization = deepcopy(shared_adapter_identity)
         recipe = {
             "model": model_identity(reference_model_path),
             "initialization": initialization,
@@ -741,7 +785,16 @@ def execute(
         records = {}
         for test_id, identity in identities.items():
             try:
-                records[test_id] = load_record(context, identity)
+                if historical_gradient_references is not None:
+                    records[test_id] = load_record(
+                        context, identity, historical_binding=historical_gradient_references[arm.name]
+                    )
+                    (tmp / "reference-record-provenance.json").write_text(
+                        json.dumps(context.reference_record_provenance, indent=2, sort_keys=True, allow_nan=False)
+                        + "\n"
+                    )
+                else:
+                    records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
                 if not prepare_references or "prepared HF reference missing:" not in str(exc):
                     raise
@@ -773,17 +826,20 @@ def execute(
                 for start in range(0, reference_calibration_runs, reference_calibration_workers):
                     indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
                     with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
-                        futures = [
+                        futures = {
                             pool.submit(
                                 measure_reference,
                                 arm,
                                 output_name=f"{arm.name}-calibration-{index}",
                                 cuda_device=index % reference_calibration_workers,
                                 deterministic=False,
-                            )
+                            ): index
                             for index in indices
-                        ]
-                        manifests.extend(Path(future.result()["optimizer_state_manifest"]) for future in futures)
+                        }
+                        completed = {}
+                        for future in as_completed(futures):
+                            completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
+                        manifests.extend(completed[index] for index in indices)
                 worst = max_pairwise_optimizer_norm_delta(
                     manifests, optimizer_config=optimizer_config, learning_rate=OPTIMIZER_LEARNING_RATE
                 )

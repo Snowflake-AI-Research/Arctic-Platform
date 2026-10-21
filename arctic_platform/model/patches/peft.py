@@ -22,9 +22,6 @@ import torch
 from torch import nn
 
 from arctic_platform.common.config import validate_peft_config
-from arctic_platform.debug.lora import maybe_initialize_lora_factors
-from arctic_platform.debug.lora import maybe_prepare_lora_initialization
-from arctic_platform.debug.lora import maybe_validate_lora_parallelism
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 
@@ -156,8 +153,6 @@ def apply_peft(
     if peft_config is None:
         return model
 
-    peft_config, initialization_config = maybe_prepare_lora_initialization(model, peft_config)
-
     import peft
 
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
@@ -166,7 +161,6 @@ def apply_peft(
         cast_trainable_params_off_fp8(model, optimization_dtype)
     else:
         model = peft.get_peft_model(model, config)
-    maybe_initialize_lora_factors(model, initialization_config)
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     from arctic_platform.model.patches.tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
@@ -178,7 +172,6 @@ def apply_peft(
 @register_patch("peft")
 def apply_peft_patch(model: nn.Module, ctx: LoaderContext) -> nn.Module:
     peft_config = ctx.spec.patches.peft or {}
-    maybe_validate_lora_parallelism(peft_config, ctx.spec.parallelism)
     dtype = torch.bfloat16 if ctx.spec.dtype == "auto" else getattr(torch, ctx.spec.dtype)
     fp8_base = model_has_fp8_weights(model)
     wrapped = apply_peft(model, ctx.spec.patches.peft, optimization_dtype=dtype)

@@ -26,6 +26,7 @@ import platform
 import re
 import shlex
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
@@ -37,6 +38,10 @@ CRITERIA = {
     "single-step-optimizer": "optimizer-state-l2-norm-v1",
 }
 MAX_RECORD_BYTES = 8 * 1024 * 1024
+_REVIEWED_GRADIENT_NAMES_TRANSITION = {
+    "historical": {"sha256": "a5c941eb9592fabe042c8f48a28bfe7e650f5b65d3b8b7a6fd3824397c63ba09", "size": 9905},
+    "current": {"sha256": "4d6cd215ef4639ab2d85f5928ca2df83954012878c39366c74e29207cc92725c", "size": 10294},
+}
 
 
 class ReferencePrerequisiteError(ValueError):
@@ -130,6 +135,12 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "batches.py",
             root / "harness" / "names.py",
+            *(
+                [root / "harness" / "shared_lora_adapter.py"]
+                if isinstance(recipe.get("initialization"), dict)
+                and recipe["initialization"].get("schema") == "shared-peft-adapter-v1"
+                else []
+            ),
         ]
     }
     identity = {
@@ -229,7 +240,110 @@ def require_git_records_dir(path: Path | str) -> Path:
     return destination
 
 
-def load_record(ctx, identity: dict) -> dict:
+def _strict_record_json(raw: bytes) -> dict:
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ReferencePrerequisiteError(f"duplicate historical reference JSON key: {key}")
+            value[key] = item
+        return value
+
+    def invalid_constant(value):
+        raise ReferencePrerequisiteError(f"nonfinite historical reference JSON value: {value}")
+
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=invalid_constant)
+
+
+def _load_historical_gradient_record(ctx, current_identity: dict, binding: dict) -> dict:
+    """Reuse reviewed HF bytes without relabeling their identity or widening the gate."""
+    try:
+        if current_identity.get("check_id") != "single-step-grads":
+            raise ReferencePrerequisiteError("historical reference binding supports gradients only")
+        if not isinstance(binding, dict) or set(binding) != {"record_path", "record_sha256", "review"}:
+            raise ReferencePrerequisiteError("historical reference requires record_path, record_sha256 and review")
+        pin, review = binding["record_sha256"], binding["review"]
+        if not isinstance(pin, str) or re.fullmatch(r"[0-9a-f]{64}", pin) is None:
+            raise ReferencePrerequisiteError("historical reference requires a full lowercase raw SHA256")
+        if not isinstance(review, str) or not review.strip():
+            raise ReferencePrerequisiteError("historical reference requires explicit review provenance")
+        _json(review)
+        if not isinstance(binding["record_path"], (str, Path)) or not str(binding["record_path"]).strip():
+            raise ReferencePrerequisiteError("historical reference requires an explicit record path")
+        path = Path(binding["record_path"])
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(MAX_RECORD_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, name) != getattr(after, name) for name in fields):
+            raise ReferencePrerequisiteError("historical reference changed while reading")
+        if len(raw) > MAX_RECORD_BYTES:
+            raise ReferencePrerequisiteError("historical reference is oversized")
+        if hashlib.sha256(raw).hexdigest() != pin:
+            raise ReferencePrerequisiteError("historical reference raw SHA256 mismatch")
+        record = _strict_record_json(raw)
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"schema", "identity", "measurements", "payload_sha256"}
+            or type(record["schema"]) is not int
+            or record["schema"] != SCHEMA_VERSION
+        ):
+            raise ReferencePrerequisiteError("historical reference schema is invalid")
+        historical_identity = record["identity"]
+        if not isinstance(historical_identity, dict) or path.name != _record_path(ctx, historical_identity).name:
+            raise ReferencePrerequisiteError("historical reference filename does not bind its original identity")
+        if (
+            type(historical_identity.get("schema")) is not int
+            or historical_identity["schema"] != SCHEMA_VERSION
+            or historical_identity.get("criterion") != CRITERIA["single-step-grads"]
+        ):
+            raise ReferencePrerequisiteError("historical reference workload schema or criterion is invalid")
+        # This reviewed change affects DSS aliases only, not HF gradient measurements.
+        historical_names = historical_identity["reference_sources"]["harness/names.py"]
+        current_names = current_identity["reference_sources"]["harness/names.py"]
+        transition = _REVIEWED_GRADIENT_NAMES_TRANSITION
+        if _json(historical_names) != _json(transition["historical"]) or _json(current_names) != _json(
+            transition["current"]
+        ):
+            raise ReferencePrerequisiteError("historical reference names.py transition is not reviewed")
+        comparable = deepcopy(historical_identity)
+        comparable["reference_sources"]["harness/names.py"] = deepcopy(current_names)
+        if _json(comparable) != _json(current_identity):
+            raise ReferencePrerequisiteError("historical reference differs in another workload field")
+        if record["payload_sha256"] != _digest(record["measurements"]):
+            raise ReferencePrerequisiteError("historical reference payload SHA256 mismatch")
+        validate_measurements(historical_identity, record["measurements"])
+        names_path = Path(__file__).resolve().with_name("names.py")
+        if _json(file_identity(names_path)) != _json(current_names):
+            raise ReferencePrerequisiteError("historical reference current names.py source mismatch")
+    except ReferencePrerequisiteError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        raise ReferencePrerequisiteError(f"historical reference binding is invalid: {exc}") from exc
+    key = _digest(current_identity)
+    provenance = getattr(ctx, "reference_record_provenance", None)
+    if provenance is None:
+        provenance = {}
+        ctx.reference_record_provenance = provenance
+    provenance[key] = {
+        "historical_identity": deepcopy(historical_identity),
+        "current_identity": deepcopy(current_identity),
+        "record_path": str(path),
+        "record_sha256": pin,
+        "review": deepcopy(review),
+    }
+    paths = getattr(ctx, "reference_record_paths", None)
+    if paths is not None:
+        paths[key] = str(path)
+    print(f"Loaded explicitly reviewed historical HF reference: {path}", flush=True)
+    return record["measurements"]
+
+
+def load_record(ctx, current_identity: dict, *, historical_binding=None) -> dict:
+    if historical_binding is not None:
+        return _load_historical_gradient_record(ctx, current_identity, historical_binding)
+    identity = current_identity
     path = _record_path(ctx, identity)
     selection = ["--test-id", identity["check_id"]]
     recipe = identity.get("recipe", {})

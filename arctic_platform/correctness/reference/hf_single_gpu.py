@@ -160,7 +160,12 @@ def build_engine(
     if peft_adapter_path:
         from peft import PeftModel
 
+        from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+        from arctic_platform.correctness.harness.shared_lora_adapter import initialize_adapter
+
+        supplied_identity = adapter_identity(peft_adapter_path, peft_config)
         model = PeftModel.from_pretrained(model, peft_adapter_path, is_trainable=True)
+        initialize_adapter(model, peft_adapter_path, supplied_identity)
     elif peft_config:
         from arctic_platform.model.patches.peft import apply_peft
 

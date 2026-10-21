@@ -47,6 +47,7 @@ class RunRequest:
 
 @dataclass(frozen=True)
 class RunOptions:
+    peft_adapter: Path | None = None
     backend: str = "onprem"
     host: str | None = None
     database: str | None = None
@@ -65,6 +66,8 @@ class RunOptions:
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
     test_spec: Path | None = None
+    historical_gradient_references: Path | None = None
+    historical_gradient_references_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,13 +179,16 @@ def options_from_args(args: Namespace) -> RunOptions:
 
 def run(request: RunRequest, options: RunOptions | None = None, *, executor: Callable | None = None) -> BatchResult:
     """Run selected cases sequentially with short output and complete saved logs."""
+    from .harness.execution import _load_historical_gradient_references
     from .harness.execution import run_batch
 
     options = options or RunOptions()
     if options.test_spec is not None and (request.config is None or request.all_configs):
         raise ValueError("--test-spec requires one explicit --config")
+    args = _namespace(request, options)
+    _load_historical_gradient_references(args)
     selected = select(request)
-    return run_batch(_namespace(request, options), selected=selected, executor=executor)
+    return run_batch(args, selected=selected, executor=executor)
 
 
 def aggregate_exit_code(results: Sequence[TestResult]) -> int:

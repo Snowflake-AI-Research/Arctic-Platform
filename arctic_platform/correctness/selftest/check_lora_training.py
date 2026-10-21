@@ -18,9 +18,6 @@
 
 from __future__ import annotations
 
-import ast
-import contextlib
-import copy
 import hashlib
 import inspect
 import json
@@ -28,7 +25,6 @@ import math
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,38 +36,18 @@ from torch import nn
 from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
 
-from arctic_platform.client import CortexConfig
-from arctic_platform.client import OnPremConfig
 from arctic_platform.common.peft import normalize_lora_peft_config
-from arctic_platform.correctness.harness import cortex as cortex_fixture
-from arctic_platform.correctness.harness import cortex_optimizer as cortex_optimizer_capture
-from arctic_platform.correctness.harness import dss_driver
-from arctic_platform.correctness.harness import hosted
 from arctic_platform.correctness.harness import lora as deterministic_lora
 from arctic_platform.correctness.harness import lora as lora_init
 from arctic_platform.correctness.harness import lora as lora_save0
-from arctic_platform.correctness.harness import reference_records
-from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness import storage as workdir
-from arctic_platform.correctness.harness.config import load_config
-from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.reference import process_determinism
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
 from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
-from arctic_platform.debug import lora as lora_initialization
-from arctic_platform.debug.lora import normalize_lora_initialization
-from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patches.peft import apply_peft
-from arctic_platform.model.patches.peft import apply_peft_patch
 from arctic_platform.model.weight_export import save_peft_adapters
 from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
-
-from . import check_reference_records as reference_selftests
-from .check_reference_records import _prepared_reference_runner_STEP_CHECKS
-from .helpers import _synthetic_config_spec
-
-_prepared_reference_runner_prepared_runner = reference_selftests._prepared_reference_runner_prepared_runner
 
 
 def test_gdn_determinism_reference_reduction_pinning_does_not_mutate_fla_autotuners() -> None:
@@ -471,9 +447,6 @@ def test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values(t
         deterministic_lora.bind_payload({"training_config": cfg.training}, output)
 
 
-_lora_save0_OPTIONS = {"recipe_version": "arctic-correctness-lora-init-v1", "global_seed": 42, "dtype": "float32"}
-
-
 _lora_save0_TOPOLOGY = normalize_lora_peft_config({"peft_type": "Lora", "r": 2, "target_modules": ["q_proj"]})
 
 
@@ -506,183 +479,38 @@ def _lora_save0_metadata(model):
 
 
 def _lora_save0_saved(tmp_path):
-    model = apply_peft(_lora_save0_tiny_model(), {**_lora_save0_TOPOLOGY, "deterministic_init": _lora_save0_OPTIONS})
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    model = get_peft_model(
+        _lora_save0_tiny_model(),
+        LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=8, target_modules=["q_proj"]),
+    )
+    metadata = _lora_save0_metadata(model)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                spec = lora_init.LoraTensorSpec(lora_init.canonical_name(name), tuple(parameter.shape), "float32")
+                parameter.copy_(lora_init.generate_tensor(spec, 42))
     root = tmp_path / "checkpoint"
     destination = root / "global_step0"
     save_peft_adapters(model, str(destination))
-    metadata = _lora_save0_metadata(model)
     response = {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0, "stage_path": None}
     return (root, response, metadata, model)
 
 
-def _lora_save0_payload():
-    return {
-        "job_type": "training",
-        "model_name": "/data-fast/base-models/synthetic/Qwen3-8B-4L",
-        "seed": 42,
-        "training_config": {
-            "n_gpus": 4,
-            "sp_size": 1,
-            "ep_size": 1,
-            "ds_config": {"zero_optimization": {"stage": 2}},
-            "peft_config": deepcopy(_lora_save0_TOPOLOGY),
-        },
-    }
-
-
 def test_lora_save0_absent_option_preserves_normalized_topology_and_default_peft_behavior():
     assert "deterministic_init" not in normalize_lora_peft_config(_lora_save0_TOPOLOGY)
+    config = {"peft_type": "Lora", "r": 2, "target_modules": ["q_proj"]}
     set_seed(17)
-    baseline = apply_peft(_lora_save0_tiny_model(), _lora_save0_TOPOLOGY)
+    baseline = apply_peft(_lora_save0_tiny_model(), config)
     set_seed(17)
-    repeated = apply_peft(_lora_save0_tiny_model(), _lora_save0_TOPOLOGY)
+    repeated = apply_peft(_lora_save0_tiny_model(), config)
     for (name, actual), (other_name, expected) in zip(
         baseline.named_parameters(), repeated.named_parameters(), strict=True
     ):
         assert name == other_name
         torch_assert_equal(actual, expected)
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        None,
-        {},
-        {**_lora_save0_OPTIONS, "unexpected": True},
-        {**_lora_save0_OPTIONS, "recipe_version": "unknown"},
-        {**_lora_save0_OPTIONS, "global_seed": True},
-        {**_lora_save0_OPTIONS, "global_seed": -1},
-        {**_lora_save0_OPTIONS, "global_seed": 2**63},
-        {**_lora_save0_OPTIONS, "dtype": []},
-        {**_lora_save0_OPTIONS, "dtype": "float64"},
-    ],
-)
-def test_lora_save0_opt_in_schema_rejects_unsupported_values(options):
-    with pytest.raises(ValueError):
-        normalize_lora_initialization(options)
-
-
-def test_lora_save0_normalizer_preserves_validated_option_without_mutating_input():
-    original = {**_lora_save0_TOPOLOGY, "deterministic_init": deepcopy(_lora_save0_OPTIONS)}
-    expected = deepcopy(original)
-    normalized = normalize_lora_peft_config(original)
-    assert original == expected == normalized
-    assert normalized["deterministic_init"] is not original["deterministic_init"]
-    with pytest.raises(ValueError, match="dense"):
-        normalize_lora_peft_config({**original, "target_parameters": ["w1"]})
-
-
-def test_lora_save0_real_peft_constructor_strips_option_and_matches_independent_reference_before_optimizer():
-    model = apply_peft(_lora_save0_tiny_model(), {**_lora_save0_TOPOLOGY, "deterministic_init": _lora_save0_OPTIONS})
-    assert "deterministic_init" not in model.peft_config["default"].to_dict()
-    metadata = _lora_save0_metadata(model)
-    tensors = {name: value for name, value in model.named_parameters() if value.requires_grad}
-    lora_init.verify_tensors(tensors, metadata["initialization"])
-    optimizer = torch.optim.AdamW(tensors.values(), lr=0.01)
-    assert not optimizer.state
-    lora_init.verify_tensors(tensors, metadata["initialization"])
-
-
-def test_lora_save0_public_sdk_and_ap_loader_forward_initialization_option():
-    from arctic_platform.model.dense_spec import dense_model_spec
-
-    model = _lora_save0_tiny_model()
-    expected = _lora_save0_metadata(
-        apply_peft(_lora_save0_tiny_model(), {**_lora_save0_TOPOLOGY, "deterministic_init": _lora_save0_OPTIONS})
-    )
-    payload = lora_save0.bind_initialization(_lora_save0_payload(), expected)
-    session = dss_driver.GatewaySession(
-        workdir=Path("/data-fast/tmp/not-used-sdk-control"),
-        slots=4,
-        backend=CortexConfig(base_url="http://127.0.0.1:8003", database="dev", schema="dev"),
-    )
-    config = dss_driver._training_client_config(session, payload)
-    sub_jobs = config.to_cortex()
-    assert len(sub_jobs) == 1 and sub_jobs[0]["job_type"] == "training"
-    public_config = sub_jobs[0]["training_config"]
-    assert public_config["peft_config"]["deterministic_init"] == _lora_save0_OPTIONS
-    spec = dense_model_spec(
-        model_path=payload["model_name"],
-        dtype="float32",
-        attn_implementation="eager",
-        sequence_parallel=1,
-        liger=False,
-        training_options=public_config,
-    )
-    assert spec.patches.peft["deterministic_init"] == _lora_save0_OPTIONS
-    actual = apply_peft_patch(model, LoaderContext(spec=spec))
-    lora_init.verify_tensors(
-        [(name, parameter) for name, parameter in actual.named_parameters() if parameter.requires_grad],
-        expected["initialization"],
-    )
-
-
-def test_lora_save0_initializer_preserves_parameter_objects_and_rng_and_ignores_traversal_order():
-    model = apply_peft(_lora_save0_tiny_model(), _lora_save0_TOPOLOGY)
-    parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
-    state = torch.random.get_rng_state().clone()
-    lora_initialization.initialize_lora_factors(model, _lora_save0_OPTIONS)
-    torch_assert_equal(state, torch.random.get_rng_state())
-    expected = {name: parameter.detach().clone() for name, parameter in parameters.items()}
-    proxy = SimpleNamespace(named_parameters=lambda **kwargs: reversed(list(parameters.items())))
-    lora_initialization.initialize_lora_factors(proxy, _lora_save0_OPTIONS)
-    for name, parameter in model.named_parameters():
-        if name in parameters:
-            assert parameter is parameters[name]
-            torch_assert_equal(parameter, expected[name])
-    tree = ast.parse(Path(lora_initialization.__file__).read_text())
-    assert not any(
-        (isinstance(node, ast.ImportFrom) and "correctness" in (node.module or "") for node in ast.walk(tree))
-    )
-
-
-@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-def test_lora_save0_private_initializer_matches_exact_reference_generation_dtype_and_cast(dtype):
-    model = apply_peft(_lora_save0_tiny_model(), _lora_save0_TOPOLOGY)
-    model.to(dtype=getattr(torch, dtype))
-    lora_initialization.initialize_lora_factors(model, {**_lora_save0_OPTIONS, "dtype": dtype})
-    parameters = [(name, value) for name, value in model.named_parameters() if value.requires_grad]
-    manifest = lora_init.build_manifest(
-        [
-            lora_init.LoraTensorSpec(lora_init.canonical_name(name), tuple(value.shape), dtype)
-            for name, value in parameters
-        ],
-        42,
-    )
-    lora_init.verify_tensors(parameters, manifest)
-
-
-@pytest.mark.parametrize("ep,sp", [(2, 1), (1, 2)])
-def test_lora_save0_patcher_rejects_unreviewed_parallelism_before_wrapping(ep, sp):
-    ctx = SimpleNamespace(
-        spec=SimpleNamespace(
-            patches=SimpleNamespace(peft={**_lora_save0_TOPOLOGY, "deterministic_init": _lora_save0_OPTIONS}),
-            parallelism=SimpleNamespace(expert_parallel=ep, sequence_parallel=sp),
-        )
-    )
-    with pytest.raises(ValueError, match="EP1/SP1"):
-        apply_peft_patch(_lora_save0_tiny_model(), ctx)
-
-
-@pytest.mark.parametrize("failure", ["dtype", "sharded", "missing", "alias", "tied"])
-def test_lora_save0_initializer_rejects_unsupported_storage_before_any_parameter_is_changed(failure):
-    model = apply_peft(_lora_save0_tiny_model(), _lora_save0_TOPOLOGY)
-    parameters = [(name, value) for name, value in model.named_parameters() if value.requires_grad]
-    original = [parameter.detach().clone() for _, parameter in parameters]
-    options = {**_lora_save0_OPTIONS, "dtype": "bfloat16"} if failure == "dtype" else _lora_save0_OPTIONS
-    if failure == "sharded":
-        parameters[0][1].ds_id = 0
-    if failure == "missing":
-        parameters = parameters[:1]
-    if failure == "alias":
-        parameters.append((parameters[0][0], parameters[0][1]))
-    if failure == "tied":
-        parameters.append((parameters[0][0].replace(".q_proj.", ".k_proj."), parameters[0][1]))
-    proxy = SimpleNamespace(named_parameters=lambda **kwargs: parameters)
-    with pytest.raises(ValueError):
-        lora_initialization.initialize_lora_factors(proxy, options)
-    for (_, parameter), before in zip(parameters, original):
-        torch_assert_equal(parameter, before)
 
 
 def test_lora_save0_real_peft_save_pack_proves_complete_exact_initialization(tmp_path):
@@ -691,10 +519,6 @@ def test_lora_save0_real_peft_save_pack_proves_complete_exact_initialization(tmp
     assert proof["identity_sha256"] == metadata["initialization"]["identity_sha256"]
     assert len(proof["verified_tensors"]) == len(metadata["initialization"]["tensors"])
     assert proof["proof_scope"] == "exported-adapter-pack-not-all-rank-equality"
-    payload = _lora_save0_payload()
-    bound = lora_save0.bind_initialization(payload, metadata)
-    assert "deterministic_init" not in payload["training_config"]["peft_config"]
-    assert bound["training_config"]["peft_config"]["deterministic_init"] == _lora_save0_OPTIONS
 
 
 @pytest.mark.parametrize(
@@ -746,72 +570,6 @@ def test_lora_save0_save0_rejects_changed_coverage_identity_and_files(tmp_path, 
         save_file(tensors, str(path))
     with pytest.raises(ValueError):
         lora_save0.verify_saved_initialization(root, response, metadata)
-
-
-@pytest.mark.parametrize("failure", ["width", "ep", "sp", "zero3", "model", "topology"])
-def test_lora_save0_binding_rejects_unreviewed_target_scope(tmp_path, failure):
-    _, _, metadata, _ = _lora_save0_saved(tmp_path)
-    payload = _lora_save0_payload()
-    training = payload["training_config"]
-    if failure == "width":
-        training["n_gpus"] = 8
-    elif failure in {"ep", "sp"}:
-        training[f"{failure}_size"] = 8
-    elif failure == "zero3":
-        training["ds_config"]["zero_optimization"]["stage"] = 3
-    elif failure == "model":
-        metadata["model_name"] = "another-model"
-    elif failure == "topology":
-        training["peft_config"]["r"] = 99
-    with pytest.raises(ValueError):
-        lora_save0.bind_initialization(payload, metadata)
-
-
-@pytest.mark.parametrize("failure", [None, "save", "identity"])
-def test_lora_save0_client_is_not_exposed_before_proof_and_owned_shutdown_always_occurs(
-    tmp_path, monkeypatch, failure
-):
-    root, response, metadata, _ = _lora_save0_saved(tmp_path)
-    events = []
-    job = SimpleNamespace(client=object())
-
-    @contextlib.contextmanager
-    def running(session, payload):
-        events.append("initialized")
-        try:
-            yield job
-        finally:
-            events.append("closed")
-
-    def save(client, kind):
-        assert client is job.client and kind == "weights-only"
-        events.append("save0")
-        if failure == "save":
-            raise RuntimeError("actual save failure")
-        if failure == "identity":
-            return (root, {**response, "version": 1})
-        return (root, response)
-
-    monkeypatch.setattr(dss_driver, "running_job", running)
-    monkeypatch.setattr(hosted, "_save_local_checkpoint", save)
-    monkeypatch.setattr(hosted, "require_local_cortex_gateway", lambda backend: None)
-    proof_path = tmp_path / "proof.json"
-    if failure is not None:
-        error = RuntimeError if failure == "save" else ValueError
-        with pytest.raises(error):
-            with lora_save0.verified_running_job(
-                SimpleNamespace(backend=object()), _lora_save0_payload(), metadata, proof_path=proof_path
-            ):
-                pytest.fail("client exposed after failed proof")
-        assert events == ["initialized", "save0", "closed"] and (not proof_path.exists())
-    else:
-        with lora_save0.verified_running_job(
-            SimpleNamespace(backend=object()), _lora_save0_payload(), metadata, proof_path=proof_path
-        ) as (exposed, proof):
-            assert events == ["initialized", "save0"]
-            assert exposed is job and proof_path.is_file()
-            events.append("first-forward")
-        assert events == ["initialized", "save0", "first-forward", "closed"]
 
 
 class _qwen4_reference_TinyQwen4(nn.Module):
@@ -956,360 +714,3 @@ def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_
     else:
         assert calls[0] == {"dtype": torch.bfloat16, "attn_implementation": "qsa_flex"}
         assert model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
-
-
-@pytest.fixture
-def _runner_lora_save0_save0_runner(_prepared_reference_runner_prepared_runner, tmp_path, monkeypatch):
-    control = _prepared_reference_runner_prepared_runner
-    lora_cfg = load_config(_synthetic_config_spec(tmp_path / "lora-inputs", lora=True)[0])
-    control.cfg.__dict__.update(lora_cfg.__dict__)
-    control.spec.config_id = control.cfg.config_id
-    control.spec.model.source_checkpoint = control.cfg.model_name
-    control.spec.model.num_hidden_layers = 4
-    control.backend = CortexConfig(base_url="http://127.0.0.1:8003", database="dev", schema="dev", host=None, pat=None)
-    control.payloads = []
-    control.proofs = []
-    control.failure = None
-    control.adapter_path = tmp_path / "adapter"
-    control.metadata = {
-        "model_name": control.cfg.model_name,
-        "peft_config": normalize_lora_peft_config(control.cfg.training["peft_config"]),
-    }
-
-    def set_manifest(pairs):
-        rank = control.metadata["peft_config"]["r"]
-        specs = []
-        for index in range(pairs):
-            prefix = f"base_model.model.model.layers.{index}.self_attn.q_proj"
-            specs.extend(
-                [
-                    lora_init.LoraTensorSpec(f"{prefix}.lora_A.weight", (rank, 3 + index), "float32"),
-                    lora_init.LoraTensorSpec(f"{prefix}.lora_B.weight", (5 + index, rank), "float32"),
-                ]
-            )
-        control.metadata["initialization"] = lora_init.build_manifest(specs, runner.SEED)
-
-    set_manifest(1)
-    control.set_manifest = set_manifest
-
-    def materialize(cfg, model, workdir):
-        assert cfg.config_id == control.cfg.config_id
-        assert model == control.spec.model.cache_path
-        assert workdir == tmp_path / "run" / "reference-adapter-init"
-        return control.adapter_path
-
-    def identity(path):
-        assert path == control.adapter_path
-        return copy.deepcopy(control.metadata)
-
-    def fixture(backend, spec):
-        assert backend is control.backend and spec is control.spec
-        return {"model_name": control.spec.model.cache_path}
-
-    @contextmanager
-    def gateway(workdir, gpus, *, backend):
-        assert workdir == tmp_path / "run"
-        assert gpus == 4 and backend is control.backend
-        control.events.append(("gateway-enter",))
-        try:
-            yield SimpleNamespace(backend=backend)
-        finally:
-            control.events.append(("gateway-exit",))
-
-    @contextmanager
-    def running_job(session, payload):
-        assert session.backend is control.backend
-        assert payload["model_name"] == control.spec.model.cache_path
-        assert payload["training_config"]["peft_config"]["deterministic_init"] == {
-            "recipe_version": control.metadata["initialization"]["recipe_version"],
-            "global_seed": runner.SEED,
-            "dtype": "float32",
-        }
-        control.payloads.append(copy.deepcopy(payload))
-        control.events.append(("initialized",))
-        try:
-            yield SimpleNamespace(client=object())
-        finally:
-            control.events.append(("closed",))
-
-    root = tmp_path / "saved"
-    response = {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0, "stage_path": None}
-
-    def save(client, kind):
-        assert client is not None and kind == "weights-only"
-        control.events.append(("save0",))
-        if control.failure == "save":
-            raise RuntimeError("public SAVE0 failed")
-        return (root, response)
-
-    def verify(saved_root, saved_response, metadata):
-        assert saved_root == root and saved_response == response
-        assert metadata == control.metadata
-        control.events.append(("proof",))
-        if control.failure == "proof":
-            raise ValueError("saved tensor identity differs")
-        proof = {
-            "identity_sha256": metadata["initialization"]["identity_sha256"],
-            "verified_tensors": [
-                {key: entry[key] for key in ("name", "dtype", "sha256")}
-                for entry in metadata["initialization"]["tensors"]
-            ],
-            **response,
-            "proof_scope": "exported-adapter-pack-not-all-rank-equality",
-        }
-        control.proofs.append(copy.deepcopy(proof))
-        return proof
-
-    def target(session, job, body, *, learning_rate, **kwargs):
-        assert session.backend is control.backend and job.client is not None
-        rows = body["batch"]["input_ids"].shape[0]
-        arm = next((arm for arm in control.arms if arm.global_batch_size == rows))
-        proof_path = tmp_path / "run" / "lora-save0" / f"{arm.name}.json"
-        assert json.loads(proof_path.read_text()) == control.proofs[-1]
-        assert control.events[-1] == ("proof",)
-        if kwargs:
-            assert learning_rate == runner.OPTIMIZER_LEARNING_RATE
-            assert kwargs["local_checkpoint"] is True
-            assert kwargs["expected_dp_world_size"] == 4
-            assert kwargs["output_dir"] == tmp_path / "run" / "optimizer" / "dss" / arm.name
-        else:
-            assert learning_rate == 0.0
-        control.events.append(("target", arm.name))
-        return SimpleNamespace(
-            optimizer_state_manifest=str(control.target_manifest),
-            avg_loss=2.0,
-            grad_norms={"module.layer.weight": 1.0},
-            model_calls=None,
-        )
-
-    def execute(*, selected=_prepared_reference_runner_STEP_CHECKS, selected_arms=None, **overrides):
-        options = {
-            "vocab_size": 128,
-            "select": selected,
-            "workdir": tmp_path / "run",
-            "reference_records_dir": tmp_path / "records",
-            "client_backend": control.backend,
-            "local_cortex_fixture": True,
-            "local_gateway_lora_save0": True,
-        }
-        options.update(overrides)
-        return runner.execute(
-            control.cfg, control.spec, control.arms if selected_arms is None else selected_arms, **options
-        )
-
-    monkeypatch.setattr(deterministic_lora, "materialize_adapter", materialize)
-    monkeypatch.setattr(deterministic_lora, "adapter_identity", identity)
-    monkeypatch.setattr(cortex_fixture, "load_local_fixture", fixture)
-    monkeypatch.setattr(runner, "gateway", gateway)
-    monkeypatch.setattr(dss_driver, "running_job", running_job)
-    monkeypatch.setattr(hosted, "_save_local_checkpoint", save)
-    monkeypatch.setattr(lora_save0, "verify_saved_initialization", verify)
-    monkeypatch.setattr(runner, "running_job", lambda *a, **k: pytest.fail("must enter verified SAVE0 wrapper"))
-    monkeypatch.setattr(runner, "fwd_bwd_step", target)
-    monkeypatch.setattr(cortex_optimizer_capture, "capture_optimizer_step", target)
-    control.execute = execute
-    return control
-
-
-@pytest.mark.parametrize("order", ["batched", "arm"])
-@pytest.mark.parametrize(
-    "selected",
-    [
-        _prepared_reference_runner_STEP_CHECKS[:1],
-        _prepared_reference_runner_STEP_CHECKS[1:],
-        _prepared_reference_runner_STEP_CHECKS,
-    ],
-)
-@pytest.mark.parametrize("pairs", [1, 2])
-def test_runner_lora_save0_cached_records_then_save0_proof_before_each_measurement(
-    _runner_lora_save0_save0_runner, order, selected, pairs, tmp_path
-):
-    control = _runner_lora_save0_save0_runner
-    control.set_manifest(pairs)
-    before = copy.deepcopy((control.cfg.sub_job, control.metadata, control.record))
-    results = control.execute(order=order, selected=selected)
-    assert [(result.test_id, result.arm, result.outcome, result.gpus) for result in results] == [
-        (check, arm.name, Outcome.PASS, 4) for arm in control.arms for check in selected
-    ]
-    records = [("record", check, arm.name) for arm in control.arms for check in selected]
-    assert control.events[: len(records)] == records
-    assert [event for event in control.events if event[0] not in {"record", "gateway-enter", "gateway-exit"}] == [
-        event
-        for arm in control.arms
-        for event in [("initialized",), ("save0",), ("proof",), ("target", arm.name), ("closed",)]
-    ]
-    assert (
-        control.events.count(("gateway-enter",))
-        == control.events.count(("gateway-exit",))
-        == (1 if order == "batched" else 2)
-    )
-    assert (control.cfg.sub_job, control.metadata, control.record) == before
-    assert not control.published
-    assert len(control.payloads) == len(control.arms)
-    for _, _, recipe in control.recipes:
-        assert recipe["initialization"] == control.metadata
-        assert "deterministic_init" not in recipe["training"]["peft_config"]
-    for arm in control.arms:
-        proof = json.loads((tmp_path / "run" / "lora-save0" / f"{arm.name}.json").read_text())
-        assert proof["identity_sha256"] == control.metadata["initialization"]["identity_sha256"]
-        assert len(proof["verified_tensors"]) == len(control.metadata["initialization"]["tensors"]) == 2 * pairs
-    for result in results:
-        if result.test_id == "single-step-optimizer":
-            assert result.metrics["optimizer_values_compared"] == 3
-            assert result.metrics["stated_criterion_abs"] == 0.001
-
-
-def test_runner_lora_save0_default_lora_cortex_rejection_is_unchanged(_runner_lora_save0_save0_runner):
-    control = _runner_lora_save0_save0_runner
-    results = control.execute(local_gateway_lora_save0=False)
-    assert len(results) == 2
-    assert all((result.outcome is Outcome.FAIL for result in results))
-    assert all(("product-initialized LoRA adapter" in result.reason for result in results))
-    assert not control.events and (not control.payloads) and (not control.published)
-
-
-def test_runner_lora_save0_opt_in_does_not_bypass_fixture_capability_rejection(
-    _runner_lora_save0_save0_runner, monkeypatch
-):
-    control = _runner_lora_save0_save0_runner
-    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *a: None)
-    results = control.execute()
-    assert len(results) == 2
-    assert all((result.outcome is Outcome.FAIL and "published" in result.reason for result in results))
-    assert not control.events and (not control.payloads) and (not control.published)
-
-
-@pytest.mark.parametrize("order", ["batched", "arm"])
-def test_runner_lora_save0_missing_cached_record_stops_before_allocation_or_save0(
-    _runner_lora_save0_save0_runner, order
-):
-    control = _runner_lora_save0_save0_runner
-    control.missing.add(("single-step-optimizer", "gas4"))
-    with pytest.raises(reference_records.ReferencePrerequisiteError, match="single-step-optimizer/gas4"):
-        control.execute(order=order)
-    assert control.events == [
-        ("record", check, arm.name) for arm in control.arms for check in _prepared_reference_runner_STEP_CHECKS
-    ]
-    assert not control.payloads and (not control.proofs) and (not control.published)
-
-
-@pytest.mark.parametrize("failure", ["save", "proof"])
-def test_runner_lora_save0_save0_failure_closes_each_job_and_never_measures_or_passes(
-    _runner_lora_save0_save0_runner, failure, tmp_path
-):
-    control = _runner_lora_save0_save0_runner
-    control.failure = failure
-    results = control.execute()
-    assert len(results) == 4
-    assert all((result.outcome is Outcome.FAIL and "execution error:" in result.summary for result in results))
-    assert control.events.count(("initialized",)) == control.events.count(("closed",)) == 2
-    assert not any((event[0] == "target" for event in control.events))
-    assert not control.proofs and (not control.published)
-    assert not (tmp_path / "run" / "lora-save0").exists()
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "width",
-        "config",
-        "spec",
-        "model",
-        "source",
-        "layers",
-        "sp",
-        "ep",
-        "rl",
-        "peft",
-        "onprem",
-        "remote",
-        "auth",
-        "prepare",
-        "records",
-        "empty",
-        "unknown-check",
-        "publication",
-        "fixture",
-    ],
-)
-def test_runner_lora_save0_opt_in_refuses_outside_reviewed_scope_before_any_work(
-    _runner_lora_save0_save0_runner, failure
-):
-    control = _runner_lora_save0_save0_runner
-    overrides = {}
-    if failure == "width":
-        control.cfg.native = control.cfg.native.model_copy(update={"training_gpus": 8})
-        control.cfg.training["n_gpus"] = 8
-    elif failure == "config":
-        control.cfg.config_id = "another-config"
-    elif failure == "spec":
-        control.spec.config_id = "another-config"
-    elif failure == "model":
-        control.cfg.sub_job["model_name"] = "another-model"
-    elif failure == "source":
-        control.spec.model.source_checkpoint = "another-model"
-    elif failure == "layers":
-        control.spec.model.num_hidden_layers = 32
-    elif failure in {"sp", "ep"}:
-        control.cfg.training[f"{failure}_size"] = 2
-    elif failure == "rl":
-        control.cfg.native = control.cfg.native.model_copy(update={"sampling_gpus": 4})
-    elif failure == "peft":
-        control.cfg.training.pop("peft_config")
-    elif failure == "onprem":
-        overrides["client_backend"] = OnPremConfig()
-    elif failure in {"remote", "auth"}:
-        overrides["client_backend"] = CortexConfig(
-            base_url="https://remote.invalid" if failure == "remote" else "http://127.0.0.1:8003",
-            database="dev",
-            schema="dev",
-            host=None,
-            pat="not-a-real-token" if failure == "auth" else None,
-        )
-    elif failure == "prepare":
-        overrides["prepare_references"] = True
-    elif failure == "records":
-        overrides["reference_records_dir"] = None
-    elif failure in {"empty", "unknown-check"}:
-        overrides["selected"] = {"empty": [], "unknown-check": ["unknown-check"]}[failure]
-    elif failure == "publication":
-        overrides["cortex_fixture"] = Path("unread-publication.json")
-    elif failure == "fixture":
-        overrides["local_cortex_fixture"] = False
-    with pytest.raises(ValueError):
-        control.execute(**overrides)
-    assert not control.events and (not control.payloads) and (not control.published)
-
-
-def test_runner_lora_save0_default_selection_runs_both_checks(_runner_lora_save0_save0_runner):
-    control = _runner_lora_save0_save0_runner
-    results = control.execute(selected=None)
-    assert [(result.test_id, result.arm, result.outcome) for result in results] == [
-        (check, arm.name, Outcome.PASS) for arm in control.arms for check in _prepared_reference_runner_STEP_CHECKS
-    ]
-
-
-@pytest.mark.parametrize("failure", ["missing-adapter", "topology", "zero3", "sp-alias", "ep-alias"])
-def test_runner_lora_save0_metadata_or_binding_failure_stops_before_records_and_gateway(
-    _runner_lora_save0_save0_runner, monkeypatch, failure
-):
-    control = _runner_lora_save0_save0_runner
-    if failure == "missing-adapter":
-        monkeypatch.setattr(deterministic_lora, "materialize_adapter", lambda *a: None)
-    elif failure == "topology":
-        control.metadata["peft_config"]["r"] += 1
-    elif failure == "zero3":
-        control.cfg.training["ds_config"]["zero_optimization"]["stage"] = 3
-    else:
-        key = "sequence_parallel_size" if failure == "sp-alias" else "expert_parallel_size"
-        control.cfg.training[key] = 2
-    with pytest.raises(ValueError):
-        control.execute()
-    assert not control.events and (not control.payloads) and (not control.published)
-
-
-def test_runner_lora_save0_default_onprem_binding_still_fails_closed(_runner_lora_save0_save0_runner):
-    control = _runner_lora_save0_save0_runner
-    with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError, match="no supported public"):
-        control.execute(client_backend=OnPremConfig(), local_cortex_fixture=False, local_gateway_lora_save0=False)
-    assert not control.events and (not control.payloads) and (not control.published)

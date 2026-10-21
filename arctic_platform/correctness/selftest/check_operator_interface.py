@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import inspect
 import io
 import json
@@ -77,6 +78,484 @@ def _external_operator_catalog(tmp_path, monkeypatch):
 
     monkeypatch.setattr(api, "catalog", catalog)
     monkeypatch.setattr(cli, "SPEC_DIR", root / "specs")
+
+
+@pytest.fixture
+def _historical_gradient_cli(tmp_path):
+    path = tmp_path / "receipts" / "bindings.json"
+    path.parent.mkdir()
+    value = {
+        "schema": "reviewed-gradient-references-v1",
+        "records": {
+            arm: {
+                "record_path": f"records/{arm}.json" if arm == "gas1" else str(tmp_path / "absolute-record.json"),
+                "record_sha256": hashlib.sha256(arm.encode()).hexdigest(),
+                "review": f"Reviewed historical {arm} gradient names only",
+            }
+            for arm in ("gas1", "gas4")
+        },
+    }
+    path.write_text(json.dumps(value))
+    config = tmp_path / "external.config"
+    config.write_text(
+        json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"}))
+    )
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(config),
+            "--test",
+            "single-step-grads",
+            "--backend",
+            "cortex",
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--out",
+            str(tmp_path / "out"),
+            "--historical-gradient-references",
+            str(path),
+            "--historical-gradient-references-sha256",
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        ]
+    )
+    return args, value
+
+
+def test_historical_gradient_cli_api_preserve_original_pinned_pair(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    request, options = api.parse_run_args(
+        [
+            "--config",
+            str(args.config),
+            "--test",
+            "single-step-grads",
+            "--historical-gradient-references",
+            str(args.historical_gradient_references),
+            "--historical-gradient-references-sha256",
+            args.historical_gradient_references_sha256,
+        ]
+    )
+    assert options.historical_gradient_references == args.historical_gradient_references
+    assert isinstance(options.historical_gradient_references, Path)
+    assert options.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+    namespace = api._namespace(request, options)
+    assert namespace.historical_gradient_references == args.historical_gradient_references
+    assert namespace.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+    expected_selection = object()
+    result = object()
+    monkeypatch.setattr(
+        api, "select", lambda actual: expected_selection if actual == request else pytest.fail("request changed")
+    )
+
+    def capture(actual, *, selected, executor):
+        assert actual.historical_gradient_references == args.historical_gradient_references
+        assert actual.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+        assert selected is expected_selection and executor is None
+        return result
+
+    monkeypatch.setattr(execution, "run_batch", capture)
+    assert api.run(request, options) is result
+
+
+def test_historical_gradient_absent_pair_keeps_default():
+    assert execution._load_historical_gradient_references(Namespace()) is None
+    assert api.RunOptions().historical_gradient_references is None
+    assert api.RunOptions().historical_gradient_references_sha256 is None
+    assert api.RunOptions().backend == "onprem"
+
+
+@pytest.mark.parametrize("missing", ["historical_gradient_references", "historical_gradient_references_sha256"])
+def test_historical_gradient_pair_rejected_before_setup(_historical_gradient_cli, monkeypatch, missing):
+    args, _ = _historical_gradient_cli
+    setattr(args, missing, None)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: pytest.fail("invalid pair reached configs"))
+    monkeypatch.setattr(execution, "correctness_workdir", lambda *a: pytest.fail("invalid pair allocated workdir"))
+    with pytest.raises(ValueError, match="required together"):
+        execution._run_configs(args)
+
+
+@pytest.mark.parametrize("digest", ["0" * 64, "0" * 63, "A" * 64, "g" * 64, 123])
+def test_historical_gradient_pin_checked_before_json(_historical_gradient_cli, monkeypatch, digest):
+    args, _ = _historical_gradient_cli
+    args.historical_gradient_references.write_bytes(b"not JSON")
+    args.historical_gradient_references_sha256 = digest
+    monkeypatch.setattr(execution.json, "loads", lambda *a, **kw: pytest.fail("bad pin reached JSON parsing"))
+    with pytest.raises(ValueError, match="SHA256"):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"schema":"first","schema":"second","records":{}}',
+        b'{"schema":"reviewed-gradient-references-v1","records":{"gas1":{},"gas1":{}}}',
+        b'{"schema":"reviewed-gradient-references-v1","records":{"gas1":{"review":"first","review":"second"}}}',
+    ],
+)
+def test_historical_gradient_duplicate_keys_rejected(_historical_gradient_cli, raw):
+    args, _ = _historical_gradient_cli
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="duplicate"):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_historical_gradient_nonfinite_metadata_rejected(_historical_gradient_cli, number):
+    args, _ = _historical_gradient_cli
+    raw = ('{"schema":"reviewed-gradient-references-v1","records":{"gas1":{"review":' + number + "}}}").encode()
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError):
+        execution._load_historical_gradient_references(args)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "root-list",
+        "root-null",
+        "schema",
+        "extra-root",
+        "missing-records",
+        "empty-records",
+        "records-list",
+        "empty-arm",
+        "binding-list",
+        "extra-binding",
+        "missing-review",
+        "path-type",
+        "empty-path",
+        "record-pin",
+        "review-type",
+        "blank-review",
+    ],
+)
+def test_historical_gradient_descriptor_schema_is_strict(_historical_gradient_cli, corruption):
+    args, value = _historical_gradient_cli
+    binding = value["records"]["gas1"]
+    if corruption == "root-list":
+        value = []
+    elif corruption == "root-null":
+        value = None
+    elif corruption == "schema":
+        value["schema"] = "unreviewed"
+    elif corruption == "extra-root":
+        value["ignored"] = True
+    elif corruption == "missing-records":
+        del value["records"]
+    elif corruption == "empty-records":
+        value["records"] = {}
+    elif corruption == "records-list":
+        value["records"] = []
+    elif corruption == "empty-arm":
+        value["records"][""] = value["records"].pop("gas1")
+    elif corruption == "binding-list":
+        value["records"]["gas1"] = []
+    elif corruption == "extra-binding":
+        binding["ignored"] = True
+    elif corruption == "missing-review":
+        del binding["review"]
+    elif corruption == "path-type":
+        binding["record_path"] = 1
+    elif corruption == "empty-path":
+        binding["record_path"] = ""
+    elif corruption == "record-pin":
+        binding["record_sha256"] = "A" * 64
+    elif corruption == "review-type":
+        binding["review"] = True
+    else:
+        binding["review"] = " \n\t "
+    raw = json.dumps(value).encode()
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="schema|binding"):
+        execution._load_historical_gradient_references(args)
+
+
+def test_historical_gradient_descriptor_size_bounded(_historical_gradient_cli):
+    args, _ = _historical_gradient_cli
+    raw = b" " * (1024 * 1024 + 1)
+    args.historical_gradient_references.write_bytes(raw)
+    args.historical_gradient_references_sha256 = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(ValueError, match="exceeds 1 MiB"):
+        execution._load_historical_gradient_references(args)
+
+
+def test_historical_gradient_relative_paths_use_caller_and_descriptor_directory(
+    _historical_gradient_cli, monkeypatch, tmp_path
+):
+    args, value = _historical_gradient_cli
+    original = args.historical_gradient_references
+    pin = args.historical_gradient_references_sha256
+    args.historical_gradient_references = original.relative_to(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    bindings = execution._load_historical_gradient_references(args)
+    assert bindings["gas1"]["record_path"] == str(original.parent / "records" / "gas1.json")
+    assert bindings["gas4"]["record_path"] == str(tmp_path / "absolute-record.json")
+    for arm in value["records"]:
+        assert bindings[arm]["record_sha256"] == value["records"][arm]["record_sha256"]
+        assert bindings[arm]["review"] == value["records"][arm]["review"]
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == pin
+    assert args.historical_gradient_references == original.relative_to(tmp_path)
+    assert args.historical_gradient_references_sha256 == pin
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("config", None),
+        ("all_configs", True),
+        ("test", None),
+        ("test", []),
+        ("test", ["single-step-optimizer"]),
+        ("test", ["single-step-grads", "single-step-optimizer"]),
+        ("test", ["single-step-grads", "single-step-grads"]),
+        ("prepare_references", True),
+        ("probe_layers", 0),
+        ("probe_layers", 4),
+    ],
+)
+def test_historical_gradient_runbatch_checks_original_selection_before_narrowing(
+    _historical_gradient_cli, monkeypatch, tmp_path, field, value
+):
+    args, _ = _historical_gradient_cli
+    selected = [api.SelectedCase("synthetic", Path(args.config), "single-step-grads")]
+    setattr(args, field, value)
+    args.out = None
+    monkeypatch.setattr(execution, "_run_configs", lambda *a, **kw: pytest.fail("invalid selection narrowed"))
+    monkeypatch.setattr(
+        execution, "correctness_workdir", lambda *a: pytest.fail("invalid selection allocated workdir")
+    )
+    with pytest.raises(ValueError, match="one explicit config and only single-step-grads"):
+        execution.run_batch(args, selected=selected)
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("selection", ["all-configs", "all-tests", "optimizer", "mixed"])
+def test_historical_gradient_api_guard_precedes_catalog(_historical_gradient_cli, monkeypatch, selection):
+    args, _ = _historical_gradient_cli
+    request = api.RunRequest(
+        config=None if selection == "all-configs" else args.config,
+        tests={
+            "all-configs": ("single-step-grads",),
+            "all-tests": (),
+            "optimizer": ("single-step-optimizer",),
+            "mixed": ("single-step-grads", "single-step-optimizer"),
+        }[selection],
+        all_configs=selection == "all-configs",
+    )
+    options = api.RunOptions(
+        historical_gradient_references=args.historical_gradient_references,
+        historical_gradient_references_sha256=args.historical_gradient_references_sha256,
+    )
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid selection reached catalog"))
+    with pytest.raises(ValueError, match="one explicit config and only single-step-grads"):
+        api.run(request, options)
+
+
+def test_historical_gradient_runbatch_forwards_original_pair(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    expected = execution._load_historical_gradient_references(args)
+    captured = []
+    selected = [api.SelectedCase("synthetic", Path(args.config), "single-step-grads")]
+    monkeypatch.setattr(execution, "write_report", lambda *a, **kw: None)
+
+    def capture(child, *, executor, snapshot):
+        assert child.historical_gradient_references == args.historical_gradient_references
+        assert child.historical_gradient_references_sha256 == args.historical_gradient_references_sha256
+        assert child.test == ["single-step-grads"]
+        captured.append(execution._load_historical_gradient_references(child))
+        snapshot([Result("single-step-grads", "synthetic", Outcome.PASS)], {}, {})
+
+    monkeypatch.setattr(execution, "_run_configs", capture)
+    result = execution.run_batch(args, selected=selected)
+    assert captured == [expected]
+    assert result.exit_code == 0
+
+
+def test_historical_gradient_execution_forwards_exact_bindings(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["single-step-grads"])
+    expected = execution._load_historical_gradient_references(args)
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, definitions, **kwargs):
+        assert config == cfg and reviewed is spec and definitions == arms
+        captured.append(kwargs)
+        return []
+
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    assert captured[0]["historical_gradient_references"] == expected
+    assert captured[0]["select"] == ["single-step-grads"]
+
+
+def test_historical_gradient_execution_refuses_rl_before_native_or_spec_work(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    Path(args.config).write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"},
+                sampling={"n_gpus": 4, "max_seq_len": 16},
+            )
+        )
+    )
+    assert execution.load_config(Path(args.config)).is_rl
+    assert not hasattr(execution, "execute_rl")
+    recorded = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: pytest.fail("RL rejection reached frozen spec"))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: pytest.fail("RL rejection read model metadata"))
+    monkeypatch.setattr(execution, "arms_for", lambda *a, **kw: pytest.fail("RL rejection reached native arms"))
+    monkeypatch.setattr(
+        execution, "reference_tests", lambda: pytest.fail("historical bindings reached RL inapplicable branch")
+    )
+
+    def finish(results, *a, **kw):
+        recorded.extend(results)
+        return 1
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    assert execution._run_configs(args, executor=lambda *a, **kw: pytest.fail("RL reached SFT executor")) == 1
+    assert len(recorded) == 1
+    assert recorded[0].outcome is Outcome.FAIL
+    assert recorded[0].test_id == "-"
+    assert recorded[0].reason == "historical gradient references require a supervised config"
+
+
+def test_historical_gradient_execution_keeps_declared_width_with_larger_pool(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    config_bytes = Path(args.config).read_bytes()
+    cfg = execution.load_config(Path(args.config))
+    args.gpu_pool = cfg.n_gpus * 4
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    spec = SimpleNamespace(applicable_tests=["single-step-grads"])
+    bindings = execution._load_historical_gradient_references(args)
+    captured = []
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *a, **kw: (spec, arms))
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, definitions, **kwargs):
+        captured.append((config.n_gpus, definitions, kwargs))
+        assert reviewed is spec
+        return []
+
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(captured) == 1
+    width, definitions, kwargs = captured[0]
+    assert width == cfg.n_gpus == 4
+    assert definitions == arms
+    assert kwargs["historical_gradient_references"] == bindings
+    assert kwargs["select"] == ["single-step-grads"]
+    assert Path(args.config).read_bytes() == config_bytes
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing-arm", "extra-arm", "empty", "type", "optimizer", "mixed", "prep", "rl"]
+)
+def test_historical_gradient_runner_guard_precedes_workdir_and_target(
+    _historical_gradient_cli, monkeypatch, corruption
+):
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    bindings = execution._load_historical_gradient_references(args)
+    select = ["single-step-grads"]
+    if corruption == "missing-arm":
+        bindings.pop("gas4")
+    elif corruption == "extra-arm":
+        bindings["foreign"] = bindings["gas1"]
+    elif corruption == "empty":
+        bindings = {}
+    elif corruption == "type":
+        bindings = []
+    elif corruption == "optimizer":
+        select = ["single-step-optimizer"]
+    elif corruption == "mixed":
+        select.append("single-step-optimizer")
+    elif corruption == "rl":
+        Path(args.config).write_text(
+            json.dumps(
+                _config_factory_native_config(
+                    {"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"},
+                    sampling={"n_gpus": 4, "max_seq_len": 16},
+                )
+            )
+        )
+        cfg = execution.load_config(Path(args.config))
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("invalid binding reached workdir"))
+    monkeypatch.setattr(runner, "gateway", lambda *a, **kw: pytest.fail("invalid binding reached target"))
+    with pytest.raises(ValueError, match="exactly the selected SFT arms"):
+        runner.execute(
+            cfg,
+            None,
+            [SimpleNamespace(name=arm) for arm in ("gas1", "gas4")],
+            vocab_size=128,
+            select=select,
+            prepare_references=corruption == "prep",
+            historical_gradient_references=bindings,
+        )
+
+
+def test_historical_gradient_runner_records_provenance_before_target_and_keeps_bindings(
+    _historical_gradient_cli, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.harness import reference_records
+    from arctic_platform.correctness.harness.config import ArmDefinition
+
+    args, _ = _historical_gradient_cli
+    cfg = execution.load_config(Path(args.config))
+    bindings = execution._load_historical_gradient_references(args)
+    before = copy.deepcopy(bindings)
+    definitions = [ArmDefinition("gas1", 2, 8), ArmDefinition("gas4", 4, 8)]
+    spec = SimpleNamespace(
+        applicable_tests=["single-step-grads"],
+        test_settings={},
+        model=SimpleNamespace(cache_path="/data-fast/tmp/unmaterialized-synthetic-model"),
+    )
+    loaded = []
+    provenance = {}
+    work = tmp_path / "runner"
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
+    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *a: False)
+    monkeypatch.setattr(runner, "run_reference", lambda *a, **kw: pytest.fail("historical binding rebuilt HF"))
+    monkeypatch.setattr(reference_records, "model_identity", lambda *a: {"synthetic": True})
+    monkeypatch.setattr(reference_records, "workload_identity", lambda ctx, check, recipe: recipe)
+
+    def load(ctx, identity, *, historical_binding):
+        arm = "gas1" if identity["synthetic_inputs"]["rows"] == 2 else "gas4"
+        assert historical_binding == before[arm]
+        provenance[arm] = copy.deepcopy(historical_binding)
+        ctx.reference_record_provenance[arm] = provenance[arm]
+        loaded.append(arm)
+        historical_binding["review"] = "mutated loader-local copy"
+        return {"loss": 1.0, "grad_norms": {"synthetic.weight": 0.5}}
+
+    def no_target(*a, **kw):
+        assert loaded == ["gas1", "gas4"]
+        assert json.loads((work / "reference-record-provenance.json").read_text()) == provenance
+        assert bindings == before
+        raise RuntimeError("test-only stop before target allocation")
+
+    monkeypatch.setattr(reference_records, "load_record", load)
+    monkeypatch.setattr(runner, "gateway", no_target)
+    with pytest.raises(RuntimeError, match="test-only stop before target allocation"):
+        runner.execute(
+            cfg,
+            spec,
+            definitions,
+            vocab_size=128,
+            select=["single-step-grads"],
+            workdir=work,
+            historical_gradient_references=bindings,
+        )
+    assert bindings == before
 
 
 def test_clean_port_payload_does_not_invent_deepep_chunking():

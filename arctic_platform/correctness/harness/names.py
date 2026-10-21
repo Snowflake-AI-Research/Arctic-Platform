@@ -45,6 +45,7 @@ _ROUTED_EXPERT = re.compile(r"^(?P<prefix>.*\.mlp\.experts)\.(?P<weight>w[123])$
 _SHARED_EXPERT = re.compile(
     r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?(?:qwen_)?shared_expert\.(?P<weight>w[123])\.weight$"
 )
+_BARE_SHARED_EXPERT = re.compile(r"^(?P<layer>(?:.*\.)?layers\.\d+)\.mlp\.shared_expert\.(?P<weight>w[123])$")
 _SHARED_NAMES = {
     "w1": "gate_proj.weight",
     "w2": "down_proj.weight",
@@ -60,6 +61,18 @@ class _Entry:
 
 def normalize(name: str) -> str:
     return ".".join(part for part in name.split(".") if part not in _CONTAINER_SEGMENTS)
+
+
+def _shared_expert_name(name: str) -> Optional[str]:
+    match = _SHARED_EXPERT.match(name)
+    container = "shared_expert"
+    if match is None:
+        # GLM-5.3 uses bare Prime projections and a plural HF shared-experts container.
+        match = _BARE_SHARED_EXPERT.match(name)
+        container = "shared_experts"
+    if match is None:
+        return None
+    return f"{match.group('layer')}.mlp.{container}.{_SHARED_NAMES[match.group('weight')]}"
 
 
 def _insert(entries: Dict[str, _Entry], key: str, original: str, value: float) -> None:
@@ -104,9 +117,8 @@ def _canonical_dss(values: Dict[str, float]) -> Dict[str, _Entry]:
             canonical[f"{prefix}.down_proj"].originals.extend(entry.originals[1:])
             continue
 
-        match = _SHARED_EXPERT.match(key)
-        if match:
-            mapped = f"{match.group('layer')}.mlp.shared_expert.{_SHARED_NAMES[match.group('weight')]}"
+        mapped = _shared_expert_name(key)
+        if mapped is not None:
             _insert(canonical, mapped, entry.originals[0], entry.value)
             canonical[mapped].originals.extend(entry.originals[1:])
             continue
@@ -156,10 +168,9 @@ def canonical_dss_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTens
                 canonical[f"{prefix}.down_proj"] = CanonicalTensorGroup((key,))
             continue
 
-        match = _SHARED_EXPERT.match(key)
-        if match:
-            mapped = f"{match.group('layer')}.mlp.shared_expert.{_SHARED_NAMES[match.group('weight')]}"
-            canonical[mapped] = CanonicalTensorGroup((key,))
+        mapped = _shared_expert_name(key)
+        if mapped is not None:
+            canonical[mapped] = CanonicalTensorGroup((original,))
             continue
 
         if ".mlp.router.gate.weight" in key:

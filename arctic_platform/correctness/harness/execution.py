@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import sys
@@ -279,6 +280,74 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     return CortexConfig(**options)
 
 
+def _load_historical_gradient_references(args) -> dict | None:
+    """Load explicit raw-pinned bindings before batch grouping can narrow a selection."""
+    path = getattr(args, "historical_gradient_references", None)
+    expected = getattr(args, "historical_gradient_references_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--historical-gradient-references and --historical-gradient-references-sha256 are required together"
+        )
+    if path is None:
+        return None
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or getattr(args, "test", None) != ["single-step-grads"]
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        raise ValueError("historical gradient references require one explicit config and only single-step-grads")
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("historical gradient references require a full lowercase SHA256")
+    descriptor = Path(path).resolve()
+    with descriptor.open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("historical gradient references descriptor exceeds 1 MiB")
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("historical gradient references descriptor SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate historical gradient references key: {key}")
+            result[key] = value
+        return result
+
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    json.dumps(value, allow_nan=False)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "records"}
+        or value["schema"] != "reviewed-gradient-references-v1"
+        or not isinstance(value["records"], dict)
+        or not value["records"]
+    ):
+        raise ValueError("invalid historical gradient references descriptor schema")
+    bindings = {}
+    for arm, binding in value["records"].items():
+        if (
+            not arm
+            or not isinstance(binding, dict)
+            or set(binding) != {"record_path", "record_sha256", "review"}
+            or not isinstance(binding["record_path"], str)
+            or not binding["record_path"]
+            or not isinstance(binding["record_sha256"], str)
+            or len(binding["record_sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in binding["record_sha256"])
+            or not isinstance(binding["review"], str)
+            or not binding["review"].strip()
+        ):
+            raise ValueError(f"invalid historical gradient reference binding for arm {arm}")
+        record_path = Path(binding["record_path"])
+        if not record_path.is_absolute():
+            record_path = descriptor.parent / record_path
+        bindings[arm] = {**binding, "record_path": str(record_path.resolve())}
+    return bindings
+
+
 def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None = None) -> int:
     from transformers import AutoConfig
 
@@ -301,6 +370,7 @@ def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None =
 
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    historical_gradient_references = _load_historical_gradient_references(args)
     test_spec = getattr(args, "test_spec", None)
     if test_spec is not None and (not args.config or args.all_configs):
         raise SystemExit("--test-spec requires one explicit --config")
@@ -343,6 +413,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     for path in config_paths:
         try:
             cfg = load_config(path)
+            if historical_gradient_references is not None and cfg.is_rl:
+                raise ValueError("historical gradient references require a supervised config")
             execution[cfg.config_id] = {
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
@@ -356,7 +428,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             # Both are read from the config as written. The cases belong to the reviewed spec and do not
             # move with the placement, so every width measures the same work on a different topology.
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = [cfg.n_gpus] if local_fixture else placement_widths(cfg.n_gpus, pool)
+            widths = (
+                [cfg.n_gpus]
+                if local_fixture or historical_gradient_references is not None
+                else placement_widths(cfg.n_gpus, pool)
+            )
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -475,6 +551,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
                     **({"local_cortex_fixture": True} if local_fixture else {}),
                     **(
+                        {"peft_adapter": Path(args.peft_adapter)}
+                        if getattr(args, "peft_adapter", None) is not None
+                        else {}
+                    ),
+                    **(
+                        {"historical_gradient_references": historical_gradient_references}
+                        if historical_gradient_references is not None
+                        else {}
+                    ),
+                    **(
                         {"reference_records_dir": Path(args.reference_records_dir)}
                         if getattr(args, "reference_records_dir", None) is not None
                         else {}
@@ -548,6 +634,7 @@ def run_batch(args, *, selected, executor=None):
     from ..api import aggregate_exit_code
     from .reference_records import ReferencePrerequisiteError
 
+    _load_historical_gradient_references(args)
     started = time.monotonic()
     out = Path(args.out) if args.out is not None else correctness_workdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
@@ -819,6 +906,15 @@ def parse_args(argv=None):
         "--reference-records-dir",
         type=Path,
         help="prepared HF records; missing records require explicit onboarding",
+    )
+    r.add_argument(
+        "--historical-gradient-references", type=Path, help="explicit reviewed historical gradient bindings JSON"
+    )
+    r.add_argument("--historical-gradient-references-sha256", help="full SHA256 of the historical bindings JSON bytes")
+    r.add_argument(
+        "--peft-adapter",
+        type=Path,
+        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
     )
     r.add_argument(
         "--cortex-fixture",

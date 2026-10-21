@@ -463,20 +463,50 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
     spec.write(args.test_spec)
 
 
+def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
+    from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+
+    path = getattr(args, "peft_adapter", None)
+    if not config.training.get("peft_config"):
+        if path is not None:
+            raise ValueError("--peft-adapter requires a LoRA training config")
+        return None
+    if path is None:
+        from arctic_platform.correctness.harness.shared_lora_adapter import generate_adapter
+
+        if model_path is None:
+            return None
+        generated = getattr(args, "_generated_shared_adapters", {})
+        key = str(model_path.resolve())
+        if key not in generated:
+            generated[key] = generate_adapter(
+                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
+            )
+        args._generated_shared_adapters = generated
+        identity = adapter_identity(generated[key], config.training["peft_config"])
+        identities = getattr(args, "_generated_shared_adapter_identities", {})
+        if key in identities and identities[key] != identity:
+            raise ValueError("shared adapter changed during onboarding")
+        identities[key] = identity
+        args._generated_shared_adapter_identities = identities
+        return generated[key]
+    path = require_data_fast_path(path, label="shared PEFT adapter").resolve(strict=True)
+    identity = adapter_identity(path, config.training["peft_config"])
+    expected = getattr(args, "_admitted_shared_adapter_identity", identity)
+    if identity != expected:
+        raise ValueError("shared adapter changed during onboarding")
+    args._admitted_shared_adapter_identity = identity
+    return path
+
+
 def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Path:
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.runner import materialize_dss_peft_adapter
 
     from .calibration import render
 
     model_path = args.cache_root / f"{Path(args.source_checkpoint).name}-{selected['layers']}L"
     config = load_config(args.config)
-    peft_adapter_path = materialize_dss_peft_adapter(
-        config,
-        str(model_path),
-        args.output_dir / "calibration-adapter-init",
-        attn_implementation=config.attention_implementation,
-    )
+    peft_adapter_path = _shared_adapter(args, config, model_path)
     calibration_json = args.output_dir / "reference-repeatability.json"
     calibration_script = args.output_dir / "reference_repeatability.py"
     render_args = argparse.Namespace(
@@ -495,6 +525,7 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
     calibration_script.write_text(render(render_args))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     subprocess.run([sys.executable, str(calibration_script)], cwd=args.checkout_root, env=env, check=True)
+    _shared_adapter(args, config, model_path)
     return calibration_json
 
 
@@ -518,7 +549,6 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.runner import materialize_dss_peft_adapter
     from arctic_platform.correctness.harness.runner import run_reference
 
     config = load_config(args.config)
@@ -537,12 +567,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     optimizer_config = config.training.get("optimizer")
     if not isinstance(optimizer_config, dict):
         raise ValueError("optimizer calibration requires an explicit optimizer config")
-    adapter_path = materialize_dss_peft_adapter(
-        config,
-        str(model_path),
-        args.output_dir / "optimizer-calibration-adapter",
-        attn_implementation=config.attention_implementation,
-    )
+    adapter_path = _shared_adapter(args, config, model_path)
 
     lanes = max(1, min(CALIBRATION_RUNS, torch.cuda.device_count()))
     calibration_root = correctness_workdir("optimizer-calibration-")
@@ -797,6 +822,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         command.append("--local-cortex-fixture")
     if getattr(args, "reference_records_dir", None) is not None:
         command += ["--reference-records-dir", str(args.reference_records_dir)]
+    if getattr(args, "peft_adapter", None) is not None:
+        command += ["--peft-adapter", str(args.peft_adapter)]
     if bootstrap is not None:
         command = [
             sys.executable,
@@ -923,6 +950,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
             reference_calibration_runs=runs,
             reference_calibration_workers=workers,
             client_backend=_client_backend(args),
+            peft_adapter=_shared_adapter(args, config),
         )
         if results:
             raise ValueError(
@@ -934,9 +962,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         expected_model = model_identity(args.optimizer_model_path)
         initialization = "external-model"
         if config.training.get("peft_config"):
-            from arctic_platform.correctness.harness.lora import adapter_identity
+            from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
 
-            initialization = adapter_identity(args.output_dir / "reference-adapter-init")
+            initialization = adapter_identity(_shared_adapter(args, config, args.optimizer_model_path))
         training = config.effective_training
         expected_training = {
             "fp32_lm_head": bool(training.get("fp32_lm_head", False)),
@@ -1303,6 +1331,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=Path(__file__).resolve().parents[1] / "reference_data",
     )
     parser.add_argument("--reference-calibration-runs", type=int, default=16)
+    parser.add_argument(
+        "--peft-adapter",
+        type=Path,
+        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
+    )
     parser.add_argument("--reference-calibration-workers", type=int, default=1)
     parser.add_argument(
         "--local-cortex-fixture",
@@ -1360,6 +1393,7 @@ def _prepare_references(args: argparse.Namespace) -> int:
         reference_calibration_runs=args.reference_calibration_runs,
         reference_calibration_workers=args.reference_calibration_workers,
         client_backend=backend,
+        peft_adapter=_shared_adapter(args, config),
     )
     return 0
 
@@ -1385,6 +1419,12 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("sizing reuse is only supported for gradient onboarding, not probes or reference prep")
     _validate_storage(args)
     args.config = args.config.resolve()
+    if getattr(args, "peft_adapter", None) is not None:
+        from arctic_platform.correctness.harness.config import load_config
+
+        if not getattr(args, "prepare_references", False) and getattr(args, "backend", "onprem") != "onprem":
+            raise ValueError("--peft-adapter requires on-prem first-two SFT onboarding or reference preparation")
+        args.peft_adapter = _shared_adapter(args, load_config(args.config))
     if getattr(args, "prepare_references", False):
         if args.probe_layers is not None:
             raise ValueError("reference preparation cannot be combined with model sizing")

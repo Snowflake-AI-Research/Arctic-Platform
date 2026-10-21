@@ -238,7 +238,13 @@ def _optimizer_capture_worker_class() -> Any:
                 if not os.path.isabs(model_state_output_dir):
                     raise ValueError("debug.model_state_output_dir must be an absolute path")
             self._model_state_output_dir = model_state_output_dir
-            return super().initialize(master_addr, job_config)
+            adapter = debug_config.get("shared_peft_adapter")
+            if adapter is None:
+                return super().initialize(master_addr, job_config)
+            from .shared_lora_adapter import worker_adapter_scope
+
+            with worker_adapter_scope(adapter["object_ref"], adapter["identity"]):
+                return super().initialize(master_addr, job_config)
 
         def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
             group_name = getattr(param, "group_name", None)
