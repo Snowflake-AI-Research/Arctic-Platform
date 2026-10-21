@@ -286,9 +286,14 @@ def test_empty_patch_cannot_enable_dense_training():
         Patches(peft={})
 
 
-def test_worker_bridge_forwards_peft():
+def test_dense_model_spec_forwards_peft():
     config = {"peft_type": "Lora", "target_modules": ["q_proj"]}
-    spec = ModelSpec.from_ds_worker_config("unused", {"attn_implementation": "eager", "peft_config": config})
+    spec = ModelSpec(
+        model_path_or_name="unused",
+        attn_implementation="eager",
+        loader="huggingface",
+        patches=Patches(peft=config),
+    )
     assert spec.patches.peft == config
 
 

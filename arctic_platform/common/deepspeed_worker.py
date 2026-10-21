@@ -31,6 +31,9 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
+from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import dp_sp_world_size
@@ -44,6 +47,8 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import Patches
 from arctic_platform.model import build_model
 
 logger = logging.getLogger(__name__)
@@ -61,19 +66,6 @@ else:
     from arctic_platform.common.utils.debug import SynchronizedWallClockTimerSimpleDummy
 
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
-
-
-def make_model_gradient_checkpointing_compatible(model):
-    # Taken from arctic_platform/model/hf_factory.py
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    elif hasattr(model, "get_input_embeddings"):
-
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-    return model
 
 
 # ---------------------------------------------------------------------------
@@ -174,20 +166,99 @@ class DeepSpeedWorker:
 
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        # HF load + patches via ModelSpec (world_size already injected above).
-        spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
-        loaded = build_model(spec)
+        ep_size = int(ds_worker_config.get("ep_size", 1))
+        if ep_size != 1:
+            raise ValueError("on-prem expert-parallel loading is not wired; ep_size must be 1")
+        if self.sp_size != 1:
+            raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
+        model_provider = ds_worker_config.get("model_provider", "huggingface")
+        if model_provider not in {"huggingface", "liger"}:
+            raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
+        offload = (ds_worker_config.get("ac_config") or {}).get("offload_config") or {}
+        activation_offload = (
+            {key: value for key, value in offload.items() if key != "enabled" and value is not None}
+            if offload.get("enabled", False)
+            else None
+        )
+        token_chunk_size = ds_worker_config.get("fused_lm_head_token_chunk_size")
+        fp32_lm_head = ds_worker_config.get("fp32_lm_head", False)
+        lm_head = (
+            {
+                "fp32": fp32_lm_head,
+                "token_chunk_size": token_chunk_size,
+                "vocab_chunk_size": ds_worker_config.get("fused_lm_head_vocab_chunk_size", 8192),
+            }
+            if fp32_lm_head or token_chunk_size is not None
+            else None
+        )
+        tiled_size = ds_worker_config.get("tiled_mlp_token_chunk_size")
+        zorro_train = None
+        if ds_worker_config.get("zorro_train_enable", False):
+            zorro_train = {
+                key: ds_worker_config[key]
+                for key in (
+                    "response_len",
+                    "max_token_len",
+                    "rollout_n",
+                    "temperature",
+                    "use_unpad",
+                    "world_size",
+                    "logits_optimization",
+                    "logits_optimization_peak_mem_size_in_gib",
+                    "logits_compute_from_fp32_inputs",
+                    "logits_compute_in_fp32",
+                )
+                if key in ds_worker_config
+            }
+        loader_options = {
+            key: ds_worker_config[key] for key in ("fp32_parity", "fp32_residual") if key in ds_worker_config
+        }
+        loaded = build_model(
+            ModelSpec(
+                model_path_or_name=model_name,
+                dtype=str(job_config.get("dtype") or "bfloat16"),
+                attn_implementation=ds_worker_config.get("attn_implementation"),
+                loader="huggingface",
+                parallelism=ParallelismConfig(sequence_parallel=self.sp_size),
+                patches=Patches(
+                    liger=model_provider == "liger" or bool(ds_worker_config.get("use_liger")),
+                    gradient_checkpointing=ds_worker_config.get("enable_gradient_checkpointing", True),
+                    activation_offload=activation_offload,
+                    compile=ds_worker_config.get("compile"),
+                    tiled_mlp={"token_chunk_size": tiled_size} if tiled_size is not None else None,
+                    lm_head=lm_head,
+                    zorro_train=zorro_train,
+                    peft=ds_worker_config.get("peft_config"),
+                ),
+                **({"loader_options": loader_options} if loader_options else {}),
+            )
+        )
         model = loaded.model
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
-        init_kwargs = dict(model=model, config=ds_config)
         if self._has_optimizer:
-            # Forward-only (log-prob) engines are initialized without an
-            # optimizer so DeepSpeed allocates no optimizer state.
-            init_kwargs["model_parameters"] = model.parameters()
-        self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
+            engine_spec = TrainingEngineSpec.from_deepspeed_config(
+                ds_config,
+                dtype=str(job_config.get("dtype") or "bfloat16"),
+                world_size=self.world_size,
+                sequence_parallel=self.sp_size,
+                seed=job_config.get("seed"),
+            )
+            ds_config = build_deepspeed_config(engine_spec)
+            self.engine, _, self.optimizer_choice = initialize_training_engine(
+                model,
+                ds_config,
+                optimizer=engine_spec.optimizer,
+                ep_size=1,
+                mpu=None,
+                model_path=model_name,
+                rank=self.rank,
+            )
+        else:
+            # Forward-only/log-prob remains a separate no-optimizer contract.
+            self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
         gpu_id = torch.cuda.current_device()
