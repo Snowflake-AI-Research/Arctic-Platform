@@ -7,26 +7,19 @@ from collections.abc import Iterator
 import torch
 import torch.nn as nn
 
-_WEIGHT_SYNC_BUFFER_NAMES = frozenset(
-    {
-        "layer_multipliers",
-        "ngram_heads_vocab_sizes",
-        "ngram_heads_offsets",
-    }
-)
-
 
 def named_weight_sync_tensors(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield parameters, expert biases and supported persistent model buffers."""
+    """Yield parameters, expert biases and module-declared persistent buffers."""
     yield from model.named_parameters()
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
             continue
         module_name, _, buffer_name = name.rpartition(".")
-        if buffer_name not in _WEIGHT_SYNC_BUFFER_NAMES:
-            continue
         owning_module = model.get_submodule(module_name)
+        sync_names = getattr(owning_module, "_dss_weight_export_buffers", ())
+        if buffer_name not in sync_names:
+            continue
         if buffer_name not in owning_module._non_persistent_buffers_set:
             yield name, buffer
 
