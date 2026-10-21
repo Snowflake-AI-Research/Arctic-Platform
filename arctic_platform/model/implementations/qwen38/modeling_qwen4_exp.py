@@ -38,6 +38,7 @@ from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
+from . import hyper_connection
 from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
 from .converting_qwen4_exp import convert_prime_layer_to_hf
@@ -270,6 +271,22 @@ class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
         return output
 
 
+def _mix_streams(module, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``Qwen4ExpTextGatedResidual``'s ``(mixed, hyper_input, injection_weights)``, fused when the module allows."""
+    if hyper_connection.fused_hyper_connection_supported(module, hidden_states):
+        mixed, injection_weights = hyper_connection.gated_residual(module, hidden_states)
+        return mixed, hidden_states, injection_weights
+    return module(hidden_states)
+
+
+def _inject(hyper_input: Tensor, block_output: Tensor, injection_weights: Tensor) -> Tensor:
+    hc = injection_weights.shape[-1]
+    if hyper_input.is_cuda and hyper_input.dtype == torch.bfloat16 and hc & (hc - 1) == 0:
+        return hyper_connection.inject(hyper_input, block_output, injection_weights)
+    injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    return hyper_input + injection.flatten(-2)
+
+
 class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
     def forward(
         self,
@@ -292,7 +309,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 position_ids=ple_position_ids,
             )
 
-        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection_weights = _mix_streams(self.attn_hyper_connection, hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
@@ -306,16 +323,13 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 **kwargs,
             )
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = _inject(hyper_input, hidden_states, injection_weights)
 
-        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection_weights = _mix_streams(self.mlp_hyper_connection, hidden_states)
         routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
         hidden_states = self.mlp(hidden_states, routed_experts=routes)
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
-        return hidden_states
+        return _inject(hyper_input, hidden_states, injection_weights)
 
 
 class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
