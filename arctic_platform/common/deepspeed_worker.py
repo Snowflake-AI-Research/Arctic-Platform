@@ -210,6 +210,9 @@ class DeepSpeedWorker:
                 )
                 if key in ds_worker_config
             }
+        loader_options = {
+            key: ds_worker_config[key] for key in ("fp32_parity", "fp32_residual") if key in ds_worker_config
+        }
         loaded = build_model(
             ModelSpec(
                 model_path_or_name=model_name,
@@ -227,6 +230,7 @@ class DeepSpeedWorker:
                     zorro_train=zorro_train,
                     peft=ds_worker_config.get("peft_config"),
                 ),
+                **({"loader_options": loader_options} if loader_options else {}),
             )
         )
         model = loaded.model
