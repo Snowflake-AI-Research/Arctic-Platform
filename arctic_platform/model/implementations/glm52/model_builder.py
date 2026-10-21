@@ -380,8 +380,9 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             f"tensor_size_threshold={ac_config.offload_config.tensor_size_threshold})"
         )
 
+    ac_config.check_layers_exist(len(language_model.layers))
     for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
-        if layer_id % ac_config.freq != 0:
+        if not ac_config.checkpoints(layer_id):
             continue
 
         if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
@@ -416,13 +417,13 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             )
         logger.info(
             "Applied selective activation checkpointing "
-            f"(freq={ac_config.freq}, targets={target_list}, selective_layers={selective_layers}, "
+            f"(freq={ac_config.freq}, layers={ac_config.layers}, targets={target_list}, selective_layers={selective_layers}, "
             f"full_fallback_layers={full_layers})"
         )
         return
 
     logger.info(
-        f"Applied activation checkpointing (freq={ac_config.freq}, "
+        f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )
