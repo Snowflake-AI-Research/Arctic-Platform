@@ -14,7 +14,8 @@ Paths in this table are relative to `arctic_platform/correctness/`.
 | `harness/storage.py` | Fast-storage paths, allocation hostfiles, and interrupted-build checks. |
 | `harness/sft.py` | Shared dataset locations, configured training settings, and answer-token scoring. |
 | `harness/transport.py` | Training transport contracts and explicitly requested microbatch packing. Ordinary requests remain unsplit. |
-| `harness/lora.py` | Adapter recipes, materialization, and saved-weight verification. |
+| `harness/shared_lora_adapter.py` | Upstream PEFT adapter generation, content verification, and worker-local loading through Ray. |
+| `harness/lora.py` | Shared tensor-name validation and legacy E2E reference adapter recipes. Retired SAVE0 execution and its verifier are removed. |
 | `harness/cortex.py`, `harness/cortex_optimizer.py` | Local gateway client, fixture admission, checkpoint transport, and optimizer capture/decoding. |
 | `models/` | Shared original-model metadata and exact validation; metadata alone does not establish runtime or capacity admission. |
 | `checks/` | Registered numerical comparisons; adding a model does not require a new launcher. |

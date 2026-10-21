@@ -52,13 +52,11 @@ from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
 
 from arctic_platform.client import CortexConfig
-from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.correctness.checks import e2e_sft_train_validate as check
 from arctic_platform.correctness.checks import e2e_sft_train_validate as e2e
 from arctic_platform.correctness.checks import inference_checkpoint_loss as inference
 from arctic_platform.correctness.harness import lora as deterministic_lora
 from arctic_platform.correctness.harness import lora as lora_init
-from arctic_platform.correctness.harness import lora as lora_save0
 from arctic_platform.correctness.harness import reference_records
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness import sft
@@ -100,11 +98,7 @@ from arctic_platform.debug.weight_sync_evidence import VERIFY_ENV
 from arctic_platform.debug.weight_sync_evidence import source_files
 from arctic_platform.debug.weight_sync_evidence import tensor_manifest
 from arctic_platform.model import weight_export as native
-from arctic_platform.model.patches.peft import apply_peft
 from arctic_platform.model.patches.peft import is_peft_lora_param
-from arctic_platform.model.weight_export import save_peft_adapters
-from arctic_platform.testing_utils import set_seed
-from arctic_platform.testing_utils import torch_assert_equal
 
 from . import check_reference_records as _reference_selftests
 
@@ -1536,139 +1530,6 @@ def test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values(t
     assert len(receipt["verified_tensors"]) == 4
     with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError):
         deterministic_lora.bind_payload({"training_config": cfg.training}, output)
-
-
-# Lora save0.
-
-
-_lora_save0_TOPOLOGY = normalize_lora_peft_config({"peft_type": "Lora", "r": 2, "target_modules": ["q_proj"]})
-
-
-def _lora_save0_tiny_model():
-    return Qwen3ForCausalLM(
-        Qwen3Config(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-            max_position_embeddings=32,
-        )
-    )
-
-
-def _lora_save0_metadata(model):
-    specs = [
-        lora_init.LoraTensorSpec(lora_init.canonical_name(name), tuple(parameter.shape), "float32")
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
-    ]
-    return {
-        "model_name": "Qwen/Qwen3-8B",
-        "initialization": lora_init.build_manifest(specs, 42),
-        "peft_config": deepcopy(_lora_save0_TOPOLOGY),
-    }
-
-
-def _lora_save0_saved(tmp_path):
-    from peft import LoraConfig
-    from peft import get_peft_model
-
-    model = get_peft_model(
-        _lora_save0_tiny_model(),
-        LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=8, target_modules=["q_proj"]),
-    )
-    metadata = _lora_save0_metadata(model)
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if parameter.requires_grad:
-                spec = lora_init.LoraTensorSpec(lora_init.canonical_name(name), tuple(parameter.shape), "float32")
-                parameter.copy_(lora_init.generate_tensor(spec, 42))
-    root = tmp_path / "checkpoint"
-    destination = root / "global_step0"
-    save_peft_adapters(model, str(destination))
-    response = {
-        "checkpoint_path": str(root),
-        "checkpoint_tag": "global_step0",
-        "version": 0,
-        "stage_path": None,
-    }
-    return (root, response, metadata, model)
-
-
-def test_lora_save0_absent_option_preserves_normalized_topology_and_default_peft_behavior():
-    assert "deterministic_init" not in normalize_lora_peft_config(_lora_save0_TOPOLOGY)
-    config = {"peft_type": "Lora", "r": 2, "target_modules": ["q_proj"]}
-    set_seed(17)
-    baseline = apply_peft(_lora_save0_tiny_model(), config)
-    set_seed(17)
-    repeated = apply_peft(_lora_save0_tiny_model(), config)
-    for (name, actual), (other_name, expected) in zip(
-        baseline.named_parameters(), repeated.named_parameters(), strict=True
-    ):
-        assert name == other_name
-        torch_assert_equal(actual, expected)
-
-
-def test_lora_save0_real_peft_save_pack_proves_complete_exact_initialization(tmp_path):
-    root, response, metadata, _ = _lora_save0_saved(tmp_path)
-    proof = lora_save0.verify_saved_initialization(root, response, metadata)
-    assert proof["identity_sha256"] == metadata["initialization"]["identity_sha256"]
-    assert len(proof["verified_tensors"]) == len(metadata["initialization"]["tensors"])
-    assert proof["proof_scope"] == "exported-adapter-pack-not-all-rank-equality"
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("version", 1),
-        ("version", False),
-        ("checkpoint_tag", "global_step1"),
-        ("checkpoint_path", "/data-fast/tmp/not-owned"),
-        ("stage_path", "remote"),
-    ],
-)
-def test_lora_save0_save0_rejects_wrong_step_path_or_stage(tmp_path, field, value):
-    root, response, metadata, _ = _lora_save0_saved(tmp_path)
-    response[field] = value
-    with pytest.raises(ValueError, match="step/version zero"):
-        lora_save0.verify_saved_initialization(root, response, metadata)
-
-
-@pytest.mark.parametrize("failure", ["missing", "extra", "bytes", "dtype", "shape", "symlink", "config"])
-def test_lora_save0_save0_rejects_changed_coverage_identity_and_files(tmp_path, failure):
-    root, response, metadata, _ = _lora_save0_saved(tmp_path)
-    directory = root / "global_step0" / "default"
-    path = directory / "adapter_model.safetensors"
-    from safetensors.torch import load_file
-
-    tensors = load_file(str(path))
-    name = next(iter(tensors))
-    if failure == "missing":
-        del tensors[name]
-    elif failure == "extra":
-        tensors[name.replace("q_proj", "k_proj")] = tensors[name].clone()
-    elif failure == "bytes":
-        tensors[name] = tensors[name] + 1
-    elif failure == "dtype":
-        tensors[name] = tensors[name].to(torch.bfloat16)
-    elif failure == "shape":
-        tensors[name] = tensors[name][:1]
-    elif failure == "symlink":
-        target = directory / "hidden.safetensors"
-        path.rename(target)
-        path.symlink_to(target)
-    elif failure == "config":
-        config_path = directory / "adapter_config.json"
-        config = json.loads(config_path.read_text())
-        config["r"] = 99
-        config_path.write_text(json.dumps(config))
-    if failure not in {"symlink", "config"}:
-        save_file(tensors, str(path))
-    with pytest.raises(ValueError):
-        lora_save0.verify_saved_initialization(root, response, metadata)
 
 
 # Qwen4 reference.
