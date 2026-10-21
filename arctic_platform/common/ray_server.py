@@ -649,9 +649,10 @@ class ArcticRLRayServer:
         """Await refs. Caller must already hold ``_training_op_lock``.
 
         On the first worker failure, siblings get ``_training_ref_grace_s`` to
-        finish. Whatever is still running is cancelled. If a sibling ignores
-        cancellation, the job is marked failed so later ops raise instead of
-        queueing on the lock.
+        finish. Whatever is still running is cancelled on the worker, not only
+        in this process. Cancelling this await (client disconnect, timeout) does
+        the same. A cancelled collective marks the workers failed so the next op
+        does not start while a data-parallel collective may still be running.
         """
         self._raise_if_training_failed()
         refs = list(submit_refs())
@@ -668,6 +669,15 @@ class ArcticRLRayServer:
                 rejected.append(type(ref).__name__)
         tasks = [task for _, task in paired]
         grace = getattr(self, "_training_ref_grace_s", _TRAINING_REF_GRACE_S)
+        cancelled_collective = False
+
+        def _cancel_unfinished() -> None:
+            nonlocal cancelled_collective
+            for ref, task in paired:
+                if not task.done():
+                    self._cancel_training_ref(ref, task)
+                    cancelled_collective = True
+
         try:
             if tasks:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -677,20 +687,24 @@ class ArcticRLRayServer:
             if errors and pending:
                 _, pending = await asyncio.wait(pending, timeout=grace)
             if errors and pending:
-                for ref, task in paired:
-                    if not task.done():
-                        self._cancel_training_ref(ref, task)
+                _cancel_unfinished()
                 _, pending = await asyncio.wait(pending, timeout=grace)
-            if errors and pending:
+            if cancelled_collective or (errors and pending):
                 self._training_failed = True
-                self._training_failure = errors[0]
+                self._training_failure = errors[0] if errors else asyncio.CancelledError()
+            if errors and pending:
                 raise errors[0]
             if errors:
                 raise errors[0]
+        except asyncio.CancelledError:
+            cancelled_collective = True
+            raise
         finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+            _cancel_unfinished()
+            if cancelled_collective:
+                self._training_failed = True
+                if getattr(self, "_training_failure", None) is None:
+                    self._training_failure = asyncio.CancelledError()
         if rejected:
             kinds = ", ".join(sorted(set(rejected)))
             raise TypeError(f"training worker RPC must return an awaitable ObjectRef, got {kinds}")
