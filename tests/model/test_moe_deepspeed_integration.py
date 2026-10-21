@@ -118,7 +118,7 @@ def test_family_defaults_remain_distinct():
         glm_config.moe_use_grouped_mm,
         glm_config.moe_use_sonicmoe,
         glm_config.sparse_mla_backend,
-    ) == ("flash_attention_2", False, False, "ref")
+    ) == ("flash_attention_2", False, False, "auto")
 
 
 def test_qwen_adapter_keeps_sp_and_vllm_export(monkeypatch):

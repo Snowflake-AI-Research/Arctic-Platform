@@ -43,6 +43,15 @@ def test_set_sparse_mla_backend_ref():
     assert sparse_mla_backend() == "ref"
 
 
+@pytest.mark.parametrize(("usable", "expected"), [(True, "tilelang"), (False, "ref")])
+def test_auto_sparse_mla_backend_prefers_fused_tilelang(monkeypatch, usable, expected):
+    import arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla as kernel
+
+    monkeypatch.setattr(kernel, "_tilelang_usable", lambda: usable)
+    assert set_sparse_mla_backend("auto") == expected
+    assert sparse_mla_backend() == expected
+
+
 def test_set_sparse_mla_backend_rejects_unknown():
     with pytest.raises(ValueError, match="Unknown sparse_mla_backend"):
         set_sparse_mla_backend("bogus")

@@ -58,8 +58,8 @@ except ImportError:
     flash_mla_sparse_fwd = None  # type: ignore
 
 
-_VALID_SPARSE_MLA_BACKENDS = ("flashmla", "ref", "tilelang", "dense")
-_DEFAULT_SPARSE_MLA_BACKEND = "ref"
+_VALID_SPARSE_MLA_BACKENDS = ("auto", "flashmla", "ref", "tilelang", "dense")
+_DEFAULT_SPARSE_MLA_BACKEND = "auto"
 _SPARSE_MLA_BWD_CHUNK = 64
 _configured_sparse_mla_backend: str | None = None
 
@@ -78,6 +78,12 @@ def flash_mla_available() -> bool:
         return False
 
 
+def _tilelang_usable() -> bool:
+    import importlib.util
+
+    return torch.cuda.is_available() and importlib.util.find_spec("tilelang") is not None
+
+
 def set_sparse_mla_backend(backend: str) -> str:
     """Set the process-wide sparse MLA implementation.
 
@@ -91,6 +97,10 @@ def set_sparse_mla_backend(backend: str) -> str:
             f"Unknown sparse_mla_backend={backend!r}, "
             f"expected one of {_VALID_SPARSE_MLA_BACKENDS}"
         )
+    if requested == "auto":
+        # The fused TileLang forward and backward; the FlashMLA forward pairs with the tiled reference backward
+        # (1.7x slower per step for GLM-5.3 at 256K on H200).
+        requested = "tilelang" if _tilelang_usable() else "ref"
     if requested == "flashmla":
         _ensure_flash_mla_sparse_fwd()
     _configured_sparse_mla_backend = requested
