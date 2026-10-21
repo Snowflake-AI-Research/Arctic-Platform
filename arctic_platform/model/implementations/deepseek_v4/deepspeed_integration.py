@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """DeepSpeed entry point for DeepSeek-V4-Flash.
 
 The decoder is a causal LM on the shared MoE lifecycle. Sequence parallel is
@@ -20,10 +35,8 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 def _install_context_parallel(model: nn.Module, sp_group, sp_size: int) -> None:
     from arctic_platform.model.implementations.deepseek_v4.attention import DeepseekV4Attention
     from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
-    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import (
-        DeepseekV4Model,
-        _seq_lens_from_position_ids,
-    )
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Model
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import _seq_lens_from_position_ids
 
     if sp_group is None:
         raise ValueError("DeepSeek V4 sequence parallel requires the DSS SP group")
@@ -77,7 +90,7 @@ def _install_context_parallel(model: nn.Module, sp_group, sp_size: int) -> None:
             **kwargs,
         )
 
-    backbone.forward = forward
+    setattr(backbone, "forward", forward)
 
 
 def load_deepseek_v4_model(

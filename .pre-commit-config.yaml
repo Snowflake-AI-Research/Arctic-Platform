@@ -1,7 +1,8 @@
 # TODO(models): files vendored/copied from PrimeRL are skipped by ALL hooks while the
 # MoE loaders are being integrated (attribution handled separately). RE-ENABLE by
 # removing this global exclude once the implementations are refactored.
-exclude: ^(arctic_platform/model/implementations/(qwen35|glm52|moe|layers|qwen3_moe|glm4_moe|minimax_m2|afmoe|nemotron_h)/|cortex-client/|arctic_platform/inference/|tests/inference/)
+# DeepSeek V4 copies are in that set. cp.py and deepspeed_integration.py are not.
+exclude: ^(arctic_platform/model/implementations/(qwen35|glm52|moe|layers|qwen3_moe|glm4_moe|minimax_m2|afmoe|nemotron_h)/|arctic_platform/model/implementations/deepseek_v4/(?!cp\.py$|deepspeed_integration\.py$)|arctic_platform/model/implementations/kernels/deepseek_v4/|arctic_platform/model/implementations/kernels/fp8_indexer\.py$|cortex-client/|arctic_platform/inference/|tests/inference/)
 
 repos:
   - repo: local

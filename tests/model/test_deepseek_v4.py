@@ -108,11 +108,11 @@ def test_autoconfig_returns_the_ported_class(tmp_path):
 
 
 def test_hash_layer_uses_tid2eid_and_learned_layer_keeps_expert_bias():
-    from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4ForCausalLM
+    from arctic_platform.model.implementations.deepseek_v4.moe import DeepseekV4MoE
 
-    model = DeepseekV4ForCausalLM(_tiny_config())
-    hash_moe = model.model.layers[0].mlp
-    learned_moe = model.model.layers[1].mlp
+    config = _tiny_config()
+    hash_moe = DeepseekV4MoE(config, 0)
+    learned_moe = DeepseekV4MoE(config, 1)
     assert hash_moe.is_hash
     assert hash_moe.router.tid2eid.shape == (32, 2)
     assert hash_moe.expert_bias is None
@@ -122,8 +122,8 @@ def test_hash_layer_uses_tid2eid_and_learned_layer_keeps_expert_bias():
 
 
 def test_published_expert_names_convert_to_platform_parameters():
-    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
     from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
 
     config = _tiny_config()
     state = {
