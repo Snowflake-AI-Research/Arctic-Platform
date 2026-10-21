@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import math
@@ -28,7 +27,6 @@ import os
 import stat
 import sys
 import tempfile
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -402,46 +400,6 @@ def bind_payload(payload: dict, adapter_path: str | Path | None) -> dict:
     )
 
 
-def _dense_training(payload: dict) -> dict:
-    training = payload.get("training_config")
-    if not isinstance(training, dict) or payload.get("job_type", "training") != "training":
-        raise ValueError("LoRA SAVE0 requires a training payload")
-    if training.get("n_gpus") != 4 or type(training.get("n_gpus")) is not int:
-        raise ValueError("LoRA SAVE0 currently admits original four-GPU dense training only")
-    if any(
-        type(training.get(key, 1)) is not int or training.get(key, 1) != 1
-        for key in ("sp_size", "ep_size", "sequence_parallel_size", "expert_parallel_size")
-    ):
-        raise ValueError("LoRA SAVE0 currently requires dense EP1/SP1")
-    zero = (training.get("ds_config") or {}).get("zero_optimization") or {}
-    if not isinstance(zero, dict) or type(zero.get("stage", 0)) is not int or zero.get("stage", 0) not in {0, 1, 2}:
-        raise ValueError("LoRA SAVE0 does not admit ZeRO3")
-    return training
-
-
-def bind_initialization(payload: dict, metadata: dict) -> dict:
-    """Add only the reviewed AP opt-in; never change the reference topology."""
-    training = _dense_training(payload)
-    if metadata.get("model_name") != "Qwen/Qwen3-8B":
-        raise ValueError("LoRA SAVE0 currently admits the reviewed dense Qwen3-8B reference only")
-    manifest = metadata["initialization"]
-    specs = manifest_specs(manifest)
-    dtypes = {spec.dtype for spec in specs}
-    if len(dtypes) != 1:
-        raise ValueError("LoRA SAVE0 requires one declared adapter storage dtype")
-    topology = normalize_lora_peft_config(training.get("peft_config"))
-    if "deterministic_init" in topology or topology != metadata.get("peft_config"):
-        raise ValueError("LoRA SAVE0 target topology differs from the genuine reference")
-    options = {
-        "recipe_version": manifest["recipe_version"],
-        "global_seed": manifest["global_seed"],
-        "dtype": next(iter(dtypes)),
-    }
-    bound = deepcopy(payload)
-    bound["training_config"]["peft_config"] = normalize_lora_peft_config({**topology, "deterministic_init": options})
-    return bound
-
-
 def _fingerprint(path: Path, *, maximum_bytes: int) -> tuple:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= maximum_bytes:
@@ -522,25 +480,3 @@ def verify_saved_initialization(root: str | Path, response: dict, metadata: dict
         "adapter_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "proof_scope": "exported-adapter-pack-not-all-rank-equality",
     }
-
-
-@contextlib.contextmanager
-def verified_running_job(session, payload: dict, metadata: dict, *, proof_path: Path):
-    """Do not expose the owned client until SAVE0 proves initialization; always close it."""
-    from .dss_driver import running_job
-    from .hosted import _save_local_checkpoint
-    from .hosted import require_local_cortex_gateway
-
-    require_local_cortex_gateway(session.backend)
-    proof_path = require_data_fast_path(proof_path, label="LoRA SAVE0 proof")
-    if proof_path.exists():
-        raise ValueError("LoRA SAVE0 proof destination must be new")
-    bound = bind_initialization(payload, metadata)
-    with running_job(session, bound) as job:
-        root, response = _save_local_checkpoint(job.client, "weights-only")
-        proof = verify_saved_initialization(root, response, metadata)
-        proof_path.parent.mkdir(parents=True, exist_ok=True)
-        with proof_path.open("x") as stream:
-            json.dump(proof, stream, indent=2, sort_keys=True, allow_nan=False)
-            stream.write("\n")
-        yield job, proof

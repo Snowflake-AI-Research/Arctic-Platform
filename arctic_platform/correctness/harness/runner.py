@@ -341,12 +341,9 @@ def _cortex_rejection(
     test,
     cfg,
     published_fixture: dict | None = None,
-    *,
-    local_gateway_lora_save0: bool = False,
 ) -> TestResult | None:
     reason = cortex_unavailable_reason(test, published_fixture)
-    save0_check = local_gateway_lora_save0 and test.test_id in {"single-step-grads", "single-step-optimizer"}
-    if reason is None and test.compares_to_reference and cfg.training.get("peft_config") and not save0_check:
+    if reason is None and test.compares_to_reference and cfg.training.get("peft_config"):
         reason = "Cortex reference comparisons cannot export the product-initialized LoRA adapter"
     if reason is None:
         return None
@@ -475,7 +472,6 @@ def execute(
                 test,
                 cfg,
                 published_fixture,
-                local_gateway_lora_save0=local_gateway_lora_save0,
             )
             if rejection is not None:
                 results.append(rejection)
@@ -591,7 +587,7 @@ def execute(
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
                 payload["hardware"] = cfg.gpu_type.upper()
-        if context.reference_adapter_path is not None and not local_gateway_lora_save0:
+        if context.reference_adapter_path is not None:
             payload["training_config"]["debug"]["shared_peft_adapter"] = {
                 "path": str(context.reference_adapter_path),
                 "identity": deepcopy(shared_adapter_identity),
@@ -641,22 +637,8 @@ def execute(
     else:
         reference_adapter_path = None
     context.reference_adapter_path = reference_adapter_path
-    save0_metadata = None
-    if reference_adapter_path is not None and not prepare_references:
-        if local_gateway_lora_save0:
-            from .lora import adapter_identity
-            from .lora import bind_initialization
-
-            save0_metadata = adapter_identity(reference_adapter_path)
-            bind_initialization(
-                build_payload(cfg.training, target_model, SEED, weight_format=cfg.sub_job.get("weight_format")),
-                save0_metadata,
-            )
-        else:
-            if not isinstance(client_backend, OnPremConfig):
-                raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
-    if local_gateway_lora_save0 and save0_metadata is None:
-        raise ValueError("LoRA SAVE0 requires a verified deterministic reference adapter")
+    if reference_adapter_path is not None and not prepare_references and not isinstance(client_backend, OnPremConfig):
+        raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
 
     from .batches import load as load_batch
 
@@ -909,20 +891,7 @@ def execute(
     def measure_target_arm(session, arm: ArmSpec) -> bool:
         try:
             with console.activity(f"Running Arctic Platform {arm.name}"):
-                with ExitStack() as job_stack:
-                    if local_gateway_lora_save0:
-                        from .lora import verified_running_job
-
-                        job_id, _proof = job_stack.enter_context(
-                            verified_running_job(
-                                session,
-                                payload_for(arm),
-                                save0_metadata,
-                                proof_path=tmp / "lora-save0" / f"{arm.name}.json",
-                            )
-                        )
-                    else:
-                        job_id = job_stack.enter_context(running_job(session, payload_for(arm)))
+                with running_job(session, payload_for(arm)) as job_id:
                     started = time.monotonic()
                     context._target[arm.name] = measure_target(session, job_id, arm)
                     context._timing.setdefault(arm.name, {})["dss"] = time.monotonic() - started
