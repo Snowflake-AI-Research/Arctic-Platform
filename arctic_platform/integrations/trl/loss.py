@@ -39,11 +39,13 @@ def trl_grpo(
     logprob frame, so no response-window reshift is done here.
 
     Normalization is ``masked_sum / batch_num_tokens * dp_size``. ``batch_num_tokens``
-    is the completion-token count of the whole forward TRL sent (the optimizer step,
-    since TRL accumulation stays 1). DeepSpeed splits that forward into engine
-    microbatches that share this denominator, so the piece sums add back to the token
-    mean. Dividing by engine GAS as well would shrink the update by that factor.
-    ``* dp_size`` corrects DeepSpeed's cross-DP average (verl ``agg_loss`` token-mean).
+    is the completion-token count of this forward. TRL gradient accumulation must stay
+    1: each call backward()s immediately, and this loss does not divide by TRL's
+    accumulation. ``ArcticAsyncGRPOTrainer`` rejects any other value. DeepSpeed may
+    still split the forward into engine microbatches that share this denominator, so
+    the piece sums add back to the token mean. Dividing by engine GAS as well would
+    shrink the update by that factor. ``* dp_size`` corrects DeepSpeed's cross-DP
+    average (verl ``agg_loss`` token-mean).
     """
     logprobs = model_outputs["logprobs"]
     old_log_probs = batch["old_log_probs"].to(logprobs.dtype)
