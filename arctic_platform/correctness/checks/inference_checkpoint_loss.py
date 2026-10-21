@@ -347,6 +347,65 @@ def training_batches(examples: Sequence[gsm8k.Example], rows_per_step: int, pad_
     ]
 
 
+def _minimum_context_parallel_row_tokens(ctx, model_path: str) -> int:
+    """Read PLE's embedding and dilated-convolution context from the actual offline config."""
+    if (
+        getattr(ctx.cfg, "config_id", None) != _FLASHNEXT_CONFIG_ID
+        or ctx.cfg.training.get("model_provider") != "prime_rl"
+    ):
+        return 0
+    sp_size = ctx.cfg.sp_size
+    if sp_size <= 1:
+        return 0
+    from transformers import AutoConfig
+
+    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    text = getattr(source, "text_config", source)
+    if (
+        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
+        or text.model_type != "qwen4_exp_text"
+        or type(text.num_hidden_layers) is not int
+        or text.num_hidden_layers != 48
+    ):
+        raise ValueError("context-parallel inference requires the original full48 Flash-Next text configuration")
+    ngram = getattr(text, "ngram_size", None)
+    kernel = getattr(text, "ple_conv_kernel_size", None)
+    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
+        raise ValueError("context-parallel inference requires positive integer PLE ngram and convolution sizes")
+    local_context = max(ngram - 1, (kernel - 1) * ngram)
+    return sp_size * local_context
+
+
+def _extend_short_causal_rows(batch: Batch, minimum_tokens: int, pad_id: int) -> Batch:
+    """Keep every possible packed row group wide enough without adding loss-bearing tokens."""
+    if minimum_tokens == 0:
+        return batch
+    import torch
+
+    from ..harness.batches import IGNORE_INDEX
+    from ..harness.dss_driver import _attention_mask_from_position_ids
+
+    lengths = _attention_mask_from_position_ids(batch.position_ids).sum(dim=1)
+    if bool((lengths >= minimum_tokens).all()):
+        return batch
+    width = max(batch.seq_len, minimum_tokens)
+    ids = batch.input_ids.new_full((batch.rows, width), pad_id)
+    positions = batch.position_ids.new_zeros((batch.rows, width))
+    labels = batch.labels.new_full((batch.rows, width), IGNORE_INDEX)
+    ids[:, : batch.seq_len] = batch.input_ids
+    positions[:, : batch.seq_len] = batch.position_ids
+    labels[:, : batch.seq_len] = batch.labels
+    for row, length in enumerate(lengths.tolist()):
+        if length < minimum_tokens:
+            # Monotone positions keep the loss-free causal tail through attention-mask packing.
+            ids[row, length:minimum_tokens] = pad_id
+            positions[row, length:minimum_tokens] = torch.arange(
+                length, minimum_tokens, dtype=positions.dtype, device=positions.device
+            )
+            labels[row, length:minimum_tokens] = IGNORE_INDEX
+    return Batch(name=batch.name, input_ids=ids, position_ids=positions, labels=labels)
+
+
 def materialize_checkpoint_tokenizer(tokenizer, checkpoint_path: str | Path) -> None:
     """Store the validated model tokenizer beside an exported weights-only checkpoint."""
     tokenizer.save_pretrained(checkpoint_path)
@@ -482,6 +541,8 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
 
 
 def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenizer) -> Path:
+    from ..harness.inference_export import distribute_local_inference_export
+
     require_local_cortex_gateway(backend)
     root = require_data_fast_path(correctness_workdir("cortex-inference-"), label="local inference save")
     result = client.save_checkpoint(path=str(root), checkpoint_type="weights-only", export_hf=False)
@@ -498,13 +559,19 @@ def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenize
     restored = gsm8k.load_tokenizer(str(weights_dir))
     if restored.get_vocab() != tokenizer.get_vocab() or restored.special_tokens_map != tokenizer.special_tokens_map:
         raise RuntimeError("local inference export tokenizer differs from the configured tokenizer")
+    ctx._inference_export_locality = distribute_local_inference_export(
+        weights_dir, getattr(ctx, "inference_export_allocation", None)
+    )
     print("LOCAL_INFERENCE_CHECKPOINT", json.dumps(result, sort_keys=True), "HF_EXPORT", weights_dir, flush=True)
     return weights_dir
 
 
 def local_cortex_sampling_config(ctx, backend: CortexConfig, weights_dir: Path, token_budget: int):
+    from ..harness.inference_export import require_local_inference_export_locality
+
     require_local_cortex_gateway(backend)
     weights_dir = validate_local_inference_export(ctx, weights_dir)
+    require_local_inference_export_locality(ctx, weights_dir)
     payload = _sampling_payload(ctx, str(weights_dir), token_budget)
     payload["job_type"] = "sampling"
     config = _inference_client_config(payload, backend=backend)
@@ -524,7 +591,10 @@ def _run(ctx) -> TestResult:
     managed = isinstance(backend, CortexConfig)
     local = managed and is_local_cortex_gateway(backend)
     if local:
+        from ..harness.inference_export import validate_local_inference_allocation
+
         require_local_cortex_gateway(backend)
+        validate_local_inference_allocation(getattr(ctx, "inference_export_allocation", None))
     model_path = _full_model_name(ctx)
     gateway_slots = (
         max(ctx.cfg.n_gpus, sampling_gpus)
@@ -547,6 +617,13 @@ def _run(ctx) -> TestResult:
 
     validation_batch = gsm8k.build_batch("validation", validation_examples, pad_id)
     train_batches = training_batches(training_examples, rows_per_step, pad_id)
+    minimum_row_tokens = _minimum_context_parallel_row_tokens(ctx, model_path)
+    validation_batch = _extend_short_causal_rows(validation_batch, minimum_row_tokens, pad_id)
+    train_batches = [_extend_short_causal_rows(batch, minimum_row_tokens, pad_id) for batch in train_batches]
+    if minimum_row_tokens and validation_batch.total_tokens > token_budget:
+        raise ValueError(
+            "context-parallel validation padding exceeds the unchanged token budget; rows cannot be dropped"
+        )
 
     workdir = Path(ctx.workdir) / TEST_ID
     # ``serve_gateway`` writes its hostfile into the directory it is handed and does not create it.
@@ -562,6 +639,7 @@ def _run(ctx) -> TestResult:
         SEED,
         attn_implementation=ctx.attn_implementation,
         gradient_norms_per_param=False,
+        weight_format=ctx.cfg.sub_job.get("weight_format"),
     )
     if managed and ctx.cfg.gpu_type is not None:
         payload["hardware"] = ctx.cfg.gpu_type.upper()
@@ -638,6 +716,8 @@ def _run(ctx) -> TestResult:
         "validation_padded_width": float(padded_width),
         "validation_token_slots": float(len(validation_examples) * padded_width),
         "single_forward_token_budget": float(token_budget),
+        "training_minimum_context_parallel_row_tokens": float(minimum_row_tokens),
+        "training_validation_padded_width": float(validation_batch.seq_len if minimum_row_tokens else padded_width),
         "scored_answer_tokens": float(reference_count),
         "held_out_examples": float(distribution["examples"]),
         "held_out_minimum_tokens": float(distribution["minimum_tokens"]),
@@ -671,6 +751,7 @@ def _onprem_sampling_and_reload(ctx, session, weights_dir, token_budget, example
         SEED,
         attn_implementation=ctx.attn_implementation,
         gradient_norms_per_param=False,
+        weight_format=ctx.cfg.sub_job.get("weight_format"),
     )
     with running_job(session, reload_payload) as reloaded_training_job:
         reloaded_rows = reference_answer_logprobs(

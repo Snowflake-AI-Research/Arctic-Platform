@@ -72,10 +72,6 @@ CONFIG_DIR = CORRECTNESS_DIR / "configs"
 SPEC_DIR = CORRECTNESS_DIR / "specs"
 
 
-def _specs_for(config_paths: List[Path]) -> Dict[str, Path]:
-    return {p.stem: SPEC_DIR / f"{p.stem}.json" for p in config_paths}
-
-
 def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
     """The configs this invocation runs. Local-GPU filtering applies only where the jobs use local GPUs."""
     if getattr(args, "resolved_paths", None) is not None:
@@ -113,6 +109,7 @@ def _frozen_spec(
     cases: Optional[List[str]],
     results: List[TestResult],
     specs: Dict[str, TestSpec],
+    test_spec: Path | None = None,
 ) -> Optional[Tuple[TestSpec, List[ArmDefinition]]]:
     """This config's reviewed spec and the cases to run, or ``None`` once the reason it cannot run is recorded.
 
@@ -121,7 +118,7 @@ def _frozen_spec(
     content, cases, or backend no longer match it is refused here, because a verdict about a configuration
     nobody reviewed says nothing.
     """
-    spec_path = SPEC_DIR / f"{cfg.config_id}.json"
+    spec_path = Path(test_spec) if test_spec is not None else SPEC_DIR / f"{cfg.config_id}.json"
     if not spec_path.exists():
         results.append(
             TestResult(
@@ -135,6 +132,17 @@ def _frozen_spec(
         print(f"skip {path.name}: no spec at {spec_path}", flush=True)
         return None
     spec = TestSpec.read(spec_path)
+    if spec.config_id != cfg.config_id:
+        results.append(
+            TestResult(
+                test_id="-",
+                config_id=cfg.config_id,
+                outcome=TestOutcome.FAIL,
+                summary="spec config identity mismatch",
+                reason=f"spec {spec.config_id!r} does not describe config {cfg.config_id!r}",
+            )
+        )
+        return None
     current_config_checksum = config_checksum(cfg)
     if not spec.config_checksum or spec.config_checksum != current_config_checksum:
         expected = spec.config_checksum[:12] if spec.config_checksum else "missing"
@@ -308,6 +316,12 @@ def _run_vocab_size(
 
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    test_spec = getattr(args, "test_spec", None)
+    topology = getattr(args, "inference_sampling_topology", None)
+    if test_spec is not None and (not args.config or args.all_configs):
+        raise SystemExit("--test-spec requires one explicit --config")
+    if topology is not None and (not args.config or args.all_configs or args.test != ["inference-checkpoint-loss"]):
+        raise SystemExit("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
     if getattr(args, "out", None) is None:
         args.out = correctness_workdir("ap-correctness-run-")
     backend = _client_backend(args)
@@ -343,6 +357,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     if local_fixture or local_full_model:
         require_local_cortex_gateway(backend)
     config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)
+    if test_spec is not None and len(config_paths) != 1:
+        raise SystemExit("--test-spec requires exactly one resolved config")
     results: List[TestResult] = []
     specs: Dict[str, TestSpec] = {}
     execution: Dict[str, dict] = {}
@@ -357,6 +373,13 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     for path in config_paths:
         try:
             cfg = load_config(path)
+            if topology is not None:
+                from types import SimpleNamespace
+
+                from ..checks.inference_checkpoint_loss import _sampling_topology
+
+                topology = tuple(topology)
+                _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=topology))
             execution[cfg.config_id] = {
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
@@ -370,7 +393,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             # Both are read from the config as written. The cases belong to the reviewed spec and do not
             # move with the placement, so every width measures the same work on a different topology.
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = [cfg.n_gpus] if local_fixture or local_full_model else placement_widths(cfg.n_gpus, pool)
+            widths = (
+                [cfg.n_gpus]
+                if local_fixture or local_full_model or topology is not None
+                else placement_widths(cfg.n_gpus, pool)
+            )
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -406,6 +433,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 cases=None,
                 results=results,
                 specs=specs,
+                test_spec=test_spec,
             )
             if prepared is None:
                 continue
@@ -437,6 +465,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             cases=getattr(args, "case", None),
             results=results,
             specs=specs,
+            test_spec=test_spec,
         )
         if prepared is None:
             continue
@@ -536,6 +565,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
                     **({"local_cortex_fixture": True} if local_fixture else {}),
                     **({"local_gateway_full_model": True} if local_full_model else {}),
+                    **({"inference_sampling_topology": topology} if topology is not None else {}),
                     **(
                         {"reference_records_dir": Path(args.reference_records_dir)}
                         if getattr(args, "reference_records_dir", None) is not None
@@ -818,6 +848,17 @@ def cmd_publish_fixture(args) -> int:
     return 0
 
 
+def add_connection_arguments(parser, *, default_backend="cortex"):
+    parser.add_argument("--backend", choices=["cortex", "onprem"], default=default_backend)
+    parser.add_argument("--host", help="Snowflake account host; otherwise ARCTIC_CORTEX_HOST")
+    parser.add_argument("--database", help="Snowflake database; otherwise ARCTIC_CORTEX_DATABASE")
+    parser.add_argument("--schema", help="Snowflake schema; otherwise ARCTIC_CORTEX_SCHEMA")
+    parser.add_argument("--endpoint", help="SnowAPI endpoint; default cortex-training")
+    parser.add_argument("--base-url", help="direct Cortex development URL without PAT authentication")
+    parser.add_argument("--pat-file", help="PAT file; otherwise ARCTIC_CORTEX_PAT, never logged")
+    parser.add_argument("--gpu-pool", type=int, help="remote training GPU placement pool; default declared width")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="arctic_platform.correctness")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -850,19 +891,19 @@ def parse_args(argv=None):
             ),
         )
 
-    def connection(p):
-        p.add_argument("--backend", choices=["cortex", "onprem"], default="cortex")
-        p.add_argument("--host", help="Snowflake account host; otherwise ARCTIC_CORTEX_HOST")
-        p.add_argument("--database", help="Snowflake database; otherwise ARCTIC_CORTEX_DATABASE")
-        p.add_argument("--schema", help="Snowflake schema; otherwise ARCTIC_CORTEX_SCHEMA")
-        p.add_argument("--endpoint", help="SnowAPI endpoint; default cortex-training")
-        p.add_argument("--base-url", help="direct Cortex development URL without PAT authentication")
-        p.add_argument("--pat-file", help="PAT file; otherwise ARCTIC_CORTEX_PAT, never logged")
-        p.add_argument("--gpu-pool", type=int, help="remote training GPU placement pool; default declared width")
-
     r = sub.add_parser("run", help="run tests over the config-by-test matrix")
     shared(r)
-    connection(r)
+    add_connection_arguments(r)
+    r.add_argument(
+        "--test-spec", type=Path, help="reviewed private spec for one explicit config; integrity checks apply"
+    )
+    r.add_argument(
+        "--inference-sampling-topology",
+        type=int,
+        nargs=3,
+        metavar=("GPUS", "TP", "PP"),
+        help="explicit original Flash-Next16 sampling allocation, tensor parallelism and pipeline parallelism",
+    )
     r.add_argument("--test", action="append", help="test id (repeatable); default every applicable test")
     r.add_argument(
         "--case",
@@ -915,7 +956,7 @@ def parse_args(argv=None):
         help="run Arctic Platform-against-Arctic Platform checks on the hosted server, which supplies the GPUs",
     )
     shared(h)
-    connection(h)
+    add_connection_arguments(h)
     h.add_argument(
         "--test",
         action="append",

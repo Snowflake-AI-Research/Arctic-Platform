@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,6 +331,493 @@ def test_config_gpu_attention_flash_next_cortex_wire_preserves_all_training_fiel
             },
         }
     ]
+
+
+# Flash 256k source recipes.
+
+
+_FLASH_RECIPE_PATHS = {
+    "glm53-flash-bf16-rl-32gpus-256k": "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config",
+    "glm53-flash-bf16-sft-16gpus-256k": "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config",
+    "glm53-flash-lora-rl-16gpus-256k": "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
+    "glm53-flash-lora-sft-8gpus-256k": "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
+    "qwen38-flash-next-sft-16gpus-256k": "qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config",
+}
+
+
+@pytest.mark.parametrize(
+    ("relative", "target", "reference"),
+    [
+        *[(path, "sparse_mla", "sdpa") for recipe, path in _FLASH_RECIPE_PATHS.items() if recipe.startswith("glm53")],
+        (_FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"], "qsa_flex", "qsa_flex"),
+        ("qwen3-8b/h200/train-sft-full-4gpus-64k.config", "flash_attention_3", "flash_attention_3"),
+    ],
+)
+def test_reference_attention_preserves_native_recipe_and_target_backend(relative, target, reference):
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / relative)
+    before = deepcopy(config.native.model_dump(mode="json"))
+    checksum = config_checksum(config)
+    assert config.reference_attention_implementation == reference
+    assert config.attention_implementation == target
+    assert config.native.model_dump(mode="json") == before
+    assert config_checksum(config) == checksum
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"])
+def test_reference_attention_does_not_bypass_invalid_glm_target(tmp_path, model):
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="requires attn_implementation='sparse_mla'"):
+        _ = load_config(path).reference_attention_implementation
+
+
+def _flash_source_recipe(recipe: str) -> tuple[str, dict, dict | None]:
+    """Independent source semantics; selftests do not require the external clone."""
+    qwen = recipe.startswith("qwen38")
+    lora = "-lora-" in recipe
+    rl = "-rl-" in recipe
+    width = 8 if lora else 16
+    model = "Qwen/Qwen3.8-Flash-Next" if qwen else "zai-org/GLM-5.3-Flash" + ("" if lora else "-BF16")
+    optimizer = {
+        "name": "AdamW",
+        "lr": 0.0001 if lora else 2e-05,
+        "weight_decay": 0.0,
+        "betas": [0.9, 0.999],
+        "eps": 1e-08,
+    }
+    bf16 = {"enabled": True}
+    if not qwen:
+        bf16.update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    training = {
+        "n_gpus": width,
+        "max_seq_len": 262144,
+        "train_batch_size": 1,
+        "gradient_clipping": 1.0,
+        "model_provider": "prime_rl",
+        "attn_implementation": "qsa_flex" if qwen else "sparse_mla",
+        "cuda_allocator_conf": "expandable_segments:True",
+        "activation_checkpointing": True,
+        "sp_size": width,
+        "ep_size": 8 if qwen else width,
+        "ep_group_layout": "auto",
+        "mb_spec": {"max_tokens_per_mb": 262144},
+        "ac_config": {
+            "mode": "full",
+            "freq": 1,
+            "router_replay_recompute": True,
+            "offload_config": {
+                "enabled": not qwen,
+                "keep_last_n": 1,
+                "use_streams": True,
+                "pin_memory_enabled": True,
+                "pin_memory_max_size_gib": "auto",
+                "pin_memory_bucket_size_mib": 64,
+            },
+        },
+        "tiled_mlp_token_chunk_size": None if qwen else 1024,
+        "step_peak_memory_log": True,
+        "optimizer": optimizer,
+        "ds_config": {
+            "train_batch_size": 1,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": 1,
+            "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+            "bf16": bf16,
+        },
+    }
+    peft = None
+    if lora:
+        peft = {
+            "peft_type": "Lora",
+            "r": 32,
+            "lora_alpha": 32,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"],
+        }
+        training["peft_config"] = peft
+    if qwen:
+        training.update(deepep_token_chunk_size=8192, fp32_lm_head=False, training_memory_telemetry=False)
+    elif lora:
+        training["prime_rl"] = {
+            "ep_comm_backend": "deepep",
+            "deepep_token_chunk_size": 8192,
+            "fused_cross_entropy": False if rl else "liger",
+        }
+        training["model_options"] = {"lm_head": {"cross_entropy": False if rl else "liger"}}
+        if rl:
+            training["prime_rl"]["fused_lm_head_token_chunk_size"] = 4096
+            training["model_options"]["lm_head"]["token_chunk_size"] = 4096
+    else:
+        training["prime_rl"] = {
+            "ep_comm_backend": "uccl",
+            "fused_cross_entropy": False if rl else "liger",
+            "deepep_token_chunk_size": 1024 if rl else 3072,
+        }
+        training["model_options"] = {"moe": {"comm_token_chunk": 1024 if rl else 3072}}
+        if rl:
+            training["prime_rl"]["fused_lm_head_token_chunk_size"] = 1024
+            training["model_options"]["lm_head"] = {"token_chunk_size": 1024}
+        else:
+            training["model_options"]["lm_head"] = {"cross_entropy": "liger"}
+    sampling = None
+    if rl:
+        vllm = {"tensor_parallel_size": width, "trust_remote_code": True, "gpu_memory_utilization": 0.8}
+        if lora:
+            vllm["extra_engine_kwargs"] = {"attention_config": {"backend": "FLASHINFER_MLA_SPARSE_SM90"}}
+        sampling = {"n_gpus": width, "max_seq_len": 262144, "vllm_config": vllm}
+        if peft is not None:
+            sampling["peft_config"] = deepcopy(peft)
+    return model, training, sampling
+
+
+@pytest.mark.parametrize("recipe", _FLASH_RECIPE_PATHS)
+def test_flash_recipe_native_conversion_preserves_complete_source_semantics(recipe: str) -> None:
+    model, training, sampling = _flash_source_recipe(recipe)
+    path = Path(__file__).resolve().parents[1] / "configs" / _FLASH_RECIPE_PATHS[recipe]
+    native = load_config(path).native
+    expected_sampling = deepcopy(sampling)
+    if expected_sampling is not None and "peft_config" in expected_sampling:
+        assert expected_sampling.pop("peft_config") == training["peft_config"]
+    expected = _config_factory_native_config(training, model_name=model, sampling=expected_sampling)
+    expected["backend"] = {
+        "type": "remote",
+        "protocol": "cortex",
+        "base_url": "http://127.0.0.1:8003",
+        "database": "dev",
+        "schema": "dev",
+    }
+    assert native.model_dump(mode="json") == ArcticClientConfig.model_validate(expected).model_dump(mode="json")
+    raw = json.loads(path.read_text())
+    assert native.model_dump(mode="json", by_alias=True, exclude_unset=True) == raw
+    total_gpus = 32 if "-rl-32gpus-" in recipe else (16 if "-16gpus-" in recipe else 8)
+    assert native.training_gpus + native.sampling_gpus == total_gpus
+    assert native.max_seq_len == 262144
+    config = load_config(path)
+    validate_against_host(config, available_gpus=native.training_gpus, check_gpu_type=False)
+    assert config.attention_implementation == ("qsa_flex" if recipe.startswith("qwen38") else "sparse_mla")
+
+
+@pytest.mark.parametrize("recipe", _FLASH_RECIPE_PATHS)
+def test_flash_recipe_correctness_wire_retains_all_training_knobs(recipe: str) -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    model, training, _ = _flash_source_recipe(recipe)
+    path = Path(__file__).resolve().parents[1] / "configs" / _FLASH_RECIPE_PATHS[recipe]
+    native = load_config(path).native
+    wire = CortexTrainingConfig.model_validate(native.model_dump(mode="json")).to_cortex()
+    actual = next(sub for sub in wire if sub["job_type"] == "training")
+    expected = deepcopy(training)
+    expected["ds_config"].update(
+        gradient_clipping=training["gradient_clipping"],
+        optimizer={
+            "type": training["optimizer"]["name"],
+            "params": {key: value for key, value in training["optimizer"].items() if key != "name"},
+        },
+    )
+    expected["debug"] = {"full_determinism": False}
+    assert actual == {
+        "job_type": "training",
+        "model_name": model,
+        "dtype": "bfloat16",
+        "seed": 42,
+        "training_config": expected,
+    }
+    if native.training.peft is not None and native.sampling_gpus:
+        sampling = next(sub for sub in wire if sub["job_type"] == "sampling")
+        assert sampling["inference_config"]["peft_config"] == native.training.peft
+
+
+@pytest.mark.parametrize("location", ["client", "training", "sampling"])
+def test_flash_recipe_public_schema_rejects_unrepresentable_weight_format(location: str) -> None:
+    from pydantic import ValidationError
+
+    raw = {"model_name": "Qwen/Qwen3.8-Flash-Next"}
+    if location == "client":
+        raw["weight_format"] = "vllm"
+    else:
+        raw[location] = {"weight_format": "vllm"}
+    with pytest.raises(ValidationError) as failure:
+        ArcticClientConfig.model_validate(raw)
+    assert any(
+        error["loc"][-1] == "weight_format" and error["type"] == "extra_forbidden" for error in failure.value.errors()
+    )
+
+
+def test_flash_recipe_qwen_rl_sampling16_tp8_cannot_use_single_engine_override() -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    raw = {
+        "model_name": "Qwen/Qwen3.8-Flash-Next",
+        "max_seq_len": 262144,
+        "sampling_gpus": 16,
+        "sampling": {
+            "vllm": {"tensor_parallel_size": 8},
+            "arctic_inference_config": {"router_replay": {"enabled": True, "max_cache_bytes": 17179869184}},
+        },
+        "backend": {"type": "remote", "base_url": "http://127.0.0.1:8003"},
+    }
+    native = ArcticClientConfig.model_validate(raw)
+    assert native.sampling.vllm["tensor_parallel_size"] == 8
+    assert native.sampling.arctic_inference_config["router_replay"]["max_cache_bytes"] == 17179869184
+    with pytest.raises(ValueError, match="allocation must equal tensor times pipeline parallelism"):
+        CortexTrainingConfig.model_validate({**raw, "inference_tensor_parallel_size": 8})
+
+
+_CORRECTNESS_QWEN_FLASH_PATHS = {
+    "sft8": "qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config",
+    "rl32": "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config",
+}
+
+
+def _correctness_qwen_flash_source(recipe):
+    model, training, _ = _flash_source_recipe("qwen38-flash-next-sft-16gpus-256k")
+    for key in ("tiled_mlp_token_chunk_size", "deepep_token_chunk_size", "fp32_lm_head", "training_memory_telemetry"):
+        training.pop(key)
+    training["ac_config"]["offload_config"]["enabled"] = True
+    sampling = None
+    if recipe == "sft8":
+        training.update(n_gpus=8, sp_size=8)
+        training["ds_config"]["bf16"].update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    else:
+        training.pop("model_provider")
+        training.update(
+            router_replay={"enabled": True, "max_cache_bytes": 2147483648},
+            prime_rl={"fused_cross_entropy": False, "seq_len": 262144},
+            fused_lm_head_token_chunk_size=1024,
+            fused_lm_head_vocab_chunk_size=8192,
+        )
+        sampling = {
+            "n_gpus": 16,
+            "max_seq_len": 262144,
+            "num_replicas": 2,
+            "router_replay": {"enabled": True, "max_cache_bytes": 17179869184},
+            "vllm_config": {
+                "tensor_parallel_size": 8,
+                "trust_remote_code": True,
+                "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 16,
+                "distributed_executor_backend": "mp",
+                "enable_chunked_prefill": True,
+                "max_num_batched_tokens": 8192,
+                "enforce_eager": False,
+                "enable_return_routed_experts": True,
+                "enable_prefix_caching": True,
+                "gdn_prefill_backend": "triton",
+                "reasoning_parser": "qwen3",
+                "extra_engine_kwargs": {"disable_custom_all_reduce": True},
+            },
+        }
+    subjobs = [
+        {
+            "job_type": "training",
+            "model_name": model,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "weight_format": "vllm",
+            "training_config": training,
+        }
+    ]
+    if sampling is not None:
+        subjobs.append(
+            {
+                "job_type": "sampling",
+                "model_name": model,
+                "dtype": "bfloat16",
+                "seed": 42,
+                "weight_format": "vllm",
+                "inference_config": sampling,
+            }
+        )
+    return subjobs
+
+
+def _correctness_qwen_flash_config(recipe):
+    return load_config(Path(__file__).resolve().parents[1] / "configs" / _CORRECTNESS_QWEN_FLASH_PATHS[recipe])
+
+
+@pytest.mark.parametrize("recipe", _CORRECTNESS_QWEN_FLASH_PATHS)
+def test_correctness_subjob_weight_formats_round_trip(recipe):
+    config = _correctness_qwen_flash_config(recipe)
+    expected = _correctness_qwen_flash_source(recipe)
+    training = expected[0]["training_config"]
+    training["ds_config"].update(
+        gradient_clipping=training["gradient_clipping"],
+        optimizer={
+            "type": training["optimizer"]["name"],
+            "params": {key: value for key, value in training["optimizer"].items() if key != "name"},
+        },
+    )
+    assert config.sub_jobs == expected
+    raw = json.loads(config.path.read_text())
+    assert config.native.model_dump(mode="json", by_alias=True, exclude_unset=True) == raw
+    assert config.native.training.weight_format == "vllm"
+    if recipe == "rl32":
+        assert config.native.sampling.weight_format == "vllm"
+    validate_against_host(config, available_gpus=config.n_gpus, check_gpu_type=False)
+
+
+@pytest.mark.parametrize("recipe", _CORRECTNESS_QWEN_FLASH_PATHS)
+def test_correctness_sampling_replicas_wire(recipe):
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    config = _correctness_qwen_flash_config(recipe)
+    before = config.native.model_dump(mode="json")
+    adapted = CortexTrainingConfig.from_reviewed(config.native)
+    actual = {sub["job_type"]: sub for sub in adapted.to_cortex()}
+    expected = {sub["job_type"]: sub for sub in _correctness_qwen_flash_source(recipe)}
+    training = expected["training"]["training_config"]
+    training["ds_config"].update(
+        gradient_clipping=training["gradient_clipping"],
+        optimizer={
+            "type": training["optimizer"]["name"],
+            "params": {key: value for key, value in training["optimizer"].items() if key != "name"},
+        },
+    )
+    training["debug"] = {"full_determinism": False}
+    assert actual == expected
+    assert config.native.model_dump(mode="json") == before
+    assert config_checksum(config) == config_checksum(load_config(config.path))
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "error"),
+    [
+        (("arctic_inference_config", "num_replicas"), True, "positive integer"),
+        (("arctic_inference_config", "num_replicas"), 0, "positive integer"),
+        (("arctic_inference_config", "num_replicas"), 3, "replicas times tensor"),
+        (("vllm", "tensor_parallel_size"), True, "integer"),
+        (("vllm", "pipeline_parallel_size"), True, "positive integer"),
+        (("arctic_inference_config", "router_replay", "max_cache_bytes"), -1, "positive integer"),
+        (("arctic_inference_config", "router_replay", "enabled"), 1, "boolean"),
+        (("arctic_inference_config", "router_replay", "mode"), "best_effort", "must be strict"),
+        (("arctic_inference_config", "n_gpus"), 16, "unsupported Cortex inference fields"),
+    ],
+)
+def test_correctness_sampling_replicas_reject_invalid_recipe(path, value, error):
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    config = _correctness_qwen_flash_config("rl32")
+    raw = config.native.model_dump()
+    target = raw["sampling"]
+    for component in path[:-1]:
+        target = target[component]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=error):
+        CortexTrainingConfig.from_reviewed(type(config.native).model_validate(raw))
+
+
+def test_correctness_sampling_replicas_preserve_log_probability_single_engine_guard():
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    config = _correctness_qwen_flash_config("rl32")
+    with pytest.raises(ValueError, match="replicas times tensor"):
+        CortexTrainingConfig.from_reviewed(config.native, log_prob_gpus=16)
+
+
+def test_correctness_subjob_weight_formats_reject_mismatched_pair_and_onprem(monkeypatch):
+    from arctic_platform.client import OnPremConfig
+    from arctic_platform.correctness.harness import cortex
+
+    config = _correctness_qwen_flash_config("rl32")
+    training = config.native.training.model_copy(update={"weight_format": "hf"})
+    with pytest.raises(ValueError, match="weight formats must agree"):
+        cortex.CortexTrainingConfig.from_reviewed(config.native, training=training)
+    onprem = type(config.native).model_validate({**config.native.model_dump(), "backend": OnPremConfig()})
+    monkeypatch.setattr(cortex.ArcticClient, "__init__", lambda *args: pytest.fail("unsupported route launched"))
+    with pytest.raises(ValueError, match="require the Cortex correctness route"):
+        cortex.CorrectnessClient(onprem)
+
+
+def test_correctness_subjob_weight_formats_preserve_implicit_defaults_and_checksum(tmp_path):
+    import hashlib
+
+    from arctic_platform.correctness.harness.config import ReviewedClientConfig
+    from arctic_platform.correctness.harness.config import normalize_ints
+
+    path = Path(__file__).resolve().parents[1] / "configs" / _FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"]
+    raw = normalize_ints(json.loads(path.read_text()))
+    public = ArcticClientConfig.model_validate(raw)
+    reviewed = ReviewedClientConfig.model_validate(raw)
+    assert reviewed.model_dump(mode="json") == public.model_dump(mode="json")
+    projection = {
+        key: public.model_dump(mode="json")[key]
+        for key in ("model_name", "seed", "dtype", "max_seq_len", "training_gpus", "training")
+    }
+    expected_checksum = hashlib.sha256(
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert config_checksum(load_config(path)) == expected_checksum
+    raw["training"]["weight_format"] = "vllm"
+    changed = tmp_path / "explicit.config"
+    changed.write_text(json.dumps(raw))
+    assert config_checksum(load_config(changed)) != expected_checksum
+
+
+def test_correctness_sampling_replicas_checksum_binds_inference_recipe(tmp_path):
+    config = _correctness_qwen_flash_config("rl32")
+    before = config_checksum(config)
+    raw = json.loads(config.path.read_text())
+    raw["sampling"]["arctic_inference_config"]["router_replay"]["max_cache_bytes"] += 1
+    path = tmp_path / "changed.config"
+    path.write_text(json.dumps(raw))
+    assert config_checksum(load_config(path)) != before
+
+
+def test_correctness_subjob_weight_formats_constructor_revalidates_public_nested_update():
+    from arctic_platform.client import TrainingConfig
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    config = _correctness_qwen_flash_config("rl32")
+    raw = config.native.training.model_dump()
+    raw.pop("weight_format")
+    training = TrainingConfig.model_validate(raw)
+    updated = CortexTrainingConfig.from_reviewed(config.native, training=training)
+    assert updated.training.model_dump() == training.model_dump()
+    assert updated.sampling.model_dump() == config.native.sampling.model_dump()
+    assert updated.inference_tensor_parallel_size == 8
+
+
+def test_correctness_subjob_weight_formats_hosted_builder_forwarding(monkeypatch):
+    from arctic_platform.correctness.harness import hosted
+
+    observed = []
+    monkeypatch.setattr(
+        hosted, "_training_client_config", lambda session, payload: observed.append(payload) or SimpleNamespace()
+    )
+    config = _correctness_qwen_flash_config("sft8")
+    hosted.training_client_config(config, config.native.backend)
+    assert observed[0]["weight_format"] == "vllm"
+
+
+def test_correctness_sampling_replicas_client_selects_faithful_adapter(monkeypatch):
+    from arctic_platform.correctness.harness import cortex
+
+    observed = []
+    monkeypatch.setattr(cortex, "require_any_dep_group", lambda *args: None)
+    monkeypatch.setattr(cortex, "CorrectnessCortexTransport", lambda backend: SimpleNamespace(backend=backend))
+    monkeypatch.setattr(
+        cortex,
+        "initialize_or_cleanup",
+        lambda transport, *, client_config: observed.append(client_config.to_cortex()) or SimpleNamespace(),
+    )
+    config = _correctness_qwen_flash_config("rl32")
+    client = cortex.CorrectnessClient(config.native)
+    assert client.config.inference_tensor_parallel_size == 8
+    sampling = next(sub for sub in observed[0] if sub["job_type"] == "sampling")
+    assert sampling == _correctness_qwen_flash_source("rl32")[1]
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"])
+def test_flash_recipe_glm_rejects_generic_h200_attention(tmp_path: Path, model: str) -> None:
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="requires attn_implementation='sparse_mla'"):
+        validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
 
 
 # Config tolerance.
@@ -890,3 +1378,206 @@ def test_spec_model_hash_keeps_tokenizer_metadata_in_identity(tmp_path: Path) ->
     expected = hash_directory(tmp_path)
     (tmp_path / "tokenizer_config.json").write_text("tokenizer")
     assert hash_directory(tmp_path) != expected
+
+
+# Reference-free RL onboarding.
+
+
+def _rl_bootstrap_case(monkeypatch, tmp_path, recipe="glm53-flash-bf16-rl-32gpus-256k"):
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.onboarding import onboard
+    from arctic_platform.correctness.onboarding import synth_model
+
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / _FLASH_RECIPE_PATHS[recipe])
+    package = tmp_path / "package"
+    monkeypatch.setattr(onboard, "__file__", str(package / "onboarding" / "onboard.py"))
+    monkeypatch.setattr(onboard, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(onboard, "_model_shape", lambda source: (48, 4, 4))
+    calls = []
+
+    def materialize(source, destination, layers):
+        calls.append((source, destination, layers))
+        return ModelSpec(
+            source_checkpoint=source,
+            num_hidden_layers=layers,
+            vision_depth=2,
+            seed=42,
+            param_count=100,
+            cache_path=destination,
+            content_hash="synthetic-only",
+            sized_against_gib=0.0,
+        )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("reference-free bootstrap must not size or calibrate a supervised reference")
+
+    monkeypatch.setattr(synth_model, "materialize_pretrained", materialize)
+    monkeypatch.setattr(synth_model, "size_for_single_gpu", unexpected)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(vocab_size=128))
+    monkeypatch.setattr(onboard, "_run_probe", unexpected)
+    monkeypatch.setattr(onboard, "_render_and_run_calibration", unexpected)
+    output = tmp_path / "output"
+    output.mkdir()
+    args = SimpleNamespace(
+        config=config.path,
+        test_id="rl-weight-sync",
+        test_spec=package / "specs" / f"{config.config_id}.json",
+        source_checkpoint=config.model_name,
+        cache_root=tmp_path / "cache",
+        output_dir=output,
+        tokens=arms_for(config.max_seq_len, config.n_gpus)[0].max_seq_len,
+    )
+    return onboard, args, config, calls
+
+
+def _rl_bootstrap_validation(status="pass"):
+    return {
+        "status": status,
+        "log": "/synthetic-only/run.log",
+        "report": "/synthetic-only/report.json" if status == "pass" else None,
+    }
+
+
+@pytest.mark.parametrize("recipe", ["glm53-flash-bf16-rl-32gpus-256k", "glm53-flash-lora-rl-16gpus-256k"])
+def test_rl_bootstrap_materializes_cases_without_reference_calibration(monkeypatch, tmp_path, recipe):
+    from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
+    from arctic_platform.correctness.harness.registry import reference_tests
+
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path, recipe)
+    native_before = deepcopy(config.native.model_dump(mode="json"))
+    seen = []
+
+    def validate(run_args, selected, **kwargs):
+        spec = ConfigSpec.read(run_args.test_spec)
+        assert spec.applicable_tests == [args.test_id]
+        assert spec.config_checksum == config_checksum(config)
+        assert spec.model.num_hidden_layers == selected["layers"] == 4
+        assert spec.model.measured_reference_peak_gib is None
+        assert spec.test_tolerances == spec.test_settings == {}
+        assert spec.inapplicable == {name: RL_INAPPLICABLE_REASON for name in reference_tests()}
+        assert [arm.name for arm in spec.arms] == ["gas1", "gas4"]
+        assert [arm.global_batch_size for arm in spec.arms] == [config.n_gpus, 4 * config.n_gpus]
+        assert all(arm.max_seq_len == args.tokens and arm.active_tokens > 0 for arm in spec.arms)
+        seen.append(selected)
+        return _rl_bootstrap_validation()
+
+    monkeypatch.setattr(onboard, "_run_final_regression", validate)
+    assert onboard._onboard_fixed_tolerance_test(args, config) == 0
+    assert seen == [{"layers": 4}]
+    assert calls == [(config.model_name, str(args.cache_root / f"{Path(config.model_name).name}-4L"), 4)]
+    assert config.native.model_dump(mode="json") == native_before
+    manifest = json.loads((args.output_dir / f"onboarding-{args.test_id}.json").read_text())
+    assert manifest["bootstrapped_reference_free_rl"] is True
+    assert manifest["already_listed_before_this_run"] is False
+    assert manifest["validated_report"] == "/synthetic-only/report.json"
+
+
+@pytest.mark.parametrize("status", ["failed", "oom"])
+def test_rl_bootstrap_failed_validation_retains_draft_outside_catalog(monkeypatch, tmp_path, status):
+    onboard, args, config, _ = _rl_bootstrap_case(monkeypatch, tmp_path)
+    monkeypatch.setattr(onboard, "_run_final_regression", lambda *a, **kw: _rl_bootstrap_validation(status))
+    with pytest.raises(RuntimeError, match=f"rl-weight-sync {status}"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert not args.test_spec.exists()
+    failed = list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+    assert len(failed) == 1
+    assert ConfigSpec.read(failed[0]).config_checksum == config_checksum(config)
+    assert not (args.output_dir / f"onboarding-{args.test_id}.json").exists()
+
+
+def test_rl_bootstrap_validation_exception_does_not_publish_spec(monkeypatch, tmp_path):
+    onboard, args, config, _ = _rl_bootstrap_case(monkeypatch, tmp_path)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(onboard, "_run_final_regression", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert not args.test_spec.exists()
+    assert len(list(args.output_dir.glob("unvalidated-rl-spec-*.json"))) == 1
+
+
+def test_rl_bootstrap_materialization_failure_publishes_nothing(monkeypatch, tmp_path):
+    from arctic_platform.correctness.onboarding import synth_model
+
+    onboard, args, config, _ = _rl_bootstrap_case(monkeypatch, tmp_path)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("materialization failed")
+
+    monkeypatch.setattr(synth_model, "materialize_pretrained", fail)
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert not args.test_spec.exists()
+    assert not list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+
+
+def test_rl_bootstrap_custom_spec_destination_is_refused_before_materialization(monkeypatch, tmp_path):
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    args.test_spec = tmp_path / "custom-spec.json"
+    with pytest.raises(ValueError, match="regression reads the canonical spec"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert calls == []
+    assert not args.test_spec.exists()
+
+
+def test_rl_bootstrap_custom_case_width_is_refused_before_materialization(monkeypatch, tmp_path):
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    args.tokens = 256
+    with pytest.raises(ValueError, match="would not match the regression cases"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert calls == []
+    assert not args.test_spec.exists()
+
+
+def test_rl_bootstrap_reference_check_is_refused_before_materialization(monkeypatch, tmp_path):
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    args.test_id = "single-step-grads"
+    with pytest.raises(ValueError, match="reference-free"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert calls == []
+    assert not args.test_spec.exists()
+
+
+def test_rl_bootstrap_existing_spec_is_not_rematerialized_or_recalibrated(monkeypatch, tmp_path):
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    spec = _applicable_tests_spec(["rl-router-replay"])
+    spec.config_id = config.config_id
+    spec.config_checksum = config_checksum(config)
+    before = json.loads(spec.to_json())
+    spec.write(args.test_spec)
+    monkeypatch.setattr(onboard, "_run_final_regression", lambda *a, **kw: _rl_bootstrap_validation())
+    assert onboard._onboard_fixed_tolerance_test(args, config) == 0
+    after = json.loads(args.test_spec.read_text())
+    assert after.pop("applicable_tests") == ["rl-router-replay", "rl-weight-sync"]
+    before.pop("applicable_tests")
+    assert after == before
+    assert calls == []
+    manifest = json.loads((args.output_dir / f"onboarding-{args.test_id}.json").read_text())
+    assert manifest["bootstrapped_reference_free_rl"] is False
+
+
+def test_rl_bootstrap_stale_existing_spec_is_not_restamped(monkeypatch, tmp_path):
+    onboard, args, config, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    spec = _applicable_tests_spec(["rl-router-replay"])
+    spec.config_id = config.config_id
+    spec.config_checksum = "stale"
+    spec.write(args.test_spec)
+    before = args.test_spec.read_bytes()
+    with pytest.raises(ValueError, match="neither re-stamps the checksum"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert args.test_spec.read_bytes() == before
+    assert calls == []
+
+
+def test_rl_bootstrap_sft_missing_spec_still_requires_reviewed_spec(monkeypatch, tmp_path):
+    onboard, args, _, calls = _rl_bootstrap_case(monkeypatch, tmp_path)
+    config = load_config(
+        Path(__file__).resolve().parents[1] / "configs" / _FLASH_RECIPE_PATHS["glm53-flash-bf16-sft-16gpus-256k"]
+    )
+    args.test_id = "inference-checkpoint-loss"
+    with pytest.raises(ValueError, match="requires an existing reviewed spec"):
+        onboard._onboard_fixed_tolerance_test(args, config)
+    assert calls == []

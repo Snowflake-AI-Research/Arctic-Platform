@@ -32,9 +32,60 @@ from pathlib import Path
 from typing import Any
 from typing import Dict
 from typing import List
+from typing import Literal
 from typing import Optional
 
+from pydantic import Field
+from pydantic import model_serializer
+
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import SamplingConfig
+from arctic_platform.client.config import TrainingConfig
+
+
+class ReviewedTrainingConfig(TrainingConfig):
+    weight_format: Literal["vllm", "hf", "lora"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.weight_format is None:
+            result.pop("weight_format", None)
+        return result
+
+
+class ReviewedSamplingConfig(SamplingConfig):
+    weight_format: Literal["vllm", "hf", "lora"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        result = handler(self)
+        if self.weight_format is None:
+            result.pop("weight_format", None)
+        return result
+
+
+class ReviewedClientConfig(ArcticClientConfig):
+    """Correctness-only sub-job fields; public client defaults remain unchanged."""
+
+    training: ReviewedTrainingConfig = Field(default_factory=ReviewedTrainingConfig)
+    sampling: ReviewedSamplingConfig = Field(default_factory=ReviewedSamplingConfig)
+
+    def _cortex_sub_job(self, job_type: str, extra: dict[str, Any]) -> dict[str, Any]:
+        sub = super()._cortex_sub_job(job_type, extra)
+        settings = self.training if job_type == "training" else self.sampling
+        if settings.weight_format is not None:
+            sub["weight_format"] = settings.weight_format
+        return sub
+
+    def to_onprem(self, job_type: str) -> dict[str, Any]:
+        settings = self.training if job_type == "training" else self.sampling
+        if (
+            settings.weight_format is not None
+            or (self.sampling.arctic_inference_config or {}).get("num_replicas") is not None
+        ):
+            raise ValueError("reviewed weight formats and explicit replicas require the Cortex correctness route")
+        return super().to_onprem(job_type)
 
 
 @dataclass
@@ -192,6 +243,12 @@ GPU_ATTENTION_IMPLEMENTATIONS = {
 }
 MODEL_ATTENTION_IMPLEMENTATIONS = {
     "Qwen/Qwen3.8-Flash-Next": "qsa_flex",
+    "zai-org/GLM-5.3-Flash": "sparse_mla",
+    "zai-org/GLM-5.3-Flash-BF16": "sparse_mla",
+}
+MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS = {
+    "zai-org/GLM-5.3-Flash": "sdpa",
+    "zai-org/GLM-5.3-Flash-BF16": "sdpa",
 }
 
 
@@ -379,6 +436,12 @@ class LoadedConfig:
         )
 
     @property
+    def reference_attention_implementation(self) -> str:
+        """Use upstream GLM's top-k SDPA mask without changing AP's sparse-MLA target."""
+        target = self.attention_implementation
+        return MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS.get(self.model_name, target)
+
+    @property
     def max_seq_len(self) -> int:
         """The padded row width the config declares, or the one the training engine would supply for it.
 
@@ -483,6 +546,9 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
         "seed": native.seed,
         "training_config": training,
     }
+    training_weight_format = getattr(native.training, "weight_format", None)
+    if training_weight_format is not None:
+        training_sub["weight_format"] = training_weight_format
     sub_jobs = [training_sub]
     if native.sampling_gpus > 0:
         inference = {
@@ -501,6 +567,9 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
                 "inference_config": inference,
             }
         )
+        sampling_weight_format = getattr(native.sampling, "weight_format", None)
+        if sampling_weight_format is not None:
+            sub_jobs[-1]["weight_format"] = sampling_weight_format
     return training_sub, sub_jobs
 
 
@@ -511,7 +580,7 @@ def load_config(path: str | Path) -> LoadedConfig:
     if isinstance(backend, dict) and backend.get("type") == "onprem" and backend.get("protocol") == "ray":
         # Retained reviewed recipes predate the public client's single on-prem protocol.
         backend.pop("protocol")
-    native = ArcticClientConfig.model_validate(raw)
+    native = ReviewedClientConfig.model_validate(raw)
     training, sub_jobs = _legacy_views(native)
     return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs, native=native)
 
@@ -525,6 +594,11 @@ def config_checksum(config: LoadedConfig) -> str:
         projection = {
             key: raw[key] for key in ("model_name", "seed", "dtype", "max_seq_len", "training_gpus", "training")
         }
+        if (
+            getattr(config.native.sampling, "weight_format", None) is not None
+            or (config.native.sampling.arctic_inference_config or {}).get("num_replicas") is not None
+        ):
+            projection.update({key: raw[key] for key in ("sampling_gpus", "sampling")})
         canonical = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 

@@ -132,20 +132,14 @@ def training_client_config(
     # DSS schedules request-wide accumulation from mb_spec, not the engine GAS.
     payload["dtype"] = cfg.sub_job.get("dtype") or payload["dtype"]
     payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
+    if "weight_format" in cfg.sub_job:
+        payload["weight_format"] = cfg.sub_job["weight_format"]
     client_config = _training_client_config(GatewaySession(Path("."), cfg.n_gpus, backend), payload)
     if source_checkpoint_info is not None:
         client_config = type(client_config).model_validate(
             {**client_config.model_dump(), "source_checkpoint_info": source_checkpoint_info}
         )
     return client_config
-
-
-def training_sub_job(cfg: LoadedConfig, *, source_checkpoint_info: dict | None = None) -> dict:
-    """Compatibility helper exposing the unified client's create-job wire."""
-    config = training_client_config(
-        cfg, CortexConfig(base_url="http://unused"), source_checkpoint_info=source_checkpoint_info
-    )
-    return config.to_cortex()[0]
 
 
 def save_and_resolve_checkpoint_id(client: ArcticClient, job_id: str, checkpoint_type: str) -> str:
@@ -189,12 +183,6 @@ def require_local_cortex_gateway(backend: CortexConfig) -> None:
         raise ValueError("local Cortex gateway requires an unauthenticated HTTP loopback base URL")
 
 
-def save_local_checkpoint(client: ArcticClient, checkpoint_type: str) -> Path:
-    """Retain a local DSS save without a hosted catalog or stage credentials."""
-    root, _ = _save_local_checkpoint(client, checkpoint_type)
-    return root
-
-
 def _save_local_checkpoint(client: ArcticClient, checkpoint_type: str) -> tuple[Path, dict]:
     if checkpoint_type not in {"resumable", "weights-only"}:
         raise ValueError("local checkpoint_type must be resumable or weights-only")
@@ -219,21 +207,6 @@ def _local_checkpoint_metadata(result: dict, root: Path, operation: str) -> str:
     version = result.get("version")
     if match is None or type(version) is not int or version != int(match.group(1)):
         raise RuntimeError(f"local checkpoint {operation} returned inconsistent checkpoint_tag/version")
-    return tag
-
-
-def _local_resume_tag(root: Path) -> str:
-    marker = root / "latest"
-    if marker.is_symlink() or not marker.is_file():
-        raise ValueError("local checkpoint resume requires a regular latest marker")
-    try:
-        with marker.open("rb") as stream:
-            raw = stream.read(129)
-        tag = raw.decode("ascii").strip()
-    except (OSError, UnicodeError):
-        raise ValueError("local checkpoint resume requires a readable latest marker") from None
-    if len(raw) > 128 or _LOCAL_CHECKPOINT_TAG.fullmatch(tag) is None:
-        raise ValueError("local checkpoint resume requires a bounded global_stepN latest marker")
     return tag
 
 

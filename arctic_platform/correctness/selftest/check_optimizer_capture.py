@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -1825,7 +1826,8 @@ def test_dss_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pi
 
 
 @pytest.mark.parametrize("auth_mode", [None, "disabled", "token", "legacy-mode"])
-def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch, auth_mode) -> None:
+@pytest.mark.parametrize("slots", [8, 16])
+def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch, auth_mode, slots) -> None:
     import torch
 
     from arctic_platform.correctness.harness import dss_driver
@@ -1839,38 +1841,76 @@ def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkey
     monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", lambda: events.append("clean"))
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
-    def start(*, auto_attach, include_peers):
-        events.append(
-            ("start", auto_attach, include_peers, os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE"))
-        )
-
     class RayCluster:
+        _HOSTFILE = "/job/hostfile"
 
         @staticmethod
-        def init_ray_cluster(*, auto_attach, include_peers):
-            start(auto_attach=auto_attach, include_peers=include_peers)
+        def init_ray_cluster(*, auto_attach):
+            events.append(
+                (
+                    "start",
+                    auto_attach,
+                    RayCluster._HOSTFILE,
+                    os.environ["MASTER_PORT"],
+                    os.environ.get("RAY_AUTH_MODE"),
+                )
+            )
 
         @staticmethod
         def _shutdown():
-            events.append("shutdown")
+            events.append(("shutdown", RayCluster._HOSTFILE))
 
     def load_ray_cluster():
         events.append(("load", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
         return RayCluster
 
     monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load_ray_cluster)
-    with _gateway_runtime(8):
+    selected_hostfile = os.devnull if slots == 8 else "/job/hostfile"
+    with _gateway_runtime(slots):
+        assert RayCluster._HOSTFILE == selected_hostfile
         events.append(("body", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
     assert events == [
         ("load", "29500", auth_mode),
         "clean",
-        ("start", False, False, "29500", auth_mode),
+        ("start", False, selected_hostfile, "29500", auth_mode),
         ("body", "29500", auth_mode),
-        "shutdown",
+        ("shutdown", selected_hostfile),
         "clean",
     ]
     assert os.environ["MASTER_PORT"] == "12345"
     assert os.environ.get("RAY_AUTH_MODE") == auth_mode
+    assert RayCluster._HOSTFILE == "/job/hostfile"
+
+
+@pytest.mark.parametrize("stage", ["start", "body"])
+def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch, stage) -> None:
+    import torch
+
+    from arctic_platform.correctness.harness import dss_driver
+
+    failure = RuntimeError("runtime failed")
+    shutdown_hostfiles = []
+    ray = SimpleNamespace(_HOSTFILE="/job/hostfile")
+
+    def start(*, auto_attach):
+        assert auto_attach is False
+        assert ray._HOSTFILE == os.devnull
+        if stage == "start":
+            raise failure
+
+    ray.init_ray_cluster = start
+    ray._shutdown = lambda: shutdown_hostfiles.append(ray._HOSTFILE)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
+    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", lambda: None)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    with pytest.raises(RuntimeError) as caught:
+        with _gateway_runtime(8):
+            raise failure
+    assert caught.value is failure
+    assert shutdown_hostfiles == [os.devnull]
+    assert ray._HOSTFILE == "/job/hostfile"
+    assert "MASTER_PORT" not in os.environ
 
 
 def test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:
@@ -1918,16 +1958,18 @@ def test_dss_driver_gateway_runtime_restores_port_when_preflight_fails(monkeypat
             raise RuntimeError("port is still bound")
 
     monkeypatch.setenv("MASTER_PORT", "12345")
+    ray = SimpleNamespace(_HOSTFILE="/job/hostfile", init_ray_cluster=lambda **kwargs: None, _shutdown=lambda: None)
     monkeypatch.setattr(
         dss_driver,
         "_load_gateway_ray_cluster",
-        lambda: SimpleNamespace(init_ray_cluster=lambda **kwargs: None, _shutdown=lambda: None),
+        lambda: ray,
     )
     monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
     with pytest.raises(RuntimeError, match="port is still bound"):
         with _gateway_runtime(1):
             pytest.fail("preflight must fail before launch")
     assert os.environ["MASTER_PORT"] == "12345"
+    assert ray._HOSTFILE == "/job/hostfile"
 
 
 def test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path) -> None:
@@ -1980,7 +2022,7 @@ def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(
         if stage == "shutdown":
             raise failure
 
-    ray = SimpleNamespace(init_ray_cluster=lambda **kwargs: None, _shutdown=shutdown)
+    ray = SimpleNamespace(_HOSTFILE="/job/hostfile", init_ray_cluster=lambda **kwargs: None, _shutdown=shutdown)
     monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
     monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
     monkeypatch.setenv("MASTER_PORT", "12345")
@@ -1990,6 +2032,7 @@ def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(
     assert caught.value.__cause__ is failure
     assert os.environ["MASTER_PORT"] == "12345"
     assert calls == ["verify", "verify"]
+    assert ray._HOSTFILE == "/job/hostfile"
 
 
 def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
@@ -2939,3 +2982,328 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
     assert cli.cmd_run(args) == 0
     assert widths == [cfg.n_gpus] == [4]
+
+
+def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
+    config = {
+        "zero_optimization": {"stage": 2},
+        "bf16": {
+            "enabled": True,
+            "bf16_master_weights_and_grads": True,
+            "bf16_optimizer_states": True,
+        },
+        "optimizer": {"type": "AdamW"},
+    }
+    # Deliberately reversed EP ownership; the decoder must use the supplied actual order.
+    routes = [[ep - 1 - rank + replica * ep for replica in range(world // ep)] for rank in range(ep)]
+    expert_name = "model.layers.0.mlp.experts.w2"
+    shapes = [OrderedDict([("dense.weight", torch.Size([3]))])]
+    if train_experts:
+        shapes.append(OrderedDict([(expert_name, torch.Size([1, 5]))]))
+    sources = {}
+    for role in sorted(decoder._NATIVE_SOURCE_ROLES):
+        path = tmp_path / f"{role}.py"
+        path.write_text(f"# synthetic producer descriptor: {role}\n")
+        sources[role] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    layout = {
+        "schema": "native-ep-zero2-layout-v1",
+        "world_size": world,
+        "ep_size": ep,
+        "sp_size": ep,
+        "model_mp_world_size": ep,
+        "model_ep_rank": ep - 1,
+        "optimizer_mp_ranks": [rank % ep for rank in range(world)],
+        "expert_data_parallel_groups": {"native-experts": routes} if train_experts else {},
+        "ds_config": config,
+        "source_files": sources,
+    }
+    expected = {}
+    roots = [tmp_path / "before", tmp_path / "after"]
+    for root, step in zip(roots, (0, 1)):
+        tag = root / f"global_step{step}"
+        tag.mkdir(parents=True)
+        dense = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16) + step * 0.25
+        expert_values = [torch.full((1, 5), 4.0 + rank + step * 0.25, dtype=torch.bfloat16) for rank in range(ep)]
+        module = {"dense.weight": dense, expert_name: expert_values[layout["model_ep_rank"]]}
+        torch.save(
+            {
+                "module": module,
+                "param_shapes": shapes,
+                "global_steps": step,
+                "dp_world_size": world,
+                "mp_world_size": ep,
+                "ds_config": config,
+            },
+            tag / "mp_rank_00_model_states.pt",
+        )
+        for rank, value in enumerate(expert_values):
+            torch.save({expert_name: value}, tag / f"experts_ep_rank_{rank:03d}.pt")
+        for rank in range(world):
+            masters, mappings, paddings, states, groups, counts = [], [], [], {}, [], []
+            for index, shape_group in enumerate(shapes):
+                route = list(range(world)) if index == 0 else next(route for route in routes if rank in route)
+                partition_rank = route.index(rank)
+                ep_rank = next(position for position, route in enumerate(routes) if rank in route)
+                name, shape = next(iter(shape_group.items()))
+                values = dense if index == 0 else expert_values[ep_rank]
+                length = math.ceil(values.numel() / (2 * len(route))) * 2
+                start = partition_rank * length
+                valid = max(0, min(length, values.numel() - start))
+                masters.append(values.flatten()[start : start + valid].clone())
+                paddings.append(length - valid)
+                mappings.append({name: fragment_address(start=0, numel=valid)} if valid else {})
+                counts.append(len(route))
+                group = {
+                    "params": [index],
+                    "lr": 0.01,
+                    "betas": (0.9, 0.999),
+                    "eps": 1e-8,
+                    "weight_decay": 0.0,
+                    "bias_correction": True,
+                    "moe": index != 0,
+                }
+                if index:
+                    group["name"] = "native-experts"
+                groups.append(group)
+                if step:
+                    vector = torch.zeros(length, dtype=torch.bfloat16)
+                    vector[:valid] = 1 if index == 0 else ep_rank + 2
+                    states[index] = {"step": step, "exp_avg": vector, "exp_avg_sq": vector * 2}
+            torch.save(
+                {
+                    "ds_config": config,
+                    "optimizer_state_dict": {
+                        "zero_stage": ZeroStageEnum.gradients,
+                        "base_optimizer_state": {"state": states, "param_groups": groups},
+                        "single_partition_of_fp32_groups": masters,
+                        "param_slice_mappings": mappings,
+                        "partition_count": counts,
+                        "group_paddings": paddings,
+                    },
+                },
+                tag / f"bf16_zero_pp_rank_{rank}_mp_rank_{layout['optimizer_mp_ranks'][rank]:02d}_optim_states.pt",
+            )
+    expected["dense.weight"] = torch.full((3,), 0.25)
+    if train_experts:
+        expected[expert_name] = torch.full((ep, 5), 0.25)
+    return SimpleNamespace(before=roots[0], after=roots[1], layout=layout, expected=expected, expert_name=expert_name)
+
+
+def _native_ep_bf16_decode(pair, output):
+    return decoder.decode_optimizer_capture(
+        pair.before,
+        pair.after,
+        output,
+        expected_optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
+        expected_learning_rate=0.01,
+        expected_native_layout=pair.layout,
+    )
+
+
+@pytest.mark.parametrize("world,ep", [(8, 8), (16, 8), (16, 16)])
+def test_native_ep_bf16_optimizer_reconstructs_actual_ordered_groups_without_sidefile_substitution(
+    tmp_path, world, ep
+):
+    pair = _native_ep_bf16_pair(tmp_path, world=world, ep=ep)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert manifest["source_dtypes"] == dict.fromkeys(("master", "exp_avg", "exp_avg_sq"), "bfloat16")
+    assert manifest["expert_sidefiles_are_master_sources"] is False
+    assert manifest["runtime_provenance_is_caller_owned"] is True
+    assert manifest["step"] == 1
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+        assert list(tensors["parameter_update"].shape) == entry["shape"]
+        assert tensors["parameter_update"].dtype == torch.float32
+        assert tensors["exp_avg"].dtype == tensors["exp_avg_sq"].dtype == torch.bfloat16
+        if entry["name"] == pair.expert_name:
+            assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.bfloat16))
+
+
+def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records(tmp_path):
+    pair = _native_ep_bf16_pair(tmp_path, train_experts=False)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert [entry["name"] for entry in manifest["parameters"]] == ["dense.weight"]
+    assert manifest["frozen_expert_parameters"] == [pair.expert_name]
+
+
+@pytest.mark.parametrize("field", ["master", "exp_avg", "exp_avg_sq"])
+def test_native_ep_bf16_optimizer_rejects_false_fp32_state_recipe(tmp_path, field):
+    pair = _native_ep_bf16_pair(tmp_path)
+    path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
+
+    def edit(state):
+        optimizer = state["optimizer_state_dict"]
+        if field == "master":
+            optimizer["single_partition_of_fp32_groups"][1] = optimizer["single_partition_of_fp32_groups"][1].float()
+        else:
+            optimizer["base_optimizer_state"]["state"][1][field] = optimizer["base_optimizer_state"]["state"][1][
+                field
+            ].float()
+
+    _cortex_optimizer_decode_rewrite(path, edit)
+    with pytest.raises(ValueError, match="BF16 vector"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("kind", ["optimizer", "expert"])
+def test_native_ep_bf16_optimizer_rejects_incomplete_native_inventory(tmp_path, kind):
+    pair = _native_ep_bf16_pair(tmp_path)
+    pattern = "*zero_pp_rank_7_*optim_states.pt" if kind == "optimizer" else "experts_ep_rank_007.pt"
+    path = next(pair.after.rglob(pattern))
+    path.rename(tmp_path / "retained-missing.pt")
+    with pytest.raises(ValueError, match="every optimizer and expert rank"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_native_ep_bf16_optimizer_wrong_ep_order_cannot_relabel_valid_weights(tmp_path):
+    pair = _native_ep_bf16_pair(tmp_path)
+    routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
+    routes[0], routes[1] = routes[1], routes[0]
+    with pytest.raises(ValueError, match="master/sidefile ownership"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_native_ep_bf16_optimizer_rejects_wrong_partition_counter_and_mapping(tmp_path):
+    pair = _native_ep_bf16_pair(tmp_path)
+    path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
+    _cortex_optimizer_decode_rewrite(
+        path, lambda state: state["optimizer_state_dict"]["partition_count"].__setitem__(1, 8)
+    )
+    with pytest.raises(ValueError, match="partition_count"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_native_ep_bf16_optimizer_rejects_inconsistent_adam_step(tmp_path):
+    pair = _native_ep_bf16_pair(tmp_path)
+    path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
+    _cortex_optimizer_decode_rewrite(
+        path, lambda state: state["optimizer_state_dict"]["base_optimizer_state"]["state"][1].update(step=2)
+    )
+    with pytest.raises(ValueError, match="engine/Adam optimizer step"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+
+
+@pytest.mark.parametrize("mutation", ["source-before", "source-after", "input-after"])
+def test_native_ep_bf16_optimizer_source_and_input_drift_never_publish(tmp_path, monkeypatch, mutation):
+    pair = _native_ep_bf16_pair(tmp_path)
+    source = Path(pair.layout["source_files"]["zero"]["path"])
+    sentinel = tmp_path / "unrelated"
+    sentinel.write_text("keep")
+    save = torch.save
+
+    def changed_save(value, path, *args, **kwargs):
+        save(value, path, *args, **kwargs)
+        if Path(path).parent == tmp_path / "out":
+            if mutation == "source-after":
+                source.write_text("# changed source\n")
+            elif mutation == "input-after":
+                (pair.after / "added-metadata.json").write_text("{}")
+
+    if mutation == "source-before":
+        source.write_text("# changed source\n")
+    monkeypatch.setattr(torch, "save", changed_save)
+    with pytest.raises(ValueError, match="source drift|input drift"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+    assert sentinel.read_text() == "keep"
+
+
+@pytest.mark.parametrize("failure", [None, "baseline", "child", "child-after-decode", "source-after-decode"])
+def test_native_ep_bf16_optimizer_local_lifecycle_validates_before_step_and_retains_child(
+    tmp_path, monkeypatch, failure
+):
+    pair = _native_ep_bf16_pair(tmp_path)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    events = []
+    client = SimpleNamespace(
+        config=SimpleNamespace(backend=backend),
+        jobs=SimpleNamespace(training="same-child"),
+        transport=SimpleNamespace(job_id="same-parent"),
+    )
+
+    def save_checkpoint(**kwargs):
+        step = 0 if not events else 1
+        source = pair.before if step == 0 else pair.after
+        destination = Path(kwargs["path"])
+        assert kwargs == {"path": str(destination), "checkpoint_type": "resumable", "export_hf": False}
+        shutil.copytree(source, destination)
+        if failure == "baseline" and step == 0:
+            model = next(destination.rglob("*_model_states.pt"))
+            _cortex_optimizer_decode_rewrite(model, lambda state: state.update(ds_config={}))
+        events.append(f"save{step}")
+        return {"checkpoint_path": str(destination), "checkpoint_tag": f"global_step{step}", "version": step}
+
+    def step(*args, **kwargs):
+        events.append("step")
+        if failure == "child":
+            client.jobs.training = "other-child"
+        return StepResult(2.0, {"dense.weight": 1.0}, model_calls=1, packed_rows=8)
+
+    client.save_checkpoint = save_checkpoint
+    monkeypatch.setattr(capture, "fwd_bwd_step", step)
+    decode = capture.decode_optimizer_capture
+
+    def changed_decode(*args, **kwargs):
+        result = decode(*args, **kwargs)
+        if failure == "child-after-decode":
+            client.jobs.training = "other-child"
+        elif failure == "source-after-decode":
+            Path(pair.layout["source_files"]["zero"]["path"]).write_text("# changed source\n")
+        return result
+
+    monkeypatch.setattr(capture, "decode_optimizer_capture", changed_decode)
+    output = tmp_path / "capture"
+
+    def run():
+        return capture.capture_optimizer_step(
+            GatewaySession(tmp_path, 8, backend),
+            ArcticJob(client, "training"),
+            {"original": "batch"},
+            learning_rate=0.01,
+            output_dir=output,
+            expected_dp_world_size=8,
+            optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
+            local_checkpoint=True,
+            expected_native_layout=pair.layout,
+        )
+
+    if failure:
+        with pytest.raises(ValueError, match="selected ds_config|training child changed|source drift"):
+            run()
+        assert not (output / "states").exists()
+        if failure == "baseline":
+            assert events == ["save0"]
+    else:
+        result = run()
+        assert events == ["save0", "step", "save1"]
+        assert result.model_calls == 1 and result.packed_rows == 8
+        assert Path(result.optimizer_state_manifest).is_file()
+    assert not list(output.glob("snapshots-*"))
+
+
+@pytest.mark.parametrize("mutation", ["duplicate-route", "missing-route", "mp-filename", "slice-mapping"])
+def test_native_ep_bf16_optimizer_new_layout_negatives_cannot_guess_ownership(tmp_path, mutation):
+    pair = _native_ep_bf16_pair(tmp_path)
+    routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
+    if mutation == "duplicate-route":
+        routes[0] = list(routes[1])
+    elif mutation == "missing-route":
+        pair.layout["expert_data_parallel_groups"] = {}
+    elif mutation == "mp-filename":
+        pair.layout["optimizer_mp_ranks"][0] = 1
+    else:
+        path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
+        _cortex_optimizer_decode_rewrite(
+            path,
+            lambda state: state["optimizer_state_dict"]["param_slice_mappings"][1].update(
+                {pair.expert_name: fragment_address(start=1, numel=5)}
+            ),
+        )
+    with pytest.raises(ValueError, match="cover every rank|actual ordered DP route|MP filename|slice mapping"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()

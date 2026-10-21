@@ -396,6 +396,74 @@ def test_prepared_reference_runner_prepare_mode_measures_hf_once_and_never_start
     assert measurements["grad_norms"] == {"layer.weight": 1.0}
 
 
+@pytest.mark.parametrize("override", [None, "eager"])
+def test_reference_attention_runner_uses_same_glm_backend_in_measurement_and_identity(
+    _prepared_reference_runner_prepared_runner, monkeypatch, override
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.cfg.sub_job["model_name"] = "zai-org/GLM-5.3-Flash-BF16"
+    control.cfg.training["attn_implementation"] = "sparse_mla"
+    control.missing.add(("single-step-grads", "gas1"))
+    expected = override or "sdpa"
+    calls = []
+
+    def reference(model, batch, output, **kwargs):
+        assert kwargs["attn"] == expected
+        assert control.recipes[-1][2]["attention"] == expected
+        assert control.contexts[-1].attn_implementation == "sparse_mla"
+        calls.append(kwargs)
+        return {
+            **{key: value for key, value in control.record.items() if not key.startswith("optimizer_")},
+            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert (
+        control.execute(
+            selected=["single-step-grads"],
+            selected_arms=control.arms[:1],
+            prepare_references=True,
+            reference_attn=override,
+        )
+        == []
+    )
+    assert len(calls) == len(control.published) == 1
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
+@pytest.mark.parametrize(
+    ("relative", "target", "override", "expected"),
+    [
+        ("glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config", "sparse_mla", None, "sdpa"),
+        ("glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config", "sparse_mla", "eager", "eager"),
+        ("qwen3-8b/h200/train-sft-full-4gpus-64k.config", "eager", None, "eager"),
+    ],
+)
+def test_reference_attention_e2e_command_and_options_preserve_target_and_explicit_overrides(
+    tmp_path, monkeypatch, relative, target, override, expected
+):
+    from arctic_platform.correctness.checks import e2e_sft_train_validate
+
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs" / relative)
+    spec = _applicable_tests_spec([])
+    ctx = runner.RunContext(
+        config_id=cfg.config_id,
+        cfg=cfg,
+        spec=spec,
+        arms=[],
+        attn_implementation=target,
+        workdir=tmp_path,
+        batch_paths={},
+        vocab_size=16,
+        reference_attn_implementation=override,
+    )
+    monkeypatch.setattr(e2e_sft_train_validate, "uses_mixer_packing", lambda *args: False)
+    options = e2e_sft_train_validate.reference_options(ctx, spec.model.cache_path)
+    command = e2e_sft_train_validate.reference_command(ctx, None, tmp_path / "replay", tmp_path / "output", None)
+    assert options["attn"] == command[command.index("--attn") + 1] == expected
+    assert ctx.attn_implementation == target
+
+
 def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_reference(
     _prepared_reference_runner_prepared_runner, monkeypatch
 ):

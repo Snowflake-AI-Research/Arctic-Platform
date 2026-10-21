@@ -29,9 +29,11 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from typing import Dict
 from typing import List
@@ -88,6 +90,8 @@ class RunContext:
     local_gateway_full_model: bool = False
     local_full_model_path: str | None = None
     inference_sampling_topology: tuple[int, int, int] | None = None
+    inference_export_allocation: dict | None = None
+    _inference_export_locality: dict | None = field(default=None, init=False, repr=False)
     prepare_references: bool = False
     reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
     reference_record_paths: Dict[str, str] = field(default_factory=dict)
@@ -96,6 +100,15 @@ class RunContext:
     _target: Dict[str, object] = field(default_factory=dict)
     # Seconds spent in each engine per case, so the report can say which case dominates the run.
     _timing: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    reference_attn_implementation: str | None = None
+
+    @property
+    def reference_attention_implementation(self) -> str:
+        """Keep explicit HF overrides and legacy target overrides for other architectures."""
+        if self.reference_attn_implementation is not None:
+            return self.reference_attn_implementation
+        reference = self.cfg.reference_attention_implementation
+        return reference if reference != self.cfg.attention_implementation else self.attn_implementation
 
     def transport_for(self, workdir: Path, *, arm: ArmSpec | None = None):
         """The transport a check creates its jobs through, entered by the caller and exited when it ends."""
@@ -256,6 +269,16 @@ def materialize_dss_peft_adapter(
         return None
     workdir = require_data_fast_path(workdir, label="PEFT adapter workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
+    backend = None
+    if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
+        from .hosted import require_local_cortex_gateway
+
+        if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
+            raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
+        backend = cfg.native.backend
+        require_local_cortex_gateway(backend)
+        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
+            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
     workdir.mkdir(parents=True, exist_ok=True)
     gateway_dir = workdir / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
@@ -265,13 +288,31 @@ def materialize_dss_peft_adapter(
         model_path,
         SEED,
         attn_implementation=attn_implementation,
+        weight_format=cfg.sub_job.get("weight_format"),
     )
     checkpoint_root = workdir / "checkpoint"
-    with gateway(gateway_dir, cfg.n_gpus) as session:
+    if backend is not None:
+        checkpoint_root = require_data_fast_path(checkpoint_root, label="GLM initial checkpoint")
+        adapter_dir = require_data_fast_path(adapter_dir, label="GLM initial adapter")
+        if adapter_dir.exists():
+            raise FileExistsError(f"GLM initial adapter already exists: {adapter_dir}")
+        checkpoint_root.mkdir()
+        payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
+    with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
         with running_job(session, payload) as job:
-            saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
-            exported = Path(saved.get("hf_path") or saved["path"])
-    return copy_checkpoint_peft_adapter(exported.parent, adapter_dir)
+            if backend is not None:
+                from .hosted import _local_checkpoint_metadata
+
+                # The native EP checkpointer writes the unmerged adapter under global_step0/default.
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
+                tag = _local_checkpoint_metadata(saved, checkpoint_root, "initial adapter save")
+                if tag != "global_step0":
+                    raise RuntimeError("GLM initial adapter save must report step zero")
+                exported_root = checkpoint_root
+            else:
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
+                exported_root = Path(saved.get("hf_path") or saved["path"]).parent
+    return copy_checkpoint_peft_adapter(exported_root, adapter_dir)
 
 
 # The optimizer comparison needs a step large enough to separate a real disagreement from rounding, so
@@ -378,25 +419,45 @@ def execute(
     local_cortex_fixture: bool = False,
     local_gateway_full_model: bool = False,
     local_gateway_lora_save0: bool = False,
+    inference_sampling_topology: tuple[int, int, int] | None = None,
+    inference_export_allocation: dict | None = None,
     prepare_references: bool = False,
     reference_records_dir: Path | None = None,
     reference_calibration_runs: int = 16,
     reference_calibration_workers: int = 1,
 ) -> List[TestResult]:
-    """Use the config's GPU-family FlashAttention kernel for the reference unless explicitly overridden.
+    """Use the config's upstream reference attention unless explicitly overridden.
 
-    The onboarding calibration turns that kernel's nondeterministic backward into the frozen gate.
-    Matching kernels avoids adding an SDPA-versus-FlashAttention difference and keeps the 64K reference
-    memory-feasible. The HF side keeps samples in separate rows, while Arctic Platform exercises packed/SP execution.
+    GLM's upstream top-k mask uses SDPA while the AP target keeps sparse MLA. Other architectures retain
+    their target attention default. Onboarding calibrates the selected reference backend; the HF side keeps
+    samples in separate rows while Arctic Platform exercises packed/SP execution.
     """
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
+    if inference_sampling_topology is not None:
+        from ..checks.inference_checkpoint_loss import _sampling_topology
+
+        if select != ["inference-checkpoint-loss"] or prepare_references:
+            raise ValueError("explicit inference sampling topology requires only inference-checkpoint-loss")
+        _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=inference_sampling_topology))
     if prepare_references and (
         not select or not set(select) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
     ):
         raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
+    if inference_export_allocation is not None:
+        from ..checks.inference_checkpoint_loss import is_local_cortex_gateway
+        from .inference_export import validate_local_inference_allocation
+
+        if (
+            select != ["inference-checkpoint-loss"]
+            or prepare_references
+            or not isinstance(client_backend, CortexConfig)
+            or not is_local_cortex_gateway(client_backend)
+        ):
+            raise ValueError("export locality admission requires only local Cortex inference-checkpoint-loss")
+        validate_local_inference_allocation(inference_export_allocation)
     if local_gateway_lora_save0:
         if (
             not isinstance(client_backend, CortexConfig)
@@ -560,6 +621,7 @@ def execute(
         spec=spec,
         arms=arm_specs,
         attn_implementation=attn_impl,
+        reference_attn_implementation=reference_attn,
         workdir=tmp,
         batch_paths=batch_paths,
         vocab_size=vocab_size,
@@ -567,6 +629,8 @@ def execute(
         target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
         local_gateway_full_model=local_gateway_full_model,
         local_full_model_path=local_full_model_path,
+        inference_sampling_topology=inference_sampling_topology,
+        inference_export_allocation=deepcopy(inference_export_allocation),
         prepare_references=prepare_references,
         **({"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {}),
     )
@@ -591,6 +655,7 @@ def execute(
             attn_implementation=attn_impl,
             optimizer_state_output_dir=optimizer_state_output_dir,
             gradient_norms_per_param=collect_gradient_norms,
+            weight_format=cfg.sub_job.get("weight_format"),
         )
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
@@ -645,11 +710,17 @@ def execute(
             from .lora import bind_initialization
 
             save0_metadata = adapter_identity(reference_adapter_path)
-            bind_initialization(build_payload(cfg.training, target_model, SEED), save0_metadata)
+            bind_initialization(
+                build_payload(cfg.training, target_model, SEED, weight_format=cfg.sub_job.get("weight_format")),
+                save0_metadata,
+            )
         else:
             from .lora import bind_payload
 
-            bind_payload(build_payload(cfg.training, target_model, SEED), reference_adapter_path)
+            bind_payload(
+                build_payload(cfg.training, target_model, SEED, weight_format=cfg.sub_job.get("weight_format")),
+                reference_adapter_path,
+            )
     if local_gateway_lora_save0 and save0_metadata is None:
         raise ValueError("LoRA SAVE0 requires a verified deterministic reference adapter")
 
@@ -676,7 +747,7 @@ def execute(
             tmp / f"ref-{output_name}.json",
             token_budget=reference_token_budget,
             ce_chunk=ce_chunk,
-            attn=reference_attn or cfg.attention_implementation,
+            attn=reference_attn or cfg.reference_attention_implementation,
             fp32_lm_head=bool(reference_training.get("fp32_lm_head", False)),
             seed=SEED,
             fused_cross_entropy=cfg.fused_cross_entropy,
@@ -724,7 +795,7 @@ def execute(
                 "vocab_size": vocab_size,
                 "batch": batch_identity(batch),
             },
-            "attention": reference_attn or cfg.attention_implementation,
+            "attention": reference_attn or cfg.reference_attention_implementation,
             "token_budget": reference_token_budget,
             "ce_chunk": ce_chunk,
             "training": {

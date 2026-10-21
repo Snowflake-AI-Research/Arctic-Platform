@@ -29,6 +29,7 @@ tensors on the same side, and the checkpoint's weights bring that to -2.01e-04 w
 from __future__ import annotations
 
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import List
@@ -52,14 +53,14 @@ BYTES_PER_PARAM = 8
 
 
 def detect_block_period(layer_types: List[str]) -> int:
-    """Smallest period for which the layer list is its first ``p`` entries repeated.
+    """Smallest period whose repetitions have the layer list as a prefix.
 
     Derived from the list rather than read from an interval field, because not every architecture has such
     a field and the ones that do are not always consistent with the list.
     """
     n = len(layer_types)
     for p in range(1, n + 1):
-        if n % p == 0 and all(layer_types[i] == layer_types[i % p] for i in range(n)):
+        if all(layer_types[i] == layer_types[i % p] for i in range(n)):
             return p
     return n
 
@@ -181,6 +182,26 @@ def copy_sidecars(source: str, dest_path: Path) -> List[Path]:
     return copied
 
 
+def _save_reduced_pretrained(model, dest_path: Path) -> None:
+    generation = getattr(model, "generation_config", None)
+    preserve_legacy_defaults = False
+    if generation is not None:
+        try:
+            generation.validate(strict=True)
+        except ValueError:
+            # Loading permits inherited, inactive generation flags; keep hard-invalid values rejected.
+            generation.validate()
+            preserve_legacy_defaults = True
+            model.generation_config = type(generation)()
+    try:
+        model.save_pretrained(dest_path, safe_serialization=True, max_shard_size="5GB")
+    finally:
+        if preserve_legacy_defaults:
+            model.generation_config = generation
+    if preserve_legacy_defaults:
+        generation.to_json_file(dest_path / "generation_config.json", use_diff=True, keys_to_pop=["compile_config"])
+
+
 def materialize_pretrained(
     source: str, dest: str, num_layers: int, vision_depth: int = 2, force: bool = False
 ) -> ModelSpec:
@@ -200,13 +221,41 @@ def materialize_pretrained(
     import transformers
 
     cfg, _, _ = reduce_config(source, num_layers, vision_depth)
+    load_options = {}
+    quantization = getattr(cfg, "quantization_config", None)
+    if quantization is not None:
+        quantization = quantization.to_dict() if hasattr(quantization, "to_dict") else dict(quantization)
+        if quantization.get("quant_method") != "fp8":
+            raise ValueError(
+                "reduced pretrained fixtures support only unquantized or explicitly dequantized FP8 sources"
+            )
+        quantization["dequantize"] = True
+        load_options["quantization_config"] = transformers.FineGrainedFP8Config.from_dict(quantization)
 
     if force or not (dest_path / "config.json").exists():
         dest_path.mkdir(parents=True, exist_ok=True)
         cls = getattr(transformers, cfg.architectures[0])
-        model = cls.from_pretrained(source, config=cfg, dtype=torch.bfloat16, trust_remote_code=True)
-        model.save_pretrained(dest_path, safe_serialization=True, max_shard_size="5GB")
+        model = cls.from_pretrained(source, config=cfg, dtype=torch.bfloat16, trust_remote_code=True, **load_options)
+        if quantization is not None:
+            if (
+                getattr(model, "hf_quantizer", None) is not None
+                or getattr(model.config, "quantization_config", None) is not None
+                or getattr(model, "is_quantized", False)
+            ):
+                raise ValueError("the FP8 source loader did not complete explicit dequantization")
+            for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+                if name.endswith(("weight_scale_inv", "activation_scale")) or (
+                    tensor.is_floating_point() and tensor.dtype not in (torch.bfloat16, torch.float32)
+                ):
+                    raise ValueError(f"the dequantized fixture still contains a quantized tensor: {name}")
+            from transformers.conversion_mapping import get_model_conversion_mapping
+
+            # Undo architecture transforms when saving, but never the already-completed FP8 dequantization.
+            model._weight_conversions = get_model_conversion_mapping(model, add_legacy=False)
+        _save_reduced_pretrained(model, dest_path)
         del model
+    elif json.loads((dest_path / "config.json").read_text()).get("quantization_config") is not None:
+        raise ValueError("the cached reduced fixture is quantized; rebuild it with force=True")
     copy_sidecars(source, dest_path)
 
     params = count_parameters(cfg)

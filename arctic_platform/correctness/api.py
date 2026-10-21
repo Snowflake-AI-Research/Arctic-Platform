@@ -65,6 +65,8 @@ class RunOptions:
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
     local_gateway_full_model: bool = False
+    test_spec: Path | None = None
+    inference_sampling_topology: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +167,7 @@ def options_from_args(args: Namespace) -> RunOptions:
         for name in RunOptions.__dataclass_fields__
         if hasattr(args, name) and getattr(args, name) is not None
     }
-    for name in ("attn", "case"):
+    for name in ("attn", "case", "inference_sampling_topology"):
         if name in values:
             values[name] = tuple(values[name])
     if "out" in values:
@@ -178,6 +180,12 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
     from .harness.execution import run_batch
 
     options = options or RunOptions()
+    if options.test_spec is not None and (request.config is None or request.all_configs):
+        raise ValueError("--test-spec requires one explicit --config")
+    if options.inference_sampling_topology is not None and (
+        request.config is None or request.all_configs or request.tests != ("inference-checkpoint-loss",)
+    ):
+        raise ValueError("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
     selected = select(request)
     return run_batch(_namespace(request, options), selected=selected, executor=executor)
 

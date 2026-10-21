@@ -38,16 +38,17 @@ from typing import List
 from typing import Optional
 from typing import Sequence
 
-from arctic_platform.client import ArcticClient as RLClient
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.client import SamplingConfig
-from arctic_platform.client import TrainingConfig
 from arctic_platform.client.requests import log_probs_request
 
+from .config import ReviewedClientConfig
+from .config import ReviewedSamplingConfig
+from .config import ReviewedTrainingConfig
 from .config import correctness_microbatch_tokens
 from .cortex import CorrectnessClient as ArcticClient
+from .cortex import CorrectnessClient as RLClient
 from .cortex import CortexTrainingConfig
 from .storage import parse_hostfile
 from .storage import require_data_fast_path
@@ -155,10 +156,14 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
     previous_master_port = os.environ.get("MASTER_PORT")
     os.environ["MASTER_PORT"] = str(_STANDARD_MASTER_PORT)
     ray_cluster = None
+    previous_hostfile = None
     try:
         ray_cluster = _load_gateway_ray_cluster()
+        previous_hostfile = ray_cluster._HOSTFILE
+        if not include_peers:
+            ray_cluster._HOSTFILE = os.devnull
         _stop_and_verify_gateway_runtime()
-        ray_cluster.init_ray_cluster(auto_attach=False, include_peers=include_peers)
+        ray_cluster.init_ray_cluster(auto_attach=False)
         yield
     finally:
         try:
@@ -172,6 +177,8 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
                 "gateway runtime cleanup failed; inspect owned resources before retrying"
             ) from exc
         finally:
+            if ray_cluster is not None and previous_hostfile is not None:
+                ray_cluster._HOSTFILE = previous_hostfile
             if previous_master_port is None:
                 os.environ.pop("MASTER_PORT", None)
             else:
@@ -219,14 +226,15 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
     if not isinstance(backend, CortexConfig):
         workdir = require_data_fast_path(session.workdir, label="training workdir")
         checkpoint_path = str(require_data_fast_path(workdir / "checkpoints", label="training checkpoint output"))
-    config_type = CortexTrainingConfig if isinstance(backend, CortexConfig) else ArcticClientConfig
+    config_type = CortexTrainingConfig if isinstance(backend, CortexConfig) else ReviewedClientConfig
     return config_type(
         model_name=payload["model_name"],
         seed=payload.get("seed"),
         dtype=payload.get("dtype"),
         max_seq_len=max_seq_len,
         training_gpus=n_gpus,
-        training=TrainingConfig(
+        training=ReviewedTrainingConfig(
+            weight_format=payload.get("weight_format"),
             full_determinism=bool(debug.get("full_determinism", False)),
             checkpoint_path=checkpoint_path,
             ds_config=ds,
@@ -247,16 +255,19 @@ def _inference_client_config(
     vllm = deepcopy(inf.pop("vllm_config", {}))
     vllm.setdefault("max_model_len", max_seq_len)
     job_type = payload.get("job_type")
-    return ArcticClientConfig(
+    config = ReviewedClientConfig(
         model_name=payload["model_name"],
         seed=payload.get("seed"),
         dtype=payload.get("dtype"),
         max_seq_len=max_seq_len,
         sampling_gpus=n_gpus if job_type == "sampling" else 0,
         log_prob_gpus=n_gpus if job_type == "log_prob" else 0,
-        sampling=SamplingConfig(vllm=vllm, arctic_inference_config=inf or None),
+        sampling=ReviewedSamplingConfig(
+            weight_format=payload.get("weight_format"), vllm=vllm, arctic_inference_config=inf or None
+        ),
         backend=backend if backend is not None else OnPremConfig(),
     )
+    return CortexTrainingConfig.from_reviewed(config) if isinstance(config.backend, CortexConfig) else config
 
 
 @contextlib.contextmanager
@@ -267,6 +278,8 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
         if job_type == "training"
         else _inference_client_config(payload, backend=session.backend)
     )
+    if isinstance(session.backend, OnPremConfig):
+        config.to_onprem(job_type)
     runtime = (
         _gateway_runtime(session.slots) if isinstance(session.backend, OnPremConfig) else contextlib.nullcontext()
     )
@@ -373,6 +386,7 @@ def build_payload(
     lm_head_token_chunk_size: Optional[int] = None,
     determinism: str = "best-effort",
     gradient_norms_per_param: bool = True,
+    weight_format: Optional[str] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
     if lm_head_token_chunk_size is not None:
@@ -397,21 +411,20 @@ def build_payload(
             require_data_fast_path(optimizer_state_output_dir, label="optimizer artifact output")
         )
     tc["debug"] = debug
-    return {
+    payload = {
         "model_name": model_path,
         "job_type": "training",
         "seed": seed,
         "dtype": tc.get("dtype", "bfloat16"),
         "training_config": tc,
     }
+    if weight_format is not None:
+        payload["weight_format"] = weight_format
+    return payload
 
 
 def _labels_for_provider(batch, model_provider: str):
     return batch.shifted_labels() if model_provider == "prime_rl" else batch.labels
-
-
-def _attention_mask(batch):
-    return _attention_mask_from_position_ids(batch.position_ids)
 
 
 def _attention_mask_from_position_ids(position_ids):
@@ -681,17 +694,26 @@ def running_rl_client(
     if cfg.native is None:
         raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
     session = GatewaySession(Path(workdir), rl_gpu_count(cfg), backend if backend is not None else OnPremConfig())
-    training_only = _training_client_config(session, training_payload)
-    native = cfg.native.model_copy(
-        update={
-            "model_name": str(model_path),
-            "training": training_only.training,
-            "backend": training_only.backend,
-        },
-        deep=True,
-    )
+    payload = dict(training_payload)
+    payload.setdefault("weight_format", getattr(cfg.native.training, "weight_format", None))
+    training_only = _training_client_config(session, payload)
+    updates = {
+        "model_name": str(model_path),
+        "training": training_only.training,
+        "backend": training_only.backend,
+    }
+    if isinstance(session.backend, CortexConfig):
+        native = CortexTrainingConfig.from_reviewed(cfg.native, **updates)
+    else:
+        native = ReviewedClientConfig.model_validate(
+            {**cfg.native.model_dump(), **updates, "training": training_only.training.model_dump()}
+        )
     client = RLClient(native)
     try:
+        training_replay = (native.training.ds_worker_config or {}).get("router_replay") or {}
+        sampling_replay = (native.sampling.arctic_inference_config or {}).get("router_replay") or {}
+        if training_replay.get("enabled") and sampling_replay.get("enabled"):
+            client.bootstrap_router_replay(max_cache_bytes=training_replay.get("max_cache_bytes"))
         yield client
     finally:
         try:

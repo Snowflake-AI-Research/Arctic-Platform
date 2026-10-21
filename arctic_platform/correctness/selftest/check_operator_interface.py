@@ -149,6 +149,251 @@ def test_clean_port_sampling_does_not_select_gdn_backend_to_match_training():
 
 # Cli config selection.
 
+_inference_forwarding_config = (
+    Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+)
+
+
+def _inference_forwarding_spec():
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import load_config
+
+    cfg = load_config(_inference_forwarding_config)
+    spec = TestSpec.read(execution.SPEC_DIR / f"{cfg.config_id}.json")
+    return cfg, spec
+
+
+def test_inference_forwarding_cli_and_python_options_preserve_private_spec_and_topology(tmp_path):
+    candidate = tmp_path / "reviewed.json"
+    request, options = api.parse_run_args(
+        [
+            "--config",
+            str(_inference_forwarding_config),
+            "--test",
+            "inference-checkpoint-loss",
+            "--test-spec",
+            str(candidate),
+            "--inference-sampling-topology",
+            "16",
+            "8",
+            "2",
+        ]
+    )
+    assert options.test_spec == candidate
+    assert options.inference_sampling_topology == (16, 8, 2)
+    namespace = api._namespace(request, options)
+    assert namespace.test_spec == candidate
+    assert namespace.inference_sampling_topology == (16, 8, 2)
+    _, default = api.parse_run_args(["--config", str(_inference_forwarding_config)])
+    assert default.test_spec is None and default.inference_sampling_topology is None
+
+
+@pytest.mark.parametrize(
+    "run_request", [api.RunRequest(tests=("inference-checkpoint-loss",)), api.RunRequest(all_configs=True)]
+)
+def test_inference_forwarding_private_spec_cannot_escape_single_config(monkeypatch, tmp_path, run_request):
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid selection reached catalog"))
+    with pytest.raises(ValueError, match="one explicit"):
+        api.run(run_request, api.RunOptions(test_spec=tmp_path / "private.json"))
+
+
+@pytest.mark.parametrize("corruption", [None, "identity", "checksum", "cases", "attention", "unregistered"])
+def test_inference_forwarding_private_spec_keeps_integrity_checks(tmp_path, corruption):
+    from arctic_platform.correctness.harness.config import arms_for
+
+    cfg, spec = _inference_forwarding_spec()
+    candidate = tmp_path / "private.json"
+    if corruption == "identity":
+        spec.config_id = "unrelated"
+    elif corruption == "checksum":
+        spec.config_checksum = "0" * 64
+    elif corruption == "cases":
+        spec.arms[0].global_batch_size += 1
+    elif corruption == "attention":
+        spec.attn_implementations = ["unreviewed"]
+    elif corruption == "unregistered":
+        spec.applicable_tests.append("unknown-check")
+    spec.write(candidate)
+    results, specs = [], {}
+    prepared = execution._frozen_spec(
+        cfg,
+        _inference_forwarding_config,
+        arms_for(cfg.max_seq_len, cfg.n_gpus),
+        attention=cfg.attention_implementation,
+        cases=None,
+        results=results,
+        specs=specs,
+        test_spec=candidate,
+    )
+    if corruption is None:
+        assert prepared[0] == spec
+        assert results == []
+    else:
+        assert prepared is None
+        assert len(results) == 1 and results[0].outcome is Outcome.FAIL
+
+
+@pytest.mark.parametrize("topology", [None, (8, 8, 1), (16, 8, 2)])
+def test_inference_forwarding_runner_context_reaches_existing_check_only(monkeypatch, tmp_path, topology):
+    cfg, spec = _inference_forwarding_spec()
+    spec.applicable_tests = ["inference-checkpoint-loss"]
+    contexts = []
+
+    def capture(ctx):
+        contexts.append(ctx)
+        return [Result("inference-checkpoint-loss", ctx.config_id, Outcome.PASS)]
+
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
+    monkeypatch.setattr(runner.registered_tests()["inference-checkpoint-loss"], "fn", capture)
+    monkeypatch.setattr(runner, "gateway", lambda *a, **kw: pytest.fail("no GPU/gateway"))
+    results = runner.execute(
+        cfg,
+        spec,
+        [],
+        vocab_size=128,
+        select=["inference-checkpoint-loss"],
+        workdir=tmp_path,
+        inference_sampling_topology=topology,
+    )
+    assert results[0].outcome is Outcome.PASS
+    assert contexts[0].inference_sampling_topology == topology
+    assert contexts[0].cfg.model_name == cfg.model_name
+
+
+@pytest.mark.parametrize(
+    "topology,selected", [((4, 4, 1), ["inference-checkpoint-loss"]), ((16, 8, 2), ["single-step-grads"])]
+)
+def test_inference_forwarding_runner_rejects_before_workdir_or_model(monkeypatch, topology, selected):
+    cfg, spec = _inference_forwarding_spec()
+    monkeypatch.setattr(runner, "correctness_workdir", lambda *a: pytest.fail("must reject before workdir"))
+    monkeypatch.setattr(runner, "validate_local_full_model", lambda *a: pytest.fail("no model admission"))
+    with pytest.raises(ValueError, match="sampling topology"):
+        runner.execute(cfg, spec, [], vocab_size=128, select=selected, inference_sampling_topology=topology)
+
+
+def test_inference_forwarding_execution_passes_same_private_spec_topology_and_full_model(monkeypatch, tmp_path):
+    cfg, spec = _inference_forwarding_spec()
+    spec.applicable_tests = ["inference-checkpoint-loss"]
+    candidate = tmp_path / "private.json"
+    spec.write(candidate)
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(_inference_forwarding_config),
+            "--test",
+            "inference-checkpoint-loss",
+            "--test-spec",
+            str(candidate),
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--database",
+            "dev",
+            "--schema",
+            "dev",
+            "--local-gateway-full-model",
+            "--inference-sampling-topology",
+            "16",
+            "8",
+            "2",
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(execution, "validate_local_full_model", lambda *a: tmp_path / "full48")
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
+
+    def capture(config, reviewed, arms, **kwargs):
+        calls.append((config, reviewed, arms, kwargs))
+        return []
+
+    assert execution._run_configs(args, executor=capture) == 0
+    assert len(calls) == 1
+    assert calls[0][0].n_gpus == 16
+    assert calls[0][1] == spec
+    assert calls[0][3]["inference_sampling_topology"] == (16, 8, 2)
+    assert calls[0][3]["local_gateway_full_model"] is True
+
+
+@pytest.mark.parametrize("weight_format", [None, "hf", "vllm"])
+def test_inference_forwarding_runner_adapter_payload_keeps_native_weight_format(monkeypatch, tmp_path, weight_format):
+    from contextlib import contextmanager
+
+    from arctic_platform.correctness.harness.config import load_config
+
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/qwen3-8b/h200/train-sft-lora-4gpus-64k.config")
+    if weight_format is not None:
+        config.sub_job["weight_format"] = weight_format
+    captured = []
+
+    def payload(*args, **kwargs):
+        captured.append(kwargs)
+        return {}
+
+    @contextmanager
+    def session(*args, **kwargs):
+        yield object()
+
+    @contextmanager
+    def job(*args, **kwargs):
+        client = SimpleNamespace(save_checkpoint=lambda **kw: {"hf_path": str(tmp_path / "checkpoint" / "hf")})
+        yield SimpleNamespace(client=client)
+
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
+    monkeypatch.setattr(runner, "build_payload", payload)
+    monkeypatch.setattr(runner, "gateway", session)
+    monkeypatch.setattr(runner, "running_job", job)
+    monkeypatch.setattr(runner, "copy_checkpoint_peft_adapter", lambda root, path: path)
+    assert (
+        runner.materialize_dss_peft_adapter(
+            config, "unchanged", tmp_path, attn_implementation=config.attention_implementation
+        )
+        == tmp_path / "adapter"
+    )
+    assert captured[0]["weight_format"] == weight_format
+
+
+@pytest.mark.parametrize(
+    "run_request",
+    [
+        api.RunRequest(tests=("inference-checkpoint-loss",)),
+        api.RunRequest(config="config", all_configs=True, tests=("inference-checkpoint-loss",)),
+        api.RunRequest(config="config", tests=("single-step-grads",)),
+    ],
+)
+def test_inference_forwarding_new_batch_topology_guard_precedes_selection(monkeypatch, run_request):
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid topology selection reached catalog"))
+    with pytest.raises(ValueError, match="one config and only inference-checkpoint-loss"):
+        api.run(run_request, api.RunOptions(inference_sampling_topology=(16, 8, 2)))
+
+
+def test_inference_forwarding_new_topology_preserves_full_model_admission_before_check(monkeypatch, tmp_path):
+    cfg, spec = _inference_forwarding_spec()
+    spec.applicable_tests = ["inference-checkpoint-loss"]
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
+
+    def reject(*args):
+        raise ValueError("test-only missing original full snapshot")
+
+    monkeypatch.setattr(runner, "validate_local_full_model", reject)
+    monkeypatch.setattr(
+        runner.registered_tests()["inference-checkpoint-loss"], "fn", lambda *a: pytest.fail("no bypass")
+    )
+    with pytest.raises(ValueError, match="missing original full snapshot"):
+        runner.execute(
+            cfg,
+            spec,
+            [],
+            vocab_size=128,
+            select=["inference-checkpoint-loss"],
+            client_backend=execution.CortexConfig(base_url="http://127.0.0.1:8003"),
+            local_gateway_full_model=True,
+            workdir=tmp_path,
+            inference_sampling_topology=(16, 8, 2),
+        )
+
 
 def _cli_config_selection_write_config(root: Path, gpu_type: str) -> Path:
     path = root / "model" / gpu_type / "train.config"

@@ -18,8 +18,15 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
+import io
 import json
 import os
+import socket
+import subprocess
+import sys
+import time
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -233,6 +240,177 @@ def test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_eac
     assert all((batch.rows == rows_per_step for batch in batches))
     seen = [tuple(row) for batch in batches for row in batch.input_ids.tolist()]
     assert len(set(seen)) == len(examples)
+
+
+@pytest.mark.parametrize("composite,ngram,kernel,expected", [(True, 3, 4, 144), (False, 2, 7, 192), (True, 5, 1, 64)])
+def test_inference_ple_padding_floor_uses_effective_offline_config(monkeypatch, composite, ngram, kernel, expected):
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text", num_hidden_layers=48, ngram_size=ngram, ple_conv_kernel_size=kernel
+    )
+    source = SimpleNamespace(model_type="qwen4_exp", text_config=text) if composite else text
+    cfg = SimpleNamespace(config_id=check._FLASHNEXT_CONFIG_ID, sp_size=16, training={"model_provider": "prime_rl"})
+    calls = []
+
+    def offline(path, **kwargs):
+        calls.append((path, kwargs))
+        return source
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", offline)
+    assert check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "/actual/local/model") == expected
+    assert calls == [("/actual/local/model", {"local_files_only": True})]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ngram_size", True),
+        ("ngram_size", 0),
+        ("ngram_size", None),
+        ("ple_conv_kernel_size", -1),
+        ("ple_conv_kernel_size", 4.0),
+        ("num_hidden_layers", 4),
+        ("model_type", "qwen3"),
+    ],
+)
+def test_inference_ple_padding_refuses_missing_invalid_or_reduced_config(monkeypatch, field, value):
+    text = SimpleNamespace(model_type="qwen4_exp_text", num_hidden_layers=48, ngram_size=3, ple_conv_kernel_size=4)
+    setattr(text, field, value)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: text)
+    cfg = SimpleNamespace(config_id=check._FLASHNEXT_CONFIG_ID, sp_size=16, training={"model_provider": "prime_rl"})
+    with pytest.raises(ValueError, match="context-parallel inference requires"):
+        check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "/actual/local/model")
+
+
+@pytest.mark.parametrize(
+    "config_id,provider,sp",
+    [
+        ("other", "prime_rl", 16),
+        (check._FLASHNEXT_CONFIG_ID, "huggingface", 16),
+        (check._FLASHNEXT_CONFIG_ID, "prime_rl", 1),
+    ],
+)
+def test_inference_ple_padding_leaves_unaffected_routes_without_config_reads(monkeypatch, config_id, provider, sp):
+    monkeypatch.setattr(
+        AutoConfig, "from_pretrained", lambda *args, **kwargs: pytest.fail("unaffected route config read")
+    )
+    cfg = SimpleNamespace(config_id=config_id, sp_size=sp, training={"model_provider": provider})
+    assert check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "unused") == 0
+    sentinel = object()
+    assert check._extend_short_causal_rows(sentinel, 0, 0) is sentinel
+
+
+@pytest.mark.parametrize("long_row", [False, True])
+@pytest.mark.parametrize("shifted", [False, True])
+def test_inference_ple_padding_survives_real_pack_and_all_sequence_shards(long_row, shifted):
+    from arctic_platform.common.packing.pack import IGNORE_INDEX
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import cu_seqlens_from_position_ids
+    from arctic_platform.common.packing.windows import token_shard
+
+    rows = list(_inference_checkpoint_loss_ROWS)
+    if long_row:
+        rows[0] = replace(rows[0], input_ids=tuple(range(1, 182)))
+    batch = gsm8k.build_batch("validation", rows, pad_id=0)
+    original = copy.deepcopy(batch)
+    padded = check._extend_short_causal_rows(batch, 144, pad_id=0)
+    assert padded.name == batch.name and padded.rows == batch.rows
+    assert padded.active_tokens == batch.active_tokens
+    for field in ("input_ids", "position_ids", "labels"):
+        assert torch.equal(getattr(batch, field), getattr(original, field))
+    for index, row in enumerate(rows):
+        for field in ("input_ids", "position_ids", "labels"):
+            assert torch.equal(getattr(padded, field)[index, : row.length], getattr(batch, field)[index, : row.length])
+        assert padded.labels[index, row.length :].eq(IGNORE_INDEX).all()
+        assert padded.input_ids[index, row.length :].eq(0).all()
+        assert padded.position_ids[index, : max(row.length, 144)].tolist() == list(range(max(row.length, 144)))
+
+    body = check.pack_logit_aligned(padded) if shifted else check.pack(padded, model_provider="huggingface")
+    original_body = check.pack_logit_aligned(batch) if shifted else check.pack(batch, model_provider="huggingface")
+    # A token-budget group may contain just the shortest row, even in a wider ragged batch.
+    for indices in ([0], [1], [0, 1]):
+        group = {key: value[indices] for key, value in body["batch"].items()}
+        packed, metadata = pack_microbatch(group)
+        assert metadata.valid_lengths.tolist() == [max(rows[index].length, 144) for index in indices]
+        expected_labels = original_body["batch"]["labels"][indices]
+        assert torch.equal(
+            packed["labels"][packed["labels"] != IGNORE_INDEX], expected_labels[expected_labels != IGNORE_INDEX]
+        )
+        assert cu_seqlens_from_position_ids(packed["position_ids"]).tolist() == metadata.cu_seqlens.tolist()
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        shards = [token_shard(packed, metadata, 16, rank) for rank in range(16)]
+        assert all(shard["input_ids"].shape[1] >= 9 for shard in shards)
+        for field in ("input_ids", "position_ids", "labels"):
+            assert torch.equal(torch.cat([shard[field] for shard in shards], dim=1), packed[field])
+
+
+def test_inference_ple_padding_already_long_rows_are_identity_noop():
+    rows = [replace(row, input_ids=tuple(range(1, 162))) for row in _inference_checkpoint_loss_ROWS]
+    batch = gsm8k.build_batch("train", rows, pad_id=0)
+    assert check._extend_short_causal_rows(batch, 144, 0) is batch
+
+
+@pytest.mark.parametrize("token_budget", [128, 256])
+def test_inference_ple_padding_real_run_packs_training_and_validation_without_reselecting(
+    tmp_path, monkeypatch, token_budget
+):
+    train = [replace(_inference_checkpoint_loss_ROWS[0], question=f"train{index}") for index in range(10)]
+    validation = [_inference_checkpoint_loss_ROWS[1]]
+    cfg = SimpleNamespace(
+        config_id=check._FLASHNEXT_CONFIG_ID,
+        model_name="/actual/local/model",
+        n_gpus=16,
+        sp_size=16,
+        dp_size=1,
+        max_tokens_per_mb=token_budget,
+        sub_job={},
+        training={"model_provider": "prime_rl", "train_batch_size": 1, "optimizer": {"lr": 2e-5}},
+    )
+    ctx = SimpleNamespace(cfg=cfg, workdir=tmp_path, attn_implementation="qsa_flex")
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", lambda path: SimpleNamespace(pad_token_id=0, eos_token_id=0))
+    monkeypatch.setattr(
+        check.gsm8k, "read_rows", lambda split, **kwargs: train if split == check.TRAIN_SPLIT else validation
+    )
+    monkeypatch.setattr(check.gsm8k, "tokenize_examples", lambda tokenizer, rows: rows)
+    monkeypatch.setattr(check.gsm8k, "select_by_token_budget", lambda *args: (validation, 4))
+    monkeypatch.setattr(
+        AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(
+            model_type="qwen4_exp_text", num_hidden_layers=48, ngram_size=3, ple_conv_kernel_size=4
+        ),
+    )
+    monkeypatch.setattr(check, "build_payload", lambda *args, **kwargs: {})
+    real_pack, real_validation_pack = check.pack, check.pack_logit_aligned
+    packed = []
+
+    def training_body(batch, **kwargs):
+        packed.append(batch)
+        return real_pack(batch, **kwargs)
+
+    def validation_body(batch):
+        packed.append(batch)
+        return real_validation_pack(batch)
+
+    monkeypatch.setattr(check, "pack", training_body)
+    monkeypatch.setattr(check, "pack_logit_aligned", validation_body)
+
+    def no_gateway(*args, **kwargs):
+        raise RuntimeError("stop before network")
+
+    monkeypatch.setattr(check, "gateway", no_gateway)
+    if token_budget == 128:
+        with pytest.raises(ValueError, match="unchanged token budget; rows cannot be dropped"):
+            check._run(ctx)
+        assert packed == []
+    else:
+        with pytest.raises(RuntimeError, match="stop before network"):
+            check._run(ctx)
+        assert len(packed) == check.TRAIN_STEPS + 1
+        for batch, row in zip(packed, validation + train):
+            assert batch.rows == 1 and batch.seq_len == 144
+            assert batch.input_ids[0, : row.length].tolist() == list(row.input_ids)
+            assert batch.active_tokens == row.answer_tokens
 
 
 def test_inference_checkpoint_loss_agreement_inside_the_gate_passes_and_outside_it_fails() -> None:
@@ -804,7 +982,851 @@ def test_inference_rendezvous_reload_error_does_not_allocate_an_alternate_port(
     assert os.environ["MASTER_PORT"] == "29500"
 
 
+# Reviewed training weight-format callers.
+
+
+def _reviewed_weight_format_callers_config(tmp_path, weight_format, *, lora=False):
+    root = Path(__file__).resolve().parents[1] / "configs"
+    relative = (
+        "qwen3-8b/h200/train-sft-lora-4gpus-64k.config"
+        if lora
+        else "qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config"
+    )
+    source = root / relative
+    recipe = json.loads(source.read_text())
+    recipe["training"].pop("weight_format", None)
+    if weight_format is not None:
+        recipe["training"]["weight_format"] = weight_format
+    path = tmp_path / source.name
+    path.write_text(json.dumps(recipe))
+    return load_config(path)
+
+
+def _reviewed_weight_format_callers_assert_payload(payload, cfg, model_path, *, gradient_norms_per_param=True):
+    expected = rl_driver.build_payload(
+        cfg.training,
+        model_path,
+        SEED,
+        attn_implementation="sdpa",
+        gradient_norms_per_param=gradient_norms_per_param,
+    )
+    observed = deepcopy(payload)
+    assert ("weight_format" in observed) == (cfg.sub_job.get("weight_format") is not None)
+    assert observed.pop("weight_format", None) == cfg.sub_job.get("weight_format")
+    assert observed == expected
+    assert "weight_format" not in observed["training_config"]
+
+
+@pytest.fixture
+def _reviewed_weight_format_callers_e2e_run(tmp_path, monkeypatch):
+    from arctic_platform.correctness.checks import e2e_sft_train_validate as e2e
+
+    cfg = _reviewed_weight_format_callers_config(tmp_path, "vllm")
+    ctx = SimpleNamespace(
+        cfg=cfg,
+        spec=SimpleNamespace(model=SimpleNamespace(cache_path="/data-fast/tmp/reviewed-caller-model")),
+        attn_implementation="sdpa",
+        client_backend=OnPremConfig(),
+    )
+    captured = []
+
+    @contextmanager
+    def gateway(directory, slots, *, backend):
+        assert slots == ctx.cfg.n_gpus
+        assert backend is ctx.client_backend
+        yield SimpleNamespace(backend=backend, workdir=tmp_path)
+
+    @contextmanager
+    def running_job(session, payload):
+        captured.append(payload)
+        yield "job"
+
+    monkeypatch.setattr(e2e, "gateway", gateway)
+    monkeypatch.setattr(e2e, "running_job", running_job)
+    monkeypatch.setattr(
+        e2e,
+        "request_bodies",
+        lambda *args, **kwargs: ([{"training": 1}], {"processing": {"return_logprobs": True}}),
+    )
+    monkeypatch.setattr(e2e, "fwd_bwd_step", lambda *args, **kwargs: SimpleNamespace(avg_loss=2.0))
+    monkeypatch.setattr(e2e, "forward_logprobs", lambda *args: torch.tensor([[-1.0]]))
+    return SimpleNamespace(module=e2e, context=ctx, captured=captured)
+
+
+@pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
+def test_reviewed_weight_format_callers_e2e_trajectory_preserves_top_level_format_and_recipe(
+    _reviewed_weight_format_callers_e2e_run, tmp_path, weight_format
+):
+    run = _reviewed_weight_format_callers_e2e_run
+    run.context.cfg = _reviewed_weight_format_callers_config(tmp_path, weight_format)
+    before = deepcopy(run.context.cfg)
+    losses, logprobs = run.module.run_dss_trajectory(run.context, object(), tmp_path)
+    assert losses == [2.0]
+    assert torch.equal(logprobs, torch.tensor([[-1.0]]))
+    assert len(run.captured) == 1
+    _reviewed_weight_format_callers_assert_payload(run.captured[0], run.context.cfg, run.context.spec.model.cache_path)
+    assert run.context.cfg == before
+
+
+@pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
+def test_reviewed_weight_format_callers_adapter_preparation_preserves_format_and_recipe(
+    tmp_path, monkeypatch, weight_format
+):
+    from arctic_platform.correctness.checks import e2e_sft_train_validate as e2e
+    from arctic_platform.correctness.harness import lora
+
+    cfg = _reviewed_weight_format_callers_config(tmp_path, weight_format, lora=True)
+    before = deepcopy(cfg)
+    ctx = SimpleNamespace(cfg=cfg, attn_implementation="sdpa", prepare_references=False)
+    adapter = tmp_path / "adapter-init"
+    captured = []
+    monkeypatch.setattr(lora, "materialize_adapter", lambda *args: adapter)
+    monkeypatch.setattr(lora, "identity_metadata", lambda path: {"mock-adapter": str(path)})
+
+    def bind(payload, path):
+        assert path == adapter
+        captured.append(payload)
+        return payload
+
+    monkeypatch.setattr(lora, "bind_payload", bind)
+    actual, identity = e2e._prepare_adapter(ctx, cfg.model_name, tmp_path)
+    assert actual == adapter
+    assert identity == {"kind": "deterministic-lora", "metadata": {"mock-adapter": str(adapter)}}
+    assert len(captured) == 1
+    _reviewed_weight_format_callers_assert_payload(captured[0], cfg, cfg.model_name)
+    assert cfg == before
+
+
+@pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
+def test_reviewed_weight_format_callers_inference_training_and_reload_preserve_format_and_recipe(
+    _inference_rendezvous_inference_run, tmp_path, monkeypatch, weight_format
+):
+    run = _inference_rendezvous_inference_run
+    run.context.cfg = _reviewed_weight_format_callers_config(tmp_path, weight_format)
+    run.context.attn_implementation = "sdpa"
+    before = deepcopy(run.context.cfg)
+    captured = []
+
+    @contextmanager
+    def running_job(session, payload):
+        captured.append(payload)
+        yield "job"
+
+    monkeypatch.setattr(check, "running_job", running_job)
+    monkeypatch.setattr(check, "build_payload", rl_driver.build_payload)
+    monkeypatch.setattr(check, "materialize_checkpoint_tokenizer", lambda *args: None)
+    assert check._run(run.context) == "verified"
+    assert [payload["job_type"] for payload in captured] == ["training", "sampling", "training"]
+    _reviewed_weight_format_callers_assert_payload(
+        captured[0], run.context.cfg, run.context.cfg.model_name, gradient_norms_per_param=False
+    )
+    _reviewed_weight_format_callers_assert_payload(
+        captured[2], run.context.cfg, str(tmp_path / "hf"), gradient_norms_per_param=False
+    )
+    assert run.context.cfg == before
+
+
+def test_reviewed_weight_format_callers_explicit_onprem_format_reaches_prestart_route_rejection(
+    _reviewed_weight_format_callers_e2e_run, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.harness import cortex
+
+    run = _reviewed_weight_format_callers_e2e_run
+    captured = []
+
+    def must_not_start(*args, **kwargs):
+        pytest.fail("unsupported reviewed format must fail before starting the public client")
+
+    @contextmanager
+    def running_job(session, payload):
+        captured.append(payload)
+        config = rl_driver._training_client_config(session, payload)
+        cortex.CorrectnessClient(config)
+        pytest.fail("unsupported reviewed format must not create a job")
+        yield
+
+    monkeypatch.setattr(cortex.ArcticClient, "__init__", must_not_start)
+    monkeypatch.setattr(run.module, "running_job", running_job)
+    with pytest.raises(ValueError, match="require the Cortex correctness route"):
+        run.module.run_dss_trajectory(run.context, object(), tmp_path)
+    assert len(captured) == 1
+    assert captured[0]["weight_format"] == "vllm"
+
+
+def test_reviewed_weight_format_callers_onprem_rejects_before_gateway_runtime_or_client_start(
+    _reviewed_weight_format_callers_e2e_run, monkeypatch, tmp_path
+):
+    run = _reviewed_weight_format_callers_e2e_run
+
+    @contextmanager
+    def gateway(directory, slots, *, backend):
+        yield SimpleNamespace(backend=backend, workdir=tmp_path, slots=slots)
+
+    def must_not_start(*args, **kwargs):
+        pytest.fail("unsupported reviewed format must fail before entering the gateway runtime or client")
+
+    monkeypatch.setattr(run.module, "gateway", gateway)
+    monkeypatch.setattr(run.module, "running_job", rl_driver.running_job)
+    monkeypatch.setattr(rl_driver, "_gateway_runtime", must_not_start)
+    monkeypatch.setattr(rl_driver, "ArcticClient", must_not_start)
+    with pytest.raises(ValueError, match="require the Cortex correctness route"):
+        run.module.run_dss_trajectory(run.context, object(), tmp_path)
+
+
 # Inference sampling topology.
+
+
+@pytest.fixture
+def _inference_export_locality_saved(tmp_path):
+    root = tmp_path / "trained-step10"
+    root.mkdir()
+    save_file({"model.weight": torch.zeros((2, 2), dtype=torch.bfloat16)}, root / "model.safetensors")
+    for name, value in {
+        "config.json": {"model_type": "qwen3", "num_hidden_layers": 4},
+        "model.safetensors.index.json": {
+            "weight_map": {"model.weight": "model.safetensors"},
+            "metadata": {"total_size": 8},
+        },
+        "tokenizer.json": {"version": "1.0", "model": {"vocab": {"x": 0}}},
+        "tokenizer_config.json": {"eos_token": "x"},
+    }.items():
+        (root / name).write_text(json.dumps(value))
+    return root
+
+
+def _inference_export_locality_node(host="127.0.0.1", slots=8):
+    return {
+        "host": host,
+        "slots": slots,
+        "hostname": socket.gethostname(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "python": sys.executable,
+        "python_sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
+    }
+
+
+@pytest.fixture
+def _inference_export_locality_admission(monkeypatch, tmp_path):
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("127.0.0.1 slots=8\n")
+    monkeypatch.setattr(export, "_LOCAL_HOSTFILE", hostfile)
+    return {
+        "allocation_id": "test-allocation",
+        "hostfile_content": hostfile.read_text(),
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        "nodes": [_inference_export_locality_node()],
+    }
+
+
+@pytest.fixture
+def _inference_export_prescribed_hostfile(_inference_export_locality_admission, monkeypatch, tmp_path):
+    hostfile = export._LOCAL_HOSTFILE
+    target = tmp_path / "data-fast-hostfile"
+    hostfile.rename(target)
+    hostfile.symlink_to(target)
+    monkeypatch.setattr(export, "_LOCAL_HOSTFILE_TARGET", target)
+    return _inference_export_locality_admission
+
+
+def test_inference_export_hostfile_symlink_prescribed_target_binds_bytes_and_order(
+    _inference_export_prescribed_hostfile,
+):
+    admission = _inference_export_prescribed_hostfile
+    target = export._LOCAL_HOSTFILE_TARGET
+    target.write_text(target.read_text() + "127.0.0.2 slots=4\n")
+    admission["hostfile_content"] = target.read_text()
+    admission["hostfile_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    worker = _inference_export_locality_node("127.0.0.2", 4)
+    worker["hostname"] = "fixture-worker"
+    admission["nodes"].append(worker)
+    before = export._local_hostfile_identity()
+    assert export.validate_local_inference_allocation(admission) == admission["nodes"]
+    assert export._local_hostfile_identity() == before
+    assert before["link"] == str(target)
+    assert before["target_path"] == str(target)
+    assert before["original"] != before["target"]
+
+
+@pytest.mark.parametrize("change", ["link_target", "same_bytes_target_replacement"])
+def test_inference_export_hostfile_symlink_changed_during_validation_rejected(
+    _inference_export_prescribed_hostfile, monkeypatch, tmp_path, change
+):
+    original_parse = export.parse_hostfile
+
+    def parse_then_change(path):
+        rows = original_parse(path)
+        replacement = tmp_path / "replacement-hostfile"
+        replacement.write_bytes(path.read_bytes())
+        if change == "link_target":
+            export._LOCAL_HOSTFILE.unlink()
+            export._LOCAL_HOSTFILE.symlink_to(replacement)
+        else:
+            replacement.replace(path)
+        return rows
+
+    monkeypatch.setattr(export, "parse_hostfile", parse_then_change)
+    with pytest.raises(ValueError, match="hostfile"):
+        export.validate_local_inference_allocation(_inference_export_prescribed_hostfile)
+
+
+@pytest.mark.parametrize("change", ["same_target_link_replacement", "same_bytes_target_replacement"])
+def test_inference_export_hostfile_symlink_identity_change_blocks_published_sampling(
+    _inference_export_prescribed_hostfile, _inference_export_locality_saved, monkeypatch, tmp_path, change
+):
+    admission = _inference_export_prescribed_hostfile
+    root = _inference_export_locality_saved
+    monkeypatch.setattr(export, "require_data_fast_path", lambda path: Path(path))
+    proof = export.distribute_local_inference_export(root, admission, timeout_s=30)
+    ctx = SimpleNamespace(inference_export_allocation=admission, _inference_export_locality=proof)
+    export.require_local_inference_export_locality(ctx, root)
+    replacement = tmp_path / "replacement"
+    if change == "same_target_link_replacement":
+        replacement.symlink_to(export._LOCAL_HOSTFILE_TARGET)
+        replacement.replace(export._LOCAL_HOSTFILE)
+    else:
+        replacement.write_bytes(export._LOCAL_HOSTFILE_TARGET.read_bytes())
+        replacement.replace(export._LOCAL_HOSTFILE_TARGET)
+    with pytest.raises(ValueError, match="hostfile link or target identity changed"):
+        export.require_local_inference_export_locality(ctx, root)
+
+
+def test_inference_export_integration_preserves_reviewed_glm_materializer_bytes():
+    # The independent GLM release must survive the locality-only runner merge.
+    source = inspect.getsource(runner.materialize_dss_peft_adapter).encode()
+    assert hashlib.sha256(source).hexdigest() == "d517f8fa302b1ad110eb4ea0caca73305dc42faec10aa8b0bca559277eb379cc"
+
+
+def test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty():
+    import ctypes
+    import signal
+    import threading
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    leader = None
+    sentinel = None
+    reaper = None
+    try:
+        sentinel = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+        leader = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,signal,time\n"
+                    "reader,writer=os.pipe()\n"
+                    "child=os.fork()\n"
+                    "if child==0:\n"
+                    " os.close(reader)\n"
+                    " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                    " os.write(writer,b'ready');os.close(writer)\n"
+                    " while True: time.sleep(1)\n"
+                    "os.close(writer);os.read(reader,5);os.close(reader)\n"
+                    "print(child,flush=True)\n"
+                    "os._exit(0)\n"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        descendant = int(leader.stdout.readline())
+        assert leader.wait(timeout=5) == 0
+        reaped = []
+        reaper = threading.Thread(target=lambda: reaped.append(os.waitpid(descendant, 0)), daemon=True)
+        reaper.start()
+        started = time.monotonic()
+        export._stop_local_children([leader])
+        reaper.join(timeout=1)
+        assert time.monotonic() - started < 7
+        assert len(reaped) == 1 and reaped[0][0] == descendant
+        assert os.WIFSIGNALED(reaped[0][1]) and os.WTERMSIG(reaped[0][1]) == signal.SIGKILL
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader.pid, 0)
+        assert sentinel.poll() is None
+    finally:
+        if leader is not None:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            leader.wait(timeout=5)
+            leader.stdout.close()
+        if reaper is not None:
+            reaper.join(timeout=5)
+        if sentinel is not None:
+            sentinel.terminate()
+            sentinel.wait(timeout=5)
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+@pytest.fixture
+def _inference_export_integration_runner(tmp_path):
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config")
+    spec = SimpleNamespace(
+        applicable_tests=["inference-checkpoint-loss"],
+        test_settings={},
+        model=SimpleNamespace(cache_path=str(tmp_path / "fixture")),
+    )
+    return cfg, spec
+
+
+def test_inference_export_integration_real_runner_admits_and_copies_allocation(
+    _inference_export_integration_runner, _inference_export_prescribed_hostfile, monkeypatch, tmp_path
+):
+    cfg, spec = _inference_export_integration_runner
+    admission = _inference_export_prescribed_hostfile
+    before = deepcopy(admission)
+    observed = []
+    backend = CortexConfig(base_url="http://localhost:8003")
+    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kwargs: Path(path))
+
+    def check_context(ctx):
+        observed.append(ctx)
+        assert ctx.inference_export_allocation == admission
+        assert ctx.inference_export_allocation is not admission
+        assert ctx.inference_export_allocation["nodes"] is not admission["nodes"]
+        assert ctx._inference_export_locality is None
+        assert ctx.client_backend is backend
+        return []
+
+    monkeypatch.setattr(registered_tests()["inference-checkpoint-loss"], "fn", check_context)
+    assert (
+        runner.execute(
+            cfg,
+            spec,
+            [],
+            vocab_size=128,
+            workdir=tmp_path,
+            select=["inference-checkpoint-loss"],
+            client_backend=backend,
+            inference_export_allocation=admission,
+        )
+        == []
+    )
+    assert len(observed) == 1
+    assert admission == before
+
+
+@pytest.mark.parametrize("invalid", ["nonlocal_cortex", "onprem", "other_check"])
+def test_inference_export_integration_real_runner_rejects_unadmitted_route_before_work(
+    _inference_export_integration_runner, _inference_export_prescribed_hostfile, monkeypatch, invalid
+):
+    cfg, spec = _inference_export_integration_runner
+    backend = (
+        OnPremConfig()
+        if invalid == "onprem"
+        else CortexConfig(
+            base_url="http://other-job.invalid" if invalid == "nonlocal_cortex" else "http://localhost:8003"
+        )
+    )
+    selected = ["single-step-grads"] if invalid == "other_check" else ["inference-checkpoint-loss"]
+    monkeypatch.setattr(
+        runner, "registered_tests", lambda: pytest.fail("invalid admission must stop before test or model setup")
+    )
+    with pytest.raises(ValueError, match="only local Cortex inference-checkpoint-loss"):
+        runner.execute(
+            cfg,
+            spec,
+            [],
+            vocab_size=128,
+            select=selected,
+            client_backend=backend,
+            inference_export_allocation=_inference_export_prescribed_hostfile,
+        )
+
+
+def _inference_export_locality_manifest(root):
+    return export._local_manifest(root, time.monotonic() + 30)
+
+
+def _inference_export_locality_wire(root, manifest):
+    return (
+        json.dumps(manifest, sort_keys=True).encode()
+        + b"\n"
+        + b"".join((root / row["path"]).read_bytes() for row in manifest["files"])
+    )
+
+
+def test_inference_export_locality_manifest_hashes_all_trained_files_and_preserves_header_identity(
+    _inference_export_locality_saved,
+):
+    root = _inference_export_locality_saved
+    manifest = _inference_export_locality_manifest(root)
+    assert {row["path"] for row in manifest["files"]} == {p.name for p in root.iterdir()}
+    for row in manifest["files"]:
+        assert row["sha256"] == hashlib.sha256((root / row["path"]).read_bytes()).hexdigest()
+        assert row["size_bytes"] == (root / row["path"]).stat().st_size
+    assert manifest["tensor_schema_sha256"] == export.schema_sha({"model.weight": ["BF16", [2, 2]]})
+    assert manifest["tensor_payload_bytes"] == 8
+    assert manifest["config_sha256"] == export.schema_sha(json.loads((root / "config.json").read_text()))
+    assert set(manifest["tokenizer_files"]) == {"tokenizer.json", "tokenizer_config.json"}
+
+
+@pytest.mark.parametrize("damage", ["missing_tokenizer", "symlink", "directory", "extra_shard", "wrong_index"])
+def test_inference_export_locality_manifest_rejects_incomplete_or_nonregular_exports(
+    _inference_export_locality_saved,
+    damage,
+):
+    root = _inference_export_locality_saved
+    if damage == "missing_tokenizer":
+        (root / "tokenizer.json").unlink()
+    elif damage == "symlink":
+        (root / "aliased.json").symlink_to(root / "config.json")
+    elif damage == "directory":
+        (root / "nested").mkdir()
+    elif damage == "extra_shard":
+        (root / "unindexed.safetensors").write_bytes(b"unused")
+    else:
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"other": "model.safetensors"}, "metadata": {"total_size": 8}})
+        )
+    with pytest.raises((ValueError, OSError)):
+        _inference_export_locality_manifest(root)
+
+
+@pytest.mark.parametrize("changed", ["hostfile_hash", "hostfile_content", "ordered_hosts", "boot", "python"])
+def test_inference_export_locality_admission_rejects_changed_job_or_node(
+    _inference_export_locality_admission,
+    changed,
+):
+    admission = deepcopy(_inference_export_locality_admission)
+    if changed == "hostfile_hash":
+        admission["hostfile_sha256"] = "0" * 64
+    elif changed == "hostfile_content":
+        admission["hostfile_content"] += "#changed\n"
+    elif changed == "ordered_hosts":
+        admission["nodes"][0]["host"] = "external-job.invalid"
+    elif changed == "boot":
+        admission["nodes"][0]["boot_id"] = "0" * 36
+    else:
+        admission["nodes"][0]["python_sha256"] = "0" * 64
+    with pytest.raises(ValueError):
+        export.validate_local_inference_allocation(admission)
+
+
+def test_inference_export_locality_receiver_publishes_verified_files_exclusively(
+    monkeypatch,
+    tmp_path,
+    _inference_export_locality_saved,
+):
+    root = _inference_export_locality_saved
+    manifest = _inference_export_locality_manifest(root)
+    destination = tmp_path / "worker-trained-step10"
+    request = {
+        "node": _inference_export_locality_node(),
+        "root": str(destination),
+        "allocation_id": "test-allocation",
+        "manifest_sha256": export.schema_sha(manifest),
+    }
+    wire = _inference_export_locality_wire(root, manifest)
+    monkeypatch.setattr(export.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(wire)))
+    receipt = export._receive_local_export(request, time.monotonic() + 30)
+    assert receipt["semantic_exit"] == 0
+    assert receipt["files_verified"] == 5
+    assert json.loads((destination / export._LOCAL_RECEIPT).read_text()) == receipt
+    for row in manifest["files"]:
+        assert (destination / row["path"]).read_bytes() == (root / row["path"]).read_bytes()
+    monkeypatch.setattr(export.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(wire)))
+    with pytest.raises(FileExistsError):
+        export._receive_local_export(request, time.monotonic() + 30)
+
+
+@pytest.mark.parametrize("damage", ["truncated", "corrupted", "extra_bytes", "manifest_identity", "node_identity"])
+def test_inference_export_locality_receiver_never_publishes_partial_or_wrong_bytes(
+    monkeypatch,
+    tmp_path,
+    _inference_export_locality_saved,
+    damage,
+):
+    root = _inference_export_locality_saved
+    manifest = _inference_export_locality_manifest(root)
+    destination = tmp_path / "failed-worker-save"
+    request = {
+        "node": _inference_export_locality_node(),
+        "root": str(destination),
+        "allocation_id": "test-allocation",
+        "manifest_sha256": export.schema_sha(manifest),
+    }
+    wire = _inference_export_locality_wire(root, manifest)
+    if damage == "truncated":
+        wire = wire[:-1]
+    elif damage == "corrupted":
+        wire = wire[:-1] + bytes([wire[-1] ^ 1])
+    elif damage == "extra_bytes":
+        wire += b"unexpected"
+    elif damage == "manifest_identity":
+        request["manifest_sha256"] = "0" * 64
+    else:
+        request["node"]["boot_id"] = "0" * 36
+    monkeypatch.setattr(export.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(wire)))
+    with pytest.raises(ValueError):
+        export._receive_local_export(request, time.monotonic() + 30)
+    assert not (destination / export._LOCAL_RECEIPT).exists()
+
+
+def test_inference_export_locality_strict_transport_uses_only_admitted_host_and_keyfile(
+    tmp_path,
+    _inference_export_locality_admission,
+):
+    admission = _inference_export_locality_admission
+    known = tmp_path / "known_hosts"
+    known.write_text("admitted-public-key-placeholder\n")
+    admission["ssh"] = {
+        "port": 7878,
+        "known_hosts": str(known),
+        "known_hosts_sha256": hashlib.sha256(known.read_bytes()).hexdigest(),
+    }
+    node = admission["nodes"][0]
+    argv = export._local_ssh_argv(admission, node, {"timeout_s": 5}, time.monotonic() + 5)
+    assert argv[-2] == node["host"]
+    assert "StrictHostKeyChecking=yes" in argv
+    assert "BatchMode=yes" in argv
+    assert "UserKnownHostsFile=" + str(known) in argv
+    known.write_text("changed-keys\n")
+    with pytest.raises(ValueError, match="strict SSH"):
+        export._local_ssh_argv(admission, node, {}, time.monotonic() + 5)
+
+
+def test_inference_export_locality_bounded_child_timeout_reaps_only_created_session(monkeypatch):
+    children = []
+    original = subprocess.Popen
+
+    def observe(*args, **kwargs):
+        child = original(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(export.subprocess, "Popen", observe)
+    before = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        export._bounded_local_json([sys.executable, "-c", "import time;time.sleep(60)"], time.monotonic() + 0.2)
+    assert time.monotonic() - before < 5
+    assert len(children) == 1 and children[0].poll() is not None
+
+
+def test_inference_export_locality_single_head_proof_is_bound_and_mutation_blocks_sampling(
+    monkeypatch,
+    _inference_export_locality_saved,
+    _inference_export_locality_admission,
+):
+    root = _inference_export_locality_saved
+    admission = _inference_export_locality_admission
+
+    def manifest_worker(argv, deadline):
+        fingerprints = {}
+        manifest = export._local_manifest(root, deadline, fingerprints)
+        return {"manifest": manifest, "head_files": fingerprints}
+
+    monkeypatch.setattr(export, "_bounded_local_json", manifest_worker)
+    proof = export.distribute_local_inference_export(root, admission, timeout_s=30)
+    ctx = SimpleNamespace(inference_export_allocation=admission, _inference_export_locality=proof)
+    export.require_local_inference_export_locality(ctx, root)
+    (root / "tokenizer_config.json").write_text('{"eos_token":"changed"}')
+    with pytest.raises(ValueError, match="changed after locality"):
+        export.require_local_inference_export_locality(ctx, root)
+
+
+def test_inference_export_locality_missing_publication_blocks_sampling_before_payload(monkeypatch, tmp_path):
+    ctx = SimpleNamespace()
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    monkeypatch.setattr(check, "validate_local_inference_export", lambda ctx, path: path)
+
+    def forbidden(*args):
+        pytest.fail("sampling payload created without trained export locality")
+
+    monkeypatch.setattr(check, "_sampling_payload", forbidden)
+    with pytest.raises(ValueError, match="receipt required before sampling"):
+        check.local_cortex_sampling_config(ctx, backend, tmp_path / "unpublished", 10240)
+
+
+def test_inference_export_locality_local_run_rejects_absent_admission_before_tokenizer_or_model(monkeypatch):
+    ctx = SimpleNamespace(
+        cfg=load_config(_inference_sampling_topology_ORDINARY_CONFIG),
+        client_backend=CortexConfig(base_url="http://127.0.0.1:8003"),
+    )
+
+    def forbidden(*args):
+        pytest.fail("model preparation started without same-allocation admission")
+
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", forbidden)
+    with pytest.raises(ValueError, match="current allocation admission required"):
+        check._run(ctx)
+
+
+def test_inference_export_locality_save_publishes_only_after_real_save_and_tokenizer_validation(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    ctx = SimpleNamespace(inference_export_allocation={"admitted": True})
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    result = {"path": str(tmp_path), "tag": "global_step10"}
+    tokenizer = SimpleNamespace(get_vocab=lambda: {"x": 0}, special_tokens_map={"eos_token": "x"})
+
+    def save(**kwargs):
+        assert kwargs == {"path": str(tmp_path), "checkpoint_type": "weights-only", "export_hf": False}
+        events.append("public_save")
+        return result
+
+    def metadata(actual, root, operation):
+        assert actual == result and root == tmp_path and operation == "save"
+        return "global_step10"
+
+    monkeypatch.setattr(check, "correctness_workdir", lambda prefix: tmp_path)
+    monkeypatch.setattr(check, "_local_checkpoint_metadata", metadata)
+    monkeypatch.setattr(check, "validate_local_inference_export", lambda ctx, path: path)
+    monkeypatch.setattr(
+        check, "materialize_checkpoint_tokenizer", lambda tokenizer, path: events.append("tokenizer_save")
+    )
+    monkeypatch.setattr(check, "_export_json", lambda path: {})
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", lambda path: tokenizer)
+    proof = {"actual_receipts": True}
+
+    def distribute(root, admission):
+        assert root == tmp_path / "global_step10" and admission == {"admitted": True}
+        events.append("locality")
+        return proof
+
+    monkeypatch.setattr(export, "distribute_local_inference_export", distribute)
+    weights = check.save_local_inference_checkpoint(ctx, backend, SimpleNamespace(save_checkpoint=save), tokenizer)
+    assert weights == tmp_path / "global_step10"
+    assert events == ["public_save", "tokenizer_save", "locality"]
+    assert ctx._inference_export_locality is proof
+
+
+def test_inference_export_locality_changed_tokenizer_never_reaches_transfer(monkeypatch, tmp_path):
+    ctx = SimpleNamespace()
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    tokenizer = SimpleNamespace(get_vocab=lambda: {"x": 0}, special_tokens_map={})
+    changed = SimpleNamespace(get_vocab=lambda: {"y": 0}, special_tokens_map={})
+    monkeypatch.setattr(check, "correctness_workdir", lambda prefix: tmp_path)
+    monkeypatch.setattr(check, "_local_checkpoint_metadata", lambda *args: "global_step10")
+    monkeypatch.setattr(check, "validate_local_inference_export", lambda ctx, path: path)
+    monkeypatch.setattr(check, "materialize_checkpoint_tokenizer", lambda *args: None)
+    monkeypatch.setattr(check, "_export_json", lambda path: {})
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", lambda path: changed)
+
+    def forbidden(*args):
+        pytest.fail("transfer started before tokenizer identity was verified")
+
+    monkeypatch.setattr(export, "distribute_local_inference_export", forbidden)
+    with pytest.raises(RuntimeError, match="tokenizer differs"):
+        check.save_local_inference_checkpoint(
+            ctx, backend, SimpleNamespace(save_checkpoint=lambda **kwargs: {}), tokenizer
+        )
+
+
+def test_inference_export_locality_process_stream_cpu_roundtrip_checks_complete_saved_bytes(
+    tmp_path,
+    _inference_export_locality_saved,
+):
+    source = _inference_export_locality_saved
+    manifest = _inference_export_locality_manifest(source)
+    destination = tmp_path / "cpu-receiver"
+    request = {
+        "root": str(destination),
+        "node": _inference_export_locality_node(),
+        "allocation_id": "cpu-control",
+        "manifest_sha256": export.schema_sha(manifest),
+        "timeout_s": 15,
+    }
+    children = []
+    try:
+        sender = subprocess.Popen(
+            export._local_worker_argv(
+                sys.executable, "send", {"root": str(source), "manifest": manifest, "timeout_s": 15}
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        children.append(sender)
+        receiver = subprocess.Popen(
+            export._local_worker_argv(sys.executable, "supervise", request),
+            stdin=sender.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        children.append(receiver)
+        sender.stdout.close()
+        output, errors = receiver.communicate(timeout=15)
+        sender.wait(timeout=15)
+        sender_errors = sender.stderr.read()
+        assert receiver.returncode == 0, errors.decode()
+        assert sender.returncode == 0, sender_errors.decode()
+        receipt = json.loads(output)
+        assert receipt == json.loads((destination / export._LOCAL_RECEIPT).read_text())
+        for row in manifest["files"]:
+            assert (destination / row["path"]).read_bytes() == (source / row["path"]).read_bytes()
+    finally:
+        export._stop_local_children(children)
+
+
+def test_inference_export_locality_process_backpressure_obeys_global_deadline_and_reaps_both_children(
+    monkeypatch,
+    _inference_export_locality_saved,
+    _inference_export_locality_admission,
+):
+    root = _inference_export_locality_saved
+    # Larger than a pipe buffer: the sender blocks if its recipient never reads.
+    (root / "tokenizer.json").write_text(json.dumps({"padding": "x" * 1024**2}))
+    fingerprints = {}
+    manifest = export._local_manifest(root, time.monotonic() + 30, fingerprints)
+    admission = _inference_export_locality_admission
+    node = admission["nodes"][0]
+    monkeypatch.setattr(export, "_validate_local_allocation", lambda admission, deadline: [node, node])
+    monkeypatch.setattr(
+        export, "_bounded_local_json", lambda argv, deadline: {"manifest": manifest, "head_files": fingerprints}
+    )
+    monkeypatch.setattr(
+        export,
+        "_local_ssh_argv",
+        lambda *args: [sys.executable, "-c", "import time;time.sleep(60)"],
+    )
+    children = []
+    original = subprocess.Popen
+
+    def observe(*args, **kwargs):
+        child = original(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(export.subprocess, "Popen", observe)
+    before = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        export.distribute_local_inference_export(root, admission, timeout_s=0.3)
+    assert time.monotonic() - before < 5
+    assert len(children) == 2 and all(child.poll() is not None for child in children)
+
+
+def test_inference_export_locality_source_binding_worker_ignores_other_package_import_root(
+    monkeypatch,
+    _inference_export_locality_saved,
+):
+    root = _inference_export_locality_saved
+    other_paths = [
+        path for path in os.environ.get("PYTHONPATH", "").split(":") if "inference-export-locality" not in path
+    ]
+    monkeypatch.setenv("PYTHONPATH", ":".join(other_paths))
+    result = export._bounded_local_json(
+        export._local_worker_argv(sys.executable, "manifest", {"root": str(root), "timeout_s": 15}),
+        time.monotonic() + 15,
+    )
+    assert result["manifest"] == _inference_export_locality_manifest(root)
+    assert result["head_files"] == {
+        row["path"]: list(export._fingerprint(root / row["path"])) for row in result["manifest"]["files"]
+    }
+
+
+def test_inference_export_locality_source_binding_expired_global_deadline_stops_before_receive(
+    monkeypatch,
+):
+    monkeypatch.setattr(export, "_receive_local_export", lambda *args: pytest.fail("expired receiver started"))
+    with pytest.raises(TimeoutError, match="locality deadline"):
+        export._local_worker("receive", {"timeout_s": 60, "deadline_epoch": time.time() - 1})
 
 
 _inference_sampling_topology_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
@@ -1008,9 +2030,10 @@ def test_inference_sampling_topology_local_sampling_validates_export_then_uses_s
         return original(actual_ctx, model_path, token_budget)
 
     monkeypatch.setattr(check, "validate_local_inference_export", validate)
+    monkeypatch.setattr(export, "require_local_inference_export_locality", lambda ctx, path: events.append("locality"))
     monkeypatch.setattr(check, "_sampling_payload", observe)
     config = check.local_cortex_sampling_config(ctx, backend, weights, _inference_sampling_topology_TOKEN_BUDGET)
-    assert events == ["validate", "helper"]
+    assert events == ["validate", "locality", "helper"]
     sub = config.to_cortex()[0]
     _inference_sampling_topology_assert_topology(sub, topology)
     assert sub["model_name"] == str(weights)

@@ -30,7 +30,7 @@ def render(args: argparse.Namespace) -> str:
     training = config.training
     lm_head_config = config.effective_training
     frozen_config_checksum = config_checksum(config)
-    attention = config.attention_implementation
+    attention = config.reference_attention_implementation
     tokens = args.tokens if args.tokens is not None else config.max_seq_len
     fp32_lm_head = bool(lm_head_config.get("fp32_lm_head", False))
     fused_cross_entropy = lm_head_config.get("fused_cross_entropy", False)

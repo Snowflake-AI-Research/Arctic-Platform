@@ -163,11 +163,6 @@ def activity(message: str, *, stream: TextIO | None = None, interval: float = 0.
     return Activity(message, stream=stream, interval=interval)
 
 
-def separator() -> str:
-    """The same three-line break the per-case verdicts use, for callers that print their own blocks."""
-    return "\n".join(SEPARATOR)
-
-
 def stopped_early(skipped) -> str:
     joined = ", ".join(skipped)
     return (

@@ -33,6 +33,7 @@ from urllib.parse import urlencode
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from pydantic import BaseModel
 from pydantic import StrictInt
 from pydantic import model_validator
 from typing_extensions import Self
@@ -51,20 +52,68 @@ from arctic_platform.client.transports.cortex import _raise_for_status
 from arctic_platform.client.transports.cortex import _Route
 from arctic_platform.client.transports.cortex import _SendPolicy
 
+from .config import ReviewedClientConfig
 from .config import TestSpec
 from .config import hash_directory
 from .storage import require_data_fast_path
 
 
-class CortexTrainingConfig(ArcticClientConfig):
+class CortexTrainingConfig(ReviewedClientConfig):
     """Keep DSS's extra creation fields outside the production config adapter."""
 
     hardware: str | None = None
     source_checkpoint_info: dict[str, str] | None = None
     inference_tensor_parallel_size: StrictInt | None = None
 
+    @classmethod
+    def from_reviewed(cls, native: ArcticClientConfig, **updates) -> Self:
+        raw = {**native.model_dump(), **updates}
+        for key in ("training", "sampling"):
+            if isinstance(raw.get(key), BaseModel):
+                raw[key] = raw[key].model_dump()
+        vllm = (raw.get("sampling") or {}).get("vllm", {})
+        if "tensor_parallel_size" in vllm and "inference_tensor_parallel_size" not in updates:
+            raw["inference_tensor_parallel_size"] = vllm["tensor_parallel_size"]
+        return cls.model_validate(raw)
+
     @model_validator(mode="after")
     def _check_source(self) -> Self:
+        if self.training_gpus and self.sampling_gpus:
+            formats = (self.training.weight_format, self.sampling.weight_format)
+            if any(value is not None for value in formats) and (formats[0] or "vllm") != (formats[1] or "vllm"):
+                raise ValueError("training and sampling weight formats must agree")
+        inference = self.sampling.arctic_inference_config or {}
+        allowed = {
+            "num_replicas",
+            "router_replay",
+            "max_num_batched_tokens",
+            "max_inflight_choices_per_replica",
+            "multiplex_job_id",
+            "peft_config",
+            "semi_p",
+            "model_options",
+        }
+        unsupported = set(inference) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported Cortex inference fields: {sorted(unsupported)}")
+        replicas = inference.get("num_replicas")
+        if replicas is not None:
+            if type(replicas) is not int or replicas <= 0:
+                raise ValueError("explicit sampling replicas require a positive integer")
+            if self.inference_tensor_parallel_size is None or self.sampling_gpus <= 0:
+                raise ValueError("explicit sampling replicas require explicit tensor parallelism and sampling GPUs")
+        replay = inference.get("router_replay")
+        if replay is not None:
+            if not isinstance(replay, dict) or set(replay) - {"enabled", "max_cache_bytes", "mode"}:
+                raise ValueError("sampling router replay must contain only supported replay fields")
+            if "enabled" in replay and type(replay["enabled"]) is not bool:
+                raise ValueError("sampling router replay enabled must be a boolean")
+            if "max_cache_bytes" in replay and (
+                type(replay["max_cache_bytes"]) is not int or replay["max_cache_bytes"] <= 0
+            ):
+                raise ValueError("sampling router replay cache must be a positive integer")
+            if replay.get("mode", "strict") != "strict":
+                raise ValueError("sampling router replay mode must be strict")
         if self.inference_tensor_parallel_size is not None:
             if not isinstance(self.backend, CortexConfig) or self.inference_tensor_parallel_size <= 0:
                 raise ValueError("explicit inference tensor parallelism requires a positive size and CortexConfig")
@@ -72,9 +121,12 @@ class CortexTrainingConfig(ArcticClientConfig):
             if type(pipeline) is not int or pipeline <= 0:
                 raise ValueError("explicit inference pipeline parallelism requires a positive integer")
             expected_gpus = self.inference_tensor_parallel_size * pipeline
-            allocations = (self.sampling_gpus, self.log_prob_gpus)
-            if not any(allocations) or any(size not in (0, expected_gpus) for size in allocations):
-                raise ValueError("inference allocation must equal tensor times pipeline parallelism")
+            if replicas is None:
+                allocations = (self.sampling_gpus, self.log_prob_gpus)
+                if not any(allocations) or any(size not in (0, expected_gpus) for size in allocations):
+                    raise ValueError("inference allocation must equal tensor times pipeline parallelism")
+            elif self.sampling_gpus != replicas * expected_gpus or self.log_prob_gpus not in (0, expected_gpus):
+                raise ValueError("sampling allocation must equal replicas times tensor times pipeline parallelism")
             tensor = self.sampling.vllm.get("tensor_parallel_size")
             if type(tensor) is not int or tensor != self.inference_tensor_parallel_size:
                 raise ValueError("explicit inference tensor parallelism differs from sampling configuration")
@@ -102,6 +154,14 @@ class CortexTrainingConfig(ArcticClientConfig):
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict:
         sub = super()._cortex_inference_sub_job(job_type, n_gpus)
+        inference = deepcopy(self.sampling.arctic_inference_config or {})
+        if job_type != "sampling":
+            inference.pop("num_replicas", None)
+            inference.pop("router_replay", None)
+        for key, value in inference.items():
+            if key in sub["inference_config"] and sub["inference_config"][key] != value:
+                raise ValueError(f"conflicting Cortex inference field: {key}")
+        sub["inference_config"] = {**inference, **sub["inference_config"]}
         if self.inference_tensor_parallel_size is not None:
             sub = deepcopy(sub)
             sub["inference_config"].setdefault("vllm_config", {})[
@@ -114,6 +174,12 @@ class CortexTrainingConfig(ArcticClientConfig):
 
 class CorrectnessClient(ArcticClient):
     def __init__(self, config: ArcticClientConfig) -> None:
+        if isinstance(config, ReviewedClientConfig) and isinstance(config.backend, CortexConfig):
+            config = CortexTrainingConfig.from_reviewed(config)
+        elif isinstance(config, ReviewedClientConfig):
+            for role in ("training", "sampling", "log_prob"):
+                if config.gpus_for(role) > 0:
+                    config.to_onprem(role)
         if not isinstance(config, CortexTrainingConfig) or not isinstance(config.backend, CortexConfig):
             super().__init__(config)
             return

@@ -224,7 +224,7 @@ def reference_options(ctx, model_path: str) -> dict:
     fused = ctx.cfg.fused_cross_entropy
     return {
         "seed": SEED,
-        "attn": ctx.attn_implementation,
+        "attn": getattr(ctx, "reference_attention_implementation", ctx.attn_implementation),
         "token_budget": correctness_microbatch_tokens(ctx.cfg.max_tokens_per_mb),
         "ce_chunk": 2048,
         "matmul_precision": training.get("matmul_precision", "highest"),
@@ -389,7 +389,13 @@ def run_dss_trajectory(
         # Cortex forward returns logprobs without the on-prem processing option.
         validation_body["processing"].pop("return_logprobs")
     learning_rate = configured_learning_rate(ctx.cfg)
-    payload = build_payload(ctx.cfg.training, model_name, SEED, attn_implementation=ctx.attn_implementation)
+    payload = build_payload(
+        ctx.cfg.training,
+        model_name,
+        SEED,
+        attn_implementation=ctx.attn_implementation,
+        weight_format=ctx.cfg.sub_job.get("weight_format"),
+    )
     if peft_adapter_path is not None:
         from ..harness.lora import bind_payload
 
@@ -598,7 +604,13 @@ def _prepare_adapter(ctx, model_path: str, workdir: Path) -> Tuple[Path | None, 
         raise reference_records.ReferencePrerequisiteError("LoRA initialization produced no deterministic adapter")
     adapter = require_data_fast_path(adapter, label="E2E deterministic adapter")
     if not getattr(ctx, "prepare_references", False):
-        payload = build_payload(ctx.cfg.training, model_path, SEED, attn_implementation=ctx.attn_implementation)
+        payload = build_payload(
+            ctx.cfg.training,
+            model_path,
+            SEED,
+            attn_implementation=ctx.attn_implementation,
+            weight_format=ctx.cfg.sub_job.get("weight_format"),
+        )
         deterministic_lora.bind_payload(payload, adapter)
     return adapter, {
         "kind": "deterministic-lora",
