@@ -158,6 +158,19 @@ def _pad_rows(rows: list[dict[str, torch.Tensor]], width: int, pad_token_id: int
 _TRAINER_CLS = None
 
 
+def _require_server_loss_gas(training_client: Any, args: Any) -> None:
+    """Server-side ``trl_grpo`` backward()s each forward and does not divide by TRL accumulation."""
+    if not getattr(training_client, "server_side_loss", False) or args is None:
+        return
+    gas = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+    if gas != 1:
+        raise ValueError(
+            "server_side_loss requires gradient_accumulation_steps=1 "
+            f"(got {gas}); the server backward is not scaled by TRL accumulation, "
+            "so a larger value multiplies the update"
+        )
+
+
 def _trainer_cls():
     global _TRAINER_CLS
     if _TRAINER_CLS is not None:
@@ -185,6 +198,7 @@ def _trainer_cls():
                 min_p = getattr(grpo_args, "min_p", None)
                 if min_p not in (None, 0, 0.0):
                     raise ValueError("min_p is not supported.")
+            _require_server_loss_gas(training_client, grpo_args)
             model = kwargs.get("model", args[0] if args else None)
             if isinstance(model, str):
                 raise TypeError("Pass the module from build_stub_model(config); a model id would load the checkpoint.")
