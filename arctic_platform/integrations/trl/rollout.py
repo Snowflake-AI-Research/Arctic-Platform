@@ -217,9 +217,11 @@ class ArcticRolloutWorker:
     def _rollout_groups(self, dataset_rows: list[dict], start_group_id: int) -> None:
         """One ``generate()`` over ``len(dataset_rows)`` groups; identical prompts stay adjacent."""
         rendered = [self._render_prompt(row["prompt"]) for row in dataset_rows]
-        prompts: list[str] = []
-        for text, _ids in rendered:
-            prompts.extend([text] * self.num_generations)
+        # Token ids, not text. The server tokenizes text again and can add special
+        # tokens the training row does not have.
+        prompts: list[list[int]] = []
+        for _text, ids in rendered:
+            prompts.extend([list(ids)] * self.num_generations)
 
         model_version = self.model_version
         results = self.client.generate(
@@ -288,6 +290,11 @@ class ArcticRolloutWorker:
         completion_ids: list[list[int]] = []
         rows: list[dict[str, Any]] = []
         for result in results:
+            seen_prompt = result.get("prompt_token_ids")
+            if seen_prompt is not None and [int(t) for t in seen_prompt] != list(prompt_ids):
+                raise RuntimeError(
+                    f"sampler prompt ids {list(seen_prompt)} do not match training prompt ids {list(prompt_ids)}"
+                )
             token_ids = [int(t) for t in result["token_ids"]]
             text = result.get("text", "")
             lps = result.get("logprobs")
@@ -330,6 +337,8 @@ class ArcticRolloutWorker:
         advantages = self._advantages(rewards)
 
         for i, (r, adv) in enumerate(zip(rewards, advantages, strict=True)):
+            if np.isnan(r):
+                continue
             metrics = {
                 "reward": float(r),
                 "reward_std": float(reward_std),
