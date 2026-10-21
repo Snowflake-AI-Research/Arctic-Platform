@@ -351,8 +351,10 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         vocab = weight.shape[0]
         vocab_chunk_size = min(vocab, 8192)
 
-        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype)
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype)
+        # A frozen LM head (LoRA elsewhere) needs no weight gradient: no [vocab, hidden] buffer, no GEMM per tile.
+        need_hidden, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype) if need_hidden else None
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype) if need_weight else None
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -377,38 +379,61 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 hidden_for_logits = hidden_chunk.float() if fp32_lm_head else hidden_chunk
                 weight_for_logits = weight_chunk.float() if fp32_lm_head else weight_chunk
                 logits_chunk = hidden_for_logits @ weight_for_logits.t()
-                scaled_logits = logits_chunk.to(torch.float32) * inv_t_chunk
-                apply_lm_head_action_masks_(
-                    scaled_logits,
-                    token_masks,
-                    token_start=0,
-                    vocab_start=vocab_start,
-                    vocab_end=vocab_end,
-                )
-                probs = torch.exp(scaled_logits - logz_chunk.unsqueeze(-1))
+                if grouped is None:
+                    # The same FP32 operations in the same order, in place on one tile: at 8192 x 8192 the
+                    # out-of-place chain held four 256 MiB FP32 tiles at the start of backward, the step's peak.
+                    grad_logits = logits_chunk.to(torch.float32).mul_(inv_t_chunk)
+                    apply_lm_head_action_masks_(
+                        grad_logits,
+                        token_masks,
+                        token_start=0,
+                        vocab_start=vocab_start,
+                        vocab_end=vocab_end,
+                    )
+                    grad_logits.sub_(logz_chunk.unsqueeze(-1)).exp_().mul_((-normalizer_gradients).unsqueeze(-1))
+                    # Label term without a host sync: rows whose label is outside this tile add zero.
+                    local = labels_chunk - vocab_start
+                    in_tile = (local >= 0) & (local < vocab_end - vocab_start)
+                    grad_logits.scatter_add_(
+                        1,
+                        local.clamp(0, vocab_end - vocab_start - 1).to(torch.long).unsqueeze(-1),
+                        torch.where(in_tile, grad_chunk, 0.0).unsqueeze(-1),
+                    )
+                    grad_logits.mul_(inv_t_chunk)
+                else:
+                    scaled_logits = logits_chunk.to(torch.float32) * inv_t_chunk
+                    apply_lm_head_action_masks_(
+                        scaled_logits,
+                        token_masks,
+                        token_start=0,
+                        vocab_start=vocab_start,
+                        vocab_end=vocab_end,
+                    )
+                    probs = torch.exp(scaled_logits - logz_chunk.unsqueeze(-1))
 
-                grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
-                mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
-                if torch.any(mask):
-                    idx = (labels_chunk[mask] - vocab_start).to(torch.long)
-                    grad_logits[mask, idx] += grad_chunk[mask]
-                if grouped is not None:
+                    grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
+                    mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
+                    if torch.any(mask):
+                        idx = (labels_chunk[mask] - vocab_start).to(torch.long)
+                        grad_logits[mask, idx] += grad_chunk[mask]
                     grouped.add_group_gradients_to_tile(
                         grad_logits,
                         scaled_logits,
                         group_gradient_state,
                         vocab_start,
                     )
-                grad_logits = grad_logits * inv_t_chunk
+                    grad_logits = grad_logits * inv_t_chunk
 
-                grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
-                grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
-                grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
-                grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
+                if need_hidden:
+                    grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
+                    grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
+                if need_weight:
+                    grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
+                    grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
 
         return (
-            grad_hidden.to(hidden.dtype),
-            grad_weight.to(weight.dtype),
+            grad_hidden.to(hidden.dtype) if need_hidden else None,
+            grad_weight.to(weight.dtype) if need_weight else None,
             None,
             None,
             None,
