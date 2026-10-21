@@ -219,6 +219,12 @@ def _quantize_act_fp8_1x128(x: Tensor) -> tuple[Tensor, Tensor]:
     group = _FP8_BLOCK
     if x.shape[-1] % group != 0:
         raise ValueError(f"FP8 activation quant expects K divisible by {group}, got {tuple(x.shape)}")
+    dg = _deep_gemm()
+    if x.is_cuda and dg is not None and x.ndim == 2:
+        from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8_mn_major
+
+        # Scales written straight into DeepGEMM's MN-major TMA-aligned layout; same values as the per-group kernel.
+        return per_token_group_quant_fp8_mn_major(x, group)
     if x.is_cuda:
         from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8
 
@@ -230,7 +236,6 @@ def _quantize_act_fp8_1x128(x: Tensor) -> tuple[Tensor, Tensor]:
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         scale = (amax / fp8_max).contiguous()
         q = (blocks.float() / scale.unsqueeze(-1)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn).view(rows, cols)
-    dg = _deep_gemm()
     if dg is not None and q.is_cuda:
         scale = dg.get_mn_major_tma_aligned_tensor(scale)
     return q, scale

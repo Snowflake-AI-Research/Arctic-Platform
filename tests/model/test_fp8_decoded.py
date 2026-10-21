@@ -116,3 +116,20 @@ def test_grouped_fp8_decoded_mm_stacks_side_by_side():
     assert _rel(out[:routed], torch.cat([gate, up], 1)[:routed]) < 1e-3
     assert _rel(stacked_dx[:routed], x.grad[:routed]) < 1e-2
     assert (out[routed:] == 0).all() and (stacked_dx[routed:] == 0).all()
+
+
+@pytest.mark.parametrize("rows, cols", [(1001, 384), (4096, 2048)])
+def test_mn_major_activation_quant_matches_the_per_group_kernel_and_layout(rows, cols):
+    deep_gemm = pytest.importorskip("deep_gemm")
+    from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8
+    from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8_mn_major
+
+    torch.manual_seed(0)
+    x = (torch.randn(rows, cols, device="cuda") * 3).bfloat16()
+    x[5] = 0  # all-zero groups take the eps floor
+    q_ref, s_ref = per_token_group_quant_fp8(x, 128, use_ue8m0=False)
+    s_ref = deep_gemm.get_mn_major_tma_aligned_tensor(s_ref)
+    q, s = per_token_group_quant_fp8_mn_major(x, 128)
+
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s, s_ref) and s.stride() == s_ref.stride()
