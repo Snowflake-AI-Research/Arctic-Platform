@@ -95,3 +95,21 @@ def test_already_constructed_offload_config_is_preserved():
 def test_offload_enabled_with_selective_mode_raises():
     with pytest.raises(ValueError, match=r"mode='full'"):
         ActivationCheckpointConfig(mode="selective", offload_config=ActivationOffloadConfig(enabled=True))
+
+
+def test_layers_select_exactly_the_listed_blocks():
+    ac = ActivationCheckpointConfig(**{"mode": "full", "layers": [0, 2, 5]})
+
+    assert [layer for layer in range(8) if ac.checkpoints(layer)] == [0, 2, 5]
+    assert [layer for layer in range(8) if ActivationCheckpointConfig(freq=3).checkpoints(layer)] == [0, 3, 6]
+    assert not any(ActivationCheckpointConfig(layers=[]).checkpoints(layer) for layer in range(8))
+
+
+def test_layers_refuse_freq_duplicates_and_blocks_past_the_model():
+    with pytest.raises(ValueError, match="not both"):
+        ActivationCheckpointConfig(freq=2, layers=[0])
+    with pytest.raises(ValueError, match="twice"):
+        ActivationCheckpointConfig(layers=[1, 1])
+    with pytest.raises(ValueError, match="past the model"):
+        ActivationCheckpointConfig(layers=[3, 40]).check_layers_exist(40)
+    ActivationCheckpointConfig(layers=[39]).check_layers_exist(40)

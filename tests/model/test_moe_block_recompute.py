@@ -51,3 +51,16 @@ def test_full_checkpointing_recomputes_past_the_last_saved_tensor(apply_ac):
     model.model.layers[0](hidden_states).sum().backward()
 
     assert tail_runs == ["tail", "tail"]
+
+
+@pytest.mark.parametrize("apply_ac", [glm52_builder.apply_ac, qwen35_builder.apply_ac], ids=["glm52", "qwen35"])
+def test_listed_layers_are_the_only_checkpointed_blocks(apply_ac):
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([_Block([]) for _ in range(4)])
+    apply_ac(model, ActivationCheckpointConfig(mode="full", layers=[1, 3], router_replay_recompute=False))
+
+    wrapped = [type(block).__name__ == "CheckpointWrapper" for block in model.model.layers]
+    assert wrapped == [False, True, False, True]
+    with pytest.raises(ValueError, match="past the model"):
+        apply_ac(model, ActivationCheckpointConfig(mode="full", layers=[4], router_replay_recompute=False))
