@@ -393,6 +393,38 @@ class GroupedExperts(nn.Module):
 
         return lora
 
+    def _forward_fp8_decoded(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ab: dict,
+    ) -> torch.Tensor:
+        """Block-FP8 experts decoded to BF16 for each grouped GEMM (W8A16), plus grouped expert LoRA.
+
+        One routed-token count serves every projection; tokens need no per-expert padding and
+        activations are not quantized.
+        """
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora
+        from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
+
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        _offsets_must_cover_no_more_than_the_rows("fp8", x, num_tokens_per_expert, offsets)
+        rows = int(offsets[-1])
+        block_size = cast(int, self.fp8_block_size)
+        projections = dict(zip(("w1", "w2", "w3"), zip(weights, scales)))
+
+        def project(inputs: torch.Tensor, name: str) -> torch.Tensor:
+            weight, scale = projections[name]
+            out = grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
+            if name in ab:
+                out = out + grouped_expert_lora(inputs, ab[name], offsets, rows)
+            return out
+
+        h = _apply_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
+        return project(h, "w2")
+
     def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -410,6 +442,8 @@ class GroupedExperts(nn.Module):
             s2 = _maybe_to_local(self.w2_scale_inv)
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
+            if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab)
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)

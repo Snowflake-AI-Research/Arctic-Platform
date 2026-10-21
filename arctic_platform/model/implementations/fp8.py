@@ -457,6 +457,50 @@ class _GroupedBlockFp8MmFn(torch.autograd.Function):
         return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None, None
 
 
+class _GroupedDecodedFp8MmFn(torch.autograd.Function):
+    """Grouped ``x_e @ W_e.T`` against block-FP8 experts decoded to BF16; gradients flow to ``x``.
+
+    The decoded ``[E, rows, cols]`` weights exist for one GEMM and are decoded again in
+    backward. Rows of ``x`` past the last expert offset are padding and stay zero.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int) -> Tensor:
+        # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
+        ctx.weights = (weight, scale)
+        ctx.rows = rows
+        ctx.block_size = block_size
+        ctx.save_for_backward(offsets)
+        decoded = _decode_fp8_to_bf16(weight, scale, block_size)
+        out = torch._grouped_mm(x.bfloat16(), decoded.transpose(-2, -1), offs=offsets)
+        if rows < out.shape[0]:
+            out[rows:].zero_()
+        return out.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (offsets,) = ctx.saved_tensors
+        weight, scale = ctx.weights
+        decoded = _decode_fp8_to_bf16(weight, scale, ctx.block_size)
+        dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
+        if ctx.rows < dx.shape[0]:
+            dx[ctx.rows :].zero_()
+        return dx.type_as(grad_output), None, None, None, None, None
+
+
+def grouped_fp8_decoded_mm(
+    x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int
+) -> Tensor:
+    """Grouped GEMM of tokens packed by expert against block-FP8 experts decoded to BF16 per call (W8A16).
+
+    Unlike ``grouped_fp8_mm`` on Hopper, activations stay BF16 and tokens need no per-expert padding.
+    ``offsets`` is the cumulative token count per expert and ``rows`` its last value.
+    """
+    if offsets.numel() != weight.shape[0]:
+        raise ValueError(f"{offsets.numel()} expert offsets for {weight.shape[0]} FP8 experts")
+    return _GroupedDecodedFp8MmFn.apply(x, weight, scale, offsets, rows, block_size)
+
+
 def grouped_fp8_mm(
     x: Tensor,
     weight: Tensor,
