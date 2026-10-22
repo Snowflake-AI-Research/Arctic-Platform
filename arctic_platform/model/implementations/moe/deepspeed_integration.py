@@ -197,11 +197,17 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    # Only the master consumes the export: gather its EP group's shards straight into one output
+                    # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
+                    if 0 not in dist.get_process_group_ranks(ep_group):
+                        continue
                     local = tensor.data.contiguous()
-                    shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
-                    dist.all_gather(shards, local, group=ep_group)
+                    world = dist.get_world_size(group=ep_group)
+                    full = torch.empty((world * local.shape[0], *local.shape[1:]), dtype=local.dtype,
+                                       device=local.device) if is_master else None
+                    dist.gather(local, list(full.chunk(world, dim=0)) if is_master else None, dst=0, group=ep_group)
                     if is_master:
-                        layer_state[name] = torch.cat(shards, dim=0)
+                        layer_state[name] = full
                 elif is_master:
                     layer_state[name] = tensor.data
 
