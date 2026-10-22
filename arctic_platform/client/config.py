@@ -44,6 +44,7 @@ from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
+from arctic_platform.common.optimizer import OptimizerSettings
 
 JobId = int | str
 
@@ -349,9 +350,11 @@ class ArcticClientConfig(BaseModel):
             training["train_batch_size"] = ds["train_batch_size"]
         if "gradient_clipping" in ds:
             training["gradient_clipping"] = ds["gradient_clipping"]
-        optimizer = _neutrino_optimizer(ds.get("optimizer"))
-        if optimizer:
-            training["optimizer"] = optimizer
+        if isinstance(ds.get("optimizer"), dict):
+            optimizer = OptimizerSettings.model_validate(ds["optimizer"])
+            training["optimizer"] = optimizer.model_dump(exclude_unset=True)
+            if optimizer.gradient_clipping is not None:
+                training.setdefault("gradient_clipping", optimizer.gradient_clipping)
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
         provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
@@ -392,14 +395,6 @@ class ArcticClientConfig(BaseModel):
         if self.seed is not None:
             sub["seed"] = self.seed
         return sub
-
-
-def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
-    """DeepSpeed ``{"type", "params": {...}}`` → Neutrino ``{"name", lr, betas, ...}``."""
-    if not isinstance(ds_optimizer, dict):
-        return None
-    params = ds_optimizer.get("params") or {}
-    return {"name": ds_optimizer.get("type", "AdamW"), **params}
 
 
 def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
