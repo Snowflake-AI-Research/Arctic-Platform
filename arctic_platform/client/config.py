@@ -104,6 +104,32 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
+    request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
+    poll_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to poll a submitted Cortex operation."
+    )
+    job_ready_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to wait for a Cortex job to reach RUNNING."
+    )
+    # Every job on a shared account has the same submitter, so put a person or
+    # run name here. Existing launchers export CORTEX_JOB_COMMENT.
+    job_comment: str | None = Field(
+        None,
+        validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
+        description="cortex: comment stored on the job at create time.",
+    )
+    # The server reclaims a job nobody is using, so a client that is killed
+    # outright still releases its GPUs. None keeps the server default (30 min).
+    idle_timeout_seconds: int | None = Field(
+        None,
+        description="cortex: seconds a job may sit idle before the server reclaims it; 0 disables, else 300-604800.",
+    )
+    pending_timeout_seconds: int | None = Field(
+        None,
+        ge=300,
+        le=604_800,
+        description="cortex: seconds a job may wait for capacity before the server fails it (default 24h).",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -114,6 +140,9 @@ class CortexConfig(BaseSettings):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
             if not (self.pat and self.pat.get_secret_value()):
                 raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
+        idle = self.idle_timeout_seconds
+        if idle is not None and idle != 0 and not 300 <= idle <= 604_800:
+            raise ValueError("cortex: idle_timeout_seconds must be 0 or between 300 and 604800.")
         return self
 
 
@@ -224,11 +253,6 @@ class ArcticClientConfig(BaseModel):
     sampling_gpus: int = 0
     log_prob_gpus: int = 0
 
-    # Shared across backends.
-    job_ready_timeout: float = Field(1800.0, description="Seconds to wait for a created job to reach RUNNING.")
-    request_timeout: float = Field(
-        1800.0, description="Per-request timeout (seconds) applied to every call. Generous for long ops."
-    )
     training: TrainingConfig = Field(default_factory=TrainingConfig, description="Training job settings.")
     sampling: SamplingConfig = Field(
         default_factory=SamplingConfig, description="Sampling / log-prob engine settings."

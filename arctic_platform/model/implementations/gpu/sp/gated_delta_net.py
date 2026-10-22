@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import types
 from typing import Any
@@ -316,9 +317,13 @@ def head_parallel_gated_delta_net(
     global_cu_seqlens: torch.Tensor,
     num_key_heads: int,
     num_value_heads: int,
+    fp32_beta: bool,
     **rule_kwargs,
 ):
     """Run convolution and recurrence on a full-sequence GDN head shard.
+
+    ``fp32_beta`` evaluates the beta gate as a sigmoid of fp32 ``b``; ``False`` evaluates it in ``b``'s own dtype. It
+    has no default, so every caller chooses.
 
     The first all-to-all exchanges native projected Q/K/V and gate preactivations
     from local-sequence/all-heads to full-sequence/local-heads. The depthwise
@@ -443,7 +448,11 @@ def head_parallel_gated_delta_net(
         num_value_heads=num_value_heads,
         process_group=process_group,
     )
-    beta = exchanged["b"].sigmoid()
+    # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of low-precision
+    # ``b`` would round the gate before the recurrence reads it. This function is shared by the custom Qwen3.5-MoE
+    # model and by the generic transformers wrapper (``_adapt_gated_delta_net_module``); each passes its loader's
+    # ``fp32_parity`` setting.
+    beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
     replication = num_value_heads // num_key_heads
@@ -583,9 +592,50 @@ def head_parallel_gated_delta_rule(
     return output, None
 
 
+_KERNEL_DISPATCH = {
+    "causal_conv1d_fn": (
+        "causal_conv1d_fn",
+        "causal_conv1d",
+        "causal_conv1d_fn",
+    ),
+    "chunk_gated_delta_rule": (
+        "torch_chunk_gated_delta_rule",
+        "fla.ops.gated_delta_rule",
+        "chunk_gated_delta_rule",
+    ),
+}
+
+
+def _resolve_gated_delta_net_kernel(module: nn.Module, attribute: str):
+    kernel = getattr(module, attribute, None) or getattr(module, f"_{attribute}", None)
+    if kernel is not None:
+        return kernel
+
+    dispatch_name, package_name, package_attribute = _KERNEL_DISPATCH[attribute]
+    implementation = importlib.import_module(type(module).__module__)
+    dispatch = getattr(implementation, dispatch_name, None)
+    if dispatch is None or not hasattr(dispatch, "__wrapped__"):
+        return dispatch
+    try:
+        package = importlib.import_module(package_name)
+    except ImportError:
+        return dispatch
+    return getattr(package, package_attribute, dispatch)
+
+
+def _has_gated_delta_net_kernel_slot(module: nn.Module, attribute: str) -> bool:
+    if hasattr(module, attribute) or hasattr(module, f"_{attribute}"):
+        return True
+    dispatch_name = _KERNEL_DISPATCH[attribute][0]
+    implementation = importlib.import_module(type(module).__module__)
+    return hasattr(implementation, dispatch_name)
+
+
 def _is_gated_delta_net_module(module: nn.Module) -> bool:
-    return all(
-        hasattr(module, attribute) for attribute in ("causal_conv1d_fn", "chunk_gated_delta_rule", "conv_kernel_size")
+    return (
+        hasattr(module, "conv_kernel_size")
+        and _has_gated_delta_net_kernel_slot(module, "causal_conv1d_fn")
+        and _has_gated_delta_net_kernel_slot(module, "chunk_gated_delta_rule")
     )
 
 
@@ -610,7 +660,12 @@ def _module_head_counts(module: nn.Module) -> tuple[int, int]:
     return num_key_heads, num_value_heads
 
 
-def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
+def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta: bool) -> None:
+    """Replace ``module.forward`` with the head-parallel forward.
+
+    ``fp32_beta`` is passed to :func:`head_parallel_gated_delta_net`: ``True`` evaluates the beta gate as a sigmoid of
+    fp32 ``b``, ``False`` as ``b.sigmoid()`` in ``b``'s own dtype, which is what the stock transformers forward does.
+    """
     required_attributes = (
         "in_proj_qkv",
         "in_proj_z",
@@ -632,8 +687,8 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
             f"full temporal-core head parallelism: {missing}"
         )
 
-    original_causal_convolution = module.causal_conv1d_fn
-    original_gated_delta_rule = module.chunk_gated_delta_rule
+    original_causal_convolution = _resolve_gated_delta_net_kernel(module, "causal_conv1d_fn")
+    original_gated_delta_rule = _resolve_gated_delta_net_kernel(module, "chunk_gated_delta_rule")
     num_key_heads, num_value_heads = _module_head_counts(module)
     world_size = dist.get_world_size(process_group)
     if num_key_heads % world_size or num_value_heads % world_size:
@@ -716,6 +771,7 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
             global_cu_seqlens=global_cu_seqlens,
             num_key_heads=num_key_heads,
             num_value_heads=num_value_heads,
+            fp32_beta=fp32_beta,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
@@ -769,8 +825,11 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
     model.forward = forward
 
 
-def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) -> int:
-    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count."""
+def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group, *, fp32_beta: bool) -> int:
+    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count.
+
+    ``fp32_beta`` selects the beta gate's precision in every adapted module (see ``_adapt_gated_delta_net_module``).
+    """
     if process_group is None:
         return 0
 
@@ -782,7 +841,7 @@ def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) 
         compatible_modules += 1
         if getattr(module, "_dss_gated_delta_net_sequence_parallel", False):
             continue
-        _adapt_gated_delta_net_module(module, process_group)
+        _adapt_gated_delta_net_module(module, process_group, fp32_beta=fp32_beta)
         adapted.append(module)
     adapted_modules = len(adapted)
     if adapted:

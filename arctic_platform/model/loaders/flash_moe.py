@@ -51,8 +51,6 @@ def _validate_common(
         raise ValueError(f"{family} dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1 and not allow_sequence_parallel:
         raise NotImplementedError(f"Sequence parallelism is not implemented for {family}.")
-    if spec.patches.peft is not None:
-        raise ValueError(f"{family} PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             f"the {family} loader does not support the liger patch; "
@@ -70,6 +68,7 @@ def _validate_common(
 
 
 def _validate_glm5_next(spec: ModelSpec) -> None:
+    from arctic_platform.model.implementations.glm53.context_parallel import SPARSE_MLA_BACKENDS
     from arctic_platform.model.implementations.glm53.deepspeed_integration import GLM53_ATTN_BACKEND
 
     _validate_common(
@@ -78,7 +77,7 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
         default_attention=GLM53_ATTN_BACKEND,
         allow_sequence_parallel=True,
     )
-    if spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+    if spec.attn_implementation not in SPARSE_MLA_BACKENDS:
         raise ValueError(
             f"GLM-5.3-Flash training requires sparse MLA; got attn_implementation={spec.attn_implementation!r}"
         )

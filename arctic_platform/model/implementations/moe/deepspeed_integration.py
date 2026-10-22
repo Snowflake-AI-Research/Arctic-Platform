@@ -41,7 +41,7 @@ class MoEDeepSpeedAdapter:
     shared_expert_type: type[nn.Module]
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
-    extra_weight_iterators: tuple[tuple[str, Callable[[nn.Module], Callable]], ...] = ()
+    vllm_weight_export: Callable[[nn.Module], Callable] | None = None
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -170,7 +170,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def iterator():
+    def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
@@ -182,7 +182,10 @@ def build_iter_full_hf_weights(model: nn.Module):
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model):
-            if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+            if not include_skipped and (
+                getattr(tensor, "_dss_skip_weight_sync", False)
+                or id(tensor) in skipped_parameter_ids
+            ):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
@@ -286,9 +289,16 @@ def load_moe_model_for_deepspeed(
     )
     count = tag_expert_params_for_deepspeed(model, ep_group_name)
     get_logger().info(f"Tagged {count} expert parameters with group_name='{ep_group_name}', allreduce=False")
-    model._iter_full_hf_weights = build_iter_full_hf_weights(model)
-    for attribute, builder in adapter.extra_weight_iterators:
-        setattr(model, attribute, builder(model))
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+
+    register_weight_export(
+        model,
+        WeightExportContract(
+            hf=build_iter_full_hf_weights,
+            vllm=adapter.vllm_weight_export,
+        ),
+    )
     return model
 
 
