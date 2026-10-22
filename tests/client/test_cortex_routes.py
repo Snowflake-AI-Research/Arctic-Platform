@@ -159,6 +159,7 @@ class TestLifecycleRoutes:
     def test_shutdown_cancel_is_replay_safe(self):
         """Cancel is idempotent, so teardown retries transient errors instead of leaking the job."""
         transport, send = _transport()
+        transport._owns_job = True
         transport.shutdown()
 
         (sent,) = send.sent
@@ -166,6 +167,7 @@ class TestLifecycleRoutes:
 
     def test_shutdown_tolerates_a_failed_cancel(self):
         transport, _ = _transport()
+        transport._owns_job = True
 
         async def fail(*args, **kwargs):
             raise aiohttp.ClientConnectionError("gone")
