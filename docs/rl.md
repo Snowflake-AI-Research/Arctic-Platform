@@ -195,8 +195,14 @@ and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
 The term clamps the teacher-minus-policy log ratio to
 `[-teacher_clip_negative, teacher_clip]`; `teacher_clip_negative` is an
 optional finite non-negative lower-clip magnitude that defaults to
-`teacher_clip`. `ap_grpo` accepts only the baseline GRPO config keys
-(`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control keys below; the
+`teacher_clip`. Every GRPO name also accepts `sampler_kl_coef` (β, finite
+non-negative, default `0.0`), which adds `β · (old_log_probs_shifted − logprobs)`
+on every policy token except `nll_mask` tokens, aggregated like the policy
+term. This is the k1 estimate of KL(sampler ‖ policy); its gradient `−β ∇ log p`
+raises each sampled token's probability regardless of its advantage, which
+keeps the policy close to the sampler. `ap_grpo` accepts only the baseline
+GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control
+keys below; the
 unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
 `kd_divergence`, `kd_beta`, and `kd_batch_num_tokens` keys. Any other key is
 rejected by name in the batching and validation callbacks and again in the
