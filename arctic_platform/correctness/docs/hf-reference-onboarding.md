@@ -4,9 +4,9 @@
 
 ## Create A Reviewed Specification
 
-**Start with the complete example in the [operator guide](running-tests.doc).** That example checks out this branch, resolves `axolotl-ai-co/tiny-qwen3-129m`'s weights and tokenizer through Hugging Face's existing `/checkpoint/huggingface` cache, creates a complete one-H200, 128-token training config, and defines every directory used below. Hugging Face reuses cached files and automatically downloads missing files. The example requires an exclusively allocated, prepared head node with the upstream DSS gateway installed. Correctness uses Cortex-training; onboarding manages its own local gateway when no service is configured.
+**Start with the complete example in the [operator guide](running-tests.md).** That example checks out this branch, resolves `axolotl-ai-co/tiny-qwen3-129m`'s weights and tokenizer through Hugging Face's existing `/checkpoint/huggingface` cache, creates a complete one-H200, 128-token training config, and defines every directory used below. Hugging Face reuses cached files and automatically downloads missing files. The example requires an exclusively allocated, prepared head node with the upstream DSS gateway installed. Correctness uses Cortex-training; onboarding manages its own local gateway when no service is configured.
 
-**A new configuration needs only its native config as onboarding input.** The harness derives the source checkpoint from `model_name`, prepares the reduced fixture, calibrates gates, publishes individual and combined references, and validates applicable checks. The generated specification describes the fixture, input batches, applicable checks and calibrated tolerances. Compact records contain independent Hugging Face measurements, not tensor payloads. Source weights use `/checkpoint/huggingface/hub`; the demo config and final reports use the checkout's Git-ignored `./work/` directory. Generated fixtures and calibration calculations use temporary fast storage. Records must be inside the executing library's checkout, which need not be on temporary storage.
+**A new configuration needs only its config file as onboarding input.** Both native client configs and existing Cortex-training recipe JSON with `sub_job_configs` are accepted; pass either file directly with `--config`, without converting or flattening the recipe. The harness derives the source checkpoint from `model_name`, prepares the reduced fixture, calibrates gates, publishes individual and combined references, and validates applicable checks. The generated specification describes the fixture, input batches, applicable checks and calibrated tolerances. Compact records contain independent Hugging Face measurements, not tensor payloads. Source weights use `/checkpoint/huggingface/hub`; the demo config and final reports use the checkout's Git-ignored `./work/` directory. Generated fixtures and calibration calculations use temporary fast storage. Records must be inside the executing library's checkout, which need not be on temporary storage.
 
 ```bash
 python -m arctic_platform.correctness onboard \
@@ -15,7 +15,7 @@ python -m arctic_platform.correctness onboard \
 
 **Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and the adjacent `tiny-qwen3-129m-one-h200.onboarding.json` summary before accepting the gates. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
 
-**Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.doc#onboarding) for retained reports.
+**Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.md#onboarding) for retained reports.
 
 **Use an existing reviewed spec for preparation-only runs.** `--prepare-references` does not resize the fixture or rewrite an existing numerical gate.
 
@@ -33,7 +33,7 @@ python -m arctic_platform.correctness onboard \
 
 **Records bind measurements to the exact workload.** Identity includes configuration checksum, check and arm, model asset contents, reference source and dependency identities, adapter initialization where applicable, input tensor semantics, and check-specific settings. Records are compact JSON at `<records>/<config-id>/<check-id>/<identity-sha256>.json`; they do not contain model or optimizer tensors.
 
-**Compact records default to the Git-ignored `arctic_platform/correctness/reference_data` directory.** The publisher validates containment under the executing library's Git root, not merely the shell's current directory. An unrelated sibling records directory is rejected. No measurements are bundled. To override the default, pass the same `--reference-records-dir` inside the checkout to preparation and regression. Model weights and adapter tensors do not belong in this directory or in Git.
+**Compact records are generated local artifacts, not files to commit.** They default to the Git-ignored `arctic_platform/correctness/reference_data` directory. Retain them for later regression; regression cannot regenerate missing HF measurements. The publisher validates containment under the executing library's Git root, not Git tracking or merely the shell's current directory. An unrelated sibling records directory is rejected. No measurements are bundled. To override the default, pass the same `--reference-records-dir` inside the checkout to preparation and regression. Model weights and adapter tensors do not belong in this directory or in Git.
 
 **Publication is immutable.** Identical records can be reused. Corrupt records, conflicting measurements, changed sources, changed assets, or changed workloads require explicit resolution and reviewed preparation; regression cannot replace or recalibrate them.
 
@@ -61,7 +61,7 @@ python -m arctic_platform.correctness onboard \
 
 ## LoRA Prerequisites
 
-**First-two reference preparation detects low-rank adaptation (LoRA) settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.doc#lora-without-adapter-inputs) distinguishes reference generation from target support.
+**First-two reference preparation detects low-rank adaptation (LoRA) settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
 
 **Compact records contain the generation recipe and content hashes, not adapter tensors.** Identity binds the dependency versions, topology, tensor shapes/dtypes and exact values. Regression reconstructs adapter factors and requires matching prepared references; it never runs HF again to accommodate a mismatch. Only explicit onboarding measures references.
 
@@ -69,7 +69,7 @@ python -m arctic_platform.correctness onboard \
 
 ## Run Regression
 
-**Run regression with one command in one terminal, just like onboarding.** With no Cortex host or base URL configured, regression starts and stops its owned installed DSS gateway and selects the reduced fixture automatically. An explicitly configured endpoint is external and must already be running; the command does not stop it. Loopback database/schema segments default to `dev`. See the [Running section](running-tests.doc#running) for prerequisites, diagnostics and cleanup limits.
+**Run regression with one command in one terminal, just like onboarding.** With no Cortex host or base URL configured, regression starts and stops its owned installed DSS gateway and selects the reduced fixture automatically. An explicitly configured endpoint is external and must already be running; the command does not stop it. Loopback database/schema segments default to `dev`. See the [Running section](running-tests.md#running) for prerequisites, diagnostics and cleanup limits.
 
 ```bash
 python -m arctic_platform.correctness run \
@@ -77,4 +77,4 @@ python -m arctic_platform.correctness run \
   --out ./work/reports/both
 ```
 
-**CPU tests and preparation receipts are not numerical target passes.** Only an actual target comparison under the reviewed workload establishes a verdict. See [the operator guide](running-tests.doc) for backend prerequisites and result files.
+**CPU tests and preparation receipts are not numerical target passes.** Only an actual target comparison under the reviewed workload establishes a verdict. See [the operator guide](running-tests.md) for backend prerequisites and result files.

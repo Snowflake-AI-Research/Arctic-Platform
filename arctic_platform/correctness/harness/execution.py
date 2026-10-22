@@ -708,6 +708,7 @@ def run_batch(args, *, selected, executor=None):
             else:
                 groups.append([case])
     print(f"Selected {len(selected)} configuration/test pair(s); running sequentially.", flush=True)
+    print("Selected tests: " + ", ".join(dict.fromkeys(case.test_id for case in selected)), flush=True)
     with (out / "full.log").open("w", encoding="utf-8") as log:
         for index, group in enumerate(groups):
             group_results = []

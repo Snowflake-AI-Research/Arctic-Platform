@@ -30,6 +30,7 @@ import runpy
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -67,7 +68,7 @@ from .helpers import _synthetic_config_spec
 
 @pytest.mark.parametrize(
     "document",
-    ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.doc"],
+    ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"],
 )
 def test_quick_demo_config_is_tiny_and_retains_both_gas_arms(tmp_path, monkeypatch, document):
     from arctic_platform.correctness.harness.config import arms_for
@@ -116,6 +117,66 @@ def test_quick_demo_config_is_tiny_and_retains_both_gas_arms(tmp_path, monkeypat
     ]
     assert "--config ./work/configs/tiny-qwen3-129m-one-h200.json" in text
     assert "qwen3-8b-four-h200" not in text
+
+
+@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"])
+@pytest.mark.parametrize("private_paths", [False, True])
+def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scratch(tmp_path, document, private_paths):
+    root = Path(__file__).resolve().parents[3]
+    text = (root / document).read_text()
+    staging = (
+        text.split("## Add To Repo\n", 1)[1].split("## Cleanup\n", 1)[0].split("```bash\n", 1)[1].split("```", 1)[0]
+    )
+    cleanup = text.split("## Cleanup\n", 1)[1]
+    commands = [block.split("```", 1)[0] for block in cleanup.split("```bash\n")[1:3]]
+    assert all("/data-fast" not in command and "DSS_CORRECTNESS_TMPDIR" not in command for command in commands)
+    identifier = "tiny-qwen3-129m-one-h200"
+    config = f"arctic_platform/correctness/configs/{identifier}.json"
+    specification = f"arctic_platform/correctness/specs/{identifier}.json"
+    record = f"arctic_platform/correctness/reference_data/{identifier}/single-step-grads/record.json"
+    unrelated_record = "arctic_platform/correctness/reference_data/other/single-step-grads/record.json"
+    original = f"work/configs/{identifier}.json"
+    report_path = "work/reports/both/report.json"
+    for relative in (config, specification, record, unrelated_record, original, report_path):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    (tmp_path / ".gitignore").write_text(
+        "/arctic_platform/correctness/configs/\n/arctic_platform/correctness/specs/\n/arctic_platform/correctness/reference_data/\n/work/\n"
+    )
+
+    def run(*args, env=None):
+        return subprocess.run(args, cwd=tmp_path, env=env, check=True, text=True, capture_output=True).stdout
+
+    run("git", "init", "--quiet")
+    run("bash", "-eu", "-c", staging)
+    assert set(run("git", "ls-files", "--cached").splitlines()) == {config, specification}
+    assert set(run("git", "check-ignore", record, unrelated_record).splitlines()) == {record, unrelated_record}
+    assert text.index("## When A Step Fails\n") < text.index("## Add To Repo\n") < text.index("## Cleanup\n")
+    assert "mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX" in text
+
+    logs = tmp_path / "work" / "logs" / ("correctness-demo.test" if private_paths else "other-run")
+    logs.mkdir(parents=True)
+    (logs / "onboarding.log").write_text("saved diagnostic")
+    other_logs = tmp_path / "work" / "logs" / "keep-this-run"
+    other_logs.mkdir()
+    (other_logs / "onboarding.log").write_text("unrelated diagnostic")
+    with tempfile.TemporaryDirectory(
+        prefix="correctness-demo." if private_paths else "unrelated-run.", dir="/data-fast/tmp"
+    ) as scratch:
+        scratch_path = Path(scratch)
+        (scratch_path / "batch.pt").write_bytes(b"temporary")
+        (scratch_path / "retained-input").symlink_to(tmp_path / config)
+        env = {**os.environ, "DSS_CORRECTNESS_TMPDIR": scratch, "DSS_CORRECTNESS_LOGDIR": str(logs)}
+        for command in commands:
+            run("bash", "-eu", "-c", command, env=env)
+        assert (scratch_path / "batch.pt").read_bytes() == b"temporary"
+        assert (scratch_path / "retained-input").is_symlink()
+        assert logs.exists() is not private_paths
+        assert all((tmp_path / relative).is_file() for relative in (config, specification, record, unrelated_record))
+        assert (other_logs / "onboarding.log").is_file()
+        assert not (tmp_path / original).exists()
+        assert not (tmp_path / report_path).exists()
 
 
 @pytest.fixture(autouse=True)
@@ -1671,7 +1732,9 @@ def test_operator_api_mixed_batch_continues_and_retains_every_pair(tmp_path, mon
     assert (tmp_path / "batch.json").is_file()
 
 
-def test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity(tmp_path, monkeypatch):
+def test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity(
+    tmp_path, monkeypatch, capsys
+):
     selected = api.select(api.RunRequest(config=_operator_api_CONFIG))
     observed = []
     monkeypatch.setattr(execution, "write_report", lambda *a, **k: None)
@@ -1690,6 +1753,8 @@ def test_operator_api_actual_execution_preserves_selection_order_and_combined_st
     assert ("single-step-grads", "single-step-optimizer") in observed
     assert [case["test_id"] for case in result.cases] == [case.test_id for case in selected]
     assert result.exit_code == 0
+    expected = ", ".join(dict.fromkeys(case.test_id for case in selected))
+    assert f"Selected tests: {expected}" in capsys.readouterr().out.splitlines()
 
 
 def test_operator_api_inapplicable_is_visible_and_not_a_pass(tmp_path, monkeypatch):
@@ -1771,7 +1836,7 @@ def test_operator_api_parse_flags_is_shared_with_operator_command():
 
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
     monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
-    guide = api.PACKAGE_DIR / "docs" / "running-tests.doc"
+    guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
     before = guide.read_bytes()
     monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
     from transformers import AutoConfig
@@ -2655,6 +2720,7 @@ def test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance
     lines = capsys.readouterr().out.splitlines()
     assert lines[-1] == "Total run time: 00:01:08"
     assert sum(line.startswith("Total run time:") for line in lines) == 1
+    assert f"Selected tests: {_operator_api_TEST}" in lines
     assert any(line.startswith("Report:") for line in lines[:-1])
     if isinstance(verdict, Exception):
         assert lines[-2].startswith("Action required:")
