@@ -1,6 +1,6 @@
 """CPU completion ordering; real vLLM methods, synthetic storage, no GPU kernels.
 
-VLLM_SOURCE_ROOT may name a vLLM 0.30.0 checkout on CPU-only test hosts.
+VLLM_SOURCE_ROOT may name a vLLM 0.31.0 checkout on CPU-only test hosts.
 Otherwise read the installed vLLM package without importing its GPU runtime.
 """
 
@@ -77,17 +77,20 @@ def manager_methods(monkeypatch):
     target.MambaManager = ns["Manager"]
     monkeypatch.setitem(sys.modules, target.__name__, target)
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.30.0"
+    vllm.__version__ = "0.31.0"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
     from arctic_platform.inference.vllm import required_patches
 
     for name, entry in [
+        ("config", "ensure_dflash_max_position_patch"),
         ("router_replay", "ensure_router_replay_vllm_patches"),
         ("xgrammar_stop_mask", "ensure_xgrammar_stop_mask_fix"),
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
         ("dflash2_nan_fix", "apply_dflash2_nan_fixes"),
+        ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
+        ("kv_group_size", "ensure_kv_group_size_patch"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)
@@ -151,7 +154,11 @@ def setup(retained, active_last=False):
     mapping.update((b.block_hash, b) for b in blocks.values())
     pool.null_block = null
     spec = SimpleNamespace(
-        block_size=1, mamba_cache_mode="align", num_speculative_blocks=0, num_prefill_checkpoint_blocks=1
+        block_size=1,
+        dcp_sharded=False,
+        mamba_cache_mode="align",
+        num_speculative_blocks=0,
+        num_prefill_checkpoint_blocks=1,
     )
     obj = ns["Manager"](spec, pool, enable_caching=True, kv_cache_group_id=0, scheduler_block_size=1)
     obj.req_to_blocks = {"r": [blocks.get(i, null) for i in range(1, 9)]}
