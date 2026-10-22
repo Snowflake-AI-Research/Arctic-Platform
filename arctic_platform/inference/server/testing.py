@@ -12,6 +12,9 @@ import ray
 import torch
 
 from arctic_platform.inference.server.worker import WorkerLifecycleState
+from arctic_platform.inference.server.worker import _is_full_wake
+from arctic_platform.inference.server.worker import _is_kv_only_wake
+from arctic_platform.inference.server.worker import _is_weights_only_wake
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
     densify as _densify_prompt_logprobs,
@@ -87,7 +90,11 @@ class DummyWorker:
         return result
 
     def is_healthy(self) -> bool:
-        return self.state in (WorkerLifecycleState.READY, WorkerLifecycleState.SLEEPING)
+        return self.state in (
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.WEIGHTS_READY,
+        )
 
     def get_state(self) -> str:
         return self.state.value
@@ -115,8 +122,30 @@ class DummyWorker:
         return {"status": "sleeping", "level": level}
 
     async def wake_up(self, tags: list[str] | None = None) -> dict[str, Any]:
-        self.state = WorkerLifecycleState.READY
-        return {"status": "ready"}
+        if self.state == WorkerLifecycleState.READY:
+            return {"status": "already_ready"}
+        if self.state == WorkerLifecycleState.WEIGHTS_READY:
+            if _is_weights_only_wake(tags):
+                return {"status": "already_weights_ready"}
+            if not (_is_kv_only_wake(tags) or _is_full_wake(tags)):
+                raise RuntimeError(
+                    f"Cannot wake up from weights_ready with tags={tags!r}; "
+                    "use tags=['kv_cache'] or a full wake"
+                )
+            self.state = WorkerLifecycleState.READY
+            return {"status": "ready"}
+        if self.state != WorkerLifecycleState.SLEEPING:
+            raise RuntimeError(f"Cannot wake up: worker state is {self.state.value}")
+        if _is_kv_only_wake(tags):
+            raise RuntimeError(
+                "Cannot wake kv_cache only from sleeping; wake weights first "
+                "(tags=['weights'])"
+            )
+        if _is_full_wake(tags):
+            self.state = WorkerLifecycleState.READY
+            return {"status": "ready"}
+        self.state = WorkerLifecycleState.WEIGHTS_READY
+        return {"status": "weights_ready"}
 
     async def sync_weights(
         self, master_addr: str, master_port: int, rank_offset: int,
