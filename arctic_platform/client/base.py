@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import Any
 
@@ -54,6 +55,7 @@ from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
 from arctic_platform.client.requests import generate_stream_request
+from arctic_platform.client.requests import get_experiment_run_request
 from arctic_platform.client.requests import get_job_request
 from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.requests import list_jobs_request
@@ -124,7 +126,7 @@ def _next_poll_wait(got_items: bool, wait: float, poll_interval: float) -> float
 
 def _next_log_wait(page: dict, wait: float, poll_interval: float, follow: bool) -> float | None:
     """Seconds before `stream_logs` fetches again, or None to stop."""
-    if page["eof"] and not follow and not page["entries"]:
+    if not page["entries"] and (page["eof"] or not follow):
         return None
     return _next_poll_wait(bool(page["entries"]), wait, poll_interval)
 
@@ -192,14 +194,17 @@ class ArcticClient(_ArcticClientCore):
     def list_jobs(self, status: str | None = None) -> list[dict]:
         return self._call(list_jobs_request(status))
 
-    def capacity(self, hardware: str | None = None) -> dict:
-        return self._call(capacity_request(hardware))
+    def capacity(self, hardware: str | None = None, *, breakdown: str | Iterable[str] | None = None) -> dict:
+        return self._call(capacity_request(hardware, breakdown))
 
     def cancel_job(self, job_id: JobId) -> None:
         self._call(cancel_job_request(job_id))
 
     def get_job(self) -> dict:
         return self._call(get_job_request(self.jobs.require_any()))
+
+    def get_experiment_run(self) -> dict[str, str]:
+        return self._call(get_experiment_run_request(self.jobs.require_any()))
 
     def list_checkpoints(self) -> list[dict]:
         return self._call(list_checkpoints_request(self.jobs.require("training")))
@@ -409,14 +414,17 @@ class AsyncArcticClient(_ArcticClientCore):
     async def list_jobs(self, status: str | None = None) -> list[dict]:
         return await self._acall(list_jobs_request(status))
 
-    async def capacity(self, hardware: str | None = None) -> dict:
-        return await self._acall(capacity_request(hardware))
+    async def capacity(self, hardware: str | None = None, *, breakdown: str | Iterable[str] | None = None) -> dict:
+        return await self._acall(capacity_request(hardware, breakdown))
 
     async def cancel_job(self, job_id: JobId) -> None:
         await self._acall(cancel_job_request(job_id))
 
     async def get_job(self) -> dict:
         return await self._acall(get_job_request(self.jobs.require_any()))
+
+    async def get_experiment_run(self) -> dict[str, str]:
+        return await self._acall(get_experiment_run_request(self.jobs.require_any()))
 
     async def list_checkpoints(self) -> list[dict]:
         return await self._acall(list_checkpoints_request(self.jobs.require("training")))
