@@ -23,6 +23,7 @@ transiently.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import torch
@@ -1026,6 +1027,168 @@ class WeightSyncExtension:
         spec_model.load_weights(all_weights)
 
         return self._build_result(start, mem_before, "batched", loaded)
+
+    # ------------------------------------------------------------------
+    # Colocated CUDA IPC / shared-file load, and the sampler weight norm
+    # ------------------------------------------------------------------
+
+    def _validate_weight_sync_names(self, model, sender_names, *, context: str = "") -> None:
+        """Raise when the sender's HF param names do not match this model."""
+        from arctic_platform.inference.server.weight_sync.utils import _name_is_non_synced
+        from arctic_platform.inference.server.weight_sync.utils import compute_expected_hf_param_names
+
+        sender_set = {n for n in sender_names if not _name_is_non_synced(n)}
+        try:
+            expected_set = compute_expected_hf_param_names(model)
+        except Exception as exc:
+            logger.warning(
+                "Weight-sync name check skipped: failed to derive expected param names (%s).",
+                exc,
+            )
+            return
+
+        unexpected = sender_set - expected_set
+        missing = expected_set - sender_set
+        if not unexpected and not missing:
+            logger.info(
+                "weight-sync names validated context=%s sender=%d expected=%d",
+                context or "?",
+                len(sender_set),
+                len(expected_set),
+            )
+            return
+
+        ctx = f" [{context}]" if context else ""
+        parts = [f"Weight-sync param name mismatch{ctx}:"]
+        if unexpected:
+            sample = sorted(unexpected)[:10]
+            extra = "" if len(unexpected) <= len(sample) else f" ... (+{len(unexpected) - len(sample)} more)"
+            parts.append(
+                f"  Sender shipped {len(unexpected)} names the model does not expect: {', '.join(sample)}{extra}"
+            )
+        if missing:
+            sample = sorted(missing)[:10]
+            extra = "" if len(missing) <= len(sample) else f" ... (+{len(missing) - len(sample)} more)"
+            parts.append(
+                f"  Model expects {len(missing)} names the sender did not ship: {', '.join(sample)}{extra}"
+            )
+        parts.append(f"  (sender_count={len(sender_set)}, expected_count={len(expected_set)})")
+        msg = "\n".join(parts)
+        if os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") == "0":
+            logger.warning("%s\n(non-strict mode: continuing despite mismatch)", msg)
+            return
+        raise RuntimeError(msg)
+
+    def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict:
+        """Load weights from CUDA IPC handles (zero-copy, same GPU)."""
+        import base64
+        import pickle
+
+        start = time.time()
+        model = self.model_runner.model
+        torch.cuda.reset_peak_memory_stats(self.device)
+        mem_before = torch.cuda.memory_allocated(self.device)
+
+        names = ipc_payload["names"]
+        self._validate_weight_sync_names(model, names, context="cuda_ipc")
+        handles_list = pickle.loads(base64.b64decode(ipc_payload["ipc_handles_pickled"]))
+
+        device_index = torch.cuda.current_device()
+        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
+        self._offloaded_state = {}
+
+        loaded = 0
+        missing = []
+        for name, handle_dict in zip(names, handles_list):
+            if physical_gpu_id not in handle_dict:
+                missing.append(name)
+                continue
+            func, args = handle_dict[physical_gpu_id]
+            args_list = list(args)
+            args_list[6] = device_index
+            src_tensor = func(*args_list)
+            model.load_weights([(name, src_tensor)])
+            loaded += 1
+
+        if loaded != len(names):
+            raise RuntimeError(
+                f"CUDA IPC weight sync incomplete on GPU {physical_gpu_id}: "
+                f"loaded {loaded}/{len(names)} tensors "
+                f"({len(missing)} had no IPC handle for this GPU, e.g. {missing[:5]}). "
+                "This usually indicates a GPU UUID / placement mismatch between sender and receiver."
+            )
+
+        torch.cuda.synchronize()
+        return self._build_result(start, mem_before, "cuda_ipc", loaded)
+
+    def load_weights_cuda_ipc_chunk(self, ipc_payload: dict, validate_names=None) -> dict:
+        """Load one CUDA IPC chunk. Validate the full name set only on the last chunk."""
+        import base64
+        import pickle
+
+        start = time.time()
+        model = self.model_runner.model
+        self._offloaded_state = {}
+
+        names = ipc_payload["names"]
+        handles_list = pickle.loads(base64.b64decode(ipc_payload["ipc_handles_pickled"]))
+        device_index = torch.cuda.current_device()
+        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
+
+        loaded = 0
+        missing = []
+        for name, handle_dict in zip(names, handles_list):
+            if physical_gpu_id not in handle_dict:
+                missing.append(name)
+                continue
+            func, args = handle_dict[physical_gpu_id]
+            args_list = list(args)
+            args_list[6] = device_index
+            src_tensor = func(*args_list)
+            model.load_weights([(name, src_tensor)])
+            loaded += 1
+
+        if missing:
+            raise RuntimeError(
+                f"CUDA IPC streaming sync: {len(missing)} param(s) had no IPC handle for GPU "
+                f"{physical_gpu_id} (e.g. {missing[:5]})."
+            )
+        if validate_names is not None:
+            self._validate_weight_sync_names(model, validate_names, context="cuda_ipc_stream")
+
+        torch.cuda.synchronize()
+        return {"loaded": loaded, "names": names, "elapsed_s": time.time() - start}
+
+    def load_weights_from_shm_path(self, path: str) -> dict:
+        """Load weights from a shared-memory file path."""
+        weights = torch.load(path, map_location="cpu", weights_only=True)
+        return self._load_cpu_weights_into_model(weights)
+
+    def _load_cpu_weights_into_model(self, weights: list) -> dict:
+        start = time.time()
+        model = self.model_runner.model
+        torch.cuda.reset_peak_memory_stats(self.device)
+        mem_before = torch.cuda.memory_allocated(self.device)
+        self._validate_weight_sync_names(model, (name for name, _ in weights), context="cpu_to_gpu")
+        self._offloaded_state = {}
+
+        loaded = 0
+        for name, cpu_tensor in weights:
+            model.load_weights([(name, cpu_tensor.to(self.device))])
+            loaded += 1
+
+        torch.cuda.synchronize()
+        return self._build_result(start, mem_before, "cpu_to_gpu", loaded)
+
+    def compute_weight_norm(self) -> dict:
+        """Partial sum of squares of this TP rank's live parameters."""
+        model = self.model_runner.model
+        sq_sum = 0.0
+        num_params = 0
+        for _, param in model.named_parameters():
+            sq_sum += param.detach().double().pow(2).sum().item()
+            num_params += 1
+        return {"sq_sum": sq_sum, "num_params": num_params}
 
     # ------------------------------------------------------------------
     # Cleanup
