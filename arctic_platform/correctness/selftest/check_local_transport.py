@@ -27,10 +27,129 @@ import aiohttp
 import pytest
 
 from arctic_platform.client import CortexConfig
+from arctic_platform.client.requests import Request
 from arctic_platform.client.transport import initialize_or_cleanup
+from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.correctness.harness import cortex as cortex_transport
+from arctic_platform.correctness.harness.cortex import LOCAL_NATIVE_FORWARD_ENV
 from arctic_platform.correctness.harness.cortex import CorrectnessCortexTransport
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_local_cortex_save_automatically_uses_explicit_path_and_owned_native_child(
+    _local_cortex_shutdown_gateway, monkeypatch, asynchronous
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    assert transport._native_gateway is False
+    token = transport.jobs.training
+    child = transport._native_bindings[str(token)][1]
+    root = "/data-fast/tmp/correctness-owned-save-control"
+    expected = {"job_id": child, "checkpoint_path": root, "checkpoint_tag": "global_step0", "version": 0}
+    captured = []
+
+    async def native(method, url, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        captured.append((method, url, kwargs))
+        return json.dumps(expected).encode()
+
+    monkeypatch.setattr(transport, "_native_http", native)
+    request = Request("save", token, {"path": root, "checkpoint_type": "resumable", "export_hf": False})
+    result = asyncio.run(transport.acall(request)) if asynchronous else transport.call(request)
+    assert result == expected
+    assert captured == [
+        (
+            "POST",
+            f"http://127.0.0.1:8003/save-checkpoint?job_id={child}",
+            {"json": {"path": root, "checkpoint_type": "resumable"}},
+        )
+    ]
+    assert state.calls == []
+    transport.shutdown()
+    assert transport._native_bindings == {}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"path": "/tmp/not-fast"},
+        {"path": "/data-fast/tmp/../control"},
+        {"checkpoint_type": "unknown"},
+        {"checkpoint_id": "managed-checkpoint"},
+        {"stage_info": {"location": "remote"}},
+        {"step": 1},
+        {"export_hf": True},
+        {"save_total_limit": 1},
+    ],
+)
+def test_local_cortex_save_rejects_unsupported_native_options_before_request(
+    _local_cortex_shutdown_gateway, monkeypatch, change
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    _, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("invalid save reached HTTP")
+
+    monkeypatch.setattr(transport, "_native_http", unexpected)
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable", **change}
+    with pytest.raises(ValueError):
+        transport.call(Request("save", transport.jobs.training, body))
+    transport.shutdown()
+
+
+@pytest.mark.parametrize("token", ["foreign:training:0", "owned-parent:sampling:0"])
+def test_local_cortex_save_never_reroutes_foreign_or_wrong_role(_local_cortex_shutdown_gateway, monkeypatch, token):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    _, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    transport._native_bindings["owned-parent:sampling:0"] = ("sampling", "sampling-child")
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("nonowned or wrong-role save reached HTTP")
+
+    monkeypatch.setattr(transport, "_native_http", unexpected)
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    with pytest.raises(ValueError, match="owned child|cannot target"):
+        transport.call(Request("save", token, body))
+    transport.shutdown()
+    with pytest.raises(ValueError, match="owned child"):
+        transport.call(Request("save", "owned-parent:training:0", body))
+
+
+@pytest.mark.parametrize("payload", [b"invalid-json", b"[]", b'{"job_id": "foreign-child"}'])
+def test_local_cortex_save_rejects_malformed_or_wrong_child_response(
+    _local_cortex_shutdown_gateway, monkeypatch, payload
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    _, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+
+    async def native(*args, **kwargs):
+        return payload
+
+    monkeypatch.setattr(transport, "_native_http", native)
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    with pytest.raises(ValueError):
+        transport.call(Request("save", transport.jobs.training, body))
+    transport.shutdown()
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8003", "http://remote.example"])
+def test_local_cortex_save_managed_and_hosted_saves_preserve_public_route(
+    _local_cortex_shutdown_gateway, monkeypatch, base_url
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    _, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create(base_url=base_url)
+    body = {"path": None if base_url.startswith("http://127.") else "/data-fast/tmp/control"}
+    request = Request("save", transport.jobs.training, body)
+    monkeypatch.setattr(CortexTransport, "call", lambda actual, supplied: {"public": supplied is request})
+    assert transport.call(request) == {"public": True}
+    transport.shutdown()
 
 
 @pytest.fixture

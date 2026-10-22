@@ -98,6 +98,8 @@ Path("./work/configs/qwen3-8b-four-h200.json").write_text(
 PY
 ```
 
+**The config's `backend` object describes the upstream gateway's native Ray worker runtime, not the correctness CLI transport.** The native service still uses `{"type": "onprem", "protocol": "ray"}` for that internal runtime. Correctness connects to the service through `--backend cortex-training`; `--backend onprem` is rejected.
+
 **The example uses full fine-tuning, not low-rank adaptation (LoRA).** Native `training.peft` or `training.ds_worker_config.peft_config` is detected automatically for reference preparation, but Cortex-training has no admitted shared-adapter target-loading route in this suite. A LoRA config therefore cannot complete this target onboarding workflow yet; supplying an adapter file does not resolve that limitation. See [LoRA without adapter inputs](#lora-without-adapter-inputs).
 
 ## Onboarding
@@ -143,7 +145,10 @@ python -m dss.ray_dss.gateway_server \
 **Run both checks against that service and the reviewed references.** The following connection settings also apply to the later regression selection examples in this guide. Omitting `--test` selects both P1 checks. Regression never generates missing references or widens reviewed tolerances.
 
 ```bash
+unset ARCTIC_CORTEX_HOST ARCTIC_CORTEX_PAT
 export ARCTIC_CORTEX_BASE_URL=http://127.0.0.1:8003
+export ARCTIC_CORTEX_DATABASE=dev
+export ARCTIC_CORTEX_SCHEMA=dev
 python -m arctic_platform.correctness run \
   --backend cortex-training --local-cortex-fixture \
   --config ./work/configs/qwen3-8b-four-h200.json \
@@ -152,7 +157,7 @@ python -m arctic_platform.correctness run \
 
 **Each later local regression command also needs `--local-cortex-fixture`.** Stop the manually started gateway when finished with the allocation. These regression commands do not acquire machines or manage an external gateway's lifecycle.
 
-Read `./work/reports/both/report.md`, `report.json` and `full.log`. A missing reference, failed execution or unsafe cleanup is not a numerical pass. See the selection commands below for one check or several configs, and the model-adaptation section for another supported model.
+Read `./work/reports/both/report.md`, `report.json` and `full.log`. The local gateway requires nonempty database/schema URL segments; `dev` supplies those segments without selecting a hosted account. A missing reference, failed execution or unsafe cleanup is not a numerical pass. See the selection commands below for one check or several configs, and the model-adaptation section for another supported model.
 
 
 ## Explicit Reference Preparation

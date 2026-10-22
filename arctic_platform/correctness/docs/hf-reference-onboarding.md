@@ -67,6 +67,8 @@ python -m arctic_platform.correctness onboard \
 
 ## Run Regression
 
+**Start the local gateway before running this regression command.** Onboarding closes its own gateway, so use the complete [Running section](running-tests.doc#running) for the separate service command and connection environment. A loopback gateway uses nonempty database/schema segments; the harness supplies `dev` defaults when no values are configured.
+
 ```bash
 python -m arctic_platform.correctness run \
   --backend cortex-training --base-url http://127.0.0.1:8003 --local-cortex-fixture \

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.metadata
 import inspect
@@ -265,6 +266,55 @@ def _checkpoint_file_identity(path: Path | str) -> dict:
     return {"sha256": digest, "size": size}
 
 
+def _resume_preparation_request(request: dict, root: Path) -> dict:
+    """Exclude target transport and reviewed measurement-preserving bookkeeping changes."""
+    preparation = {**request, "code": dict(request["code"])}
+    preparation["code"].pop("harness/cortex.py", None)
+    for relative in ("onboarding/onboard.py", "harness/runner.py"):
+        if relative not in preparation["code"]:
+            continue
+        path = root / relative
+        if _checkpoint_file_identity(path) != request["code"][relative]:
+            raise ValueError(f"Onboarding source changed while recording retry state: {path}")
+        tree = ast.parse(path.read_text())
+        if relative == "onboarding/onboard.py":
+            tree.body = [
+                node
+                for node in tree.body
+                if not (isinstance(node, ast.FunctionDef) and node.name.startswith("_resume_"))
+                and not (isinstance(node, ast.Import) and [alias.name for alias in node.names] == ["ast"])
+            ]
+        else:
+            # These exact changes affect reuse/logging, not the measured HF recipe or gate.
+            summaries = [
+                """print(
+                    f"\\n*** Optimizer Norm Summary: {arm.name} ***\\n"
+                    f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
+                    flush=True,
+                )""",
+                "summary_started = time.monotonic()",
+                """print(
+                    f"Optimizer norm summary complete: arm={arm.name}, "
+                    f"elapsed={time.monotonic() - summary_started:.1f}s, "
+                    f"maximum_pairwise_norm_delta={spread:.9e}\\n",
+                    flush=True,
+                )""",
+            ]
+            ignored = {ast.dump(ast.parse(source).body[0]) for source in summaries}
+            reuse = ast.dump(ast.parse('stepping and "single-step-optimizer" not in records', mode="eval").body)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.If) and ast.dump(node.test) == reuse:
+                    node.test = ast.Name(id="stepping", ctx=ast.Load())
+                for field, value in ast.iter_fields(node):
+                    if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                        setattr(node, field, [item for item in value if ast.dump(item) not in ignored])
+        preparation["code"][relative] = {
+            "schema": "onboarding-preparation-ast-v1",
+            "sha256": hashlib.sha256(ast.dump(tree).encode()).hexdigest(),
+        }
+    return preparation
+
+
 def _resume_setup(args: argparse.Namespace) -> None:
     """Bind retained phase results to this config, options, sources and Python environment."""
     if not hasattr(args, "_resume_root"):
@@ -310,6 +360,31 @@ def _resume_setup(args: argparse.Namespace) -> None:
     digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
     args._resume_dir = args._resume_root / args.test_spec.stem / args.test_id / digest
     args._resume_dir.mkdir(parents=True, exist_ok=True)
+    preparation = _resume_preparation_request(request, root)
+    manifest = {"schema": "onboarding-resume-request-v1", "request": request, "preparation_request": preparation}
+    manifest_path = args._resume_dir / "request.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text()) != manifest:
+            raise ValueError(f"Conflicting onboarding retry request: {manifest_path}")
+    else:
+        temporary = manifest_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        temporary.replace(manifest_path)
+    args._resume_candidates = []
+    for candidate in sorted(args._resume_dir.parent.glob("*/request.json")):
+        if candidate == manifest_path:
+            continue
+        try:
+            saved = json.loads(candidate.read_text())
+            original_digest = hashlib.sha256(json.dumps(saved["request"], sort_keys=True).encode()).hexdigest()
+            if (
+                saved["schema"] == manifest["schema"]
+                and candidate.parent.name == original_digest
+                and saved["preparation_request"] == preparation
+            ):
+                args._resume_candidates.append(candidate.parent)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
 
 
 def _resume_phase(args: argparse.Namespace, phase: str, operation):
@@ -320,9 +395,14 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
 
     checkpoint = args._resume_dir / f"{phase}.json"
     input_spec = _checkpoint_file_identity(args.test_spec) if args.test_spec.exists() else None
-    if checkpoint.exists():
+    candidates = [checkpoint]
+    if phase != "validation":
+        candidates.extend(path / f"{phase}.json" for path in getattr(args, "_resume_candidates", []))
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
         try:
-            saved = json.loads(checkpoint.read_text())
+            saved = json.loads(candidate.read_text())
             valid = phase in {"sizing", "fixture"} or saved["input_spec"] == input_spec
             valid = valid and all(
                 _checkpoint_file_identity(path) == identity for path, identity in saved["files"].items()
@@ -339,6 +419,7 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
             pass
         print(f"Retained {phase} work is missing or changed; rebuilding this phase.", flush=True)
     # A rebuilt phase invalidates downstream results even if it happens to reproduce identical bytes.
+    args._resume_candidates = []
     phases = ("sizing", "fixture", "calibration", "references", "validation")
     for name in phases[phases.index(phase) :]:
         (args._resume_dir / f"{name}.json").unlink(missing_ok=True)

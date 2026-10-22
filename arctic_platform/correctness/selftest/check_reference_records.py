@@ -296,8 +296,67 @@ def test_prepared_reference_runner_prepare_mode_measures_hf_once_and_never_start
     assert measurements["grad_norms"] == {"layer.weight": 1.0}
 
 
+@pytest.mark.parametrize("arm_name", ["gas1", "gas4"])
+def test_prepared_reference_runner_combined_prepare_reuses_optimizer_calibration(
+    _prepared_reference_runner_prepared_runner, monkeypatch, arm_name
+):
+    control = _prepared_reference_runner_prepared_runner
+    arm = next(arm for arm in control.arms if arm.name == arm_name)
+    control.missing.add(("single-step-grads", arm_name))
+    retained = {
+        "loss": 9.0,
+        "optimizer_norm_gate": {
+            **copy.deepcopy(control.record["optimizer_norm_gate"]),
+            "absolute": 0.017,
+            "provenance": "retained reviewed optimizer calibration",
+        },
+    }
+    control.record_overrides["single-step-optimizer", arm_name] = retained
+    captures = []
+
+    def reference(model, batch, output, **kwargs):
+        assert model == control.spec.model.cache_path
+        assert batch.name == f"batch-{arm_name}.pt"
+        assert kwargs["optimizer_config"] == control.cfg.training["optimizer"]
+        assert kwargs["deterministic"] is True
+        captures.append(output)
+        return {
+            "loss": 3.0,
+            "microbatches": 1,
+            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    def unexpected_calibration(*args, **kwargs):
+        pytest.fail("a retained optimizer record must not be recalibrated")
+
+    from arctic_platform.correctness.checks import optimizer_state
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    monkeypatch.setattr(optimizer_state, "summarize_optimizer_artifacts", unexpected_calibration)
+    monkeypatch.setattr(optimizer_state, "max_pairwise_optimizer_norm_delta", unexpected_calibration)
+    assert control.execute(selected_arms=[arm], prepare_references=True) == []
+    assert len(captures) == 1
+    assert control.events == [
+        ("record", "single-step-grads", arm_name),
+        ("record", "single-step-optimizer", arm_name),
+        ("publish", "single-step-grads", arm_name),
+    ]
+    identity, measurements = control.published[0]
+    assert identity["check_id"] == "single-step-grads"
+    assert measurements["loss"] == 3.0
+    assert measurements["grad_norms"] == {"layer.weight": 3.0}
+    assert "optimizer_state_manifest" not in measurements
+    assert "optimizer_norm_gate" not in measurements
+    records = control.contexts[0]._reference_by_check[arm_name]
+    assert records["single-step-grads"] == measurements
+    assert records["single-step-optimizer"]["loss"] == retained["loss"]
+    assert records["single-step-optimizer"]["optimizer_norm_gate"] == retained["optimizer_norm_gate"]
+
+
 def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_reference(
-    _prepared_reference_runner_prepared_runner, monkeypatch
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
 ):
     control = _prepared_reference_runner_prepared_runner
     control.missing.add(("single-step-optimizer", "gas1"))
@@ -342,6 +401,11 @@ def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_
     assert records["single-step-grads"]["loss"] == 9.0
     assert records["single-step-optimizer"] == measurements
     assert records["single-step-optimizer"]["grad_norms"] == {"layer.weight": 3.0}
+    output = capsys.readouterr().out
+    assert "\n*** Optimizer Norm Summary: gas1 ***\n" in output
+    assert "Reading saved optimizer states from 2 completed HF runs." in output
+    assert "Optimizer norm summary complete: arm=gas1, elapsed=" in output
+    assert "maximum_pairwise_norm_delta=0.000000000e+00\n\n" in output
 
 
 def test_reference_grouping_mixer_packing_preserves_one_row_reference_default() -> None:

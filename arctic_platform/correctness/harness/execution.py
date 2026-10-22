@@ -52,6 +52,7 @@ from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
 from .dss_driver import available_gpus
+from .hosted import is_local_cortex_gateway
 from .hosted import read_pat
 from .hosted import require_local_cortex_gateway
 from .registry import RL_INAPPLICABLE_REASON
@@ -279,7 +280,12 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     }
     if getattr(args, "pat_file", None) is not None:
         options["pat"] = SecretStr(read_pat(args.pat_file))
-    return CortexConfig(**options)
+    backend = CortexConfig(**options)
+    if is_local_cortex_gateway(backend):
+        # The local SnowAPI router requires both segments even though it ignores their values.
+        backend.database = backend.database or "dev"
+        backend.schema_ = backend.schema_ or "dev"
+    return backend
 
 
 def _load_historical_gradient_references(args) -> dict | None:

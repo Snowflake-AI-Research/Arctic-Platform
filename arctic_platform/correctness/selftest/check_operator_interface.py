@@ -2018,6 +2018,119 @@ def test_onboarding_resume_state_is_bound_to_recipe_and_environment(tmp_path, mo
     assert args._resume_dir != original
 
 
+@pytest.fixture
+def _onboarding_retry_sources(tmp_path, monkeypatch):
+    from arctic_platform.correctness.onboarding import onboard
+
+    root = tmp_path / "package"
+    for directory in ("onboarding", "harness", "reference", "checks"):
+        (root / directory).mkdir(parents=True)
+    (root / "onboarding" / "onboard.py").write_text(
+        "def recipe():\n    return 42\n\ndef _resume_bookkeeping():\n    return 1\n"
+    )
+    (root / "harness" / "runner.py").write_text("if stepping:\n    gate = 0.005\n")
+    (root / "harness" / "cortex.py").write_text("save_route = 'old'\n")
+    (root / "reference" / "worker.py").write_text("seed = 42\n")
+    (root / "harness" / "batches.py").write_text("seed = 42\n")
+    monkeypatch.setattr(onboard, "__file__", str(root / "onboarding" / "onboard.py"))
+    config = tmp_path / "config.json"
+    config.write_text('{"seed": 42}')
+    args = Namespace(
+        config=config,
+        source_checkpoint="synthetic/model",
+        test_id="single-step-optimizer",
+        test_spec=tmp_path / "spec.json",
+        reference_records_dir=tmp_path / "records",
+        _resume_root=tmp_path / "state",
+    )
+    args.test_spec.write_text("{}")
+    return onboard, args, root
+
+
+def test_onboarding_retry_target_fix_reuses_preparation_in_place_but_not_validation(_onboarding_retry_sources):
+    onboard, args, root = _onboarding_retry_sources
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    calibration = root / "calibration.json"
+    calibration.write_text('{"gate": 0.005}')
+    onboard._resume_phase(args, "calibration", lambda: str(calibration))
+    onboard._resume_phase(args, "validation", lambda: {"status": "pass"})
+    saved = (original / "calibration.json").read_bytes()
+    (root / "harness" / "cortex.py").write_text("save_route = 'fixed'\n")
+    onboard._resume_setup(args)
+    assert args._resume_dir != original
+    assert onboard._resume_phase(
+        args, "calibration", lambda: pytest.fail("a target-only fix must not rerun calibration")
+    ) == str(calibration)
+    assert not (args._resume_dir / "calibration.json").exists()
+    assert (original / "calibration.json").read_bytes() == saved
+    calls = []
+    result = onboard._resume_phase(args, "validation", lambda: calls.append("current-target") or {"status": "error"})
+    assert result["status"] == "error" and calls == ["current-target"]
+    assert not (args._resume_dir / "validation.json").exists()
+
+
+@pytest.mark.parametrize(
+    "relative,source",
+    [
+        ("reference/worker.py", "seed = 43\n"),
+        ("harness/batches.py", "seed = 43\n"),
+        ("harness/runner.py", "if stepping:\n    gate = 0.100\n"),
+        ("onboarding/onboard.py", "def recipe():\n    return 43\n"),
+    ],
+)
+def test_onboarding_retry_reference_or_recipe_change_cannot_reuse_preparation(
+    _onboarding_retry_sources, relative, source
+):
+    onboard, args, root = _onboarding_retry_sources
+    onboard._resume_setup(args)
+    (root / relative).write_text(source)
+    onboard._resume_setup(args)
+    assert args._resume_candidates == []
+
+
+def test_onboarding_retry_reviewed_cache_and_summary_changes_preserve_preparation(_onboarding_retry_sources):
+    onboard, args, root = _onboarding_retry_sources
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    (root / "onboarding" / "onboard.py").write_text(
+        "import ast\n\ndef recipe():\n    return 42\n\ndef _resume_bookkeeping():\n    return 2\n"
+    )
+    (root / "harness" / "runner.py").write_text(
+        'if stepping and "single-step-optimizer" not in records:\n'
+        '    print(f"\\n*** Optimizer Norm Summary: {arm.name} ***\\n"\n'
+        '          f"Reading saved optimizer states from {len(manifests)} completed HF runs.", flush=True)\n'
+        "    summary_started = time.monotonic()\n"
+        "    gate = 0.005\n"
+        '    print(f"Optimizer norm summary complete: arm={arm.name}, "\n'
+        '          f"elapsed={time.monotonic() - summary_started:.1f}s, "\n'
+        '          f"maximum_pairwise_norm_delta={spread:.9e}\\n", flush=True)\n'
+    )
+    onboard._resume_setup(args)
+    assert args._resume_candidates == [original]
+
+
+@pytest.mark.parametrize("damage", ["missing-manifest", "wrong-key", "changed-artifact"])
+def test_onboarding_retry_incomplete_or_corrupt_legacy_state_is_not_admitted(_onboarding_retry_sources, damage):
+    onboard, args, root = _onboarding_retry_sources
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    calibration = root / "calibration.json"
+    calibration.write_text('{"gate": 0.005}')
+    onboard._resume_phase(args, "calibration", lambda: str(calibration))
+    if damage == "missing-manifest":
+        (original / "request.json").unlink()
+    elif damage == "wrong-key":
+        original.rename(original.with_name("not-the-request-digest"))
+    else:
+        calibration.write_text('{"gate": 0.100}')
+    (root / "harness" / "cortex.py").write_text("save_route = 'fixed'\n")
+    onboard._resume_setup(args)
+    calls = []
+    onboard._resume_phase(args, "calibration", lambda: calls.append("rebuild"))
+    assert calls == ["rebuild"] and args._resume_candidates == []
+
+
 @pytest.mark.parametrize("selection", ["all", "single-step-grads", "single-step-optimizer"])
 def test_onboarding_config_only_automatically_selects_cortex_fixture(tmp_path, monkeypatch, selection):
     from arctic_platform.correctness.onboarding import onboard

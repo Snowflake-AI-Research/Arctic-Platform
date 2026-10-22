@@ -791,7 +791,7 @@ def execute(
                 raise ReferencePrerequisiteError("HF reference preparation required")
             reference = measure_reference(arm)
             compact = {key: value for key, value in reference.items() if key != "optimizer_state_manifest"}
-            if stepping:
+            if stepping and "single-step-optimizer" not in records:
                 from decimal import ROUND_CEILING
                 from decimal import Decimal
 
@@ -828,10 +828,22 @@ def execute(
                         for future in as_completed(futures):
                             completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
                         manifests.extend(completed[index] for index in indices)
+                print(
+                    f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
+                    f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
+                    flush=True,
+                )
+                summary_started = time.monotonic()
                 worst = max_pairwise_optimizer_norm_delta(
                     manifests, optimizer_config=optimizer_config, learning_rate=OPTIMIZER_LEARNING_RATE
                 )
                 spread = worst.delta_norm if worst is not None else 0.0
+                print(
+                    f"Optimizer norm summary complete: arm={arm.name}, "
+                    f"elapsed={time.monotonic() - summary_started:.1f}s, "
+                    f"maximum_pairwise_norm_delta={spread:.9e}\n",
+                    flush=True,
+                )
                 quantum = Decimal("0.001")
                 absolute = float(
                     max(

@@ -157,6 +157,44 @@ def test_client_backends_cortex_connection_uses_environment_or_pat_file(tmp_path
 
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize(
+    "base_url",
+    ["http://127.0.0.1:7001", "http://localhost:7001", "http://[::1]:7001", "http://remote.test:7001"],
+)
+@pytest.mark.parametrize("from_environment", [False, True])
+@pytest.mark.parametrize("settings", ["missing", "explicit", "environment", "empty"])
+def test_client_backends_local_cortex_route_segments(monkeypatch, base_url, from_environment, settings):
+    for name in ("BASE_URL", "HOST", "PAT", "DATABASE", "SCHEMA"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    args = Namespace(backend="cortex-training")
+    if from_environment:
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", base_url)
+    else:
+        args.base_url = base_url
+    if settings == "explicit":
+        args.database, args.schema = "USER_DB", "USER_SCHEMA"
+    elif settings == "environment":
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "USER_DB")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "USER_SCHEMA")
+    elif settings == "empty":
+        args.database, args.schema = "", ""
+
+    backend = cli._client_backend(args)
+    if settings in {"explicit", "environment"}:
+        expected = ("USER_DB", "USER_SCHEMA")
+    elif base_url == "http://remote.test:7001":
+        expected = ("", "")
+    else:
+        expected = ("dev", "dev")
+    assert (backend.database, backend.schema_) == expected
+    transport = CortexTransport(backend)
+    try:
+        assert transport._prefix == f"{base_url}/api/v2/databases/{expected[0]}/schemas/{expected[1]}/cortex-training"
+    finally:
+        transport.shutdown()
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+@pytest.mark.parametrize(
     "base_url", ["http://127.0.0.1:7001", "http://localhost:7001", "http://[::1]:7001", "http://127.0.0.1:7001/"]
 )
 @pytest.mark.parametrize("from_environment", [False, True])
