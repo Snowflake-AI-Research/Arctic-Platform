@@ -52,7 +52,7 @@ _OPTIMIZER_ALIASES = {
 
 
 class OptimizerSettings(BaseModel):
-    """Optimizer block handed to DeepSpeed after the caller has resolved aliases."""
+    """Optimizer block handed to DeepSpeed after ``normalize_optimizer_config`` has resolved aliases."""
 
     model_config = ConfigDict(extra="forbid")
 
