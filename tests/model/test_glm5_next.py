@@ -607,6 +607,7 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
     assert sparse_attention.indexer.wq_b.weight.grad is None
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")
 def test_glm53_fused_indexer_selects_the_general_paths_keys():
     """One packed row takes the fused path; a batch of two identical rows takes the general path."""
@@ -675,9 +676,7 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     q, kv = query.clone().requires_grad_(True), key_value.clone().requires_grad_(True)
     q_ref, kv_ref = query.float().requires_grad_(True), key_value.float().requires_grad_(True)
     sentinel = indices.masked_fill(indices < 0, keys)
-    out = sparse_mla_flashmla_fused_apply(
-        F.pad(q, (0, 64)), F.pad(kv, (0, 64)), sentinel.unsqueeze(2), 0.0625
-    )
+    out = sparse_mla_flashmla_fused_apply(F.pad(q, (0, 64)), F.pad(kv, (0, 64)), sentinel.unsqueeze(2), 0.0625)
     out_ref = _reference_sparse_mla(q_ref, kv_ref, indices, scale=0.0625, value_dim=latent)
     grad = torch.randn_like(out_ref)
     out.backward(grad.bfloat16())

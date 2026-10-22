@@ -87,6 +87,10 @@ class _ApplyRoutingWeights(torch.autograd.Function):
             x, go = _rows(hidden_states), _rows(grad_output)
             grad_hidden = torch.empty(x.shape, dtype=hidden_states.dtype, device=x.device) if need_hidden else None
             grad_scores = torch.empty(x.shape[0], dtype=torch.float32, device=x.device) if need_scores else None
+            hidden_stride = 0
+            if need_hidden:
+                assert grad_hidden is not None
+                hidden_stride = grad_hidden.stride(0)
             _routing_weights_bwd_kernel[(x.shape[0],)](
                 go,
                 x,
@@ -96,12 +100,13 @@ class _ApplyRoutingWeights(torch.autograd.Function):
                 x.shape[1],
                 go.stride(0),
                 x.stride(0),
-                grad_hidden.stride(0) if need_hidden else 0,
+                hidden_stride,
                 NEED_GX=need_hidden,
                 NEED_GS=need_scores,
                 BLOCK_D=_BLOCK_D,
             )
             if need_scores:
+                assert grad_scores is not None
                 grad_scores = grad_scores.reshape(scores.shape).to(scores.dtype)
             return grad_hidden, grad_scores, None
         grad_output_fp32 = grad_output.float()

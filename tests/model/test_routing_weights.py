@@ -328,4 +328,3 @@ def test_routing_weights_cuda_kernel_matches_reference(hidden_dtype, out_dtype):
     expected.backward(gradient)
     torch_assert_equal(hidden.grad, reference_hidden.grad)
     torch_assert_close(scores.grad, reference_scores.grad, rtol=1e-5, atol=1e-4)
-
