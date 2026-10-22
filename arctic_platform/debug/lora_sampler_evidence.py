@@ -26,6 +26,7 @@ manufactured by this bridge.
 from __future__ import annotations
 
 import functools
+import importlib
 
 from arctic_platform.debug.weight_sync_evidence import enabled
 from arctic_platform.debug.weight_sync_evidence import source_files
@@ -114,9 +115,11 @@ def receive_and_install_lora(
         type(max_received_bytes) is int and max_received_bytes > 0,
         "an explicit finite received-adapter byte limit is required",
     )
-    from arctic_platform.inference.server.weight_sync.receiver import _build_lora_model
-    from arctic_platform.inference.server.weight_sync.receiver import _install_lora_adapter
-    from arctic_platform.inference.server.weight_sync.receiver import normalize_lora_peft_config
+    # The optional inference backend belongs to the selected receiver, not the model factory.
+    native = importlib.import_module("arctic_platform.inference.server.weight_sync.receiver")
+    _build_lora_model = native._build_lora_model
+    _install_lora_adapter = native._install_lora_adapter
+    normalize_lora_peft_config = native.normalize_lora_peft_config
 
     runner = receiver.model_runner
     wrapper = getattr(runner, "lora_manager", None)

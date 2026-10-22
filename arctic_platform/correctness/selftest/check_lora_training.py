@@ -2726,6 +2726,32 @@ def test_receiver_binding_model_id_mismatch_never_reserves(inputs):
 # Lora receiver preparation.
 
 
+def test_receiver_preparation_resolves_exact_optional_native_components(monkeypatch):
+    world_group = object()
+    model_class = object()
+    native = SimpleNamespace(
+        _build_lora_model=build,
+        _install_lora_adapter=install,
+        _remap_lora_key=selected_symbol,
+        _served_lm_module_prefix=selected_symbol,
+    )
+    monkeypatch.setitem(sys.modules, "vllm.distributed", SimpleNamespace(get_world_group=lambda: world_group))
+    monkeypatch.setitem(sys.modules, "vllm.lora.lora_model", SimpleNamespace(LoRAModel=model_class))
+    monkeypatch.setitem(sys.modules, "vllm.lora.utils", SimpleNamespace(parse_fine_tuned_lora_name=selected_symbol))
+    monkeypatch.setitem(sys.modules, "arctic_platform.inference.server.weight_sync.receiver", native)
+
+    components, get_world_group = helper._actual_components()
+
+    assert get_world_group() is world_group
+    assert components["builder"] is native._build_lora_model
+    assert components["installer"] is native._install_lora_adapter
+    assert components["remap_key"] is native._remap_lora_key
+    assert components["served_prefix_for_model"] is native._served_lm_module_prefix
+    assert components["native_model_class"] is model_class
+    assert components["parse_name"] is selected_symbol
+    assert components["observer"] is _lora_adapter_tensor_binding_evidence.observe_lora_build
+
+
 def selected_symbol():
     raise AssertionError("preparation must not invoke builder/parser/installer")
 
@@ -3423,6 +3449,18 @@ def test_lora_receiver_native_build_install_and_honest_nonadmissions(native_fixt
     assert record["full_parameter_coverage"] is False
     assert record["capacity_admitted"] is False and record["numerical"] is None
     assert "weight_sync_verification" not in record and "trainer_parameters" not in record
+
+
+def test_lora_receiver_disabled_evidence_never_resolves_optional_backend(native_fixture, monkeypatch):
+    receiver, _, options = native_fixture
+    monkeypatch.delenv(VERIFY_ENV)
+
+    def unexpected_import(name):
+        raise AssertionError(f"disabled receiver imported {name}")
+
+    monkeypatch.setattr(bridge.importlib, "import_module", unexpected_import)
+    with pytest.raises(ValueError, match="explicitly enabled"):
+        bridge.receive_and_install_lora(receiver, Engine([]), **options)
 
 
 def test_lora_receiver_clones_before_reusable_bucket_advances(native_fixture):

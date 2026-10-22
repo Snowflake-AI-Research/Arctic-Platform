@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import os
+import re
 import runpy
 import signal
 import subprocess
@@ -77,7 +78,14 @@ def _isolated_gateway_ownership(tmp_path, monkeypatch):
     return scanner
 
 
-@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"])
+@pytest.mark.parametrize(
+    "document",
+    [
+        "PR_DESCRIPTION.md",
+        "arctic_platform/correctness/docs/running-tests.md",
+        "arctic_platform/correctness/docs/getting-started.md",
+    ],
+)
 def test_quick_demo_config_is_tiny_and_retains_both_gas_arms(tmp_path, monkeypatch, document):
     from arctic_platform.correctness.harness.config import arms_for
     from arctic_platform.correctness.harness.config import load_config
@@ -2430,9 +2438,24 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
     monkeypatch.setattr(onboard, "run", run)
     args = Namespace(config="synthetic.json")
     assert onboard.logged_run(args) == int(failure)
-    assert capsys.readouterr().out.splitlines()[-1] == "Total run time: 00:01:08"
+    captured = capsys.readouterr()
+    if failure:
+        banner = "\n\n!!!!! ONBOARDING FAILED: VALUEERROR: SYNTHETIC ONBOARDING FAILURE !!!!!\n\n\n"
+        assert banner in captured.err
+        assert banner in (args._diagnostics_dir / "onboarding.log").read_text()
+    assert captured.out.splitlines()[-1] == "Total run time: 00:01:08"
     assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 00:01:08"
     assert "DSS_CORRECTNESS_LOGDIR" not in os.environ
+
+
+def test_onboarding_failure_banner_is_uppercase_separated_and_flushed(capsys):
+    from arctic_platform.correctness.onboarding import onboard
+
+    onboard._onboarding_failure("single-step-grads: final 4-layer regression failed")
+    assert (
+        capsys.readouterr().err
+        == "\n\n!!!!! ONBOARDING FAILED: SINGLE-STEP-GRADS: FINAL 4-LAYER REGRESSION FAILED !!!!!\n\n\n"
+    )
 
 
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
@@ -3548,6 +3571,30 @@ def test_onboarding_retry_reference_or_recipe_change_cannot_reuse_preparation(
     assert args._resume_candidates == []
 
 
+def test_onboarding_retry_calibration_repair_rebuilds_instead_of_reusing_old_measurements(
+    _onboarding_retry_sources,
+):
+    onboard, args, root = _onboarding_retry_sources
+    source = root / "onboarding" / "calibration.py"
+    source.write_text("def render(args):\n    return 'one row without packing'\n")
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    measurements = root / "calibration.json"
+    measurements.write_text('{"gate": 0.026}')
+    onboard._resume_phase(args, "calibration", lambda: str(measurements))
+    saved = (original / "calibration.json").read_bytes()
+    source.write_text("def render(args):\n    return 'frozen arms with model packing'\n")
+    onboard._resume_setup(args)
+    assert args._resume_dir != original
+    assert args._resume_candidates == []
+    calls = []
+    assert onboard._resume_phase(
+        args, "calibration", lambda: calls.append("recalibrated") or str(measurements)
+    ) == str(measurements)
+    assert calls == ["recalibrated"]
+    assert (original / "calibration.json").read_bytes() == saved
+
+
 def test_onboarding_retry_reviewed_cache_and_summary_changes_preserve_preparation(_onboarding_retry_sources):
     onboard, args, root = _onboarding_retry_sources
     onboard._resume_setup(args)
@@ -4479,17 +4526,44 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     assert "Reusing the verified completed phase" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"])
-@pytest.mark.parametrize("private_paths", [False, True])
-def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scratch(tmp_path, document, private_paths):
+def test_getting_started_preserves_pr_demo_commands_and_is_first_read():
+    root = Path(__file__).resolve().parents[3]
+    guide = root / "arctic_platform/correctness/docs/getting-started.md"
+    commands = r"```bash\n(.*?)```"
+    assert sorted(re.findall(commands, guide.read_text(), re.DOTALL)) == sorted(
+        re.findall(commands, (root / "PR_DESCRIPTION.md").read_text(), re.DOTALL)
+    )
+    index = (root / "docs/correctness.md").read_text()
+    first_paragraph = index.split("\n\n", 2)[1]
+    assert first_paragraph.startswith(
+        "**Read [Getting started](../arctic_platform/correctness/docs/getting-started.md) first."
+    )
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "PR_DESCRIPTION.md",
+        "arctic_platform/correctness/docs/running-tests.md",
+        "arctic_platform/correctness/docs/getting-started.md",
+    ],
+)
+@pytest.mark.parametrize("log_override", ["demo", "other-run", "traversal"])
+def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scratch(tmp_path, document, log_override):
     root = Path(__file__).resolve().parents[3]
     text = (root / document).read_text()
-    staging = (
-        text.split("## Add To Repo\n", 1)[1].split("## Cleanup\n", 1)[0].split("```bash\n", 1)[1].split("```", 1)[0]
-    )
-    cleanup = text.split("## Cleanup\n", 1)[1]
+    staging_header = re.search(r"(?m)^## (?:Add To Repo|Step \d+\. Add Results to the Repo)\n", text)
+    cleanup_header = re.search(r"(?m)^## (?:Cleanup|Step \d+\. Optional Cleanup)\n", text)
+    assert staging_header is not None and cleanup_header is not None
+    staging = text[staging_header.end() : cleanup_header.start()].split("```bash\n", 1)[1].split("```", 1)[0]
+    cleanup = text[cleanup_header.end() :]
     commands = [block.split("```", 1)[0] for block in cleanup.split("```bash\n")[1:3]]
     assert all("/data-fast" not in command and "DSS_CORRECTNESS_TMPDIR" not in command for command in commands)
+    assert commands == [
+        "rm ./work/configs/tiny-qwen3-129m-one-h200.json\n",
+        "rm -r ./work/logs/correctness-demo/\nrm -r ./work/reports/both/\n",
+    ]
+    assert 'export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"' in text
     identifier = "tiny-qwen3-129m-one-h200"
     config = f"arctic_platform/correctness/configs/{identifier}.json"
     specification = f"arctic_platform/correctness/specs/{identifier}.json"
@@ -4514,31 +4588,38 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
     assert set(run("git", "check-ignore", record, unrelated_record).splitlines()) == {record, unrelated_record}
     assert (
         text.index("Use skills/correctness/SKILL.md to fix onboarding for\n")
-        < text.index("## Add To Repo\n")
-        < text.index("## Cleanup\n")
+        < staging_header.start()
+        < cleanup_header.start()
     )
     assert "mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX" in text
 
-    logs = tmp_path / "work" / "logs" / ("correctness-demo.test" if private_paths else "other-run")
+    logs = tmp_path / "work" / "logs" / "correctness-demo"
     logs.mkdir(parents=True)
     (logs / "onboarding.log").write_text("saved diagnostic")
     other_logs = tmp_path / "work" / "logs" / "keep-this-run"
     other_logs.mkdir()
     (other_logs / "onboarding.log").write_text("unrelated diagnostic")
-    with tempfile.TemporaryDirectory(
-        prefix="correctness-demo." if private_paths else "unrelated-run.", dir="/data-fast/tmp"
-    ) as scratch:
+    unrelated_demo_logs = tmp_path / "work" / "logs" / "correctness-demo.previous"
+    unrelated_demo_logs.mkdir()
+    (unrelated_demo_logs / "onboarding.log").write_text("retained earlier diagnostic")
+    overrides = {
+        "demo": str(logs),
+        "other-run": str(other_logs),
+        "traversal": str(logs) + "/../..",
+    }
+    with tempfile.TemporaryDirectory(prefix="correctness-demo.", dir="/data-fast/tmp") as scratch:
         scratch_path = Path(scratch)
         (scratch_path / "batch.pt").write_bytes(b"temporary")
         (scratch_path / "retained-input").symlink_to(tmp_path / config)
-        env = {**os.environ, "DSS_CORRECTNESS_TMPDIR": scratch, "DSS_CORRECTNESS_LOGDIR": str(logs)}
+        env = {**os.environ, "DSS_CORRECTNESS_TMPDIR": scratch, "DSS_CORRECTNESS_LOGDIR": overrides[log_override]}
         for command in commands:
             run("bash", "-eu", "-c", command, env=env)
         assert (scratch_path / "batch.pt").read_bytes() == b"temporary"
         assert (scratch_path / "retained-input").is_symlink()
-        assert logs.exists() is not private_paths
+        assert not logs.exists()
         assert all((tmp_path / relative).is_file() for relative in (config, specification, record, unrelated_record))
         assert (other_logs / "onboarding.log").is_file()
+        assert (unrelated_demo_logs / "onboarding.log").is_file()
         assert not (tmp_path / original).exists()
         assert not (tmp_path / report_path).exists()
 

@@ -98,20 +98,19 @@ def _actual_components():
 
     from arctic_platform.common.peft import normalize_lora_peft_config
     from arctic_platform.debug.lora_adapter_tensor_binding import observe_lora_build
-    from arctic_platform.inference.server.weight_sync.receiver import _build_lora_model
-    from arctic_platform.inference.server.weight_sync.receiver import _install_lora_adapter
-    from arctic_platform.inference.server.weight_sync.receiver import _remap_lora_key
-    from arctic_platform.inference.server.weight_sync.receiver import _served_lm_module_prefix
+
+    # Resolve the optional server only on the selected native worker.
+    native = importlib.import_module("arctic_platform.inference.server.weight_sync.receiver")
 
     return {
         "observer": observe_lora_build,
-        "builder": _build_lora_model,
-        "installer": _install_lora_adapter,
+        "builder": native._build_lora_model,
+        "installer": native._install_lora_adapter,
         "normalize_config": normalize_lora_peft_config,
         "native_model_class": LoRAModel,
         "parse_name": parse_fine_tuned_lora_name,
-        "remap_key": _remap_lora_key,
-        "served_prefix_for_model": _served_lm_module_prefix,
+        "remap_key": native._remap_lora_key,
+        "served_prefix_for_model": native._served_lm_module_prefix,
     }, get_world_group
 
 
