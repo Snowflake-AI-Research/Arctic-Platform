@@ -36,6 +36,7 @@ from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import RATIO_MASK_CONFIG_KEYS
 from .functional import EchoBatchDenominator
 from .functional import RatioMasks
+from .functional import _config_nonnegative
 from .functional import _full_observation_denominator
 from .functional import _get_sequence_parallel_group
 from .functional import _packed_per_sequence_sums
@@ -335,6 +336,7 @@ def _internal_grpo_loss_fn(
     use_kl_loss: bool = False,
     kl_loss_coef: float = 0.001,
     kl_loss_type: str = "low_var_kl",
+    sampler_kl_coef: float = 0.0,
     prompt_group_ids: torch.Tensor | None = None,
     prompt_token_counts: torch.Tensor | None = None,
     sequence_loss_weights: torch.Tensor | None = None,
@@ -620,6 +622,26 @@ def _internal_grpo_loss_fn(
             )
             loss = loss + kl_loss_coef * kl_loss
 
+        if sampler_kl_coef > 0.0:
+            # k1 estimate of KL(sampler || policy); NLL targets were not sampled, so they carry no term.
+            sampler_kl = old_logp - logprobs
+            if nll_mask is not None:
+                sampler_kl = torch.where(nll_mask, 0.0, sampler_kl)
+            sampler_kl_loss = agg_loss(
+                sampler_kl,
+                loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+            loss = loss + sampler_kl_coef * sampler_kl_loss
+
         stats_mask = loss_mask if nll_mask is None else loss_mask & ~nll_mask
         metrics = {
             "approx_kl": _masked_mean_float(stat["approx_kl"].detach(), stats_mask),
@@ -764,6 +786,7 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "use_kl_loss": False,
     "kl_loss_coef": 0.001,
     "kl_loss_type": "low_var_kl",
+    "sampler_kl_coef": 0.0,
 }
 _ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
     "aux_ce_weight": None,
@@ -857,6 +880,9 @@ def _grpo_loss(
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs_shifted`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
+        ``sampler_kl_coef`` (default 0.0; finite non-negative β of ``β · agg(old_log_probs_shifted - logprobs)``
+        over non-NLL policy tokens with the policy term's aggregation: the k1 estimate of KL(sampler || policy),
+        whose gradient ``-β ∇ log p`` raises every sampled token regardless of advantage),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -889,6 +915,7 @@ def _grpo_loss(
     values = _grpo_config_values(config)
     _validate_loss_denominators(values["batch_num_tokens"], values["global_batch_size"])
     values["teacher_tau"] = _resolve_teacher_tau(config, context)
+    values["sampler_kl_coef"] = _config_nonnegative(config, "sampler_kl_coef") or 0.0
     values["ratio_masks"] = RatioMasks.from_config(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
 
@@ -1361,6 +1388,7 @@ def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
+    _config_nonnegative(config, "sampler_kl_coef")
     if teacher_tau > 0:
         teacher_log_probs = context["teacher_log_probs_shifted"]
         if not torch.is_tensor(teacher_log_probs) or not teacher_log_probs.is_floating_point():
