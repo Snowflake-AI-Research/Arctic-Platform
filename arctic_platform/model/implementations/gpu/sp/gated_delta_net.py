@@ -149,21 +149,15 @@ def _pack_and_exchange_head_tensors(
 
     exchanged: dict[str, torch.Tensor] = {}
     for fields in grouped.values():
-        destination_chunks = []
         widths: dict[str, int] = {}
-        for destination in range(world_size):
-            packed_fields = []
-            for name, tensor in fields:
-                local_heads, _tail_shape = specs[name]
-                start = destination * local_heads
-                stop = start + local_heads
-                part = tensor[:, :, start:stop]
-                width = part[0, 0].numel()
-                widths[name] = width
-                packed_fields.append(part.reshape(batch_size, local_sequence_length, width))
-            destination_chunks.append(torch.cat(packed_fields, dim=-1))
-
-        packed = torch.stack(destination_chunks, dim=2)
+        views = []
+        for name, tensor in fields:
+            # Each destination's heads are contiguous, so ``[B, T, world, width]`` is a view of the
+            # field; one cat packs every field, and its backward is views rather than one
+            # zero-filled full-size gradient per destination.
+            widths[name] = tensor[0, 0].numel() // world_size
+            views.append(tensor.reshape(batch_size, local_sequence_length, world_size, widths[name]))
+        packed = torch.cat(views, dim=-1)
         packed = sequence_head_all_to_all(
             process_group,
             packed,
@@ -171,19 +165,16 @@ def _pack_and_exchange_head_tensors(
             gather_dim=1,
         ).squeeze(2)
 
-        offset = 0
         global_sequence_length = local_sequence_length * world_size
-        for name, _tensor in fields:
-            width = widths[name]
+        # split, not slicing: its backward is one cat instead of a zero-filled packed-size gradient per field.
+        for (name, _tensor), field in zip(fields, torch.split(packed, [widths[name] for name, _ in fields], dim=-1)):
             local_heads, tail_shape = specs[name]
-            field = packed[:, :, offset : offset + width]
             exchanged[name] = field.reshape(
                 batch_size,
                 global_sequence_length,
                 local_heads,
                 *tail_shape,
             )
-            offset += width
     return exchanged
 
 
