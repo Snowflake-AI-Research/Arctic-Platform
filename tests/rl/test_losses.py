@@ -58,6 +58,7 @@ from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_RECOMPUTE
 from arctic_platform.rl.processors.grpo import _apply_m2po_masking
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
 from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
+from arctic_platform.rl.processors.grpo import _sampler_kl
 from arctic_platform.rl.processors.grpo import compute_prox_logp_approximations
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.testing_utils import TestCasePlus
@@ -1247,9 +1248,62 @@ class TestMigratedGrpo(TestCasePlus):
                 torch_assert_close(runs[0.25][0] - runs[0.0][0], 0.25 * k1)
                 torch_assert_close(runs[0.25][1] - runs[0.0][1], torch.where(sampled, -0.25 / 4, 0.0))
         context.pop("nll_mask")
-        for invalid in (-0.01, float("inf"), True):
-            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "sampler_kl_coef"):
-                grpo_loss({"logprobs": values.detach()}, context, {}, {"sampler_kl_coef": invalid}, "cpu")
+        for key, invalid in (
+            ("sampler_kl_coef", -0.01),
+            ("sampler_kl_coef", float("inf")),
+            ("sampler_kl_coef", True),
+            ("sampler_kl_type", "low_var_kl"),
+            ("sampler_kl_ratio_cap", 1.0),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, key):
+                grpo_loss({"logprobs": values.detach()}, context, {}, {key: invalid}, "cpu")
+        weights = torch.tensor([[1.0, 0.0, 2.0, 0.5]])
+        values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+        grpo_loss(
+            {"logprobs": values}, {**context, "sampler_kl_weights": weights}, {}, {"sampler_kl_coef": 0.25}, "cpu"
+        )[0].backward()
+        unweighted = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+        grpo_loss({"logprobs": unweighted}, context, {}, {}, "cpu")[0].backward()
+        torch_assert_close(values.grad - unweighted.grad, -0.25 * weights / 4)
+        with self.assertRaisesRegex(ValueError, "sampler_kl_weights must be a finite"):
+            grpo_loss({"logprobs": values.detach()}, {**context, "sampler_kl_weights": -weights}, {}, {}, "cpu")
+        row_weighted = {**context, "sequence_loss_weights": torch.ones(1)}
+        with self.assertRaisesRegex(ValueError, "fold them into sampler_kl_weights"):
+            grpo_loss({"logprobs": values.detach()}, row_weighted, {}, {"sampler_kl_coef": 0.25}, "cpu")
+        grpo_loss(
+            {"logprobs": values.detach()},
+            {**row_weighted, "sampler_kl_weights": weights},
+            {},
+            {"sampler_kl_coef": 0.25},
+            "cpu",
+        )
+
+    def test_sampler_kl_estimators_give_the_kl_gradient_in_expectation_and_cap_their_tails(self):
+        # Exact expectation over a categorical sampler q: E_q[d k(log p - log q) / dz] vs d KL(q || p) / dz = p - q.
+        q = torch.tensor([0.5, 0.3, 0.15, 0.05])
+        logits = torch.tensor([0.2, -0.4, 0.9, -1.5], requires_grad=True)
+        p = torch.softmax(logits, -1).detach()
+        for kind, cap, exact in (("k1", 5.0, True), ("k3", float("inf"), True), ("k2", float("inf"), False)):
+            (grad,) = torch.autograd.grad(
+                (q * _sampler_kl(torch.log_softmax(logits, -1) - q.log(), kind, cap)).sum(), logits
+            )
+            with self.subTest(kind=kind):
+                if exact:
+                    torch_assert_close(grad, p - q)
+                else:
+                    self.assertFalse(torch.allclose(grad, p - q))
+                    self.assertGreater(float(grad @ (p - q)), 0.0)
+        log_ratio = torch.tensor([-3.0, -0.5, 0.0, 0.5, 3.0], requires_grad=True)
+        bound = math.log(5.0)
+        for kind, slope in (
+            ("k1", -torch.ones(5)),
+            ("k2", log_ratio.detach().clamp(-bound, bound)),
+            ("k3", log_ratio.detach().clamp(-bound, bound).exp() - 1.0),
+        ):
+            (grad,) = torch.autograd.grad(_sampler_kl(log_ratio, kind, 5.0).sum(), log_ratio)
+            with self.subTest(kind=kind, cap=5.0):
+                torch_assert_close(grad, slope)
+        torch_assert_close(_sampler_kl(log_ratio, "k3", 5.0)[2], torch.tensor(0.0))
 
     def test_mixed_loss_and_worker_metrics_exclude_nll_from_rl_means(self):
         values = torch.tensor([[-2.0, -3.0]], requires_grad=True)

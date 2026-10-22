@@ -208,6 +208,53 @@ def _resolve_teacher_tau(config: dict, context: dict) -> float:
     return tau
 
 
+_SAMPLER_KL_TYPES = ("k1", "k2", "k3")
+
+
+def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]:
+    """Validated ``(sampler_kl_coef, sampler_kl_type, sampler_kl_ratio_cap)``."""
+    coef = _config_nonnegative(config, "sampler_kl_coef") or 0.0
+    kind = config.get("sampler_kl_type", "k1")
+    if kind not in _SAMPLER_KL_TYPES:
+        raise ValueError(f"sampler_kl_type must be one of {_SAMPLER_KL_TYPES}, got {kind!r}")
+    cap = config.get("sampler_kl_ratio_cap", 5.0)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or math.isnan(cap) or cap <= 1.0:
+        raise ValueError(f"sampler_kl_ratio_cap must be a number > 1 (inf disables the cap), got {cap!r}")
+    weights = context.get("sampler_kl_weights")
+    if weights is not None and not (
+        torch.is_tensor(weights) and weights.is_floating_point() and (torch.isfinite(weights) & (weights >= 0)).all()
+    ):
+        raise ValueError("sampler_kl_weights must be a finite, non-negative floating-point tensor")
+    if (
+        coef > 0.0
+        and weights is None
+        and config.get("loss_agg_mode", "token-mean") == "token-mean"
+        and context.get("sequence_loss_weights") is not None
+    ):
+        raise ValueError(
+            "sampler_kl_coef > 0 with token-mean cannot carry sequence_loss_weights to the sampler KL term; "
+            "fold them into sampler_kl_weights"
+        )
+    return coef, kind, float(cap)
+
+
+def _sampler_kl(log_ratio: torch.Tensor, kind: str, ratio_cap: float) -> torch.Tensor:
+    """Per-token KL(sampler || policy) estimate from ``log_ratio = log p - log q`` on tokens drawn from the sampler.
+
+    k1 is ``-log r``, k2 ``(log r)^2 / 2``, k3 ``r - 1 - log r``; k1 and k3 are unbiased for the KL and its gradient.
+    Past ``|log r| = log(ratio_cap)`` k2 and k3 continue linearly, so a token's gradient stays at its value at the cap.
+    """
+    if kind == "k1":
+        return -log_ratio
+    bound = math.log(ratio_cap)
+    clamped = log_ratio.clamp(-bound, bound)
+    if kind == "k2":
+        value, slope = 0.5 * clamped.square(), clamped
+    else:
+        value, slope = clamped.exp() - 1.0 - clamped, clamped.exp() - 1.0
+    return value + slope.detach() * (log_ratio - clamped)
+
+
 def compute_prox_logp_approximations(
     old_logp: torch.Tensor,
     logprobs: torch.Tensor,
@@ -337,6 +384,8 @@ def _internal_grpo_loss_fn(
     kl_loss_coef: float = 0.001,
     kl_loss_type: str = "low_var_kl",
     sampler_kl_coef: float = 0.0,
+    sampler_kl_type: str = "k1",
+    sampler_kl_ratio_cap: float = 5.0,
     prompt_group_ids: torch.Tensor | None = None,
     prompt_token_counts: torch.Tensor | None = None,
     sequence_loss_weights: torch.Tensor | None = None,
@@ -623,8 +672,10 @@ def _internal_grpo_loss_fn(
             loss = loss + kl_loss_coef * kl_loss
 
         if sampler_kl_coef > 0.0:
-            # k1 estimate of KL(sampler || policy); NLL targets were not sampled, so they carry no term.
-            sampler_kl = old_logp - logprobs
+            sampler_kl = _sampler_kl(logprobs - old_logp, sampler_kl_type, sampler_kl_ratio_cap)
+            if input_data["sampler_kl_weights"] is not None:
+                sampler_kl = sampler_kl * input_data["sampler_kl_weights"]
+            # NLL targets were not sampled, so they carry no term.
             if nll_mask is not None:
                 sampler_kl = torch.where(nll_mask, 0.0, sampler_kl)
             sampler_kl_loss = agg_loss(
@@ -787,6 +838,8 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "kl_loss_coef": 0.001,
     "kl_loss_type": "low_var_kl",
     "sampler_kl_coef": 0.0,
+    "sampler_kl_type": "k1",
+    "sampler_kl_ratio_cap": 5.0,
 }
 _ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
     "aux_ce_weight": None,
@@ -880,9 +933,13 @@ def _grpo_loss(
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs_shifted`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
-        ``sampler_kl_coef`` (default 0.0; finite non-negative β of ``β · agg(old_log_probs_shifted - logprobs)``
-        over non-NLL policy tokens with the policy term's aggregation: the k1 estimate of KL(sampler || policy),
-        whose gradient ``-β ∇ log p`` raises every sampled token regardless of advantage),
+        ``sampler_kl_coef`` (default 0.0; finite non-negative β of ``β · agg(w · k(log p - old_log_probs_shifted))``
+        over non-NLL policy tokens with the policy term's aggregation: a per-token estimate of KL(sampler || policy)),
+        ``sampler_kl_type`` (default "k1": ``k = -log r``, whose gradient ``-β ∇ log p`` raises every sampled token
+        regardless of advantage; "k2": ``(log r)^2 / 2``; "k3": ``r - 1 - log r``, zero gradient where r = 1),
+        ``sampler_kl_ratio_cap`` (default 5.0, > 1, inf allowed; k2 and k3 continue linearly past
+        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token (finite, non-negative,
+        default 1; required to carry ``sequence_loss_weights`` under token-mean),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -915,7 +972,9 @@ def _grpo_loss(
     values = _grpo_config_values(config)
     _validate_loss_denominators(values["batch_num_tokens"], values["global_batch_size"])
     values["teacher_tau"] = _resolve_teacher_tau(config, context)
-    values["sampler_kl_coef"] = _config_nonnegative(config, "sampler_kl_coef") or 0.0
+    values["sampler_kl_coef"], values["sampler_kl_type"], values["sampler_kl_ratio_cap"] = _resolve_sampler_kl(
+        config, context
+    )
     values["ratio_masks"] = RatioMasks.from_config(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
 
@@ -978,6 +1037,7 @@ def _grpo_loss(
         "nll_mask": nll_mask,
         "teacher_log_probs": context.get("teacher_log_probs_shifted"),
         "teacher_policy_finite": teacher_policy_finite,
+        "sampler_kl_weights": context.get("sampler_kl_weights"),
         "sft_mask": context.get("sft_mask"),
         "echo_observation_mask": context.get("echo_observation_mask"),
         "echo_observation_token_counts": context.get("echo_observation_token_counts"),
@@ -995,6 +1055,8 @@ def _grpo_loss(
         input_data["versions"] = input_data["versions"].to(logprobs.device)
     if input_data["ref_log_probs"] is not None:
         input_data["ref_log_probs"] = input_data["ref_log_probs"].to(logprobs.device)
+    if input_data["sampler_kl_weights"] is not None:
+        input_data["sampler_kl_weights"] = input_data["sampler_kl_weights"].to(logprobs.device)
     if input_data["teacher_log_probs"] is not None:
         if not torch.is_tensor(input_data["teacher_log_probs"]):
             raise ValueError("teacher_log_probs_shifted must be a floating-point tensor")
@@ -1017,6 +1079,7 @@ def _grpo_loss(
             "nll_mask",
             "teacher_log_probs",
             "teacher_policy_finite",
+            "sampler_kl_weights",
             "sft_mask",
             "echo_observation_mask",
             "labels",
@@ -1033,6 +1096,12 @@ def _grpo_loss(
                 "teacher_log_probs_shifted must exactly match prediction-aligned logprobs shape, "
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
             )
+    sampler_kl_weights = input_data["sampler_kl_weights"]
+    if sampler_kl_weights is not None and sampler_kl_weights.shape != logprobs.shape:
+        raise ValueError(
+            f"sampler_kl_weights must match logprobs shape, got {tuple(sampler_kl_weights.shape)} and "
+            f"{tuple(logprobs.shape)}"
+        )
 
     prompt_group_ids = context.get("prompt_group_ids")
     if prompt_group_ids is not None:
@@ -1373,6 +1442,7 @@ def _packed_grpo_validation_context(context: dict) -> dict:
         "loss_mask",
         "nll_mask",
         "teacher_log_probs_shifted",
+        "sampler_kl_weights",
         "sft_mask",
         "echo_observation_mask",
     ):
@@ -1388,7 +1458,12 @@ def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
-    _config_nonnegative(config, "sampler_kl_coef")
+    _resolve_sampler_kl(config, context)
+    weights = context.get("sampler_kl_weights")
+    if weights is not None and weights.shape != mask.shape:
+        raise ValueError(
+            f"sampler_kl_weights must match loss_mask shape, got {tuple(weights.shape)} and {tuple(mask.shape)}"
+        )
     if teacher_tau > 0:
         teacher_log_probs = context["teacher_log_probs_shifted"]
         if not torch.is_tensor(teacher_log_probs) or not teacher_log_probs.is_floating_point():
