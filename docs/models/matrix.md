@@ -8,31 +8,31 @@ that the loader accepts. `no` means the loader offers no way to set it, and `n/a
 rules the option out. Restrictions that depend on the platform, the parallelism or the value stay in
 each loader's own validation. The reasons follow the table.
 
-| Option | Runs in | Goal | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `qwen3_5_moe` | `qwen4_exp` |
-|---|---|---|---|---|---|---|---|---|
-| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes |
-| `attention.sparse_mla` | trainer | speed | n/a | yes | yes | no | n/a | n/a |
-| `checkpointing.freq` | trainer | memory | yes | yes | yes | yes | yes | yes |
-| `checkpointing.mode` | trainer | memory | yes | yes | yes | no | yes | yes |
-| `checkpointing.offload` | trainer | memory | yes | yes | yes | yes | yes | yes |
-| `checkpointing.targets` | trainer | memory | yes | yes | yes | no | yes | yes |
-| `compile.fullgraph` | trainer | speed | no | no | no | yes | no | no |
-| `liger` | trainer | speed | no | no | no | yes | no | no |
-| `lm_head.cross_entropy` | trainer | memory | yes | yes | yes | no | yes | yes |
-| `lm_head.fp32` | both | parity | yes | yes | yes | yes | yes | yes |
-| `lm_head.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes |
-| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | yes | no | no |
-| `moe.comm_backend` | trainer | speed | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_sms` | trainer | speed | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_token_chunk` | trainer | speed | yes | yes | yes | n/a | yes | yes |
-| `moe.grouped_mm` | trainer | speed | yes | yes | yes | n/a | yes | yes |
-| `numerics.fp32_parity` | trainer | parity | no | no | no | yes | yes | no |
-| `numerics.fp32_residual` | trainer | parity | no | no | no | yes | no | no |
-| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | no | yes | yes |
-| `numerics.reduce_dtype` | trainer | parity | yes | yes | yes | no | yes | yes |
-| `peft` | trainer | mode | no | no | no | yes | no | no |
-| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes |
-| `zorro_train` | trainer | mode | no | no | no | yes | no | no |
+| Option | Runs in | Goal | `deepseek_v4` | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `qwen3_5_moe` | `qwen4_exp` |
+|---|---|---|---|---|---|---|---|---|---|
+| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes | yes |
+| `attention.sparse_mla` | trainer | speed | n/a | n/a | yes | yes | no | n/a | n/a |
+| `checkpointing.freq` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
+| `checkpointing.mode` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
+| `checkpointing.offload` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
+| `checkpointing.targets` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
+| `compile.fullgraph` | trainer | speed | no | no | no | no | yes | no | no |
+| `liger` | trainer | speed | no | no | no | no | yes | no | no |
+| `lm_head.cross_entropy` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
+| `lm_head.fp32` | both | parity | yes | yes | yes | yes | yes | yes | yes |
+| `lm_head.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
+| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | yes | no | no |
+| `moe.comm_backend` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
+| `moe.comm_sms` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
+| `moe.comm_token_chunk` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
+| `moe.grouped_mm` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
+| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | yes | no |
+| `numerics.fp32_residual` | trainer | parity | no | no | no | no | yes | no | no |
+| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | no | yes | yes |
+| `numerics.reduce_dtype` | trainer | parity | yes | yes | yes | yes | no | yes | yes |
+| `peft` | trainer | mode | no | no | no | no | yes | no | no |
+| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
+| `zorro_train` | trainer | mode | no | no | no | no | yes | no | no |
 
 ## Options
 
@@ -59,6 +59,21 @@ each loader's own validation. The reasons follow the table.
 - `peft`: Train adapters (LoRA) instead of the full weights. Today: `patches.peft`.
 - `tiled_mlp.token_chunk_size`: Recompute the MLP in token tiles of this size. Today: `patches.tiled_mlp.token_chunk_size`; `loader_options.tiled_mlp_token_chunk_size`.
 - `zorro_train`: Replace the forward with the ZoRRo Train log-prob and entropy path. Today: `patches.zorro_train`.
+
+## `deepseek_v4`
+
+Extends `generic_moe`.
+
+7 of 23 options unsupported.
+
+- `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
+- `compile.fullgraph` (no): the loader rejects `patches.compile`
+- `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
+- `lm_head.vocab_chunk_size` (no): no equivalent option
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
+- `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `generic_moe`
 
