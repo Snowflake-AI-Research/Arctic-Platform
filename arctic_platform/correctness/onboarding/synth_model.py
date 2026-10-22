@@ -110,7 +110,9 @@ def count_parameters(cfg) -> int:
 
 
 def size_for_single_gpu(
-    source: str, budget_gib: float = SINGLE_GPU_BUDGET_GIB, bytes_per_param: int = BYTES_PER_PARAM
+    source: str,
+    budget_gib: float = SINGLE_GPU_BUDGET_GIB,
+    bytes_per_param: int = BYTES_PER_PARAM,
 ) -> Tuple[int, int]:
     """Largest whole-block layer count whose parameter-resident memory fits the budget.
 
@@ -199,7 +201,46 @@ def _save_reduced_pretrained(model, dest_path: Path) -> None:
         if preserve_legacy_defaults:
             model.generation_config = generation
     if preserve_legacy_defaults:
-        generation.to_json_file(dest_path / "generation_config.json", use_diff=True, keys_to_pop=["compile_config"])
+        generation.to_json_file(
+            dest_path / "generation_config.json",
+            use_diff=True,
+            keys_to_pop=["compile_config"],
+        )
+
+
+def _load_reduced_pretrained(model_class, source: str, cfg, num_layers: int, original_layers: int, **options):
+    import torch
+    from transformers import PreTrainedModel
+
+    if num_layers >= original_layers:
+        return model_class.from_pretrained(source, config=cfg, **options)
+
+    def adjust_loading_info(model, loading_info):
+        model_class._adjust_missing_and_unexpected_keys(model, loading_info)
+        text_config = getattr(model.config, "text_config", model.config)
+        omitted_prefixes = []
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.ModuleList) or len(module) != num_layers:
+                continue
+            parent = model.get_submodule(name.rpartition(".")[0])
+            if isinstance(parent, PreTrainedModel) and parent.config is text_config:
+                omitted_prefixes.extend(f"{name}.{index}." for index in range(num_layers, original_layers))
+        loading_info.unexpected_keys = {
+            key for key in loading_info.unexpected_keys if not key.startswith(tuple(omitted_prefixes))
+        }
+
+    # Scope reporting rules to this load, preserving architecture-specific conversion names and model identity.
+    loading_class = type(
+        model_class.__name__,
+        (model_class,),
+        {
+            "__module__": model_class.__module__,
+            "_adjust_missing_and_unexpected_keys": adjust_loading_info,
+        },
+    )
+    model = loading_class.from_pretrained(source, config=cfg, **options)
+    model.__class__ = model_class
+    return model
 
 
 def materialize_pretrained(
@@ -220,7 +261,7 @@ def materialize_pretrained(
     import torch
     import transformers
 
-    cfg, _, _ = reduce_config(source, num_layers, vision_depth)
+    cfg, original_layers, _ = reduce_config(source, num_layers, vision_depth)
     load_options = {}
     quantization = getattr(cfg, "quantization_config", None)
     if quantization is not None:
@@ -235,7 +276,16 @@ def materialize_pretrained(
     if force or not (dest_path / "config.json").exists():
         dest_path.mkdir(parents=True, exist_ok=True)
         cls = getattr(transformers, cfg.architectures[0])
-        model = cls.from_pretrained(source, config=cfg, dtype=torch.bfloat16, trust_remote_code=True, **load_options)
+        model = _load_reduced_pretrained(
+            cls,
+            source,
+            cfg,
+            num_layers,
+            original_layers,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            **load_options,
+        )
         if quantization is not None:
             if (
                 getattr(model, "hf_quantizer", None) is not None
@@ -272,7 +322,12 @@ def materialize_pretrained(
 
 
 def materialize(
-    source: str, dest: str, num_layers: int, vision_depth: int = 2, seed: int = SEED, force: bool = False
+    source: str,
+    dest: str,
+    num_layers: int,
+    vision_depth: int = 2,
+    seed: int = SEED,
+    force: bool = False,
 ) -> ModelSpec:
     """Generate the model once and write it to ``dest``; both engines then load that directory by path.
 

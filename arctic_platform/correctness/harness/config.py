@@ -42,6 +42,8 @@ from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
 
+DEFAULT_REFERENCE_CALIBRATION_RUNS = 5
+
 
 class ReviewedTrainingConfig(TrainingConfig):
     weight_format: Literal["vllm", "hf", "lora"] | None = None

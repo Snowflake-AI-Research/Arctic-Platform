@@ -42,14 +42,13 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
+from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-# Sixteen reference executions over an eight-GPU node: two waves, so more samples cost the same wall
-# clock as two sequential runs.
-CALIBRATION_RUNS = 16
+CALIBRATION_RUNS = DEFAULT_REFERENCE_CALIBRATION_RUNS
 # How far above the run-to-run variation the calibrated gate sits. Sixteen calibration runs measure the
 # tail imperfectly: on the CPU-offloaded Qwen3.8-27B config a factor of two produced a 2e-03 gate that the
 # validation run then exceeded at 2.929e-03, so a factor that only just covers the observed spread does not
@@ -62,7 +61,8 @@ OOM_EXIT = 42
 
 
 def _stage(phase: str, name: str, detail: str = "") -> None:
-    print(f"\n*** {phase.title()}: {name.title()} ***", flush=True)
+    marker = "###" if phase.split()[0].casefold() == "onboarding" else "***"
+    print(f"\n{marker} {phase.title()}: {name.title()} {marker}", flush=True)
     if detail:
         print(detail, flush=True)
     print(flush=True)
@@ -89,7 +89,7 @@ class _ConsoleLog:
 
 def logged_run(args: argparse.Namespace) -> int:
     """Retain diagnostics even when prerequisites or specification loading fail."""
-    from arctic_platform.correctness.harness.report import duration
+    from arctic_platform.correctness.harness.report import total_duration
 
     if getattr(args, "probe_layers", None) is not None:
         return run(args)
@@ -127,7 +127,10 @@ def logged_run(args: argparse.Namespace) -> int:
                         )
                         return 1
                     finally:
-                        print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)
+                        print(
+                            f"Total run time: {total_duration(time.monotonic() - started)}",
+                            flush=True,
+                        )
             finally:
                 logger.handlers = previous_handlers
                 handler.close()
@@ -141,7 +144,13 @@ def logged_run(args: argparse.Namespace) -> int:
 def _stream_subprocess(command, *, cwd, env) -> int:
     """Stream child output through the console/log tee, including native-library output."""
     process = subprocess.Popen(
-        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
     try:
         for line in process.stdout:
@@ -225,16 +234,26 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                 ast.dump(ast.parse(source).body[0])
                 for source in (
                     "from arctic_platform.correctness.harness.report import duration",
+                    "from arctic_platform.correctness.harness.report import total_duration",
                     "started = time.monotonic()",
                     'print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)',
+                    'print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)',
                 )
             }
             for function in tree.body:
                 if isinstance(function, ast.FunctionDef) and function.name == "logged_run":
                     for node in ast.walk(function):
                         for field, value in ast.iter_fields(node):
-                            if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
-                                setattr(node, field, [item for item in value if ast.dump(item) not in footer_nodes])
+                            if isinstance(value, list) and field in {
+                                "body",
+                                "orelse",
+                                "finalbody",
+                            }:
+                                setattr(
+                                    node,
+                                    field,
+                                    [item for item in value if ast.dump(item) not in footer_nodes],
+                                )
             tree.body = [
                 node
                 for node in tree.body
@@ -271,9 +290,15 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                     if len(node.items) == 1 and ast.dump(node.items[0]) == progress_context:
                         for child in ast.walk(node):
                             for field, value in ast.iter_fields(child):
-                                if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                                if isinstance(value, list) and field in {
+                                    "body",
+                                    "orelse",
+                                    "finalbody",
+                                }:
                                     setattr(
-                                        child, field, [item for item in value if ast.dump(item) != progress_update]
+                                        child,
+                                        field,
+                                        [item for item in value if ast.dump(item) != progress_update],
                                     )
                         return node.body
                     return node
@@ -299,8 +324,16 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                 if isinstance(node, ast.If) and ast.dump(node.test) == reuse:
                     node.test = ast.Name(id="stepping", ctx=ast.Load())
                 for field, value in ast.iter_fields(node):
-                    if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
-                        setattr(node, field, [item for item in value if ast.dump(item) not in ignored])
+                    if isinstance(value, list) and field in {
+                        "body",
+                        "orelse",
+                        "finalbody",
+                    }:
+                        setattr(
+                            node,
+                            field,
+                            [item for item in value if ast.dump(item) not in ignored],
+                        )
         preparation["code"][relative] = {
             "schema": "onboarding-preparation-ast-v1",
             "sha256": hashlib.sha256(ast.dump(tree).encode()).hexdigest(),
@@ -332,7 +365,16 @@ def _resume_setup(args: argparse.Namespace) -> None:
     if not getattr(args, "_automatic_cortex_gateway", False):
         options["base_url"] = getattr(args, "base_url", None) or os.environ.get("ARCTIC_CORTEX_BASE_URL")
     versions = {}
-    for name in ("torch", "transformers", "huggingface-hub", "peft", "deepspeed", "ray", "dss", "dss-client"):
+    for name in (
+        "torch",
+        "transformers",
+        "huggingface-hub",
+        "peft",
+        "deepspeed",
+        "ray",
+        "dss",
+        "dss-client",
+    ):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -354,7 +396,11 @@ def _resume_setup(args: argparse.Namespace) -> None:
     args._resume_dir = args._resume_root / args.test_spec.stem / args.test_id / digest
     args._resume_dir.mkdir(parents=True, exist_ok=True)
     preparation = _resume_preparation_request(request, root)
-    manifest = {"schema": "onboarding-resume-request-v1", "request": request, "preparation_request": preparation}
+    manifest = {
+        "schema": "onboarding-resume-request-v1",
+        "request": request,
+        "preparation_request": preparation,
+    }
     manifest_path = args._resume_dir / "request.json"
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != manifest:
@@ -406,11 +452,18 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
             if valid:
                 if saved["spec"] is not None:
                     args.test_spec.write_text(saved["spec"])
-                _stage("Resume", phase.replace("-", " "), "Reusing the verified completed phase.")
+                _stage(
+                    "Resume",
+                    phase.replace("-", " "),
+                    "Reusing the verified completed phase.",
+                )
                 return saved["result"]
         except (OSError, ValueError, KeyError):
             pass
-        print(f"Retained {phase} work is missing or changed; rebuilding this phase.", flush=True)
+        print(
+            f"Retained {phase} work is missing or changed; rebuilding this phase.",
+            flush=True,
+        )
     # A rebuilt phase invalidates downstream results even if it happens to reproduce identical bytes.
     args._resume_candidates = []
     phases = ("sizing", "fixture", "calibration", "references", "validation")
@@ -493,6 +546,7 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
     """Fail before fixture creation, sizing, calibration or adapter generation."""
     from arctic_platform.correctness.harness import storage
     from arctic_platform.correctness.harness.dss_driver import _allocation_hostfile
+    from arctic_platform.correctness.harness.dss_driver import recover_local_cortex_gateway
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
 
@@ -562,8 +616,12 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
     _stage(
         "Prerequisites",
         "Environment And Target",
-        f"Config: {config.config_id}; checks: {', '.join(selection)}; Python: {sys.executable}",
+        f"Config: {config.config_id}; checks: {', '.join(selection)}; Python: {sys.executable}\n"
+        f"Config file: {args.config.resolve()}\nModel source: {source}\n"
+        f"Configured sequence length: {config.max_seq_len:,} tokens",
     )
+    if getattr(args, "_automatic_cortex_gateway", False):
+        recover_local_cortex_gateway()
     local = storage.onboarding_node_prerequisites(request)
     failures = [f"{local['host']} ({local['python']}): {error}" for error in local["errors"]]
     if failures:
@@ -916,7 +974,10 @@ def build_spec(
         num_layers, _ = size_for_single_gpu(source_checkpoint)
     destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
     model = materialize_pretrained(source_checkpoint, destination, num_layers)
-    print(f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}", flush=True)
+    print(
+        f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}",
+        flush=True,
+    )
 
     model_config = AutoConfig.from_pretrained(destination, trust_remote_code=True)
     vocab_size = getattr(model_config, "text_config", model_config).vocab_size
@@ -1009,7 +1070,9 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         key = str(model_path.resolve())
         if key not in generated:
             generated[key] = generate_adapter(
-                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
+                model_path,
+                config.training["peft_config"],
+                correctness_workdir("shared-peft-") / "adapter",
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
@@ -1142,7 +1205,10 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     try:
         completed: dict[int, tuple[float, dict]] = {}
         with tqdm(
-            total=CALIBRATION_RUNS, desc="Finding optimizer tolerance", unit="run", dynamic_ncols=True
+            total=CALIBRATION_RUNS,
+            desc="Finding optimizer tolerance",
+            unit="run",
+            dynamic_ncols=True,
         ) as progress:
             with ThreadPoolExecutor(max_workers=lanes) as pool:
                 futures = [pool.submit(one_run, index) for index in range(CALIBRATION_RUNS)]
@@ -1160,7 +1226,10 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         parameter_count = len(json.loads(manifests[0].read_text())["parameters"])
         pair_count = CALIBRATION_RUNS * (CALIBRATION_RUNS - 1) // 2
         with tqdm(
-            total=parameter_count, desc=f"Comparing {pair_count} reference pairs", unit="tensor", dynamic_ncols=True
+            total=parameter_count,
+            desc=f"Comparing {pair_count} reference pairs",
+            unit="tensor",
+            dynamic_ncols=True,
         ) as progress:
             worst = max_pairwise_optimizer_delta(
                 manifests,
@@ -1301,7 +1370,15 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
     ):
         raise ValueError("optimizer validation bootstrap requires only local Cortex Test 2 onboarding")
     admitted = {}
-    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
     for role, value, digest in (
         ("bootstrap", values[0], values[1]),
         ("config", values[2], values[3]),
@@ -1331,7 +1408,11 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
             or hashlib.sha256(raw).hexdigest() != digest
         ):
             raise ValueError(f"optimizer validation {role} changed or SHA256 differs")
-        admitted[role] = {"path": str(path), "sha256": digest, "file_identity": identity}
+        admitted[role] = {
+            "path": str(path),
+            "sha256": digest,
+            "file_identity": identity,
+        }
     return admitted
 
 
@@ -1360,7 +1441,15 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     ]
     if getattr(args, "test_spec", None) is not None:
         command += ["--test-spec", str(args.test_spec)]
-    for name in ("host", "database", "schema", "endpoint", "base_url", "pat_file", "gpu_pool"):
+    for name in (
+        "host",
+        "database",
+        "schema",
+        "endpoint",
+        "base_url",
+        "pat_file",
+        "gpu_pool",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
@@ -1487,7 +1576,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     runs = args.reference_calibration_runs
     workers = args.reference_calibration_workers
     if runs != CALIBRATION_RUNS or not 1 <= workers <= 8:
-        raise ValueError("local optimizer norm onboarding requires 16 repeats per arm and 1 to 8 HF workers")
+        raise ValueError(
+            f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm and 1 to 8 HF workers"
+        )
     records_root = require_git_records_dir(args.reference_records_dir)
     records_root.mkdir(parents=True, exist_ok=True)
     model_config = AutoConfig.from_pretrained(args.optimizer_model_path, trust_remote_code=True)
@@ -1593,7 +1684,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 or provenance.get("multiplier") != GATE_SAFETY_FACTOR
                 or provenance.get("minimum_gate") != 0.001
             ):
-                raise ValueError("optimizer norm gate requires fresh criterion-specific 16-repeat provenance")
+                raise ValueError(f"optimizer norm gate requires fresh criterion-specific {runs}-repeat provenance")
             spread = provenance.get("maximum_pairwise_norm_delta")
             if type(spread) not in {float, int} or not math.isfinite(spread) or spread < 0:
                 raise ValueError("optimizer norm calibration spread must be finite and nonnegative")
@@ -1692,7 +1783,11 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
     )
     try:
         calibration_json = Path(
-            _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
+            _resume_phase(
+                args,
+                "calibration",
+                lambda: str(_run_local_optimizer_calibration(args, config, spec)),
+            )
         )
         selected = {"layers": optimizer_layers}
         validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
@@ -1769,7 +1864,8 @@ def _parent(args: argparse.Namespace) -> int:
     else:
         _onboarding_preflight(args, config)
         validate_against_host(
-            config, args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()
+            config,
+            (args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()),
         )
         ensure_no_interrupted_builds()
     _onboarding_preflight(args, config)
@@ -1799,7 +1895,11 @@ def _parent(args: argparse.Namespace) -> int:
     full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
     sizing_started = time.monotonic()
     if getattr(args, "reuse_sizing", None) is not None:
-        _stage("Phase 1/3", "Retained Sizing", "Admitting the source-bound result without HF sizing replay.")
+        _stage(
+            "Phase 1/3",
+            "Retained Sizing",
+            "Admitting the source-bound result without HF sizing replay.",
+        )
         selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
     else:
         _stage(
@@ -1829,7 +1929,11 @@ def _parent(args: argparse.Namespace) -> int:
             f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs.",
         )
         calibration_json = Path(
-            _resume_phase(args, "calibration", lambda: str(_render_and_run_calibration(args, selected)))
+            _resume_phase(
+                args,
+                "calibration",
+                lambda: str(_render_and_run_calibration(args, selected)),
+            )
         )
         calibration = json.loads(calibration_json.read_text())
         if local_fixture:
@@ -1913,7 +2017,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="reuse a reviewed source-bound sizing receipt, then continue calibration and validation",
     )
-    parser.add_argument("--reuse-sizing-sha256", help="full SHA256 of the immutable sizing reuse receipt")
+    parser.add_argument(
+        "--reuse-sizing-sha256",
+        help="full SHA256 of the immutable sizing reuse receipt",
+    )
     parser.add_argument(
         "--prepare-references",
         action="store_true",
@@ -1924,7 +2031,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path(__file__).resolve().parents[1] / "reference_data",
     )
-    parser.add_argument("--reference-calibration-runs", type=int, default=16)
+    parser.add_argument("--reference-calibration-runs", type=int, default=CALIBRATION_RUNS)
     parser.add_argument(
         "--peft-adapter",
         type=Path,
@@ -1941,9 +2048,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="source-pinned caller bootstrap for final local Cortex optimizer validation only",
     )
-    parser.add_argument("--optimizer-validation-bootstrap-sha256", help="full SHA256 of the caller bootstrap")
-    parser.add_argument("--optimizer-validation-config", type=Path, help="private caller bootstrap configuration")
-    parser.add_argument("--optimizer-validation-config-sha256", help="full SHA256 of the private caller configuration")
+    parser.add_argument(
+        "--optimizer-validation-bootstrap-sha256",
+        help="full SHA256 of the caller bootstrap",
+    )
+    parser.add_argument(
+        "--optimizer-validation-config",
+        type=Path,
+        help="private caller bootstrap configuration",
+    )
+    parser.add_argument(
+        "--optimizer-validation-config-sha256",
+        help="full SHA256 of the private caller configuration",
+    )
 
 
 def _prepare_references(args: argparse.Namespace) -> int:
@@ -2083,7 +2200,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             (
                 0
                 if test_id == "single-step-grads"
-                else 1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2
+                else (1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2)
             ),
             test_id,
         )
@@ -2103,9 +2220,12 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
     if selected and not config.is_rl and not spec_path.exists() and "single-step-grads" not in queue:
         queue.insert(0, "single-step-grads")
         print("preparing the gradient fixture required by the selected check", flush=True)
-    for test_id in queue:
+    for index, test_id in enumerate(queue, start=1):
         if test_id != "single-step-grads" and not config.is_rl and not spec_path.exists():
-            results[test_id] = {"status": "failed", "reason": "gradient fixture onboarding failed"}
+            results[test_id] = {
+                "status": "failed",
+                "reason": "gradient fixture onboarding failed",
+            }
             continue
         child = argparse.Namespace(
             **{
@@ -2118,7 +2238,11 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         if hasattr(args, "_diagnostics_dir"):
             child._diagnostics_dir = args._diagnostics_dir / test_id
             child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        _stage("Onboarding", test_id.replace("-", " "), f"Config: {config.config_id}")
+        _stage(
+            f"Onboarding {index}/{len(queue)}",
+            test_id.replace("-", " "),
+            f"Config: {config.config_id}",
+        )
         try:
             code = _parent(child)
             results[test_id] = {
@@ -2196,7 +2320,10 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         report_path.write_text("\n".join(lines), encoding="utf-8")
         print(f"Report: {report_path}", flush=True)
     print(f"onboarding summary: {destination}", flush=True)
-    print(f"spec: {spec_path}" if spec_path.exists() else "no specification was published", flush=True)
+    print(
+        (f"spec: {spec_path}" if spec_path.exists() else "no specification was published"),
+        flush=True,
+    )
     return int(preparation_error is not None or any(result["status"] == "failed" for result in results.values()))
 
 

@@ -262,7 +262,9 @@ def _finish(
     print(f"report: {out / 'report.md'}")
     for r in failed:
         print(f"  FAIL {r.config_id} {r.test_id} {r.arm or ''}: {r.summary}")
-    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
+    print(
+        f"total run time across {configs} config(s): {console.total_duration(time.monotonic() - started)}", flush=True
+    )
     return 0 if passed and not failed else 1
 
 
@@ -798,7 +800,7 @@ def run_batch(args, *, selected, executor=None):
     print(f"Report: {out / 'report.md'}; complete logs: {out / 'full.log'}", flush=True)
     if any(case["status"] in {"blocked", "error"} for case in cases):
         print("Action required: see the reason in batch.json and the full traceback in full.log.", flush=True)
-    print(f"Total run time: {console.duration(time.monotonic() - started)}", flush=True)
+    print(f"Total run time: {console.total_duration(time.monotonic() - started)}", flush=True)
     return BatchResult(results, out, aggregate_exit_code(results), elapsed, stopped, cases)
 
 

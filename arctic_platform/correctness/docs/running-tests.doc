@@ -90,7 +90,13 @@ config = {
         },
     },
     "sampling": {},
-    "backend": {"type": "onprem", "protocol": "ray"},
+    "backend": {
+        "type": "remote",
+        "protocol": "cortex",
+        "base_url": "http://127.0.0.1:1",
+        "database": "dev",
+        "schema": "dev",
+    },
 }
 Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
     json.dumps(config, indent=2) + "\n"
@@ -98,7 +104,7 @@ Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
 PY
 ```
 
-**The config's `backend` object describes the upstream gateway's native Ray worker runtime, not the correctness CLI transport.** The native service still uses `{"type": "onprem", "protocol": "ray"}` for that internal runtime. Correctness connects to the service through `--backend cortex-training`; `--backend onprem` is rejected.
+**The config uses the remote Cortex protocol, matching the correctness commands' `cortex-training` backend.** The loopback URL on port 1 is a non-serving placeholder required by the client schema. Onboarding and regression replace that placeholder with their automatically started gateway's actual URL. Do not start a server on port 1 or export the placeholder as `ARCTIC_CORTEX_BASE_URL`; an explicit endpoint selects an externally managed service. `--backend onprem` is rejected.
 
 **The example uses full fine-tuning, not low-rank adaptation (LoRA).** Native `training.peft` or `training.ds_worker_config.peft_config` is detected automatically for reference preparation, but Cortex-training has no admitted shared-adapter target-loading route in this suite. A LoRA config therefore cannot complete this target onboarding workflow yet; supplying an adapter file does not resolve that limitation. See [LoRA without adapter inputs](#lora-without-adapter-inputs).
 
@@ -108,7 +114,7 @@ PY
 
 **Automatically managed local Cortex-training onboarding checks the target allocation too.** When the configured GPU count exceeds the local node's visible GPUs, onboarding checks every host using the existing `ds_ssh` transport and invoking Python executable. It requires every host to respond, checks GPU counts against the hostfile slots and rejects differing target dependency versions. Set `ARCTIC_HOSTFILE` or `DSS_GATEWAY_HOSTFILE` to the same-job hostfile, or use the allocation's `/job/hostfile`. Without a hostfile, a single-node gateway gets an automatically generated local hostfile. Reference dependencies and the original checkpoint are checked on the reference node; target dependencies and writable scratch/cache locations are checked on each host without assuming `/data-fast` is shared. An explicitly supplied gateway is not owned or inspected by this command. These checks do not predict model memory use or prove successful kernel execution; sizing and validation still follow.
 
-**Give onboarding the config; it selects all applicable checks automatically.** On P1 that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, prepares fixture prerequisites, calibrates gates, publishes references for individual checks and the combined selection, and validates the target. The quick demo uses a four-layer fixture, 128-token sequences and one GPU, keeping all 16 nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. It does not establish full-model, distributed-training or maximum-sequence-length correctness.
+**Give onboarding the config; it selects all applicable checks automatically.** On P1 that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, prepares fixture prerequisites, calibrates gates, publishes references for individual checks and the combined selection, and validates the target. The quick demo uses a four-layer fixture, 128-token sequences and one GPU, with five nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. Five runs is also the default for real-model onboarding. It does not establish full-model, distributed-training or maximum-sequence-length correctness.
 
 ```bash
 python -m arctic_platform.correctness onboard \
@@ -117,7 +123,7 @@ python -m arctic_platform.correctness onboard \
 
 **No manual gateway startup or fixture flag is needed for this onboarding command.** With no Cortex host or base URL configured, onboarding selects the reduced local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for target validation, and closes its owned gateway afterwards. An existing loopback gateway can be supplied with `--base-url`; onboarding does not start or stop that external service. Hosted Cortex account endpoints cannot use this reduced-fixture onboarding mode.
 
-**Every attempt retains a shareable diagnostic directory under `./work/logs/`.** The console prints `onboarding.log` immediately. That directory also contains `report.md`, the summary, sizing diagnostics, calibration summaries, target reports and complete reference-worker logs. Stage headings have vertical spacing and `***` prefixes. `DSS_CORRECTNESS_LOGDIR` overrides the diagnostic root. Large model fixtures, adapters and tensor scratch remain on fast storage; none belong in Git.
+**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `DSS_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing. Queued checks use `###` markers and automatic numbering, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; inner phases retain `***` markers. Prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
 
 **After fixing a reported failure, repeat exactly the same command.** Small recovery records live in `./work/logs/onboarding-state/`. The harness reuses completed sizing, fixture, calibration, reference preparation and successful validation only when their inputs, source, environment and retained artifacts match. It retries failed phases and rebuilds missing or changed artifacts. A failed optimizer validation does not force another gradient calibration. Removing temporary model fixtures after an allocation ends can require rebuilding those phases; logs alone are not reusable model data.
 
@@ -143,7 +149,11 @@ Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run e
 
 **A gateway shutdown failure stops subsequent workloads and makes the command fail, even when the numerical comparisons passed.** Inspect `full.log` and the recorded `gateway.log` before retrying; automatic gateway shutdown is not proof that every detached Ray worker has exited.
 
-**Ctrl-C, SIGTERM and SIGHUP stop the automatically owned gateway during startup or execution.** The command reports shutdown, waits for its owned process, and restores the previous signal handlers; repeated stop signals do not interrupt that bounded cleanup. This applies to onboarding and regression, not an explicitly configured external service. SIGKILL (`kill -9`), node failure and forced container termination cannot be trapped; inspect retained logs and allocation processes before retrying after those events.
+**Ctrl-C, SIGTERM and SIGHUP stop the automatically owned gateway during startup or execution.** The command reports shutdown, waits for its owned process, and restores the previous signal handlers; repeated stop signals do not interrupt that bounded cleanup. This applies to onboarding and regression, not an explicitly configured external service.
+
+**Both commands recover an orphaned harness gateway before starting a replacement; onboarding also checks before HF calibration.** Startup verifies the recorded launch token, process start time and owning command, then stops the stale gateway and waits for its exit. Older unrecorded gateways require an exact harness launch, an orphaned parent and a retained harness log. Active commands and unrelated services are not stopped; unproven ownership or forced-shutdown failure blocks startup. SIGKILL (`kill -9`) cannot be trapped, but the next command can recover a verified surviving gateway. This check does not prove that detached Ray workers have exited.
+
+**Confirm the resolved config file, model source and configured sequence length printed before model work.** The quick demo must show the tiny Qwen3 snapshot and 128 configured tokens. HF calibration uses those settings independently of the gateway; output naming an old 8B configuration is not the tiny demo.
 
 **The automatically started gateway's loopback readiness check ignores environment proxies.** No proxy changes are required for that startup check; explicitly configured service connections keep their existing behavior.
 
@@ -211,7 +221,7 @@ python -m arctic_platform.correctness run \
 
 **Every regression ends with total wall-clock runtime after the report paths and any error guidance.** The final runtime includes gateway startup, execution, owned shutdown and report writing. Reports and complete logs default to `./work/logs`, overridden by `DSS_CORRECTNESS_LOGDIR` or `--out`; tensor scratch remains on fast storage.
 
-**Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts the sixteen nondeterministic HF runs and updates elapsed time and ETA after each completed run. Onboarding ends with total wall-clock runtime in the terminal and `onboarding.log`, including when onboarding fails.
+**Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts the five nondeterministic HF runs and updates elapsed time and ETA after each completed run. Onboarding ends with total wall-clock runtime in the terminal and `onboarding.log`, including when onboarding fails.
 
 **Reports retain comparison results and complete execution errors.** Read the report directory's `report.md`, `report.json`, `batch.json`, and `full.log`. A missing reference, an execution exception, an unsafe cleanup, or an empty selection is not a numerical pass. Unsafe cleanup stops the remaining batch.
 

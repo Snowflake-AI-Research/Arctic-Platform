@@ -1792,21 +1792,22 @@ def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_refer
         }
 
     monkeypatch.setattr(runner, "run_reference", reference)
-    assert (
-        control.execute(prepare_references=True, reference_calibration_runs=16, reference_calibration_workers=workers)
-        == []
-    )
+    assert control.execute(prepare_references=True, reference_calibration_workers=workers) == []
     output = capsys.readouterr().out
     for arm in control.arms:
         assert f"Optimizer calibration {arm.name}" in output
-        for completed in range(1, 17):
-            assert f"{completed}/16" in output
+        for completed in range(1, 6):
+            assert f"{completed}/5" in output
         assert output.index(f"Optimizer calibration {arm.name}") < output.index(
             f"*** Optimizer Norm Summary: {arm.name} ***"
         )
         assert calls.count((f"batch-{arm.name}.pt", True)) == 1
-        assert calls.count((f"batch-{arm.name}.pt", False)) == 16
+        assert calls.count((f"batch-{arm.name}.pt", False)) == 5
     assert len(control.published) == 2
+    assert all(
+        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 5
+        for identity, measurements in control.published
+    )
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
 
 
@@ -1834,11 +1835,10 @@ def test_optimizer_calibration_failed_run_leaves_partial_progress_without_public
         control.execute(
             selected_arms=control.arms[:1],
             prepare_references=True,
-            reference_calibration_runs=16,
             reference_calibration_workers=1,
         )
     output = capsys.readouterr().out
-    assert "Optimizer calibration gas1" in output and "1/16" in output
-    assert "16/16" not in output and "Optimizer Norm Summary" not in output
+    assert "Optimizer calibration gas1" in output and "1/5" in output
+    assert "5/5" not in output and "Optimizer Norm Summary" not in output
     assert control.published == []
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)

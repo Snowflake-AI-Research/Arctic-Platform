@@ -4,7 +4,7 @@
 
 ## Create A Reviewed Specification
 
-**Start with the complete example in the [operator guide](running-tests.doc).** That example checks out this branch, resolves Qwen3-8B's weights and tokenizer through Hugging Face's existing `/checkpoint/huggingface` cache, creates a complete four-H200 training config, and defines every directory used below. Hugging Face reuses cached files and automatically downloads missing files. The example requires an exclusively allocated, prepared head node with the upstream DSS gateway installed. Correctness uses Cortex-training; onboarding manages its own local gateway when no service is configured.
+**Start with the complete example in the [operator guide](running-tests.doc).** That example checks out this branch, resolves `axolotl-ai-co/tiny-qwen3-129m`'s weights and tokenizer through Hugging Face's existing `/checkpoint/huggingface` cache, creates a complete one-H200, 128-token training config, and defines every directory used below. Hugging Face reuses cached files and automatically downloads missing files. The example requires an exclusively allocated, prepared head node with the upstream DSS gateway installed. Correctness uses Cortex-training; onboarding manages its own local gateway when no service is configured.
 
 **A new configuration needs only its native config as onboarding input.** The harness derives the source checkpoint from `model_name`, prepares the reduced fixture, calibrates gates, publishes individual and combined references, and validates applicable checks. The generated specification describes the fixture, input batches, applicable checks and calibrated tolerances. Compact records contain independent Hugging Face measurements, not tensor payloads. Source weights use `/checkpoint/huggingface/hub`; the demo config and final reports use the checkout's Git-ignored `./work/` directory. Generated fixtures and calibration calculations use temporary fast storage. Records must be inside the executing library's checkout, which need not be on temporary storage.
 
@@ -13,7 +13,7 @@ python -m arctic_platform.correctness onboard \
   --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/qwen3-8b-four-h200.json` and the adjacent `qwen3-8b-four-h200.onboarding.json` summary before accepting the gates. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
+**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and the adjacent `tiny-qwen3-129m-one-h200.onboarding.json` summary before accepting the gates. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
 
 **Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.doc#onboarding) for retained reports.
 
@@ -22,7 +22,7 @@ python -m arctic_platform.correctness onboard \
 ```bash
 # Prepare the identity used by a regression selecting both checks.
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/qwen3-8b-four-h200.json \
+  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer
 ```
@@ -53,7 +53,9 @@ python -m arctic_platform.correctness onboard \
 
 **`optimizer-state-l2-norm-v1` compares scalar magnitudes.** For each canonical parameter, it compares the L2 norms of the update residual, first moment, and second moment. The residual subtracts the Adam update explained by each backend's own moments. Shape and coverage checks remain mandatory, including zero and near-zero norms. See [optimizer_state.py](../checks/optimizer_state.py).
 
-**Calibration measures nondeterministic HF norm variation.** The prepared gate uses the largest pairwise spread across repeat captures, multiplies it by four, rounds upward to a `1e-3` increment, and applies a minimum of `1e-3`. The record retains the reviewed criterion, gate, and provenance. `--reference-calibration-workers` requires that many available reference GPUs; one worker is the conservative default.
+**A new optimizer norm record needs fresh, criterion-specific onboarding calibration.** Config-only onboarding uses five nondeterministic single-GPU HF repeats per arm, in addition to the deterministic baseline capture, for tiny and real models alike. The CLI defaults to one worker; `--reference-calibration-workers 5` uses five workers and requires five available GPUs. The [runner](../harness/runner.py) measures the largest absolute scalar-norm difference over all repeat pairs, multiplies that spread by 4, rounds upward to a `1e-3` increment, and applies a minimum absolute gate of `1e-3`. The record retains the gate and actual calibration run count. Existing records retain their original provenance, including historical 16-run measurements. No legacy full-tensor tolerance is inherited, and regression neither recalibrates nor widens this gate.
+
+**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Five repeats plus a deterministic baseline for each of GAS1 and GAS4 means twelve processes with the default one worker, not five processes for the entire optimizer check. The progress bar measures complete reference runs, including this overhead; its ETA appears after a completion.
 
 **A norm pass is weaker than full-tensor equivalence.** Equal norms can hide directional errors. The report must not describe the scalar criterion as elementwise equality.
 
@@ -67,12 +69,11 @@ python -m arctic_platform.correctness onboard \
 
 ## Run Regression
 
-**Start the local gateway before running this regression command.** Onboarding closes its own gateway, so use the complete [Running section](running-tests.doc#running) for the separate service command and connection environment. A loopback gateway uses nonempty database/schema segments; the harness supplies `dev` defaults when no values are configured.
+**Run regression with one command in one terminal, just like onboarding.** With no Cortex host or base URL configured, regression starts and stops its owned installed DSS gateway and selects the reduced fixture automatically. An explicitly configured endpoint is external and must already be running; the command does not stop it. Loopback database/schema segments default to `dev`. See the [Running section](running-tests.doc#running) for prerequisites, diagnostics and cleanup limits.
 
 ```bash
 python -m arctic_platform.correctness run \
-  --backend cortex-training --base-url http://127.0.0.1:8003 --local-cortex-fixture \
-  --config ./work/configs/qwen3-8b-four-h200.json \
+  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
   --out ./work/reports/both
 ```
 
