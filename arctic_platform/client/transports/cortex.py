@@ -102,6 +102,13 @@ def _query(request: Request, body: dict) -> list[Send]:
     return [{"params": body}]
 
 
+def _capacity_query(request: Request, body: dict) -> list[Send]:
+    breakdown = body.get("breakdown")
+    if breakdown is not None and not isinstance(breakdown, str):
+        body = {**body, "breakdown": ",".join(breakdown)}
+    return _query(request, body)
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -115,6 +122,17 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     return encode
 
 
+def _generate_body(body: dict) -> dict:
+    return {**body, "prompts": wire.pack_token_prompts(body["prompts"])}
+
+
+_generate_octet = _octet("generate")
+
+
+def _generate(request: Request, body: dict) -> list[Send]:
+    return _generate_octet(request, _generate_body(body))
+
+
 def _unchunked_octet(request: Request, body: dict) -> list[Send]:
     """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
@@ -124,6 +142,10 @@ def _unchunked_octet(request: Request, body: dict) -> list[Send]:
             f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
         )
     return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _generate_stream(request: Request, body: dict) -> list[Send]:
+    return _unchunked_octet(request, _generate_body(body))
 
 
 def _status_query(request: Request, body: dict) -> list[Send]:
@@ -189,7 +211,7 @@ def _identity(value: Any) -> Any:
 
 
 def _capacity_result(result: dict) -> dict:
-    return {
+    totals = {
         "has_reservation": bool(result.get("has_reservation", False)),
         "max_total_gpus": int(result.get("max_total_gpus", 0)),
         "reserved_gpus": int(result.get("reserved_gpus", 0)),
@@ -197,6 +219,7 @@ def _capacity_result(result: dict) -> dict:
         "pending_gpus": int(result.get("pending_gpus", 0)),
         "available_gpus": int(result.get("available_gpus", 0)),
     }
+    return {**result, **totals}
 
 
 def _fwd_bwd_result(result: dict) -> dict:
@@ -262,6 +285,12 @@ def _is_job_not_found(exc: BaseException) -> bool:
     return isinstance(exc, aiohttp.ClientResponseError) and getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE
 
 
+def _tail_logs_eof(request: Request, exc: BaseException) -> dict | None:
+    if request.body.get("operation_type") == "tail-logs" and _is_job_not_found(exc):
+        return {"entries": [], "next_cursor": None, "eof": True}
+    return None
+
+
 def _is_transient_during_job_visibility(exc: BaseException) -> bool:
     return _is_job_not_found(exc) or _is_transient(exc)
 
@@ -304,6 +333,7 @@ class _Route:
     # `operation_type`s that may answer in the POST reply instead of with a request_id.
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
+    recover: Callable[[Request, BaseException], dict | None] | None = None
 
     def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
@@ -348,8 +378,11 @@ _ROUTES = {
     "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
+    "get-experiment-run": _Route(method="GET", path="/{job}/experiment-run", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
-    "capacity": _Route(method="GET", path="/capacity", encode=_query, policy=_QUICK_READ, normalize=_capacity_result),
+    "capacity": _Route(
+        method="GET", path="/capacity", encode=_capacity_query, policy=_QUICK_READ, normalize=_capacity_result
+    ),
     "list-checkpoints": _Route(
         method="GET",
         path="/{job}/checkpoints",
@@ -373,13 +406,11 @@ _ROUTES = {
         normalize=_fwd_bwd_result,
     ),
     # SnowAPI requires DSSST1 octet bodies here even though generate carries no tensors.
-    "generate": _Route(
-        method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
-    ),
+    "generate": _Route(method="POST", path="/{job}/generate", encode=_generate, poll=True, normalize=_to_python),
     # Answers {request_id, count} at once; events are read with request-status. A replay
     # would start a second generation nobody reads.
     "generate-stream": _Route(
-        method="POST", path="/{job}/generate-stream", encode=_unchunked_octet, policy=_NO_REPLAY
+        method="POST", path="/{job}/generate-stream", encode=_generate_stream, policy=_NO_REPLAY
     ),
     # Each poll drains the events it returns from the server.
     "request-status": _Route(
@@ -399,6 +430,7 @@ _ROUTES = {
         inline_types=frozenset(
             {"reset-prefix-cache", "tail-logs", "bootstrap-router-replay", "router-replay-discard"}
         ),
+        recover=_tail_logs_eof,
     ),
 }
 
@@ -598,10 +630,16 @@ class CortexTransport(Transport):
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
     async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
-        reply = await self._send_group(route, url, sends)
-        if not route.poll:
-            return [], reply
-        return await self._poll(route.submitted(request, reply))
+        try:
+            reply = await self._send_group(route, url, sends)
+            if not route.poll:
+                return [], reply
+            return await self._poll(route.submitted(request, reply))
+        except Exception as exc:
+            recovered = route.recover(request, exc) if route.recover is not None else None
+            if recovered is None:
+                raise
+            return [], recovered
 
     async def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
         try:
