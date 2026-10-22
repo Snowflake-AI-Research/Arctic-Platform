@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 
 import torch
 from torch import nn
@@ -29,6 +30,7 @@ from arctic_platform.model.implementations.qwen35 import deepspeed_integration a
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
+from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
 
 GLM53_ATTN_BACKEND = "sparse_mla"
@@ -42,7 +44,7 @@ def _build_model_config(
     attn_implementation: str,
     options: Qwen3_5MoeOptions,
 ) -> ModelConfig:
-    if attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+    if attn_implementation not in SPARSE_MLA_BACKENDS:
         raise ValueError(
             f"GLM-5.3-Flash training requires the non-SDPA sparse-MLA backend; got {attn_implementation!r}"
         )
@@ -51,28 +53,35 @@ def _build_model_config(
         ep_size,
         dp_replicate,
         optimization_dtype,
-        "eager",
+        attn_implementation,
         options,
     )
-    model_config.attn = "eager"
     return model_config
 
 
-def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
-    apply_context_parallelism(model, sp_size, sp_group)
+def _get_model(model_config: ModelConfig, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    # HF constructs eager attention; AP patches every sparse layer with the requested backend, including SP1.
+    return qwen_ds._generic_adapter().get_model(replace(model_config, attn="eager"), device=device, dtype=dtype)
+
+
+def _apply_sequence_parallelism(
+    model: nn.Module, sp_size: int, sp_group, *, attn_implementation: str = GLM53_ATTN_BACKEND
+) -> None:
+    apply_context_parallelism(model, sp_size, sp_group, attn_implementation=attn_implementation)
 
 
 def _shared_expert_forward(feed_forward: BCFeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
     return BCFeedForward.forward(feed_forward, hidden_states)
 
 
-def _adapter() -> MoEDeepSpeedAdapter:
+def _adapter(attn_implementation: str = GLM53_ATTN_BACKEND) -> MoEDeepSpeedAdapter:
     return replace(
         qwen_ds._generic_adapter(),
+        get_model=_get_model,
         shared_expert_type=BCFeedForward,
         shared_expert_forward=_shared_expert_forward,
         build_model_config=_build_model_config,
-        apply_sequence_parallelism=_apply_sequence_parallelism,
+        apply_sequence_parallelism=partial(_apply_sequence_parallelism, attn_implementation=attn_implementation),
     )
 
 
@@ -88,7 +97,7 @@ def load_glm5_next_model_for_deepspeed(
     sp_group=None,
 ) -> nn.Module:
     return qwen_ds._load_moe_model_for_deepspeed(
-        _adapter(),
+        _adapter(model_config.attn),
         model_config,
         parallel_dims,
         ep_mesh,

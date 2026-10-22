@@ -136,7 +136,7 @@ class TestInitFailureShutdown(TestCasePlus):
                 self.shutdown_calls = 0
                 self.jobs = JobHandles()
 
-            def initialize(self):
+            def initialize(self, client_config):
                 raise RuntimeError("init failed")
 
             def call(self, request: Request) -> dict:

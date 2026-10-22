@@ -16,8 +16,8 @@
 import re
 from importlib.metadata import requires
 
-VLLM_VERSION_030 = "0.30.0"
-SUPPORTED_VLLM_VERSIONS = (VLLM_VERSION_030,)
+VLLM_VERSION_031 = "0.31.0"
+SUPPORTED_VLLM_VERSIONS = (VLLM_VERSION_031,)
 
 
 def get_compatible_vllm_version():
