@@ -87,6 +87,10 @@ class _ConsoleLog:
         return False
 
 
+def _onboarding_failure(reason: str) -> None:
+    print(f"\n\n!!!!! ONBOARDING FAILED: {reason.upper()} !!!!!\n\n", file=sys.stderr, flush=True)
+
+
 def logged_run(args: argparse.Namespace) -> int:
     """Retain diagnostics even when prerequisites or specification loading fail."""
     from arctic_platform.correctness.harness.report import total_duration
@@ -120,11 +124,8 @@ def logged_run(args: argparse.Namespace) -> int:
                             f"## Reason\n\n{reason}\n\nComplete traceback: [onboarding.log](onboarding.log)\n",
                             encoding="utf-8",
                         )
-                        print(
-                            f"\nOnboarding failed: {reason}\nReport: {args._diagnostics_dir / 'report.md'}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                        _onboarding_failure(reason)
+                        print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
                     finally:
                         print(
@@ -1926,7 +1927,7 @@ def _parent(args: argparse.Namespace) -> int:
         _stage(
             "Phase 2/3",
             "Gradient Calibration",
-            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs.",
+            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
         )
         calibration_json = Path(
             _resume_phase(
@@ -2255,7 +2256,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         except Exception as exc:
             results[test_id] = {"status": "failed", "reason": str(exc)}
             traceback.print_exc()
-            print(f"onboarding failed: {test_id}: {exc}", flush=True)
+            _onboarding_failure(f"{test_id}: {exc}")
     references = [test_id for test_id in selected if test_id in CRITERIA and results[test_id]["status"] == "onboarded"]
     preparation_error = None
     if len(references) > 1:
@@ -2275,7 +2276,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         except Exception as exc:
             preparation_error = str(exc)
             traceback.print_exc()
-            print(f"combined reference preparation failed: {exc}", flush=True)
+            _onboarding_failure(f"combined reference preparation: {exc}")
     summary = {
         "config_id": config.config_id,
         "config": str(args.config),

@@ -289,14 +289,14 @@ git diff --cached --stat
 **Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
 
 ```bash
-rm -f -- ./work/configs/tiny-qwen3-129m-one-h200.json
+rm ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
 **Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
 
 ```bash
-rm -rf -- ./work/logs/correctness-demo/
-rm -rf -- ./work/reports/both/
+rm -r ./work/logs/correctness-demo/
+rm -r ./work/reports/both/
 ```
 
 **Use the retained imported config for future runs after cleanup.**

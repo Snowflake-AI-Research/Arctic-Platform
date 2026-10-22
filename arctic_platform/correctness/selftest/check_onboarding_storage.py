@@ -1014,6 +1014,19 @@ def _onboarding_render_config(tmp_path: Path, prime_rl: dict | None, peft_config
     if peft_config is not None:
         training["peft_config"] = peft_config
     config.write_text(json.dumps(_config_factory_native_config(training)))
+    (tmp_path / "model").mkdir(exist_ok=True)
+    (tmp_path / "model" / "config.json").write_text(json.dumps({"layer_types": ["full_attention"] * 4}))
+    (tmp_path / "spec.json").write_text(
+        json.dumps(
+            {
+                "arms": [
+                    {"name": "gas1", "global_batch_size": 8, "max_seq_len": 2048},
+                    {"name": "gas4", "global_batch_size": 32, "max_seq_len": 1024},
+                ],
+                "test_tolerances": {"single-step-grads": {"absolute": 0.026}},
+            }
+        )
+    )
     args = argparse.Namespace(
         config=config,
         source_checkpoint="source",
@@ -1067,7 +1080,15 @@ def test_onboarding_renderer_passes_peft_config_to_reference(tmp_path: Path) -> 
 @pytest.fixture
 def _rendered_calibration_workers(monkeypatch):
     calls = []
-    monkeypatch.setattr(synth_model, "materialize_pretrained", lambda *args: None)
+
+    def materialize(source, destination, layers):
+        path = Path(destination)
+        path.mkdir(parents=True, exist_ok=True)
+        config = path / "config.json"
+        if not config.exists():
+            config.write_text(json.dumps({"layer_types": ["full_attention"] * layers}))
+
+    monkeypatch.setattr(synth_model, "materialize_pretrained", materialize)
     monkeypatch.setattr(
         transformers.AutoConfig,
         "from_pretrained",
@@ -1078,8 +1099,18 @@ def _rendered_calibration_workers(monkeypatch):
 
     def reference(model, batch_path, output, **kwargs):
         batch = batches.load(batch_path)
-        assert batch.input_ids.shape == (1, 2048)
-        result = {"loss": 1.0, "grad_norms": {"model.weight": 2.0}, "peak_gib": 0.0}
+        assert batch.input_ids.shape == {"gas1": (8, 2048), "gas4": (32, 1024)}[batch.name]
+        assert kwargs["token_budget"] == 65536
+        assert kwargs["deterministic"] is False
+        assert kwargs["seed"] == batches.SEED
+        result = {
+            "loss": 1.0,
+            "grad_norms": {"model.weight": 2.0},
+            "peak_gib": 0.0,
+            "active_tokens": batch.active_tokens,
+            "microbatches": 1,
+            "skipped_no_grad": ["model.visual.weight"],
+        }
         output.write_text(json.dumps(result))
         calls.append((batch_path, output))
         return result
@@ -1104,7 +1135,6 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     scratch = _onboarding_storage_fast_root / "explicit-calibration"
     if explicit:
         namespace["WORK_DIR"] = str(scratch)
-    namespace["SPEC_PATH"].write_text("{}")
 
     assert namespace["main"]() == 0
     lines = capsys.readouterr().out.splitlines()
@@ -1113,16 +1143,19 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
 
     calls = _rendered_calibration_workers
-    assert len(calls) == 5
+    assert len(calls) == 10
     batch_paths = {batch_path for batch_path, output in calls}
-    assert len(batch_paths) == 1
-    batch_path = batch_paths.pop()
-    assert batch_path.is_relative_to(_onboarding_storage_fast_root)
-    if explicit:
-        assert batch_path.parent == scratch
-    else:
-        assert batch_path.parent.parent == _onboarding_storage_fast_root / "tmp"
-    assert all(output.parent == diagnostics / "calibration-runs" for batch_path, output in calls)
+    assert len(batch_paths) == 2
+    for batch_path in batch_paths:
+        assert batch_path.is_relative_to(_onboarding_storage_fast_root)
+        if explicit:
+            assert batch_path.parent == scratch
+        else:
+            assert batch_path.parent.parent == _onboarding_storage_fast_root / "tmp"
+    assert all(
+        output.parent == diagnostics / "calibration-runs" / batches.load(batch_path).name
+        for batch_path, output in calls
+    )
     assert not list(diagnostics.rglob("*.pt"))
     payload = json.loads(namespace["OUTPUT"].read_text())
     assert payload["configuration"]["runs"] == 5
@@ -1169,7 +1202,6 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
         checkout_root=tmp_path,
     )
     args.output_dir.mkdir()
-    args.test_spec.write_text("{}")
 
     def execute(command, *, cwd, env):
         namespace = {"__name__": "synthetic_calibration"}
@@ -1181,9 +1213,185 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
     result = onboard._render_and_run_calibration(args, {"layers": 4})
     assert result == args._diagnostics_dir / "reference-repeatability.json"
     assert result.is_file()
-    assert (args.output_dir / "calibration-runs" / "batch.pt").is_file()
-    assert len(_rendered_calibration_workers) == 5
+    assert (args.output_dir / "calibration-runs" / "batch-gas1.pt").is_file()
+    assert (args.output_dir / "calibration-runs" / "batch-gas4.pt").is_file()
+    assert len(_rendered_calibration_workers) == 10
     assert not list(args._diagnostics_dir.rglob("*.pt"))
+
+
+@pytest.fixture
+def _calibration_driver(tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers):
+    namespace = {"__name__": "synthetic_calibration"}
+    exec(compile(_onboarding_render_config(tmp_path, None), "<gradient-calibration>", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing(_calibration_driver, hybrid):
+    namespace = _calibration_driver
+    model_config = Path(namespace["MODEL_PATH"]) / "config.json"
+    model_config.write_text(
+        json.dumps({"text_config": {"layer_types": ["linear_attention" if hybrid else "full_attention"] * 4}})
+    )
+    reference = namespace["run_reference"]
+    measured = []
+
+    def observe(model, batch_path, output, **kwargs):
+        assert kwargs["mixer_packing"] is hybrid
+        measured.append(batches.load(batch_path))
+        return reference(model, batch_path, output, **kwargs)
+
+    namespace["run_reference"] = observe
+    assert namespace["main"]() == 0
+    payload = json.loads(namespace["OUTPUT"].read_text())
+    assert payload["configuration"]["mixer_packing"] is hybrid
+    assert payload["configuration"]["reference_token_budget"] == 65536
+    for arm in json.loads(namespace["SPEC_PATH"].read_text())["arms"]:
+        expected = batches.build_batch(
+            arm["name"], arm["global_batch_size"], arm["max_seq_len"], 128, seed=batches.SEED
+        )
+        actual = [batch for batch in measured if batch.name == arm["name"]]
+        assert len(actual) == 5
+        for batch in actual:
+            for tensor in ("input_ids", "position_ids", "labels"):
+                assert torch.equal(getattr(batch, tensor), getattr(expected, tensor))
+        evidence = payload["arms"][arm["name"]]
+        assert evidence["global_batch_size"] == expected.rows
+        assert evidence["max_seq_len"] == expected.seq_len
+        assert evidence["active_tokens"] == expected.active_tokens
+        assert evidence["batch_hash"] == namespace["_batch_hash"](expected)
+        assert evidence["microbatches"] == [1] * 5
+        assert evidence["skipped_no_grad"] == ["model.visual.weight"]
+
+
+def test_gradient_calibration_measures_spread_only_within_each_arm(_calibration_driver):
+    namespace = _calibration_driver
+    reference = namespace["run_reference"]
+
+    def vary(model, batch_path, output, **kwargs):
+        result = reference(model, batch_path, output, **kwargs)
+        index = int(output.stem.split("-")[-1])
+        arm = batches.load(batch_path).name
+        result["grad_norms"]["model.weight"] = (2 if arm == "gas1" else 100) + index * (
+            0.001 if arm == "gas1" else 0.002
+        )
+        result["loss"] = 1 if arm == "gas1" else 20
+        return result
+
+    namespace["run_reference"] = vary
+    assert namespace["main"]() == 0
+    payload = json.loads(namespace["OUTPUT"].read_text())
+    assert payload["tolerance"]["raw_max_same_tensor_range"] == pytest.approx(0.008)
+    assert payload["tolerance"]["worst_arm"] == "gas4"
+    assert payload["tolerance"]["selected_gate"] == 0.032
+    assert payload["loss_range"] == 0
+    assert {row["arm"] for row in payload["gradient_ranges"]} == {"gas1", "gas4"}
+    assert len(payload["gradient_ranges"]) == 2
+
+
+@pytest.mark.parametrize(
+    "drift,message",
+    [
+        ("nan-norm", "finite and nonnegative"),
+        ("inf-norm", "finite and nonnegative"),
+        ("negative-norm", "finite and nonnegative"),
+        ("missing-gradient", "different gradient parameter sets"),
+        ("empty-gradients", "no gradients"),
+        ("skipped-parameters", "skipped different parameters"),
+        ("active-tokens", "active-token count"),
+        ("nan-loss", "loss must be finite"),
+    ],
+)
+def test_gradient_calibration_rejects_invalid_measurements_without_rewriting_spec(_calibration_driver, drift, message):
+    namespace = _calibration_driver
+    original_spec = namespace["SPEC_PATH"].read_bytes()
+    reference = namespace["run_reference"]
+
+    def corrupt(model, batch_path, output, **kwargs):
+        result = reference(model, batch_path, output, **kwargs)
+        if output.parent.name == "gas4" and (output.stem == "run-02" or drift == "empty-gradients"):
+            if drift == "nan-norm":
+                result["grad_norms"]["model.weight"] = float("nan")
+            elif drift == "inf-norm":
+                result["grad_norms"]["model.weight"] = float("inf")
+            elif drift == "negative-norm":
+                result["grad_norms"]["model.weight"] = -1
+            elif drift in {"missing-gradient", "empty-gradients"}:
+                result["grad_norms"] = {}
+            elif drift == "skipped-parameters":
+                result["skipped_no_grad"] = []
+            elif drift == "active-tokens":
+                result["active_tokens"] += 1
+            elif drift == "nan-loss":
+                result["loss"] = float("nan")
+        return result
+
+    namespace["run_reference"] = corrupt
+    with pytest.raises(RuntimeError, match=message):
+        namespace["main"]()
+    assert namespace["SPEC_PATH"].read_bytes() == original_spec
+    assert not namespace["OUTPUT"].exists()
+
+
+def test_gradient_calibration_preserves_worker_failure_and_existing_spec(_calibration_driver):
+    namespace = _calibration_driver
+    original_spec = namespace["SPEC_PATH"].read_bytes()
+    failure = RuntimeError("HF calibration worker failed")
+    reference = namespace["run_reference"]
+
+    def fail(model, batch_path, output, **kwargs):
+        if output.parent.name == "gas4":
+            raise failure
+        return reference(model, batch_path, output, **kwargs)
+
+    namespace["run_reference"] = fail
+    with pytest.raises(RuntimeError) as caught:
+        namespace["main"]()
+    assert caught.value is failure
+    assert namespace["SPEC_PATH"].read_bytes() == original_spec
+    assert not namespace["OUTPUT"].exists()
+
+
+def test_gradient_calibration_never_overlaps_workers_on_the_same_gpu(_calibration_driver, monkeypatch):
+    import threading
+    import time
+
+    namespace = _calibration_driver
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    reference = namespace["run_reference"]
+    lock = threading.Lock()
+    active = set()
+    devices = []
+
+    def observe(model, batch_path, output, **kwargs):
+        device = kwargs["cuda_device"]
+        with lock:
+            assert device not in active
+            active.add(device)
+            devices.append(device)
+        try:
+            time.sleep(0.05 if device == 0 else 0.001)
+            return reference(model, batch_path, output, **kwargs)
+        finally:
+            with lock:
+                active.remove(device)
+
+    namespace["run_reference"] = observe
+    assert namespace["main"]() == 0
+    assert not active
+    assert devices.count(0) == 6
+    assert devices.count(1) == 4
+
+
+@pytest.mark.parametrize("arms", [[], [{"name": "gas1"}, {"name": "gas1"}]])
+def test_gradient_calibration_requires_distinct_frozen_arms(_calibration_driver, arms):
+    namespace = _calibration_driver
+    namespace["SPEC_PATH"].write_text(json.dumps({"arms": arms}))
+    original_spec = namespace["SPEC_PATH"].read_bytes()
+    with pytest.raises(ValueError, match="uniquely named specification arms"):
+        namespace["main"]()
+    assert namespace["SPEC_PATH"].read_bytes() == original_spec
+    assert not namespace["OUTPUT"].exists()
 
 
 def test_onboarding_renderer_gate_metadata_uses_the_computed_safety_factor(

@@ -1,45 +1,31 @@
 # Part One: Gradient And Optimizer Correctness
 
-## Scope
+## About
 
-This branch introduces a shared correctness library with stable operator commands for two checks:
+This doc gives a simple way to figure out how to use the correctness system via a simple demo that onboards a new config and runs the tests.
 
-- `single-step-grads`: compare named gradient L2 norms against an independent, single-GPU Hugging Face reference.
-- `single-step-optimizer`: compare step-one update-residual, Adam first-moment, and Adam second-moment L2 norms against prepared references.
+The onboarding takes much longer than running tests, since that's where calibration happens and the same worklaod is re-run multiple times to deal with non-determinism and to identify an expected variance of tensor values between different runs.
 
-No model configurations, reviewed specifications, measurements, model weights, fleet-management scripts, or live progress reports are bundled. Checkpoint-resume, inference, end-to-end training, and reinforcement-learning tests are reserved for later parts. Checkpoint export remains only where required to inspect optimizer state.
+## Step 1. Setup
 
-**LoRA reference initialization belongs to the correctness suite, not production PEFT code.** The first two checks can prepare HF references with a standard adapter generated automatically using upstream PEFT's default initializer and seed `42`. The base architecture is metadata-only during generation; only adapter factors allocate CPU storage. Production PEFT code no longer imports or calls the correctness initializer. Cortex-training has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression are not supported by these operator commands. Unrelated production fixes from the larger correctness branch are not copied.
+**This quick demo uses `axolotl-ai-co/tiny-qwen3-129m`, a 129M-parameter Qwen3 model, with 128-token sequences on one exclusively allocated H200 GPU.**
 
-**No adapter tensors are checked into Git or prepared by an agent.** Compact reference identity binds the adapter recipe, dependency versions, topology, shapes/dtypes and hashes; reference reuse does not regenerate HF measurements. The retained internal Ray integration transfers verified adapter bytes to worker-local temporary copies, but it is not an admitted Cortex-training loading route. Model assets and installed code still need the runtime's supported per-node distribution.
+Activate a Python 3.12+ environment with working CUDA, FlashAttention-3 kernels, and any custom python packages that don't get installed via AP's requirements.
 
-**Shared-expert comparisons preserve tensor coverage across the supported naming layouts.** The correctness harness maps GLM-5.3's bare `mlp.shared_expert.w1/w2/w3` parameters to Hugging Face's plural `mlp.shared_experts` projection names, while preserving Qwen's singular-container mapping. Optimizer tensor groups retain the raw source names. Unmatched indexer tensors remain coverage failures; no parameters are ignored and no tolerance is changed. Focused CPU tests validate these mappings, not model-level numerical correctness.
+Onboarding and regression start and stop their own gateway automatically; do not start a gateway in another terminal.
 
-**Reviewed historical gradient reuse is explicit and narrowly bounded.** Maintainers can bind original gradient records through a hash-pinned descriptor only for the reviewed shared-expert naming-source transition; every other workload field must match. Original record bytes, identities and gates remain unchanged, and the run records both identities in its provenance receipt. This option is gradient-only, does not admit optimizer or reinforcement-learning runs, and is unnecessary for the new-model example below. No historical records are bundled. The [reference guide](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/hf-reference-onboarding.md#reviewed-historical-gradients) defines the descriptor and rejection rules.
-
-## Setup
-
-**The installed upstream DSS service (`dss.ray_dss.gateway_server`) is also required.** The `correctness` extra does not install that separate service. Onboarding and regression start and stop their owned gateway automatically; no second terminal or manual gateway startup is needed.
-
-**This quick demo uses `axolotl-ai-co/tiny-qwen3-129m`, a 129M-parameter Qwen3 model, with 128-token sequences on one exclusively allocated H200 GPU.** Activate a Python 3.12+ environment with working CUDA and FlashAttention-3 kernels first. Install `.[correctness]`, not `.[testing]`: the correctness extra includes the Cortex client, training and Hugging Face reference dependencies, and CPU selftest tools. It does not install CUDA or model-specific attention kernels. Use the existing `/checkpoint/huggingface` cache; Hugging Face downloads missing model files there automatically, requiring network access and sufficient cache space. Use an exclusive allocation: the upstream DSS gateway may manage Ray services and workers on its nodes. Owned gateway shutdown is not proof that detached Ray workers were released.
-
-**Start in the directory where you want to keep the checkout and results, then copy the blocks in order.** No pre-existing config, specification, or measurement is needed. After cloning, remain in the Arctic Platform checkout: the demo config and final reports use its Git-ignored `./work/` directory. Model weights stay in `/checkpoint/huggingface`, not the checkout. Compact reference records stay inside the executing library's checkout as required by the publisher. Generated fixtures and calibration scratch use the harness's allocation-local fast-storage defaults and are temporary, so retain printed preparation logs separately if the allocation will disappear.
+The assumption is that you are already inside an Arctic-Platform clone.
 
 ```bash
-set -e
-mkdir -p ./correctness-p1
-cd ./correctness-p1
-git clone --single-branch --branch stas/correctness-testing-p1 \
-  https://github.com/Snowflake-AI-Research/Arctic-Platform.git \
-  ./Arctic-Platform
-cd ./Arctic-Platform
-python -m pip install -e '.[correctness]'
+# assuming you're already in the AP clone
+git checkout -b stas/correctness-testing-p1
+pip install -e '.[correctness]'
 python -m arctic_platform.correctness list
 ```
 
-## Model Configuration
+## Step 2. Create a Job Config file
 
-**Resolve the model through the existing Hugging Face cache and write a complete native training config.** `snapshot_download()` reuses cached files and downloads missing files into `/checkpoint/huggingface/hub`, the Hub subdirectory of `/checkpoint/huggingface`. No commit hash is required: Hugging Face resolves the model ID's default revision. The config uses the returned snapshot path and declares the GPU count, precision, attention implementation and optimizer. All subsequent commands run from the checkout root.
+First let's create a simple config that will onboarded:
 
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
@@ -103,22 +89,25 @@ Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
 PY
 ```
 
-**The demo config uses the Cortex protocol, not the on-premises backend.** Its loopback URL on port 1 is a non-serving placeholder required by the client schema. The documented correctness commands replace that placeholder with their automatically started gateway's actual URL; do not start a server on port 1 or export the placeholder as `ARCTIC_CORTEX_BASE_URL`.
+All subsequent commands run from the checkout root.
+
+**The demo config uses the Cortex protocol, not the on-prem backend.** Its loopback URL on port 1 is a non-serving placeholder required by the client schema. The documented correctness commands replace that placeholder with their automatically started gateway's actual URL; do not start a server on port 1 or export the placeholder as `ARCTIC_CORTEX_BASE_URL`.
 
 **LoRA is detected automatically for reference preparation, not admitted target execution.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic HF adapter generation. Cortex-training target execution rejects shared adapters, including generated ones, so a LoRA config cannot complete the onboarding and regression commands below. The example config above has no LoRA settings and therefore uses full fine-tuning.
 
-## Onboarding
+## Step 3. Config Onboard
 
 **Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with five nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. Five runs is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
 
 ```bash
-python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json
+python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
 **Inspect the generated specification and onboarding summary before accepting the gates.** They are `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json`. The summary records each check's result and diagnostic directory, plus any combined-reference preparation error. Compact measurements default to `arctic_platform/correctness/reference_data`; no model or adapter tensors belong in Git. The new config name keeps this demo separate from existing 8B configs and their reference records.
 
 **Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
+
+**Gradient calibration uses five nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
 
 **Optimizer calibration shows a `tqdm` progress bar for each GAS arm, with elapsed time and ETA after every completed HF run.** Onboarding finishes with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, retained in `onboarding.log` as well as the terminal.
 
@@ -135,7 +124,7 @@ python -m arctic_platform.correctness onboard \
   --config ../cortex-training/recipes/sft/configs/qwen38_flash_next.json
 ```
 
-## Running
+## Step 4. Run Config Tests
 
 **Run both checks with one command in one terminal, just like onboarding.** When no Cortex host or base URL is configured, regression selects the reduced fixture, starts the installed upstream DSS gateway on an available loopback port, supplies local database/schema segments, and closes only its owned gateway after execution or failure. No separate gateway command or fixture flag is required. Omitting `--test` selects both P1 checks. Regression never generates missing references or widens reviewed tolerances.
 
@@ -161,6 +150,60 @@ Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run e
 
 **The automatically started gateway's loopback readiness check ignores environment proxies.** No proxy changes are required for that startup check; explicitly configured service connections keep their existing behavior.
 
+## Use the Correctness Skill if manual onboarding or testing is failing
+
+It shouldn't be needed for model archs that have already been onboarded in the past and the corresponding tooling is in the correctness code base, but a new model architecture may easily fail to onboard since the script may not know what to do about some of its new ingredients.
+
+**Give the coding agent only the config path and the operation you intended.** If any manual step fails, ask:
+
+```text
+Use skills/correctness/SKILL.md to fix onboarding for
+./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
+Discover the environment, reports, logs and prepared artifacts yourself.
+```
+
+For a regression-only failure, say "run both checks" or name the desired check IDs with the config path. The skill discovers the matching command, reports, logs, retry state, model assets and references without asking you to collect them. Keep compatible prepared references and reviewed tolerances intact; do not widen a gate to make a failing comparison pass.
+
+
+## Step 5. Add Results to the Repo
+
+You don't need to do it for the demo, but for the real config addition
+
+**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The harness imports the config into `configs/`; `specs/` contains the reviewed gates and onboarding summary. Those directories are ignored by default on P1, so staging them deliberately requires `-f`. Review all contents of `configs/` and `specs/` before adding those directories, especially in a checkout with other local recipes.
+
+```bash
+git add -f -- arctic_platform/correctness/configs/ arctic_platform/correctness/specs/
+git diff --cached --stat
+```
+
+**Do not stage `reference_data/`, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records in `reference_data/` are generated local artifacts, not files to commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
+
+## Step 6. Optional Cleanup
+
+You can ignore this step and only do it if you need to free up space on the shared partition.
+
+**Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
+
+```bash
+rm ./work/configs/tiny-qwen3-129m-one-h200.json
+```
+
+**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
+
+```bash
+rm -r ./work/logs/correctness-demo/
+rm -r ./work/reports/both/
+```
+
+**Use the retained imported config for future runs after cleanup.**
+
+```bash
+python -m arctic_platform.correctness run \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
+  --out ./work/reports/both
+```
+
+
 ## Validation And Limits
 
 CPU selftests cover the extracted interfaces, training-only boundaries, external configurations, reference publication, optimizer decoding, shared LoRA adapter generation/loading/transport, and synthetic backend behavior. These are library tests, not new model or distributed-GPU results.
@@ -174,62 +217,3 @@ python -m arctic_platform.correctness selftest
 ```
 
 Both checks compare scalar norms, not elementwise tensor equality. Reduced reference fixtures do not establish correctness of a full model at its configured maximum sequence length. These supervised reference checks are inapplicable to reinforcement-learning configurations. A model still needs compatible runtime support, matching initial weights or adapters, and reviewed references; this branch does not promise arbitrary model support.
-
-## Documentation
-
-The maintainer workflow is in `skills/correctness/SKILL.md`, replacing the correctness-specific `AGENTS.md`.
-
-[LoRA without adapter inputs](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/running-tests.md#lora-without-adapter-inputs) explains automatic reference initialization and the separate target limitation. Reference generation supports dense `target_modules` LoRA with upstream default initialization; expert `target_parameters`, advanced initializers, and Cortex shared-adapter target loading are not admitted. An existing standard adapter can optionally override reference generation through `--prepare-references --peft-adapter`; it does not enable LoRA target onboarding or regression.
-
-- [Documentation map](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/docs/correctness.md)
-- [Operator guide](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/running-tests.md)
-- [Reference onboarding](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/hf-reference-onboarding.md)
-- [Code map](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/code-inventory.md)
-
-## When A Step Fails
-
-**Give the coding agent only the config path and the operation you intended.** If any manual step fails, ask:
-
-```text
-Use skills/correctness/SKILL.md to fix onboarding for
-./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
-Discover the environment, reports, logs and prepared artifacts yourself.
-```
-
-For a regression-only failure, say "run both checks" or name the desired check IDs with the config path. The skill discovers the matching command, reports, logs, retry state, model assets and references without asking you to collect them. Keep compatible prepared references and reviewed tolerances intact; do not widen a gate to make a failing comparison pass.
-
-## Add To Repo
-
-**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The harness imports the config into `configs/`; `specs/` contains the reviewed gates and onboarding summary. Those directories are ignored by default on P1, so staging them deliberately requires `-f`. Review all contents of `configs/` and `specs/` before adding those directories, especially in a checkout with other local recipes.
-
-```bash
-git add -f -- \
-  arctic_platform/correctness/configs/ \
-  arctic_platform/correctness/specs/
-git diff --cached --stat
-```
-
-**Do not stage `reference_data/`, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records in `reference_data/` are generated local artifacts, not files to commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
-
-## Cleanup
-
-**Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
-
-```bash
-rm -f -- ./work/configs/tiny-qwen3-129m-one-h200.json
-```
-
-**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
-
-```bash
-rm -rf -- ./work/logs/correctness-demo/
-rm -rf -- ./work/reports/both/
-```
-
-**Use the retained imported config for future runs after cleanup.**
-
-```bash
-python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
-  --out ./work/reports/both
-```
