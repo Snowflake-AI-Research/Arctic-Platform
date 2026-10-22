@@ -107,10 +107,9 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         a = self.in_proj_a(hidden_states)
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        if num_value_heads // num_key_heads > 1:
-            replication = num_value_heads // num_key_heads
-            query = query.repeat_interleave(replication, dim=2)
-            key = key.repeat_interleave(replication, dim=2)
+        # q/k stay at the 16 key heads: FLA's chunk rule applies grouped value attention for HV > H, reading key
+        # head hv // (HV // H) for value head hv, the assignment repeat_interleave would build. Its fp32 dq/dk sum over
+        # the value heads of a key head replaces the BF16 RepeatInterleaveBackward sum.
         if check_finite:
             for name, tensor in (
                 ("query", query),
