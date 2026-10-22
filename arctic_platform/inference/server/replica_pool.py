@@ -197,6 +197,9 @@ class ReplicaPool:
         self._cached_weights_info: list[dict] | None = None
         self._cached_spec_weights_info: list[dict] | None = None
         self._sleeping = False
+        # Set by a weights-only wake: the workers hold mapped weights while the
+        # pool stays asleep, so ``sleep`` still has engine memory to free.
+        self._weights_staged = False
         self._synced_lora_name: str | None = None
         # Cross-node placement group for a pod-spanning engine, built and
         # owned by the caller (dss-platform) and threaded in via initialize().
@@ -565,6 +568,7 @@ class ReplicaPool:
         self._cached_weights_info = None
         self._cached_spec_weights_info = None
         self._sleeping = False
+        self._weights_staged = False
         self._synced_lora_name = None
 
     async def _cleanup_failed_initialize(self) -> None:
@@ -1179,11 +1183,17 @@ class ReplicaPool:
         return self._sleeping
 
     async def sleep(self, model_id: str | None = None, level: int = 1) -> dict[str, Any]:
-        """Drain requests, then free GPU memory on every worker."""
+        """Drain requests, then free GPU memory on every worker.
+
+        A pool whose weights stage landed but whose KV wake never arrived (the
+        weight load failed in between) is still ``_sleeping`` while the workers
+        hold mapped weights, so that case sleeps the workers rather than
+        reporting ``already_sleeping`` and leaving the memory resident.
+        """
         self._check_model_id(model_id)
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
-        if self._sleeping:
+        if self._sleeping and not self._weights_staged:
             return {"status": "already_sleeping", "level": level}
 
         async with self._stream_lifecycle():
@@ -1202,6 +1212,7 @@ class ReplicaPool:
                 return_exceptions=True,
             )
             self._sleeping = True
+            self._weights_staged = False
 
             per_worker = [
                 {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
@@ -1210,28 +1221,70 @@ class ReplicaPool:
             logger.info("ReplicaPool sleeping (%d workers, level=%d)", len(self._workers), level)
             return {"status": "sleeping", "level": level, "workers": per_worker}
 
+    @staticmethod
+    def _wake_finalize(tags: list[str] | None) -> bool:
+        """True when generate() may run after this wake (KV cache restored)."""
+        if tags is None:
+            return True
+        return "kv_cache" in tags
+
+    @staticmethod
+    def _check_wake_worker_results(results: list, tags: list[str] | None) -> None:
+        """Raise when any worker failed to wake.
+
+        A swallowed weights-stage failure is the dangerous one: the colocated
+        sync goes on to load weights into a worker whose parameter storage is
+        still unmapped, and a swallowed KV failure resumes scheduling onto a
+        worker that has no cache.
+        """
+        errors = [r for r in results if isinstance(r, Exception)]
+        if not errors:
+            return
+        raise RuntimeError(f"wake_up(tags={tags!r}) failed on {len(errors)} worker(s): {errors[0]}") from errors[0]
+
     async def wake_up(self, model_id: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
-        """Restore GPU memory on every worker, then resume scheduling."""
+        """Restore GPU memory on every worker.
+
+        ``tags=["weights"]`` keeps the pool asleep and the scheduler paused so
+        a colocated sync can load weights before ``tags=["kv_cache"]`` allocates
+        the cache and resumes scheduling. Clearing ``_sleeping`` on the weights
+        call makes the KV wake return ``already_ready`` without restoring the cache.
+        """
         self._check_model_id(model_id)
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
         if not self._sleeping:
             return {"status": "already_ready"}
 
+        finalize = self._wake_finalize(tags)
         async with self._stream_lifecycle():
             results = await asyncio.gather(
                 *[w.wake_up.remote(tags=tags) for w in self._workers],
                 return_exceptions=True,
             )
-            self._sleeping = False
-            self._scheduler.resume()
-
+            self._check_wake_worker_results(results, tags)
             per_worker = [
                 {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
                 for r in results
             ]
-            logger.info("ReplicaPool awake (%d workers)", len(self._workers))
-            return {"status": "ready", "workers": per_worker}
+            if finalize:
+                self._sleeping = False
+                self._weights_staged = False
+                self._scheduler.resume()
+                logger.info(
+                    "ReplicaPool awake (%d workers, tags=%s)",
+                    len(self._workers),
+                    tags,
+                )
+                return {"status": "ready", "tags": tags, "workers": per_worker}
+
+            self._weights_staged = True
+            logger.info(
+                "ReplicaPool weights stage (%d workers, tags=%s); KV wake pending",
+                len(self._workers),
+                tags,
+            )
+            return {"status": "weights_ready", "tags": tags, "workers": per_worker}
 
     # ------------------------------------------------------------------
     # Status
