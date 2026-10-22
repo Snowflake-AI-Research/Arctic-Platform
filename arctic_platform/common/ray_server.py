@@ -90,10 +90,12 @@ def _arctic_sampling_env(job_config) -> dict[str, str]:
 
 logger = logging.getLogger(__name__)
 
-# After one worker fails, how long to let the others finish or accept cancellation
-# before giving up the training lock. An unbounded wait lets a dead rank wedge
-# every later step, save, and weight sync.
-_TRAINING_REF_GRACE_S = 5.0
+
+def _finished_task_error(task: asyncio.Task) -> BaseException | None:
+    """Exception from a finished task. A cancellation is reported, not raised."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
 
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
@@ -628,17 +630,20 @@ class ArcticRLRayServer:
         # Serializes every RPC that drives ``training_workers``. Awaiting ObjectRefs
         # (instead of blocking ``ray.get``) lets the transport loop keep serving
         # generation, so two ops could otherwise overlap a DP collective.
-        # ``_gather_training_refs`` covers forward / step / save / load. weight_sync,
-        # sleep/wake, empty-cache, and weight_norm take the same lock directly.
+        # ``_gather_training_refs`` covers forward / step / load. weight_sync,
+        # sleep/wake, empty-cache, and the training half of weight_norm take the
+        # same lock directly. ``save`` takes the lock but is allowed after a
+        # failure so a checkpoint can still be written. Sampling refs do not
+        # latch ``_training_failed``.
         self._training_op_lock = asyncio.Lock()
         self._training_failed = False
         self._training_failure: BaseException | None = None
 
     def _raise_if_training_failed(self) -> None:
-        if getattr(self, "_training_failed", False):
+        if self._training_failed:
             raise RuntimeError(
                 "training workers failed and did not finish; refusing further training ops"
-            ) from getattr(self, "_training_failure", None)
+            ) from self._training_failure
 
     def _cancel_training_ref(self, ref: Any, task: asyncio.Task) -> None:
         task.cancel()
@@ -648,30 +653,47 @@ class ArcticRLRayServer:
             except Exception:
                 logger.warning("could not cancel training worker ref", exc_info=True)
 
-    async def _await_training_refs(self, submit_refs):
-        """Await refs. Caller must already hold ``_training_op_lock``.
-
-        On the first worker failure, siblings get ``_training_ref_grace_s`` to
-        finish. Whatever is still running is cancelled on the worker, not only
-        in this process. Cancelling this await (client disconnect, timeout) does
-        the same. A cancelled collective marks the workers failed so the next op
-        does not start while a data-parallel collective may still be running.
-        """
-        self._raise_if_training_failed()
-        refs = list(submit_refs())
-        paired: list[tuple[Any, asyncio.Task]] = []
-        rejected: list[str] = []
+    def _reject_non_awaitable_refs(self, refs: list[Any]) -> None:
+        """Raise before any ref is scheduled. ``submit_refs`` has already returned."""
+        rejected = [type(ref).__name__ for ref in refs if not inspect.isawaitable(ref)]
+        if not rejected:
+            return
         for ref in refs:
-            if inspect.isawaitable(ref):
+            if inspect.iscoroutine(ref):
+                ref.close()
+        kinds = ", ".join(sorted(set(rejected)))
+        raise TypeError(f"training worker RPC must return an awaitable ObjectRef, got {kinds}")
 
-                async def _consume(awaitable=ref):
-                    return await awaitable
+    def _mark_training_failed(self, error: BaseException | None) -> None:
+        self._training_failed = True
+        if self._training_failure is None:
+            self._training_failure = error or asyncio.CancelledError()
 
-                paired.append((ref, asyncio.ensure_future(_consume())))
-            else:
-                rejected.append(type(ref).__name__)
+    async def _await_training_refs(self, submit_refs, *, latch: bool = True, check_failed: bool = True):
+        """Await refs. Caller must already hold ``_training_op_lock`` for training refs.
+
+        The first failure cancels every ref still running, on the worker and in
+        this process, and marks the workers failed. The step result is
+        discarded, and a later training op is refused while a data-parallel
+        collective may still be running. Cancelling this await (client
+        disconnect, timeout) does the same.
+
+        ``latch=False`` is the sampling-worker path: a sampler error is raised
+        and does not block later ``step`` / ``weight_sync``. ``check_failed=False``
+        is the checkpoint recovery path: ``save`` may run after the latch is set.
+        """
+        if check_failed:
+            self._raise_if_training_failed()
+        refs = list(submit_refs())
+        self._reject_non_awaitable_refs(refs)
+        paired: list[tuple[Any, asyncio.Task]] = []
+        for ref in refs:
+
+            async def _consume(awaitable=ref):
+                return await awaitable
+
+            paired.append((ref, asyncio.ensure_future(_consume())))
         tasks = [task for _, task in paired]
-        grace = getattr(self, "_training_ref_grace_s", _TRAINING_REF_GRACE_S)
         cancelled_collective = False
 
         def _cancel_unfinished() -> None:
@@ -688,13 +710,9 @@ class ArcticRLRayServer:
                 done, pending = set(), set()
             errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
             if errors and pending:
-                _, pending = await asyncio.wait(pending, timeout=grace)
-            if errors and pending:
                 _cancel_unfinished()
-                _, pending = await asyncio.wait(pending, timeout=grace)
-            if cancelled_collective or (errors and pending):
-                self._training_failed = True
-                self._training_failure = errors[0] if errors else asyncio.CancelledError()
+            if latch and (cancelled_collective or (errors and pending)):
+                self._mark_training_failed(errors[0] if errors else None)
             if errors and pending:
                 raise errors[0]
             if errors:
@@ -704,14 +722,13 @@ class ArcticRLRayServer:
             raise
         finally:
             _cancel_unfinished()
-            if cancelled_collective:
-                self._training_failed = True
-                if getattr(self, "_training_failure", None) is None:
-                    self._training_failure = asyncio.CancelledError()
-        if rejected:
-            kinds = ", ".join(sorted(set(rejected)))
-            raise TypeError(f"training worker RPC must return an awaitable ObjectRef, got {kinds}")
+            if latch and cancelled_collective:
+                self._mark_training_failed(None)
         return [task.result() for _, task in paired]
+
+    async def _await_sampling_refs(self, submit_refs):
+        """Await sampler refs. A sampler failure does not latch training workers."""
+        return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
 
     async def _gather_training_refs(self, submit_refs):
         """Submit and await worker ObjectRefs without blocking the transport loop.
@@ -902,15 +919,18 @@ class ArcticRLRayServer:
         export_hf = bool(body.get("export_hf", False))
         limit = body.get("save_total_limit")
         async with self._training_op_lock:
+            # Save is the recovery op: it still runs after a failed collective.
             results = await self._await_training_refs(
-                lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers]
+                lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers],
+                check_failed=False,
             )
             if step is not None:
                 with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
                     f.write(str(int(step)))
             if limit is not None and int(limit) > 0 and self.training_workers:
                 await self._await_training_refs(
-                    lambda: [self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))]
+                    lambda: [self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))],
+                    check_failed=False,
                 )
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
@@ -956,7 +976,16 @@ class ArcticRLRayServer:
         """
         self._verify_job(job_id, "sampling")
         tags = body.get("tags") if isinstance(body, dict) else body
-        results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
+        # Colocated wake empty-caches the training workers inside the state
+        # actor. Hold the training lock across that call so it cannot overlap
+        # forward/step. weight_sync already holds the lock and calls the state
+        # method directly, so it does not re-enter here.
+        if self.colocate:
+            async with self._training_op_lock:
+                self._raise_if_training_failed()
+                results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
+        else:
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
 
     async def reset_prefix_cache(self, job_id: int, body: dict[str, Any] | None = None):
@@ -1186,7 +1215,7 @@ class ArcticRLRayServer:
         async with self._training_op_lock:
             training = (await self._await_training_refs(lambda: [self.training_workers[0].weight_norm.remote()]))[0]
             sampling = (
-                await self._await_training_refs(lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()])
+                await self._await_sampling_refs(lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()])
             )[0]
         return {
             "training_norm": training["norm"],
@@ -1290,7 +1319,35 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        await self._await_training_refs(lambda: [receive_task, *send_tasks])
+        # Send and receive run together. A training-send failure latches the
+        # workers. A sampler-side receive error cancels any send still running,
+        # which latches as well.
+        training_await = asyncio.ensure_future(self._await_training_refs(lambda: send_tasks, check_failed=False))
+        sampling_await = asyncio.ensure_future(self._await_sampling_refs(lambda: [receive_task]))
+        try:
+            done, _pending = await asyncio.wait(
+                {training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION
+            )
+            sampling_error = _finished_task_error(sampling_await) if sampling_await in done else None
+            training_error = _finished_task_error(training_await) if training_await in done else None
+            if training_error is not None:
+                if not sampling_await.done():
+                    sampling_await.cancel()
+                raise training_error
+            if sampling_error is not None:
+                if not training_await.done():
+                    training_await.cancel()
+                    try:
+                        await training_await
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise sampling_error
+            await training_await
+            await sampling_await
+        finally:
+            for pending_await in (training_await, sampling_await):
+                if not pending_await.done():
+                    pending_await.cancel()
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         return {"status": "ok"}
 
