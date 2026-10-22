@@ -83,6 +83,7 @@ def _finished_task_error(task: asyncio.Task) -> BaseException | None:
         return asyncio.CancelledError()
     return task.exception()
 
+
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
 PROFILER_TYPE = "none"
@@ -1322,9 +1323,7 @@ class ArcticRLRayServer:
         training_await = asyncio.ensure_future(self._await_training_refs(lambda: send_tasks, check_failed=False))
         sampling_await = asyncio.ensure_future(self._await_sampling_refs(lambda: [receive_task]))
         try:
-            done, _pending = await asyncio.wait(
-                {training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION
-            )
+            done, _pending = await asyncio.wait({training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION)
             sampling_error = _finished_task_error(sampling_await) if sampling_await in done else None
             training_error = _finished_task_error(training_await) if training_await in done else None
             if training_error is not None:
