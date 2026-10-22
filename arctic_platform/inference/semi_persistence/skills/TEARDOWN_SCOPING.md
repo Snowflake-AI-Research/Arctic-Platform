@@ -2,6 +2,12 @@
 
 Status: root cause identified, fix designed and **implemented**.
 
+> Naming note (2026-09-24): the log lines quoted below predate the rename of
+> `recapture_graphs` to `rebind_graphs`, and the `(reuse)` in
+> `recapture_graphs(reuse) across 2 worker(s)` is the retired `graph_mode`
+> argument. Quoted verbatim so the record stays accurate; see
+> [`tp_DESIGN.md`](tp_DESIGN.md) Section 2 for the current surface.
+
 `_kill_restored_tree` ended with what was meant to be a process-group SIGKILL.
 procps-ng `kill(1)` does not parse it as one: a multi-digit negative pid is
 consumed as an option cluster and the target is derived from its first digit
@@ -309,8 +315,12 @@ def _kill_restored_tree(ident, log=None):
     """SIGKILL exactly the tasks of a CRIU-restored tree, and nothing else.
 
     Used by the reduced-capability restore path, which has no PID namespace to
-    collapse.  The restored tasks are root-owned (restored via ``sudo criu``),
-    so kills go through ``sudo``.
+    collapse.  The restored tasks carry the image's uid, which equals this
+    worker's -- dump and restore must share one uid, which
+    ``Instance.criu_restore`` enforces -- so ``os.kill`` reaches every one of
+    them without elevating.  A failure is logged rather than swallowed: an
+    unkilled task holds GPU memory and squats on the task ids the next restore
+    needs.
 
     This must never signal a negative pid.  The previous implementation ended
     with ``kill -9 -<root_pid>`` to catch tasks that had reparented away from
@@ -359,7 +369,15 @@ def _kill_restored_tree(ident, log=None):
         log.info("  killing restored tree root=%s victims=%s",
                  root_pid, sorted(victims))
     for pid in sorted(victims, reverse=True):     # leaves first
-        subprocess.run(["sudo", "kill", "-9", str(pid)], capture_output=True)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass                    # exited between the snapshot check and here
+        except PermissionError:
+            if log is not None:
+                log.error("  cannot kill restored task pid=%s: not permitted. "
+                          "It holds GPU memory and its recorded task ids will "
+                          "block the next restore; kill it by hand.", pid)
 ```
 
 `_own_ancestry()` already exists at line 625 and needs no changes. It walks
@@ -481,8 +499,8 @@ recorded pid set removes that dependency.
 Both of these are symlinks to the same file on shared Lustre:
 
 ```
-/data-fast/semi_persistence                             -> /code/users/mert/ArcticInference/arctic_inference/semi_persistence/
-/usr/local/lib/python3.12/dist-packages/arctic_inference/semi_persistence -> /code/users/mert/ArcticInference/arctic_inference/semi_persistence
+/data-fast/semi_persistence                             -> <checkout>/arctic_inference/semi_persistence/
+/usr/local/lib/python3.12/dist-packages/arctic_inference/semi_persistence -> <checkout>/arctic_inference/semi_persistence
 ```
 
 Consequences: editing the file **is** editing the live import, with no sync

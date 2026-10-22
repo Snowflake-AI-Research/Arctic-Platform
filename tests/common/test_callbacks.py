@@ -110,6 +110,24 @@ class TestCallbackRunner(unittest.TestCase):
             [("_First", "post_init"), ("_Second", "post_init")],
         )
 
+    def test_run_dispatches_post_fwd_only_microbatch(self):
+        class _Recorder(Callback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def __init__(self, training_config):
+                self.calls = []
+
+            def post_fwd_only_microbatch(self, trainer, is_padding):
+                self.calls.append(is_padding)
+
+        trainer = _Trainer(rank=0)
+        runner = CallbackRunner([_Recorder], {}, rank=0)
+        runner.run("post_fwd_only_microbatch", trainer, True)
+        runner.run("post_fwd_only_microbatch", trainer, False)
+        self.assertEqual(runner.callbacks[0].calls, [True, False])
+
     def test_log_twice_in_one_step_raises(self):
         cb = _Metrics({})
         cb.log("x", 1)

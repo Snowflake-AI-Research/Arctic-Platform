@@ -16,6 +16,7 @@ from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
+from ..routing_weights import apply_routing_weights
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -83,7 +84,7 @@ class MoEArgs:
     num_shared_experts: int = 1
 
     # router
-    score_func: Literal["softmax", "sigmoid"] = "sigmoid"
+    score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sigmoid"
     route_norm: bool = False
     route_scale: float = 1.0
     score_before_experts: bool = True
@@ -459,7 +460,7 @@ class TokenChoiceTopKRouter(nn.Module):
         dim (int): Dimension of input tokens.
         num_experts (int): Number of experts in each moe layer.
         top_k (int): Number of experts each token will be routed to in token-choice routing.
-        score_func (Literal["softmax", "sigmoid"]): Whether to use sigmoid or softmax for router scores.
+        score_func: ``sigmoid``, ``softmax``, or DeepSeek V4's ``sqrtsoftplus``.
         route_norm (bool): Whether to normalize the routing scores when using sigmoid.
         route_scale (float): Scaling factor applied to the routing scores.
     """
@@ -469,7 +470,7 @@ class TokenChoiceTopKRouter(nn.Module):
         dim: int,
         num_experts: int,
         top_k: int,
-        score_func: Literal["softmax", "sigmoid"],
+        score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"],
         route_norm: bool,
         route_scale: float,
     ):
@@ -501,6 +502,8 @@ class TokenChoiceTopKRouter(nn.Module):
             scores = torch.sigmoid(scores.to(torch.float32))
         elif self.score_func == "softmax":
             scores = F.softmax(scores.to(torch.float32), dim=1)
+        elif self.score_func == "sqrtsoftplus":
+            scores = F.softplus(scores.to(torch.float32)).sqrt()
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
@@ -674,12 +677,12 @@ class MoE(nn.Module):
         routed_input = torch.gather(x, dim=0, index=routed_indices)
 
         if self.score_before_experts:
-            routed_input = (routed_input.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
+            routed_input = apply_routing_weights(routed_input, top_scores_experts_sorted)
 
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         if not self.score_before_experts:
-            routed_output = (routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
+            routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted, out_dtype=x.dtype)
 
         return routed_output
 
@@ -1114,7 +1117,7 @@ class LatentMoE(nn.Module):
         routed_input = self.fc1_latent_proj(routed_input)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-        routed_output = (routed_output.float() * top_scores_experts_sorted.reshape(-1, 1)).to(routed_output.dtype)
+        routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted)
         routed_output = routed_output * self.routed_scaling_factor
 
         routed_output = self.fc2_latent_proj(routed_output)
