@@ -146,7 +146,7 @@ tinker = [
 # excludes the sampling stack: the server imports arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
-    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
+    "deepspeed>=0.19.8",  # fix fp32 compute issue #8749
     "liger-kernel>=0.8.0",
     "numpy",
     "nvidia-ml-py",
