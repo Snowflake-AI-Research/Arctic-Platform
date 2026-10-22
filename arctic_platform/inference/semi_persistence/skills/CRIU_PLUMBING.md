@@ -1844,9 +1844,9 @@ lost. The probe fires per process and will not agree with that count.
 **Correction, 2026-09-28 (second): driving both halves is not enough, because
 the restore half cannot find what the prepare half detached.** vLLM matches a
 workspace to the group that created it *by object identity*, and the lookup is
-keyed on the communicator's own `cpu_group`:
+keyed on the communicator's own `cpu_group`. The following pseudocode omits the lookup body:
 
-```python
+```text
 # cuda_communicator.py
 def checkpoint_restore(self) -> None:
     checkpoint_restore_fi_ar_workspaces(self.cpu_group)

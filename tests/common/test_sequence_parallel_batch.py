@@ -24,8 +24,10 @@ import pytest
 import torch
 
 from arctic_platform.common.utils.batch import _split_batch
+from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.batch import sequence_parallel_worker_groups
+from arctic_platform.common.utils.sequence_parallel import collect_sequence_parallel_results
 from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import sp_size_from_job_config
 from arctic_platform.testing_utils import torch_assert_equal
@@ -198,3 +200,52 @@ def test_sp_preparation_dense_default_keeps_disjoint_rows_and_world_scaling():
     assert reorder is None
     assert all(shard["meta"]["dp_size"] == 4 for shard in shards)
     torch_assert_equal(torch.cat([shard["batch"]["input_ids"] for shard in shards]), source["batch"]["input_ids"])
+
+
+def _sp_execution_results():
+    info = _membership(groups=((2, 0), (3, 1)), order=(1, 2, 3, 0))
+    source = _envelope()
+    shards, _ = _split_batch(source, 4, 2, worker_sp_info=info)
+    results = [
+        {
+            "_sequence_parallel_info": deepcopy(record),
+            "batch": {"output": shard["batch"]["input_ids"]},
+            "avg_loss": 1.0 if 3 in record["sp_ranks"] else 2.0,
+            "metrics": {"token_count": float(shard["batch"]["input_ids"].shape[0])},
+        }
+        for record, shard in zip(info, shards)
+    ]
+    return info, source, results
+
+
+def test_sp_execution_collects_one_group_primary_in_actual_logical_shard_order():
+    info, source, results = _sp_execution_results()
+    logical = collect_sequence_parallel_results(results, worker_sp_info=info, sp_size=2)
+    assert len(logical) == 2
+    assert logical[0]["batch"] is results[2]["batch"]
+    assert logical[1]["batch"] is results[1]["batch"]
+    torch_assert_equal(torch.cat([value["batch"]["output"] for value in logical]), source["batch"]["input_ids"])
+    assert all("_sequence_parallel_info" not in value for value in logical)
+    assert all("_sequence_parallel_info" in value for value in results)
+    metrics, loss = finalize_fwd_bwd_metrics(logical)
+    assert metrics["token_count"] == 5.0
+    assert loss == 3.0
+
+
+@pytest.mark.parametrize("fault", ["count", "missing", "rank", "order", "non_dict", "bool_rank"])
+def test_sp_execution_rejects_result_worker_membership_mismatch(fault):
+    info, _, results = _sp_execution_results()
+    if fault == "count":
+        results.pop()
+    elif fault == "missing":
+        results[0].pop("_sequence_parallel_info")
+    elif fault == "rank":
+        results[0]["_sequence_parallel_info"]["rank"] = 3
+    elif fault == "order":
+        results.reverse()
+    elif fault == "non_dict":
+        results[0] = None
+    else:
+        results[0]["_sequence_parallel_info"]["rank"] = True
+    with pytest.raises(ValueError):
+        collect_sequence_parallel_results(results, worker_sp_info=info, sp_size=2)

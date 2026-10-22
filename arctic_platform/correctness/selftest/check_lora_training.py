@@ -6228,3 +6228,1527 @@ def test_shared_adapter_capture_initializer_enters_worker_scope_before_base_and_
     assert not list(control.root.iterdir())
     assert job_config["ds_worker_config"]["debug"]["shared_peft_adapter"]["object_ref"] is control.ref
     assert job_config["ds_worker_config"]["debug"]["shared_peft_adapter"]["identity"] == expected_identity
+
+
+# Source-bound initialization hooks; fixtures are not native/capacity evidence.
+
+_INITIALIZATION_EVENTS = []
+
+
+class _InitializationRuntime:
+    def __init__(self, release_bound, *, wrapper_sources):
+        self.release_bound = release_bound
+        self.wrapper_sources = wrapper_sources
+
+    def guard(self):
+        _INITIALIZATION_EVENTS.append(("guard", self))
+
+    def verify_engine(self, engine, *, sp_info, sp_group):
+        _INITIALIZATION_EVENTS.append(("engine", engine, sp_info, sp_group))
+        return {"synthetic_engine_verified": True}
+
+
+def _initialization_capacity(request, *, phase, subject, runtime):
+    _INITIALIZATION_EVENTS.append(("capacity", phase, subject, runtime))
+    if request.get("fail_phase") == phase:
+        raise RuntimeError("synthetic capacity supplier rejected " + phase)
+    if request.get("empty"):
+        return {"phase": phase, "request": request, "evidence": {}}
+    if request.get("mutate_recipe"):
+        subject["ds_config"]["optimizer"]["lr"] = 0.0
+    if request.get("mutate_args"):
+        subject["engine_args"].tensor_parallel_size = 1
+    return {"phase": phase, "request": request, "evidence": {"synthetic_only": True}}
+
+
+class _InitializationWorker:
+    def __init__(self):
+        self.engine = SimpleNamespace(global_steps=0)
+        self.sp_group = object()
+        self.fail_cleanup = False
+
+    def initialize(self):
+        pass
+
+    def destroy(self):
+        _INITIALIZATION_EVENTS.append(("destroy", self.engine))
+        self.engine = None
+        if self.fail_cleanup:
+            raise RuntimeError("synthetic cleanup failed")
+
+    def get_sequence_parallel_info(self):
+        return {"rank": 0, "world_size": 8, "sp_size": 8, "sp_rank": 0, "sp_ranks": list(range(8))}
+
+
+def _initialization_build_model(spec):
+    return spec
+
+
+def _initialization_initialize(**kwargs):
+    return kwargs
+
+
+@pytest.fixture
+def initialization_hooks(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(sys.modules[__name__], "_INITIALIZATION_EVENTS", events)
+    monkeypatch.setenv(VERIFY_ENV, "1")
+    release = tmp_path / "synthetic-source-release.json"
+    release.write_text('{"synthetic_only":true}')
+    sources = source_files(
+        hooks,
+        selected,
+        receiver,
+        _lora_sampler_worker_bridge,
+        SamplerEvidenceWorker,
+        _InitializationRuntime,
+    )
+    sources[str(release)] = hashlib.sha256(release.read_bytes()).hexdigest()
+
+    def symbol(name):
+        return {"module": __name__, "name": name, "source": str(Path(__file__).resolve())}
+
+    request = {
+        "schema": "explicit-native-initialization-request-v1",
+        "admitted_sources": sources,
+        "runtime": symbol("_InitializationRuntime"),
+        "runtime_options": {
+            "release_bound": {"path": str(release), "sha256": sources[str(release)]},
+            "wrapper_sources": {},
+        },
+        "verify_capacity": symbol("_initialization_capacity"),
+        "capacity_request": {"synthetic_only": True},
+    }
+    path = tmp_path / "initialization-request.json"
+
+    def publish():
+        path.write_text(json.dumps(request, sort_keys=True))
+        monkeypatch.setenv(hooks.INITIALIZATION_ENV, str(path))
+        monkeypatch.setenv(hooks.INITIALIZATION_SHA_ENV, hashlib.sha256(path.read_bytes()).hexdigest())
+
+    publish()
+    return SimpleNamespace(
+        events=events,
+        request=request,
+        path=path,
+        release=release,
+        publish=publish,
+        worker=_InitializationWorker(),
+        spec=object(),
+        groups=object(),
+        config={"optimizer": {"lr": 0.001}},
+    )
+
+
+def _arm_initialization(control):
+    return hooks.maybe_admit_worker_construction(
+        control.worker,
+        control.spec,
+        control.config,
+        control.groups,
+        _initialization_build_model,
+        _initialization_initialize,
+    )
+
+
+def test_initialization_hooks_disabled_path_does_not_read_request_or_change_worker(monkeypatch):
+    monkeypatch.delenv(VERIFY_ENV, raising=False)
+    monkeypatch.delenv(hooks.INITIALIZATION_ENV, raising=False)
+    monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV, raising=False)
+    worker = _InitializationWorker()
+    engine = worker.engine
+    assert hooks.maybe_admit_worker_construction(worker, None, None, None, None, None) is None
+    assert hooks.maybe_verify_worker_engine(worker) is None
+    assert hooks.maybe_admit_sampler_construction(worker, None, None, None) is None
+    assert hooks.maybe_verify_sampler_construction(worker) is None
+    assert worker.engine is engine and not hasattr(worker, "_ap_initialization_admission")
+
+
+def test_initialization_hooks_weight_sync_optin_alone_preserves_unselected_initialization(monkeypatch):
+    monkeypatch.setenv(VERIFY_ENV, "1")
+    monkeypatch.delenv(hooks.INITIALIZATION_ENV, raising=False)
+    monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV, raising=False)
+    worker = _InitializationWorker()
+    engine = worker.engine
+    assert hooks.maybe_admit_worker_construction(worker, None, None, None, None, None) is None
+    assert hooks.maybe_verify_worker_engine(worker) is None
+    assert hooks.maybe_admit_sampler_construction(worker, None, None, None) is None
+    assert hooks.maybe_verify_sampler_construction(worker) is None
+    assert worker.engine is engine and not hasattr(worker, "_ap_initialization_admission")
+
+
+@pytest.mark.parametrize("key", [hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV])
+def test_initialization_hooks_partial_pair_without_evidence_optin_never_falls_back(monkeypatch, key):
+    monkeypatch.delenv(VERIFY_ENV, raising=False)
+    monkeypatch.delenv(hooks.INITIALIZATION_ENV, raising=False)
+    monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV, raising=False)
+    monkeypatch.setenv(key, "/data-fast/not-a-request" if key == hooks.INITIALIZATION_ENV else "a" * 64)
+    with pytest.raises(ValueError, match="requires explicit evidence opt-in"):
+        hooks.maybe_admit_worker_construction(_InitializationWorker(), None, None, None, None, None)
+
+
+@pytest.mark.parametrize("missing", ["pointer", "digest", "source", "runtime", "capacity", "plan"])
+def test_initialization_hooks_missing_required_inputs_fail_before_constructor(
+    initialization_hooks, monkeypatch, missing
+):
+    control = initialization_hooks
+    if missing in {"pointer", "digest"}:
+        key = hooks.INITIALIZATION_ENV if missing == "pointer" else hooks.INITIALIZATION_SHA_ENV
+        monkeypatch.delenv(key)
+    else:
+        key = {"source": "admitted_sources", "runtime": "runtime", "capacity": "verify_capacity"}.get(missing)
+        if key:
+            control.request.pop(key)
+        else:
+            control.request["capacity_request"] = {}
+        control.publish()
+    with pytest.raises(ValueError):
+        _arm_initialization(control)
+    assert control.events == [] and not hasattr(control.worker, "_ap_initialization_admission")
+
+
+def test_initialization_hooks_worker_binds_actual_recipe_groups_and_engine_before_ready(initialization_hooks):
+    control = initialization_hooks
+    result = _arm_initialization(control)
+    assert result["capacity_admitted"] is False and result["numerical"] is None
+    engine = control.worker.engine
+    result = hooks.maybe_verify_worker_engine(control.worker)
+    calls = [event for event in control.events if event[0] == "capacity"]
+    assert [event[1] for event in calls] == ["before-build-model", "after-engine"]
+    assert calls[0][2]["worker"] is control.worker and calls[0][2]["model_spec"] is control.spec
+    assert calls[0][2]["parallel_groups"] is control.groups and calls[0][2]["ds_config"] is control.config
+    assert calls[1][2]["engine"] is engine
+    assert [event for event in control.events if event[0] == "engine"][0][1] is engine
+    assert control.worker._ap_initialization_admission["status"] == "verified"
+    assert control.config == {"optimizer": {"lr": 0.001}}
+    assert result["capacity_admitted"] is False and result["numerical"] is None
+    with pytest.raises(ValueError, match="single-use"):
+        _arm_initialization(control)
+
+
+@pytest.mark.parametrize("cause", ["provider", "empty", "recipe"])
+def test_initialization_hooks_supplier_failure_cannot_arm_constructor(initialization_hooks, cause):
+    control = initialization_hooks
+    control.request["capacity_request"].update(
+        {"fail_phase": "before-build-model"}
+        if cause == "provider"
+        else {"empty": True} if cause == "empty" else {"mutate_recipe": True}
+    )
+    control.publish()
+    with pytest.raises(RuntimeError if cause == "provider" else ValueError):
+        _arm_initialization(control)
+    assert not hasattr(control.worker, "_ap_initialization_admission")
+
+
+@pytest.mark.parametrize("cause", ["request", "source", "disabled"])
+def test_initialization_hooks_postengine_drift_restores_only_owned_worker(initialization_hooks, monkeypatch, cause):
+    control = initialization_hooks
+    _arm_initialization(control)
+    engine = control.worker.engine
+    if cause == "request":
+        control.path.write_text("{}")
+    elif cause == "source":
+        control.release.write_text("changed")
+    else:
+        monkeypatch.delenv(VERIFY_ENV)
+        monkeypatch.delenv(hooks.INITIALIZATION_ENV)
+        monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV)
+    with pytest.raises(ValueError):
+        hooks.maybe_verify_worker_engine(control.worker)
+    assert ("destroy", engine) in control.events and control.worker.engine is None
+    assert control.worker._ap_initialization_admission["status"] == "failed"
+
+
+def test_initialization_hooks_afterengine_provider_error_survives_cleanup_failure(initialization_hooks):
+    control = initialization_hooks
+    control.request["capacity_request"]["fail_phase"] = "after-engine"
+    control.publish()
+    _arm_initialization(control)
+    control.worker.fail_cleanup = True
+    with pytest.raises(RuntimeError, match="supplier rejected") as caught:
+        hooks.maybe_verify_worker_engine(control.worker)
+    assert control.worker.engine is None
+    assert any("initialization cleanup also failed" in note for note in caught.value.__notes__)
+
+
+def test_initialization_hooks_wrong_worker_cannot_claim_or_destroy_another_owner(initialization_hooks):
+    control = initialization_hooks
+    _arm_initialization(control)
+    other = _InitializationWorker()
+    other._ap_initialization_admission = control.worker._ap_initialization_admission
+    with pytest.raises(ValueError, match="actual armed worker"):
+        hooks.maybe_verify_worker_engine(other)
+    assert not [event for event in control.events if event[0] == "destroy"]
+    assert control.worker.engine is not None and other.engine is not None
+
+
+def test_initialization_hooks_no_prebuild_slot_cannot_validate_selected_engine(initialization_hooks):
+    with pytest.raises(ValueError, match="no armed pre-build"):
+        hooks.maybe_verify_worker_engine(initialization_hooks.worker)
+
+
+def test_initialization_hooks_provider_code_replacement_is_not_admitted_source(initialization_hooks, monkeypatch):
+    def replacement(request, *, phase, subject, runtime):
+        return {"phase": phase, "request": request, "evidence": {"fabricated": True}}
+
+    monkeypatch.setattr(_initialization_capacity, "__code__", replacement.__code__)
+    with pytest.raises(ValueError, match="differs from admitted source"):
+        _arm_initialization(initialization_hooks)
+    assert initialization_hooks.events == []
+
+
+def test_initialization_hooks_sampler_positive_native_boundary_retains_recipe(initialization_hooks, native_modules):
+    control = initialization_hooks
+    worker = _lora_sampler_worker_bridge.LoRASamplerEvidenceWorker(native_modules)
+    options = {"enable_lora": True, "max_lora_rank": 32, "tensor_parallel_size": 8, "model": "original"}
+    asyncio.run(worker.initialize(options))
+    assert worker.state == "ready" and len(LLM.constructed) == 1
+    calls = [event for event in control.events if event[0] == "capacity"]
+    assert len(calls) == 1 and calls[0][1] == "before-sampler-constructor"
+    assert calls[0][2]["worker"] is worker and calls[0][2]["engine_kwargs"] is options
+    assert worker._ap_initialization_admission["status"] == "verified"
+    assert options == {"enable_lora": True, "max_lora_rank": 32, "tensor_parallel_size": 8, "model": "original"}
+
+
+@pytest.mark.parametrize("cause", ["missing", "provider", "args"])
+def test_initialization_hooks_sampler_rejection_precedes_actual_constructor(
+    initialization_hooks, native_modules, monkeypatch, cause
+):
+    control = initialization_hooks
+    if cause == "missing":
+        monkeypatch.delenv(hooks.INITIALIZATION_ENV)
+    else:
+        control.request["capacity_request"].update(
+            {"fail_phase": "before-sampler-constructor"} if cause == "provider" else {"mutate_args": True}
+        )
+        control.publish()
+    worker = _lora_sampler_worker_bridge.LoRASamplerEvidenceWorker(native_modules)
+    expected = (
+        "requires an explicit FAST request"
+        if cause == "missing"
+        else "supplier rejected" if cause == "provider" else "changed the native sampler recipe"
+    )
+    with pytest.raises(RuntimeError if cause == "provider" else ValueError, match=expected):
+        asyncio.run(worker.initialize({"enable_lora": True, "max_lora_rank": 32, "tensor_parallel_size": 8}))
+    assert LLM.constructed == [] and worker.state == "uninitialized"
+
+
+def test_initialization_hooks_production_calls_bracket_native_worker_and_sampler_boundaries():
+    root = Path(hooks.__file__).resolve().parents[1]
+    tree = ast.parse((root / "common/deepspeed_worker.py").read_text())
+    worker = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepSpeedWorker")
+    initialize = next(node for node in worker.body if isinstance(node, ast.FunctionDef) and node.name == "initialize")
+    source = ast.unparse(initialize)
+    assert source.index("maybe_admit_worker_construction(") < source.index("build_model(spec")
+    assert source.index("deepspeed.initialize(**init_kwargs)") < source.index("maybe_verify_worker_engine(self)")
+    assert source.index("maybe_verify_worker_engine(self)") < source.index("self._device =")
+    for name in ("rl_sampler_evidence", "lora_sampler_worker", "lora_selected_sampler"):
+        source = (root / f"debug/{name}.py").read_text()
+        assert source.index("maybe_admit_sampler_construction(self,") < source.index("self.llm = AsyncLLM")
+        assert source.index("self.llm = AsyncLLM") < source.index("maybe_verify_sampler_construction(self)")
+
+
+@contextlib.contextmanager
+def _initialization_bootstrap_base(staging, *, cluster, guard):
+    guard()
+    yield {"settings": {"SYNTHETIC_BASE_ENV": "unchanged"}}
+
+
+def _initialization_peer_launch(hosts, argv, **kwargs):
+    _INITIALIZATION_EVENTS.append(("peer", hosts, argv, kwargs))
+    return SimpleNamespace(returncode=0)
+
+
+@pytest.fixture
+def initialization_hooks_bootstrap(initialization_hooks, _lora_request_staging_inputs, monkeypatch):
+    from arctic_platform.debug import lora_bootstrap_environment as bootstrap
+
+    control = initialization_hooks
+    cfg, options = _lora_request_staging_inputs
+    monkeypatch.setattr(_lora_request_staging_helper, "bootstrap_descriptor", selected.bootstrap_descriptor)
+    options["admitted_sources"].update(control.request["admitted_sources"])
+    options["admitted_sources"].update(
+        source_files(
+            bootstrap,
+            selected.bootstrap_descriptor,
+            selected.engine_kwargs_for_lora,
+            _initialization_bootstrap_base,
+        ),
+    )
+    options["admitted_sources"][str(selected.RPC_PATH)] = hashlib.sha256(selected.RPC_PATH.read_bytes()).hexdigest()
+    staged = _lora_request_staging_helper.stage_selected_lora_request(cfg, **options)
+    control.request["admitted_sources"] = staged["admitted_sources"]
+    control.publish()
+    pointer = {
+        "path": str(control.path),
+        "sha256": hashlib.sha256(control.path.read_bytes()).hexdigest(),
+    }
+    return SimpleNamespace(
+        bootstrap=bootstrap,
+        control=control,
+        staged=staged,
+        pointer=pointer,
+        cluster=SimpleNamespace(_pdsh=_initialization_peer_launch, _spawned_temp_dir="/tmp/j3rl-" + "a" * 24),
+    )
+
+
+@pytest.mark.parametrize("selected_initialization", [False, True])
+@pytest.mark.parametrize("prior_environment", [False, True])
+@pytest.mark.parametrize("body_failure", [False, True])
+def test_initialization_hooks_bootstrap_forwards_only_selected_pair_and_restores_owner(
+    initialization_hooks_bootstrap, monkeypatch, selected_initialization, prior_environment, body_failure
+):
+    case = initialization_hooks_bootstrap
+    staged = copy.deepcopy(case.staged)
+    if selected_initialization:
+        staged["initialization"] = case.pointer
+        staged["environment"].update(
+            {
+                hooks.INITIALIZATION_ENV: case.pointer["path"],
+                hooks.INITIALIZATION_SHA_ENV: case.pointer["sha256"],
+            },
+        )
+    keys = {*staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    if prior_environment:
+        for key, value in staged["environment"].items():
+            monkeypatch.setenv(key, value)
+    before = {key: os.environ.get(key) for key in keys}
+    original = case.cluster._pdsh
+    failure = RuntimeError("synthetic bootstrap body failed")
+    receipt = None
+
+    def execute():
+        nonlocal receipt
+        with case.bootstrap.owned_selected_lora_bootstrap(
+            staged,
+            cluster=case.cluster,
+            base_environment=_initialization_bootstrap_base,
+            staging=object(),
+            guard=lambda: None,
+        ) as receipt:
+            assert {key: os.environ.get(key) for key in staged["environment"]} == staged["environment"]
+            result = case.cluster._pdsh(
+                [case.bootstrap.PEER],
+                [
+                    "env",
+                    "SYNTHETIC_BASE_ENV=unchanged",
+                    case.bootstrap.RAY,
+                    "start",
+                    "--address=10.4.166.121:23456",
+                    f"--temp-dir={case.cluster._spawned_temp_dir}",
+                    "--disable-usage-stats",
+                ],
+                check=False,
+                timeout=600,
+            )
+            assert result.returncode == 0
+            forwarded = receipt["peer_launches"][0]["argv"]
+            for key, value in staged["environment"].items():
+                assert f"{key}={value}" in forwarded
+            if not selected_initialization:
+                assert not any(item.startswith(hooks.INITIALIZATION_ENV + "=") for item in forwarded)
+                assert not any(item.startswith(hooks.INITIALIZATION_SHA_ENV + "=") for item in forwarded)
+            if body_failure:
+                raise failure
+
+    if body_failure:
+        with pytest.raises(RuntimeError) as caught:
+            execute()
+        assert caught.value is failure
+    else:
+        execute()
+    assert case.cluster._pdsh is original
+    assert {key: os.environ.get(key) for key in keys} == before
+    assert receipt["callback_restored"] and receipt["environment_restored"]
+    assert receipt["capacity_admitted"] is False and receipt["numerical"] is None
+    assert len(case.control.events) == 1 and case.control.events[0][0] == "peer"
+
+
+def test_initialization_hooks_bootstrap_rejects_mismatched_source_closure_before_environment(
+    initialization_hooks_bootstrap,
+):
+    case = initialization_hooks_bootstrap
+    case.control.request["admitted_sources"] = copy.deepcopy(case.control.request["admitted_sources"])
+    case.control.request["admitted_sources"].pop(str(Path(case.bootstrap.__file__).resolve()))
+    case.control.publish()
+    staged = copy.deepcopy(case.staged)
+    staged["initialization"] = {
+        "path": str(case.control.path),
+        "sha256": hashlib.sha256(case.control.path.read_bytes()).hexdigest(),
+    }
+    staged["environment"].update(
+        {
+            hooks.INITIALIZATION_ENV: staged["initialization"]["path"],
+            hooks.INITIALIZATION_SHA_ENV: staged["initialization"]["sha256"],
+        },
+    )
+    before = dict(os.environ)
+    with pytest.raises(ValueError, match="same complete source closure"):
+        with case.bootstrap.owned_selected_lora_bootstrap(
+            staged,
+            cluster=case.cluster,
+            base_environment=_initialization_bootstrap_base,
+            staging=object(),
+            guard=lambda: None,
+        ):
+            pytest.fail("mismatched sources reached the bootstrap body")
+    assert dict(os.environ) == before and case.control.events == []
+    assert case.cluster._pdsh is _initialization_peer_launch
+
+
+@contextlib.contextmanager
+def _initialization_bootstrap_ownership_base(staging, *, cluster, guard):
+    guard()
+    yield {"settings": {"SYNTHETIC_BASE_ENV": "unchanged"}}
+    if cluster.teardown_failure is not None:
+        raise cluster.teardown_failure
+
+
+@pytest.mark.parametrize("changed_owner", ["callback", "environment", "both"])
+@pytest.mark.parametrize("primary_failure", ["none", "body", "teardown"])
+def test_bootstrap_restoration_preserves_foreign_owner(
+    initialization_hooks_bootstrap, monkeypatch, changed_owner, primary_failure
+):
+    case = initialization_hooks_bootstrap
+    keys = {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    original = case.cluster._pdsh
+    foreign = object()
+    key = next(iter(case.staged["environment"]))
+    failure = RuntimeError("synthetic primary " + primary_failure)
+    case.cluster.teardown_failure = failure if primary_failure == "teardown" else None
+    receipt = None
+    with pytest.raises(ValueError if primary_failure == "none" else RuntimeError) as caught:
+        with case.bootstrap.owned_selected_lora_bootstrap(
+            case.staged,
+            cluster=case.cluster,
+            base_environment=_initialization_bootstrap_ownership_base,
+            staging=object(),
+            guard=lambda: None,
+        ) as receipt:
+            if changed_owner in ("callback", "both"):
+                case.cluster._pdsh = foreign
+            if changed_owner in ("environment", "both"):
+                monkeypatch.setenv(key, "foreign owner")
+            if primary_failure == "body":
+                raise failure
+    if primary_failure == "none":
+        assert "captured bootstrap ownership changed" in str(caught.value)
+    else:
+        assert caught.value is failure
+        assert any("captured bootstrap ownership changed" in note for note in failure.__notes__)
+    assert case.cluster._pdsh is (foreign if changed_owner in ("callback", "both") else original)
+    for name in case.staged["environment"]:
+        expected = "foreign owner" if name == key and changed_owner in ("environment", "both") else None
+        assert os.environ.get(name) == expected
+    assert receipt["callback_restored"] is (changed_owner == "environment")
+    assert receipt["environment_restored"] is (changed_owner == "callback")
+    assert receipt["peer_runtime_admitted"] is False
+    assert receipt["capacity_admitted"] is False and receipt["numerical"] is None
+
+
+def test_bootstrap_restoration_does_not_claim_state_before_installation(initialization_hooks_bootstrap, monkeypatch):
+    case = initialization_hooks_bootstrap
+    for key in {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}:
+        monkeypatch.delenv(key, raising=False)
+    key = next(iter(case.staged["environment"]))
+    foreign = object()
+    failure = RuntimeError("synthetic initial guard failure")
+
+    def guard():
+        case.cluster._pdsh = foreign
+        monkeypatch.setenv(key, "foreign guard owner")
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        with case.bootstrap.owned_selected_lora_bootstrap(
+            case.staged,
+            cluster=case.cluster,
+            base_environment=_initialization_bootstrap_base,
+            staging=object(),
+            guard=guard,
+        ):
+            pytest.fail("failed initial guard reached bootstrap")
+    assert caught.value is failure
+    assert case.cluster._pdsh is foreign
+    assert os.environ[key] == "foreign guard owner"
+    assert all(os.environ.get(name) is None for name in case.staged["environment"] if name != key)
+
+
+@pytest.mark.parametrize("changed_owner", ["callback", "environment", "both"])
+def test_bootstrap_installation_preserves_foreign_owner_after_guard(
+    initialization_hooks_bootstrap, monkeypatch, changed_owner
+):
+    case = initialization_hooks_bootstrap
+    for key in {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}:
+        monkeypatch.delenv(key, raising=False)
+    key = next(iter(case.staged["environment"]))
+    original = case.cluster._pdsh
+    foreign = object()
+
+    def guard():
+        if changed_owner in ("callback", "both"):
+            case.cluster._pdsh = foreign
+        if changed_owner in ("environment", "both"):
+            monkeypatch.setenv(key, "foreign guard owner")
+
+    with pytest.raises(ValueError, match="ownership changed before installation"):
+        with case.bootstrap.owned_selected_lora_bootstrap(
+            case.staged,
+            cluster=case.cluster,
+            base_environment=_initialization_bootstrap_base,
+            staging=object(),
+            guard=guard,
+        ):
+            pytest.fail("foreign ownership reached bootstrap")
+    assert case.cluster._pdsh is (foreign if changed_owner in ("callback", "both") else original)
+    for name in case.staged["environment"]:
+        expected = "foreign guard owner" if name == key and changed_owner in ("environment", "both") else None
+        assert os.environ.get(name) == expected
+    assert case.control.events == []
+
+
+@pytest.mark.parametrize("change", ["code", "defaults", "keyword_defaults", "binding"])
+def test_initialization_cleanup_does_not_invoke_changed_destroy(initialization_hooks, monkeypatch, change):
+    control = initialization_hooks
+    control.request["capacity_request"]["fail_phase"] = "after-engine"
+    control.publish()
+    _arm_initialization(control)
+    engine = control.worker.engine
+    destroy = type(control.worker).destroy
+
+    def foreign_destroy(self):
+        _INITIALIZATION_EVENTS.append(("foreign_destroy", self.engine))
+        self.engine = None
+
+    if change == "code":
+        monkeypatch.setattr(destroy, "__code__", foreign_destroy.__code__)
+    elif change == "defaults":
+        monkeypatch.setattr(destroy, "__defaults__", (None,))
+    elif change == "keyword_defaults":
+        monkeypatch.setattr(destroy, "__kwdefaults__", {"foreign": True})
+    else:
+        monkeypatch.setattr(control.worker, "destroy", foreign_destroy.__get__(control.worker))
+    with pytest.raises((ValueError, RuntimeError)) as caught:
+        hooks.maybe_verify_worker_engine(control.worker)
+    assert control.worker.engine is engine
+    assert control.worker._ap_initialization_admission["status"] == "failed"
+    assert not [event for event in control.events if event[0] in ("destroy", "foreign_destroy")]
+    assert any("owned cleanup not attempted" in note for note in caught.value.__notes__)
+
+
+@pytest.mark.parametrize("phase", ["runtime", "capacity"])
+def test_initialization_cleanup_drift_during_verification_preserves_primary(initialization_hooks, monkeypatch, phase):
+    control = initialization_hooks
+    _arm_initialization(control)
+    engine = control.worker.engine
+    failure = KeyboardInterrupt("synthetic engine verification interrupted")
+
+    def foreign_destroy(self):
+        _INITIALIZATION_EVENTS.append(("foreign_destroy", self.engine))
+        self.engine = None
+
+    class VerificationEvents(list):
+        def append(self, event):
+            super().append(event)
+            selected = event[0] == "engine" if phase == "runtime" else event[:2] == ("capacity", "after-engine")
+            if selected:
+                monkeypatch.setattr(type(control.worker).destroy, "__code__", foreign_destroy.__code__)
+                if phase == "runtime":
+                    raise failure
+
+    events = VerificationEvents(control.events)
+    monkeypatch.setattr(sys.modules[__name__], "_INITIALIZATION_EVENTS", events)
+    with pytest.raises(KeyboardInterrupt if phase == "runtime" else ValueError) as caught:
+        hooks.maybe_verify_worker_engine(control.worker)
+    if phase == "runtime":
+        assert caught.value is failure
+    else:
+        assert "capacity verifier changed worker cleanup" in str(caught.value)
+    assert control.worker.engine is engine
+    assert control.worker._ap_initialization_admission["status"] == "failed"
+    assert not [event for event in events if event[0] in ("destroy", "foreign_destroy")]
+    assert any("owned cleanup not attempted" in note for note in caught.value.__notes__)
+
+
+@pytest.mark.parametrize("method", ["guard", "verify_engine"])
+@pytest.mark.parametrize("attribute", ["__defaults__", "__kwdefaults__"])
+def test_initialization_runtime_method_default_drift_refuses_engine(
+    initialization_hooks, monkeypatch, method, attribute
+):
+    control = initialization_hooks
+    _arm_initialization(control)
+    function = getattr(_InitializationRuntime, method)
+    value = (None,) if attribute == "__defaults__" else {"foreign": True}
+    monkeypatch.setattr(function, attribute, value)
+    with pytest.raises(ValueError, match="runtime verification method defaults changed"):
+        hooks.maybe_verify_worker_engine(control.worker)
+    assert not [event for event in control.events if event[0] == "engine"]
+    assert control.worker._ap_initialization_admission["status"] == "failed"
+    assert control.worker.engine is None
+    assert len([event for event in control.events if event[0] == "destroy"]) == 1
+
+
+@pytest.mark.parametrize("method", ["guard", "verify_engine"])
+def test_initialization_runtime_defaults_changed_by_capacity_cannot_arm(initialization_hooks, monkeypatch, method):
+    control = initialization_hooks
+
+    class MutatingEvents(list):
+        def append(self, event):
+            super().append(event)
+            if event[0] == "capacity":
+                monkeypatch.setattr(getattr(_InitializationRuntime, method), "__kwdefaults__", {"foreign": True})
+
+    events = MutatingEvents()
+    monkeypatch.setattr(sys.modules[__name__], "_INITIALIZATION_EVENTS", events)
+    with pytest.raises(ValueError, match="runtime verification method defaults changed"):
+        _arm_initialization(control)
+    assert not hasattr(control.worker, "_ap_initialization_admission")
+    assert not [event for event in events if event[0] in ("engine", "destroy")]
+
+
+def test_initialization_runtime_unchanged_nonempty_defaults_preserve_verification(initialization_hooks, monkeypatch):
+    control = initialization_hooks
+    monkeypatch.setattr(_InitializationRuntime.guard, "__defaults__", (None,))
+    monkeypatch.setattr(_InitializationRuntime.verify_engine, "__kwdefaults__", {"sp_info": None, "sp_group": None})
+    _arm_initialization(control)
+    engine = control.worker.engine
+    result = hooks.maybe_verify_worker_engine(control.worker)
+    assert result["capacity_admitted"] is False and result["numerical"] is None
+    assert control.worker.engine is engine
+    assert control.worker._ap_initialization_admission["status"] == "verified"
+    assert len([event for event in control.events if event[0] == "engine"]) == 1
+    assert not [event for event in control.events if event[0] == "destroy"]
+
+
+def test_initialization_runtime_default_guards_leave_unselected_worker_unchanged(initialization_hooks, monkeypatch):
+    control = initialization_hooks
+    monkeypatch.delenv(hooks.INITIALIZATION_ENV)
+    monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV)
+    monkeypatch.setattr(_InitializationRuntime.guard, "__defaults__", (None,))
+    monkeypatch.setattr(_InitializationRuntime.verify_engine, "__kwdefaults__", {"foreign": True})
+    engine = control.worker.engine
+    assert _arm_initialization(control) is None
+    assert hooks.maybe_verify_worker_engine(control.worker) is None
+    assert control.worker.engine is engine and control.events == []
+    assert not hasattr(control.worker, "_ap_initialization_admission")
+
+
+@pytest.mark.parametrize("method", ["guard", "verify_engine"])
+def test_initialization_runtime_guard_default_mutation_stops_before_engine(initialization_hooks, monkeypatch, method):
+    control = initialization_hooks
+    _arm_initialization(control)
+
+    class MutatingGuardEvents(list):
+        def append(self, event):
+            super().append(event)
+            if event[0] == "guard":
+                monkeypatch.setattr(getattr(_InitializationRuntime, method), "__kwdefaults__", {"foreign": True})
+
+    events = MutatingGuardEvents()
+    monkeypatch.setattr(sys.modules[__name__], "_INITIALIZATION_EVENTS", events)
+    with pytest.raises(ValueError, match="runtime verification method defaults changed"):
+        hooks.maybe_verify_worker_engine(control.worker)
+    assert not [event for event in events if event[0] == "engine"]
+    assert control.worker._ap_initialization_admission["status"] == "failed"
+    assert control.worker.engine is None
+    assert len([event for event in events if event[0] == "destroy"]) == 1
+
+
+def _model_factory_load(spec, groups):
+    from arctic_platform.model.factory import build_model
+
+    return build_model(spec, parallel_groups=groups)
+
+
+class _ModelFactoryWorker:
+    def __init__(self, cfg, spec, groups):
+        self.cfg = cfg
+        self.loaded = _model_factory_load(spec, groups)
+
+
+def _model_factory_capacity(request, *, phase, subject, runtime):
+    result = _initialization_capacity(request, phase=phase, subject=subject, runtime=runtime)
+    damage = request.get("damage")
+    if damage == "spec":
+        subject["model_spec"].dtype = "float32"
+    elif damage == "config":
+        subject["config"]["original_recipe"] = False
+    elif damage == "groups":
+        subject["parallel_groups"]["sp_group"] = object()
+    elif damage == "source":
+        Path(request["source_path"]).write_text("synthetic source drift")
+    return result
+
+
+@pytest.fixture
+def model_factory_initialization(initialization_hooks, monkeypatch):
+    from arctic_platform.model import factory
+    from arctic_platform.model.config import ModelSpec
+
+    control = initialization_hooks
+    control.request = copy.deepcopy(control.request)
+    control.request["schema"] = "explicit-native-model-construction-request-v1"
+    control.request["admitted_sources"].update(source_files(factory, ModelSpec))
+    control.request["verify_capacity"]["name"] = "_model_factory_capacity"
+    source = str(Path(__file__).resolve())
+    control.request["factory_route"] = {
+        "factory": {"module": factory.__name__, "qualname": "build_model", "source": factory.__file__},
+        "caller": {"module": __name__, "qualname": "_model_factory_load", "source": source},
+        "constructor": {"module": __name__, "qualname": "_ModelFactoryWorker.__init__", "source": source},
+    }
+    monkeypatch.delenv(hooks.INITIALIZATION_ENV)
+    monkeypatch.delenv(hooks.INITIALIZATION_SHA_ENV)
+
+    def publish():
+        control.path.write_text(json.dumps(control.request, sort_keys=True))
+        monkeypatch.setenv(hooks.MODEL_CONSTRUCTION_ENV, str(control.path))
+        monkeypatch.setenv(
+            hooks.MODEL_CONSTRUCTION_SHA_ENV,
+            hashlib.sha256(control.path.read_bytes()).hexdigest(),
+        )
+
+    publish()
+    spec = ModelSpec(model_path_or_name="synthetic-no-weights")
+    groups = {"ep_group": object(), "sp_group": object()}
+    config = {"original_recipe": True}
+    loaded = SimpleNamespace(model=object())
+    operations = []
+
+    def allocate(debug):
+        if os.environ.get(hooks.MODEL_CONSTRUCTION_ENV) is not None:
+            calls = [event for event in control.events if event[0] == "capacity"]
+            assert len(calls) == 1 and calls[0][1] == "before-build-model"
+        operations.append(("allocate", debug))
+        return None
+
+    def select_loader(ctx):
+        operations.append(("select", ctx))
+
+        def load(actual):
+            assert actual is ctx and actual.spec is spec and actual.parallel_groups is groups
+            operations.append(("load", actual))
+            return loaded
+
+        return load
+
+    monkeypatch.setattr(factory, "allocate_gpu_mem_preallocation", allocate)
+    monkeypatch.setattr(factory, "select_loader", select_loader)
+    monkeypatch.setattr(factory, "apply_patches", lambda actual, ctx: operations.append(("patch", actual)))
+    monkeypatch.setattr(factory, "freeze_fp8_weights_and_scales", lambda model: operations.append(("freeze", model)))
+    return SimpleNamespace(
+        control=control,
+        factory=factory,
+        spec=spec,
+        groups=groups,
+        config=config,
+        loaded=loaded,
+        operations=operations,
+        publish=publish,
+    )
+
+
+@pytest.mark.parametrize("evidence_optin", [False, True])
+def test_model_factory_initialization_unselected_route_preserves_normal_factory(
+    model_factory_initialization,
+    monkeypatch,
+    evidence_optin,
+):
+    case = model_factory_initialization
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_ENV)
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_SHA_ENV)
+    if evidence_optin:
+        monkeypatch.setenv(VERIFY_ENV, "1")
+    else:
+        monkeypatch.delenv(VERIFY_ENV)
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert worker.loaded is case.loaded
+    assert case.control.events == []
+    assert [event[0] for event in case.operations] == ["allocate", "select", "load", "patch", "freeze"]
+
+
+def test_model_factory_initialization_actual_spec_config_groups_and_route_precede_allocation(
+    model_factory_initialization,
+):
+    case = model_factory_initialization
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    calls = [event for event in case.control.events if event[0] == "capacity"]
+    assert len(calls) == 1 and calls[0][1] == "before-build-model"
+    subject = calls[0][2]
+    assert subject["worker"] is worker and subject["config"] is case.config
+    assert subject["model_spec"] is case.spec and subject["parallel_groups"] is case.groups
+    assert subject["build_model"] is case.factory.build_model
+    assert subject["factory_route"] == case.control.request["factory_route"]
+    assert worker.loaded is case.loaded
+    assert case.spec.dtype == "bfloat16" and case.config == {"original_recipe": True}
+    assert [event[0] for event in case.operations] == ["allocate", "select", "load", "patch", "freeze"]
+    assert not hasattr(worker, "_ap_initialization_admission")
+
+
+@pytest.mark.parametrize("missing", ["path", "digest", "provider", "route", "factory_source"])
+def test_model_factory_initialization_missing_input_stops_before_any_allocation(
+    model_factory_initialization,
+    monkeypatch,
+    missing,
+):
+    case = model_factory_initialization
+    if missing in {"path", "digest"}:
+        monkeypatch.delenv(
+            hooks.MODEL_CONSTRUCTION_ENV if missing == "path" else hooks.MODEL_CONSTRUCTION_SHA_ENV,
+        )
+    else:
+        if missing == "factory_source":
+            case.control.request["admitted_sources"].pop(case.factory.__file__)
+        else:
+            case.control.request.pop("verify_capacity" if missing == "provider" else "factory_route")
+        case.publish()
+    with pytest.raises(ValueError):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert case.operations == [] and case.control.events == []
+
+
+@pytest.mark.parametrize("field", ["module", "qualname", "source"])
+def test_model_factory_initialization_selected_caller_must_match_actual_body(
+    model_factory_initialization,
+    field,
+):
+    case = model_factory_initialization
+    case.control.request["factory_route"]["caller"][field] = "not.the.selected.caller"
+    case.publish()
+    with pytest.raises(ValueError, match="differs from selected caller"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert case.operations == [] and case.control.events == []
+
+
+@pytest.mark.parametrize("damage", ["provider", "empty", "spec", "config", "groups", "source"])
+def test_model_factory_initialization_provider_or_input_drift_cannot_reach_loader(
+    model_factory_initialization,
+    damage,
+):
+    case = model_factory_initialization
+    request = case.control.request["capacity_request"]
+    if damage == "provider":
+        request["fail_phase"] = "before-build-model"
+    elif damage == "empty":
+        request["empty"] = True
+    else:
+        request["damage"] = damage
+        request["source_path"] = str(case.control.release)
+    case.publish()
+    with pytest.raises(RuntimeError if damage == "provider" else ValueError):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert case.operations == []
+    assert len([event for event in case.control.events if event[0] == "capacity"]) == 1
+
+
+def test_model_factory_initialization_rejects_unselected_direct_factory_caller(model_factory_initialization):
+    case = model_factory_initialization
+    with pytest.raises(ValueError, match="differs from selected caller"):
+        case.factory.build_model(case.spec, parallel_groups=case.groups)
+    assert case.operations == [] and case.control.events == []
+
+
+def test_model_factory_initialization_worker_request_alone_does_not_select_factory(
+    model_factory_initialization,
+    monkeypatch,
+):
+    case = model_factory_initialization
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_ENV)
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_SHA_ENV)
+    monkeypatch.setenv(hooks.INITIALIZATION_ENV, str(case.control.path))
+    monkeypatch.setenv(hooks.INITIALIZATION_SHA_ENV, "a" * 64)
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert worker.loaded is case.loaded and case.control.events == []
+
+
+def test_model_factory_initialization_reader_keeps_worker_selection_independent(initialization_hooks, monkeypatch):
+    control = initialization_hooks
+    monkeypatch.setenv(hooks.MODEL_CONSTRUCTION_ENV, "/data-fast/not-a-factory-request")
+    monkeypatch.setenv(hooks.MODEL_CONSTRUCTION_SHA_ENV, "b" * 64)
+    _arm_initialization(control)
+    result = hooks.maybe_verify_worker_engine(control.worker)
+    assert control.worker._ap_initialization_admission["request_reader"] is hooks._initialization_request
+    assert result["capacity_admitted"] is False and result["numerical"] is None
+    assert [event[1] for event in control.events if event[0] == "capacity"] == [
+        "before-build-model",
+        "after-engine",
+    ]
+
+
+def _model_constructor_frame_foreign_init(self, cfg, spec, groups):
+    raise AssertionError("a foreign constructor must never run")
+
+
+def _model_constructor_frame_capacity(request, *, phase, subject, runtime):
+    result = _model_factory_capacity(request, phase=phase, subject=subject, runtime=runtime)
+    damage = request.get("wrapper_damage")
+    installed = type(subject["worker"]).__init__
+    if damage == "binding":
+        type(subject["worker"]).__init__ = _model_constructor_frame_foreign_init
+    elif damage == "original_code":
+        installed.__wrapped__.__code__ = _model_constructor_frame_foreign_init.__code__
+    elif damage == "wrapped_pointer":
+        installed.__wrapped__ = _model_constructor_frame_foreign_init
+    elif damage == "closure":
+        cells = dict(zip(installed.__code__.co_freevars, installed.__closure__, strict=True))
+        cells["original"].cell_contents = _model_constructor_frame_foreign_init
+    elif damage == "source":
+        Path(request["wrapper_source"]).write_text("synthetic wrapper source drift")
+    return result
+
+
+@pytest.fixture
+def model_constructor_frame_binding(model_factory_initialization, tmp_path, monkeypatch):
+    case = model_factory_initialization
+    path = tmp_path / "synthetic_owned_constructor.py"
+    raw = """from functools import wraps
+from arctic_platform.debug import lora_sync_hooks as hooks
+
+def indirect(original, worker, args, kwargs):
+    return original(worker, *args, **kwargs)
+
+def make_wrapper(worker_class, original, sources, mode):
+    @wraps(original)
+    def wrapped(worker, *args, **kwargs):
+        assert type(worker) is worker_class
+        if mode == "unregistered":
+            return original(worker, *args, **kwargs)
+        selected_sources = dict(sources)
+        if mode == "incomplete_sources":
+            selected_sources.pop(__file__)
+        with hooks.owned_model_constructor_frame(
+            worker, constructor=original, wrapper=wrapped, admitted_sources=selected_sources,
+        ):
+            if mode == "nested":
+                with hooks.owned_model_constructor_frame(
+                    worker, constructor=original, wrapper=wrapped, admitted_sources=selected_sources,
+                ):
+                    return original(worker, *args, **kwargs)
+            if mode == "indirect":
+                return indirect(original, worker, args, kwargs)
+            if mode == "wrong_receiver":
+                return original(object.__new__(worker_class), *args, **kwargs)
+            return original(worker, *args, **kwargs)
+    return wrapped
+"""
+    path.write_text(raw)
+    module = ModuleType("_synthetic_owned_model_constructor")
+    module.__file__ = str(path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    case.control.request["admitted_sources"].update(source_files(module))
+    case.control.request["verify_capacity"]["name"] = "_model_constructor_frame_capacity"
+    case.publish()
+    original = _ModelFactoryWorker.__init__
+    monkeypatch.setattr(original, "__code__", original.__code__)
+
+    def install(mode="owned"):
+        wrapper = module.make_wrapper(
+            _ModelFactoryWorker,
+            original,
+            case.control.request["admitted_sources"],
+            mode,
+        )
+        monkeypatch.setattr(_ModelFactoryWorker, "__init__", wrapper)
+        return wrapper
+
+    return SimpleNamespace(case=case, original=original, install=install, source=path)
+
+
+def test_model_constructor_frame_binding_actual_wrapper_allows_only_original_frame_before_allocation(
+    model_constructor_frame_binding,
+    monkeypatch,
+):
+    control = model_constructor_frame_binding
+    case = control.case
+    wrapper = control.install()
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    calls = [event for event in case.control.events if event[0] == "capacity"]
+    assert len(calls) == 1 and calls[0][2]["worker"] is worker
+    assert wrapper.__wrapped__ is control.original
+    assert worker.loaded is case.loaded
+    assert case.config == {"original_recipe": True} and case.spec.dtype == "bfloat16"
+    assert [event[0] for event in case.operations] == ["allocate", "select", "load", "patch", "freeze"]
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+    monkeypatch.setattr(_ModelFactoryWorker, "__init__", control.original)
+    case.control.events.clear()
+    case.operations.clear()
+    assert _ModelFactoryWorker(case.config, case.spec, case.groups).loaded is case.loaded
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+def test_model_constructor_frame_binding_absent_selection_preserves_wrapped_normal_route(
+    model_constructor_frame_binding,
+    monkeypatch,
+):
+    control = model_constructor_frame_binding
+    case = control.case
+    control.install()
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_ENV)
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_SHA_ENV)
+    assert _ModelFactoryWorker(case.config, case.spec, case.groups).loaded is case.loaded
+    assert case.control.events == [] and hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+@pytest.mark.parametrize("mode", ["unregistered", "incomplete_sources", "nested", "indirect", "wrong_receiver"])
+def test_model_constructor_frame_binding_cannot_admit_unowned_or_indirect_routes(
+    model_constructor_frame_binding,
+    mode,
+):
+    control = model_constructor_frame_binding
+    case = control.case
+    control.install(mode)
+    with pytest.raises(ValueError):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert case.operations == [] and case.control.events == []
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+def test_model_constructor_frame_binding_detached_wrapper_cannot_claim_class(
+    model_constructor_frame_binding,
+    monkeypatch,
+):
+    control = model_constructor_frame_binding
+    case = control.case
+    wrapper = control.install()
+    monkeypatch.setattr(_ModelFactoryWorker, "__init__", control.original)
+    worker = object.__new__(_ModelFactoryWorker)
+    with pytest.raises(ValueError, match="constructor binding changed"):
+        wrapper(worker, case.config, case.spec, case.groups)
+    assert case.operations == [] and case.control.events == []
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+@pytest.mark.parametrize("damage", ["binding", "original_code", "wrapped_pointer", "closure", "source"])
+def test_model_constructor_frame_binding_provider_drift_never_reaches_loader(
+    model_constructor_frame_binding,
+    damage,
+):
+    control = model_constructor_frame_binding
+    case = control.case
+    control.install()
+    request = case.control.request["capacity_request"]
+    request["wrapper_damage"] = damage
+    request["wrapper_source"] = str(control.source)
+    case.publish()
+    with pytest.raises(ValueError):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert case.operations == []
+    assert len([event for event in case.control.events if event[0] == "capacity"]) == 1
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+# The real post-sharding inventory is supplied before the original loader runs.
+
+
+class _MaterializationModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty((2, 3), device="meta"))
+        self.register_buffer("scratch", torch.zeros(2), persistent=False)
+
+
+def _materialization_checkpoint_load(model, config, parallel_dims):
+    _INITIALIZATION_EVENTS.append(("checkpoint_load", model, config, parallel_dims))
+
+
+def _materialization_load(model, adapter, config, parallel_dims, ep_mesh):
+    hooks.maybe_observe_model_materialization(model, adapter, config, parallel_dims, ep_mesh)
+    adapter.load_dcp_from_hf(model, config, parallel_dims)
+
+
+def _materialization_capacity(request, *, phase, subject, runtime):
+    result = _initialization_capacity(request, phase=phase, subject=subject, runtime=runtime)
+    if phase != "before-model-materialization":
+        return result
+    damage = request.get("materialization_damage")
+    if damage == "buffer":
+        subject["model"].register_buffer("unexpected", torch.zeros(1))
+    elif damage == "recipe":
+        subject["config"].original_recipe = False
+    elif damage == "loader_defaults":
+        subject["adapter"].load_dcp_from_hf.__defaults__ = (None,)
+    elif damage == "empty_inventory":
+        subject["native_inventory"].clear()
+    elif damage == "parameter_identity":
+        subject["model"].weight = nn.Parameter(torch.empty_like(subject["model"].weight))
+    elif damage == "buffer_identity":
+        subject["model"].scratch = torch.zeros_like(subject["model"].scratch)
+    elif damage == "factory_binding":
+        subject["build_model"].__globals__["build_model"] = _model_factory_load
+    elif damage == "worker_config":
+        subject["worker"].cfg["original_recipe"] = False
+    elif damage == "model_spec":
+        subject["build_model"].__globals__["_materialization_selected_spec"].dtype = "float32"
+    return result
+
+
+@pytest.fixture
+def model_materialization(model_factory_initialization, monkeypatch):
+    from arctic_platform.model.implementations.debug import gpu_memory
+
+    case = model_factory_initialization
+    model = _MaterializationModel()
+    adapter = SimpleNamespace(load_dcp_from_hf=_materialization_checkpoint_load)
+    config = SimpleNamespace(original_recipe=True)
+    dims = SimpleNamespace(ep=2)
+    mesh = object()
+    case.loaded.model = model
+    case.control.request["admitted_sources"].update(source_files(gpu_memory, _MaterializationModel))
+    case.control.request["verify_capacity"]["name"] = "_materialization_capacity"
+    monkeypatch.setattr(_materialization_checkpoint_load, "__defaults__", None)
+    case.publish()
+
+    def select_loader(ctx):
+        def load(actual):
+            assert actual is ctx
+            _materialization_load(model, adapter, config, dims, mesh)
+            return case.loaded
+
+        return load
+
+    monkeypatch.setattr(case.factory, "select_loader", select_loader)
+    return SimpleNamespace(case=case, model=model, adapter=adapter, config=config, dims=dims, mesh=mesh)
+
+
+def test_model_materialization_observes_actual_model_before_checkpoint_load(model_materialization):
+    control = model_materialization
+    case = control.case
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    events = [event for event in case.control.events if event[0] in ("capacity", "checkpoint_load")]
+    assert [event[1] for event in events[:2]] == ["before-build-model", "before-model-materialization"]
+    subject = events[1][2]
+    assert subject["worker"] is worker and subject["model"] is control.model
+    assert subject["ep_mesh"] is control.mesh and subject["parallel_dims"] is control.dims
+    assert subject["native_inventory"]
+    assert events[2] == ("checkpoint_load", control.model, control.config, control.dims)
+    assert worker.loaded.model is control.model
+    assert control.model.weight.device.type == "meta"
+
+
+def test_model_materialization_disabled_does_not_inspect_or_require_factory(model_materialization, monkeypatch):
+    control = model_materialization
+    case = control.case
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_ENV)
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_SHA_ENV)
+    _materialization_load(control.model, control.adapter, control.config, control.dims, control.mesh)
+    assert case.control.events == [("checkpoint_load", control.model, control.config, control.dims)]
+
+
+def test_model_materialization_selected_without_owning_factory_refuses_load(model_materialization):
+    control = model_materialization
+    with pytest.raises(ValueError, match="active owning model factory"):
+        _materialization_load(control.model, control.adapter, control.config, control.dims, control.mesh)
+    assert control.case.control.events == []
+
+
+@pytest.mark.parametrize("damage", ["buffer", "recipe", "loader_defaults"])
+def test_model_materialization_provider_drift_never_calls_checkpoint_loader(model_materialization, damage):
+    case = model_materialization.case
+    case.control.request["capacity_request"]["materialization_damage"] = damage
+    case.publish()
+    with pytest.raises(ValueError, match="capacity verifier changed"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_load"]
+
+
+def test_model_materialization_capacity_rejection_never_calls_checkpoint_loader(model_materialization):
+    case = model_materialization.case
+    case.control.request["capacity_request"]["fail_phase"] = "before-model-materialization"
+    case.publish()
+    with pytest.raises(RuntimeError, match="before-model-materialization"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_load"]
+
+
+def test_model_materialization_observation_cannot_change_inventory_snapshot(model_materialization):
+    case = model_materialization.case
+    case.control.request["capacity_request"]["materialization_damage"] = "empty_inventory"
+    case.publish()
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert worker.loaded.model is model_materialization.model
+    assert len([event for event in case.control.events if event[0] == "checkpoint_load"]) == 1
+
+
+@pytest.mark.parametrize(
+    "damage", ["parameter_identity", "buffer_identity", "factory_binding", "worker_config", "model_spec"]
+)
+def test_model_materialization_identity_drift_refuses_checkpoint_load(model_materialization, monkeypatch, damage):
+    case = model_materialization.case
+    monkeypatch.setattr(case.factory, "build_model", case.factory.build_model)
+    monkeypatch.setattr(case.factory, "_materialization_selected_spec", case.spec, raising=False)
+    case.control.request["capacity_request"]["materialization_damage"] = damage
+    case.publish()
+    with pytest.raises(ValueError, match="capacity verifier changed"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_load"]
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_model_materialization_retained_identities_preserve_selected_recipe(
+    model_materialization, model_constructor_frame_binding, wrapped
+):
+    control = model_materialization
+    case = control.case
+    if wrapped:
+        model_constructor_frame_binding.install()
+    case.control.request["verify_capacity"]["name"] = "_materialization_capacity"
+    case.publish()
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    subject = next(
+        event[2] for event in case.control.events if event[:2] == ("capacity", "before-model-materialization")
+    )
+    inventory = subject["native_inventory"]
+    assert inventory["parameters"][0]["tensor"]["object_id"] == f"tensor:{id(control.model.weight):x}"
+    assert inventory["buffers"][0]["tensor"]["object_id"] == f"tensor:{id(control.model.scratch):x}"
+    assert inventory["modules"][0]["object_id"] == f"module:{id(control.model):x}"
+    assert inventory["capacity_admitted"] is inventory["runtime_admitted"] is False
+    assert subject["model_spec"] is case.spec and subject["native_config"] is case.config
+    assert subject["parallel_groups"] is case.groups
+    assert worker.loaded.model is control.model and control.model.weight.device.type == "meta"
+    assert case.spec.dtype == "bfloat16" and case.config == {"original_recipe": True}
+    assert [event for event in case.control.events if event[0] == "checkpoint_load"] == [
+        ("checkpoint_load", control.model, control.config, control.dims)
+    ]
+    assert hooks._MODEL_CONSTRUCTOR_FRAME.get() is None
+
+
+def test_model_materialization_production_hook_precedes_adapter_load():
+    path = Path(__file__).resolve().parents[2] / "model/implementations/moe/deepspeed_integration.py"
+    module = ast.parse(path.read_text())
+    setup = next(
+        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "setup_model_local_no_train"
+    )
+    calls = [node.value for node in setup.body if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)]
+    observation = next(
+        call
+        for call in calls
+        if isinstance(call.func, ast.Name) and call.func.id == "maybe_observe_model_materialization"
+    )
+    load = next(
+        call for call in calls if isinstance(call.func, ast.Attribute) and call.func.attr == "load_dcp_from_hf"
+    )
+    assert calls.index(observation) + 1 == calls.index(load)
+    assert [argument.id for argument in observation.args] == ["model", "adapter", "config", "parallel_dims", "ep_mesh"]
+
+
+# Selected checkpoint reader observation.
+
+
+class _CheckpointObservationReader:
+    def __init__(self):
+        self.path = "/synthetic/selected-cache"
+        self.thread_count = 1
+        self.storage_data = {"weight": {"file": "model.safetensors", "shape": [2, 3]}}
+        self.result = object()
+        self.failure = None
+
+    def read_data(self, plan, planner):
+        _INITIALIZATION_EVENTS.append(("checkpoint_read", self, plan, planner))
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+
+class _CheckpointObservationPlanner:
+    def __init__(self, state_dict):
+        self.state_dict = dict(state_dict)
+
+    def resolve_tensor(self, item):
+        raise AssertionError("observation must not resolve destination tensors")
+
+    def commit_tensor(self, item, tensor):
+        raise AssertionError("observation must not commit destination tensors")
+
+    def finish_plan(self, plan):
+        return plan
+
+
+def _checkpoint_observation_load(model, state_dict, config, parallel_dims):
+    reader = _CheckpointObservationReader()
+    if config.reader_failure:
+        reader.failure = KeyboardInterrupt("synthetic checkpoint payload interruption")
+    reader = hooks.maybe_observe_checkpoint_reader(reader, model, state_dict, config, parallel_dims)
+    plan = SimpleNamespace(items=[SimpleNamespace(source="weight", offsets=[0, 0], lengths=[2, 3])])
+    planner = _CheckpointObservationPlanner(state_dict)
+    config.read_result = reader.read_data(plan, planner)
+    config.actual_reader = reader
+    if config.repeat:
+        reader.read_data(plan, planner)
+
+
+def _checkpoint_observation_capacity(request, *, phase, subject, runtime):
+    result = _initialization_capacity(request, phase=phase, subject=subject, runtime=runtime)
+    if phase != "before-checkpoint-read":
+        return result
+    damage = request.get("reader_damage")
+    if damage == "plan":
+        subject["load_plan"].items.clear()
+    elif damage == "files":
+        subject["reader"].storage_data.clear()
+    elif damage == "threads":
+        subject["reader"].thread_count = 2
+    elif damage == "model":
+        subject["model"].weight = nn.Parameter(torch.empty_like(subject["model"].weight))
+    elif damage == "destinations":
+        subject["checkpoint_destinations"]["weight"] = torch.zeros(2, 3)
+    elif damage == "planner":
+        subject["planner"].state_dict = dict(subject["planner"].state_dict)
+    elif damage == "inventory":
+        subject["native_inventory"].clear()
+    elif damage == "planner_defaults":
+        subject["planner"].resolve_tensor.__func__.__defaults__ = (None,)
+    elif damage == "planner_keyword_defaults":
+        subject["planner"].commit_tensor.__func__.__kwdefaults__ = {"tensor": None}
+    elif damage == "reader_defaults":
+        type(subject["reader"]).read_data.__defaults__ = (None,)
+    return result
+
+
+@pytest.fixture
+def checkpoint_observation(model_factory_initialization, monkeypatch):
+    from arctic_platform.model.implementations.debug import gpu_memory
+
+    case = model_factory_initialization
+    model = _MaterializationModel()
+    model.to_empty(device="cpu")
+    state_dict = {"weight": model.weight.detach()}
+    config = SimpleNamespace(reader_failure=False, repeat=False)
+    dims = SimpleNamespace(ep=2)
+    case.loaded.model = model
+    case.control.request["admitted_sources"].update(source_files(gpu_memory, _MaterializationModel))
+    case.control.request["verify_capacity"]["name"] = "_checkpoint_observation_capacity"
+    case.publish()
+
+    def select_loader(ctx):
+        def load(actual):
+            assert actual is ctx
+            _checkpoint_observation_load(model, state_dict, config, dims)
+            return case.loaded
+
+        return load
+
+    monkeypatch.setattr(case.factory, "select_loader", select_loader)
+    return SimpleNamespace(case=case, model=model, state_dict=state_dict, config=config, dims=dims)
+
+
+def test_checkpoint_observation_supplies_materialized_storage_and_preserves_original_result(checkpoint_observation):
+    control = checkpoint_observation
+    case = control.case
+    worker = _ModelFactoryWorker(case.config, case.spec, case.groups)
+    events = [event for event in case.control.events if event[0] in ("capacity", "checkpoint_read")]
+    assert [event[1] for event in events[:2]] == ["before-build-model", "before-checkpoint-read"]
+    subject = events[1][2]
+    assert subject["worker"] is worker and subject["model"] is control.model
+    assert subject["load_plan"] is events[2][2] and subject["planner"] is events[2][3]
+    assert control.config.read_result is control.config.actual_reader.result
+    inventory = subject["native_inventory"]
+    parameter = inventory["parameters"][0]["tensor"]
+    destination = inventory["checkpoint_destinations"]["weight"]
+    assert parameter["object_id"] != destination["object_id"]
+    assert parameter["storage"]["storage_id"] == destination["storage"]["storage_id"]
+    assert inventory["buffers"] and inventory["capacity_admitted"] is False
+    assert subject["reader"].read_data.__func__ is not _CheckpointObservationReader.read_data
+
+
+def test_checkpoint_observation_disabled_preserves_instance_without_factory(checkpoint_observation, monkeypatch):
+    control = checkpoint_observation
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_ENV)
+    monkeypatch.delenv(hooks.MODEL_CONSTRUCTION_SHA_ENV)
+    reader = _CheckpointObservationReader()
+    assert hooks.maybe_observe_checkpoint_reader(reader, object(), {}, object(), object()) is reader
+    assert "read_data" not in vars(reader) and control.case.control.events == []
+
+
+@pytest.mark.parametrize("damage", ["plan", "files", "threads", "model", "destinations", "planner"])
+def test_checkpoint_observation_callback_drift_refuses_original_read(checkpoint_observation, damage):
+    case = checkpoint_observation.case
+    case.control.request["capacity_request"]["reader_damage"] = damage
+    case.publish()
+    with pytest.raises(ValueError):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_read"]
+
+
+def test_checkpoint_observation_callback_inventory_is_an_independent_copy(checkpoint_observation):
+    control = checkpoint_observation
+    case = control.case
+    case.control.request["capacity_request"]["reader_damage"] = "inventory"
+    case.publish()
+    _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert control.config.read_result is control.config.actual_reader.result
+    assert len([event for event in case.control.events if event[0] == "checkpoint_read"]) == 1
+
+
+def test_checkpoint_observation_rejection_does_not_read_payload(checkpoint_observation):
+    case = checkpoint_observation.case
+    case.control.request["capacity_request"]["fail_phase"] = "before-checkpoint-read"
+    case.publish()
+    with pytest.raises(RuntimeError, match="before-checkpoint-read"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_read"]
+
+
+def test_checkpoint_observation_original_exception_identity_is_preserved(checkpoint_observation):
+    control = checkpoint_observation
+    case = control.case
+    control.config.reader_failure = True
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    reads = [event for event in case.control.events if event[0] == "checkpoint_read"]
+    assert len(reads) == 1 and caught.value is reads[0][1].failure
+
+
+def test_checkpoint_observation_reader_is_single_use(checkpoint_observation):
+    control = checkpoint_observation
+    case = control.case
+    control.config.repeat = True
+    with pytest.raises(ValueError, match="single-use"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert len([event for event in case.control.events if event[0] == "checkpoint_read"]) == 1
+
+
+def test_checkpoint_observation_production_call_wraps_only_created_reader():
+    path = Path(__file__).resolve().parents[2] / "model/implementations/qwen35/model_builder.py"
+    module = ast.parse(path.read_text())
+    load = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "load_dcp_from_hf")
+    call = next(
+        node for node in ast.walk(load) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dcp_load"
+    )
+    reader = next(keyword.value for keyword in call.keywords if keyword.arg == "storage_reader")
+    assert reader.func.id == "maybe_observe_checkpoint_reader"
+    assert reader.args[0].func.id == "HuggingFaceStorageReader"
+    assert [argument.id for argument in reader.args[1:]] == ["model", "state_dict", "config", "parallel_dims"]
+
+
+@pytest.mark.parametrize("damage", ["planner_defaults", "planner_keyword_defaults", "reader_defaults"])
+def test_checkpoint_observation_method_default_drift_refuses_read(checkpoint_observation, monkeypatch, damage):
+    control = checkpoint_observation
+    case = control.case
+    monkeypatch.setattr(_CheckpointObservationPlanner.resolve_tensor, "__defaults__", None)
+    monkeypatch.setattr(_CheckpointObservationPlanner.commit_tensor, "__kwdefaults__", None)
+    monkeypatch.setattr(_CheckpointObservationReader.read_data, "__defaults__", None)
+    case.control.request["capacity_request"]["reader_damage"] = damage
+    case.publish()
+    with pytest.raises(ValueError, match="checkpoint (planner|reader)"):
+        _ModelFactoryWorker(case.config, case.spec, case.groups)
+    assert not [event for event in case.control.events if event[0] == "checkpoint_read"]
+
+
+def test_checkpoint_observation_existing_instance_wrapper_is_not_replaced(checkpoint_observation):
+    control = checkpoint_observation
+    case = control.case
+    reader = _CheckpointObservationReader()
+    foreign = object()
+    reader.read_data = foreign
+
+    def load(model, state_dict, config, parallel_dims):
+        return hooks.maybe_observe_checkpoint_reader(reader, model, state_dict, config, parallel_dims)
+
+    with pytest.raises(ValueError, match="unwrapped selected reader"):
+        load(control.model, control.state_dict, control.config, control.dims)
+    assert reader.read_data is foreign and case.control.events == []

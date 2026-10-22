@@ -19,14 +19,16 @@
 
 Sequence parallelism (SP) partitions one logical replica's packed tokens in
 actual process-group order. Logprobs, not vocabulary logits, are gathered before
-the unchanged loss runs on the full logical replica. Native dispatch does not
-select this adapter automatically; the caller must admit the selected engine's
-SP gradient sum / logical data-parallel average and constructor capacity.
+the unchanged loss runs on the full logical replica. Workers select this adapter
+only for the supported GRPO route and native ZeRO2 group settings. Installed
+source admission and constructor capacity remain the operational caller's work.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
 
 import torch
 import torch.distributed as dist
@@ -137,23 +139,26 @@ def prepare_token_partition(
     tensors.pop("attention_mask")
     if "position_ids" not in tensors:
         tensors["position_ids"] = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
-    if "labels" not in tensors:
-        labels = torch.full_like(ids, -100)
-        labels[:, :-1] = ids[:, 1:]
-        next_valid = torch.zeros_like(mask)
-        next_valid[:, :-1] = mask[:, 1:]
-        tensors["labels"] = labels.masked_fill(~next_valid, -100)
     for name, value in tensors.items():
         if not torch.is_tensor(value) or value.ndim < 2 or value.shape[:2] != ids.shape:
             raise ValueError(f"SP token field {name!r} must have leading input_ids shape")
         if value.device != ids.device:
             raise ValueError(f"SP token field {name!r} must be on the input_ids device")
     for name in ("labels", "position_ids"):
+        if name not in tensors:
+            continue
         value = tensors[name]
         if value.shape != ids.shape or value.dtype not in (torch.int32, torch.int64):
             raise ValueError(f"SP {name} must be a 2D integer tensor")
     if bool((tensors["position_ids"][mask] < 0).any().item()):
         raise ValueError("SP valid-token positions must be nonnegative")
+    if "labels" not in tensors:
+        labels = torch.full_like(ids, -100)
+        labels[:, :-1] = ids[:, 1:]
+        next_valid = torch.zeros_like(mask)
+        # A position reset begins another document, even inside a padded row.
+        next_valid[:, :-1] = mask[:, 1:] & (tensors["position_ids"][:, 1:] != 0)
+        tensors["labels"] = labels.masked_fill(~next_valid, -100)
     loss_mask = tensors.get("loss_mask")
     if loss_mask is not None:
         if loss_mask.shape != ids.shape or not bool(torch.isfinite(loss_mask).all().item()):
@@ -271,30 +276,8 @@ class _TokenLocalEngine:
         return self.engine.backward(loss / len(self.partition.ranks), scale_wrt_gas=scale_wrt_gas)
 
 
-def run_sequence_parallel_grpo(
-    engine,
-    batch: dict,
-    meta: dict,
-    processing: dict,
-    device: str,
-    *,
-    sp_info: dict,
-    sp_group,
-    backward: bool = True,
-    loss_object=None,
-) -> dict:
-    """Run the selected token-mean GRPO route without changing its loss recipe.
-
-    Consume one full logical-DP microbatch already assigned to this actual SP
-    group. Only native model inputs are token local; the existing run_pipeline
-    sees gathered logprobs and the complete packed logical loss context. Requires
-    a selected SP engine whose dense/expert gradient reduction sums sequence
-    contributions and averages logical DP replicas. This source adapter is not
-    installed-runtime, native-capacity, router-application or numerical proof.
-    """
-    from arctic_platform.rl.processors import run_pipeline
-    from arctic_platform.rl.processors.base_loss import resolve_loss
-
+def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: bool) -> None:
+    """Reject unsupported objectives before dispatching any token-local model."""
     config = processing.get("config") or {}
     if (
         type(backward) is not bool
@@ -306,10 +289,98 @@ def run_sequence_parallel_grpo(
         or any(name in meta for name in TOKEN_FIELDS | {"cu_seqlens", "fwd_meta_keys", "action_masks"})
     ):
         raise ValueError("SP adapter supports only the selected compute_logprobs/token-mean grpo route")
+
+
+def verify_sequence_parallel_reduction(engine, *, sp_info: dict, sp_group) -> None:
+    """Bind the selected ZeRO2 sequence sum / logical-DP average group settings.
+
+    This checks live objects, not installed source equality. The owner must admit
+    the selected engine, reducer and group implementations before a native run.
+    """
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    rank, world, ranks, local = _membership(sp_info)
+    _check_group(TokenPartition(rank, world, ranks, local, len(ranks), (1, len(ranks))), sp_group)
+    optimizer = getattr(engine, "optimizer", None)
+    if (
+        type(optimizer) is not DeepSpeedZeroOptimizer
+        or engine.zero_optimization_stage() != 2
+        or engine.sequence_parallel_size != len(ranks)
+        or optimizer.sequence_parallel_size != len(ranks)
+        or not optimizer.partition_gradients
+        or not optimizer.reduce_scatter
+        or not optimizer.postscale_gradients
+        or optimizer.gradient_predivide_factor != 1.0
+        or optimizer.dp_process_group is not engine.seq_data_parallel_group
+        or set(dist.get_process_group_ranks(optimizer.dp_process_group)) != set(range(world))
+        or dist.get_world_size(optimizer.dp_process_group) != world
+    ):
+        raise ValueError("SP backward requires the selected native ZeRO2 sequence-sum/logical-DP-average reducer")
+
+
+def collect_sequence_parallel_results(results: list[dict], *, worker_sp_info: list[dict], sp_size: int) -> list[dict]:
+    """Keep one replicated logical result per actual SP group, in shard order."""
+    from .batch import sequence_parallel_worker_groups
+
+    groups = sequence_parallel_worker_groups(worker_sp_info, len(worker_sp_info), sp_size)
+    if len(results) != len(worker_sp_info) or any(
+        not isinstance(result, dict) or result.get("_sequence_parallel_info") != info
+        for result, info in zip(results, worker_sp_info)
+    ):
+        raise ValueError("SP result membership differs from its dispatched worker")
+    sequence_parallel_worker_groups([result["_sequence_parallel_info"] for result in results], len(results), sp_size)
+    # Each worker gathered the same complete logprobs and evaluated the full
+    # logical objective. Summing these replicas would multiply loss/counts by SP.
+    return [
+        {key: value for key, value in results[group[0]].items() if key != "_sequence_parallel_info"}
+        for group in groups
+    ]
+
+
+def run_sequence_parallel_grpo(
+    engine,
+    batch: dict,
+    meta: dict,
+    processing: dict,
+    device: str,
+    *,
+    sp_info: dict,
+    sp_group,
+    backward: bool = True,
+    loss_object=None,
+    loss_scale: float = 1.0,
+) -> dict:
+    """Run the selected token-mean GRPO route without changing its loss recipe.
+
+    Consume one full logical-DP microbatch already assigned to this actual SP
+    group. Only native model inputs are token local; the existing run_pipeline
+    sees gathered logprobs and the complete packed logical loss context. Requires
+    a selected SP engine whose dense/expert gradient reduction sums sequence
+    contributions and averages logical DP replicas. This source adapter is not
+    installed-runtime, native-capacity, router-application or numerical proof.
+    """
+    from arctic_platform.rl.processors import apply_packed_loss_reduction
+    from arctic_platform.rl.processors import run_pipeline
+    from arctic_platform.rl.processors.base_loss import resolve_loss
+
+    validate_sequence_parallel_grpo(meta, processing, backward=backward)
+    if (
+        isinstance(loss_scale, bool)
+        or not isinstance(loss_scale, Real)
+        or not math.isfinite(loss_scale)
+        or loss_scale < 0
+    ):
+        raise ValueError("SP packed loss scale must be finite and nonnegative")
     _, packed, mask, cu, part = prepare_token_partition(batch, sp_info=sp_info)
     _check_group(part, sp_group)
     logical_dp = part.world_size // len(part.ranks)
-    if meta.get("dp_size", logical_dp) != logical_dp:
+    configured_dp = (processing.get("config") or {}).get("dp_size")
+    meta_dp = meta.get("dp_size", logical_dp)
+    if (
+        type(meta_dp) is not int
+        or meta_dp != logical_dp
+        or (configured_dp is not None and (type(configured_dp) is not int or configured_dp != logical_dp))
+    ):
         raise ValueError("SP meta dp_size does not match actual logical-DP membership")
     loss_object = resolve_loss("grpo") if loss_object is None else loss_object
     adapter = _TokenLocalEngine(engine, part, sp_group)
@@ -320,11 +391,13 @@ def run_sequence_parallel_grpo(
         {**meta, "cu_seqlens": cu, "dp_size": logical_dp},
         processing,
         device,
-        backward=backward,
+        backward="loss_only" if backward else False,
         pack=False,
         return_tensors=True,
         loss_object=loss_object,
     )
+    if backward:
+        apply_packed_loss_reduction(adapter, result.pop("loss_tensor"), loss_scale, backward=True)
     _check_group(part, sp_group)
     result["batch"] = {name: restore_token_rows(value, mask) for name, value in result.get("batch", {}).items()}
     return result

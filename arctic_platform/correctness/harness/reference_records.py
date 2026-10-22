@@ -66,10 +66,11 @@ def _file_hash(path: str, size: int, mtime_ns: int, ctime_ns: int, inode: int) -
     return digest.hexdigest()
 
 
-def file_identity(path: Path | str) -> dict:
+def file_identity(path: Path | str, *, refresh: bool = False) -> dict:
     path = Path(path)
     stat = path.stat()
-    sha = _file_hash(str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+    hash_file = _file_hash.__wrapped__ if refresh else _file_hash
+    sha = hash_file(str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
     current = path.stat()
     stable_fields = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
     if any(getattr(current, name) != getattr(stat, name) for name in stable_fields):
@@ -77,7 +78,7 @@ def file_identity(path: Path | str) -> dict:
     return {"sha256": sha, "size": stat.st_size}
 
 
-def model_identity(path: Path | str) -> dict:
+def model_identity(path: Path | str, *, refresh: bool = False) -> dict:
     """Hash asset contents, not machine-specific roots or file sizes alone."""
     from .config import NON_MODEL_PROCESSOR_SIDECARS
 
@@ -85,7 +86,7 @@ def model_identity(path: Path | str) -> dict:
     if not root.is_dir():
         raise ReferencePrerequisiteError(f"reference model assets unavailable: {root}")
     assets = {
-        str(item.relative_to(root)): file_identity(item)
+        str(item.relative_to(root)): file_identity(item, refresh=refresh)
         for item in sorted(root.rglob("*"))
         if item.is_file()
         and item.suffix in {".json", ".safetensors", ".bin", ".model", ".tiktoken", ".txt", ".py"}

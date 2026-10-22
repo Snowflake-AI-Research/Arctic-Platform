@@ -48,8 +48,10 @@ def render(args: argparse.Namespace) -> str:
         " build_batch, save as save_batch\nfrom arctic_platform.correctness.harness.runner import run_reference\nfrom"
         " arctic_platform.correctness.harness.batches import SEED\nfrom arctic_platform.correctness.harness.config"
         " import hash_directory\nfrom arctic_platform.correctness.onboarding.synth_model import"
-        " materialize_pretrained\n\nSOURCE_PATH = __SOURCE__\nLAYERS = __LAYERS__\nMODEL_PATH = __MODEL__\nOUTPUT ="
-        " Path(__OUTPUT__)\nSPEC_PATH = Path(__SPEC_PATH__)\nTEST_ID = __TEST_ID__\nCONFIG_CHECKSUM ="
+        " materialize_pretrained\nfrom arctic_platform.correctness.harness.storage import"
+        " correctness_workdir, require_data_fast_path\n\nSOURCE_PATH = __SOURCE__\nLAYERS = __LAYERS__\nMODEL_PATH ="
+        " __MODEL__\nOUTPUT = Path(__OUTPUT__)\nWORK_DIR = __WORK_DIR__\nSPEC_PATH ="
+        " Path(__SPEC_PATH__)\nTEST_ID = __TEST_ID__\nCONFIG_CHECKSUM ="
         " __CONFIG_CHECKSUM__\nRUNS = 16\nTOKENS = __TOKENS__\nREFERENCE_TOKEN_BUDGET ="
         ' __REFERENCE_TOKEN_BUDGET__\nGATE_QUANTUM = Decimal("0.001")\n# How far above the run-to-run variation the'
         " calibrated gate sits. Sixteen calibration runs measure the\n# tail imperfectly: on the CPU-offloaded"
@@ -75,7 +77,10 @@ def render(args: argparse.Namespace) -> str:
         ' "text_config", model_cfg)\n    layer_types = list(getattr(inner, "layer_types", ["full_attention"] *'
         ' int(inner.num_hidden_layers)))\n    batch = build_batch("gas1", 1, TOKENS, inner.vocab_size, seed=SEED)\n   '
         ' print(f"determinism: off, {RUNS} independent processes", flush=True)\n    run_dir = OUTPUT.parent /'
-        ' "calibration-runs"\n    run_dir.mkdir(parents=True, exist_ok=True)\n    batch_path = run_dir / "batch.pt"\n '
+        ' "calibration-runs"\n    run_dir.mkdir(parents=True, exist_ok=True)\n    tensor_dir = (\n'
+        '        require_data_fast_path(WORK_DIR, label="gradient calibration tensors")\n'
+        '        if WORK_DIR is not None else correctness_workdir("reference-calibration-")\n'
+        '    )\n    batch_path = tensor_dir / "batch.pt"\n '
         "   save_batch(batch, batch_path)\n    lanes = max(1, min(RUNS, torch.cuda.device_count()))\n\n    def"
         " one_run(index: int) -> tuple[int, float, dict]:\n        started = time.monotonic()\n        result ="
         " run_reference(\n            MODEL_PATH,\n            batch_path,\n            run_dir /"
@@ -119,7 +124,7 @@ def render(args: argparse.Namespace) -> str:
         " OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n    OUTPUT.write_text(json.dumps(payload, indent=2,"
         ' sort_keys=True) + "\\n")\n    print(f"loss range: {payload[\'loss_range\']:.9e}")\n    print(f"raw'
         ' variation: {raw_variation:.9e}")\n    print(f"computed {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")\n'
-        "    print(f\"selected gate: {selected_gate:.9e}\")\n    print(f\"{'tensor':64} {'minimum':>13}"
+        "    print(f\"selected gate: {selected_gate:.9e}\")\n    print(f\"{'weight':64} {'minimum':>13}"
         " {'maximum':>13} {'range':>13}\")\n    for row in ranges[:10]:\n        print(f\"{row['name']:64}"
         " {row['minimum']:>13.9f} {row['maximum']:>13.9f} {row['range']:>13.6e}\")\n\n    spec ="
         ' json.loads(SPEC_PATH.read_text())\n    spec.setdefault("test_tolerances", {})[TEST_ID] = {\n       '
@@ -136,6 +141,7 @@ def render(args: argparse.Namespace) -> str:
         "__LAYERS__": str(args.layers),
         "__MODEL__": repr(str(args.model_path)),
         "__OUTPUT__": repr(str(args.output_json)),
+        "__WORK_DIR__": repr(str(args.work_dir)) if getattr(args, "work_dir", None) is not None else "None",
         "__SPEC_PATH__": repr(str(args.test_spec)),
         "__TEST_ID__": repr(args.test_id),
         "__CONFIG_CHECKSUM__": repr(frozen_config_checksum),
@@ -163,6 +169,9 @@ def main() -> int:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-script", type=Path, required=True)
+    parser.add_argument(
+        "--work-dir", type=Path, help="Tensor scratch directory under /data-fast (allocated automatically)"
+    )
     parser.add_argument("--test-spec", type=Path, required=True)
     parser.add_argument("--test-id", default="single-step-grads")
     parser.add_argument("--tokens", type=int)

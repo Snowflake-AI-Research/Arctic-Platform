@@ -1879,7 +1879,11 @@ def _save_local_snapshot(
         _native_sources(expected_native_layout)
         model, shards, expert_files = _native_checkpoint_files(root, expected_native_layout)
     if model.parent != root / tag or len(shards) != expected_dp_world_size:
-        raise ValueError("local optimizer checkpoint has incorrect tag or DP shard count")
+        raise ValueError(
+            "local optimizer checkpoint metadata mismatch: "
+            f"expected tag={tag!r}, observed tag={model.parent.relative_to(root).as_posix()!r}; "
+            f"expected DP shard count={expected_dp_world_size}, observed DP shard count={len(shards)}"
+        )
     if any(path.stat().st_size == 0 for path in [model, *shards, *expert_files]):
         raise ValueError("local optimizer checkpoint contains empty tensor files")
     return root

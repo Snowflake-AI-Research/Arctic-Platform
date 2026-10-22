@@ -132,6 +132,7 @@ def main() -> None:
                 "skipped_no_grad": result.skipped_no_grad,
                 "optimizer_state_manifest": result.optimizer_state_manifest,
                 "optimizer_gradient_norm": result.optimizer_gradient_norm,
+                "reference_execution": result.reference_execution,
             }
         )
     )

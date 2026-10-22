@@ -383,7 +383,7 @@ class CorrectnessCortexTransport(CortexTransport):
                 )
             self._validate_native_api(client_config)
         jobs = super().initialize(client_config)
-        if self._native_gateway:
+        if self._native_children:
             for role, gateway_role in _NATIVE_ROLES.items():
                 token = getattr(jobs, role)
                 if token is not None:
@@ -446,13 +446,13 @@ class CorrectnessCortexTransport(CortexTransport):
             await self._local_session()
         if method == "POST" and url == self._prefix:
             payload = dict(kwargs["json"])
-            if getattr(self, "_native_gateway", False):
+            if self._is_local_gateway():
                 children = {}
                 configs = []
                 for sub in payload["sub_job_configs"]:
                     role = sub.get("job_type")
                     if role not in _NATIVE_ROLES.values() or role in children or sub.get("job_id") is not None:
-                        raise ValueError("local native forward requires one fresh public job config per role")
+                        raise ValueError("local gateway requires one fresh public job config per role")
                     child = str(uuid4())
                     children[role] = child
                     configs.append({**sub, "job_id": child})
@@ -480,13 +480,32 @@ class CorrectnessCortexTransport(CortexTransport):
         return result
 
     def _native_request(self, request):
+        if request.op == "save":
+            from .hosted import require_local_cortex_gateway
+
+            require_local_cortex_gateway(self.config)
         binding = self._native_bindings.get(str(request.job_id))
         if self.job_id is None or binding is None:
             raise ValueError("local native request must target this client's owned child job")
         role, child = binding
-        allowed = {"training"} if request.op == "forward" else {"log_prob", "sampling"}
+        allowed = {"training"} if request.op in {"forward", "save"} else {"log_prob", "sampling"}
         if role not in allowed:
             raise ValueError(f"local native {request.op} cannot target a {role} child job")
+        if request.op == "save":
+            body = request.body
+            root = require_data_fast_path(body["path"], label="local checkpoint save")
+            if (
+                str(root) != body["path"]
+                or body.get("checkpoint_type") not in {"resumable", "weights-only"}
+                or body.get("checkpoint_id") is not None
+                or body.get("stage_info") is not None
+                or body.get("step") is not None
+                or body.get("export_hf")
+                or body.get("save_total_limit") is not None
+            ):
+                raise ValueError("local checkpoint save requires a canonical path and native save options")
+            url = f"{self.config.base_url.rstrip('/')}/save-checkpoint?{urlencode({'job_id': child})}"
+            return url, {"json": {"path": str(root), "checkpoint_type": body["checkpoint_type"]}}
         url = f"{self.config.base_url.rstrip('/')}/{request.op}?{urlencode({'job_id': child})}"
         body = {key: value for key, value in request.body.items() if value is not None}
         if request.op == "forward":
@@ -494,23 +513,29 @@ class CorrectnessCortexTransport(CortexTransport):
         return url, {"json": body}
 
     def _native_result(self, request, payload):
-        result = wire.loads(payload)
+        result = json.loads(payload) if request.op == "save" else wire.loads(payload)
         if not isinstance(result, dict):
-            raise ValueError("local native gateway response must be a DSSST1 object")
+            raise ValueError("local native gateway response must be an object")
         child = self._native_bindings[str(request.job_id)][1]
         if "job_id" in result and result["job_id"] != child:
             raise ValueError("local native gateway response names a different child job")
         return result
 
+    def _uses_native_route(self, request) -> bool:
+        # SnowAPI saves choose their own directory; only the native route accepts a local path.
+        if request.op == "save" and request.body.get("path") is not None and self._is_local_gateway():
+            return True
+        return getattr(self, "_native_gateway", False) and request.op in {"forward", "log-probs"}
+
     def call(self, request) -> dict:
-        if not getattr(self, "_native_gateway", False) or request.op not in {"forward", "log-probs"}:
+        if not self._uses_native_route(request):
             return super().call(request)
         url, kwargs = self._native_request(request)
         payload = self._on_loop(self._native_http("POST", url, **kwargs)).result()
         return self._native_result(request, payload)
 
     async def acall(self, request) -> dict:
-        if not getattr(self, "_native_gateway", False) or request.op not in {"forward", "log-probs"}:
+        if not self._uses_native_route(request):
             return await super().acall(request)
         url, kwargs = self._native_request(request)
         payload = await asyncio.wrap_future(self._on_loop(self._native_http("POST", url, **kwargs)))
@@ -633,16 +658,30 @@ class CorrectnessCortexTransport(CortexTransport):
             time.sleep(min(interval, remaining))
 
     def shutdown(self) -> None:
+        primary = None
         try:
             parent = getattr(self, "_local_shutdown_parent", None)
             if parent is not None and self._is_local_gateway():
                 self._wait_local_cancelled(parent)
             else:
                 super().shutdown()
+        except BaseException as error:
+            primary = error
+            if parent is not None:
+                error.add_note(
+                    f"Local gateway cancellation was not verified for owned parent {parent!r}; "
+                    f"owned children: {self._local_shutdown_children!r}"
+                )
+            raise
         finally:
             self.job_id = None
             self._native_children = {}
             self._native_bindings = {}
             self._local_shutdown_parent = None
             self._local_shutdown_children = {}
-            self._on_loop(self._close_session()).result()
+            try:
+                self._on_loop(self._close_session()).result()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                primary.add_note(f"HTTP session closure also failed: {type(error).__name__}: {error}")

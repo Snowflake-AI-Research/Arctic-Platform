@@ -76,6 +76,7 @@ _MANIFEST_FIELDS = ("shape", "dtype", "numel", "sha256")
         "written, element for element, with what it received"
     ),
     compares_to_reference=False,
+    workload_modes=("rl",),
 )
 def run(ctx) -> List[TestResult]:
     try:

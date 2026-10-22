@@ -183,6 +183,9 @@ onboarding_reports/
 # Generated correctness reference records remain local.
 /arctic_platform/correctness/reference_data/
 
+# Demo configs and reports remain local.
+/work/
+
 # Working correctness results and fleet progress remain local.
 /correctness-progress.md
 

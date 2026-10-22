@@ -32,7 +32,10 @@ from arctic_platform.debug.lora_selected_sampler import SHA_ENV
 from arctic_platform.debug.lora_selected_sampler import _bytes
 from arctic_platform.debug.lora_selected_sampler import bootstrap_descriptor
 from arctic_platform.debug.lora_sync_hooks import DIGEST_ENV
+from arctic_platform.debug.lora_sync_hooks import INITIALIZATION_ENV
+from arctic_platform.debug.lora_sync_hooks import INITIALIZATION_SHA_ENV
 from arctic_platform.debug.lora_sync_hooks import REQUEST_ENV
+from arctic_platform.debug.lora_sync_hooks import _initialization_request
 from arctic_platform.debug.lora_sync_hooks import selected_lora_request
 from arctic_platform.debug.weight_sync_evidence import VERIFY_ENV
 from arctic_platform.debug.weight_sync_evidence import source_files
@@ -65,6 +68,22 @@ def _environment(staged):
         PATH_ENV: staged["bootstrap"]["path"],
         SHA_ENV: staged["bootstrap"]["sha256"],
     }
+    if "initialization" in staged:
+        pointer = staged["initialization"]
+        _require(
+            type(pointer) is dict and set(pointer) == {"path", "sha256"},
+            "exact staged initialization pointer required",
+        )
+        settings.update(
+            {INITIALIZATION_ENV: pointer["path"], INITIALIZATION_SHA_ENV: pointer["sha256"]},
+        )
+        selected = _initialization_request(environment=settings)
+        _require(
+            selected is not None
+            and selected[0] == pointer
+            and selected[1]["admitted_sources"] == staged["admitted_sources"],
+            "staged initialization must bind the same complete source closure",
+        )
     _require(staged["environment"] == settings, "staged environment differs from pointers")
     body = bootstrap_descriptor(staged["bootstrap"])
     sources = staged["admitted_sources"]
@@ -96,6 +115,7 @@ def owned_selected_lora_bootstrap(staged, *, cluster, base_environment, staging,
         inspect.unwrap(base_environment),
         original,
         selected_lora_request,
+        _initialization_request,
     )
     _require(observed.items() <= sources.items(), "captured bootstrap sources must be admitted")
     previous = {key: os.environ.get(key) for key in settings}
@@ -162,15 +182,23 @@ def owned_selected_lora_bootstrap(staged, *, cluster, base_environment, staging,
 
     context = None
     entered = False
+    callback_bound = False
+    environment_bound = False
     try:
         guard()
+        _require(
+            cluster._pdsh is original and all(os.environ.get(key) == value for key, value in previous.items()),
+            "captured bootstrap ownership changed before installation",
+        )
         os.environ.update(settings)
+        environment_bound = True
         request = selected_lora_request()
         _require(
             request["training"]["admitted_sources"] == request["sampling"]["admitted_sources"] == sources,
             "actual selected request differs from staged sources",
         )
         cluster._pdsh = launch_peer
+        callback_bound = True
         context = base_environment(staging, cluster=cluster, guard=guard)
         base_receipt = context.__enter__()
         entered = True
@@ -199,21 +227,41 @@ def owned_selected_lora_bootstrap(staged, *, cluster, base_environment, staging,
                     context.__exit__(None, None, None)
                 except BaseException as cleanup_error:
                     if primary is None:
+                        primary = cleanup_error
                         raise
                     primary.add_note("captured bootstrap entry cleanup also failed: " + repr(cleanup_error))
         finally:
-            cluster._pdsh = original
-            report["callback_restored"] = cluster._pdsh is original
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
+            ownership_changes = []
+            if callback_bound:
+                if cluster._pdsh is launch_peer:
+                    cluster._pdsh = original
                 else:
-                    os.environ[key] = value
+                    ownership_changes.append("peer callback")
+            report["callback_restored"] = cluster._pdsh is original
+            if environment_bound:
+                for key, value in previous.items():
+                    if os.environ.get(key) != settings[key]:
+                        ownership_changes.append("environment key " + key)
+                    elif value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
             report["environment_restored"] = all(os.environ.get(key) == value for key, value in previous.items())
+            restoration_error = (
+                ValueError("captured bootstrap ownership changed: " + ", ".join(ownership_changes))
+                if ownership_changes
+                else None
+            )
             try:
                 verify_sources(sources)
                 guard()
             except BaseException as cleanup_error:
                 if primary is None:
+                    if restoration_error is not None:
+                        cleanup_error.add_note(str(restoration_error))
                     raise
                 primary.add_note("final bootstrap source guard also failed: " + repr(cleanup_error))
+            if restoration_error is not None:
+                if primary is None:
+                    raise restoration_error
+                primary.add_note(str(restoration_error))

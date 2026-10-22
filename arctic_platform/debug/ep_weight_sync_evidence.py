@@ -26,6 +26,7 @@ import math
 from dataclasses import dataclass
 from dataclasses import field
 from types import FunctionType
+from typing import Any
 
 from arctic_platform.debug.weight_sync_evidence import source_files
 from arctic_platform.debug.weight_sync_evidence import tensor_manifest
@@ -96,7 +97,7 @@ def global_inventory(records: list[dict]) -> dict:
                     groups.add(tuple(members))
             if sharded:
                 sizes = {len(group) for group in groups}
-                covered = set()
+                covered: set[int] = set()
                 for group in groups:
                     if covered.intersection(group):
                         raise ValueError(f"overlapping or reordered EP group reports: {name}")
@@ -199,7 +200,7 @@ def pack_layer_with_evidence(converter, layer_sd: dict, layer_idx: int, *, layer
         raise ValueError("native converter did not return the actual packing dictionary")
     if before != {name: tensor_manifest(value) for name, value in inputs.items()}:
         raise RuntimeError("converter changed the actual gathered input bytes")
-    coverage = {name: [] for name in inputs}
+    coverage: dict[str, list[tuple[int, int]]] = {name: [] for name in inputs}
     wire = {}
 
     def check(actual, expression, pieces):
@@ -226,7 +227,7 @@ def pack_layer_with_evidence(converter, layer_sd: dict, layer_idx: int, *, layer
     for name, value in output.items():
         if not isinstance(name, str) or not name:
             raise ValueError("converter emitted an empty or non-string wire name")
-        pieces = []
+        pieces: list[dict] = []
         check(value, plan(value), pieces)
         wire[name] = {"manifest": tensor_manifest(value), "pieces": pieces}
     for name, regions in coverage.items():
@@ -486,7 +487,7 @@ def prepare_collective_weights(
         raise ValueError("canonical GLM export requires actual registered parameters")
     verify_sources(sources)
     rank_record = {"rank": rank, "world_size": world, "wire_inputs": names, **local}
-    records = [None] * world
+    records: list[Any] = [None] * world
     dist.all_gather_object(records, rank_record)
     inventory = global_inventory(records)
     by_rank = {record["rank"]: record for record in records}
@@ -522,7 +523,7 @@ def prepare_collective_weights(
         raise ValueError("actual lossless wire inventory exceeds its explicit emitted-weight byte limit")
     weights = []
     manifest = {}
-    packing = []
+    packing: list[dict] = []
     emitted_bytes = 0
     iterator = _observed_iterator(model, builder, converter, packing, wire_sources)
     for name, tensor in iterator:

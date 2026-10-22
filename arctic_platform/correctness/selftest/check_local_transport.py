@@ -184,7 +184,7 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
             if state.failure is not None:
                 raise state.failure
             return _local_cortex_checkpoint_load_response(state.result if state.reply == "inline" else state.submitted)
-        if method == "POST" and url.endswith("/save"):
+        if method == "POST" and (url.endswith("/save") or "/save-checkpoint?job_id=" in url):
             body = kwargs["json"]
             assert body["checkpoint_type"] == "resumable"
             root = require_data_fast_path(body["path"], label="save control basetemp")
@@ -198,7 +198,9 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
                 "stage_path": "",
                 **state.save_extra,
             }
-            return _local_cortex_checkpoint_load_response({"request_id": "save-request"})
+            return _local_cortex_checkpoint_load_response(
+                state.save_result if "/save-checkpoint?job_id=" in url else {"request_id": "save-request"}
+            )
         pytest.fail(f"load controls reached an unexpected HTTP route: {method} {url}")
 
     monkeypatch.setattr(aiohttp.ClientSession, "request", send)
@@ -1062,7 +1064,7 @@ def _local_cortex_forward_native_reply(monkeypatch, reply):
     original = aiohttp.ClientSession.request
 
     def request(session, method, url, **kwargs):
-        if "/forward?job_id=" in url or "/log-probs?job_id=" in url:
+        if any(f"{route}?job_id=" in url for route in ("/forward", "/log-probs", "/save-checkpoint")):
             assert method == "POST"
             assert asyncio.get_running_loop() is session._loop
             assert session.trust_env is False
@@ -1383,7 +1385,7 @@ def test_local_cortex_forward_native_malformed_or_wrong_identity_response_reject
 
 
 @pytest.mark.parametrize("base_url", ["http://127.0.0.1:8003", "http://remote.example"])
-def test_local_cortex_forward_no_opt_in_leaves_public_cortex_unchanged(
+def test_local_cortex_forward_no_opt_in_preserves_public_compute_routes(
     _local_cortex_forward_gateway, monkeypatch, base_url
 ):
     monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
@@ -1407,9 +1409,120 @@ def test_local_cortex_forward_no_opt_in_leaves_public_cortex_unchanged(
     monkeypatch.setattr(CortexTransport, "call", lambda actual, request: {"public": request.op})
     transport.initialize(config)
     assert len(calls) == 1
-    assert all(("job_id" not in sub for sub in calls[0][2]["json"]["sub_job_configs"]))
+    configs = calls[0][2]["json"]["sub_job_configs"]
+    if base_url == "http://127.0.0.1:8003":
+        assert all(str(UUID(sub["job_id"])) == sub["job_id"] for sub in configs)
+    else:
+        assert all("job_id" not in sub for sub in configs)
     assert transport.call(Request("forward", "public-training", {})) == {"public": "forward"}
     assert transport.call(Request("log-probs", "public-log-prob", {})) == {"public": "log-probs"}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_local_cortex_save_automatically_uses_explicit_path_and_owned_native_child(
+    _local_cortex_forward_gateway, monkeypatch, asynchronous
+):
+    calls, _ = _local_cortex_forward_gateway
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
+    config = _local_cortex_forward_client_config()
+    transport = CorrectnessCortexTransport(config.backend)
+    jobs = transport.initialize(config)
+    assert not any(url.endswith("/openapi.json") for _, url, _ in calls)
+    child = transport._native_bindings[str(jobs.training)][1]
+    root = "/data-fast/tmp/correctness-owned-save-control"
+    expected = {"job_id": child, "checkpoint_path": root, "checkpoint_tag": "global_step0", "version": 0}
+    captured = []
+
+    def post(session, url, **kwargs):
+        captured.append((url, kwargs))
+        return _local_cortex_forward_response(expected)
+
+    _local_cortex_forward_native_reply(monkeypatch, post)
+    request = Request("save", jobs.training, {"path": root, "checkpoint_type": "resumable", "export_hf": False})
+    result = asyncio.run(transport.acall(request)) if asynchronous else transport.call(request)
+    assert result == expected
+    url, kwargs = captured[0]
+    assert url == f"http://127.0.0.1:8003/save-checkpoint?job_id={child}"
+    assert kwargs["json"] == {"path": root, "checkpoint_type": "resumable"}
+    assert kwargs["allow_redirects"] is False
+    transport.shutdown()
+    assert transport._native_bindings == {}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"path": "/tmp/not-fast"},
+        {"path": "/data-fast/tmp/../control"},
+        {"checkpoint_type": "unknown"},
+        {"checkpoint_id": "managed-checkpoint"},
+        {"stage_info": {"location": "remote"}},
+        {"step": 1},
+        {"export_hf": True},
+        {"save_total_limit": 1},
+    ],
+)
+def test_local_cortex_save_rejects_unsupported_native_options_before_request(
+    _local_cortex_forward_gateway, monkeypatch, change
+):
+    calls, _ = _local_cortex_forward_gateway
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
+    config = _local_cortex_forward_client_config()
+    transport = CorrectnessCortexTransport(config.backend)
+    jobs = transport.initialize(config)
+    before = len(calls)
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable", **change}
+    with pytest.raises(ValueError):
+        transport.call(Request("save", jobs.training, body))
+    assert len(calls) == before
+    transport.shutdown()
+
+
+@pytest.mark.parametrize("token", ["foreign:training:0", "owned-parent:sampling:0"])
+def test_local_cortex_save_never_reroutes_foreign_or_wrong_role(_local_cortex_forward_gateway, monkeypatch, token):
+    calls, _ = _local_cortex_forward_gateway
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
+    config = _local_cortex_forward_client_config(sampling_gpus=1)
+    transport = CorrectnessCortexTransport(config.backend)
+    transport.initialize(config)
+    before = len(calls)
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    with pytest.raises(ValueError, match="owned child|cannot target"):
+        transport.call(Request("save", token, body))
+    assert len(calls) == before
+    transport.shutdown()
+    with pytest.raises(ValueError, match="owned child"):
+        transport.call(Request("save", "owned-parent:training:0", body))
+
+
+@pytest.mark.parametrize("payload", [b"invalid-json", b"[]", b'{"job_id": "foreign-child"}'])
+def test_local_cortex_save_rejects_malformed_or_wrong_child_response(
+    _local_cortex_forward_gateway, monkeypatch, payload
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
+    config = _local_cortex_forward_client_config()
+    transport = CorrectnessCortexTransport(config.backend)
+    jobs = transport.initialize(config)
+    _local_cortex_forward_native_reply(
+        monkeypatch, lambda *args, **kwargs: _local_cortex_forward_response(data=payload)
+    )
+    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    with pytest.raises(ValueError):
+        transport.call(Request("save", jobs.training, body))
+    transport.shutdown()
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8003", "http://remote.example"])
+def test_local_cortex_save_managed_and_hosted_saves_preserve_public_route(
+    _local_cortex_forward_gateway, monkeypatch, base_url
+):
+    monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV)
+    config = _local_cortex_forward_client_config(CortexConfig(base_url=base_url))
+    transport = CorrectnessCortexTransport(config.backend)
+    body = {"path": None if base_url.startswith("http://127.") else "/data-fast/tmp/control"}
+    request = Request("save", "managed-job", body)
+    monkeypatch.setattr(CortexTransport, "call", lambda actual, supplied: {"public": supplied is request})
+    assert transport.call(request) == {"public": True}
 
 
 def test_local_cortex_forward_native_sync_and_async_forward_share_owned_loop_session_binding_and_wire(
@@ -1790,6 +1903,88 @@ def test_local_cortex_shutdown_poll_network_failure_restores_config_and_closes(_
         transport.shutdown()
     assert len(state.calls) == 2 and state.closed
     assert transport.config is original
+
+
+def test_local_cortex_shutdown_close_failure_preserves_cancellation_error_and_owned_identity(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, original = create(native=True, roles=("training", "sampling", "log_probability"))
+    primary = aiohttp.ClientConnectionError("owned cancellation failed")
+    state.error = primary
+    close = transport._close_session
+
+    async def failing_close():
+        await close()
+        raise RuntimeError("owned session close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(aiohttp.ClientConnectionError) as caught:
+            transport.shutdown()
+
+    assert caught.value is primary
+    assert len(state.calls) == 1 and state.closed
+    assert transport.config is original and transport.job_id is None
+    assert transport._native_bindings == transport._native_children == {}
+    assert transport._local_shutdown_parent is None and transport._local_shutdown_children == {}
+    notes = "\n".join(primary.__notes__)
+    assert "cancellation was not verified" in notes and "owned-parent" in notes
+    for role in ("training", "sampling", "log_prob"):
+        assert f"owned-parent:{role}:0" in notes
+    assert "HTTP session closure also failed: RuntimeError: owned session close failed" in notes
+
+
+def test_local_cortex_shutdown_close_failure_after_cancellation_still_raises(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    close = transport._close_session
+    failure = RuntimeError("owned session close failed")
+
+    async def failing_close():
+        await close()
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(RuntimeError) as caught:
+            transport.shutdown()
+
+    assert caught.value is failure
+    assert not getattr(failure, "__notes__", [])
+    assert len(state.calls) == 2 and state.closed
+    assert transport.job_id is None and transport._local_shutdown_parent is None
+
+
+def test_local_cortex_shutdown_interruption_preserves_ownership_when_session_close_fails(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    primary = KeyboardInterrupt("owned cancellation interrupted")
+    close = transport._close_session
+
+    def interrupted_cancel(parent):
+        assert parent == "owned-parent"
+        raise primary
+
+    async def failing_close():
+        await close()
+        raise RuntimeError("owned session close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_wait_local_cancelled", interrupted_cancel)
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            transport.shutdown()
+
+    assert caught.value is primary
+    assert state.calls == [] and state.closed
+    notes = "\n".join(primary.__notes__)
+    assert "cancellation was not verified" in notes and "owned-parent:training:0" in notes
+    assert "HTTP session closure also failed" in notes
 
 
 def test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadline(_local_cortex_shutdown_gateway):

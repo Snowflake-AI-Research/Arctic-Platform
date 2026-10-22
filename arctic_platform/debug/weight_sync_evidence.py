@@ -127,7 +127,7 @@ class ShadowVerifier:
             name: (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
             for name, value in self.parameters.items()
         }
-        self.storage_names = {}
+        self.storage_names: dict[tuple[str, int, int], str] = {}
         total = 0
         if not self.parameters:
             raise ValueError("weight-sync model has no parameters")
@@ -158,8 +158,8 @@ class ShadowVerifier:
         verify_sources(self.sources)
         self.shadows = {name: torch.full_like(value, float("nan")) for name, value in self.parameters.items()}
         self.shadow_names = {_storage(value): name for name, value in self.shadows.items()}
-        self.received = {}
-        self.touched = set()
+        self.received: dict[str, dict] = {}
+        self.touched: set[str] = set()
 
     def _check_inventory(self):
         current = dict(self.model.named_parameters())

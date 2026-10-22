@@ -149,8 +149,13 @@ class LoRASamplerEvidenceWorker(SamplerEvidenceWorker):
             AsyncLLM.shutdown,
             serving_lora_request,
         )
+        from arctic_platform.debug.lora_sync_hooks import maybe_admit_sampler_construction
+        from arctic_platform.debug.lora_sync_hooks import maybe_verify_sampler_construction
+
+        maybe_admit_sampler_construction(self, args, AsyncLLM.from_vllm_config, engine_kwargs)
         self.llm = AsyncLLM.from_vllm_config(args.create_engine_config(), stat_loggers=[RingStatLogger])
         try:
+            maybe_verify_sampler_construction(self)
             verify_sources(self._origins)
         except BaseException as error:
             try:

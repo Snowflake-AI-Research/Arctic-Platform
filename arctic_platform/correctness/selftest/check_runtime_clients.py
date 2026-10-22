@@ -130,12 +130,23 @@ def _client_backends_session_with_close_spy(transport, monkeypatch, closed):
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cli_defaults_to_cortex_and_accepts_explicit_onprem(monkeypatch):
+def test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex(monkeypatch):
     selected = []
     monkeypatch.setattr(cli, "cmd_run", lambda args: selected.append(args.backend) or 0)
     assert cli.main(["run", "--all-configs"]) == 0
-    assert cli.main(["run", "--all-configs", "--backend", "onprem"]) == 0
-    assert selected == ["cortex", "onprem"]
+    assert cli.main(["run", "--all-configs", "--backend", "cortex-training"]) == 0
+    assert cli.main(["run", "--all-configs", "--backend", "cortex"]) == 0
+    assert selected == ["cortex", "cortex", "cortex"]
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["run", "--all-configs", "--backend", "onprem"])
+    assert exc.value.code == 2
+
+
+def test_client_backends_onboarding_uses_the_same_cortex_training_default():
+    args = cli.parse_args(["onboard", "--config", "./work/config.json"])
+    assert args.backend == "cortex"
+    args = cli.parse_args(["onboard", "--config", "./work/config.json", "--backend", "cortex-training"])
+    assert args.backend == "cortex"
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
@@ -148,6 +159,44 @@ def test_client_backends_cortex_connection_uses_environment_or_pat_file(tmp_path
     assert backend.pat.get_secret_value() == "file-token"
     assert "file-token" not in repr(backend)
     assert isinstance(cli._client_backend(Namespace(backend="onprem")), OnPremConfig)
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://127.0.0.1:7001", "http://localhost:7001", "http://[::1]:7001", "http://remote.test:7001"],
+)
+@pytest.mark.parametrize("from_environment", [False, True])
+@pytest.mark.parametrize("settings", ["missing", "explicit", "environment", "empty"])
+def test_client_backends_local_cortex_route_segments(monkeypatch, base_url, from_environment, settings):
+    for name in ("BASE_URL", "HOST", "PAT", "DATABASE", "SCHEMA"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    args = Namespace(backend="cortex-training")
+    if from_environment:
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", base_url)
+    else:
+        args.base_url = base_url
+    if settings == "explicit":
+        args.database, args.schema = "USER_DB", "USER_SCHEMA"
+    elif settings == "environment":
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "USER_DB")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "USER_SCHEMA")
+    elif settings == "empty":
+        args.database, args.schema = "", ""
+
+    backend = cli._client_backend(args)
+    if settings in {"explicit", "environment"}:
+        expected = ("USER_DB", "USER_SCHEMA")
+    elif base_url == "http://remote.test:7001":
+        expected = ("", "")
+    else:
+        expected = ("dev", "dev")
+    assert (backend.database, backend.schema_) == expected
+    transport = CortexTransport(backend)
+    try:
+        assert transport._prefix == f"{base_url}/api/v2/databases/{expected[0]}/schemas/{expected[1]}/cortex-training"
+    finally:
+        transport.shutdown()
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")

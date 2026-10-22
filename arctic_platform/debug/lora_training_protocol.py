@@ -163,10 +163,10 @@ async def prepare_lora_training_workers(workers, request):
     completed = await asyncio.gather(*pending, return_exceptions=True)
     errors.extend(value for value in completed if isinstance(value, BaseException))
     if errors:
-        error = RuntimeError("one or more native training-rank preparations failed")
+        preparation_error = RuntimeError("one or more native training-rank preparations failed")
         for cause in errors:
-            error.add_note(repr(cause))
-        raise error from errors[0]
+            preparation_error.add_note(repr(cause))
+        raise preparation_error from errors[0]
     _require(len(completed) == 8, "all eight actual training-rank preparations must complete")
     for rank, receipt in enumerate(completed):
         _require(

@@ -87,6 +87,7 @@ _MARKER_IDENTITY_FIELDS = (
         "activation-checkpoint recompute are identical, element for element"
     ),
     compares_to_reference=False,
+    workload_modes=("rl",),
 )
 def run(ctx) -> List[TestResult]:
     try:

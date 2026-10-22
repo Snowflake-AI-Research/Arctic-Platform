@@ -22,10 +22,12 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 import traceback
 from contextlib import contextmanager
+from contextlib import nullcontext
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -46,11 +48,14 @@ from .config import arms_for
 from .config import config_checksum
 from .config import config_id
 from .config import load_config
+from .config import local_config_path
 from .config import local_gpu_type
 from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
 from .dss_driver import available_gpus
+from .dss_driver import local_cortex_gateway
+from .hosted import is_local_cortex_gateway
 from .hosted import read_pat
 from .hosted import require_local_cortex_gateway
 from .registry import RL_INAPPLICABLE_REASON
@@ -64,6 +69,7 @@ from .runner import cortex_unavailable_reason
 from .runner import execute
 from .runner import execute_rl
 from .runner import validate_local_full_model
+from .storage import correctness_logdir
 from .storage import correctness_workdir
 from .storage import ensure_no_interrupted_builds
 from .storage import require_data_fast_path
@@ -93,7 +99,8 @@ def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
         raise SystemExit("give --config <path> or --all-configs")
     from ..api import catalog
 
-    return [catalog(Path(args.config_dir)).get(str(args.config), Path(args.config))]
+    path = catalog(Path(args.config_dir)).get(str(args.config), Path(args.config))
+    return [local_config_path(path, Path(args.config_dir))]
 
 
 def _describe(shapes) -> str:
@@ -247,7 +254,6 @@ def _finish(
     execution: Dict[str, dict] | None = None,
 ) -> int:
     """Write the report and print what the run concluded. Zero only when something passed and none failed."""
-    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
     write_report(results, specs, out, execution=execution)
     failed = [r for r in results if r.outcome is TestOutcome.FAIL]
     passed = [r for r in results if r.outcome is TestOutcome.PASS]
@@ -258,6 +264,7 @@ def _finish(
     print(f"report: {out / 'report.md'}")
     for r in failed:
         print(f"  FAIL {r.config_id} {r.test_id} {r.arm or ''}: {r.summary}")
+    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
     return 0 if passed and not failed else 1
 
 
@@ -279,7 +286,12 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     }
     if getattr(args, "pat_file", None) is not None:
         options["pat"] = SecretStr(read_pat(args.pat_file))
-    return CortexConfig(**options)
+    backend = CortexConfig(**options)
+    if is_local_cortex_gateway(backend):
+        # The local SnowAPI router requires both segments even though it ignores their values.
+        backend.database = backend.database or "dev"
+        backend.schema_ = backend.schema_ or "dev"
+    return backend
 
 
 def _load_inference_export_allocation(args) -> dict | None:
@@ -438,8 +450,35 @@ def _run_vocab_size(
         return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
 
 
+def _configure_regression_target(args):
+    """First-two config regression owns a local service only when no endpoint is configured."""
+    if (
+        getattr(args, "backend", "cortex") == "onprem"
+        or not args.config
+        or args.all_configs
+        or not args.test
+        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
+        or any(
+            getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
+            for name in ("base_url", "host")
+        )
+    ):
+        return args
+    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl:
+        return args
+    args = copy.copy(args)
+    args._automatic_cortex_gateway = True
+    args.local_cortex_fixture = True
+    args.base_url = "http://127.0.0.1:1"
+    require_local_cortex_gateway(_client_backend(args))
+    return args
+
+
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    args = _configure_regression_target(args)
     inference_export_allocation = _load_inference_export_allocation(args)
     inference_initial_model_dir = _load_inference_initial_model_dir(args)
     historical_gradient_references = _load_historical_gradient_references(args)
@@ -450,7 +489,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     if topology is not None and (not args.config or args.all_configs or args.test != ["inference-checkpoint-loss"]):
         raise SystemExit("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
     if getattr(args, "out", None) is None:
-        args.out = correctness_workdir("ap-correctness-run-")
+        args.out = correctness_logdir("ap-correctness-run-")
     backend = _client_backend(args)
     if getattr(args, "reference_records_dir", None) is not None:
         from .reference_records import require_git_records_dir
@@ -655,91 +694,100 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_sha256=published_fixture["fixture_sha256"],
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
-        if local_fixture:
-            from .cortex import load_local_fixture
-
-            try:
-                published_fixture = load_local_fixture(backend, spec)
-            except ValueError as exc:
-                results.extend(
-                    [
-                        TestResult(
-                            test_id=test_id,
-                            config_id=cfg.config_id,
-                            outcome=TestOutcome.FAIL,
-                            summary="local Cortex fixture identity unavailable",
-                            reason=str(exc),
-                        )
-                        for test_id in args.test
-                    ]
-                )
-                print(f"skip {path.name}: {exc}", flush=True)
-                continue
-            execution[cfg.config_id].update(
-                requested_model_name=published_fixture["model_name"],
-                fixture_sha256=published_fixture["fixture_sha256"],
-                fixture_distribution="local-gateway",
-                gateway_url=backend.base_url,
-            )
-
-        print(f"=== {cfg.config_id} ===", flush=True)
-        vocab_size = _run_vocab_size(
-            cfg,
-            spec,
-            args.test,
-            backend,
-            published_fixture,
-            **({"local_full_model_path": local_full_model_path} if local_full_model else {}),
+        managed_gateway = (
+            local_cortex_gateway(Path(args.out))
+            if getattr(args, "_automatic_cortex_gateway", False)
+            else nullcontext(None)
         )
+        with managed_gateway as gateway_url:
+            if gateway_url is not None:
+                backend.base_url = gateway_url
+                execution[cfg.config_id]["gateway_url"] = gateway_url
+            if local_fixture:
+                from .cortex import load_local_fixture
 
-        for width in widths:
-            multiple = width // cfg.n_gpus
-            run_cfg = cfg.at_gpu_width(width)
-            run_cases = scaled_for_placement(selected_cases, multiple)
-            if len(widths) > 1:
-                print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
-            results.extend(
-                run_executor(
-                    run_cfg,
-                    spec,
-                    run_cases,
-                    order=args.order,
-                    fail_fast=args.fail_fast,
-                    vocab_size=vocab_size,
-                    select=args.test or None,
-                    attn=args.attn[0] if args.attn else None,
-                    client_backend=backend,
-                    **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
-                    **({"local_cortex_fixture": True} if local_fixture else {}),
-                    **({"local_gateway_full_model": True} if local_full_model else {}),
-                    **({"inference_sampling_topology": topology} if topology is not None else {}),
-                    **(
-                        {"inference_export_allocation": inference_export_allocation}
-                        if inference_export_allocation is not None
-                        else {}
-                    ),
-                    **(
-                        {"inference_initial_model_dir": inference_initial_model_dir}
-                        if inference_initial_model_dir is not None
-                        else {}
-                    ),
-                    **(
-                        {"reference_records_dir": Path(args.reference_records_dir)}
-                        if getattr(args, "reference_records_dir", None) is not None
-                        else {}
-                    ),
-                    **(
-                        {"peft_adapter": Path(args.peft_adapter)}
-                        if getattr(args, "peft_adapter", None) is not None
-                        else {}
-                    ),
-                    **(
-                        {"historical_gradient_references": historical_gradient_references}
-                        if historical_gradient_references is not None
-                        else {}
-                    ),
+                try:
+                    published_fixture = load_local_fixture(backend, spec)
+                except ValueError as exc:
+                    results.extend(
+                        [
+                            TestResult(
+                                test_id=test_id,
+                                config_id=cfg.config_id,
+                                outcome=TestOutcome.FAIL,
+                                summary="local Cortex fixture identity unavailable",
+                                reason=str(exc),
+                            )
+                            for test_id in args.test
+                        ]
+                    )
+                    print(f"skip {path.name}: {exc}", flush=True)
+                    continue
+                execution[cfg.config_id].update(
+                    requested_model_name=published_fixture["model_name"],
+                    fixture_sha256=published_fixture["fixture_sha256"],
+                    fixture_distribution="local-gateway",
+                    gateway_url=backend.base_url,
                 )
+
+            print(f"=== {cfg.config_id} ===", flush=True)
+            vocab_size = _run_vocab_size(
+                cfg,
+                spec,
+                args.test,
+                backend,
+                published_fixture,
+                **({"local_full_model_path": local_full_model_path} if local_full_model else {}),
             )
+
+            for width in widths:
+                multiple = width // cfg.n_gpus
+                run_cfg = cfg.at_gpu_width(width)
+                run_cases = scaled_for_placement(selected_cases, multiple)
+                if len(widths) > 1:
+                    print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
+                results.extend(
+                    run_executor(
+                        run_cfg,
+                        spec,
+                        run_cases,
+                        order=args.order,
+                        fail_fast=args.fail_fast,
+                        vocab_size=vocab_size,
+                        select=args.test or None,
+                        attn=args.attn[0] if args.attn else None,
+                        client_backend=backend,
+                        **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **({"local_gateway_full_model": True} if local_full_model else {}),
+                        **({"inference_sampling_topology": topology} if topology is not None else {}),
+                        **(
+                            {"inference_export_allocation": inference_export_allocation}
+                            if inference_export_allocation is not None
+                            else {}
+                        ),
+                        **(
+                            {"inference_initial_model_dir": inference_initial_model_dir}
+                            if inference_initial_model_dir is not None
+                            else {}
+                        ),
+                        **(
+                            {"reference_records_dir": Path(args.reference_records_dir)}
+                            if getattr(args, "reference_records_dir", None) is not None
+                            else {}
+                        ),
+                        **(
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
+                            else {}
+                        ),
+                        **(
+                            {"historical_gradient_references": historical_gradient_references}
+                            if historical_gradient_references is not None
+                            else {}
+                        ),
+                    )
+                )
 
     if snapshot is not None:
         snapshot(results, specs, execution)
@@ -809,7 +857,7 @@ def run_batch(args, *, selected, executor=None):
 
     started = time.monotonic()
     _load_historical_gradient_references(args)
-    out = Path(args.out) if args.out is not None else correctness_workdir("ap-correctness-run-")
+    out = Path(args.out) if args.out is not None else correctness_logdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
     specs = {}
     execution = {}
@@ -899,6 +947,8 @@ def run_batch(args, *, selected, executor=None):
                 cases.append(summary)
                 log.write(f"{summary['status'].upper()} {case.config_id} {case.test_id}: {summary['reason']}\n")
                 print(f"{summary['status'].upper():12s} {case.config_id}  {case.test_id}", flush=True)
+                if summary["status"] in {"blocked", "error", "fail"} and summary["reason"]:
+                    print(f"  Reason: {summary['reason']}\n", flush=True)
             results.extend(group_results)
     write_report(results, specs, out, execution=execution)
     elapsed = time.monotonic() - started
@@ -921,6 +971,7 @@ def run_batch(args, *, selected, executor=None):
     print(f"Report: {out / 'report.md'}; complete logs: {out / 'full.log'}", flush=True)
     if any(case["status"] in {"blocked", "error"} for case in cases):
         print("Action required: see the reason in batch.json and the full traceback in full.log.", flush=True)
+    print(f"Total run time: {console.duration(time.monotonic() - started)}", flush=True)
     return BatchResult(results, out, aggregate_exit_code(results), elapsed, stopped, cases)
 
 
@@ -959,9 +1010,9 @@ def cmd_list(args) -> int:
 
 
 def cmd_onboard(args) -> int:
-    from ..onboarding import run
+    from ..onboarding.onboard import logged_run
 
-    return run(args)
+    return logged_run(args)
 
 
 def cmd_selftest(args) -> int:
@@ -1016,8 +1067,21 @@ def cmd_publish_fixture(args) -> int:
     return 0
 
 
-def add_connection_arguments(parser, *, default_backend="cortex"):
-    parser.add_argument("--backend", choices=["cortex", "onprem"], default=default_backend)
+def operator_backend(value: str) -> str:
+    """Keep the public backend name separate from the internal transport identifier."""
+    if value in {"cortex-training", "cortex"}:
+        return "cortex"
+    raise argparse.ArgumentTypeError("use cortex-training; the onprem correctness backend is no longer supported")
+
+
+def add_connection_arguments(parser, *, default_backend="cortex-training"):
+    parser.add_argument(
+        "--backend",
+        type=operator_backend,
+        default=default_backend,
+        metavar="cortex-training",
+        help="Cortex-training backend (default); cortex remains a compatibility alias",
+    )
     parser.add_argument("--host", help="Snowflake account host; otherwise ARCTIC_CORTEX_HOST")
     parser.add_argument("--database", help="Snowflake database; otherwise ARCTIC_CORTEX_DATABASE")
     parser.add_argument("--schema", help="Snowflake schema; otherwise ARCTIC_CORTEX_SCHEMA")
@@ -1097,11 +1161,15 @@ def parse_args(argv=None):
             "Use this to see the output quickly: gas1 is one sequence and no accumulation"
         ),
     )
-    r.add_argument("--out", type=Path, help="report directory; default a unique directory under /data-fast/tmp")
+    r.add_argument(
+        "--out",
+        type=Path,
+        help="report directory; default a unique directory under ./work/logs (or DSS_CORRECTNESS_LOGDIR)",
+    )
     r.add_argument(
         "--reference-records-dir",
         type=Path,
-        help="Git-tracked prepared HF records; missing records require explicit onboarding",
+        help="prepared HF records inside the checkout; missing records require explicit onboarding",
     )
     r.add_argument(
         "--cortex-fixture",

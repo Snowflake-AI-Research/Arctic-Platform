@@ -334,10 +334,10 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
                 gate_result = f"PASSED {tolerance_text(gate)} tolerance"
                 gate_count = f"{optimizer_compared}/{optimizer_compared}"
             lines.append("        " + gate_result.ljust(43) + gate_count)
-        worst = result.worst_name or "-"
-        lines.append(
-            "        " + "largest disagreement".ljust(43) + f"{m.get('max_optimizer_delta_norm', 0.0):.3e}  {worst}"
-        )
+        maximum = m.get("max_optimizer_norm_delta", m.get("max_optimizer_delta_norm"))
+        if maximum is not None:
+            worst = result.worst_name or "-"
+            lines.append("        " + "largest disagreement".ljust(43) + f"{maximum:.3e}  {worst}")
 
     if result.outcome is TestOutcome.PASS:
         lines.append("")
@@ -443,9 +443,22 @@ def to_markdown(
     )
     lines.append("")
 
-    for config_id, spec in sorted(specs.items()):
+    for config_id in sorted(set(specs) | {result.config_id for result in results}):
         lines.append(f"## {config_id}")
         lines.append("")
+        spec = specs.get(config_id)
+        rows = [r for r in results if r.config_id == config_id]
+        if spec is None:
+            lines.append("No reviewed specification was loaded. No numerical comparison is established.")
+            lines.append("")
+            lines += _table(
+                ["test", "case", "outcome", "summary"],
+                [[f"`{r.test_id}`", r.arm or "-", f"**{r.outcome.value}**", r.summary] for r in rows],
+            )
+            for result in rows:
+                lines.extend(["", f"### {result.test_id} / {result.arm or '-'}", "", result.reason or result.summary])
+            lines.append("")
+            continue
         metadata = execution.get(config_id, {})
         remote = metadata.get("backend") == "cortex"
         bound_fixture = remote and metadata.get("fixture_sha256") is not None

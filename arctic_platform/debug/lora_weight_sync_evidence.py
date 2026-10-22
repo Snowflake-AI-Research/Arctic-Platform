@@ -25,6 +25,7 @@ import json
 import math
 from dataclasses import dataclass
 from dataclasses import field
+from typing import Any
 
 from arctic_platform.debug.ep_weight_sync_evidence import global_inventory
 from arctic_platform.debug.weight_sync_evidence import source_files
@@ -349,7 +350,7 @@ def prepare_collective_lora_weights(
         "wire_inputs": inputs,
         "wire_order": list(inputs),
     }
-    records = [None] * expected_world_size
+    records: list[Any] = [None] * expected_world_size
     dist.all_gather_object(records, record)
     inventory = global_inventory(records)
     records = _validate_wire_records(records, inventory)

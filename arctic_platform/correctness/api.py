@@ -21,6 +21,7 @@ The API never allocates nodes, installs software or changes numerical gates.
 
 from __future__ import annotations
 
+from argparse import ArgumentTypeError
 from argparse import Namespace
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -30,9 +31,12 @@ from typing import Callable
 from typing import Sequence
 
 from .harness.config import config_id
+from .harness.config import load_config
+from .harness.config import local_config_path
 from .harness.registry import TestOutcome
 from .harness.registry import TestResult
 from .harness.registry import registered_tests
+from .harness.registry import workload_inapplicable_reason
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -47,7 +51,7 @@ class RunRequest:
 
 @dataclass(frozen=True)
 class RunOptions:
-    backend: str = "cortex"
+    backend: str = "cortex-training"
     host: str | None = None
     database: str | None = None
     schema: str | None = None
@@ -96,9 +100,10 @@ def catalog(config_dir: Path | None = None) -> dict[str, Path]:
     """Active reviewed configurations, ordered by exact ID; archived files are excluded."""
     root = Path(config_dir) if config_dir is not None else PACKAGE_DIR / "configs"
     found = {}
-    for path in sorted(root.rglob("*.config")):
+    paths = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix in {".config", ".json"})
+    for path in paths:
         identifier = config_id(path)
-        if "archive" in path.relative_to(root).parts:
+        if {"archive", "specs"} & set(path.relative_to(root).parts):
             continue
         if not (PACKAGE_DIR / "specs" / f"{identifier}.json").is_file():
             continue
@@ -123,22 +128,35 @@ def select(request: RunRequest) -> tuple[SelectedCase, ...]:
         selector = str(request.config)
         if selector in configs:
             paths = [configs[selector]]
-        elif Path(selector).is_file() and Path(selector).suffix == ".config":
-            paths = [Path(selector)]
+        elif Path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
+            paths = [local_config_path(selector, request.config_dir)]
         else:
-            raise ValueError(f"unknown configuration: {selector}; use the list command or an existing .config path")
+            raise ValueError(f"unknown configuration: {selector}; use the list command or an existing config path")
     else:
         paths = list(configs.values())
     if not paths:
         raise ValueError(f"no active reviewed configurations in {request.config_dir}")
-    test_ids = sorted(set(request.tests)) if request.tests else sorted(tests)
-    return tuple(
-        SelectedCase(config_id(path), path, test_id) for path in sorted(paths, key=config_id) for test_id in test_ids
-    )
+    selected = []
+    for path in sorted(paths, key=config_id):
+        if request.tests:
+            test_ids = sorted(set(request.tests))
+        else:
+            config = load_config(path)
+            test_ids = sorted(
+                test_id for test_id, test in tests.items() if workload_inapplicable_reason(test, config) is None
+            )
+        selected.extend(SelectedCase(config_id(path), path, test_id) for test_id in test_ids)
+    return tuple(selected)
 
 
 def _namespace(request: RunRequest, options: RunOptions) -> Namespace:
+    from .harness.execution import operator_backend
+
     values = asdict(options)
+    try:
+        values["backend"] = operator_backend(options.backend)
+    except ArgumentTypeError as exc:
+        raise ValueError(str(exc)) from exc
     values.update(
         config=str(request.config) if request.config is not None else None,
         config_dir=str(request.config_dir),
@@ -178,6 +196,8 @@ def options_from_args(args: Namespace) -> RunOptions:
             values[name] = tuple(values[name])
     if "out" in values:
         values["out"] = Path(values["out"])
+    if values.get("backend") == "cortex":
+        values["backend"] = "cortex-training"
     return RunOptions(**values)
 
 

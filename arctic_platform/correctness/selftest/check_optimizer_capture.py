@@ -2529,7 +2529,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     session = GatewaySession(tmp_path, 4, backend)
     events, replies, paths = ([], {}, [])
-    state = SimpleNamespace(step=0, failure=None, receipt=None, cancelled=False)
+    state = SimpleNamespace(step=0, failure=None, receipt=None, cancelled=False, training_child=None)
 
     async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
         assert asyncio.get_running_loop() is transport._loop
@@ -2540,6 +2540,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
         if url.endswith(":cancel") or (state.cancelled and method == "GET"):
             assert policy.max_retries == 0 and policy.timeout > 0
         if method == "POST" and url == transport._prefix:
+            state.training_child = kwargs["json"]["sub_job_configs"][0]["job_id"]
             return {"job_id": "local-parent"}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
             return {
@@ -2568,7 +2569,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
             events.append(f"save-{state.step}")
             shutil.copytree(pair.before if state.step == 0 else pair.after, path)
             result = {
-                "job_id": "actual-training-child",
+                "job_id": state.training_child,
                 "checkpoint_path": str(path),
                 "checkpoint_tag": f"global_step{state.step}",
                 "version": state.step,
@@ -2598,6 +2599,24 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
         return {"request_id": request_id}
 
     monkeypatch.setattr(CortexTransport, "_send", send)
+
+    async def native_save(transport, method, url, **kwargs):
+        assert method == "POST"
+        assert url == f"http://127.0.0.1:8003/save-checkpoint?job_id={state.training_child}"
+        assert getattr(transport, "_native_gateway", False) is False
+        body = kwargs["json"]
+        assert set(body) == {"path", "checkpoint_type"}
+        reply = await send(
+            transport,
+            method,
+            f"{transport._prefix}/{transport.job_id}/save",
+            json={**body, "export_hf": False},
+            allow_redirects=False,
+        )
+        return json.dumps(replies[reply["request_id"]]).encode()
+
+    monkeypatch.delenv(cortex_fixture.LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    monkeypatch.setattr(cortex_fixture.CorrectnessCortexTransport, "_native_http", native_save)
     client_config = _training_client_config(
         session, build_payload(load_config(_cortex_optimizer_capture_CONFIG).training, "local-fixture", 42)
     )
@@ -2769,6 +2788,54 @@ def test_local_cortex_optimizer_incomplete_local_checkpoint_never_reaches_step(
         _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
     assert _local_cortex_optimizer_local_capture.events == ["save-0"]
     assert not list(_local_cortex_optimizer_local_capture.output.iterdir())
+
+
+@pytest.mark.parametrize(
+    "saved_tag,saved_ranks",
+    [("global_step99", 16), ("global_step0", 8), ("global_step99", 8)],
+)
+def test_local_cortex_optimizer_snapshot_error_identifies_tag_and_shard_counts(tmp_path, saved_tag, saved_ranks):
+    root = tmp_path / "snapshot"
+
+    def save_checkpoint(**kwargs):
+        assert kwargs == {"path": str(root), "checkpoint_type": "resumable", "export_hf": False}
+        tag_dir = root / saved_tag
+        tag_dir.mkdir(parents=True)
+        (tag_dir / "mp_rank_00_model_states.pt").write_bytes(b"model")
+        for rank in range(saved_ranks):
+            (tag_dir / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(b"optimizer")
+        return {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0}
+
+    with pytest.raises(ValueError) as failure:
+        capture._save_local_snapshot(
+            SimpleNamespace(save_checkpoint=save_checkpoint), root, step=0, expected_dp_world_size=16
+        )
+    assert (
+        str(failure.value)
+        == "local optimizer checkpoint metadata mismatch: "
+        f"expected tag='global_step0', observed tag={saved_tag!r}; "
+        f"expected DP shard count=16, observed DP shard count={saved_ranks}"
+    )
+
+
+def test_local_cortex_optimizer_snapshot_matching_tag_and_shard_counts_is_accepted(tmp_path):
+    root = tmp_path / "snapshot"
+
+    def save_checkpoint(**kwargs):
+        assert kwargs == {"path": str(root), "checkpoint_type": "resumable", "export_hf": False}
+        tag_dir = root / "global_step0"
+        tag_dir.mkdir(parents=True)
+        (tag_dir / "mp_rank_00_model_states.pt").write_bytes(b"model")
+        for rank in range(16):
+            (tag_dir / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(b"optimizer")
+        return {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0}
+
+    assert (
+        capture._save_local_snapshot(
+            SimpleNamespace(save_checkpoint=save_checkpoint), root, step=0, expected_dp_world_size=16
+        )
+        == root
+    )
 
 
 @pytest.mark.usefixtures("_local_cortex_optimizer_no_network")

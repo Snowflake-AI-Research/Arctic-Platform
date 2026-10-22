@@ -242,14 +242,20 @@ def run_reference(
         # One reference per GPU lets independent runs proceed concurrently; the run itself is single-GPU
         # either way, so pinning changes only which device it lands on.
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-    try:
-        log_dir = require_data_fast_path(out_path.parent, label="reference logs")
-    except ValueError:
-        log_dir = correctness_workdir("hf-reference-logs-")
+    from .storage import CORRECTNESS_LOGDIR_ENV
+    from .storage import correctness_logdir
+
+    if os.environ.get(CORRECTNESS_LOGDIR_ENV):
+        log_dir = correctness_logdir("hf-reference-")
+    else:
+        try:
+            log_dir = require_data_fast_path(out_path.parent, label="reference logs")
+        except ValueError:
+            log_dir = correctness_workdir("hf-reference-logs-")
     log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_log = require_data_fast_path(log_dir / f"{out_path.stem}.stdout.log", label="reference stdout")
-    stderr_log = require_data_fast_path(log_dir / f"{out_path.stem}.stderr.log", label="reference stderr")
-    returncode_log = require_data_fast_path(log_dir / f"{out_path.stem}.returncode", label="reference return code")
+    stdout_log = log_dir / f"{out_path.stem}.stdout.log"
+    stderr_log = log_dir / f"{out_path.stem}.stderr.log"
+    returncode_log = log_dir / f"{out_path.stem}.returncode"
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     stdout_log.write_text(proc.stdout)
     stderr_log.write_text(proc.stderr)
@@ -938,9 +944,11 @@ def execute(
                 raise ReferencePrerequisiteError("HF reference preparation required")
             reference = measure_reference(arm)
             compact = {key: value for key, value in reference.items() if key != "optimizer_state_manifest"}
-            if stepping:
+            if stepping and "single-step-optimizer" not in records:
                 from decimal import ROUND_CEILING
                 from decimal import Decimal
+
+                from tqdm.auto import tqdm
 
                 from ..checks.optimizer_state import max_pairwise_optimizer_norm_delta
                 from ..checks.optimizer_state import summarize_optimizer_artifacts
@@ -958,27 +966,49 @@ def execute(
                     flush=True,
                 )
                 manifests = []
-                for start in range(0, reference_calibration_runs, reference_calibration_workers):
-                    indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
-                    with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
-                        futures = {
-                            pool.submit(
-                                measure_reference,
-                                arm,
-                                output_name=f"{arm.name}-calibration-{index}",
-                                cuda_device=index % reference_calibration_workers,
-                                deterministic=False,
-                            ): index
-                            for index in indices
-                        }
-                        completed = {}
-                        for future in as_completed(futures):
-                            completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
-                        manifests.extend(completed[index] for index in indices)
+                with tqdm(
+                    total=reference_calibration_runs,
+                    desc=f"Optimizer calibration {arm.name}",
+                    unit="run",
+                    file=sys.stdout,
+                    dynamic_ncols=True,
+                    mininterval=0,
+                    miniters=1,
+                ) as progress:
+                    for start in range(0, reference_calibration_runs, reference_calibration_workers):
+                        indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
+                        with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
+                            futures = {
+                                pool.submit(
+                                    measure_reference,
+                                    arm,
+                                    output_name=f"{arm.name}-calibration-{index}",
+                                    cuda_device=index % reference_calibration_workers,
+                                    deterministic=False,
+                                ): index
+                                for index in indices
+                            }
+                            completed = {}
+                            for future in as_completed(futures):
+                                completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
+                                progress.update(1)
+                            manifests.extend(completed[index] for index in indices)
+                print(
+                    f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
+                    f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
+                    flush=True,
+                )
+                summary_started = time.monotonic()
                 worst = max_pairwise_optimizer_norm_delta(
                     manifests, optimizer_config=optimizer_config, learning_rate=OPTIMIZER_LEARNING_RATE
                 )
                 spread = worst.delta_norm if worst is not None else 0.0
+                print(
+                    f"Optimizer norm summary complete: arm={arm.name}, "
+                    f"elapsed={time.monotonic() - summary_started:.1f}s, "
+                    f"maximum_pairwise_norm_delta={spread:.9e}\n",
+                    flush=True,
+                )
                 quantum = Decimal("0.001")
                 absolute = float(
                     max(

@@ -38,9 +38,14 @@ inject error far above the third decimal place the comparison is trying to resol
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
+import marshal
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from types import CodeType
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -62,6 +67,7 @@ class ReferenceResult:
     skipped_no_grad: List[str] = field(default_factory=list)
     optimizer_state_manifest: Optional[str] = None
     optimizer_gradient_norm: Optional[float] = None
+    reference_execution: Optional[dict] = None
 
 
 @dataclass
@@ -102,6 +108,66 @@ class ReferenceEngine:
     hidden_size: int
     head_name: Optional[str]
     device: str
+
+
+def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> dict:
+    """Describe the actual loaded model and decoder, without reading weight tensors."""
+    from arctic_platform.correctness.harness.reference_records import file_identity
+
+    def portable_code(code):
+        # Python embeds checkout paths in nested code objects; exclude those paths from the code digest.
+        return code.replace(
+            co_filename="",
+            co_consts=tuple(
+                portable_code(value) if isinstance(value, CodeType) else value for value in code.co_consts
+            ),
+        )
+
+    def implementation(module):
+        cls = type(module)
+        forward = getattr(module.forward, "__func__", module.forward)
+        code = getattr(forward, "__code__", None)
+        if not isinstance(code, CodeType):
+            raise ValueError("HF reference execution witness requires an inspectable Python forward")
+        source = Path(code.co_filename)
+        class_source = inspect.getsourcefile(cls)
+        if class_source is None:
+            raise ValueError("HF reference execution witness requires an inspectable Python model class")
+        return {
+            "class": {
+                "module": cls.__module__,
+                "qualname": cls.__qualname__,
+                "source": file_identity(class_source, refresh=True),
+            },
+            "forward": {
+                "module": forward.__module__,
+                "qualname": forward.__qualname__,
+                "source": file_identity(source, refresh=True),
+                "python_code_sha256": hashlib.sha256(marshal.dumps(portable_code(code))).hexdigest(),
+            },
+        }
+
+    def configuration(module):
+        cfg = module.config
+        # HF's to_dict may omit the effective attention backend; retain it explicitly.
+        value = {
+            "config": cfg.to_dict(),
+            "attention_implementation": getattr(cfg, "_attn_implementation", None),
+        }
+        return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+
+    configurations = {"model": configuration(engine.model), "decoder": configuration(engine.decoder)}
+    return {
+        "schema": "hf-reference-execution-v1",
+        "requested_attention": requested_attention,
+        "implementations": {"model": implementation(engine.model), "decoder": implementation(engine.decoder)},
+        "effective_configurations": configurations,
+        "effective_configurations_sha256": (
+            hashlib.sha256(
+                json.dumps(configurations, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+            ).hexdigest()
+        ),
+    }
 
 
 def row_groups(lengths: List[int], seq_len: int, token_budget: int) -> List[List[int]]:
@@ -458,6 +524,7 @@ def run(
         device=device,
     )
     model = engine.model
+    reference_execution = execution_witness(engine, requested_attention=attn_implementation)
     torch.cuda.reset_peak_memory_stats(device)
     forward = forward_backward(
         engine,
@@ -494,6 +561,8 @@ def run(
         optimizer_state_manifest = str(optimizer_artifact.manifest_path)
         optimizer_gradient_norm = optimizer_artifact.gradient_norm_before_clip
 
+    if execution_witness(engine, requested_attention=attn_implementation) != reference_execution:
+        raise ValueError("HF reference implementation or effective configuration changed during execution")
     peak = torch.cuda.max_memory_allocated(device) / 1024**3
     del engine, model, accumulator
     torch.cuda.empty_cache()
@@ -506,4 +575,5 @@ def run(
         skipped_no_grad=skipped,
         optimizer_state_manifest=optimizer_state_manifest,
         optimizer_gradient_norm=optimizer_gradient_norm,
+        reference_execution=reference_execution,
     )

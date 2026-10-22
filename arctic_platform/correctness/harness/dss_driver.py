@@ -20,13 +20,20 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import fcntl
 import json
 import math
 import os
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
@@ -99,6 +106,7 @@ _STANDARD_MASTER_PORT = 29500
 _RAY_PROCESS_PATTERN = (
     r"([r]aylet|[g]cs_server|[d]ashboard.py|[m]onitor.py|[l]og_monitor.py|[d]efault_worker.py|ray::)"
 )
+_GATEWAY_PROC_ROOT = Path("/proc")
 
 
 def _allocation_hostfile() -> Path | None:
@@ -109,6 +117,275 @@ def _allocation_hostfile() -> Path | None:
             return path
     default = Path("/data-fast/hostfile")
     return default if default.is_file() else None
+
+
+def _gateway_state_directory() -> Path:
+    return Path(tempfile.gettempdir()) / f"arctic-correctness-gateway-{os.getuid()}"
+
+
+def _gateway_process_identity(pid: int) -> dict | None:
+    """Bind a PID to this user's actual live Linux process, including its start time."""
+    directory = _GATEWAY_PROC_ROOT / str(pid)
+    try:
+        fields = (directory / "stat").read_text().rsplit(") ", 1)[1].split()
+        if fields[0] in {"Z", "X"}:
+            return None
+        return {"pid": pid, "start_time": fields[19], "uid": directory.stat().st_uid}
+    except FileNotFoundError:
+        return None
+
+
+def _stop_stale_gateway(gateway: dict, log_path: str) -> None:
+    if _gateway_process_identity(gateway["pid"]) != gateway:
+        return
+    print(f"Stopping stale owned Cortex-training gateway (PID {gateway['pid']}); log: {log_path}", flush=True)
+    os.kill(gateway["pid"], signal.SIGTERM)
+    deadline = time.monotonic() + 120
+    while _gateway_process_identity(gateway["pid"]) == gateway:
+        if time.monotonic() >= deadline:
+            os.killpg(gateway["pid"], signal.SIGKILL)
+            raise UnsafeCleanupError(
+                f"stale owned gateway required forced shutdown; inspect {log_path} before retrying"
+            )
+        time.sleep(0.1)
+    print("Stale owned Cortex-training gateway stopped.", flush=True)
+
+
+def _legacy_owned_gateways() -> list[tuple[dict, str]]:
+    """Recognize pre-registry orphans only by the harness launch and retained log layout."""
+    found = []
+    for directory in _GATEWAY_PROC_ROOT.iterdir():
+        if not directory.name.isdecimal():
+            continue
+        try:
+            if directory.stat().st_uid != os.getuid():
+                continue
+            command = (directory / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            if (
+                len(command) != 11
+                or command[1:5] != [b"-m", b"dss.ray_dss.gateway_server", b"--host", b"127.0.0.1"]
+                or command[5] != b"--port"
+                or not command[6].isdigit()
+                or command[7:10] != [b"--backend", b"gpu", b"--hostfile"]
+            ):
+                continue
+            pid = int(directory.name)
+            fields = (directory / "stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[1] != "1" or os.getpgid(pid) != pid:
+                continue
+            checkout = (directory / "cwd").resolve()
+            log_path = Path(os.readlink(directory / "fd" / "1"))
+            if (
+                not (checkout / "skills" / "correctness" / "SKILL.md").is_file()
+                or not log_path.is_relative_to(checkout)
+                or log_path.name != "gateway.log"
+                or os.readlink(directory / "fd" / "2") != str(log_path)
+            ):
+                continue
+            relative = log_path.relative_to(checkout).parts
+            onboarding = (
+                len(relative) > 3 and relative[:2] == ("work", "logs") and relative[2].startswith("onboarding-")
+            )
+            regression = "cases" in relative[:-1]
+            if onboarding or regression:
+                identity = _gateway_process_identity(pid)
+                if identity is not None:
+                    found.append((identity, str(log_path)))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return found
+
+
+def _recover_owned_gateway(record_path: Path) -> None:
+    if not record_path.exists():
+        return
+    try:
+        record = json.loads(record_path.read_text())
+        if record["schema"] != "correctness-owned-gateway-v1":
+            raise ValueError("unknown gateway ownership record")
+        owner, gateway = record["owner"], record["gateway"]
+        if owner["uid"] != os.getuid() or gateway["uid"] != os.getuid():
+            raise ValueError("gateway ownership record belongs to a different user")
+        if _gateway_process_identity(owner["pid"]) == owner:
+            raise UnsafeCleanupError("another correctness command still owns the local gateway; stop it first")
+        if _gateway_process_identity(gateway["pid"]) != gateway:
+            record_path.unlink()
+            return
+        environment = (_GATEWAY_PROC_ROOT / str(gateway["pid"]) / "environ").read_bytes().split(b"\0")
+        marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={record['token']}".encode()
+        if marker not in environment or os.getpgid(gateway["pid"]) != gateway["pid"]:
+            raise ValueError("live process does not match the recorded harness-owned gateway")
+        _stop_stale_gateway(gateway, record["log"])
+        record_path.unlink()
+    except UnsafeCleanupError:
+        raise
+    except ProcessLookupError:
+        record_path.unlink(missing_ok=True)
+    except Exception as exc:
+        raise UnsafeCleanupError(
+            f"cannot safely recover the previous local gateway; inspect {record_path} before retrying"
+        ) from exc
+
+
+@contextlib.contextmanager
+def _owned_gateway_slot() -> Iterator[Path]:
+    directory = _gateway_state_directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "owner.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise UnsafeCleanupError(
+                "another correctness command still owns the local gateway; stop it first"
+            ) from exc
+        try:
+            record_path = directory / "gateway.json"
+            _recover_owned_gateway(record_path)
+            for gateway, log_path in _legacy_owned_gateways():
+                try:
+                    _stop_stale_gateway(gateway, log_path)
+                except ProcessLookupError:
+                    pass
+            yield record_path
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def recover_local_cortex_gateway() -> None:
+    """Recover an orphan before onboarding starts independent HF model work."""
+    with _owned_gateway_slot():
+        pass
+
+
+@contextlib.contextmanager
+def local_cortex_gateway(directory: Path) -> Iterator[str]:
+    """Recover an orphan, then start and close this command's owned DSS service."""
+    with _owned_gateway_slot() as record_path:
+        with _started_local_cortex_gateway(directory, record_path) as url:
+            yield url
+
+
+@contextlib.contextmanager
+def _started_local_cortex_gateway(directory: Path, record_path: Path) -> Iterator[str]:
+    import requests
+    import torch
+
+    directory.mkdir(parents=True, exist_ok=True)
+    hostfile = _allocation_hostfile()
+    if hostfile is None and Path("/job/hostfile").is_file():
+        hostfile = Path("/job/hostfile")
+    if hostfile is None:
+        hostfile = directory / "hostfile"
+        hostfile.write_text(f"{socket.gethostname()} slots={torch.cuda.device_count()}\n")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    log_path = directory / "gateway.log"
+    print(f"\n*** Target: Starting Cortex Training Gateway ***\nGateway log: {log_path}\n", flush=True)
+    previous_handlers = {}
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt(f"received {signal.Signals(signum).name}; stopping owned Cortex-training gateway")
+
+    with log_path.open("w") as log:
+        process = None
+        token = uuid.uuid4().hex
+        try:
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    previous_handlers[signum] = signal.getsignal(signum)
+                    signal.signal(signum, interrupt)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "dss.ray_dss.gateway_server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--backend",
+                    "gpu",
+                    "--hostfile",
+                    str(hostfile),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env={**os.environ, "DSS_CORRECTNESS_GATEWAY_OWNER": token},
+            )
+            owner = _gateway_process_identity(os.getpid())
+            gateway = _gateway_process_identity(process.pid)
+            if owner is None or gateway is None:
+                raise RuntimeError(f"cannot record live Cortex-training gateway ownership; see {log_path}")
+            record = {
+                "schema": "correctness-owned-gateway-v1",
+                "owner": owner,
+                "gateway": gateway,
+                "token": token,
+                "log": str(log_path.resolve()),
+            }
+            temporary = record_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record) + "\n")
+            temporary.replace(record_path)
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(f"Cortex-training gateway exited {process.returncode}; see {log_path}")
+                try:
+                    response = requests.get(
+                        f"{url}/health",
+                        timeout=1,
+                        allow_redirects=False,
+                        proxies={"http": "", "https": "", "all": ""},
+                    )
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(0.2)
+            else:
+                raise RuntimeError(f"Cortex-training gateway did not become ready; see {log_path}")
+            yield url
+        finally:
+            # A repeated stop signal must not interrupt the owned child's bounded teardown.
+            for signum in previous_handlers:
+                signal.signal(signum, signal.SIG_IGN)
+            try:
+                try:
+                    if process is not None:
+                        print(
+                            f"Stopping owned Cortex-training gateway (PID {process.pid}); log: {log_path}", flush=True
+                        )
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=120)
+                            except subprocess.TimeoutExpired as exc:
+                                try:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    # The group can exit between the timeout and signal; still reap the owned child.
+                                    pass
+                                process.wait()
+                                raise UnsafeCleanupError(
+                                    "owned Cortex-training gateway did not shut down cleanly; inspect"
+                                    f" {log_path} before retrying"
+                                ) from exc
+                        else:
+                            process.wait()
+                        record_path.unlink(missing_ok=True)
+                        print("Owned Cortex-training gateway stopped and reaped.", flush=True)
+                except UnsafeCleanupError:
+                    raise
+                except Exception as exc:
+                    raise UnsafeCleanupError(
+                        f"owned Cortex-training gateway cleanup failed; inspect {log_path} before retrying"
+                    ) from exc
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 def _run_on_allocation(script: str) -> subprocess.CompletedProcess[str]:
