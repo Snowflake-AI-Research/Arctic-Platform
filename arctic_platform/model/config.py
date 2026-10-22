@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel
@@ -197,6 +198,10 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     model_path_or_name: str = Field(..., description="HF model path or hub name.")
+    text_config_overrides: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Merged text config overrides; YaRN must explicitly set original_max_position_embeddings.",
+    )
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
