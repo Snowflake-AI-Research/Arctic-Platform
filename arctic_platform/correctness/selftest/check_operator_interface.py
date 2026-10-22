@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import runpy
+import signal
 import subprocess
 import sys
 import time
@@ -62,6 +63,42 @@ from arctic_platform.correctness.harness.storage import CORRECTNESS_TMPDIR_ENV
 from .check_catalog_configuration import _applicable_tests_spec
 from .helpers import _config_factory_native_config
 from .helpers import _synthetic_config_spec
+
+
+@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.doc"])
+def test_quick_demo_config_is_tiny_and_retains_both_gas_arms(tmp_path, monkeypatch, document):
+    from arctic_platform.correctness.harness.config import arms_for
+    from arctic_platform.correctness.harness.config import load_config
+
+    root = Path(__file__).resolve().parents[3]
+    text = (root / document).read_text()
+    snippet = text.split("python - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    downloads = []
+    hub = ModuleType("huggingface_hub")
+
+    def snapshot_download(**options):
+        downloads.append(options)
+        return str(tmp_path / "tiny-model")
+
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "work" / "configs").mkdir(parents=True)
+    exec(compile(snippet, document, "exec"), {})
+    config_path = tmp_path / "work" / "configs" / "tiny-qwen3-129m-one-h200.json"
+    raw = json.loads(config_path.read_text())
+    config = load_config(config_path)
+    assert downloads == [{"repo_id": "axolotl-ai-co/tiny-qwen3-129m", "cache_dir": "/checkpoint/huggingface/hub"}]
+    assert config.n_gpus == 1 and config.max_seq_len == 128
+    assert config.attention_implementation == "flash_attention_3"
+    assert raw["training"]["ds_config"]["train_batch_size"] == 1
+    assert raw["training"]["ds_worker_config"]["activation_checkpointing"] is False
+    assert [(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in arms_for(128, 1)] == [
+        ("gas1", 1, 128),
+        ("gas4", 4, 128),
+    ]
+    assert "--config ./work/configs/tiny-qwen3-129m-one-h200.json" in text
+    assert "qwen3-8b-four-h200" not in text
 
 
 @pytest.fixture(autouse=True)
@@ -2169,7 +2206,7 @@ def test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_proc
     monkeypatch.setattr(Path, "is_file", lambda path: job_hostfile if str(path) == "/job/hostfile" else is_file(path))
     listener = MagicMock()
     listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 54321)
-    monkeypatch.setattr(onboard.socket, "socket", lambda: listener)
+    monkeypatch.setattr(dss_driver.socket, "socket", lambda: listener)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
     if body_error:
@@ -2292,3 +2329,540 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     assert len(logs) == 2
     assert any("Traceback" in path.read_text() and "regression error" in path.read_text() for path in logs)
     assert "Reusing the verified completed phase" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [Outcome.PASS, Outcome.FAIL, Outcome.INAPPLICABLE, ReferencePrerequisiteError("missing"), RuntimeError("error")],
+)
+def test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance(
+    tmp_path, monkeypatch, capsys, verdict
+):
+    _operator_api_fake_batches(monkeypatch, [verdict])
+    ticks = iter([100.0, 165.0, 167.0])
+    monkeypatch.setattr(execution.time, "monotonic", lambda: next(ticks))
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)), api.RunOptions(out=tmp_path)
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == "Total run time: 1m07.0s"
+    assert sum(line.startswith("Total run time:") for line in lines) == 1
+    assert any(line.startswith("Report:") for line in lines[:-1])
+    if isinstance(verdict, Exception):
+        assert lines[-2].startswith("Action required:")
+    assert result.elapsed_seconds == 65.0
+    assert json.loads((tmp_path / "batch.json").read_text())["elapsed_seconds"] == 65.0
+
+
+@pytest.mark.parametrize("verdict", [Outcome.PASS, Outcome.FAIL, Outcome.INAPPLICABLE])
+def test_compatibility_total_runtime_follows_all_report_and_verdict_output(tmp_path, monkeypatch, capsys, verdict):
+    monkeypatch.setattr(execution, "write_report", lambda *args, **kwargs: print("report saved"))
+    monkeypatch.setattr(execution.time, "monotonic", lambda: 165.0)
+    result = Result("single-step-grads", "synthetic", verdict, summary="synthetic result")
+    code = execution._finish([result], {}, tmp_path, configs=1, started=100.0)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == "total run time across 1 config(s): 1m05.0s"
+    assert sum("total run time" in line for line in lines) == 1
+    assert code == (0 if verdict is Outcome.PASS else 1)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, monkeypatch, capsys, failure):
+    from arctic_platform.correctness.onboarding import onboard
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    ticks = iter([100.0, 167.0])
+    monkeypatch.setattr(onboard.time, "monotonic", lambda: next(ticks))
+
+    def run(args):
+        print("completed phase")
+        if failure:
+            raise ValueError("synthetic onboarding failure")
+        print("spec published")
+        return 0
+
+    monkeypatch.setattr(onboard, "run", run)
+    args = Namespace(config="synthetic.json")
+    assert onboard.logged_run(args) == int(failure)
+    assert capsys.readouterr().out.splitlines()[-1] == "Total run time: 1m07.0s"
+    assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 1m07.0s"
+    assert "DSS_CORRECTNESS_LOGDIR" not in os.environ
+
+
+@pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
+def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypatch, destination):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    root = tmp_path / "work" / "logs"
+    options = api.RunOptions()
+    if destination == "environment":
+        root = tmp_path / "retained-logs"
+        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(root))
+    elif destination == "explicit":
+        root = tmp_path / "explicit-report"
+        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "unused-logs"))
+        options = api.RunOptions(out=root)
+    _operator_api_fake_batches(monkeypatch, [RuntimeError("synthetic target failure")])
+    result = api.run(api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)), options)
+    if destination == "explicit":
+        assert result.report_dir == root
+        assert not (tmp_path / "unused-logs").exists()
+    else:
+        assert result.report_dir.parent == root
+        assert result.report_dir.name.startswith("ap-correctness-run-")
+    assert result.exit_code == 1 and result.cases[0]["status"] == "error"
+    assert "RuntimeError: synthetic target failure" in (result.report_dir / "full.log").read_text()
+    assert json.loads((result.report_dir / "batch.json").read_text())["cases"] == result.cases
+
+
+@pytest.mark.parametrize("drift", ["display-only", "changed-run-count"])
+def test_onboarding_retry_runtime_footer_and_calibration_bar_preserve_only_unchanged_recipe(
+    _onboarding_retry_sources, drift
+):
+    onboard, args, root = _onboarding_retry_sources
+    (root / "onboarding" / "onboard.py").write_text(
+        "def logged_run(args):\n    try:\n        return run(args)\n    except Exception:\n        return 1\n"
+    )
+    (root / "harness" / "runner.py").write_text(
+        "if stepping:\n    for start in range(reference_calibration_runs):\n        measure_reference(start)\n"
+    )
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    (root / "onboarding" / "onboard.py").write_text(
+        "def logged_run(args):\n"
+        "    from arctic_platform.correctness.harness.report import duration\n"
+        "    started = time.monotonic()\n"
+        "    try:\n"
+        "        return run(args)\n"
+        "    except Exception:\n"
+        "        return 1\n"
+        "    finally:\n"
+        '        print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)\n'
+    )
+    runs = "reference_calibration_runs" if drift == "display-only" else "reference_calibration_runs + 1"
+    (root / "harness" / "runner.py").write_text(
+        "if stepping:\n"
+        "    from tqdm.auto import tqdm\n"
+        "    with tqdm(total=reference_calibration_runs,\n"
+        '              desc=f"Optimizer calibration {arm.name}", unit="run", file=sys.stdout,\n'
+        "              dynamic_ncols=True, mininterval=0, miniters=1) as progress:\n"
+        f"        for start in range({runs}):\n"
+        "            measure_reference(start)\n"
+        "            progress.update(1)\n"
+    )
+    onboard._resume_setup(args)
+    assert args._resume_candidates == ([original] if drift == "display-only" else [])
+
+
+@pytest.fixture
+def _automatic_regression_gateway(tmp_path, monkeypatch):
+    import requests
+
+    for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None)
+    is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: False if str(path) == "/job/hostfile" else is_file(path))
+    listener = MagicMock()
+    listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 54321)
+    monkeypatch.setattr(dss_driver.socket, "socket", lambda: listener)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    start = Mock(return_value=process)
+    original_popen = dss_driver.subprocess.Popen
+    monkeypatch.setattr(
+        dss_driver.subprocess,
+        "Popen",
+        lambda command, *args, **kwargs: (
+            start(command, *args, **kwargs)
+            if command[:3] == [sys.executable, "-m", "dss.ray_dss.gateway_server"]
+            else original_popen(command, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
+    real_load_local_fixture = cortex_fixture.load_local_fixture
+    monkeypatch.setattr(
+        cortex_fixture,
+        "load_local_fixture",
+        lambda backend, spec: {"model_name": "synthetic-fixture", "fixture_sha256": "f" * 64},
+    )
+    return SimpleNamespace(
+        process=process, start=start, out=tmp_path / "reports", real_load_local_fixture=real_load_local_fixture
+    )
+
+
+@pytest.mark.parametrize("failure", [None, "health", "identity", "interrupt"])
+def test_regression_automatic_gateway_starts_before_real_fixture_health_and_cleans_up(
+    _automatic_regression_gateway, monkeypatch, failure
+):
+    import requests
+
+    state = _automatic_regression_gateway
+    first_two = {key: value for key, value in api.registered_tests().items() if key.startswith("single-step-")}
+    monkeypatch.setattr(api, "registered_tests", lambda: first_two)
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", state.real_load_local_fixture)
+    monkeypatch.setattr(cortex_fixture, "require_data_fast_path", lambda path, **kw: Path(path))
+    session = MagicMock()
+    session.__enter__.return_value = session
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    events = []
+
+    def health(url, **options):
+        state.start.assert_called_once()
+        state.process.terminate.assert_not_called()
+        assert url == "http://127.0.0.1:54321/health"
+        assert session.trust_env is False and options["allow_redirects"] is False
+        events.append("health")
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        return SimpleNamespace(status_code=503 if failure == "health" else 200, json=lambda: {"status": "OK"})
+
+    def describe(spec, path):
+        assert events == ["health"]
+        events.append("identity")
+        if failure == "identity":
+            raise ValueError("synthetic fixture identity mismatch")
+        return {"fixture_sha256": "f" * 64}
+
+    def vocabulary(*args, **options):
+        assert events == ["health", "identity"]
+        events.append("vocabulary")
+        return 128
+
+    def execute(cfg, spec, arms, **options):
+        assert events == ["health", "identity", "vocabulary"]
+        events.append("execute")
+        return [Result(test, cfg.config_id, Outcome.PASS, arm=arm.name) for test in options["select"] for arm in arms]
+
+    session.get.side_effect = health
+    monkeypatch.setattr(cortex_fixture, "describe_fixture", describe)
+    monkeypatch.setattr(execution, "_run_vocab_size", vocabulary)
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG),
+        api.RunOptions(out=state.out),
+        executor=execute,
+    )
+    expected = {None: "pass", "health": "blocked", "identity": "blocked", "interrupt": "error"}
+    assert [case["status"] for case in result.cases] == [expected[failure]] * 2
+    assert result.exit_code == (0 if failure is None else 1)
+    assert events == (
+        ["health", "identity", "vocabulary", "execute"]
+        if failure is None
+        else ["health", "identity"] if failure == "identity" else ["health"]
+    )
+    state.process.terminate.assert_called_once()
+    state.process.wait.assert_called_once_with(timeout=120)
+    assert (state.out / "full.log").is_file() and (state.out / "report.json").is_file()
+
+
+@pytest.mark.parametrize("proxy_name", ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+def test_gateway_readiness_ignores_proxy_environment(_automatic_regression_gateway, monkeypatch, proxy_name):
+    import requests
+
+    state = _automatic_regression_gateway
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(proxy_name, "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setattr(requests, "get", requests.api.get)
+    observed = []
+
+    def send(adapter, request, **options):
+        observed.append(options["proxies"])
+        assert request.url == "http://127.0.0.1:54321/health"
+        assert not any(options["proxies"].values()), "loopback readiness inherited a proxy"
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"{}"
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    with dss_driver.local_cortex_gateway(state.out) as url:
+        assert url == "http://127.0.0.1:54321"
+    assert len(observed) == 1
+    state.process.terminate.assert_called_once()
+    state.process.wait.assert_called_once_with(timeout=120)
+
+
+@pytest.mark.parametrize("failure", [None, "comparison", "executor", "interrupt", "reference"])
+def test_regression_automatic_gateway_single_command_runs_both_checks_and_closes_owned_service(
+    _automatic_regression_gateway, monkeypatch, failure
+):
+    state = _automatic_regression_gateway
+    first_two = {key: value for key, value in api.registered_tests().items() if key.startswith("single-step-")}
+    monkeypatch.setattr(api, "registered_tests", lambda: first_two)
+    observed = []
+
+    def execute(cfg, spec, arms, **options):
+        assert state.process.terminate.call_count == 0
+        assert options["local_cortex_fixture"] is True
+        backend = options["client_backend"]
+        assert backend.base_url == "http://127.0.0.1:54321"
+        assert backend.database == backend.schema_ == "dev"
+        assert options["select"] == ["single-step-grads", "single-step-optimizer"]
+        observed.extend(options["select"])
+        if failure == "executor":
+            raise RuntimeError("synthetic execution failed")
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        if failure == "reference":
+            raise ReferencePrerequisiteError("synthetic prepared record missing; onboard first")
+        return [
+            Result(test, cfg.config_id, Outcome.FAIL if failure == "comparison" else Outcome.PASS, arm=arm.name)
+            for test in options["select"]
+            for arm in arms
+        ]
+
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG),
+        api.RunOptions(out=state.out),
+        executor=execute,
+    )
+    assert observed == ["single-step-grads", "single-step-optimizer"]
+    assert result.exit_code == (0 if failure is None else 1)
+    expected = {None: "pass", "comparison": "fail", "executor": "error", "interrupt": "error", "reference": "blocked"}
+    assert [case["status"] for case in result.cases] == [expected[failure]] * 2
+    assert len(result.results) == (4 if failure in (None, "comparison") else 2)
+    state.process.terminate.assert_called_once()
+    state.process.wait.assert_called_once_with(timeout=120)
+    assert state.start.call_count == 1
+    assert (state.out / "cases" / _operator_api_CONFIG / "0" / "gateway.log").is_file()
+    assert (state.out / "full.log").is_file() and (state.out / "report.json").is_file()
+
+
+@pytest.mark.parametrize("source", ["argument", "environment"])
+def test_regression_automatic_gateway_does_not_replace_explicit_endpoint(
+    _automatic_regression_gateway, monkeypatch, source
+):
+    state = _automatic_regression_gateway
+    monkeypatch.setattr(execution, "local_cortex_gateway", lambda *a: pytest.fail("explicit service replaced"))
+    values = {"out": state.out, "local_cortex_fixture": True}
+    if source == "argument":
+        values["base_url"] = "http://127.0.0.1:8003"
+    else:
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://127.0.0.1:8003")
+
+    def execute(cfg, *a, **options):
+        assert options["client_backend"].base_url == "http://127.0.0.1:8003"
+        return [Result("single-step-grads", cfg.config_id, Outcome.PASS)]
+
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG, tests=("single-step-grads",)),
+        api.RunOptions(**values),
+        executor=execute,
+    )
+    assert result.exit_code == 0
+    state.start.assert_not_called()
+    state.process.terminate.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["host", "pat", "later-check", "rl", "publication", "full-model", "onprem"])
+def test_regression_automatic_gateway_respects_authentication_and_workload_boundaries(
+    _automatic_regression_gateway, monkeypatch, mode
+):
+    args = execution.parse_args(["run", "--config", _operator_api_CONFIG, "--test", "single-step-grads"])
+    if mode == "host":
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "account.invalid")
+    elif mode == "pat":
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "synthetic-not-a-credential")
+    elif mode == "later-check":
+        args.test = ["inference-checkpoint-loss"]
+    elif mode == "rl":
+        monkeypatch.setattr(execution, "load_config", lambda *a: SimpleNamespace(is_rl=True))
+    elif mode == "publication":
+        args.cortex_fixture = Path("publication.json")
+    elif mode == "full-model":
+        args.local_gateway_full_model = True
+    else:
+        args.backend = "onprem"
+    if mode == "pat":
+        with pytest.raises(ValueError, match="unauthenticated"):
+            execution._configure_regression_target(args)
+    else:
+        assert execution._configure_regression_target(args) is args
+    assert not getattr(args, "_automatic_cortex_gateway", False)
+    _automatic_regression_gateway.start.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "shutdown"])
+def test_regression_automatic_gateway_startup_and_cleanup_failures_are_saved_and_not_passes(
+    _automatic_regression_gateway, monkeypatch, failure
+):
+    import requests
+
+    state = _automatic_regression_gateway
+    if failure == "exit":
+        state.process.poll.return_value = 7
+        state.process.returncode = 7
+    elif failure == "timeout":
+        ticks = iter([0, 1, 121])
+        monkeypatch.setattr(dss_driver.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(dss_driver.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=503))
+    else:
+        state.process.pid = 12345
+        state.process.wait.side_effect = [subprocess.TimeoutExpired("gateway", 120), 0]
+        monkeypatch.setattr(dss_driver.os, "killpg", Mock())
+    if failure in {"exit", "timeout"}:
+        with pytest.raises(RuntimeError, match="exited|did not become ready"):
+            with dss_driver.local_cortex_gateway(state.out):
+                pytest.fail("unready gateway reached target work")
+    else:
+        result = api.run(
+            api.RunRequest(config=_operator_api_CONFIG, tests=("single-step-grads",)),
+            api.RunOptions(out=state.out),
+            executor=lambda cfg, *a, **k: [Result("single-step-grads", cfg.config_id, Outcome.PASS)],
+        )
+        assert result.exit_code == 1 and result.stopped_unsafe
+        assert result.cases[0]["status"] == "error"
+        assert "did not shut down cleanly" in (state.out / "full.log").read_text()
+        dss_driver.os.killpg.assert_called_once_with(12345, dss_driver.signal.SIGKILL)
+    if failure != "shutdown":
+        assert (state.out / "gateway.log").is_file()
+    else:
+        assert state.start.call_count == 1
+
+
+@pytest.mark.parametrize("operation", ["terminate", "wait", "killpg"])
+def test_regression_gateway_cleanup_exceptions_stop_following_work(
+    _automatic_regression_gateway, monkeypatch, operation
+):
+    state = _automatic_regression_gateway
+    state.process.pid = 12345
+    if operation == "terminate":
+        state.process.terminate.side_effect = ValueError("synthetic termination failure")
+    elif operation == "wait":
+        state.process.wait.side_effect = FileNotFoundError("synthetic wait failure")
+    else:
+        state.process.wait.side_effect = subprocess.TimeoutExpired("gateway", 120)
+        monkeypatch.setattr(dss_driver.os, "killpg", Mock(side_effect=OSError("synthetic group kill failure")))
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG, tests=("single-step-grads",)),
+        api.RunOptions(out=state.out),
+        executor=lambda cfg, *a, **k: [Result("single-step-grads", cfg.config_id, Outcome.PASS)],
+    )
+    assert result.exit_code == 1 and result.stopped_unsafe
+    assert result.cases[0]["status"] == "error"
+    assert "UnsafeCleanupError" in (state.out / "full.log").read_text()
+
+
+def test_regression_gateway_disappearing_group_still_reaps_owned_child(_automatic_regression_gateway, monkeypatch):
+    state = _automatic_regression_gateway
+    state.process.pid = 12345
+    state.process.wait.side_effect = [subprocess.TimeoutExpired("gateway", 120), 0]
+    kill = Mock(side_effect=ProcessLookupError("synthetic group already exited"))
+    monkeypatch.setattr(dss_driver.os, "killpg", kill)
+    with pytest.raises(UnsafeCleanupError, match="did not shut down cleanly"):
+        with dss_driver.local_cortex_gateway(state.out):
+            pass
+    kill.assert_called_once_with(12345, dss_driver.signal.SIGKILL)
+    assert state.process.wait.call_count == 2
+    assert state.process.wait.call_args_list[0].kwargs == {"timeout": 120}
+    assert state.process.wait.call_args_list[1].kwargs == {}
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("phase", ["startup", "onboarding", "regression"])
+def test_owned_gateway_stop_signals_clean_up_and_restore_handlers(
+    _automatic_regression_gateway, monkeypatch, capsys, signum, phase
+):
+    import requests
+
+    from arctic_platform.correctness.onboarding import onboard
+
+    state = _automatic_regression_gateway
+    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    if phase == "startup":
+        monkeypatch.setattr(requests, "get", lambda *a, **k: signal.raise_signal(signum))
+        context = dss_driver.local_cortex_gateway(state.out)
+    elif phase == "onboarding":
+        context = onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=state.out))
+    else:
+        context = dss_driver.local_cortex_gateway(state.out)
+    with pytest.raises(KeyboardInterrupt, match=f"received {signal.Signals(signum).name}"):
+        with context:
+            signal.raise_signal(signum)
+    state.process.terminate.assert_called_once()
+    state.process.wait.assert_called_once_with(timeout=120)
+    assert {number: signal.getsignal(number) for number in previous} == previous
+    output = capsys.readouterr().out
+    assert "Stopping owned Cortex-training gateway" in output
+    assert "Owned Cortex-training gateway stopped and reaped." in output
+
+
+def test_owned_gateway_repeated_stop_does_not_interrupt_cleanup(_automatic_regression_gateway):
+    state = _automatic_regression_gateway
+    previous = signal.getsignal(signal.SIGTERM)
+    state.process.terminate.side_effect = lambda: signal.raise_signal(signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt, match="received SIGTERM"):
+        with dss_driver.local_cortex_gateway(state.out):
+            signal.raise_signal(signal.SIGTERM)
+    state.process.wait.assert_called_once_with(timeout=120)
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_owned_gateway_real_process_signal_reaps_child(tmp_path, signum):
+    script = """
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+import requests
+import torch
+from arctic_platform.correctness.harness import dss_driver
+
+directory = Path(sys.argv[1])
+original_popen = subprocess.Popen
+def start_gateway(*args, **kwargs):
+    return original_popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        stdout=kwargs["stdout"], stderr=kwargs["stderr"], start_new_session=True,
+    )
+dss_driver.subprocess.Popen = start_gateway
+dss_driver._allocation_hostfile = lambda: None
+torch.cuda.device_count = lambda: 1
+requests.get = lambda *args, **kwargs: SimpleNamespace(status_code=200)
+with dss_driver.local_cortex_gateway(directory):
+    (directory / "ready").write_text(str(os.getpid()))
+    signal.pause()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output = ""
+    try:
+        deadline = time.monotonic() + 30
+        while not (tmp_path / "ready").is_file():
+            if process.poll() is not None:
+                output, _ = process.communicate(timeout=5)
+                pytest.fail(f"signal test parent exited before gateway startup:\n{output}")
+            assert time.monotonic() < deadline, "signal test gateway startup timed out"
+            time.sleep(0.05)
+        process.send_signal(signum)
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode != 0
+        assert f"received {signal.Signals(signum).name}" in output
+        assert "Owned Cortex-training gateway stopped and reaped." in output
+        marker = "Stopping owned Cortex-training gateway (PID "
+        child_pid = int(output.split(marker, 1)[1].split(")", 1)[0])
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)

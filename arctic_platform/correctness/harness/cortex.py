@@ -478,16 +478,30 @@ class CorrectnessCortexTransport(CortexTransport):
             time.sleep(min(interval, remaining))
 
     def shutdown(self) -> None:
+        primary = None
         try:
             parent = getattr(self, "_local_shutdown_parent", None)
             if parent is not None and self._is_local_gateway():
                 self._wait_local_cancelled(parent)
             else:
                 super().shutdown()
+        except BaseException as error:
+            primary = error
+            if parent is not None:
+                error.add_note(
+                    f"Local gateway cancellation was not verified for owned parent {parent!r}; "
+                    f"owned children: {self._local_shutdown_children!r}"
+                )
+            raise
         finally:
             self.job_id = None
             self._native_children = {}
             self._native_bindings = {}
             self._local_shutdown_parent = None
             self._local_shutdown_children = {}
-            self._on_loop(self._close_session()).result()
+            try:
+                self._on_loop(self._close_session()).result()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                primary.add_note(f"HTTP session closure also failed: {type(error).__name__}: {error}")

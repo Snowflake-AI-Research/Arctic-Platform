@@ -454,3 +454,85 @@ def test_local_cortex_shutdown_startup_failure_still_cancels_owned_parent_with_c
         initialize_or_cleanup(transport, config)
     assert [method for method, _, _ in state.calls] == ["POST", "POST", "GET"]
     assert state.closed and transport.job_id is None
+
+
+def test_local_cortex_shutdown_close_failure_preserves_cancellation_error_and_owned_identity(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, original = create(native=True, roles=("training", "sampling", "log_probability"))
+    primary = aiohttp.ClientConnectionError("owned cancellation failed")
+    state.error = primary
+    close = transport._close_session
+
+    async def failing_close():
+        await close()
+        raise RuntimeError("owned session close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(aiohttp.ClientConnectionError) as caught:
+            transport.shutdown()
+
+    assert caught.value is primary
+    assert len(state.calls) == 1 and state.closed
+    assert transport.config is original and transport.job_id is None
+    assert transport._native_bindings == transport._native_children == {}
+    assert transport._local_shutdown_parent is None and transport._local_shutdown_children == {}
+    notes = "\n".join(primary.__notes__)
+    assert "cancellation was not verified" in notes and "owned-parent" in notes
+    for role in ("training", "sampling", "log_prob"):
+        assert f"owned-parent:{role}:0" in notes
+    assert "HTTP session closure also failed: RuntimeError: owned session close failed" in notes
+
+
+def test_local_cortex_shutdown_close_failure_after_cancellation_still_raises(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    close = transport._close_session
+    failure = RuntimeError("owned session close failed")
+
+    async def failing_close():
+        await close()
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(RuntimeError) as caught:
+            transport.shutdown()
+
+    assert caught.value is failure
+    assert not getattr(failure, "__notes__", [])
+    assert len(state.calls) == 2 and state.closed
+    assert transport.job_id is None and transport._local_shutdown_parent is None
+
+
+def test_local_cortex_shutdown_interruption_preserves_ownership_when_session_close_fails(
+    _local_cortex_shutdown_gateway, monkeypatch
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    primary = KeyboardInterrupt("owned cancellation interrupted")
+    close = transport._close_session
+
+    def interrupted_cancel(parent):
+        assert parent == "owned-parent"
+        raise primary
+
+    async def failing_close():
+        await close()
+        raise RuntimeError("owned session close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_wait_local_cancelled", interrupted_cancel)
+        patch.setattr(transport, "_close_session", failing_close)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            transport.shutdown()
+
+    assert caught.value is primary
+    assert state.calls == [] and state.closed
+    notes = "\n".join(primary.__notes__)
+    assert "cancellation was not verified" in notes and "owned-parent:training:0" in notes
+    assert "HTTP session closure also failed" in notes

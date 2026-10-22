@@ -10,7 +10,7 @@
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/qwen3-8b-four-h200.json
+  --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
 **Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/qwen3-8b-four-h200.json` and the adjacent `qwen3-8b-four-h200.onboarding.json` summary before accepting the gates. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.

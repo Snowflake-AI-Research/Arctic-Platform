@@ -124,7 +124,7 @@ def render(args: argparse.Namespace) -> str:
         " OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n    OUTPUT.write_text(json.dumps(payload, indent=2,"
         ' sort_keys=True) + "\\n")\n    print(f"loss range: {payload[\'loss_range\']:.9e}")\n    print(f"raw'
         ' variation: {raw_variation:.9e}")\n    print(f"computed {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")\n'
-        "    print(f\"selected gate: {selected_gate:.9e}\")\n    print(f\"{'tensor':64} {'minimum':>13}"
+        "    print(f\"selected gate: {selected_gate:.9e}\")\n    print(f\"{'weight':64} {'minimum':>13}"
         " {'maximum':>13} {'range':>13}\")\n    for row in ranges[:10]:\n        print(f\"{row['name']:64}"
         " {row['minimum']:>13.9f} {row['maximum']:>13.9f} {row['range']:>13.6e}\")\n\n    spec ="
         ' json.loads(SPEC_PATH.read_text())\n    spec.setdefault("test_tolerances", {})[TEST_ID] = {\n       '

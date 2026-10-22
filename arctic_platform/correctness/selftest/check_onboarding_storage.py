@@ -991,7 +991,7 @@ def _rendered_calibration_workers(monkeypatch):
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnostics(
-    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, explicit
+    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, explicit, capsys
 ):
     rendered = _onboarding_render_config(tmp_path, None)
     namespace = {"__name__": "synthetic_calibration"}
@@ -1004,6 +1004,10 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     namespace["SPEC_PATH"].write_text("{}")
 
     assert namespace["main"]() == 0
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.split() == ["weight", "minimum", "maximum", "range"])
+    assert header == f"{'weight':64} {'minimum':>13} {'maximum':>13} {'range':>13}"
+    assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
 
     calls = _rendered_calibration_workers
     assert len(calls) == 16
@@ -1022,6 +1026,8 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert payload["tolerance"]["selected_gate"] == 0.001
     spec = json.loads(namespace["SPEC_PATH"].read_text())
     assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 16
+    assert spec["test_tolerances"]["single-step-grads"]["worst_tensor"] == "model.weight"
+    assert payload["tolerance"]["raw_max_same_tensor_range"] == 0.0
 
 
 def test_onboarding_renderer_rejects_diagnostic_directory_for_tensor_scratch(

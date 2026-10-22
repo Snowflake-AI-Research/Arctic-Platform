@@ -24,8 +24,12 @@ import math
 import os
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
@@ -102,6 +106,113 @@ def _allocation_hostfile() -> Path | None:
             return path
     default = Path("/data-fast/hostfile")
     return default if default.is_file() else None
+
+
+@contextlib.contextmanager
+def local_cortex_gateway(directory: Path) -> Iterator[str]:
+    """Start the installed DSS service and close only this command's owned process."""
+    import requests
+    import torch
+
+    directory.mkdir(parents=True, exist_ok=True)
+    hostfile = _allocation_hostfile()
+    if hostfile is None and Path("/job/hostfile").is_file():
+        hostfile = Path("/job/hostfile")
+    if hostfile is None:
+        hostfile = directory / "hostfile"
+        hostfile.write_text(f"{socket.gethostname()} slots={torch.cuda.device_count()}\n")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    log_path = directory / "gateway.log"
+    print(f"\n*** Target: Starting Cortex Training Gateway ***\nGateway log: {log_path}\n", flush=True)
+    previous_handlers = {}
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt(f"received {signal.Signals(signum).name}; stopping owned Cortex-training gateway")
+
+    with log_path.open("w") as log:
+        process = None
+        try:
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    previous_handlers[signum] = signal.getsignal(signum)
+                    signal.signal(signum, interrupt)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "dss.ray_dss.gateway_server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--backend",
+                    "gpu",
+                    "--hostfile",
+                    str(hostfile),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(f"Cortex-training gateway exited {process.returncode}; see {log_path}")
+                try:
+                    response = requests.get(
+                        f"{url}/health",
+                        timeout=1,
+                        allow_redirects=False,
+                        proxies={"http": "", "https": "", "all": ""},
+                    )
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(0.2)
+            else:
+                raise RuntimeError(f"Cortex-training gateway did not become ready; see {log_path}")
+            yield url
+        finally:
+            # A repeated stop signal must not interrupt the owned child's bounded teardown.
+            for signum in previous_handlers:
+                signal.signal(signum, signal.SIG_IGN)
+            try:
+                try:
+                    if process is not None:
+                        print(
+                            f"Stopping owned Cortex-training gateway (PID {process.pid}); log: {log_path}", flush=True
+                        )
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=120)
+                            except subprocess.TimeoutExpired as exc:
+                                try:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    # The group can exit between the timeout and signal; still reap the owned child.
+                                    pass
+                                process.wait()
+                                raise UnsafeCleanupError(
+                                    "owned Cortex-training gateway did not shut down cleanly; inspect"
+                                    f" {log_path} before retrying"
+                                ) from exc
+                        else:
+                            process.wait()
+                        print("Owned Cortex-training gateway stopped and reaped.", flush=True)
+                except UnsafeCleanupError:
+                    raise
+                except Exception as exc:
+                    raise UnsafeCleanupError(
+                        f"owned Cortex-training gateway cleanup failed; inspect {log_path} before retrying"
+                    ) from exc
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 def _run_on_allocation(script: str) -> subprocess.CompletedProcess[str]:

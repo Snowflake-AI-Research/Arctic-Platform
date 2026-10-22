@@ -1773,3 +1773,72 @@ def test_reference_observability_calibration_error_keeps_existing_record_and_doe
     assert any("start" in line and "device=0" in line for line in matching)
     assert any("failed" in line and "device=0" in line for line in matching)
     assert not any("done" in line for line in matching)
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_reference_runs(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys, workers
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.update(("single-step-optimizer", arm.name) for arm in control.arms)
+    calls = []
+
+    def reference(model, batch, output, **kwargs):
+        calls.append((batch.name, kwargs["deterministic"]))
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert (
+        control.execute(prepare_references=True, reference_calibration_runs=16, reference_calibration_workers=workers)
+        == []
+    )
+    output = capsys.readouterr().out
+    for arm in control.arms:
+        assert f"Optimizer calibration {arm.name}" in output
+        for completed in range(1, 17):
+            assert f"{completed}/16" in output
+        assert output.index(f"Optimizer calibration {arm.name}") < output.index(
+            f"*** Optimizer Norm Summary: {arm.name} ***"
+        )
+        assert calls.count((f"batch-{arm.name}.pt", True)) == 1
+        assert calls.count((f"batch-{arm.name}.pt", False)) == 16
+    assert len(control.published) == 2
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
+def test_optimizer_calibration_failed_run_leaves_partial_progress_without_publication(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.add(("single-step-optimizer", "gas1"))
+    count = 0
+
+    def reference(model, batch, output, **kwargs):
+        nonlocal count
+        if not kwargs["deterministic"]:
+            count += 1
+            if count == 2:
+                raise RuntimeError("synthetic calibration failure")
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    with pytest.raises(RuntimeError, match="synthetic calibration failure"):
+        control.execute(
+            selected_arms=control.arms[:1],
+            prepare_references=True,
+            reference_calibration_runs=16,
+            reference_calibration_workers=1,
+        )
+    output = capsys.readouterr().out
+    assert "Optimizer calibration gas1" in output and "1/16" in output
+    assert "16/16" not in output and "Optimizer Norm Summary" not in output
+    assert control.published == []
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)

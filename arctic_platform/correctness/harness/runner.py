@@ -795,6 +795,8 @@ def execute(
                 from decimal import ROUND_CEILING
                 from decimal import Decimal
 
+                from tqdm.auto import tqdm
+
                 from ..checks.optimizer_state import max_pairwise_optimizer_norm_delta
                 from ..checks.optimizer_state import summarize_optimizer_artifacts
 
@@ -811,23 +813,33 @@ def execute(
                     flush=True,
                 )
                 manifests = []
-                for start in range(0, reference_calibration_runs, reference_calibration_workers):
-                    indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
-                    with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
-                        futures = {
-                            pool.submit(
-                                measure_reference,
-                                arm,
-                                output_name=f"{arm.name}-calibration-{index}",
-                                cuda_device=index % reference_calibration_workers,
-                                deterministic=False,
-                            ): index
-                            for index in indices
-                        }
-                        completed = {}
-                        for future in as_completed(futures):
-                            completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
-                        manifests.extend(completed[index] for index in indices)
+                with tqdm(
+                    total=reference_calibration_runs,
+                    desc=f"Optimizer calibration {arm.name}",
+                    unit="run",
+                    file=sys.stdout,
+                    dynamic_ncols=True,
+                    mininterval=0,
+                    miniters=1,
+                ) as progress:
+                    for start in range(0, reference_calibration_runs, reference_calibration_workers):
+                        indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
+                        with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
+                            futures = {
+                                pool.submit(
+                                    measure_reference,
+                                    arm,
+                                    output_name=f"{arm.name}-calibration-{index}",
+                                    cuda_device=index % reference_calibration_workers,
+                                    deterministic=False,
+                                ): index
+                                for index in indices
+                            }
+                            completed = {}
+                            for future in as_completed(futures):
+                                completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
+                                progress.update(1)
+                            manifests.extend(completed[index] for index in indices)
                 print(
                     f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
                     f"Reading saved optimizer states from {len(manifests)} completed HF runs.",

@@ -28,8 +28,6 @@ import logging
 import math
 import os
 import shutil
-import signal
-import socket
 import stat
 import subprocess
 import sys
@@ -91,8 +89,11 @@ class _ConsoleLog:
 
 def logged_run(args: argparse.Namespace) -> int:
     """Retain diagnostics even when prerequisites or specification loading fail."""
+    from arctic_platform.correctness.harness.report import duration
+
     if getattr(args, "probe_layers", None) is not None:
         return run(args)
+    started = time.monotonic()
     previous_root = os.environ.get(CORRECTNESS_LOGDIR_ENV)
     args._resume_root = Path(previous_root or Path.cwd() / "work" / "logs") / "onboarding-state"
     args._diagnostics_dir = correctness_logdir("onboarding-")
@@ -125,6 +126,8 @@ def logged_run(args: argparse.Namespace) -> int:
                             flush=True,
                         )
                         return 1
+                    finally:
+                        print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)
             finally:
                 logger.handlers = previous_handlers
                 handler.close()
@@ -191,71 +194,11 @@ def _validation_gateway(args: argparse.Namespace):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
-    import requests
-    import torch
-
-    from arctic_platform.correctness.harness.dss_driver import UnsafeCleanupError
-    from arctic_platform.correctness.harness.dss_driver import _allocation_hostfile
+    from arctic_platform.correctness.harness.dss_driver import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    hostfile = _allocation_hostfile()
-    if hostfile is None and Path("/job/hostfile").is_file():
-        hostfile = Path("/job/hostfile")
-    if hostfile is None:
-        hostfile = directory / "hostfile"
-        hostfile.write_text(f"{socket.gethostname()} slots={torch.cuda.device_count()}\n")
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    url = f"http://127.0.0.1:{port}"
-    log_path = directory / "gateway.log"
-    _stage("Target", "Starting Cortex Training Gateway", f"Gateway log: {log_path}")
-    with log_path.open("w") as log:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "dss.ray_dss.gateway_server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--backend",
-                "gpu",
-                "--hostfile",
-                str(hostfile),
-            ],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError(f"Cortex-training gateway exited {process.returncode}; see {log_path}")
-                try:
-                    response = requests.get(f"{url}/health", timeout=1, allow_redirects=False)
-                    if response.status_code == 200:
-                        break
-                except requests.RequestException:
-                    pass
-                time.sleep(0.2)
-            else:
-                raise RuntimeError(f"Cortex-training gateway did not become ready; see {log_path}")
-            yield url
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=120)
-                except subprocess.TimeoutExpired as exc:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                    raise UnsafeCleanupError(
-                        f"owned Cortex-training gateway did not shut down cleanly; inspect {log_path} before retrying"
-                    ) from exc
+    with local_cortex_gateway(directory) as url:
+        yield url
 
 
 def _checkpoint_file_identity(path: Path | str) -> dict:
@@ -278,6 +221,20 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
             raise ValueError(f"Onboarding source changed while recording retry state: {path}")
         tree = ast.parse(path.read_text())
         if relative == "onboarding/onboard.py":
+            footer_nodes = {
+                ast.dump(ast.parse(source).body[0])
+                for source in (
+                    "from arctic_platform.correctness.harness.report import duration",
+                    "started = time.monotonic()",
+                    'print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)',
+                )
+            }
+            for function in tree.body:
+                if isinstance(function, ast.FunctionDef) and function.name == "logged_run":
+                    for node in ast.walk(function):
+                        for field, value in ast.iter_fields(node):
+                            if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                                setattr(node, field, [item for item in value if ast.dump(item) not in footer_nodes])
             tree.body = [
                 node
                 for node in tree.body
@@ -286,6 +243,42 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
             ]
         else:
             # These exact changes affect reuse/logging, not the measured HF recipe or gate.
+            progress_context = ast.dump(
+                ast.parse(
+                    """with tqdm(
+                        total=reference_calibration_runs,
+                        desc=f"Optimizer calibration {arm.name}",
+                        unit="run",
+                        file=sys.stdout,
+                        dynamic_ncols=True,
+                        mininterval=0,
+                        miniters=1,
+                    ) as progress:
+                        pass"""
+                )
+                .body[0]
+                .items[0]
+            )
+            progress_update = ast.dump(ast.parse("progress.update(1)").body[0])
+            progress_import = ast.dump(ast.parse("from tqdm.auto import tqdm").body[0])
+
+            class CalibrationDisplay(ast.NodeTransformer):
+                def visit_ImportFrom(self, node):
+                    return None if ast.dump(node) == progress_import else node
+
+                def visit_With(self, node):
+                    node = self.generic_visit(node)
+                    if len(node.items) == 1 and ast.dump(node.items[0]) == progress_context:
+                        for child in ast.walk(node):
+                            for field, value in ast.iter_fields(child):
+                                if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                                    setattr(
+                                        child, field, [item for item in value if ast.dump(item) != progress_update]
+                                    )
+                        return node.body
+                    return node
+
+            tree = CalibrationDisplay().visit(tree)
             summaries = [
                 """print(
                     f"\\n*** Optimizer Norm Summary: {arm.name} ***\\n"

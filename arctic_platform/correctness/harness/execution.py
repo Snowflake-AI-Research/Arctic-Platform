@@ -22,10 +22,12 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 import traceback
 from contextlib import contextmanager
+from contextlib import nullcontext
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -52,6 +54,7 @@ from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
 from .dss_driver import available_gpus
+from .dss_driver import local_cortex_gateway
 from .hosted import is_local_cortex_gateway
 from .hosted import read_pat
 from .hosted import require_local_cortex_gateway
@@ -64,6 +67,7 @@ from .report import write as write_report
 from .runner import assert_applicable_tests_registered
 from .runner import cortex_unavailable_reason
 from .runner import execute
+from .storage import correctness_logdir
 from .storage import correctness_workdir
 from .storage import ensure_no_interrupted_builds
 from .storage import require_data_fast_path
@@ -248,7 +252,6 @@ def _finish(
     execution: Dict[str, dict] | None = None,
 ) -> int:
     """Write the report and print what the run concluded. Zero only when something passed and none failed."""
-    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
     write_report(results, specs, out, execution=execution)
     failed = [r for r in results if r.outcome is TestOutcome.FAIL]
     passed = [r for r in results if r.outcome is TestOutcome.PASS]
@@ -259,6 +262,7 @@ def _finish(
     print(f"report: {out / 'report.md'}")
     for r in failed:
         print(f"  FAIL {r.config_id} {r.test_id} {r.arm or ''}: {r.summary}")
+    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
     return 0 if passed and not failed else 1
 
 
@@ -376,14 +380,41 @@ def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None =
         return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
 
 
+def _configure_regression_target(args):
+    """First-two config regression owns a local service only when no endpoint is configured."""
+    if (
+        getattr(args, "backend", "cortex") == "onprem"
+        or not args.config
+        or args.all_configs
+        or not args.test
+        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
+        or any(
+            getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
+            for name in ("base_url", "host")
+        )
+    ):
+        return args
+    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl:
+        return args
+    args = copy.copy(args)
+    args._automatic_cortex_gateway = True
+    args.local_cortex_fixture = True
+    args.base_url = "http://127.0.0.1:1"
+    require_local_cortex_gateway(_client_backend(args))
+    return args
+
+
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    args = _configure_regression_target(args)
     historical_gradient_references = _load_historical_gradient_references(args)
     test_spec = getattr(args, "test_spec", None)
     if test_spec is not None and (not args.config or args.all_configs):
         raise SystemExit("--test-spec requires one explicit --config")
     if getattr(args, "out", None) is None:
-        args.out = correctness_workdir("ap-correctness-run-")
+        args.out = correctness_logdir("ap-correctness-run-")
     backend = _client_backend(args)
     if getattr(args, "reference_records_dir", None) is not None:
         from .reference_records import require_git_records_dir
@@ -503,78 +534,87 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_sha256=published_fixture["fixture_sha256"],
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
-        if local_fixture:
-            from .cortex import load_local_fixture
-
-            try:
-                published_fixture = load_local_fixture(backend, spec)
-            except ValueError as exc:
-                results.extend(
-                    [
-                        TestResult(
-                            test_id=test_id,
-                            config_id=cfg.config_id,
-                            outcome=TestOutcome.FAIL,
-                            summary="local Cortex fixture identity unavailable",
-                            reason=str(exc),
-                        )
-                        for test_id in args.test or tests
-                    ]
-                )
-                print(f"skip {path.name}: {exc}", flush=True)
-                continue
-            execution[cfg.config_id].update(
-                requested_model_name=published_fixture["model_name"],
-                fixture_sha256=published_fixture["fixture_sha256"],
-                fixture_distribution="local-gateway",
-                gateway_url=backend.base_url,
-            )
-
-        print(f"=== {cfg.config_id} ===", flush=True)
-        vocab_size = _run_vocab_size(
-            cfg,
-            spec,
-            args.test,
-            backend,
-            published_fixture,
+        managed_gateway = (
+            local_cortex_gateway(Path(args.out))
+            if getattr(args, "_automatic_cortex_gateway", False)
+            else nullcontext(None)
         )
+        with managed_gateway as gateway_url:
+            if gateway_url is not None:
+                backend.base_url = gateway_url
+                execution[cfg.config_id]["gateway_url"] = gateway_url
+            if local_fixture:
+                from .cortex import load_local_fixture
 
-        for width in widths:
-            multiple = width // cfg.n_gpus
-            run_cfg = cfg.at_gpu_width(width)
-            run_cases = scaled_for_placement(selected_cases, multiple)
-            if len(widths) > 1:
-                print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
-            results.extend(
-                run_executor(
-                    run_cfg,
-                    spec,
-                    run_cases,
-                    order=args.order,
-                    fail_fast=args.fail_fast,
-                    vocab_size=vocab_size,
-                    select=args.test or None,
-                    attn=args.attn[0] if args.attn else None,
-                    client_backend=backend,
-                    **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
-                    **({"local_cortex_fixture": True} if local_fixture else {}),
-                    **(
-                        {"peft_adapter": Path(args.peft_adapter)}
-                        if getattr(args, "peft_adapter", None) is not None
-                        else {}
-                    ),
-                    **(
-                        {"historical_gradient_references": historical_gradient_references}
-                        if historical_gradient_references is not None
-                        else {}
-                    ),
-                    **(
-                        {"reference_records_dir": Path(args.reference_records_dir)}
-                        if getattr(args, "reference_records_dir", None) is not None
-                        else {}
-                    ),
+                try:
+                    published_fixture = load_local_fixture(backend, spec)
+                except ValueError as exc:
+                    results.extend(
+                        [
+                            TestResult(
+                                test_id=test_id,
+                                config_id=cfg.config_id,
+                                outcome=TestOutcome.FAIL,
+                                summary="local Cortex fixture identity unavailable",
+                                reason=str(exc),
+                            )
+                            for test_id in args.test or tests
+                        ]
+                    )
+                    print(f"skip {path.name}: {exc}", flush=True)
+                    continue
+                execution[cfg.config_id].update(
+                    requested_model_name=published_fixture["model_name"],
+                    fixture_sha256=published_fixture["fixture_sha256"],
+                    fixture_distribution="local-gateway",
+                    gateway_url=backend.base_url,
                 )
+
+            print(f"=== {cfg.config_id} ===", flush=True)
+            vocab_size = _run_vocab_size(
+                cfg,
+                spec,
+                args.test,
+                backend,
+                published_fixture,
             )
+
+            for width in widths:
+                multiple = width // cfg.n_gpus
+                run_cfg = cfg.at_gpu_width(width)
+                run_cases = scaled_for_placement(selected_cases, multiple)
+                if len(widths) > 1:
+                    print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
+                results.extend(
+                    run_executor(
+                        run_cfg,
+                        spec,
+                        run_cases,
+                        order=args.order,
+                        fail_fast=args.fail_fast,
+                        vocab_size=vocab_size,
+                        select=args.test or None,
+                        attn=args.attn[0] if args.attn else None,
+                        client_backend=backend,
+                        **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **(
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
+                            else {}
+                        ),
+                        **(
+                            {"historical_gradient_references": historical_gradient_references}
+                            if historical_gradient_references is not None
+                            else {}
+                        ),
+                        **(
+                            {"reference_records_dir": Path(args.reference_records_dir)}
+                            if getattr(args, "reference_records_dir", None) is not None
+                            else {}
+                        ),
+                    )
+                )
 
     if snapshot is not None:
         snapshot(results, specs, execution)
@@ -642,9 +682,9 @@ def run_batch(args, *, selected, executor=None):
     from ..api import aggregate_exit_code
     from .reference_records import ReferencePrerequisiteError
 
-    _load_historical_gradient_references(args)
     started = time.monotonic()
-    out = Path(args.out) if args.out is not None else correctness_workdir("ap-correctness-run-")
+    _load_historical_gradient_references(args)
+    out = Path(args.out) if args.out is not None else correctness_logdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
     specs = {}
     execution = {}
@@ -758,6 +798,7 @@ def run_batch(args, *, selected, executor=None):
     print(f"Report: {out / 'report.md'}; complete logs: {out / 'full.log'}", flush=True)
     if any(case["status"] in {"blocked", "error"} for case in cases):
         print("Action required: see the reason in batch.json and the full traceback in full.log.", flush=True)
+    print(f"Total run time: {console.duration(time.monotonic() - started)}", flush=True)
     return BatchResult(results, out, aggregate_exit_code(results), elapsed, stopped, cases)
 
 
@@ -924,7 +965,11 @@ def parse_args(argv=None):
             "Use this to see the output quickly: gas1 is one sequence and no accumulation"
         ),
     )
-    r.add_argument("--out", type=Path, help="report directory; default a unique directory under /data-fast/tmp")
+    r.add_argument(
+        "--out",
+        type=Path,
+        help="report directory; default a unique directory under ./work/logs (or DSS_CORRECTNESS_LOGDIR)",
+    )
     r.add_argument(
         "--reference-records-dir",
         type=Path,
