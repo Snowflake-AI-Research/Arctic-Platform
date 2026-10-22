@@ -18,6 +18,8 @@ from arctic_platform.inference.server.scheduler import (
     strict_affinity_routing,
 )
 from arctic_platform.inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.worker import InferenceWorker
+from arctic_platform.inference.server.worker import WorkerLifecycleState
 
 
 WEIGHT_METHODS = (
@@ -544,5 +546,159 @@ def test_unconfirmed_cleanup_drops_a_chat_error_param(monkeypatch):
             assert "param" not in event
         finally:
             await scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_staged_wake_restores_kv_cache_on_the_second_call():
+    """Colocated sync wakes weights, then the KV cache. The first call must not look like a full wake."""
+
+    async def scenario():
+        pool, handle = make_pool()
+        await pool.sleep()
+        assert pool.sleeping
+        assert pool._scheduler.paused
+
+        weights = await pool.wake_up(tags=["weights"])
+        assert weights["status"] == "weights_ready"
+        assert pool.sleeping
+        assert pool._scheduler.paused
+        handle.wake_up.remote.assert_awaited_with(tags=["weights"])
+
+        kv = await pool.wake_up(tags=["kv_cache"])
+        assert kv["status"] == "ready"
+        assert not pool.sleeping
+        assert not pool._scheduler.paused
+        handle.wake_up.remote.assert_awaited_with(tags=["kv_cache"])
+        await pool._scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_worker_staged_wake_calls_the_engine_twice():
+    async def scenario():
+        worker = _staged_worker()
+
+        weights = await worker.wake_up(tags=["weights"])
+        assert weights["status"] == "weights_ready"
+        assert worker.state == WorkerLifecycleState.WEIGHTS_READY
+        worker.llm.collective_rpc.assert_awaited_with(
+            "wake_up", kwargs={"tags": ["weights"]},
+        )
+
+        kv = await worker.wake_up(tags=["kv_cache"])
+        assert kv["status"] == "ready"
+        assert worker.state == WorkerLifecycleState.READY
+        worker.llm.collective_rpc.assert_awaited_with(
+            "wake_up", kwargs={"tags": ["kv_cache"]},
+        )
+
+    asyncio.run(scenario())
+
+
+def _staged_worker(state=WorkerLifecycleState.SLEEPING):
+    worker_cls = InferenceWorker.__ray_metadata__.modified_class
+    worker = worker_cls.__new__(worker_cls)
+    worker.state = state
+    worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
+    return worker
+
+
+@pytest.mark.parametrize("tags", [None, ["weights", "kv_cache"]])
+def test_full_wake_from_sleeping_reaches_ready_in_one_call(tags):
+    async def scenario():
+        worker = _staged_worker()
+        assert (await worker.wake_up(tags=tags))["status"] == "ready"
+        assert worker.state == WorkerLifecycleState.READY
+        expected = {} if tags is None else {"tags": tags}
+        worker.llm.collective_rpc.assert_awaited_once_with("wake_up", kwargs=expected)
+
+    asyncio.run(scenario())
+
+
+def test_untagged_wake_from_weights_ready_restores_only_the_kv_cache():
+    # The weights are already mapped; re-remapping them is not what this wake owes the caller.
+    async def scenario():
+        worker = _staged_worker(WorkerLifecycleState.WEIGHTS_READY)
+        assert (await worker.wake_up())["status"] == "ready"
+        assert worker.state == WorkerLifecycleState.READY
+        worker.llm.collective_rpc.assert_awaited_once_with("wake_up", kwargs={"tags": ["kv_cache"]})
+
+    asyncio.run(scenario())
+
+
+def test_repeated_weights_wake_is_a_no_op():
+    async def scenario():
+        worker = _staged_worker(WorkerLifecycleState.WEIGHTS_READY)
+        assert (await worker.wake_up(tags=["weights"]))["status"] == "already_weights_ready"
+        assert worker.state == WorkerLifecycleState.WEIGHTS_READY
+        worker.llm.collective_rpc.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_kv_only_wake_from_sleeping_refuses():
+    # Mapping a KV cache for weights that are still unmapped is the original crash.
+    async def scenario():
+        worker = _staged_worker()
+        with pytest.raises(RuntimeError, match="wake weights first"):
+            await worker.wake_up(tags=["kv_cache"])
+        assert worker.state == WorkerLifecycleState.SLEEPING
+        worker.llm.collective_rpc.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_worker_sleeps_from_weights_ready():
+    async def scenario():
+        worker = _staged_worker(WorkerLifecycleState.WEIGHTS_READY)
+        worker._engine_streams = {}
+        worker._stream_cleanup_failed = False
+        assert (await worker.sleep(level=1))["status"] == "sleeping"
+        assert worker.state == WorkerLifecycleState.SLEEPING
+        worker.llm.collective_rpc.assert_awaited_with("sleep", kwargs={"level": 1})
+
+    asyncio.run(scenario())
+
+
+def test_pool_wake_raises_when_a_worker_fails():
+    """A swallowed weights-stage failure sends the weight load at an unmapped worker."""
+
+    async def scenario():
+        pool, handle = make_pool()
+        healthy = MagicMock()
+        healthy.wake_up.remote = AsyncMock(return_value={"status": "weights_ready"})
+        healthy.sleep.remote = AsyncMock(return_value={"status": "sleeping"})
+        pool._workers.append(healthy)
+        pool._scheduler.add_worker(healthy)
+        await pool.sleep()
+        handle.wake_up.remote.side_effect = RuntimeError("cumem remap failed")
+
+        with pytest.raises(RuntimeError, match="cumem remap failed"):
+            await pool.wake_up(tags=["weights"])
+        assert pool.sleeping
+        assert pool._scheduler.paused
+        await pool._scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_pool_sleeps_a_half_woken_pool():
+    """The weight load failed between the two wakes: the workers still hold mapped weights."""
+
+    async def scenario():
+        pool, handle = make_pool()
+        await pool.sleep()
+        await pool.wake_up(tags=["weights"])
+        handle.sleep.remote.reset_mock()
+
+        assert (await pool.sleep())["status"] == "sleeping"
+        handle.sleep.remote.assert_awaited_once_with(level=1)
+        assert pool.sleeping
+        # A plain already-sleeping pool has nothing to free and must stay a no-op.
+        handle.sleep.remote.reset_mock()
+        assert (await pool.sleep())["status"] == "already_sleeping"
+        handle.sleep.remote.assert_not_awaited()
+        await pool._scheduler.shutdown()
 
     asyncio.run(scenario())
