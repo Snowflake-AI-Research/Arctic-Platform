@@ -91,6 +91,7 @@ def manager_methods(monkeypatch):
         ("dflash2_nan_fix", "apply_dflash2_nan_fixes"),
         ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
+        ("mrope_yarn", "ensure_mrope_yarn_fix"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)
