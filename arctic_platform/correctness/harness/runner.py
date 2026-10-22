@@ -207,14 +207,20 @@ def run_reference(
         # One reference per GPU lets independent runs proceed concurrently; the run itself is single-GPU
         # either way, so pinning changes only which device it lands on.
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-    try:
-        log_dir = require_data_fast_path(out_path.parent, label="reference logs")
-    except ValueError:
-        log_dir = correctness_workdir("hf-reference-logs-")
+    from .storage import CORRECTNESS_LOGDIR_ENV
+    from .storage import correctness_logdir
+
+    if os.environ.get(CORRECTNESS_LOGDIR_ENV):
+        log_dir = correctness_logdir("hf-reference-")
+    else:
+        try:
+            log_dir = require_data_fast_path(out_path.parent, label="reference logs")
+        except ValueError:
+            log_dir = correctness_workdir("hf-reference-logs-")
     log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_log = require_data_fast_path(log_dir / f"{out_path.stem}.stdout.log", label="reference stdout")
-    stderr_log = require_data_fast_path(log_dir / f"{out_path.stem}.stderr.log", label="reference stderr")
-    returncode_log = require_data_fast_path(log_dir / f"{out_path.stem}.returncode", label="reference return code")
+    stdout_log = log_dir / f"{out_path.stem}.stdout.log"
+    stderr_log = log_dir / f"{out_path.stem}.stderr.log"
+    returncode_log = log_dir / f"{out_path.stem}.returncode"
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     stdout_log.write_text(proc.stdout)
     stderr_log.write_text(proc.stderr)

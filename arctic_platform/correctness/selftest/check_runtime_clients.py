@@ -124,12 +124,23 @@ def _client_backends_session_with_close_spy(transport, monkeypatch, closed):
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cli_defaults_to_onprem_and_accepts_explicit_cortex(monkeypatch):
+def test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex(monkeypatch):
     selected = []
     monkeypatch.setattr(cli, "cmd_run", lambda args: selected.append(args.backend) or 0)
     assert cli.main(["run", "--all-configs"]) == 0
+    assert cli.main(["run", "--all-configs", "--backend", "cortex-training"]) == 0
     assert cli.main(["run", "--all-configs", "--backend", "cortex"]) == 0
-    assert selected == ["onprem", "cortex"]
+    assert selected == ["cortex", "cortex", "cortex"]
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["run", "--all-configs", "--backend", "onprem"])
+    assert exc.value.code == 2
+
+
+def test_client_backends_onboarding_uses_the_same_cortex_training_default():
+    args = cli.parse_args(["onboard", "--config", "./work/config.json"])
+    assert args.backend == "cortex"
+    args = cli.parse_args(["onboard", "--config", "./work/config.json", "--backend", "cortex-training"])
+    assert args.backend == "cortex"
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")

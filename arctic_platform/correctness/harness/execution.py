@@ -46,6 +46,7 @@ from .config import arms_for
 from .config import config_checksum
 from .config import config_id
 from .config import load_config
+from .config import local_config_path
 from .config import local_gpu_type
 from .config import placement_widths
 from .config import scaled_for_placement
@@ -91,7 +92,8 @@ def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
         raise SystemExit("give --config <path> or --all-configs")
     from ..api import catalog
 
-    return [catalog(Path(args.config_dir)).get(str(args.config), Path(args.config))]
+    path = catalog(Path(args.config_dir)).get(str(args.config), Path(args.config))
+    return [local_config_path(path, Path(args.config_dir))]
 
 
 def _describe(shapes) -> str:
@@ -726,6 +728,8 @@ def run_batch(args, *, selected, executor=None):
                 cases.append(summary)
                 log.write(f"{summary['status'].upper()} {case.config_id} {case.test_id}: {summary['reason']}\n")
                 print(f"{summary['status'].upper():12s} {case.config_id}  {case.test_id}", flush=True)
+                if summary["status"] in {"blocked", "error", "fail"} and summary["reason"]:
+                    print(f"  Reason: {summary['reason']}\n", flush=True)
             results.extend(group_results)
     write_report(results, specs, out, execution=execution)
     elapsed = time.monotonic() - started
@@ -786,9 +790,9 @@ def cmd_list(args) -> int:
 
 
 def cmd_onboard(args) -> int:
-    from ..onboarding import run
+    from ..onboarding.onboard import logged_run
 
-    return run(args)
+    return logged_run(args)
 
 
 def cmd_selftest(args) -> int:
@@ -843,8 +847,21 @@ def cmd_publish_fixture(args) -> int:
     return 0
 
 
-def add_connection_arguments(parser, *, default_backend="onprem"):
-    parser.add_argument("--backend", choices=["cortex", "onprem"], default=default_backend)
+def operator_backend(value: str) -> str:
+    """Keep the public backend name separate from the internal transport identifier."""
+    if value in {"cortex-training", "cortex"}:
+        return "cortex"
+    raise argparse.ArgumentTypeError("use cortex-training; the onprem correctness backend is no longer supported")
+
+
+def add_connection_arguments(parser, *, default_backend="cortex-training"):
+    parser.add_argument(
+        "--backend",
+        type=operator_backend,
+        default=default_backend,
+        metavar="cortex-training",
+        help="Cortex-training backend (default); cortex remains a compatibility alias",
+    )
     parser.add_argument("--host", help="Snowflake account host; otherwise ARCTIC_CORTEX_HOST")
     parser.add_argument("--database", help="Snowflake database; otherwise ARCTIC_CORTEX_DATABASE")
     parser.add_argument("--schema", help="Snowflake schema; otherwise ARCTIC_CORTEX_SCHEMA")

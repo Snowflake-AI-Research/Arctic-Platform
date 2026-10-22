@@ -501,6 +501,41 @@ def config_id(path: Path) -> str:
     return "-".join(parts)
 
 
+def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
+    """Import an external config once, preserving its ID and bytes without overwriting local recipes."""
+    source = Path(path).expanduser().resolve()
+    root = (config_dir if config_dir is not None else Path(__file__).resolve().parents[1] / "configs").resolve()
+    if source.suffix not in {".config", ".json"} or not source.is_file():
+        raise ValueError(f"expected an existing .config or .json configuration: {source}")
+    if source.is_relative_to(root):
+        return source
+    load_config(source)
+    identifier = config_id(source)
+    matches = [
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_file()
+        and candidate.suffix in {".config", ".json"}
+        and "archive" not in candidate.relative_to(root).parts
+        and config_id(candidate) == identifier
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"duplicate configuration ID: {identifier}")
+    destination = matches[0] if matches else root / f"{identifier}{source.suffix}"
+    contents = source.read_bytes()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("xb") as imported:
+            imported.write(contents)
+    except FileExistsError:
+        if destination.read_bytes() != contents:
+            raise ValueError(
+                f"configuration already exists with different contents: {destination}; "
+                "use a distinct configuration filename"
+            ) from None
+    return destination
+
+
 def local_gpu_type() -> str | None:
     """The host's GPU as the layout spells it: ``NVIDIA H200`` -> ``h200``. ``None`` when there is no GPU."""
     try:

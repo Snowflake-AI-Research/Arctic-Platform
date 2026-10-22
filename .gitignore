@@ -181,6 +181,7 @@ recipes/*.json
 onboarding_reports/
 
 # Locally generated correctness inputs, measurements, and execution state.
+/work/
 /.correctness-tmp/
 /.codex-run-state/
 /correctness-progress.md

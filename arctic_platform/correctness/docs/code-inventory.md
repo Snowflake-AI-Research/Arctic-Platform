@@ -12,7 +12,8 @@
 | `harness/dss_driver.py`, `harness/transport.py` | Supervised training lifecycle, payloads, packing, and cleanup. |
 | `harness/cortex.py`, `harness/hosted.py` | Reviewed fixture admission, training transport, public save/catalog identity helpers. |
 | `harness/inference_export.py`, `harness/cortex_optimizer.py`, `harness/optimizer_capture.py` | Test2 resumable checkpoint export, safe decoding, and local optimizer capture. The export module's historical filename does not register an inference check. |
-| `harness/lora.py` | Deterministic adapter recipes, initialization binding, and SAVE0 verification. |
+| `harness/shared_lora_adapter.py` | Upstream PEFT adapter generation, content verification, and worker-local loading through Ray. |
+| `harness/lora.py` | Canonical tensor-name validation shared by the adapter checks. No retired deterministic recipes or SAVE0 execution. |
 | `harness/reference_records.py`, `harness/storage.py`, `harness/report.py`, `harness/names.py` | Compact record identity, fast scratch containment, reports, and parameter-name alignment. |
 | `reference/` | Independent single-GPU reference, one-step AdamW, model features, process determinism, and Qwen4 loading. |
 | `onboarding/` | Explicit sizing, calibration, fixture publication, and reference preparation. |

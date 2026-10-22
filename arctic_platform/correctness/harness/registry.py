@@ -92,6 +92,7 @@ class TestSpecEntry:
     # A test whose jobs only the hosted control plane can create, so no gateway a client drives itself
     # can run it. Onboarding refuses such a test rather than reporting a verdict it did not measure.
     requires_hosted_control_plane: bool = False
+    workload_modes: tuple[str, ...] = ("sft", "rl")
 
     @property
     def per_arm(self) -> Optional[Callable]:
@@ -114,6 +115,7 @@ def correctness_test(
     criterion: str,
     compares_to_reference: bool = True,
     requires_hosted_control_plane: bool = False,
+    workload_modes: tuple[str, ...] | None = None,
 ) -> Callable:
     """Register a correctness test under a stable id used by ``run --test <id>``."""
 
@@ -127,6 +129,7 @@ def correctness_test(
             fn=fn,
             compares_to_reference=compares_to_reference,
             requires_hosted_control_plane=requires_hosted_control_plane,
+            workload_modes=workload_modes or (("sft",) if compares_to_reference else ("sft", "rl")),
         )
         return fn
 
@@ -148,3 +151,22 @@ RL_INAPPLICABLE_REASON = (
 def reference_tests() -> Dict[str, TestSpecEntry]:
     """The registered tests that need the single-GPU reference, and so do not apply to an RL config."""
     return {test_id: test for test_id, test in registered_tests().items() if test.compares_to_reference}
+
+
+def workload_inapplicable_reason(test: TestSpecEntry, config) -> str | None:
+    """Select workload-compatible checks before model or backend initialization."""
+    if config.is_rl and test.compares_to_reference:
+        return RL_INAPPLICABLE_REASON
+    mode = "rl" if config.is_rl else "sft"
+    if mode not in test.workload_modes:
+        return f"{test.test_id} requires a {'reinforcement-learning' if mode == 'sft' else 'supervised'} config"
+    return None
+
+
+def onboarding_inapplicable_reason(test: TestSpecEntry, config) -> str | None:
+    reason = workload_inapplicable_reason(test, config)
+    if reason:
+        return reason
+    if test.requires_hosted_control_plane:
+        return "requires the hosted control plane; run the hosted command instead of local onboarding"
+    return None

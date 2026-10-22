@@ -1460,9 +1460,12 @@ def test_reference_records_model_identity_requires_complete_external_assets(tmp_
 
 @pytest.mark.parametrize("returncode", [0, 17])
 @pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("durable", [False, True])
 def test_reference_observability_subprocess_retains_complete_logs_and_returncode(
-    tmp_path, monkeypatch, capsys, returncode, fallback
+    tmp_path, monkeypatch, capsys, returncode, fallback, durable
 ):
+    from arctic_platform.correctness.harness import storage
+
     output = Path("/tmp") / tmp_path.name / "reference.json" if fallback else tmp_path / "reference.json"
     log_dir = tmp_path / "fallback" if fallback else tmp_path
     stdout = "reference first output\n" + "s" * 6000 + "\nreference last output\n"
@@ -1485,6 +1488,11 @@ def test_reference_observability_subprocess_retains_complete_logs_and_returncode
 
     monkeypatch.setattr(runner.subprocess, "run", child)
     monkeypatch.setattr(runner, "correctness_workdir", fast_fallback)
+    if durable:
+        monkeypatch.setenv(storage.CORRECTNESS_LOGDIR_ENV, str(tmp_path / "work" / "logs"))
+        monkeypatch.setattr(storage, "correctness_logdir", lambda prefix: log_dir)
+    else:
+        monkeypatch.delenv(storage.CORRECTNESS_LOGDIR_ENV, raising=False)
     monkeypatch.setattr(Path, "read_text", read_output)
     options = {"token_budget": 64, "ce_chunk": 8, "attn": "sdpa", "fp32_lm_head": False, "cuda_device": 0}
     if returncode:
@@ -1504,7 +1512,7 @@ def test_reference_observability_subprocess_retains_complete_logs_and_returncode
     assert subprocess_options["capture_output"] is True
     assert subprocess_options["text"] is True
     assert subprocess_options["env"]["CUDA_VISIBLE_DEVICES"] == "0"
-    assert fallbacks == (["hf-reference-logs-"] if fallback else [])
+    assert fallbacks == (["hf-reference-logs-"] if fallback and not durable else [])
     assert (log_dir / f"{output.stem}.stdout.log").read_text() == stdout
     assert (log_dir / f"{output.stem}.stderr.log").read_text() == stderr
     assert (log_dir / f"{output.stem}.returncode").read_text() == f"{returncode}\n"

@@ -21,6 +21,7 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import io
 import json
 import sys
 from decimal import ROUND_CEILING
@@ -58,6 +59,14 @@ from arctic_platform.correctness.reference import optimizer_step
 from .check_catalog_configuration import _applicable_tests_spec
 from .helpers import _config_factory_native_config
 from .helpers import _synthetic_config_spec
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_onboarding_environment(monkeypatch):
+    # These calibration/spec controls use synthetic models; operator controls cover environment preflight.
+    monkeypatch.setattr(onboard, "_onboarding_preflight", lambda *args: None)
+    monkeypatch.setattr(config_module, "local_config_path", lambda path: Path(path).resolve())
+
 
 # Data fast storage.
 
@@ -272,25 +281,28 @@ def _onboarding_config(tmp_path: Path, *, gpus: int = 4, glm: bool = False, lora
 
 
 @pytest.mark.parametrize(
-    ("test_id", "backend", "local_fixture", "pool", "base_url", "error"),
+    ("test_id", "backend", "local_fixture", "full_model", "pool", "base_url", "error"),
     [
-        ("single-step-grads", "cortex", True, 8, "http://127.0.0.1:8003", None),
+        ("single-step-grads", "cortex", True, False, 8, "http://127.0.0.1:8003", None),
         (
             "single-step-optimizer",
             "cortex",
             True,
+            False,
             None,
             "http://127.0.0.1:8003",
             None,
         ),
-        ("single-step-grads", "cortex", True, 4, "http://127.0.0.1:8003", "required 8 GPUs"),
-        ("single-step-grads", "cortex", True, 8, "https://example.com", "local"),
-        ("single-step-grads", "onprem", True, 8, "http://127.0.0.1:8003", "supervised Cortex"),
-        ("single-step-grads", "cortex", False, 8, "http://127.0.0.1:8003", "explicit local Cortex"),
+        ("single-step-grads", "cortex", True, False, 4, "http://127.0.0.1:8003", "required 8 GPUs"),
+        ("single-step-grads", "cortex", True, False, 8, "https://example.com", "local"),
+        ("single-step-grads", "cortex", True, True, 8, "http://127.0.0.1:8003", "supervised Cortex"),
+        ("single-step-grads", "onprem", True, False, 8, "http://127.0.0.1:8003", "supervised Cortex"),
+        ("single-step-grads", "cortex", False, False, 8, "http://127.0.0.1:8003", None),
+        ("unsupported-check", "cortex", True, False, 8, "http://127.0.0.1:8003", "does not support test id"),
     ],
 )
 def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
-    monkeypatch, tmp_path, test_id, backend, local_fixture, pool, base_url, error
+    monkeypatch, tmp_path, test_id, backend, local_fixture, full_model, pool, base_url, error
 ):
     config_path = _onboarding_config(tmp_path, gpus=8, glm=True, lora=True)
     cfg = load_config(config_path)
@@ -303,6 +315,7 @@ def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
         database="dev",
         schema="dev",
         local_cortex_fixture=local_fixture,
+        local_gateway_full_model=full_model,
         gpu_pool=pool,
         source_checkpoint="/data-fast/base-models/glm-original",
         tokens=None,
@@ -354,6 +367,8 @@ def test_supervised_local_fixture_onboarding_final_command_preserves_native_sele
             "onboard",
             "--config",
             str(tmp_path / "input.config"),
+            "--test-id",
+            "single-step-grads",
             "--test-spec",
             str(tmp_path / "candidate.json"),
             "--output-dir",
@@ -374,7 +389,7 @@ def test_supervised_local_fixture_onboarding_final_command_preserves_native_sele
         captured.append(command)
         output = Path(command[command.index("--out") + 1])
         (output / "report.json").write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
-        return SimpleNamespace(stdout=iter([]), wait=lambda: 0)
+        return SimpleNamespace(stdout=io.StringIO(), wait=lambda: 0)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
@@ -637,7 +652,7 @@ def test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_
     assert keywords["vocab_size"] == 128
     assert keywords["reference_calibration_runs"] == 16
     assert keywords["reference_calibration_workers"] == 1
-    assert isinstance(keywords["client_backend"], OnPremConfig)
+    assert keywords["client_backend"].base_url == "http://127.0.0.1:1"
     assert keywords["reference_records_dir"] == reference_records.DEFAULT_RECORDS_DIR
 
 
@@ -799,7 +814,7 @@ def test_hf_reference_onboarding_runner_preparation_cannot_execute_normal_refere
             )
             == []
         )
-        assert selected == first_two
+        assert selected == []
         return
     monkeypatch.setattr(runner, "registered_tests", lambda: pytest.fail("invalid selection reached execution"))
     with pytest.raises(ValueError, match="explicit HF"):
@@ -948,6 +963,111 @@ def test_onboarding_renderer_passes_peft_config_to_reference(tmp_path: Path) -> 
         tmp_path, None, {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj", "v_proj"]}
     )
     assert "peft_config={'peft_type': 'Lora', 'r': 32, 'target_modules': ['q_proj', 'v_proj']}" in rendered
+
+
+@pytest.fixture
+def _rendered_calibration_workers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(synth_model, "materialize_pretrained", lambda *args: None)
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(num_hidden_layers=4, vocab_size=128),
+    )
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(config_module, "hash_directory", lambda *args: "synthetic-model-hash")
+
+    def reference(model, batch_path, output, **kwargs):
+        batch = batches.load(batch_path)
+        assert batch.input_ids.shape == (1, 2048)
+        result = {"loss": 1.0, "grad_norms": {"model.weight": 2.0}, "peak_gib": 0.0}
+        output.write_text(json.dumps(result))
+        calls.append((batch_path, output))
+        return result
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    return calls
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnostics(
+    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, explicit
+):
+    rendered = _onboarding_render_config(tmp_path, None)
+    namespace = {"__name__": "synthetic_calibration"}
+    exec(compile(rendered, "<generated-reference-calibration>", "exec"), namespace)
+    diagnostics = tmp_path / "work" / "logs" / "calibration"
+    namespace["OUTPUT"] = diagnostics / "reference-repeatability.json"
+    scratch = _onboarding_storage_fast_root / "explicit-calibration"
+    if explicit:
+        namespace["WORK_DIR"] = str(scratch)
+    namespace["SPEC_PATH"].write_text("{}")
+
+    assert namespace["main"]() == 0
+
+    calls = _rendered_calibration_workers
+    assert len(calls) == 16
+    batch_paths = {batch_path for batch_path, output in calls}
+    assert len(batch_paths) == 1
+    batch_path = batch_paths.pop()
+    assert batch_path.is_relative_to(_onboarding_storage_fast_root)
+    if explicit:
+        assert batch_path.parent == scratch
+    else:
+        assert batch_path.parent.parent == _onboarding_storage_fast_root / "tmp"
+    assert all(output.parent == diagnostics / "calibration-runs" for batch_path, output in calls)
+    assert not list(diagnostics.rglob("*.pt"))
+    payload = json.loads(namespace["OUTPUT"].read_text())
+    assert payload["configuration"]["runs"] == 16
+    assert payload["tolerance"]["selected_gate"] == 0.001
+    spec = json.loads(namespace["SPEC_PATH"].read_text())
+    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 16
+
+
+def test_onboarding_renderer_rejects_diagnostic_directory_for_tensor_scratch(
+    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers
+):
+    namespace = {"__name__": "synthetic_calibration"}
+    exec(compile(_onboarding_render_config(tmp_path, None), "<generated-reference-calibration>", "exec"), namespace)
+    namespace["WORK_DIR"] = str(tmp_path / "work" / "logs")
+    with pytest.raises(ValueError, match="gradient calibration tensors"):
+        namespace["main"]()
+    assert _rendered_calibration_workers == []
+    assert not list(tmp_path.rglob("*.pt"))
+
+
+def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diagnostics(
+    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, monkeypatch
+):
+    _onboarding_render_config(tmp_path, None)
+    args = argparse.Namespace(
+        config=tmp_path / "configs/model/h200/workload.config",
+        source_checkpoint="synthetic-source",
+        cache_root=_onboarding_storage_fast_root / "cache",
+        output_dir=_onboarding_storage_fast_root / "scratch",
+        _diagnostics_dir=tmp_path / "work" / "logs" / "calibration",
+        test_spec=tmp_path / "spec.json",
+        test_id="single-step-grads",
+        tokens=2048,
+        reference_token_budget=65536,
+        checkout_root=tmp_path,
+    )
+    args.output_dir.mkdir()
+    args.test_spec.write_text("{}")
+
+    def execute(command, *, cwd, env):
+        namespace = {"__name__": "synthetic_calibration"}
+        exec(compile(Path(command[1]).read_text(), command[1], "exec"), namespace)
+        assert Path(namespace["WORK_DIR"]) == args.output_dir / "calibration-runs"
+        return namespace["main"]()
+
+    monkeypatch.setattr(onboard, "_stream_subprocess", execute)
+    result = onboard._render_and_run_calibration(args, {"layers": 4})
+    assert result == args._diagnostics_dir / "reference-repeatability.json"
+    assert result.is_file()
+    assert (args.output_dir / "calibration-runs" / "batch.pt").is_file()
+    assert len(_rendered_calibration_workers) == 16
+    assert not list(args._diagnostics_dir.rglob("*.pt"))
 
 
 def test_onboarding_renderer_gate_metadata_uses_the_computed_safety_factor(tmp_path: Path) -> None:
@@ -1338,7 +1458,7 @@ def test_sizing_reuse_parent_continues_only_admitted_sizing(_sizing_reuse_case, 
         assert not args.test_spec.exists()
     else:
         assert onboard._parent(args) == 0
-        assert calls == ["spec", "calibration", "publication", "validation"]
+        assert calls == ["spec", "calibration", "validation"]
         manifest = json.loads((args.output_dir / "onboarding.json").read_text())
         assert manifest["sizing_observations"] == [selected]
         assert manifest["reused_sizing"]["sha256"] == args.reuse_sizing_sha256
@@ -1467,9 +1587,10 @@ def test_onboarding_storage_onboarding_entrypoints_reject_storage_before_checkou
 ):
     monkeypatch.setattr(onboard, "_checkout_root", _onboarding_storage_unexpected)
     args = argparse.Namespace(
-        test_id="single-step-grads",
         cache_root=_onboarding_storage_fast_root / "cache",
         output_dir=_onboarding_storage_fast_root / "work",
+        test_id="single-step-grads",
+        probe_layers=None,
     )
     setattr(args, field, _onboarding_storage_invalid_destination)
     with pytest.raises(ValueError, match="/data-fast"):
@@ -1877,14 +1998,19 @@ def test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unre
     _onboarding_storage_fast_root, tmp_path, monkeypatch, probe
 ):
     args = argparse.Namespace(
-        test_id="single-step-grads",
         config=tmp_path / "checkout" / "input.config",
         cache_root=_onboarding_storage_fast_root / "cache",
         output_dir=_onboarding_storage_fast_root / "work",
         test_spec=tmp_path / "checkout" / "spec.json",
         probe_layers=4 if probe else None,
         probe_output=tmp_path / "checkout" / "probe.json",
+        test_id="single-step-grads",
+        reference_records_dir=None,
     )
+    args.config.parent.mkdir(parents=True)
+    args.config.write_text("{}")
+    args.test_spec.write_text("{}")
+    monkeypatch.setattr(config_module, "local_config_path", lambda path: path)
     monkeypatch.setattr(onboard, "_checkout_root", lambda config: tmp_path / "checkout")
     monkeypatch.setattr(onboard.sys, "path", list(onboard.sys.path))
     calls = []
@@ -2092,6 +2218,8 @@ def _local_cortex_reference_publication(tmp_path, monkeypatch):
         [
             "--config",
             str(config_path),
+            "--test-id",
+            "single-step-grads",
             "--backend",
             "cortex",
             "--base-url",
@@ -2174,7 +2302,7 @@ def _local_cortex_reference_publication(tmp_path, monkeypatch):
         assert actual is args and selected is state.selected
         state.events.append("validation")
         assert args.test_spec.read_bytes() == state.frozen
-        assert state.record.is_file()
+        assert state.record.exists() is args.local_cortex_fixture
         if state.failure == "validation":
             raise RuntimeError("validation failed")
         return {"status": "pass", "report": "synthetic-report"}
@@ -2197,16 +2325,23 @@ def test_local_cortex_reference_publication_runs_after_frozen_gate_before_valida
         state.args.backend = "onprem"
     before = state.cfg.native.model_dump()
     assert onboard._parent(state.args) == 0
-    assert state.events == ["spec", "calibration", "publication", "validation"]
+    assert state.events == (
+        ["spec", "calibration", "publication", "validation"]
+        if local_fixture
+        else ["spec", "calibration", "validation"]
+    )
     assert state.args.test_spec.read_bytes() == state.frozen
     assert load_config(state.args.config).native.model_dump() == before
-    positional, keywords = state.calls[0]
-    assert positional[0].config_id == state.cfg.config_id
-    assert keywords["prepare_references"] is True
-    assert keywords["select"] == ["single-step-grads"]
-    assert keywords["reference_records_dir"] == state.args.reference_records_dir
-    assert keywords["reference_token_budget"] == state.args.reference_token_budget
-    assert keywords["workdir"] == state.args.output_dir
+    if local_fixture:
+        positional, keywords = state.calls[0]
+        assert positional[0].config_id == state.cfg.config_id
+        assert keywords["prepare_references"] is True
+        assert keywords["select"] == ["single-step-grads"]
+        assert keywords["reference_records_dir"] == state.args.reference_records_dir
+        assert keywords["reference_token_budget"] == state.args.reference_token_budget
+        assert keywords["workdir"] == state.args.output_dir
+    else:
+        assert state.calls == []
     manifest = json.loads((state.args.output_dir / "onboarding.json").read_text())
     assert manifest["selected_gate"] == 0.005
     assert manifest["validation_attempts"] == [{"status": "pass", "report": "synthetic-report"}]
@@ -2271,7 +2406,7 @@ def test_local_cortex_reference_publication_final_command_uses_same_record_direc
         captured.append(command)
         output = Path(command[command.index("--out") + 1])
         (output / "report.json").write_text('{"totals": {"pass": 1, "fail": 0}}')
-        return SimpleNamespace(stdout=iter([]), wait=lambda: 0)
+        return SimpleNamespace(stdout=io.StringIO(), wait=lambda: 0)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
@@ -2578,12 +2713,12 @@ def test_local_cortex_optimizer_scalar_norm_failure_restores_exact_spec_and_no_v
 
 
 @pytest.mark.parametrize("failure", [None, "publication", "validation"])
-def test_p1_onboarding_onprem_gradient_bootstrap_publishes_before_validation(
+def test_p1_onboarding_cortex_gradient_bootstrap_publishes_before_validation(
     _local_cortex_reference_publication, monkeypatch, failure
 ):
     state = _local_cortex_reference_publication
-    state.args.backend = "onprem"
-    state.args.local_cortex_fixture = False
+    state.args.backend = "cortex-training"
+    state.args.local_cortex_fixture = True
     state.args.reference_records_dir = state.args.output_dir.parent / "operator-records"
     monkeypatch.setattr(reference_records, "require_git_records_dir", lambda path: Path(path))
     previous = b'{"retained":"exact prior specification"}\n'
@@ -2605,7 +2740,7 @@ def test_p1_onboarding_onprem_gradient_bootstrap_publishes_before_validation(
     )
     assert len(state.calls) == 1
     _, keywords = state.calls[0]
-    assert isinstance(keywords["client_backend"], OnPremConfig)
+    assert isinstance(keywords["client_backend"], CortexConfig)
     assert keywords["select"] == ["single-step-grads"]
     assert keywords["prepare_references"] is True
     assert keywords["reference_records_dir"] == state.args.reference_records_dir
@@ -2613,12 +2748,12 @@ def test_p1_onboarding_onprem_gradient_bootstrap_publishes_before_validation(
 
 
 @pytest.mark.parametrize("failure", [None, "calibration", "target-fail"])
-def test_p1_onboarding_onprem_optimizer_bootstrap_uses_fresh_norm_records(
+def test_p1_onboarding_cortex_optimizer_bootstrap_uses_fresh_norm_records(
     _local_cortex_optimizer_onboarding, monkeypatch, failure
 ):
     state = _local_cortex_optimizer_onboarding
-    state.args.backend = "onprem"
-    state.args.local_cortex_fixture = False
+    state.args.backend = "cortex-training"
+    state.args.local_cortex_fixture = True
     state.failure = failure
     materialized = []
     monkeypatch.setattr(config_module, "validate_against_host", lambda *a: None)
@@ -2647,27 +2782,19 @@ def test_p1_onboarding_onprem_optimizer_bootstrap_uses_fresh_norm_records(
             onboard._parent(state.args)
         assert state.args.test_spec.read_bytes() == state.previous
         assert not (state.args.output_dir / "onboarding-t02.json").exists()
-    assert materialized == [
-        (
-            state.spec.model.source_checkpoint,
-            state.spec.model.cache_path,
-            state.spec.model.num_hidden_layers,
-            {"vision_depth": state.spec.model.vision_depth},
-        )
-    ]
+    assert materialized == []
     assert state.events == (["calibration"] if failure == "calibration" else ["calibration", "validation"])
     assert list(state.args.reference_records_dir.glob(".optimizer-onboarding-*")) == []
 
 
-@pytest.mark.parametrize("backend", ["onprem", "cortex"])
+@pytest.mark.parametrize("backend", ["cortex-training", "cortex"])
 def test_p1_onboarding_records_directory_reaches_final_regression_for_both_backends(tmp_path, monkeypatch, backend):
     from arctic_platform.correctness.harness.execution import parse_args
 
     parser = argparse.ArgumentParser()
     onboard.add_arguments(parser)
     options = ["--config", str(tmp_path / "external.config"), "--backend", backend]
-    if backend == "cortex":
-        options += ["--local-cortex-fixture"]
+    options += ["--local-cortex-fixture"]
     args = parser.parse_args(options)
     args.checkout_root = tmp_path
     args.output_dir = tmp_path / "output"
@@ -2678,15 +2805,15 @@ def test_p1_onboarding_records_directory_reaches_final_regression_for_both_backe
         commands.append(command)
         output = Path(command[command.index("--out") + 1])
         (output / "report.json").write_text('{"totals":{"pass":1,"fail":0}}')
-        return SimpleNamespace(stdout=iter([]), wait=lambda: 0)
+        return SimpleNamespace(stdout=io.StringIO(""), wait=lambda: 0)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
     assert len(commands) == 1
     actual = parse_args(commands[0][3:])
-    assert actual.backend == backend
+    assert actual.backend == "cortex"
     assert actual.reference_records_dir == args.reference_records_dir
-    assert actual.local_cortex_fixture is (backend == "cortex")
+    assert actual.local_cortex_fixture is True
 
 
 @pytest.fixture
@@ -2739,11 +2866,11 @@ def test_p1_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_n
 
 
 @pytest.mark.parametrize("test_id", onboard.CALIBRATED_TEST_IDS)
-def test_p1_onboarding_first2_cli_keeps_onprem_default_and_calibration(test_id, tmp_path):
+def test_p1_onboarding_first2_cli_keeps_cortex_default_and_calibration(test_id, tmp_path):
     parser = argparse.ArgumentParser()
     onboard.add_arguments(parser)
     args = parser.parse_args(["--config", str(tmp_path / "external.json"), "--test-id", test_id])
-    assert args.backend == "onprem"
+    assert args.backend == "cortex"
     assert args.test_id == test_id
     assert onboard._onboarding_kind(test_id) == test_id
     assert args.reference_calibration_runs == 16
@@ -2896,7 +3023,7 @@ def test_p1_onboarding_optimizer_bootstrap_keeps_pinned_child_entry(_optimizer_v
         captured.append(command)
         out = Path(command[command.index("--out") + 1])
         (out / "report.json").write_text('{"totals":{"pass":1,"fail":0}}')
-        return SimpleNamespace(stdout=iter(["synthetic child\n"]), wait=lambda: 0)
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     result = onboard._run_final_regression(args, {"layers": 4})
@@ -2919,7 +3046,7 @@ def test_p1_onboarding_rl_config_rejected_before_capacity_or_fixture_work(tmp_pa
     config_path.write_text(json.dumps(raw))
     parser = argparse.ArgumentParser()
     onboard.add_arguments(parser)
-    args = parser.parse_args(["--config", str(config_path)])
+    args = parser.parse_args(["--config", str(config_path), "--test-id", "single-step-grads"])
     monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
     monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
     monkeypatch.setattr(dss_driver, "available_gpus", lambda: pytest.fail("RL rejection reached GPU discovery"))
@@ -3021,7 +3148,7 @@ def test_optimizer_validation_child_forwards_original_regression_and_retains_sou
         captured.append((command, kwargs))
         out = Path(command[command.index("--out") + 1])
         (out / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
-        return SimpleNamespace(stdout=iter(["synthetic child\n"]), wait=lambda: 0)
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     result = onboard._run_final_regression(args, {"layers": 4})
@@ -3133,7 +3260,7 @@ def test_optimizer_validation_child_rejects_source_drift_after_child_exit(
             getattr(args, "optimizer_validation_" + role).write_text("drift while target ran\n")
             return 0
 
-        return SimpleNamespace(stdout=iter([]), wait=wait)
+        return SimpleNamespace(stdout=io.StringIO(), wait=wait)
 
     monkeypatch.setattr(onboard.subprocess, "Popen", process)
     with pytest.raises(ValueError, match="optimizer validation.*changed"):
@@ -3164,7 +3291,7 @@ def test_optimizer_validation_child_failure_restores_exact_test1_without_referen
         if failure == "child-interrupt":
             raise KeyboardInterrupt()
         assert failure == "child-failure"
-        return SimpleNamespace(stdout=iter(["synthetic child failure\n"]), wait=lambda: 1)
+        return SimpleNamespace(stdout=io.StringIO("synthetic child failure\n"), wait=lambda: 1)
 
     monkeypatch.setattr(onboard, "_run_local_optimizer_calibration", calibration)
     monkeypatch.setattr(onboard.subprocess, "Popen", process)

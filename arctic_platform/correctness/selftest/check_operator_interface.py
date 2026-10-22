@@ -34,8 +34,11 @@ from argparse import Namespace
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from arctic_platform.correctness import api
 from arctic_platform.correctness.diagnostics import __main__ as dispatch
@@ -77,6 +80,15 @@ def _external_operator_catalog(tmp_path, monkeypatch):
         return original_catalog(selected)
 
     monkeypatch.setattr(api, "catalog", catalog)
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    def local_config(path, config_dir=None):
+        selected = root / "configs" if config_dir is None or Path(config_dir) == default_root else config_dir
+        return local_config_path(path, selected)
+
+    monkeypatch.setattr(api, "local_config_path", local_config)
+    monkeypatch.setattr(cli, "local_config_path", local_config)
+    monkeypatch.setattr("arctic_platform.correctness.harness.config.local_config_path", local_config)
     monkeypatch.setattr(cli, "SPEC_DIR", root / "specs")
 
 
@@ -162,7 +174,7 @@ def test_historical_gradient_absent_pair_keeps_default():
     assert execution._load_historical_gradient_references(Namespace()) is None
     assert api.RunOptions().historical_gradient_references is None
     assert api.RunOptions().historical_gradient_references_sha256 is None
-    assert api.RunOptions().backend == "onprem"
+    assert api.RunOptions().backend == "cortex-training"
 
 
 @pytest.mark.parametrize("missing", ["historical_gradient_references", "historical_gradient_references_sha256"])
@@ -387,7 +399,9 @@ def test_historical_gradient_execution_forwards_exact_bindings(_historical_gradi
     monkeypatch.setattr(execution, "_finish", lambda *a, **kw: 0)
 
     def capture(config, reviewed, definitions, **kwargs):
-        assert config == cfg and reviewed is spec and definitions == arms
+        assert config == execution.load_config(execution.local_config_path(cfg.path))
+        assert config.path.read_bytes() == cfg.path.read_bytes()
+        assert reviewed is spec and definitions == arms
         captured.append(kwargs)
         return []
 
@@ -968,10 +982,397 @@ def test_operator_api_pair_selection_accepts_catalog_id_or_path():
     assert [(case.config_id, case.test_id) for case in expected] == [(_operator_api_CONFIG, _operator_api_TEST)]
 
 
-def test_operator_api_config_only_selects_each_maintained_test_once():
+def test_operator_api_config_only_selects_each_applicable_test_once():
     selected = api.select(api.RunRequest(config=_operator_api_CONFIG))
-    assert [case.test_id for case in selected] == sorted(api.registered_tests())
+    config = api.load_config(api.catalog()[_operator_api_CONFIG])
+    assert [case.test_id for case in selected] == sorted(
+        test_id
+        for test_id, test in api.registered_tests().items()
+        if api.workload_inapplicable_reason(test, config) is None
+    )
     assert len(set(selected)) == len(selected)
+
+
+@pytest.mark.parametrize("is_rl", [False, True])
+def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tmp_path, monkeypatch, is_rl):
+    config = tmp_path / "external.json"
+    config.write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {"n_gpus": 4, "max_seq_len": 16},
+                sampling={"n_gpus": 4} if is_rl else None,
+            )
+        )
+    )
+    tests = {
+        "gradients": SimpleNamespace(compares_to_reference=True, workload_modes=("sft",)),
+        "rl-only": SimpleNamespace(test_id="rl-only", compares_to_reference=False, workload_modes=("rl",)),
+        "shared": SimpleNamespace(compares_to_reference=False, workload_modes=("sft", "rl")),
+    }
+    monkeypatch.setattr(api, "registered_tests", lambda: tests)
+    monkeypatch.setattr(api, "catalog", lambda *a: {"external": config})
+    monkeypatch.setattr(execution, "_client_backend", lambda *a: pytest.fail("selection accessed backend"))
+    local_root = tmp_path / "checkout" / "configs"
+    selected = api.select(api.RunRequest(config=config, config_dir=local_root))
+    assert [case.test_id for case in selected] == (["rl-only", "shared"] if is_rl else ["gradients", "shared"])
+    assert all(case.config_path == local_root / config.name for case in selected)
+    assert selected[0].config_path.read_bytes() == config.read_bytes()
+    incompatible = "gradients" if is_rl else "rl-only"
+    explicit = api.select(api.RunRequest(config=config, config_dir=local_root, tests=(incompatible,)))
+    assert [case.test_id for case in explicit] == [incompatible]
+
+
+@pytest.mark.parametrize("suffix", [".json", ".config"])
+def test_operator_external_config_copy_is_local_and_idempotent(tmp_path, suffix):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "incoming" / f"model{suffix}"
+    source.parent.mkdir()
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16}), indent=2) + "\n")
+    root = tmp_path / "checkout" / "configs"
+    local = local_config_path(source, root)
+    assert local == root / source.name
+    assert local.read_bytes() == source.read_bytes()
+    assert config_id(local) == config_id(source)
+    assert load_config(local).native == load_config(source).native
+    modified = local.stat().st_mtime_ns
+    assert local_config_path(source, root) == local
+    assert local.stat().st_mtime_ns == modified
+    source.unlink()
+    assert local_config_path(local, root) == local
+
+
+def test_operator_external_config_copy_preserves_local_recipe_on_collision(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "model.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
+    root = tmp_path / "checkout" / "configs"
+    local = local_config_path(source, root)
+    original = local.read_bytes()
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16})))
+    with pytest.raises(ValueError, match="different contents"):
+        local_config_path(source, root)
+    assert local.read_bytes() == original
+
+
+def test_operator_external_config_copy_reuses_id_across_extensions_and_layouts(tmp_path):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    root = tmp_path / "checkout" / "configs"
+    local = root / "model" / "h200" / "train.config"
+    local.parent.mkdir(parents=True)
+    local.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
+    source = tmp_path / "model-h200-train.json"
+    source.write_bytes(local.read_bytes())
+    assert config_id(source) == config_id(local)
+    assert local_config_path(source, root) == local
+    assert not (root / source.name).exists()
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16})))
+    with pytest.raises(ValueError, match="different contents"):
+        local_config_path(source, root)
+    assert not (root / source.name).exists()
+
+
+def test_operator_external_config_copy_rejects_invalid_input_before_import(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "not-a-config.json"
+    source.write_text('{"unrelated": true}')
+    root = tmp_path / "checkout" / "configs"
+    with pytest.raises(ValueError):
+        local_config_path(source, root)
+    assert not root.exists()
+
+
+def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.onboarding import onboard
+
+    source = tmp_path / "model.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
+    root = tmp_path / "checkout" / "configs"
+    args = execution.parse_args(["onboard", "--config", str(source)])
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(
+        "arctic_platform.correctness.harness.config.local_config_path", lambda path: local_config_path(path, root)
+    )
+    used = []
+    monkeypatch.setattr(onboard, "_onboard_configuration", lambda child: used.append(child.config) or 0)
+    assert onboard.run(args) == 0
+    assert used == [root / source.name]
+    assert used[0].read_bytes() == source.read_bytes()
+
+
+# Config-driven onboarding prerequisites.
+
+
+@pytest.fixture
+def _onboarding_prerequisites(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import config as config_module
+    from arctic_platform.correctness.harness import registry
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json")])
+    args.test_spec = tmp_path / "spec.json"
+    args.output_dir = tmp_path / "scratch"
+    args.cache_root = tmp_path / "cache"
+    args.reference_records_dir = tmp_path / "records"
+    config = SimpleNamespace(
+        config_id="synthetic",
+        is_rl=False,
+        n_gpus=4,
+        sp_size=1,
+        gpu_type="h200",
+        model_name="Qwen/synthetic",
+        training={},
+        attention_implementation="flash_attention_3",
+        reference_attention_implementation="flash_attention_3",
+    )
+    tests = {
+        test_id: SimpleNamespace(
+            test_id=test_id, compares_to_reference=True, requires_hosted_control_plane=False, workload_modes=("sft",)
+        )
+        for test_id in ("single-step-grads", "single-step-optimizer")
+    }
+    tests["hosted"] = SimpleNamespace(
+        test_id="hosted", compares_to_reference=False, requires_hosted_control_plane=True, workload_modes=("sft",)
+    )
+    monkeypatch.setattr(config_module, "load_config", lambda *a: config)
+    monkeypatch.setattr(registry, "registered_tests", lambda: tests)
+    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None)
+    calls = []
+    result = {"host": "head", "python": sys.executable, "gpu_count": 4, "versions": {"torch": "test"}, "errors": []}
+
+    def inspect_node(request):
+        calls.append(copy.deepcopy(request))
+        return copy.deepcopy(result)
+
+    monkeypatch.setattr(preflight, "onboarding_node_prerequisites", inspect_node)
+    return SimpleNamespace(args=args, config=config, calls=calls, result=result, onboard=onboard)
+
+
+@pytest.mark.parametrize("selection", ["all", "single-step-optimizer"])
+def test_onboarding_prerequisites_fail_before_workdir_fixture_or_weights(
+    _onboarding_prerequisites, monkeypatch, selection
+):
+    state = _onboarding_prerequisites
+    state.args.test_id = selection
+    state.result["errors"] = ["attention backend flash_attention_3: incompatible CUDA extension"]
+    monkeypatch.setattr(state.onboard, "_parent", lambda *a: pytest.fail("preflight reached model work"))
+    monkeypatch.setattr(state.onboard, "correctness_workdir", lambda *a: pytest.fail("preflight created scratch"))
+    with pytest.raises(ValueError, match="prerequisites failed before model work") as caught:
+        state.onboard._onboard_configuration(state.args)
+    assert "head" in str(caught.value) and sys.executable in str(caught.value)
+    assert "flash_attention_3" in str(caught.value)
+    assert len(state.calls) == 1
+    assert not state.args.output_dir.exists() and not state.args.test_spec.exists()
+    assert not getattr(state.args, "_prerequisites_checked", False)
+
+
+def test_onboarding_prerequisites_run_once_before_all_selected_checks(_onboarding_prerequisites, monkeypatch):
+    state = _onboarding_prerequisites
+    seen = []
+
+    def parent(child):
+        assert child._prerequisites_checked and len(state.calls) == 1
+        seen.append(child.test_id)
+        child.test_spec.write_text("{}")
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    monkeypatch.setattr(state.onboard, "_prepare_references", lambda child: 0)
+    assert state.onboard._onboard_configuration(state.args) == 0
+    assert seen == ["single-step-grads", "single-step-optimizer"]
+    assert state.calls[0]["attention"] == ["flash_attention_3"]
+    assert "vllm" not in state.calls[0]["modules"]
+
+
+def test_onboarding_prerequisites_respect_reference_backend_and_config_lora(_onboarding_prerequisites):
+    state = _onboarding_prerequisites
+    state.config.attention_implementation = "sparse_mla"
+    state.config.reference_attention_implementation = "sdpa"
+    state.config.training["peft_config"] = {"rank": 8}
+    state.args.backend = "cortex"
+    state.args.base_url = "http://127.0.0.1:8003"
+    state.onboard._onboarding_preflight(state.args, state.config)
+    assert state.calls[0]["attention"] == state.calls[0]["hf_attention"] == ["sdpa"]
+    assert "peft" in state.calls[0]["modules"]
+    assert "deepspeed" not in state.calls[0]["modules"]
+    assert "fla" not in state.calls[0]["modules"] and "causal_conv1d" not in state.calls[0]["modules"]
+
+
+@pytest.mark.parametrize("fault", [None, "version", "worker", "capacity", "no-hostfile"])
+def test_onboarding_prerequisites_check_actual_allocation_nodes(
+    _onboarding_prerequisites, tmp_path, monkeypatch, fault
+):
+    state = _onboarding_prerequisites
+    state.config.n_gpus = 8
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("head slots=4\npeer slots=4\n")
+    nodes = {host: copy.deepcopy(state.result) for host in ("head", "peer")}
+    if fault == "version":
+        nodes["peer"]["versions"]["torch"] = "different"
+    if fault == "worker":
+        nodes["peer"]["errors"] = ["attention backend flash_attention_3: cannot load kernel"]
+    if fault == "capacity":
+        hostfile.write_text("head slots=4\npeer slots=2\n")
+    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None if fault == "no-hostfile" else hostfile)
+    remote = Mock(return_value=nodes)
+    monkeypatch.setattr(preflight, "allocation_onboarding_prerequisites", remote)
+    if fault:
+        with pytest.raises(ValueError):
+            state.onboard._onboarding_preflight(state.args, state.config)
+        assert not getattr(state.args, "_prerequisites_checked", False)
+    else:
+        state.onboard._onboarding_preflight(state.args, state.config)
+        assert state.args._preflight_gpu_capacity == 8
+    if fault != "no-hostfile":
+        request, actual_hostfile = remote.call_args.args
+        assert actual_hostfile == hostfile and request["hf_attention"] == []
+        assert "specification output" not in request["writable"]
+        assert "liger_kernel.transformers.fused_linear_cross_entropy" not in request["modules"]
+        assert request["min_gpus"] == 1 and request["source"] is None and request["model_id"] is None
+
+
+def test_onboarding_prerequisites_reference_free_cortex_needs_no_author_gpus(_onboarding_prerequisites):
+    state = _onboarding_prerequisites
+    state.args.test_id = "hosted"
+    state.args.backend = "cortex"
+    state.args.test_spec.write_text("{}")
+    state.result["gpu_count"] = 0
+    state.onboard._onboarding_preflight(state.args, state.config, ["hosted"])
+    assert state.calls[0]["min_gpus"] == 0 and state.calls[0]["attention"] == []
+
+
+def test_onboarding_prerequisites_reference_workers_are_not_target_requirements(
+    _onboarding_prerequisites, tmp_path, monkeypatch
+):
+    state = _onboarding_prerequisites
+    state.config.n_gpus = 16
+    state.args.reference_calibration_workers = 8
+    state.result["gpu_count"] = 8
+    state.result["versions"]["liger_kernel.transformers.fused_linear_cross_entropy"] = "local-only"
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("head slots=8\npeer slots=8\n")
+    remote = Mock(
+        return_value={
+            host: {"host": host, "python": sys.executable, "gpu_count": 8, "versions": {"torch": "test"}, "errors": []}
+            for host in ("head", "peer")
+        }
+    )
+    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(preflight, "allocation_onboarding_prerequisites", remote)
+    state.onboard._onboarding_preflight(state.args, state.config)
+    assert state.calls[0]["min_gpus"] == 8
+    assert remote.call_args.args[0]["min_gpus"] == 1
+
+
+@pytest.fixture
+def _node_prerequisites(tmp_path, monkeypatch):
+    device = SimpleNamespace(name="NVIDIA H200", major=9, minor=0)
+    cuda = SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 4, get_device_properties=lambda index: device
+    )
+    torch_module = SimpleNamespace(cuda=cuda, __version__="synthetic-cuda")
+    imported = preflight.importlib.import_module
+
+    def import_module(name):
+        if name == "torch":
+            return torch_module
+        if name == "flash_attn_interface":
+            return SimpleNamespace(flash_attn_varlen_func=lambda: None)
+        if name == "transformers.utils":
+            return SimpleNamespace(is_flash_attn_3_available=lambda: True)
+        return imported(name)
+
+    monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").write_bytes(b"synthetic file, never loaded")
+    request = {
+        "modules": ["torch"],
+        "attention": ["flash_attention_3"],
+        "hf_attention": ["flash_attention_3"],
+        "gpu_type": "h200",
+        "min_gpus": 4,
+        "source": str(source),
+        "writable": {"scratch": str(tmp_path / "not-yet-created")},
+    }
+    return SimpleNamespace(request=request, device=device, cuda=cuda, importer=import_module)
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "cuda", "family", "count", "capability", "abi", "hf", "source", "output", "no-gpu-work"]
+)
+def test_onboarding_node_prerequisites_do_not_allocate_models(_node_prerequisites, monkeypatch, fault):
+    state = _node_prerequisites
+    before = copy.deepcopy(state.request)
+    if fault == "cuda":
+        state.cuda.is_available = lambda: False
+    elif fault == "family":
+        state.device.name = "NVIDIA B200"
+    elif fault == "count":
+        state.cuda.device_count = lambda: 2
+    elif fault == "capability":
+        state.device.major = 8
+    elif fault in {"abi", "hf"}:
+
+        def import_module(name):
+            if fault == "abi" and name == "flash_attn_interface":
+                raise ImportError("undefined CUDA symbol")
+            if fault == "hf" and name == "transformers.utils":
+                return SimpleNamespace(is_flash_attn_3_available=lambda: False)
+            return state.importer(name)
+
+        monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+    elif fault == "source":
+        (Path(state.request["source"]) / "config.json").unlink()
+    elif fault == "output":
+        state.request["writable"]["scratch"] = str(Path(state.request["source"]) / "config.json")
+    elif fault == "no-gpu-work":
+        state.request["min_gpus"] = 0
+        state.request["attention"] = []
+        state.cuda.is_available = lambda: pytest.fail("inspected CUDA for a reference-free Cortex request")
+    result = preflight.onboarding_node_prerequisites(state.request)
+    assert bool(result["errors"]) == (fault not in {None, "no-gpu-work"})
+    assert result["python"] == sys.executable
+    assert state.request["attention"] == ([] if fault == "no-gpu-work" else before["attention"])
+    assert not Path(before["writable"]["scratch"]).exists()
+    if fault in {"abi", "hf"}:
+        assert "another FlashAttention version is not a substitute" in "\n".join(result["errors"])
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "malformed", "slots", "transport"])
+def test_onboarding_allocation_prerequisites_require_every_host_response(tmp_path, monkeypatch, fault):
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("10.0.0.1 slots=4\n10.0.0.2 slots=4\n")
+    result = {"host": "node", "python": sys.executable, "gpu_count": 4, "versions": {}, "errors": []}
+    if fault == "slots":
+        result["gpu_count"] = 2
+    output = f"10.0.0.1: CORRECTNESS_PREREQUISITES {json.dumps(result)}\n"
+    if fault == "malformed":
+        output = "10.0.0.1: CORRECTNESS_PREREQUISITES []\n"
+    if fault != "missing":
+        output += f"10.0.0.2: CORRECTNESS_PREREQUISITES {json.dumps(result)}\n"
+    if fault == "duplicate":
+        output += output.splitlines()[0] + "\n"
+    run = Mock(return_value=subprocess.CompletedProcess([], int(fault == "transport"), output, "synthetic stderr"))
+    monkeypatch.setattr(preflight.subprocess, "run", run)
+    if fault in {"missing", "duplicate", "malformed", "transport"}:
+        with pytest.raises(ValueError):
+            preflight.allocation_onboarding_prerequisites({}, hostfile)
+    else:
+        nodes = preflight.allocation_onboarding_prerequisites({}, hostfile)
+        assert set(nodes) == {"10.0.0.1", "10.0.0.2"}
+        assert bool(nodes["10.0.0.2"]["errors"]) == (fault == "slots")
+    command = run.call_args.args[0]
+    assert command[1:3] == ["-f", str(hostfile)]
+    assert sys.executable in command[-1] and "base64 -d" in command[-1]
 
 
 def test_operator_api_test_only_selects_all_reviewed_configs_in_order():
@@ -1111,24 +1512,27 @@ def test_operator_api_comparison_failure_and_execution_errors_are_distinct(error
 
 def test_operator_api_parse_flags_is_shared_with_operator_command():
     request, options = api.parse_run_args(
-        ["--config", _operator_api_CONFIG, "--test", _operator_api_TEST, "--backend", "onprem"]
+        ["--config", _operator_api_CONFIG, "--test", _operator_api_TEST, "--backend", "cortex-training"]
     )
     assert request.config == _operator_api_CONFIG and request.tests == (_operator_api_TEST,)
-    assert options.backend == "onprem"
+    assert options.backend == api.RunOptions().backend == "cortex-training"
+    assert api._namespace(request, options).backend == "cortex"
+    with pytest.raises(ValueError, match="no longer supported"):
+        api._namespace(request, api.RunOptions(backend="onprem"))
 
 
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
+    monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
     guide = api.PACKAGE_DIR / "docs" / "running-tests.doc"
     before = guide.read_bytes()
     monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
-    monkeypatch.setattr(execution, "available_gpus", lambda: 4)
-    monkeypatch.setattr(execution, "validate_against_host", lambda *a, **k: None)
-    monkeypatch.setattr(execution, "ensure_no_interrupted_builds", lambda: None)
     from transformers import AutoConfig
 
     from arctic_platform.correctness.harness import report
     from arctic_platform.correctness.harness import runner
+    from arctic_platform.correctness.onboarding import onboard
 
+    monkeypatch.setattr(onboard, "_onboarding_preflight", lambda *a: None)
     monkeypatch.setattr(report, "collect", lambda: {"host": "synthetic"})
     result = api.run(
         api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
@@ -1146,7 +1550,7 @@ def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, 
                 "--config",
                 str(api.catalog()[_operator_api_CONFIG]),
                 "--test-spec",
-                str(cli.SPEC_DIR / f"{_operator_api_CONFIG}.json"),
+                str(execution.SPEC_DIR / f"{_operator_api_CONFIG}.json"),
                 "--prepare-references",
                 "--output-dir",
                 str(tmp_path / "preparation"),
@@ -1436,3 +1840,342 @@ def test_workdir_root_correctness_workdir_rejects_unsafe_explicit_override(monke
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match=CORRECTNESS_TMPDIR_ENV):
         workdir.correctness_workdir("dss-correctness-")
+
+
+# Repeating onboarding resumes completed preparation, not another reference measurement.
+
+
+@pytest.mark.parametrize("failure", ["reported", "missing-report", "inconsistent-totals"])
+def test_onboarding_target_failure_reason_survives_into_summary(tmp_path, monkeypatch, failure):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json"), "--test", "single-step-grads"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    cause = "The target worker rejected the optimizer snapshot metadata."
+    target_report = {
+        "totals": {"pass": 1, "fail": int(failure != "inconsistent-totals")},
+        "results": [
+            {"test_id": args.test_id, "arm": "gas1", "outcome": "pass"},
+            {"test_id": args.test_id, "arm": "gas4", "outcome": "fail", "reason": cause},
+        ],
+    }
+
+    def child(command, **kwargs):
+        out = args.output_dir / "validation" / "4-layers"
+        if failure != "missing-report":
+            (out / "report.json").write_text(json.dumps(target_report))
+        return SimpleNamespace(
+            stdout=io.StringIO(cause + "\n"),
+            wait=lambda: 0 if failure == "inconsistent-totals" else 1,
+        )
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    if failure == "inconsistent-totals":
+        with pytest.raises(RuntimeError, match=cause) as caught:
+            onboard._run_final_regression(args, {"layers": 4})
+    else:
+        validation = onboard._run_final_regression(args, {"layers": 4})
+        assert validation["status"] == "failed" and cause in validation["reason"]
+        with pytest.raises(RuntimeError, match=cause) as caught:
+            onboard._require_validation_pass(validation, "Gradient validation")
+    assert "Complete log:" in str(caught.value)
+    assert str(tmp_path / "validation" / "4-layers") in str(caught.value)
+    if failure != "missing-report":
+        assert "gas4" in str(caught.value)
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "error"])
+def test_onboarding_zero_exit_with_nonpassing_totals_is_not_success(outcome):
+    from arctic_platform.correctness.onboarding import onboard
+
+    with pytest.raises(RuntimeError, match="failing test results"):
+        onboard._validation_outcome(0, "", {"totals": {"pass": 1, "fail": 0, outcome: 1}})
+
+
+def test_onboarding_resume_retries_validation_without_repeating_preparation(tmp_path):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = Namespace(
+        _resume_dir=tmp_path / "state", test_spec=tmp_path / "spec.json", reference_records_dir=tmp_path / "records"
+    )
+    args._resume_dir.mkdir()
+    calibration = tmp_path / "calibration.json"
+    calls = []
+
+    def sizing():
+        calls.append("sizing")
+        return {"status": "fit", "layers": 4}
+
+    def fixture():
+        calls.append("fixture")
+        args.test_spec.write_text('{"fixture": 4}')
+
+    def calibrate():
+        calls.append("calibration")
+        calibration.write_text('{"tolerance": {"selected_gate": 0.005}}')
+        args.test_spec.write_text('{"fixture": 4, "gate": 0.005}')
+        return str(calibration)
+
+    def references():
+        calls.append("references")
+        return 0
+
+    def validate():
+        calls.append("validation")
+        return {"status": "error" if calls.count("validation") == 1 else "pass"}
+
+    for attempt in range(2):
+        onboard._resume_phase(args, "sizing", sizing)
+        onboard._resume_phase(args, "fixture", fixture)
+        onboard._resume_phase(args, "calibration", calibrate)
+        onboard._resume_phase(args, "references", references)
+        result = onboard._resume_phase(args, "validation", validate)
+        assert result["status"] == ("error" if attempt == 0 else "pass")
+        if attempt == 0:
+            assert not (args._resume_dir / "validation.json").exists()
+            args.test_spec.unlink()  # The failed parent rolls back its unpublished specification.
+    assert calls == ["sizing", "fixture", "calibration", "references", "validation", "validation"]
+    assert json.loads(args.test_spec.read_text())["gate"] == 0.005
+
+
+@pytest.mark.parametrize("drift", ["deleted-calibration", "changed-calibration", "changed-reference", "changed-spec"])
+def test_onboarding_resume_rebuilds_changed_phase_and_invalidates_successors(tmp_path, drift):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = Namespace(
+        _resume_dir=tmp_path / "state", test_spec=tmp_path / "spec.json", reference_records_dir=tmp_path / "records"
+    )
+    args._resume_dir.mkdir()
+    args.test_spec.write_text("{}")
+    record = args.reference_records_dir / args.test_spec.stem / "reference.json"
+    record.parent.mkdir(parents=True)
+    record.write_text('{"measurement": 1}')
+    calibration = tmp_path / "calibration.json"
+    calls = []
+
+    def calibrate():
+        calls.append("calibration")
+        calibration.write_text('{"gate": 0.005}')
+        return str(calibration)
+
+    onboard._resume_phase(args, "calibration", calibrate)
+    (args._resume_dir / "validation.json").write_text("{}")
+    if drift == "deleted-calibration":
+        calibration.unlink()
+    elif drift == "changed-calibration":
+        calibration.write_text('{"gate": 0.100}')
+    elif drift == "changed-reference":
+        record.write_text('{"measurement": 2}')
+    else:
+        args.test_spec.write_text('{"changed": true}')
+    onboard._resume_phase(args, "calibration", calibrate)
+    assert calls == ["calibration", "calibration"]
+    assert not (args._resume_dir / "validation.json").exists()
+
+
+@pytest.mark.parametrize("status", ["oom", "error"])
+def test_onboarding_resume_never_admits_failed_sizing(tmp_path, status):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = Namespace(_resume_dir=tmp_path, test_spec=tmp_path / "spec.json")
+    attempts = []
+
+    def probe():
+        attempts.append(status)
+        return {"status": status}
+
+    assert onboard._resume_phase(args, "sizing", probe)["status"] == status
+    assert onboard._resume_phase(args, "sizing", probe)["status"] == status
+    assert attempts == [status, status] and not (tmp_path / "sizing.json").exists()
+
+
+@pytest.mark.parametrize("drift", ["config", "options", "dependencies"])
+def test_onboarding_resume_state_is_bound_to_recipe_and_environment(tmp_path, monkeypatch, drift):
+    from arctic_platform.correctness.onboarding import onboard
+
+    config = tmp_path / "config.json"
+    config.write_text('{"seed": 42}')
+    args = Namespace(
+        config=config,
+        source_checkpoint="synthetic/model",
+        test_id="single-step-grads",
+        test_spec=tmp_path / "spec.json",
+        tokens=16,
+        _resume_root=tmp_path / "logs",
+    )
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    onboard._resume_setup(args)
+    assert args._resume_dir == original
+    if drift == "config":
+        config.write_text('{"seed": 43}')
+    elif drift == "options":
+        args.tokens = 32
+    else:
+        monkeypatch.setattr(onboard.importlib.metadata, "version", lambda name: "changed")
+    onboard._resume_setup(args)
+    assert args._resume_dir != original
+
+
+@pytest.mark.parametrize("selection", ["all", "single-step-grads", "single-step-optimizer"])
+def test_onboarding_config_only_automatically_selects_cortex_fixture(tmp_path, monkeypatch, selection):
+    from arctic_platform.correctness.onboarding import onboard
+
+    for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT"):
+        monkeypatch.delenv(name, raising=False)
+    args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json"), "--test", selection])
+    config = SimpleNamespace(is_rl=False)
+    onboard._configure_fixture_target(args, config, list(onboard.CALIBRATED_TEST_IDS))
+    assert args._automatic_cortex_gateway
+    if selection != "all":
+        assert args.local_cortex_fixture
+    else:
+        child = Namespace(**{**vars(args), "test_id": "single-step-grads"})
+        onboard._configure_fixture_target(child, config, ["single-step-grads"])
+        assert child.local_cortex_fixture and child._automatic_cortex_gateway
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+@pytest.mark.parametrize("job_hostfile", [False, True])
+def test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_process(
+    tmp_path, monkeypatch, body_error, job_hostfile
+):
+    import requests
+
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = Namespace(_automatic_cortex_gateway=True, output_dir=tmp_path)
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    start = Mock(return_value=process)
+    monkeypatch.setattr(onboard.subprocess, "Popen", start)
+    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None)
+    is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: job_hostfile if str(path) == "/job/hostfile" else is_file(path))
+    listener = MagicMock()
+    listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 54321)
+    monkeypatch.setattr(onboard.socket, "socket", lambda: listener)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
+    if body_error:
+        with pytest.raises(RuntimeError, match="synthetic validation failed"):
+            with onboard._validation_gateway(args):
+                raise RuntimeError("synthetic validation failed")
+    else:
+        with onboard._validation_gateway(args) as url:
+            assert url.startswith("http://127.0.0.1:")
+    command = start.call_args.args[0]
+    assert command[:3] == [sys.executable, "-m", "dss.ray_dss.gateway_server"]
+    assert "--backend" in command and "gpu" in command
+    assert command[-2:] == ["--hostfile", "/job/hostfile" if job_hostfile else str(tmp_path / "hostfile")]
+    process.terminate.assert_called_once()
+    process.wait.assert_called_once_with(timeout=120)
+
+
+def test_onboarding_automatic_gateway_does_not_start_or_stop_configured_target(tmp_path, monkeypatch):
+    from arctic_platform.correctness.onboarding import onboard
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", lambda *a, **k: pytest.fail("external target was replaced"))
+    with onboard._validation_gateway(Namespace(output_dir=tmp_path)) as url:
+        assert url is None
+
+
+def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path, monkeypatch, capsys):
+    from arctic_platform.correctness.harness import config as config_module
+    from arctic_platform.correctness.harness import registry
+    from arctic_platform.correctness.onboarding import onboard
+
+    monkeypatch.chdir(tmp_path)
+    for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT", "DSS_CORRECTNESS_LOGDIR"):
+        monkeypatch.delenv(name, raising=False)
+    config_path = tmp_path / "recipe.json"
+    config_path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "attn_implementation": "sdpa"})))
+    config = config_module.load_config(config_path)
+    spec_path = tmp_path / "spec.json"
+    model_path = tmp_path / "model"
+    calls = []
+    entries = registry.registered_tests()
+    monkeypatch.setattr(
+        registry, "registered_tests", lambda: {test_id: entries[test_id] for test_id in onboard.CALIBRATED_TEST_IDS}
+    )
+    monkeypatch.setattr(config_module, "local_config_path", lambda path: Path(path))
+    monkeypatch.setattr(onboard, "_validate_storage", lambda args: None)
+    monkeypatch.setattr(onboard, "_checkout_root", lambda path: tmp_path)
+    monkeypatch.setattr(onboard, "_onboarding_preflight", lambda *args: None)
+    monkeypatch.setattr(onboard, "correctness_workdir", lambda prefix: tmp_path / "scratch")
+    monkeypatch.setattr(onboard, "_model_shape", lambda path: (36, 1, 4))
+    monkeypatch.setattr(onboard, "_optimizer_reference_model", lambda *args: (model_path, 4))
+    spec = SimpleNamespace(
+        config_id=config.config_id,
+        config_checksum=config_module.config_checksum(config),
+        applicable_tests=list(onboard.CALIBRATED_TEST_IDS),
+        model=SimpleNamespace(
+            source_checkpoint="synthetic/model", cache_path=str(model_path), num_hidden_layers=4, vision_depth=0
+        ),
+    )
+    monkeypatch.setattr(config_module.TestSpec, "read", lambda path: spec)
+
+    def probe(args, layers):
+        calls.append("sizing")
+        return {"status": "fit", "layers": layers, "peak_gib": 1.0}
+
+    def fixture(args, selected, first_oom):
+        calls.append("fixture")
+        args.test_spec.write_text('{"tests": ["single-step-grads"]}')
+
+    def calibrate(args, *rest):
+        calls.append(f"{args.test_id}:calibration")
+        destination = args.output_dir / "calibration.json"
+        destination.write_text(
+            json.dumps(
+                {
+                    "tolerance": {"selected_gate": 0.005},
+                    "criterion": "synthetic",
+                    "arms": {},
+                }
+            )
+        )
+        if args.test_id == "single-step-optimizer":
+            args.test_spec.write_text('{"tests": ["single-step-grads", "single-step-optimizer"]}')
+        return destination
+
+    def prepare(args):
+        calls.append(f"{args.test_id}:references")
+        return 0
+
+    def validate(args, selected):
+        calls.append(f"{args.test_id}:validation")
+        failure = args.test_id == "single-step-optimizer" and calls.count("single-step-optimizer:validation") == 1
+        log = args._diagnostics_dir / "validation.log"
+        report_path = args._diagnostics_dir / "validation.json"
+        log.write_text("synthetic target failure" if failure else "pass")
+        report_path.write_text("{}")
+        return {"status": "error" if failure else "pass", "log": str(log), "report": str(report_path)}
+
+    monkeypatch.setattr(onboard, "_run_probe", probe)
+    monkeypatch.setattr(onboard, "_write_initial_spec", fixture)
+    monkeypatch.setattr(onboard, "_render_and_run_calibration", calibrate)
+    monkeypatch.setattr(onboard, "_run_local_optimizer_calibration", calibrate)
+    monkeypatch.setattr(onboard, "_prepare_references", prepare)
+    monkeypatch.setattr(onboard, "_run_final_regression", validate)
+    command = [
+        "onboard",
+        "--config",
+        str(config_path),
+        "--test-spec",
+        str(spec_path),
+        "--reference-records-dir",
+        str(tmp_path / "records"),
+    ]
+    assert execution.cmd_onboard(execution.parse_args(command)) == 1
+    assert json.loads(spec_path.read_text())["tests"] == ["single-step-grads"]
+    first_calls = calls[:]
+    assert execution.cmd_onboard(execution.parse_args(command)) == 0
+    assert calls == first_calls + ["single-step-optimizer:validation", "single-step-grads:references"]
+    assert json.loads(spec_path.read_text())["tests"] == list(onboard.CALIBRATED_TEST_IDS)
+    logs = list((tmp_path / "work" / "logs").glob("onboarding-*/onboarding.log"))
+    assert len(logs) == 2
+    assert any("Traceback" in path.read_text() and "regression error" in path.read_text() for path in logs)
+    assert "Reusing the verified completed phase" in capsys.readouterr().out
