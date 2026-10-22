@@ -1,5 +1,7 @@
 # Correctness
 
+**Read [Getting started](../arctic_platform/correctness/docs/getting-started.md) first.** Follow the complete demo from setup and onboarding through regression, troubleshooting, staging and cleanup.
+
 **This branch supports two canonical checks: `single-step-grads` and `single-step-optimizer`.** Run from a prepared allocated head. Supply a native model config to onboarding; the harness selects both applicable checks, creates a reduced-fixture specification, calibrates gates, prepares compact Hugging Face records and validates the target. The default backend is `cortex-training`; the removed `onprem` correctness backend is rejected. The harness does not allocate machines or install the GPU runtime.
 
 - [Operator guide](../arctic_platform/correctness/docs/running-tests.md): prerequisites, config/test selection, backend options, reports, and diagnostics.

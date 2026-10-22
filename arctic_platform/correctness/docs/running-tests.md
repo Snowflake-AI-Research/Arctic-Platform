@@ -47,7 +47,7 @@ python -m arctic_platform.correctness list
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
 export DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
-export DSS_CORRECTNESS_LOGDIR="$(mktemp -d "$PWD/work/logs/correctness-demo.XXXXXXXX")"
+export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 python - <<'PY'
@@ -292,17 +292,11 @@ git diff --cached --stat
 rm -f -- ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Once you no longer need the diagnostic evidence, also remove this demo's reports and retry state.** Keep them while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. This does not delete reusable regression inputs or other runs' log directories.
+**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
 
 ```bash
-case "${DSS_CORRECTNESS_LOGDIR:-}" in
-  "$PWD"/work/logs/correctness-demo.*)
-    rm -rf -- "$DSS_CORRECTNESS_LOGDIR"
-    unset DSS_CORRECTNESS_LOGDIR
-    ;;
-  *) printf '%s\n' "No demo diagnostic directory selected; nothing removed." ;;
-esac
-rm -rf -- ./work/reports/both
+rm -rf -- ./work/logs/correctness-demo/
+rm -rf -- ./work/reports/both/
 ```
 
 **Use the retained imported config for future runs after cleanup.**
