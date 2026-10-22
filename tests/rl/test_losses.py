@@ -1222,6 +1222,35 @@ class TestMigratedGrpo(TestCasePlus):
         loss.backward()
         torch_assert_close(values.grad, torch.zeros_like(values), rtol=0, atol=0)
 
+    def test_sampler_kl_raises_every_sampled_token_and_skips_nll_tokens(self):
+        # Token 1 has zero advantage and still gets the pull; token 3 is an NLL target, not a sampled token.
+        sampler_logprobs = torch.tensor([[-1.5, -1.0, -0.5, -4.0]])
+        nll_mask = torch.tensor([[False, False, False, True]])
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0}
+        for name, nll in (("grpo", None), ("ap_grpo", None), ("ap_grpo_mixed_v1", nll_mask)):
+            context = {
+                "old_log_probs_shifted": sampler_logprobs,
+                "advantages": torch.tensor([[1.0, 0.0, -1.0, 0.0]]),
+                "loss_mask": torch.ones((1, 4), dtype=torch.bool),
+            }
+            if nll is not None:
+                context["nll_mask"] = nll
+            sampled = torch.ones((1, 4), dtype=torch.bool) if nll is None else ~nll
+            runs = {}
+            for coef in (0.0, 0.25):
+                values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+                loss, _ = LOSS_FNS[name]({"logprobs": values}, context, {}, {**config, "sampler_kl_coef": coef}, "cpu")
+                loss.backward()
+                runs[coef] = (loss.detach(), values.grad)
+            with self.subTest(name=name):
+                k1 = torch.where(sampled, sampler_logprobs - values.detach(), 0.0).sum() / 4
+                torch_assert_close(runs[0.25][0] - runs[0.0][0], 0.25 * k1)
+                torch_assert_close(runs[0.25][1] - runs[0.0][1], torch.where(sampled, -0.25 / 4, 0.0))
+        context.pop("nll_mask")
+        for invalid in (-0.01, float("inf"), True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "sampler_kl_coef"):
+                grpo_loss({"logprobs": values.detach()}, context, {}, {"sampler_kl_coef": invalid}, "cpu")
+
     def test_mixed_loss_and_worker_metrics_exclude_nll_from_rl_means(self):
         values = torch.tensor([[-2.0, -3.0]], requires_grad=True)
         context = {
