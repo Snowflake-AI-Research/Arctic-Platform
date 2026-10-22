@@ -44,6 +44,9 @@ class MoEDeepSpeedAdapter:
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
 
 
+# Largest EP-group gather assembled on the master GPU in one piece during weight export.
+_EXPORT_GATHER_BYTES = 1 << 30
+
 def patch_deepspeed_moe_detection() -> None:
     import deepspeed.runtime.engine as ds_engine
 
@@ -170,6 +173,34 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
+    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
+        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
+
+        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
+        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
+        """
+        rows = local.shape[0]
+        row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
+        if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
+            full = None
+            if is_master:
+                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            dist.gather(local, list(full.chunk(world, dim=0)) if is_master else None, dst=0, group=ep_group)
+            return full
+        step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
+        full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        buffer = None
+        if is_master:
+            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+        for start in range(0, rows, step):
+            n = min(step, rows - start)
+            outputs = [buffer[r, :n] for r in range(world)] if is_master else None
+            dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
+            if is_master:
+                for r in range(world):
+                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+        return full
+
     def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
@@ -203,9 +234,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                         continue
                     local = tensor.data.contiguous()
                     world = dist.get_world_size(group=ep_group)
-                    full = torch.empty((world * local.shape[0], *local.shape[1:]), dtype=local.dtype,
-                                       device=local.device) if is_master else None
-                    dist.gather(local, list(full.chunk(world, dim=0)) if is_master else None, dst=0, group=ep_group)
+                    full = _gather_to_master(local, world, ep_group, is_master)
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
