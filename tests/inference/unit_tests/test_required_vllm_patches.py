@@ -3,6 +3,8 @@ from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
 from arctic_platform.inference.vllm import kv_group_size
+from arctic_platform.inference.vllm import mamba_completion_refresh
+from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
@@ -51,6 +53,17 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_kv_group_size_patch",
         lambda: calls.append("kv_group_size"),
     )
+    monkeypatch.setattr(
+        mrope_yarn,
+        "ensure_mrope_yarn_fix",
+        lambda: calls.append("mrope_yarn"),
+    )
+
+    monkeypatch.setattr(
+        mamba_completion_refresh,
+        "ensure_mamba_completion_refresh",
+        lambda: calls.append("mamba_completion_refresh"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -63,4 +76,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "glm5next_indexer_page",
         "kv_group_size",
         "dflash_max_position",
+        "mrope_yarn",
+        "mamba_completion_refresh",
     ]
