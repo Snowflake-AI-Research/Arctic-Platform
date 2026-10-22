@@ -151,6 +151,73 @@ def test_published_expert_names_convert_to_platform_parameters():
     assert converted["model.embed_tokens.weight"].shape == (32, 64)
 
 
+def test_official_fp8_checkpoint_keeps_packed_expert_weights():
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import decode_e8m0_scales_
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import encode_e8m0_scales_
+    from arctic_platform.model.implementations.deepseek_v4.moe import DeepseekV4MoE
+
+    config = _tiny_config()
+    config.moe_intermediate_size = 64
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    scale = torch.ones(8, 2, dtype=torch.float8_e8m0fnu)
+    state = {
+        "layers.1.ffn.experts.0.w1.weight": torch.ones(64, 32, dtype=torch.int8),
+        "layers.1.ffn.experts.1.w1.weight": torch.full((64, 32), 2, dtype=torch.int8),
+        "layers.1.ffn.experts.0.w1.scale": scale.clone(),
+        "layers.1.ffn.experts.1.w1.scale": scale.clone(),
+        "layers.1.attn.wq_a.weight": torch.zeros(32, 64, dtype=torch.float8_e4m3fn),
+        "layers.1.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.float8_e8m0fnu),
+    }
+    converted = apply_hf_to_prime(dict(state), conversion_chain(config))
+    decode_e8m0_scales_(converted)
+    experts = converted["model.layers.1.mlp.experts.w1"]
+    assert experts.dtype == torch.int8
+    assert experts.shape == (2, 64, 32)
+    assert converted["model.layers.1.mlp.experts.w1_scale_inv"].dtype == torch.float32
+    assert converted["model.layers.1.self_attn.q_a_proj.weight"].dtype == torch.float8_e4m3fn
+    assert converted["model.layers.1.self_attn.q_a_proj.weight_scale_inv"].dtype == torch.float32
+
+    encode_e8m0_scales_(converted)
+    assert converted["model.layers.1.mlp.experts.w1_scale_inv"].dtype == torch.float8_e8m0fnu
+
+    moe = DeepseekV4MoE(config, 1)
+    assert moe.experts.mxfp4
+    assert moe.experts.w1.dtype == torch.int8
+    assert moe.experts.w1.shape == (4, 64, 32)
+    assert moe.shared_expert.w1.dtype == torch.float8_e4m3fn
+
+
+def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
+
+    torch.manual_seed(0)
+    experts = Mxfp4GroupedExperts(dim=64, hidden_dim=64, num_experts=2, swiglu_limit=10.0)
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            weight = getattr(experts, name)
+            weight.copy_(torch.randint(-7, 8, weight.shape, dtype=torch.int8))
+            getattr(experts, f"{name}_scale_inv").fill_(1.0)
+    x = torch.randn(4, 64, requires_grad=True)
+    counts = torch.tensor([2, 2], dtype=torch.int32)
+    output = experts(x, counts)
+    reference = _run_experts_for_loop_impl(
+        dequantize_mxfp4(experts.w1, experts.w1_scale_inv),
+        dequantize_mxfp4(experts.w2, experts.w2_scale_inv),
+        dequantize_mxfp4(experts.w3, experts.w3_scale_inv),
+        x.detach().bfloat16(),
+        counts,
+        10.0,
+    )
+    assert torch.allclose(output, reference.float())
+    output.sum().backward()
+    assert x.grad is not None
+    assert experts.w1.grad is None
+
+
 def test_sqrtsoftplus_scores_match_softplus_sqrt():
     if not torch.cuda.is_available():
         pytest.skip("router histc on integer indices is CUDA-only")

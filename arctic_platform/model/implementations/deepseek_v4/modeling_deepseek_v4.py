@@ -22,7 +22,10 @@ from arctic_platform.model.implementations.deepseek_v4.conversion_ops import app
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
 from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
+from arctic_platform.model.implementations.deepseek_v4.dequantize import decode_e8m0_scales_
 from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_state_dict_
+from arctic_platform.model.implementations.deepseek_v4.dequantize import encode_e8m0_scales_
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.deepseek_v4.hyperconnections import (
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
@@ -163,14 +166,21 @@ class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
     def convert_to_prime(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         """Convert a HuggingFace state dict to PrimeRL format in-place.
 
-        Dequantizes the real checkpoint's fp8/MXFP4 weights to `bfloat16` first, on the raw
-        on-disk key names: a no-op for any snapshot that doesn't carry `.scale` siblings
-        (e.g. the plain-`bfloat16` mini test checkpoint).
+        A plain BF16 snapshot is dequantized, which is a no-op when no ``.scale``
+        siblings are present. The official FP8/MXFP4 checkpoint keeps those
+        packed weights and only decodes the e8m0 scales to float32.
         """
-        dequantize_state_dict_(state_dict)
-        return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
+        quantized = fp8_weight_block_size(self.config) is not None
+        if not quantized:
+            dequantize_state_dict_(state_dict)
+        converted = apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
+        if quantized:
+            decode_e8m0_scales_(converted)
+        return converted
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        if fp8_weight_block_size(self.config) is not None:
+            encode_e8m0_scales_(state_dict)
         return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
 
     def init_buffers_post_meta(self) -> None:
