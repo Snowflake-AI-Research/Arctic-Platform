@@ -7,7 +7,7 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 ## Maintained Guides
 
-**Use the shared library and its maintained commands, not a new model-specific launcher.** Start with the [operator guide](../../arctic_platform/correctness/docs/running-tests.doc) for prerequisites, selection and reports. The [code inventory](../../arctic_platform/correctness/docs/code-inventory.md) identifies implementation boundaries and retired experiments.
+**Use the shared library and its maintained commands, not a new model-specific launcher.** Start with the [operator guide](../../arctic_platform/correctness/docs/running-tests.md) for prerequisites, selection and reports. The [code inventory](../../arctic_platform/correctness/docs/code-inventory.md) identifies implementation boundaries and retired experiments.
 
 **Read the [HF reference onboarding guide](../../arctic_platform/correctness/docs/hf-reference-onboarding.md) before changing preparation, compact records, calibration or cached-reference regression.** It defines reference identity, immutable publication, retry compatibility and explicit historical reuse.
 
@@ -15,9 +15,23 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 ## Onboarding And Regression
 
+### Autonomous Failure Recovery
+
+**The operator supplies only the config path and intended operation or check IDs.** Discover the remaining context locally; do not ask the operator to paste commands, collect logs, name report directories, choose internal backend flags, locate reference records or provide environment inventories. If the operation is omitted, use the matching failed attempt to determine whether onboarding or regression was intended; if no attempt exists, inspect the specification and references before choosing onboarding for a new config or regression for prepared inputs. An omitted test selection means the applicable registered checks, not always two.
+
+**Resolve the executing checkout and configuration before reading run evidence.** Check the current Git root, active interpreter and installed `arctic_platform.correctness` location; follow the local config import in `harness/config.py`. Read the supplied config and its imported copy, deriving the config ID through that helper rather than guessing from a directory name. Inspect model source, precision, sequence length, GPU placement, attention implementation, optimizer and LoRA/RL settings. Run `python -m arctic_platform.correctness list` and the relevant command's `--help` for the actual branch's supported checks and options.
+
+**Find reports by configuration identity, not merely by the newest directory.** Inspect `work/reports/`, `work/logs/`, and any `DSS_CORRECTNESS_LOGDIR` override. Read matching `batch.json`, `report.json`, `report.md`, `full.log`, `onboarding.log` and the config's `specs/<config-id>.onboarding.json`; follow their diagnostic, gateway and work-directory paths. Match config ID/path and check IDs, then compare attempt timestamps to identify the relevant failure without borrowing another run's pass. Inspect `work/logs/onboarding-state/<config-id>/` or the override's `onboarding-state/` request/phase manifests to find reusable preparation and original artifact locations. `harness/execution.py` and `onboarding/onboard.py` define these locations if the installed version differs.
+
+**Discover prerequisites and prepared inputs from their recorded identities.** Read `specs/<config-id>.json` and its model/cache settings, plus matching records under `reference_data/<config-id>/<check-id>/` or a recorded `--reference-records-dir`. Inspect `DSS_CORRECTNESS_TMPDIR`, allocation-local hostfile settings, visible CUDA devices and installed dependencies using the command's existing preflight; do not manufacture GPU placement or switch kernels to bypass an error. Inspect Cortex connection variables without printing credentials. Follow the owned-gateway lifecycle and ownership records in `harness/dss_driver.py`; never kill an unrelated or explicitly external service.
+
+**Repair the concrete failure and verify the requested operation through completion.** Use compatible retry state, preserve reviewed gates, run focused controls for code changes and rerun the requested onboarding or regression on eligible authorized hardware. After successful onboarding, run the requested applicable regression checks against its prepared records and inspect every selected arm, exit code, report and owned cleanup. If artifacts were deleted, discover that absence and rebuild only through explicit onboarding, not regression. Missing hardware, unavailable external files or unsupported production APIs must be reported precisely; do not repeatedly request evidence the agent can read or imply access that is unavailable.
+
 **Inspect the registered checks and supplied config before selecting work.** `python -m arctic_platform.correctness list` shows the current branch's checks. P1 registers gradients and optimizer only; the full-suite branch also registers checkpoint, inference, E2E and RL checks. Applicability comes from the config and reviewed specification, not from a successful check on another model.
 
 **Onboarding prepares references; regression only consumes compatible prepared records.** Preserve initial weights or adapter factors, materialized inputs, declared GPU placement, parameter coverage and reviewed gates. A missing or incompatible record is a prerequisite error, never permission to generate a replacement reference during regression or widen tolerance.
+
+**Compact reference records are generated local artifacts, not files to commit.** Keep `reference_data/` Git-ignored and retain its compatible records for subsequent regression. Staging instructions include config and reviewed specifications only; cleanup must not delete references still needed for testing. Demo cleanup is restricted to local checkout subdirectories; allocation scratch is left for job reset.
 
 **The first-two supervised checks support automatic local gateway ownership.** When no Cortex host or base URL is configured, onboarding and regression start the installed upstream DSS service, use the reduced fixture and close their owned gateway. Operators use one command in one terminal, without manually starting another gateway. Explicit service settings remain external and must not be replaced or shut down. This automation does not establish support for later full-model or RL workflows.
 

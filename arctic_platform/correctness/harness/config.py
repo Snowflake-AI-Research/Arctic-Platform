@@ -42,6 +42,8 @@ from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
 
+DEFAULT_REFERENCE_CALIBRATION_RUNS = 5
+
 
 class ReviewedTrainingConfig(TrainingConfig):
     weight_format: Literal["vllm", "hf", "lora"] | None = None
@@ -608,9 +610,57 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
     return training_sub, sub_jobs
 
 
+def _load_cortex_recipe(path: Path, raw: dict) -> LoadedConfig:
+    """Read the service recipe without losing engine fields in a client-schema conversion."""
+    unsupported = set(raw) - {"sub_job_configs"}
+    if unsupported:
+        raise ValueError(f"{path}: unsupported Cortex recipe fields: {sorted(unsupported)}")
+    sub_jobs = raw["sub_job_configs"]
+    if not isinstance(sub_jobs, list) or not sub_jobs:
+        raise ValueError(f"{path}: sub_job_configs must be a non-empty list")
+    roles = set()
+    for sub in sub_jobs:
+        if not isinstance(sub, dict):
+            raise ValueError(f"{path}: each sub_job_configs entry must be an object")
+        role = sub.get("job_type")
+        if not isinstance(role, str) or role not in {"training", "sampling", "log_probability"} or role in roles:
+            raise ValueError(f"{path}: unsupported or duplicate sub-job type: {role!r}")
+        roles.add(role)
+        if not isinstance(sub.get("model_name"), str) or not sub["model_name"].strip():
+            raise ValueError(f"{path}: {role} sub-job requires a non-empty model_name")
+        key = "training_config" if role == "training" else "inference_config"
+        settings = sub.get(key)
+        if not isinstance(settings, dict):
+            raise ValueError(f"{path}: {role} sub-job requires an object {key}")
+        for name in ("n_gpus", "max_seq_len"):
+            value = settings.get(name)
+            if name == "max_seq_len" and name not in settings:
+                continue
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{path}: {role}.{name} must be a positive integer")
+        if role == "training":
+            ReviewedTrainingConfig.model_validate(
+                {
+                    "ds_config": settings.get("ds_config"),
+                    "ds_worker_config": settings,
+                    "weight_format": sub.get("weight_format"),
+                }
+            )
+        else:
+            ReviewedSamplingConfig.model_validate({"weight_format": sub.get("weight_format")})
+    if "training" not in roles:
+        raise ValueError(f"{path}: correctness requires exactly one training sub-job")
+    training = next(sub for sub in sub_jobs if sub["job_type"] == "training")
+    return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs)
+
+
 def load_config(path: str | Path) -> LoadedConfig:
     path = Path(path)
     raw = normalize_ints(json.loads(path.read_text()))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: configuration must be a JSON object")
+    if "sub_job_configs" in raw:
+        return _load_cortex_recipe(path, raw)
     backend = raw.get("backend")
     if isinstance(backend, dict) and backend.get("type") == "onprem" and backend.get("protocol") == "ray":
         # Retained reviewed recipes predate the public client's single on-prem protocol.

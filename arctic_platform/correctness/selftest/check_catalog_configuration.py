@@ -55,6 +55,158 @@ from .helpers import _config_factory_native_config
 # Applicable tests.
 
 
+def _cortex_recipe():
+    return {
+        "sub_job_configs": [
+            {
+                "job_type": "training",
+                "model_name": "Qwen/Qwen3.8-Flash-Next",
+                "dtype": "bfloat16",
+                "seed": 42,
+                "weight_format": "vllm",
+                "training_config": {
+                    "n_gpus": 8,
+                    "max_seq_len": 262144,
+                    "train_batch_size": 1,
+                    "gradient_clipping": 1.0,
+                    "model_provider": "prime_rl",
+                    "attn_implementation": "qsa_flex",
+                    "sp_size": 8,
+                    "ep_size": 8,
+                    "ep_group_layout": "auto",
+                    "activation_checkpointing": True,
+                    "ac_config": {"mode": "full", "offload_config": {"enabled": True}},
+                    "mb_spec": {"max_tokens_per_mb": 262144},
+                    "optimizer": {"name": "AdamW", "lr": 2e-5, "betas": [0.9, 0.999], "eps": 1e-8},
+                    "ds_config": {
+                        "train_batch_size": 1,
+                        "train_micro_batch_size_per_gpu": 1,
+                        "gradient_accumulation_steps": 1,
+                        "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+                        "bf16": {
+                            "enabled": True,
+                            "bf16_master_weights_and_grads": True,
+                            "bf16_optimizer_states": True,
+                        },
+                    },
+                },
+            }
+        ]
+    }
+
+
+def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_path):
+    from arctic_platform.client.config import CortexConfig
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.hosted import training_client_config
+
+    raw = _cortex_recipe()
+    source = tmp_path / "external" / "qwen38_flash_next.json"
+    source.parent.mkdir()
+    source.write_text(json.dumps(raw, indent=2) + "\n")
+    imported = local_config_path(source, tmp_path / "configs")
+    assert imported.read_bytes() == source.read_bytes()
+    assert local_config_path(source, tmp_path / "configs") == imported
+    cfg = load_config(imported)
+    assert cfg.sub_jobs == raw["sub_job_configs"]
+    assert cfg.training == raw["sub_job_configs"][0]["training_config"]
+    assert (cfg.n_gpus, cfg.sp_size, cfg.dp_size, cfg.max_seq_len) == (8, 8, 1, 262144)
+    assert not cfg.is_rl
+    assert cfg.attention_implementation == "qsa_flex"
+    assert cfg.optimizer_dtype == "bfloat16"
+    assert config_checksum(cfg) == config_checksum(load_config(source))
+    wire = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1")).to_cortex()[0]
+    assert wire["weight_format"] == "vllm"
+    for key in ("sp_size", "ep_size", "ep_group_layout", "ac_config", "optimizer"):
+        assert wire["training_config"][key] == cfg.training[key]
+    for key, value in cfg.training["ds_config"].items():
+        assert wire["training_config"]["ds_config"][key] == value
+    assert wire["training_config"]["mb_spec"]["max_tokens_per_mb"] == correctness_microbatch_tokens(262144)
+    assert cfg.training["mb_spec"]["max_tokens_per_mb"] == 262144
+    wider = cfg.at_gpu_width(16)
+    assert wider.n_gpus == 16 and wider.sp_size == 8
+    assert wider.training["ds_config"]["train_batch_size"] == 2
+    assert config_checksum(wider) != config_checksum(cfg)
+    assert cfg.sub_jobs == raw["sub_job_configs"]
+
+
+def test_cortex_recipe_sampling_preserves_rl_classification(tmp_path):
+    raw = _cortex_recipe()
+    raw["sub_job_configs"].append(
+        {
+            "job_type": "sampling",
+            "model_name": "Qwen/Qwen3.8-Flash-Next",
+            "inference_config": {"n_gpus": 8, "max_seq_len": 262144, "vllm_config": {"tensor_parallel_size": 8}},
+        }
+    )
+    path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(raw))
+    cfg = load_config(path)
+    assert cfg.is_rl
+    assert cfg.sub_jobs == raw["sub_job_configs"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "empty",
+        "nonlist",
+        "nonobject",
+        "no_training",
+        "duplicate",
+        "bad_role",
+        "no_model",
+        "no_settings",
+        "bad_gpu",
+        "bad_sequence",
+        "null_sequence",
+        "mixed_schema",
+        "bad_peft",
+        "bad_format",
+    ],
+)
+def test_cortex_recipe_invalid_inputs_fail_before_import(tmp_path, damage):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _cortex_recipe()
+    sub = raw["sub_job_configs"][0]
+    if damage == "empty":
+        raw["sub_job_configs"] = []
+    elif damage == "nonlist":
+        raw["sub_job_configs"] = {}
+    elif damage == "nonobject":
+        raw["sub_job_configs"] = [None]
+    elif damage == "no_training":
+        sub["job_type"] = "sampling"
+        sub["inference_config"] = sub.pop("training_config")
+    elif damage == "duplicate":
+        raw["sub_job_configs"].append(sub)
+    elif damage == "bad_role":
+        sub["job_type"] = "unknown"
+    elif damage == "no_model":
+        sub.pop("model_name")
+    elif damage == "no_settings":
+        sub.pop("training_config")
+    elif damage == "bad_gpu":
+        sub["training_config"]["n_gpus"] = True
+    elif damage == "bad_sequence":
+        sub["training_config"]["max_seq_len"] = 0
+    elif damage == "null_sequence":
+        sub["training_config"]["max_seq_len"] = None
+    elif damage == "mixed_schema":
+        raw["model_name"] = sub["model_name"]
+    elif damage == "bad_peft":
+        sub["training_config"]["peft_config"] = {}
+    else:
+        sub["weight_format"] = "invalid"
+    source = tmp_path / "recipe.json"
+    source.write_text(json.dumps(raw))
+    destination = tmp_path / "configs"
+    with pytest.raises(ValueError):
+        local_config_path(source, destination)
+    assert not destination.exists()
+
+
 def _applicable_tests_spec(applicable):
     return ConfigSpec(
         config_id="unit",

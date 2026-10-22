@@ -178,6 +178,13 @@ def duration(seconds: float) -> str:
     return f"{int(minutes)}m{rest:04.1f}s"
 
 
+def total_duration(seconds: float) -> str:
+    """Final wall-clock time, rounded upward to a whole second."""
+    hours, remainder = divmod(math.ceil(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def runtime_table(timing, wall_seconds: float) -> str:
     """Per-case time for each engine, so a case that dominates the run is visible without a profiler."""
     names = list(timing)

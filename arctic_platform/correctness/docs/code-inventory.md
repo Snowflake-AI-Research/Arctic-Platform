@@ -1,6 +1,6 @@
 # Maintained Correctness Code
 
-**Operators use a few stable commands backed by the shared library.** Start with [running-tests.doc](running-tests.doc). Commands run on an already-prepared allocation; the library does not allocate machines or install prerequisites.
+**Operators use a few stable commands backed by the shared library.** Start with [running-tests.md](running-tests.md). Commands run on an already-prepared allocation; the library does not allocate machines or install prerequisites.
 
 ## Active Layout
 

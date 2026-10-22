@@ -42,14 +42,13 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
+from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-# Sixteen reference executions over an eight-GPU node: two waves, so more samples cost the same wall
-# clock as two sequential runs.
-CALIBRATION_RUNS = 16
+CALIBRATION_RUNS = DEFAULT_REFERENCE_CALIBRATION_RUNS
 # How far above the run-to-run variation the calibrated gate sits. Sixteen calibration runs measure the
 # tail imperfectly: on the CPU-offloaded Qwen3.8-27B config a factor of two produced a 2e-03 gate that the
 # validation run then exceeded at 2.929e-03, so a factor that only just covers the observed spread does not
@@ -62,7 +61,8 @@ OOM_EXIT = 42
 
 
 def _stage(phase: str, name: str, detail: str = "") -> None:
-    print(f"\n*** {phase.title()}: {name.title()} ***", flush=True)
+    marker = "###" if phase.split()[0].casefold() == "onboarding" else "***"
+    print(f"\n{marker} {phase.title()}: {name.title()} {marker}", flush=True)
     if detail:
         print(detail, flush=True)
     print(flush=True)
@@ -89,7 +89,7 @@ class _ConsoleLog:
 
 def logged_run(args: argparse.Namespace) -> int:
     """Retain diagnostics even when prerequisites or specification loading fail."""
-    from arctic_platform.correctness.harness.report import duration
+    from arctic_platform.correctness.harness.report import total_duration
 
     if getattr(args, "probe_layers", None) is not None:
         return run(args)
@@ -127,7 +127,7 @@ def logged_run(args: argparse.Namespace) -> int:
                         )
                         return 1
                     finally:
-                        print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)
+                        print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)
             finally:
                 logger.handlers = previous_handlers
                 handler.close()
@@ -225,8 +225,10 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                 ast.dump(ast.parse(source).body[0])
                 for source in (
                     "from arctic_platform.correctness.harness.report import duration",
+                    "from arctic_platform.correctness.harness.report import total_duration",
                     "started = time.monotonic()",
                     'print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)',
+                    'print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)',
                 )
             }
             for function in tree.body:
@@ -1762,7 +1764,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     runs = args.reference_calibration_runs
     workers = args.reference_calibration_workers
     if runs != CALIBRATION_RUNS or not 1 <= workers <= 8:
-        raise ValueError("local optimizer norm onboarding requires 16 repeats per arm and 1 to 8 HF workers")
+        raise ValueError(
+            f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm and 1 to 8 HF workers"
+        )
     records_root = require_git_records_dir(args.reference_records_dir)
     records_root.mkdir(parents=True, exist_ok=True)
     model_config = AutoConfig.from_pretrained(args.optimizer_model_path, trust_remote_code=True)
@@ -1868,7 +1872,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 or provenance.get("multiplier") != GATE_SAFETY_FACTOR
                 or provenance.get("minimum_gate") != 0.001
             ):
-                raise ValueError("optimizer norm gate requires fresh criterion-specific 16-repeat provenance")
+                raise ValueError(f"optimizer norm gate requires fresh criterion-specific {runs}-repeat provenance")
             spread = provenance.get("maximum_pairwise_norm_delta")
             if type(spread) not in {float, int} or not math.isfinite(spread) or spread < 0:
                 raise ValueError("optimizer norm calibration spread must be finite and nonnegative")
@@ -2233,7 +2237,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path(__file__).resolve().parents[1] / "reference_data",
     )
-    parser.add_argument("--reference-calibration-runs", type=int, default=16)
+    parser.add_argument("--reference-calibration-runs", type=int, default=CALIBRATION_RUNS)
     parser.add_argument(
         "--peft-adapter",
         type=Path,

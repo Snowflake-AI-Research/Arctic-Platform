@@ -1,12 +1,12 @@
 # HF Reference Onboarding (Agent Guide)
 
-**This guide describes maintained reference preparation and regression, not a particular fleet run.** Start with the [operator guide](running-tests.doc) for setup and copyable commands. The [documentation index](../../../docs/correctness.md) lists the maintained guides. Local run history and numerical results belong in the uncommitted `correctness-progress.md` at the repository root, not in installation instructions.
+**This guide describes maintained reference preparation and regression, not a particular fleet run.** Start with the [operator guide](running-tests.md) for setup and copyable commands. The [documentation index](../../../docs/correctness.md) lists the maintained guides. Local run history and numerical results belong in the uncommitted `correctness-progress.md` at the repository root, not in installation instructions.
 
 ## Prepare Once
 
 ### Automatic Local Validation And Retry
 
-**A first-two config-only onboarding command manages its local Cortex-training target.** With no Cortex host or base URL configured, the harness selects the reduced fixture, starts the installed upstream DSS gateway for validation and closes that owned process afterwards. It does not replace an explicitly configured service. See the [operator guide](running-tests.doc#onboarding) for environment prerequisites.
+**A first-two config-only onboarding command manages its local Cortex-training target.** With no Cortex host or base URL configured, the harness selects the reduced fixture, starts the installed upstream DSS gateway for validation and closes that owned process afterwards. It does not replace an explicitly configured service. See the [operator guide](running-tests.md#onboarding) for environment prerequisites.
 
 **Repeating a failed command resumes verified completed phases.** Recovery records under `./work/logs/onboarding-state/` bind the configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate affected phases and successors; failed validation is retried without repeating compatible preparation. Logs and reports live in a unique `./work/logs/onboarding-*/` directory, while models and tensor scratch remain on fast storage.
 
@@ -14,13 +14,13 @@
 
 ### Automatic LoRA Initialization
 
-**First-two reference preparation detects LoRA settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.doc#lora-without-adapter-inputs) distinguishes reference generation from target support.
+**First-two reference preparation detects LoRA settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
 
-**Compact records bind generated values, not filesystem paths.** The initialization identity contains the recipe, exact dependency versions, topology, tensor shapes/dtypes and content hashes. Regression reconstructs those factors and requires the original reviewed reference identity; it never measures HF again to accommodate changed factors. Store only compact records/config/specification in Git, never adapter, model or optimizer tensors.
+**Compact records bind generated values, not filesystem paths.** The initialization identity contains the recipe, exact dependency versions, topology, tensor shapes/dtypes and content hashes. Regression reconstructs those factors and requires the original reviewed reference identity; it never measures HF again to accommodate changed factors. Stage the config and reviewed specification only; compact measurements remain local and Git-ignored, while adapter, model and optimizer tensors stay on fast storage.
 
 **The retained internal Ray adapter transport is not a Cortex-training loading route.** That integration transfers verified adapter bytes through the allocation's object store, rather than assuming `/data-fast` is shared. Model weights and installed code still require the runtime's supported per-node distribution. Optional `--peft-adapter` overrides automatic generation for reference preparation. Generation supports dense `target_modules` LoRA with upstream default initialization; unsupported expert-parameter layouts and advanced initializers fail explicitly.
 
-**For a new model, give onboarding only its native config.** The complete example in the [operator guide](running-tests.doc#setup) resolves weights and tokenizer through Hugging Face's `/checkpoint/huggingface` cache, creates a native config and runs onboarding. The harness selects applicable registered checks, prepares reduced fixtures for the first two checks, calibrates gates, publishes individual and combined references, and validates the targets. P1 selects only its two registered checks; the full branch also selects compatible later checks, whose target prerequisites still apply.
+**For a new model, give onboarding only its config file.** Both native client configs and existing Cortex-training recipe JSON with `sub_job_configs` are accepted; pass either file directly with `--config`, without converting or flattening the recipe. The complete example in the [operator guide](running-tests.md#setup) resolves weights and tokenizer through Hugging Face's `/checkpoint/huggingface` cache, creates a native config and runs onboarding. The harness selects applicable registered checks, prepares reduced fixtures for the first two checks, calibrates gates, publishes individual and combined references, and validates the targets. P1 selects only its two registered checks; the full branch also selects compatible later checks, whose target prerequisites still apply.
 
 ```bash
 python -m arctic_platform.correctness onboard \
@@ -37,7 +37,7 @@ python -m arctic_platform.correctness onboard \
 - `single-step-optimizer`: step-one Adam first-moment, second-moment, and update-residual L2 norms, with canonical parameter names and shapes.
 - `e2e-sft-train-validate`: 100 training losses and gradient norms, optimizer-step count, held-out validation cross-entropy, and scored-answer-token count.
 
-**Records default to the locally retained, Git-ignored location `arctic_platform/correctness/reference_data`.** Override the location with `--reference-records-dir` on both onboarding and regression; publication requires a directory inside the checkout, not necessarily tracked files. [reference_records.py](../harness/reference_records.py) stores bounded JSON at `<config-id>/<check-id>/<workload-identity-sha256>.json`, with a measurement checksum. The workload identity binds the config, reference sources and dependency versions, model asset contents, initialization, input tensors, and check-specific options rather than machine-specific cache roots. Publication is immutable: conflicting measurements cannot silently replace an existing record.
+**Compact records are generated local artifacts, not files to commit.** They default to the locally retained, Git-ignored location `arctic_platform/correctness/reference_data`. Retain them for later regression; regression cannot regenerate missing HF measurements. Override the location with `--reference-records-dir` on both onboarding and regression; publication requires a directory inside the checkout, not Git tracking. [reference_records.py](../harness/reference_records.py) stores bounded JSON at `<config-id>/<check-id>/<workload-identity-sha256>.json`, with a measurement checksum. The workload identity binds the config, reference sources and dependency versions, model asset contents, initialization, input tensors, and check-specific options rather than machine-specific cache roots. Publication is immutable: conflicting measurements cannot silently replace an existing record.
 
 **New single-step measurements also record the implementation and configuration used by HF.** The [reference engine](../reference/hf_single_gpu.py) captures the loaded model and decoder class identities, Python `forward` code digests, source-file content hashes, and effective configurations, including the attention backend that HF configuration serialization can omit. The engine compares these observations before and after execution and rejects a changed implementation, source file or configuration. The [reference CLI](../reference/__main__.py) retains these observations in `reference_execution`; compact-record publication and loading preserve that field without rerunning HF. This limited observation does not capture every transitive kernel or prove native target execution. Historical records without this field remain historical: neither regression nor this change reconstructs their original execution evidence.
 
@@ -51,7 +51,7 @@ python -m arctic_platform.correctness onboard \
 python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references --test-id single-step-optimizer \
-  --reference-calibration-runs 16 --reference-calibration-workers 8
+  --reference-calibration-runs 5 --reference-calibration-workers 5
 
 python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
@@ -66,12 +66,12 @@ python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer \
-  --reference-calibration-runs 16 --reference-calibration-workers 8
+  --reference-calibration-runs 5 --reference-calibration-workers 5
 ```
 
 **Advanced full-model mode is separate from config-only reduced-fixture onboarding.** [The original-model validator](../models/original.py) defines the accepted model/config pairs, source revisions, configuration hashes and indexed tensor layouts. It currently lists Qwen3-8B, the B200 Qwen3.8-27B config and the reviewed Flash-Next config; metadata inclusion does not establish a compatible sampling runtime or numerical pass. This mode requires `HF_HUB_OFFLINE=1`, `DSS_ALLOW_REMOTE_MODELS=1` and `HF_HUB_CACHE` pointing to the populated cache under `/data-fast`. Indexed models must match complete tensor-name/dtype/shape headers. Header validation does not read or hash tensor payloads.
 
-**`--local-gateway-full-model` is restricted to E2E and inference regression; reference preparation remains E2E-only.** The reference-free inference check compares training against sampling and does not need an HF record. Source admission alone does not supply a missing E2E record or compatible sampling runtime. These advanced targets require an already running, externally managed gateway supplied through `--base-url`; the automatic gateway lifecycle in the [operator guide](running-tests.doc#running) covers only the first two supervised-reference checks.
+**`--local-gateway-full-model` is restricted to E2E and inference regression; reference preparation remains E2E-only.** The reference-free inference check compares training against sampling and does not need an HF record. Source admission alone does not supply a missing E2E record or compatible sampling runtime. These advanced targets require an already running, externally managed gateway supplied through `--base-url`; the automatic gateway lifecycle in the [operator guide](running-tests.md#running) covers only the first two supervised-reference checks.
 
 ## Calibrate Optimizer Norms
 
@@ -81,7 +81,9 @@ python -m arctic_platform.correctness onboard \
 
 **Equal norms can hide sign, permutation, or directional errors.** `abs(||target||2 - ||reference||2)` is weaker than the full-tensor difference `||target - reference||2`; a norm pass does not establish elementwise optimizer-state equivalence.
 
-**A new optimizer norm record needs fresh, criterion-specific onboarding calibration.** The requested workflow uses 16 nondeterministic single-GPU HF repeats per arm, spread over 8 workers, in addition to the deterministic baseline capture. The current CLI defaults are 16 repeats and 1 worker, so request 8 workers explicitly and provide 8 available GPUs. The [runner](../harness/runner.py) measures the largest absolute scalar-norm difference over all repeat pairs, multiplies that spread by 4, rounds upward to a `1e-3` increment, and applies a minimum absolute gate of `1e-3`. The record retains the gate and calibration provenance. No legacy full-tensor tolerance is inherited, and regression neither recalibrates nor widens this gate.
+**A new optimizer norm record needs fresh, criterion-specific onboarding calibration.** Config-only onboarding uses five nondeterministic single-GPU HF repeats per arm, in addition to the deterministic baseline capture, for tiny and real models alike. The CLI defaults to one worker; the examples above explicitly use five workers and require five available GPUs. The [runner](../harness/runner.py) measures the largest absolute scalar-norm difference over all repeat pairs, multiplies that spread by 4, rounds upward to a `1e-3` increment, and applies a minimum absolute gate of `1e-3`. The record retains the gate and actual calibration run count. Existing records retain their original provenance, including historical 16-run measurements. No legacy full-tensor tolerance is inherited, and regression neither recalibrates nor widens this gate.
+
+**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Five repeats plus a deterministic baseline for each of GAS1 and GAS4 means twelve processes with the default one worker, not five processes for the entire optimizer check. The progress bar measures complete reference runs, including this overhead; its ETA appears after a completion.
 
 ## Run Regression
 

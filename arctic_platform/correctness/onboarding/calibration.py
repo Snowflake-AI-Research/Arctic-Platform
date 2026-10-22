@@ -23,6 +23,7 @@ from pathlib import Path
 
 
 def render(args: argparse.Namespace) -> str:
+    from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
 
@@ -40,7 +41,7 @@ def render(args: argparse.Namespace) -> str:
     peft_config = training.get("peft_config")
     peft_adapter_path = getattr(args, "peft_adapter_path", None)
     template = (
-        "'Measure ten-run gradient-norm repeatability of the fixed reference.'\n\nfrom __future__ import"
+        "'Measure gradient-norm repeatability of the fixed reference.'\n\nfrom __future__ import"
         " annotations\n\nimport hashlib\nimport importlib.metadata\nimport json\nimport os\nimport platform\nimport"
         " time\nfrom decimal import Decimal, ROUND_CEILING\nimport sys\nfrom concurrent.futures import"
         " ThreadPoolExecutor, as_completed\nfrom pathlib import Path\n\nimport torch\nfrom transformers import"
@@ -52,7 +53,7 @@ def render(args: argparse.Namespace) -> str:
         " correctness_workdir, require_data_fast_path\n\nSOURCE_PATH = __SOURCE__\nLAYERS = __LAYERS__\nMODEL_PATH ="
         " __MODEL__\nOUTPUT = Path(__OUTPUT__)\nWORK_DIR = __WORK_DIR__\nSPEC_PATH ="
         " Path(__SPEC_PATH__)\nTEST_ID = __TEST_ID__\nCONFIG_CHECKSUM ="
-        " __CONFIG_CHECKSUM__\nRUNS = 16\nTOKENS = __TOKENS__\nREFERENCE_TOKEN_BUDGET ="
+        " __CONFIG_CHECKSUM__\nRUNS = __RUNS__\nTOKENS = __TOKENS__\nREFERENCE_TOKEN_BUDGET ="
         ' __REFERENCE_TOKEN_BUDGET__\nGATE_QUANTUM = Decimal("0.001")\n# How far above the run-to-run variation the'
         " calibrated gate sits. Sixteen calibration runs measure the\n# tail imperfectly: on the CPU-offloaded"
         " Qwen3.8-27B config a factor of two produced a 2e-03 gate that the\n# validation run then exceeded at"
@@ -145,6 +146,7 @@ def render(args: argparse.Namespace) -> str:
         "__SPEC_PATH__": repr(str(args.test_spec)),
         "__TEST_ID__": repr(args.test_id),
         "__CONFIG_CHECKSUM__": repr(frozen_config_checksum),
+        "__RUNS__": str(DEFAULT_REFERENCE_CALIBRATION_RUNS),
         "__TOKENS__": str(tokens),
         "__REFERENCE_TOKEN_BUDGET__": str(args.reference_token_budget),
         "__ATTENTION__": repr(attention),

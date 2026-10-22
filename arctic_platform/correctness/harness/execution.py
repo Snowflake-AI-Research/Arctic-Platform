@@ -264,7 +264,9 @@ def _finish(
     print(f"report: {out / 'report.md'}")
     for r in failed:
         print(f"  FAIL {r.config_id} {r.test_id} {r.arm or ''}: {r.summary}")
-    print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
+    print(
+        f"total run time across {configs} config(s): {console.total_duration(time.monotonic() - started)}", flush=True
+    )
     return 0 if passed and not failed else 1
 
 
@@ -879,6 +881,7 @@ def run_batch(args, *, selected, executor=None):
             else:
                 groups.append([case])
     print(f"Selected {len(selected)} configuration/test pair(s); running sequentially.", flush=True)
+    print("Selected tests: " + ", ".join(dict.fromkeys(case.test_id for case in selected)), flush=True)
     with (out / "full.log").open("w", encoding="utf-8") as log:
         for index, group in enumerate(groups):
             group_results = []
@@ -971,7 +974,7 @@ def run_batch(args, *, selected, executor=None):
     print(f"Report: {out / 'report.md'}; complete logs: {out / 'full.log'}", flush=True)
     if any(case["status"] in {"blocked", "error"} for case in cases):
         print("Action required: see the reason in batch.json and the full traceback in full.log.", flush=True)
-    print(f"Total run time: {console.duration(time.monotonic() - started)}", flush=True)
+    print(f"Total run time: {console.total_duration(time.monotonic() - started)}", flush=True)
     return BatchResult(results, out, aggregate_exit_code(results), elapsed, stopped, cases)
 
 

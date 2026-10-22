@@ -48,7 +48,9 @@ python -m arctic_platform.correctness list
 **Resolve the model through the existing Hugging Face cache and write a complete native training config.** `snapshot_download()` reuses cached files and downloads missing files into `/checkpoint/huggingface/hub`, the Hub subdirectory of `/checkpoint/huggingface`. No commit hash is required: Hugging Face resolves the model ID's default revision. All subsequent commands run from the checkout root. The config uses the returned snapshot path and declares the GPU count, precision, attention implementation and optimizer.
 
 ```bash
-mkdir -p ./work/configs ./work/reports
+mkdir -p ./work/configs ./work/reports ./work/logs
+export DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
+export DSS_CORRECTNESS_LOGDIR="$(mktemp -d "$PWD/work/logs/correctness-demo.XXXXXXXX")"
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 python - <<'PY'
@@ -117,7 +119,7 @@ PY
 
 **Automatically managed local Cortex-training onboarding checks the target allocation too.** When the configured GPU count exceeds the local node's visible GPUs, onboarding checks every host using the existing `ds_ssh` transport and invoking Python executable. It requires every host to respond, checks GPU counts against the hostfile slots and rejects differing target dependency versions. Set `ARCTIC_HOSTFILE` or `DSS_GATEWAY_HOSTFILE` to the same-job hostfile, or use the allocation's `/job/hostfile`. Without a hostfile, a single-node gateway gets an automatically generated local hostfile. Reference dependencies and the original checkpoint are checked on the reference node; target dependencies and writable scratch/cache locations are checked on each host without assuming `/data-fast` is shared. An explicitly supplied gateway is not owned or inspected by this command. These checks do not predict model memory use or prove successful kernel execution; sizing and validation still follow.
 
-**Give onboarding the config; it selects all applicable checks automatically.** The harness derives the checkpoint from `model_name`, prepares fixture prerequisites, calibrates gates, publishes references for individual checks and the combined reference selection, and validates each target. The quick demo uses a four-layer fixture, 128-token sequences and one GPU, keeping all 16 nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. It does not establish full-model, distributed-training or maximum-sequence-length correctness. The full-suite branch also selects applicable later checks; P1 registers only the first two.
+**Give onboarding the config; it selects all applicable checks automatically.** The harness derives the checkpoint from `model_name`, prepares fixture prerequisites, calibrates gates, publishes references for individual checks and the combined reference selection, and validates each target. The quick demo uses a four-layer fixture, 128-token sequences and one GPU, with five nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. Five runs is also the default for real-model onboarding. It does not establish full-model, distributed-training or maximum-sequence-length correctness. The full-suite branch also selects applicable later checks; P1 registers only the first two.
 
 ```bash
 python -m arctic_platform.correctness onboard \
@@ -126,7 +128,7 @@ python -m arctic_platform.correctness onboard \
 
 **The first two reduced-fixture checks manage local validation automatically.** Without a configured Cortex host or base URL, onboarding selects the local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for validation and closes its owned gateway afterwards. No manual fixture flag or gateway command is needed. An explicitly supplied loopback gateway is left running; a hosted account endpoint cannot accept this reduced-fixture workflow. This automation does not add target capabilities for later checks.
 
-**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `DSS_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing and `***` prefixes. Queued checks are numbered, for example `*** Onboarding 1/2: Single Step Grads ***` and `*** Onboarding 2/2: Single Step Optimizer ***`; prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
+**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `DSS_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing and `***` prefixes. Queued checks are numbered, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
 
 **Repeat the same command after resolving a reported failure.** Recovery records in `./work/logs/onboarding-state/` reuse completed phases only when configuration, options, source, code, dependencies and retained artifacts match. Missing or changed artifacts rebuild the affected phase and its successors. Failed validation is retried, not counted as complete; compatible sizing and calibration do not repeat. Recycling a node can remove temporary fixtures and require rebuilding them, even though the diagnostic logs remain.
 
@@ -136,7 +138,11 @@ python -m arctic_platform.correctness onboard \
 
 **External configs are imported into this checkout before onboarding or running.** The harness copies the supplied `.json` or `.config` file, byte for byte, into `arctic_platform/correctness/configs/`, then uses that local copy for configuration identity, specifications and execution. An identical existing copy is reused; different contents under the same local filename are rejected without overwriting the existing recipe. The original external file is no longer needed after import. The copy is not automatically committed.
 
+**Existing Cortex-training recipe JSON can be onboarded without converting it to the native client schema.** Use `onboard --config ../cortex-training/recipes/sft/configs/qwen38_flash_next.json`, or an absolute path to your recipe. The loader accepts `sub_job_configs`, preserves the imported bytes and engine settings, and requires exactly one training sub-job. Training plus sampling remains an RL configuration, not supervised training. The first-two checks still select a reduced fixture and apply their existing correctness token cap; acceptance by the loader does not establish full-model runtime support.
+
 ## Running
+
+**Regression names the selected checks before running them.** The unflagged tiny demo prints `Selected tests: single-step-grads, single-step-optimizer` beneath the selected-pair count.
 
 **Give running the config; it selects all appropriate registered checks automatically.** The full branch includes later checks, while P1 can select only its two registered checks. Workload mode and the reviewed specification determine applicability. Regression never generates missing references or widens reviewed tolerances.
 
@@ -274,7 +280,7 @@ python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer \
-  --reference-calibration-runs 16 --reference-calibration-workers 8
+  --reference-calibration-runs 5 --reference-calibration-workers 5
 ```
 
 The calibration example needs eight available reference GPUs. Calibration establishes an optimizer-norm gate; it is not a target pass. For detailed reference identity, original-model admission, and calibration requirements, see [HF reference onboarding](hf-reference-onboarding.md). Changing a specification or reference to hide a mismatch is not a valid remedy.
@@ -283,11 +289,11 @@ The calibration example needs eight available reference GPUs. Calibration establ
 
 ## Read Results
 
-**The terminal prints one short result row per selected pair and the report directory, then ends with total wall-clock runtime.** The final runtime line follows any error guidance and includes gateway startup, execution, owned shutdown and report writing. Detailed arm and placement results are saved in `report.md` and the report's JSON file. `batch.json` records each selected pair, its reason, counts, elapsed time, and whether the batch stopped for safety. `full.log` retains detailed execution output and full Python tracebacks; individual execution groups also have reports under `cases/`.
+**The terminal prints one short result row per selected pair and the report directory, then ends with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format.** The final runtime line follows any error guidance and includes gateway startup, execution, owned shutdown and report writing. Detailed arm and placement results are saved in `report.md` and the report's JSON file. `batch.json` records each selected pair, its reason, counts, elapsed time, and whether the batch stopped for safety. `full.log` retains detailed execution output and full Python tracebacks; individual execution groups also have reports under `cases/`.
 
 **HF preparation also reports each worker's progress and complete subprocess logs.** Start and completion or failure messages identify the arm, run and device, with elapsed time. During onboarding, the console prints each worker's stdout, stderr and exit-code files under the attempt's `./work/logs/onboarding-*/hf-reference-*/` directory, including successful workers. These files are separate from compact reference records and tensor scratch. Output remains captured until the subprocess exits; a start message alone is not evidence of continuing computation.
 
-**Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts the sixteen nondeterministic HF runs and updates its elapsed time and estimated time remaining after each completed run. Onboarding ends with its total wall-clock runtime in both the terminal and `onboarding.log`, including when onboarding fails.
+**Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts the five nondeterministic HF runs and updates elapsed time and ETA after each completed run. Onboarding ends with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format in the terminal and `onboarding.log`, including when onboarding fails.
 
 | Status | Meaning |
 | --- | --- |
@@ -322,3 +328,57 @@ python -m arctic_platform.correctness.diagnostics run <diagnostic-id> --help
 Diagnostics have their own resource requirements and are not substitutes for the reviewed regression tests.
 
 **This guide is static.** Onboarding and test execution never append results, status, receipts, or logs here. Run artifacts belong in the selected report directory.
+
+## When A Step Fails
+
+**Give the coding agent only the config path and the operation you intended.** If any manual step fails, ask:
+
+```text
+Use skills/correctness/SKILL.md to fix onboarding for
+./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
+Discover the environment, reports, logs and prepared artifacts yourself.
+```
+
+For a regression-only failure, say "run both checks" or name the desired check IDs with the config path. The skill discovers the matching command, reports, logs, retry state, model assets and references without asking you to collect them. Keep compatible prepared references and reviewed tolerances intact; do not widen a gate to make a failing comparison pass.
+
+## Add To Repo
+
+**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The harness imports the config into `configs/`; `specs/` contains the reviewed gates and onboarding summary. Those directories are ignored by default on P1, so staging them deliberately requires `-f`. Review all contents of `configs/` and `specs/` before adding those directories, especially in a checkout with other local recipes.
+
+```bash
+git add -f -- \
+  arctic_platform/correctness/configs/ \
+  arctic_platform/correctness/specs/
+git diff --cached --stat
+```
+
+**Do not stage `reference_data/`, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records in `reference_data/` are generated local artifacts, not files to commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
+
+## Cleanup
+
+**Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
+
+```bash
+rm -f -- ./work/configs/tiny-qwen3-129m-one-h200.json
+```
+
+**Once you no longer need the diagnostic evidence, also remove this demo's reports and retry state.** Keep them while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. This does not delete reusable regression inputs or other runs' log directories.
+
+```bash
+case "${DSS_CORRECTNESS_LOGDIR:-}" in
+  "$PWD"/work/logs/correctness-demo.*)
+    rm -rf -- "$DSS_CORRECTNESS_LOGDIR"
+    unset DSS_CORRECTNESS_LOGDIR
+    ;;
+  *) printf '%s\n' "No demo diagnostic directory selected; nothing removed." ;;
+esac
+rm -rf -- ./work/reports/both
+```
+
+**Use the retained imported config for future runs after cleanup.**
+
+```bash
+python -m arctic_platform.correctness run \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
+  --out ./work/reports/both
+```

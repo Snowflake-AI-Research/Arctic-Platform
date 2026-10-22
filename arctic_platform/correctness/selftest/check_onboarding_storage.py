@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
 import sys
 from decimal import ROUND_CEILING
 from decimal import Decimal
@@ -1098,7 +1099,7 @@ def test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_
     assert keywords["prepare_references"] is True
     assert keywords["select"] == [test_id]
     assert keywords["vocab_size"] == 128
-    assert keywords["reference_calibration_runs"] == 16
+    assert keywords["reference_calibration_runs"] == 5
     assert keywords["reference_calibration_workers"] == 1
     assert keywords["client_backend"].base_url == "http://127.0.0.1:1"
     assert keywords["reference_records_dir"] == reference_records.DEFAULT_RECORDS_DIR
@@ -1445,7 +1446,7 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
 
     calls = _rendered_calibration_workers
-    assert len(calls) == 16
+    assert len(calls) == 5
     batch_paths = {batch_path for batch_path, output in calls}
     assert len(batch_paths) == 1
     batch_path = batch_paths.pop()
@@ -1457,10 +1458,10 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert all(output.parent == diagnostics / "calibration-runs" for batch_path, output in calls)
     assert not list(diagnostics.rglob("*.pt"))
     payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["configuration"]["runs"] == 16
+    assert payload["configuration"]["runs"] == 5
     assert payload["tolerance"]["selected_gate"] == 0.001
     spec = json.loads(namespace["SPEC_PATH"].read_text())
-    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 16
+    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 5
     assert spec["test_tolerances"]["single-step-grads"]["worst_tensor"] == "model.weight"
     assert payload["tolerance"]["raw_max_same_tensor_range"] == 0.0
 
@@ -1507,7 +1508,7 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
     assert result == args._diagnostics_dir / "reference-repeatability.json"
     assert result.is_file()
     assert (args.output_dir / "calibration-runs" / "batch.pt").is_file()
-    assert len(_rendered_calibration_workers) == 16
+    assert len(_rendered_calibration_workers) == 5
     assert not list(args._diagnostics_dir.rglob("*.pt"))
 
 
@@ -3051,7 +3052,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
         assert args.test_spec.read_bytes() == state.previous
         assert kwargs["select"] == ["single-step-optimizer"]
         assert kwargs["prepare_references"] is True
-        assert kwargs["reference_calibration_runs"] == 16
+        assert kwargs["reference_calibration_runs"] == 5
         assert kwargs["reference_calibration_workers"] == args.reference_calibration_workers
         assert kwargs["reference_token_budget"] == 64
         assert isinstance(kwargs["client_backend"], CortexConfig)
@@ -3115,7 +3116,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                 "status": "reviewed",
                 "provenance": {
                     "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
-                    "calibration_runs": 16,
+                    "calibration_runs": 5,
                     "maximum_pairwise_norm_delta": spread,
                     "worst_quantity": "layer.weight::exp_avg",
                     "multiplier": 4,
@@ -3213,7 +3214,7 @@ def test_local_cortex_optimizer_scalar_norm_publication_preserves_test1_and_per_
         assert record["identity"] == receipt["identity"]
         assert record["measurements"]["optimizer_norm_gate"] == receipt["gate"]
         assert receipt["gate"]["absolute"] == (0.001 if name == "gas1" else 0.004)
-        assert receipt["gate"]["provenance"]["calibration_runs"] == 16
+        assert receipt["gate"]["provenance"]["calibration_runs"] == 5
     assert list(state.args.reference_records_dir.glob(".optimizer-onboarding-*")) == []
 
 
@@ -3278,14 +3279,14 @@ def test_local_cortex_optimizer_scalar_norm_rejects_unreviewed_fixture_before_ca
     assert not (state.args.output_dir / "onboarding-t02.json").exists()
 
 
-@pytest.mark.parametrize(("runs", "workers"), [(8, 8), (0, 8), (16, 0), (16, 9)])
+@pytest.mark.parametrize(("runs", "workers"), [(16, 1), (8, 8), (0, 8), (5, 0), (5, 9)])
 def test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before_reference(
     _local_cortex_optimizer_onboarding, runs, workers
 ):
     state = _local_cortex_optimizer_onboarding
     state.args.reference_calibration_runs = runs
     state.args.reference_calibration_workers = workers
-    with pytest.raises(ValueError, match="16 repeats"):
+    with pytest.raises(ValueError, match="5 repeats"):
         onboard._parent(state.args)
     assert state.events == []
     assert state.args.test_spec.read_bytes() == state.previous
@@ -3510,3 +3511,101 @@ def test_optimizer_validation_child_failure_restores_exact_test1_without_referen
     assert len(calibrations) == (0 if failure == "pre-calibration-pin" else 1)
     assert state.events == []
     assert not (state.args.output_dir / "onboarding-t02.json").exists()
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        None,
+        "unexpected",
+        "retained-unexpected",
+        "outside-source",
+        "missing",
+        "mismatched",
+    ],
+)
+def test_onboarding_pretrained_omitted_layers_do_not_warn(
+    _onboarding_storage_fast_root, tmp_path, monkeypatch, caplog, problem
+) -> None:
+    config = transformers.Qwen3Config(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16)
+    source = tmp_path / "source"
+    model.save_pretrained(source)
+    (source / "tokenizer_config.json").write_text("{}")
+    state = load_file(source / "model.safetensors")
+    key = "model.layers.0.input_layernorm.weight"
+    if problem == "unexpected":
+        key = "unrelated.weight"
+        state[key] = torch.ones(16, dtype=torch.bfloat16)
+    elif problem == "retained-unexpected":
+        key = "model.layers.0.unrelated.weight"
+        state[key] = torch.ones(16, dtype=torch.bfloat16)
+    elif problem == "outside-source":
+        key = "model.layers.3.input_layernorm.weight"
+        state[key] = torch.ones(16, dtype=torch.bfloat16)
+    elif problem == "missing":
+        del state[key]
+    elif problem == "mismatched":
+        state[key] = torch.ones(17, dtype=torch.bfloat16)
+    save_file(state, source / "model.safetensors", metadata={"format": "pt"})
+    destination = _onboarding_storage_fast_root / "reduced"
+    original_ignore = transformers.Qwen3ForCausalLM._keys_to_ignore_on_load_unexpected
+    monkeypatch.setattr(logging.getLogger("transformers"), "propagate", True)
+    caplog.set_level(logging.WARNING, logger="transformers")
+    save_reduced = synth_model._save_reduced_pretrained
+
+    def save_original_class(loaded, path):
+        assert type(loaded) is transformers.Qwen3ForCausalLM
+        save_reduced(loaded, path)
+
+    monkeypatch.setattr(synth_model, "_save_reduced_pretrained", save_original_class)
+
+    if problem == "mismatched":
+        with pytest.raises(RuntimeError, match="ignore_mismatched_sizes"):
+            synth_model.materialize_pretrained(str(source), str(destination), 1)
+        assert not (destination / "config.json").exists()
+    else:
+        synth_model.materialize_pretrained(str(source), str(destination), 1)
+        saved = load_file(destination / "model.safetensors")
+        assert not any(name.startswith(("model.layers.1.", "model.layers.2.")) for name in saved)
+        assert json.loads((destination / "config.json").read_text())["architectures"] == ["Qwen3ForCausalLM"]
+        for name, tensor in saved.items():
+            if problem == "missing" and name == key:
+                continue
+            torch.testing.assert_close(tensor, state[name], atol=0, rtol=0, msg=name)
+
+    report = caplog.text
+    assert "model.layers.1." not in report
+    assert "model.layers.2." not in report
+    assert "model.layers.{1, 2}." not in report
+    if problem is None:
+        assert "LOAD REPORT" not in report
+        assert "UNEXPECTED" not in report
+    else:
+        assert key in report
+        expected_status = {
+            "unexpected": "UNEXPECTED",
+            "retained-unexpected": "UNEXPECTED",
+            "outside-source": "UNEXPECTED",
+            "missing": "MISSING",
+            "mismatched": "MISMATCH",
+        }
+        assert expected_status[problem] in report
+    assert transformers.Qwen3ForCausalLM._keys_to_ignore_on_load_unexpected is original_ignore
+
+    caplog.clear()
+    reduced, _, _ = synth_model.reduce_config(str(source), 1)
+    if problem != "mismatched":
+        direct, info = transformers.Qwen3ForCausalLM.from_pretrained(
+            source, config=reduced, dtype=torch.bfloat16, output_loading_info=True
+        )
+        assert type(direct) is transformers.Qwen3ForCausalLM
+        assert any(name.startswith("model.layers.1.") for name in info["unexpected_keys"])

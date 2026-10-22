@@ -29,6 +29,7 @@ import runpy
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -76,7 +77,7 @@ def _isolated_gateway_ownership(tmp_path, monkeypatch):
     return scanner
 
 
-@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.doc"])
+@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"])
 def test_quick_demo_config_is_tiny_and_retains_both_gas_arms(tmp_path, monkeypatch, document):
     from arctic_platform.correctness.harness.config import arms_for
     from arctic_platform.correctness.harness.config import load_config
@@ -2044,9 +2045,9 @@ def test_onboarding_prerequisites_run_once_before_all_selected_checks(_onboardin
     assert state.calls[0]["attention"] == ["flash_attention_3"]
     assert "vllm" not in state.calls[0]["modules"]
     output = capsys.readouterr().out
-    assert "*** Onboarding 1/2: Single Step Grads ***" in output
-    assert "*** Onboarding 2/2: Single Step Optimizer ***" in output
-    assert "*** Onboarding:" not in output
+    assert "### Onboarding 1/2: Single Step Grads ###" in output
+    assert "### Onboarding 2/2: Single Step Optimizer ###" in output
+    assert "*** Onboarding" not in output
 
 
 @pytest.mark.parametrize("has_spec", [False, True])
@@ -2067,12 +2068,12 @@ def test_onboarding_numbering_includes_only_queued_checks(_onboarding_prerequisi
     output = capsys.readouterr().out
     if has_spec:
         assert seen == ["single-step-optimizer"]
-        assert "*** Onboarding 1/1: Single Step Optimizer ***" in output
-        assert "Single Step Grads ***" not in output
+        assert "### Onboarding 1/1: Single Step Optimizer ###" in output
+        assert "Single Step Grads ###" not in output
     else:
         assert seen == ["single-step-grads", "single-step-optimizer"]
-        assert "*** Onboarding 1/2: Single Step Grads ***" in output
-        assert "*** Onboarding 2/2: Single Step Optimizer ***" in output
+        assert "### Onboarding 1/2: Single Step Grads ###" in output
+        assert "### Onboarding 2/2: Single Step Optimizer ###" in output
 
 
 def test_onboarding_numbering_scales_beyond_two_checks(_onboarding_prerequisites, monkeypatch, capsys):
@@ -2092,9 +2093,9 @@ def test_onboarding_numbering_scales_beyond_two_checks(_onboarding_prerequisites
     monkeypatch.setattr(state.onboard, "_prepare_references", lambda *a: 0)
     assert state.onboard._onboard_configuration(state.args) == 0
     output = capsys.readouterr().out
-    assert "*** Onboarding 1/3: Single Step Grads ***" in output
-    assert "*** Onboarding 2/3: Single Step Optimizer ***" in output
-    assert "*** Onboarding 3/3: Synthetic Check ***" in output
+    assert "### Onboarding 1/3: Single Step Grads ###" in output
+    assert "### Onboarding 2/3: Single Step Optimizer ###" in output
+    assert "### Onboarding 3/3: Synthetic Check ###" in output
 
 
 def test_onboarding_recovers_orphan_before_reference_prerequisites_and_reports_config(
@@ -2369,20 +2370,28 @@ def _operator_api_fake_batches(monkeypatch, verdicts):
 
 @pytest.mark.parametrize(
     "verdict",
-    [Outcome.PASS, Outcome.FAIL, Outcome.INAPPLICABLE, ReferencePrerequisiteError("missing"), RuntimeError("error")],
+    [
+        Outcome.PASS,
+        Outcome.FAIL,
+        Outcome.INAPPLICABLE,
+        ReferencePrerequisiteError("missing"),
+        RuntimeError("error"),
+    ],
 )
 def test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance(
     tmp_path, monkeypatch, capsys, verdict
 ):
     _operator_api_fake_batches(monkeypatch, [verdict])
-    ticks = iter([100.0, 165.0, 167.0])
+    ticks = iter([100.0, 165.0, 167.01])
     monkeypatch.setattr(execution.time, "monotonic", lambda: next(ticks))
     result = api.run(
-        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)), api.RunOptions(out=tmp_path)
+        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
+        api.RunOptions(out=tmp_path),
     )
     lines = capsys.readouterr().out.splitlines()
-    assert lines[-1] == "Total run time: 1m07.0s"
+    assert lines[-1] == "Total run time: 00:01:08"
     assert sum(line.startswith("Total run time:") for line in lines) == 1
+    assert f"Selected tests: {_operator_api_TEST}" in lines
     assert any(line.startswith("Report:") for line in lines[:-1])
     if isinstance(verdict, Exception):
         assert lines[-2].startswith("Action required:")
@@ -2397,7 +2406,7 @@ def test_compatibility_total_runtime_follows_all_report_and_verdict_output(tmp_p
     result = Result("single-step-grads", "synthetic", verdict, summary="synthetic result")
     code = execution._finish([result], {}, tmp_path, configs=1, started=100.0)
     lines = capsys.readouterr().out.splitlines()
-    assert lines[-1] == "total run time across 1 config(s): 1m05.0s"
+    assert lines[-1] == "total run time across 1 config(s): 00:01:05"
     assert sum("total run time" in line for line in lines) == 1
     assert code == (0 if verdict is Outcome.PASS else 1)
 
@@ -2408,7 +2417,7 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
-    ticks = iter([100.0, 167.0])
+    ticks = iter([100.0, 167.01])
     monkeypatch.setattr(onboard.time, "monotonic", lambda: next(ticks))
 
     def run(args):
@@ -2421,8 +2430,8 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
     monkeypatch.setattr(onboard, "run", run)
     args = Namespace(config="synthetic.json")
     assert onboard.logged_run(args) == int(failure)
-    assert capsys.readouterr().out.splitlines()[-1] == "Total run time: 1m07.0s"
-    assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 1m07.0s"
+    assert capsys.readouterr().out.splitlines()[-1] == "Total run time: 00:01:08"
+    assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 00:01:08"
     assert "DSS_CORRECTNESS_LOGDIR" not in os.environ
 
 
@@ -2497,14 +2506,20 @@ def test_operator_api_mixed_batch_continues_and_retains_every_pair(tmp_path, mon
     assert (tmp_path / "batch.json").is_file()
 
 
-def test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity(tmp_path, monkeypatch):
+def test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity(
+    tmp_path, monkeypatch, capsys
+):
     selected = api.select(api.RunRequest(config=_operator_api_CONFIG))
     observed = []
     monkeypatch.setattr(execution, "write_report", lambda *a, **k: None)
 
     def record(args, *, executor, snapshot):
         observed.append(tuple(args.test))
-        snapshot([Result(check, _operator_api_CONFIG, Outcome.PASS) for check in args.test], {}, {})
+        snapshot(
+            [Result(check, _operator_api_CONFIG, Outcome.PASS) for check in args.test],
+            {},
+            {},
+        )
 
     monkeypatch.setattr(execution, "_run_configs", record)
     result = api.run(api.RunRequest(config=_operator_api_CONFIG), api.RunOptions(out=tmp_path))
@@ -2512,6 +2527,8 @@ def test_operator_api_actual_execution_preserves_selection_order_and_combined_st
     assert ("single-step-grads", "single-step-optimizer") in observed
     assert [case["test_id"] for case in result.cases] == [case.test_id for case in selected]
     assert result.exit_code == 0
+    expected = ", ".join(dict.fromkeys(case.test_id for case in selected))
+    assert f"Selected tests: {expected}" in capsys.readouterr().out.splitlines()
 
 
 @pytest.mark.parametrize("module", ["rl_weight_sync", "rl_router_replay"])
@@ -2597,7 +2614,7 @@ def test_operator_api_parse_flags_is_shared_with_operator_command():
 
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
     monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
-    guide = api.PACKAGE_DIR / "docs" / "running-tests.doc"
+    guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
     before = guide.read_bytes()
     monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
     from transformers import AutoConfig
@@ -3553,8 +3570,9 @@ def test_onboarding_retry_reviewed_cache_and_summary_changes_preserve_preparatio
 
 
 @pytest.mark.parametrize("drift", ["display-only", "changed-run-count"])
+@pytest.mark.parametrize("formatter", ["duration", "total_duration"])
 def test_onboarding_retry_runtime_footer_and_calibration_bar_preserve_only_unchanged_recipe(
-    _onboarding_retry_sources, drift
+    _onboarding_retry_sources, drift, formatter
 ):
     onboard, args, root = _onboarding_retry_sources
     (root / "onboarding" / "onboard.py").write_text(
@@ -3567,14 +3585,14 @@ def test_onboarding_retry_runtime_footer_and_calibration_bar_preserve_only_uncha
     original = args._resume_dir
     (root / "onboarding" / "onboard.py").write_text(
         "def logged_run(args):\n"
-        "    from arctic_platform.correctness.harness.report import duration\n"
+        f"    from arctic_platform.correctness.harness.report import {formatter}\n"
         "    started = time.monotonic()\n"
         "    try:\n"
         "        return run(args)\n"
         "    except Exception:\n"
         "        return 1\n"
         "    finally:\n"
-        '        print(f"Total run time: {duration(time.monotonic() - started)}", flush=True)\n'
+        f'        print(f"Total run time: {{{formatter}(time.monotonic() - started)}}", flush=True)\n'
     )
     runs = "reference_calibration_runs" if drift == "display-only" else "reference_calibration_runs + 1"
     (root / "harness" / "runner.py").write_text(
@@ -4459,3 +4477,95 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     assert len(logs) == 2
     assert any("Traceback" in path.read_text() and "regression error" in path.read_text() for path in logs)
     assert "Reusing the verified completed phase" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("document", ["PR_DESCRIPTION.md", "arctic_platform/correctness/docs/running-tests.md"])
+@pytest.mark.parametrize("private_paths", [False, True])
+def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scratch(tmp_path, document, private_paths):
+    root = Path(__file__).resolve().parents[3]
+    text = (root / document).read_text()
+    staging = (
+        text.split("## Add To Repo\n", 1)[1].split("## Cleanup\n", 1)[0].split("```bash\n", 1)[1].split("```", 1)[0]
+    )
+    cleanup = text.split("## Cleanup\n", 1)[1]
+    commands = [block.split("```", 1)[0] for block in cleanup.split("```bash\n")[1:3]]
+    assert all("/data-fast" not in command and "DSS_CORRECTNESS_TMPDIR" not in command for command in commands)
+    identifier = "tiny-qwen3-129m-one-h200"
+    config = f"arctic_platform/correctness/configs/{identifier}.json"
+    specification = f"arctic_platform/correctness/specs/{identifier}.json"
+    record = f"arctic_platform/correctness/reference_data/{identifier}/single-step-grads/record.json"
+    unrelated_record = "arctic_platform/correctness/reference_data/other/single-step-grads/record.json"
+    original = f"work/configs/{identifier}.json"
+    report_path = "work/reports/both/report.json"
+    for relative in (config, specification, record, unrelated_record, original, report_path):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    (tmp_path / ".gitignore").write_text(
+        "/arctic_platform/correctness/configs/\n/arctic_platform/correctness/specs/\n/arctic_platform/correctness/reference_data/\n/work/\n"
+    )
+
+    def run(*args, env=None):
+        return subprocess.run(args, cwd=tmp_path, env=env, check=True, text=True, capture_output=True).stdout
+
+    run("git", "init", "--quiet")
+    run("bash", "-eu", "-c", staging)
+    assert set(run("git", "ls-files", "--cached").splitlines()) == {config, specification}
+    assert set(run("git", "check-ignore", record, unrelated_record).splitlines()) == {record, unrelated_record}
+    assert (
+        text.index("Use skills/correctness/SKILL.md to fix onboarding for\n")
+        < text.index("## Add To Repo\n")
+        < text.index("## Cleanup\n")
+    )
+    assert "mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX" in text
+
+    logs = tmp_path / "work" / "logs" / ("correctness-demo.test" if private_paths else "other-run")
+    logs.mkdir(parents=True)
+    (logs / "onboarding.log").write_text("saved diagnostic")
+    other_logs = tmp_path / "work" / "logs" / "keep-this-run"
+    other_logs.mkdir()
+    (other_logs / "onboarding.log").write_text("unrelated diagnostic")
+    with tempfile.TemporaryDirectory(
+        prefix="correctness-demo." if private_paths else "unrelated-run.", dir="/data-fast/tmp"
+    ) as scratch:
+        scratch_path = Path(scratch)
+        (scratch_path / "batch.pt").write_bytes(b"temporary")
+        (scratch_path / "retained-input").symlink_to(tmp_path / config)
+        env = {**os.environ, "DSS_CORRECTNESS_TMPDIR": scratch, "DSS_CORRECTNESS_LOGDIR": str(logs)}
+        for command in commands:
+            run("bash", "-eu", "-c", command, env=env)
+        assert (scratch_path / "batch.pt").read_bytes() == b"temporary"
+        assert (scratch_path / "retained-input").is_symlink()
+        assert logs.exists() is not private_paths
+        assert all((tmp_path / relative).is_file() for relative in (config, specification, record, unrelated_record))
+        assert (other_logs / "onboarding.log").is_file()
+        assert not (tmp_path / original).exists()
+        assert not (tmp_path / report_path).exists()
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (0, "00:00:00"),
+        (0.001, "00:00:01"),
+        (59, "00:00:59"),
+        (59.01, "00:01:00"),
+        (60, "00:01:00"),
+        (3599.01, "01:00:00"),
+        (3600, "01:00:00"),
+        (90061.01, "25:01:02"),
+    ],
+)
+def test_total_runtime_rounds_up_with_full_hours_minutes_seconds(seconds, expected):
+    assert report.total_duration(seconds) == expected
+
+
+@pytest.mark.parametrize(
+    "phase, marker",
+    [("Onboarding 1/1", "###"), ("Phase 2/3", "***"), ("Target", "***")],
+)
+def test_onboarding_heading_marker_is_distinct_from_inner_stages(capsys, phase, marker):
+    from arctic_platform.correctness.onboarding import onboard
+
+    onboard._stage(phase, "single step optimizer", "Config: example")
+    assert capsys.readouterr().out == f"\n{marker} {phase}: Single Step Optimizer {marker}\nConfig: example\n\n"

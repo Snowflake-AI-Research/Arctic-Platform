@@ -50,6 +50,7 @@ from . import report as console
 from .batches import SEED
 from .batches import build_batch
 from .batches import save
+from .config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from .config import ArmDefinition
 from .config import ArmSpec
 from .config import LoadedConfig
@@ -440,7 +441,7 @@ def execute(
     reference_records_dir: Path | None = None,
     peft_adapter: Path | None = None,
     historical_gradient_references: dict | None = None,
-    reference_calibration_runs: int = 16,
+    reference_calibration_runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS,
     reference_calibration_workers: int = 1,
     native_optimizer_scope=None,
     native_optimizer_scope_source: dict | None = None,
