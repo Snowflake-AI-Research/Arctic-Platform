@@ -15,9 +15,9 @@
 
 # Adapted from ArcticTraining's trainer/flops_counter.py, which adapts
 # https://github.com/volcengine/verl/blob/main/verl/utils/flops_counter.py
-# DeepSeek-V4 is counted with the checkpointed per-token convention used for
-# the H200 step reports: 8 FLOPs per activated parameter, plus the compressed
-# attention and indexer terms.
+# DeepSeek-V4 and GLM-5.3-Flash are counted with the checkpointed per-token
+# convention used for the H200 step reports: 8 FLOPs per activated parameter,
+# plus the sparse attention and indexer terms.
 
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ VALID_CONFIG_TYPE = frozenset(
         "qwen3_vl_moe",
         "deepseek_v3",
         "deepseek_v4",
+        "glm5_next",
+        "glm5_next_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
         "minicpmv",
@@ -114,6 +116,8 @@ class FlopsCounter:
             "qwen3_5_moe_text": self._estimate_qwen2_moe_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
             "deepseek_v4": self._estimate_deepseek_v4_flops,
+            "glm5_next": self._estimate_glm5_next_flops,
+            "glm5_next_text": self._estimate_glm5_next_flops,
             "minicpmv": self._estimate_qwen2_flops,
             "minicpmo": self._estimate_qwen2_flops,
         }
@@ -303,6 +307,14 @@ class FlopsCounter:
         scale = self._dense_flops_multiplier(forward_only) / 8
         return total * scale * (1.0 / delta_time) / 1e12
 
+    def _estimate_glm5_next_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
+        """Checkpointed GLM-5.3-Flash count, scaled like DeepSeek-V4."""
+        del tokens_sum
+        per_token = _glm5_next_checkpointed_flops_per_token(self.config, batch_seqlens)
+        total = sum(flops * seqlen for flops, seqlen in zip(per_token, batch_seqlens))
+        scale = self._dense_flops_multiplier(forward_only) / 8
+        return total * scale * (1.0 / delta_time) / 1e12
+
     def estimate_tflos(self, batch_seqlens, delta_time=1, forward_only=False):
         """TeraFLOPs for one row of sequence lengths. ``delta_time`` is ignored."""
         tokens_sum = sum(batch_seqlens)
@@ -363,3 +375,78 @@ def _deepseek_v4_checkpointed_flops_per_token(config, batch_seqlens) -> list[flo
         + 9 * n_csa * index_heads * index_dim * (seqlen / csa_rate)
         for seqlen in batch_seqlens
     ]
+
+
+def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float]:
+    """GLM-5.3-Flash FLOPs per token at each sequence length.
+
+    Dense GEMMs are 8 times the activated parameters. Each sparse layer adds
+    the causal indexer over the sequence (9) and the selected top-k attention
+    (18). Linear-attention layers contribute their projections only.
+    """
+    hidden = config.hidden_size
+    heads = config.num_attention_heads
+    layers = list(config.layer_types)
+    sparse = "deepseek_sparse_attention"
+    n_sparse = sum(layer == sparse for layer in layers)
+    n_linear = sum(layer == "linear_attention" for layer in layers)
+    mlp_types = list(getattr(config, "mlp_layer_types", None) or [])
+    if mlp_types:
+        n_dense = sum(kind == "dense" for kind in mlp_types)
+        n_moe = sum(kind == "sparse" for kind in mlp_types)
+    else:
+        n_dense = min(config.first_k_dense_replace, len(layers))
+        n_moe = len(layers) - n_dense
+    indexer_types = list(getattr(config, "indexer_types", None) or [])
+    n_indexer = 0
+    for index, layer in enumerate(layers):
+        if layer != sparse:
+            continue
+        kind = indexer_types[index] if index < len(indexer_types) else "full"
+        if kind != "shared":
+            n_indexer += 1
+
+    q_lora = config.q_lora_rank or 0
+    kv_rank = config.kv_lora_rank
+    nope = config.qk_nope_head_dim
+    rope = config.qk_rope_head_dim
+    value = config.v_head_dim
+    qk = nope + rope
+    if q_lora:
+        mla = hidden * q_lora + q_lora * heads * qk
+    else:
+        mla = hidden * heads * qk
+    mla += hidden * (kv_rank + rope) + kv_rank * heads * (nope + value) + heads * value * hidden
+
+    index_heads = config.index_n_heads
+    index_dim = config.index_head_dim
+    kpool = getattr(config, "index_kpool", 0) or 0
+    indexer = q_lora * index_heads * index_dim + hidden * index_dim + hidden * index_heads
+    indexer += index_dim * hidden + kpool * index_dim
+
+    linear_heads = config.linear_num_heads
+    linear_dim = config.linear_head_dim
+    qkv = linear_dim * linear_heads
+    kernel = config.linear_conv_kernel_dim
+    linear = 3 * hidden * qkv + kernel * 3 * qkv + hidden * linear_heads + qkv * hidden
+    linear += 2 * (hidden * linear_dim + linear_dim * qkv)
+
+    topk = config.num_experts_per_tok
+    shared = config.n_shared_experts
+    moe = hidden * config.n_routed_experts + (topk + shared) * 3 * hidden * config.moe_intermediate_size
+    dense = 3 * hidden * config.intermediate_size
+    hc = getattr(config, "hc_mult", 0) or 0
+    mhc = 2 * ((2 + hc) * hc) * (hc * hidden) if hc else 0
+    activated = (
+        n_sparse * mla
+        + n_indexer * indexer
+        + n_linear * linear
+        + n_moe * moe
+        + n_dense * dense
+        + len(layers) * mhc
+        + config.vocab_size * hidden
+    )
+
+    fixed = 8 * activated + 18 * n_sparse * heads * value * config.index_topk
+    indexer_per_token = 9 * n_indexer * index_heads * index_dim
+    return [fixed + indexer_per_token * seqlen for seqlen in batch_seqlens]

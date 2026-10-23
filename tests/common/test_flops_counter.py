@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The ported counter matches ArcticTraining, and DeepSeek-V4 matches the H200 reports."""
+"""The ported counter matches ArcticTraining, and the H200 models match their reports."""
 
 from __future__ import annotations
 
@@ -199,3 +199,46 @@ def test_deepseek_v4_matches_the_reported_per_token_cost():
     assert long > short
     no_recompute = tflops_per_token(config, 65536, enable_gradient_checkpointing=False)
     assert abs(no_recompute - 0.14061 * 6 / 8) < 5e-5
+
+
+def _glm53_flash():
+    sparse = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43}
+    return _Config(
+        model_type="glm5_next_text",
+        hidden_size=4096,
+        vocab_size=154880,
+        num_hidden_layers=45,
+        num_attention_heads=64,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        v_head_dim=256,
+        intermediate_size=12288,
+        moe_intermediate_size=2048,
+        num_experts_per_tok=8,
+        n_shared_experts=1,
+        n_routed_experts=288,
+        first_k_dense_replace=3,
+        hc_mult=4,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+        linear_num_heads=64,
+        linear_head_dim=128,
+        linear_conv_kernel_dim=4,
+        layer_types=["deepseek_sparse_attention" if i in sparse else "linear_attention" for i in range(45)],
+        mlp_layer_types=["dense"] * 3 + ["sparse"] * 42,
+        indexer_types=["full"] * 45,
+    )
+
+
+def test_glm53_flash_matches_the_reported_attention_terms():
+    config = _glm53_flash()
+    # 8 x 16.742B activated parameters, plus 11 sparse layers. The H200 tables
+    # rounded that activated count to 18B (0.17722 at 64K, 0.25694 at 256K).
+    assert abs(tflops_per_token(config, 65536) - 0.16715) < 5e-5
+    assert abs(tflops_per_token(config, 262144) - 0.24688) < 5e-5
+    outer = _Config(model_type="glm5_next", text_config=config)
+    assert tflops_per_token(outer, 65536) == tflops_per_token(config, 65536)
