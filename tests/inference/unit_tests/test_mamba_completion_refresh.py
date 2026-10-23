@@ -92,6 +92,7 @@ def manager_methods(monkeypatch):
         ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
+        ("mamba_replay_boundary_stop", "ensure_mamba_replay_boundary_stop"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)

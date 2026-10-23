@@ -23,6 +23,7 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.glm5next_indexer_page import apply_glm5next_indexer_page_fix
     from arctic_platform.inference.vllm.kv_group_size import ensure_kv_group_size_patch
     from arctic_platform.inference.vllm.mamba_completion_refresh import ensure_mamba_completion_refresh
+    from arctic_platform.inference.vllm.mamba_replay_boundary_stop import ensure_mamba_replay_boundary_stop
     from arctic_platform.inference.vllm.mrope_yarn import ensure_mrope_yarn_fix
     from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
     from arctic_platform.inference.vllm.spec_decode_grammar import ensure_spec_decode_grammar_fix
@@ -40,3 +41,4 @@ def apply_required_vllm_patches() -> None:
     ensure_dflash_max_position_patch()
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
+    ensure_mamba_replay_boundary_stop()
