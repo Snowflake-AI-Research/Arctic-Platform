@@ -1267,6 +1267,10 @@ class TestMigratedGrpo(TestCasePlus):
         torch_assert_close(values.grad - unweighted.grad, -0.25 * weights / 4)
         with self.assertRaisesRegex(ValueError, "sampler_kl_weights must be a finite"):
             grpo_loss({"logprobs": values.detach()}, {**context, "sampler_kl_weights": -weights}, {}, {}, "cpu")
+        no_sampler = {key: value for key, value in context.items() if key != "old_log_probs_shifted"}
+        with self.assertRaisesRegex(ValueError, "requires context 'old_log_probs_shifted'"):
+            grpo_loss({"logprobs": values.detach()}, no_sampler, {}, {"sampler_kl_coef": 0.25}, "cpu")
+        grpo_loss({"logprobs": values.detach()}, no_sampler, {}, {}, "cpu")
         row_weighted = {**context, "sequence_loss_weights": torch.ones(1)}
         with self.assertRaisesRegex(ValueError, "fold them into sampler_kl_weights"):
             grpo_loss({"logprobs": values.detach()}, row_weighted, {}, {"sampler_kl_coef": 0.25}, "cpu")
