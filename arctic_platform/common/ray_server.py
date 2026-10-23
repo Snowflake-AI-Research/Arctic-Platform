@@ -984,13 +984,9 @@ class ArcticRLRayServer:
             async with self._training_op_lock:
                 if not self._training_failed:
                     await self._await_training_refs(
-                        lambda: [
-                            self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)
-                        ]
+                        lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)]
                     )
-            results = await self.arctic_rl_ray_server_state.wake_inference.remote(
-                tags, empty_training_cache=False
-            )
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags, empty_training_cache=False)
         else:
             results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
