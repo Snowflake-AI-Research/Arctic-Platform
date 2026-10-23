@@ -220,6 +220,10 @@ def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]
     cap = config.get("sampler_kl_ratio_cap", 5.0)
     if isinstance(cap, bool) or not isinstance(cap, (int, float)) or math.isnan(cap) or cap <= 1.0:
         raise ValueError(f"sampler_kl_ratio_cap must be a number > 1 (inf disables the cap), got {cap!r}")
+    # Without them the loss falls back to the policy's own detached log-probs, where k1 has value 0 but gradient
+    # -β ∇ log p on every token.
+    if coef > 0.0 and context.get("old_log_probs_shifted") is None:
+        raise ValueError("sampler_kl_coef > 0 requires context 'old_log_probs_shifted' (the sampler's log-probs)")
     weights = context.get("sampler_kl_weights")
     if weights is not None and not (
         torch.is_tensor(weights) and weights.is_floating_point() and (torch.isfinite(weights) & (weights >= 0)).all()

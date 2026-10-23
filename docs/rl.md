@@ -199,7 +199,8 @@ optional finite non-negative lower-clip magnitude that defaults to
 non-negative, default `0.0`), which adds `β · w · k(log r)` with
 `log r = logprobs − old_log_probs_shifted` on every policy token except
 `nll_mask` tokens, aggregated like the policy term: a per-token estimate of
-KL(sampler ‖ policy). `sampler_kl_type` picks `k`: `"k1"` (default, `−log r`;
+KL(sampler ‖ policy). A request with `sampler_kl_coef > 0` must send
+`old_log_probs_shifted`. `sampler_kl_type` picks `k`: `"k1"` (default, `−log r`;
 its gradient `−β ∇ log p` raises each sampled token's probability regardless
 of its advantage), `"k2"` (`(log r)² / 2`) or `"k3"` (`r − 1 − log r`, zero
 gradient where `r = 1`). k1 and k3 are unbiased for the KL and its gradient.
