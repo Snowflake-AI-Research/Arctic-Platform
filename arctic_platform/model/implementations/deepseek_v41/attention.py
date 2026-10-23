@@ -203,10 +203,9 @@ def packed_candidate_mask(
 ) -> torch.Tensor:
     """Per-document block mask, scattered back onto the packed entry axis. ``scores`` is ``(queries, entries)``."""
     queries, entries = scores.shape
-    mask = torch.zeros(queries, entries, dtype=torch.bool, device=scores.device)
     max_entries = layout.max_entries_per_doc
     if max_entries == 0 or queries == 0:
-        return mask
+        return torch.zeros(queries, entries, dtype=torch.bool, device=scores.device)
     counts = torch.zeros(layout.first_entry_of_doc.shape[0], dtype=torch.long, device=scores.device)
     counts.scatter_add_(0, layout.entry_doc_idx, torch.ones_like(layout.entry_doc_idx))
     doc_counts = counts[tok_doc_idx]
@@ -216,9 +215,10 @@ def packed_candidate_mask(
     gathered = scores.gather(1, index.clamp(max=max(entries - 1, 0))).masked_fill(~valid, float("-inf"))
     gathered = gathered.masked_fill(local[None, :] >= causal_len[:, None], float("-inf"))
     local_mask = select_candidate_blocks(gathered, causal_len, topk_blocks, block_size)
-    query_index = torch.arange(queries, device=scores.device)[:, None].expand_as(index)
-    mask[query_index[valid], index[valid]] = local_mask[valid]
-    return mask
+    # Slots past a document's entries all land in a spare column, so the real columns of a row are distinct.
+    mask = torch.zeros(queries, entries + 1, dtype=torch.bool, device=scores.device)
+    mask.scatter_(1, index.masked_fill(~valid, entries), local_mask & valid)
+    return mask[:, :entries]
 
 
 def _fp32_weight(linear: nn.Linear) -> None:
@@ -314,53 +314,54 @@ class DeepseekV41Indexer(nn.Module):
         query = self.wq_b(query_residual).view(batch, queries, self.num_heads, self.head_dim)
         query = _rotate(query, rope_cache, packed.position_ids)
         weights = self.weights_proj(hidden) * self.score_scale
-        scores = _index_scores(query, keys, weights)
-        visible, causal_len = _visible_entries(layout, packed, self.compress_ratio)
-        candidates = None
-        if self.is_candidate_source:
-            candidates = packed_candidate_mask(
-                scores[0],
-                layout,
-                packed.tok_doc_idx,
-                causal_len,
-                self.candidate_topk_blocks,
-                self.candidate_block_size,
-            ).unsqueeze(0)
-        elif self.uses_candidates:
-            if shared.candidates is None:
-                raise RuntimeError(f"layer {self.layer_idx} expected a candidate mask from an earlier indexer")
-            visible = visible & shared.candidates[0]
-        topk = _topk_indices(scores[0], visible, self.index_topk).unsqueeze(0)
-        return topk, keys if self.owns_k else None, candidates
+        prior_candidates = shared.candidates
+        if self.uses_candidates and not self.is_candidate_source and prior_candidates is None:
+            raise RuntimeError(f"layer {self.layer_idx} expected a candidate mask from an earlier indexer")
+        # Every per-query tensor below spans the whole sequence's entries, so at long context
+        # they are only ever materialized for a slice of queries.
+        entries = keys.shape[1]
+        chunk = max(1, _INDEX_CHUNK_BYTES // max(1, batch * self.num_heads * entries * 4))
+        score_keys = keys.float()
+        topk = torch.empty(queries, self.index_topk, dtype=torch.long, device=hidden.device)
+        candidates = torch.empty(
+            batch, queries, entries if self.is_candidate_source else 0, dtype=torch.bool, device=hidden.device
+        )
+        for start in range(0, queries, chunk):
+            rows = slice(start, min(start + chunk, queries))
+            scores = _index_scores(query[:, rows], score_keys, weights[:, rows])[0]
+            tok_doc_idx = packed.tok_doc_idx[rows]
+            visible, causal_len = _visible_entries(
+                layout, packed.position_ids[0, rows], tok_doc_idx, self.compress_ratio
+            )
+            if self.is_candidate_source:
+                candidates[0, rows] = packed_candidate_mask(
+                    scores,
+                    layout,
+                    tok_doc_idx,
+                    causal_len,
+                    self.candidate_topk_blocks,
+                    self.candidate_block_size,
+                )
+            elif self.uses_candidates and prior_candidates is not None:
+                visible = visible & prior_candidates[0, rows]
+            topk[rows] = _topk_indices(scores, visible, self.index_topk)
+        return topk.unsqueeze(0), keys if self.owns_k else None, candidates if self.is_candidate_source else None
 
 
-_INDEX_SCORE_CHUNK_BYTES = 1 << 30
+_INDEX_CHUNK_BYTES = 1 << 30
 
 
 def _index_scores(query: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Head-weighted ReLU scores ``(b, q, e)``, chunked over queries.
-
-    The per-head product is ``(b, q, h, e)`` fp32, which at long context dwarfs everything else in
-    the layer, so it is only ever materialized for a slice of queries.
-    """
-    batch, queries, heads, _ = query.shape
-    entries = keys.shape[1]
-    keys = keys.float()
-    weights = weights.float()
-    chunk = max(1, _INDEX_SCORE_CHUNK_BYTES // max(1, batch * heads * entries * 4))
-    if chunk >= queries:
-        return (torch.einsum("bqhd,bed->bqhe", query.float(), keys).relu() * weights.unsqueeze(-1)).sum(dim=2)
-    scores = query.new_empty(batch, queries, entries, dtype=torch.float32)
-    for start in range(0, queries, chunk):
-        end = min(start + chunk, queries)
-        part = torch.einsum("bqhd,bed->bqhe", query[:, start:end].float(), keys).relu()
-        scores[:, start:end] = (part * weights[:, start:end].unsqueeze(-1)).sum(dim=2)
-    return scores
+    """Head-weighted ReLU scores ``(b, q, e)``."""
+    scores = torch.einsum("bqhd,bed->bqhe", query.float(), keys.float()).relu()
+    return (scores * weights.float().unsqueeze(-1)).sum(dim=2)
 
 
-def _visible_entries(layout, packed: PackedContext, ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
-    causal_len = (packed.position_ids[0] + 1) // ratio
-    same_doc = layout.entry_doc_idx[None, :] == packed.tok_doc_idx[:, None]
+def _visible_entries(
+    layout, position_ids: torch.Tensor, tok_doc_idx: torch.Tensor, ratio: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    causal_len = (position_ids + 1) // ratio
+    same_doc = layout.entry_doc_idx[None, :] == tok_doc_idx[:, None]
     reached = layout.entry_local_idx[None, :] < causal_len[:, None]
     return same_doc & reached, causal_len
 
