@@ -273,14 +273,14 @@ class ArcticRLRayServerState(ArcticRLServerState):
         results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         return results
 
-    async def wake_inference(self, tags: list[str] | None = None):
+    async def wake_inference(self, tags: list[str] | None = None, empty_training_cache: bool = True):
         """Wake all inference engines, restoring GPU memory.
 
         The in-tree pool wakes by tag (``weights``, then ``kv_cache``). Weight
         bytes come from the following sync, so this does not copy a CPU
         checkpoint back onto the GPU.
         """
-        if self.colocate:
+        if self.colocate and empty_training_cache:
             # Release cached GPU pages so cumem can remap.
             await self._empty_training_cache(self.training_workers)
         results = {}
@@ -920,10 +920,8 @@ class ArcticRLRayServer:
         export_hf = bool(body.get("export_hf", False))
         limit = body.get("save_total_limit")
         async with self._training_op_lock:
-            # Save is the recovery op: it still runs after a failed collective.
             results = await self._await_training_refs(
                 lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers],
-                check_failed=False,
             )
             if step is not None:
                 with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
@@ -931,7 +929,6 @@ class ArcticRLRayServer:
             if limit is not None and int(limit) > 0 and self.training_workers:
                 await self._await_training_refs(
                     lambda: [self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))],
-                    check_failed=False,
                 )
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
@@ -977,14 +974,21 @@ class ArcticRLRayServer:
         """
         self._verify_job(job_id, "sampling")
         tags = body.get("tags") if isinstance(body, dict) else body
-        # Colocated wake empty-caches the training workers inside the state
-        # actor. Hold the training lock across that call so it cannot overlap
-        # forward/step. weight_sync already holds the lock and calls the state
-        # method directly, so it does not re-enter here.
+        # Empty-cache is the only training-worker operation in a public
+        # colocated wake. Guard just that RPC, then wake vLLM outside the lock.
+        # A latched training failure skips empty-cache so inference can still
+        # drain rollouts or shut down cleanly.
         if self.colocate:
             async with self._training_op_lock:
-                self._raise_if_training_failed()
-                results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
+                if not self._training_failed:
+                    await self._await_training_refs(
+                        lambda: [
+                            self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)
+                        ]
+                    )
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(
+                tags, empty_training_cache=False
+            )
         else:
             results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
