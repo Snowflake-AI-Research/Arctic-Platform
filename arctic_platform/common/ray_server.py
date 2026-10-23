@@ -1211,7 +1211,8 @@ class ArcticRLRayServer:
 
         Both are computed as sqrt of the sum of squares over all params, which is invariant to how each engine shards
         / fuses its parameters -- so after a weight sync the two values must match. Used by tests to verify sync
-        correctness.
+        correctness. The sampling side raises above `tensor_parallel_size=1`, where a replicated tensor would be
+        counted once per TP rank.
         """
         self._verify_job(training_job_id, "training")
         self._verify_job(sampling_job_id, "sampling")

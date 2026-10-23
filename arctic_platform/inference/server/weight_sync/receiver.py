@@ -34,6 +34,10 @@ from arctic_platform.inference.utils import require_supported_vllm_version
 logger = logging.getLogger(__name__)
 
 
+def _weight_sync_names_are_strict() -> bool:
+    return os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") != "0"
+
+
 def _tensor_l2_sq(value: torch.Tensor, chunk_numel: int = 1 << 20) -> torch.Tensor:
     total = torch.zeros((), dtype=torch.float64, device=value.device)
     # reshape (not view) so non-contiguous parameters still checksum.
@@ -1038,14 +1042,17 @@ class WeightSyncExtension:
         from arctic_platform.inference.server.weight_sync.utils import compute_expected_hf_param_names
 
         sender_set = {n for n in sender_names if not _name_is_non_synced(n)}
+        ctx = f" [{context}]" if context else ""
         try:
             expected_set = compute_expected_hf_param_names(model)
         except Exception as exc:
-            logger.warning(
-                "Weight-sync name check skipped: failed to derive expected param names (%s).",
-                exc,
-            )
-            return
+            # A derivation failure leaves the names unchecked, so it answers to the
+            # same strict setting as a mismatch.
+            msg = f"Weight-sync name check could not derive expected param names{ctx}: {exc}"
+            if not _weight_sync_names_are_strict():
+                logger.warning("%s\n(non-strict mode: continuing unchecked)", msg)
+                return
+            raise RuntimeError(msg) from exc
 
         unexpected = sender_set - expected_set
         missing = expected_set - sender_set
@@ -1058,7 +1065,6 @@ class WeightSyncExtension:
             )
             return
 
-        ctx = f" [{context}]" if context else ""
         parts = [f"Weight-sync param name mismatch{ctx}:"]
         if unexpected:
             sample = sorted(unexpected)[:10]
@@ -1074,7 +1080,7 @@ class WeightSyncExtension:
             )
         parts.append(f"  (sender_count={len(sender_set)}, expected_count={len(expected_set)})")
         msg = "\n".join(parts)
-        if os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") == "0":
+        if not _weight_sync_names_are_strict():
             logger.warning("%s\n(non-strict mode: continuing despite mismatch)", msg)
             return
         raise RuntimeError(msg)
@@ -1181,14 +1187,30 @@ class WeightSyncExtension:
         return self._build_result(start, mem_before, "cpu_to_gpu", loaded)
 
     def compute_weight_norm(self) -> dict:
-        """Partial sum of squares of this TP rank's live parameters."""
+        """Partial sum of squares of this TP rank's live parameters.
+
+        ``tp_size`` rides along so the caller that adds these up can tell whether the
+        total is a whole model. A rank's parameters carry no usable mark of whether
+        a tensor is sharded or replicated: ``BasevLLMParameter`` stamps the TP world
+        size on every parameter it builds, including ``ReplicatedLinear`` weights
+        that each rank keeps whole, and ``FusedMoE`` reports ``tp_size=1`` under
+        expert parallelism while each rank owns a different set of experts.
+        """
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
         model = self.model_runner.model
-        sq_sum = 0.0
+        sq_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         num_params = 0
         for _, param in model.named_parameters():
-            sq_sum += param.detach().double().pow(2).sum().item()
+            # `_tensor_l2_sq` lands on the parameter's device, which is not this one
+            # once a parameter has been offloaded to the host.
+            sq_sum.add_(_tensor_l2_sq(param).to(sq_sum.device))
             num_params += 1
-        return {"sq_sum": sq_sum, "num_params": num_params}
+        return {
+            "sq_sum": sq_sum.item(),
+            "num_params": num_params,
+            "tp_size": get_tensor_model_parallel_world_size(),
+        }
 
     # ------------------------------------------------------------------
     # Cleanup

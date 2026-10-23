@@ -1816,8 +1816,24 @@ class InferenceWorker(StreamingWorkerMixin):
         return results[0] if results else {}
 
     async def compute_weight_norm(self) -> dict[str, Any]:
-        """Global L2 norm of the engine's live weights, summed across TP ranks."""
+        """Global L2 norm of the engine's live weights, summed across TP ranks.
+
+        Tensor parallelism is refused rather than estimated. Adding the ranks up is
+        only a whole model when every tensor is sharded, and a tensor each rank keeps
+        whole (an ``RMSNorm`` weight, a ``ReplicatedLinear`` weight, a row-parallel
+        bias) would land in the total once per rank. Callers compare this against the
+        training engine's norm, where a quietly inflated number reads as a broken
+        weight sync.
+        """
         results = await self.llm.collective_rpc("compute_weight_norm")
+        tp_size = max((r.get("tp_size", 1) for r in results), default=1)
+        if tp_size > 1:
+            raise RuntimeError(
+                "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                f"engine runs tensor_parallel_size={tp_size}. Replicated tensors would be "
+                "counted once per rank, so the norm would not be comparable to the "
+                "training engine's."
+            )
         sq_sum = sum(r["sq_sum"] for r in results)
         num_params = sum(r["num_params"] for r in results)
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
