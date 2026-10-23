@@ -26,10 +26,12 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.mrope_yarn import ensure_mrope_yarn_fix
     from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
     from arctic_platform.inference.vllm.spec_decode_grammar import ensure_spec_decode_grammar_fix
+    from arctic_platform.inference.vllm.xgrammar_request_errors import ensure_xgrammar_request_error_isolation
     from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
+    ensure_xgrammar_request_error_isolation()
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
     apply_dflash2_nan_fixes()
