@@ -248,18 +248,22 @@ class InstanceBase(ABC):
             budget    = min(pinned_cpu_bytes, allotment - pinned_cpu_bytes)
 
         Splits the parameter index into chunks of ``<= budget`` bytes
-        and caches the result on the worker.  Subsequent
-        ``restore_weights()`` calls execute the cached plan.
+        and caches the result on the worker.  If the host buffer is
+        pageable, also forms a small pinned ring on the worker
+        (``SEMIP_RING_BYTES``, ``SEMIP_RING_SLOTS``,
+        ``SEMIP_RING_COPY_THREADS``; ``SEMIP_RING_BYTES=0`` forms none).
+        Subsequent ``restore_weights()`` calls execute the cached plan.
         """
 
     @abstractmethod
     def restore_weights(self) -> InstanceBase:
-        """Copy staged weights from pinned CPU into model parameters.
+        """Copy staged weights from host memory into model parameters.
 
         Pure execution against the chunk plan cached by a prior
         ``plan_restore_weights()``.  For each chunk the worker copies
-        a slice of the pinned buffer into a single reused GPU staging
-        buffer (PCIe H2D) and then scatters into
+        a slice of the host buffer into a single reused GPU staging
+        buffer (PCIe H2D) -- through the pinned ring if the plan formed
+        one, directly otherwise -- and then scatters into
         ``model.named_parameters()`` in place.  When no plan is cached,
         falls back to a single-chunk path identical to the pre-chunk
         behavior.  The staging buffer is freed before returning.

@@ -2378,6 +2378,8 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     # boundaries are part of the contract, not formatting: attach() is what
     # puts the real pinned-buffer sizes on the handle, and
     # plan_restore_weights() reads them synchronously when it is called.
+    # No repin(): the host copy stays pageable, and plan_restore_weights()
+    # forms the small pinned ring restore_weights() stages it through.
     try:
         inst.criu_restore().wait()
         inst.cuda_restore(gpus=gpus).wait()
@@ -2385,7 +2387,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
         inst.attach().load_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
-        inst.repin().plan_restore_weights().wait()
+        inst.plan_restore_weights().wait()
         inst.restore_weights().wait()
         inst.wake_up_kv_cache().wait()
         inst.rebind_graphs().wait()
@@ -2688,7 +2690,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         inst.attach().load_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
-        inst.repin().plan_restore_weights().wait()
+        inst.plan_restore_weights().wait()
         inst.restore_weights().wait()
         inst.wake_up_kv_cache().wait()
         # Not rebind_graphs: the dump destroyed the graphs so that
@@ -3477,9 +3479,9 @@ class _SemiPEngine:
         # restore_weights() is not optional here: sleep() is level 2, which
         # frees the weight memory, and wake_up_weights() only re-allocates the
         # parameter tensors without repopulating them. Without it the model
-        # generates from uninitialized weights and never errors. Matches
-        # Orchestrator's wake sequence; no repin(), since the buffer stays
-        # pinned and the chunk plan cached at restore time still applies.
+        # generates from uninitialized weights and never errors. No
+        # plan_restore_weights() here: the chunk plan and the pinned ring
+        # formed at restore time stay on the workers across sleep.
         self._inst.wake_up_weights()
         self._inst.restore_weights()
         self._inst.wake_up_kv_cache()
