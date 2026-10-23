@@ -71,7 +71,7 @@ def engine(tmp_path, monkeypatch):
     calls = {"dump": 0, "restore": 0, "publish": []}
     paths = _paths(tmp_path)
     sys.modules["semip_logging"] = types.SimpleNamespace(
-        attach_pod_log=lambda names: None)
+        attach_pod_log=lambda names: None, tee_tree_to_ray=lambda: None)
     monkeypatch.setattr(se, "_vllm_config_from_engine_kwargs",
                         lambda kwargs: dict(CONFIG))
     monkeypatch.setattr(se, "_resolve_model_dir", lambda cfg: paths)

@@ -3014,6 +3014,14 @@ def _start_publish_nodes(paths: _ImagePaths, skeleton_dir: str | None,
                      name="semip-publish", daemon=True).start()
 
 
+def _tee_tree_to_ray() -> None:
+    """Copy the semi-p tree's output to this actor's stdout, Ray's file, as well
+    as the pod log. Before any Instance exists: its worker inherits the target.
+    """
+    import semip_logging  # on sys.path: this module imports Instance at the top
+    semip_logging.tee_tree_to_ray()
+
+
 def restore_and_wrap(engine_kwargs: dict[str, Any],
                      agents: list[Any] | None = None) -> "_SemiPEngine":
     """Bring a semi-p engine up and return a ``_SemiPEngine`` (blocking).
@@ -3053,6 +3061,7 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
     # Before any Instance exists: its worker inherits this environment. A job's
     # extra_env, applied to os.environ before this call, still overrides it.
     os.environ.setdefault(_UNPRIVILEGED_ENV, "1")
+    _tee_tree_to_ray()
 
     # On sys.path once the Instance import above has run. The actor's stdout is
     # Ray's per-worker file, so this is what puts the engine's lines in the pod
