@@ -113,6 +113,14 @@ def _pack_mlp(layer_sd: dict, prefix: str) -> None:
             ],
             f"{prefix}.mlp.shared_experts.gate_up_proj.weight",
         )
+        _fuse(
+            layer_sd,
+            [
+                f"{prefix}.mlp.shared_experts.gate_proj.weight_scale_inv",
+                f"{prefix}.mlp.shared_experts.up_proj.weight_scale_inv",
+            ],
+            f"{prefix}.mlp.shared_experts.gate_up_proj.weight_scale_inv",
+        )
         return
     _fuse(
         layer_sd,
@@ -121,6 +129,14 @@ def _pack_mlp(layer_sd: dict, prefix: str) -> None:
             f"{prefix}.mlp.up_proj.weight",
         ],
         f"{prefix}.mlp.gate_up_proj.weight",
+    )
+    _fuse(
+        layer_sd,
+        [
+            f"{prefix}.mlp.gate_proj.weight_scale_inv",
+            f"{prefix}.mlp.up_proj.weight_scale_inv",
+        ],
+        f"{prefix}.mlp.gate_up_proj.weight_scale_inv",
     )
 
 

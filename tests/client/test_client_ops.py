@@ -60,7 +60,7 @@ class FakeTransport(Transport):
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"results": ["ok"], "loss": 0.0}
+        return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -75,6 +75,20 @@ def _call(client, method: str, *args, **kwargs):
     if inspect.isawaitable(result):
         return asyncio.run(result)
     return result
+
+
+def _stop_stream_after_one_event(stream) -> None:
+    """Read one event from a sync or async stream, then close it early."""
+    if not inspect.isasyncgen(stream):
+        next(stream)
+        stream.close()
+        return
+
+    async def drive():
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(drive())
 
 
 def _build(monkeypatch, cls):
@@ -154,7 +168,7 @@ class TestOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/x", "step": 2}
+        assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -242,6 +256,12 @@ class TestLifecycle:
         with pytest.raises(ValueError, match="No training job"):
             JobHandles().require("training")
 
+    def test_require_any_returns_the_first_live_job(self):
+        """require_any picks any initialized job and fails when none exists."""
+        assert JobHandles(sampling=SAMPLING, log_prob=LOG_PROB).require_any() == SAMPLING
+        with pytest.raises(ValueError, match="No job initialized"):
+            JobHandles().require_any()
+
 
 class TestServerState:
     """Reconnect handoff: a client can expose (and reattach via) the transport's
@@ -309,6 +329,7 @@ class TestOpRegistry:
         _call(rl_client, "save_checkpoint")
         _call(rl_client, "load_checkpoint")
         _call(rl_client, "generate", ["hi"])
+        _stop_stream_after_one_event(rl_client.generate_stream(["hi"]))  # submit, poll, cancel
         _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
         n_before = len(rl_client.transport.calls)
@@ -350,8 +371,19 @@ class TestClusterRequestBuilders:
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
+                ),
+            ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
             (
                 cluster_requests.export_checkpoint_request("job-1", "step-1"),
@@ -381,6 +413,7 @@ class TestClusterRequestBuilders:
         requests = (
             cluster_requests.list_jobs_request(),
             cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
             cluster_requests.cancel_job_request("job"),
             cluster_requests.capacity_request(),
             cluster_requests.list_checkpoints_request("job"),
@@ -390,6 +423,37 @@ class TestClusterRequestBuilders:
         )
         assert {request.op for request in requests} == CLUSTER_OPS
         assert CLUSTER_OPS.isdisjoint(OPS)
+
+
+class TestClusterClientMethods:
+    def test_account_ops_use_the_given_arguments(self, client):
+        """Account-level ops need no stored handle."""
+        _call(client, "list_jobs", "running")
+        assert _last(client) == cluster_requests.list_jobs_request("running")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
+        _call(client, "cancel_job", "job-9")
+        assert _last(client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, client):
+        _call(client, "get_job")
+        assert _last(client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, client):
+        _call(client, "list_checkpoints")
+        assert _last(client) == cluster_requests.list_checkpoints_request(TRAINING)
+        _call(client, "export_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        _call(client, "delete_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
 
 
 class TestTransportSelection:
@@ -660,13 +724,23 @@ class TestCortexTransportNoopOps:
         assert t.call(Request("wake-inference", 1, None)) == {}
         assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
 
+    def test_wake_inference_tag_list_is_a_noop(self, monkeypatch):
+        """sync_weights wakes with a bare tag list as the body; it must not be read as a dict."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        t = CortexTransport(CortexConfig(base_url="http://mock"))
+        assert t.call(cluster_requests.wake_inference_request(JobHandles(sampling=SAMPLING), ["weights"])) == {}
+        assert asyncio.run(t.acall(Request("wake-inference", SAMPLING, ["kv_cache"]))) == {}
+
 
 class TestCortexCancelToleratesEmptyBody:
     """``:cancel`` answers 200 with no body. Decoding that as JSON reported a
     release that had in fact succeeded as ``could not release <id>``, which
     points the operator at the GPU cap instead of at their freed GPUs."""
 
-    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
         pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
@@ -675,24 +749,27 @@ class TestCortexCancelToleratesEmptyBody:
         t = CortexTransport(CortexConfig())
 
         class _EmptyResp:
-            status_code = 200
-            content = b""
+            status = 200
 
-            def raise_for_status(self):
+            async def read(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
                 return None
-
-            def json(self):
-                raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
         sent = {}
 
-        def _request(method, url, **kwargs):
-            sent["method"], sent["url"] = method, url
-            return _EmptyResp()
+        class _Session:
+            def request(self, method, url, **kwargs):
+                sent["method"], sent["url"] = method, url
+                return _EmptyResp()
 
-        monkeypatch.setattr(t.session, "request", _request)
+        t._session = _Session()
 
-        t.cancel_job("job-abc")
+        t.call(cluster_requests.cancel_job_request("job-abc"))
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")
@@ -769,6 +846,41 @@ class TestCortexSharedHelper:
         assert moved_adv[0][loss_mask[0]].tolist() == [0.5, 0.5]
         # No advantage may survive on a padding column.
         assert torch.equal((moved_adv != 0), loss_mask)
+
+    def test_explicit_old_log_probs_ride_the_alignment(self):
+        """A caller-supplied pi_old has to move with the tokens it scored."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+        old = torch.tensor([[0.0, 0.0, -0.1, -0.2], [0.0, 0.0, -0.7, -0.8]], dtype=torch.float64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": resp_mask.to(torch.float32),
+                    "response_mask": resp_mask,
+                    "old_log_probs": torch.full((2, 4), -9.0),
+                },
+                "meta": {"temperature": 0.7, "calculate_entropy": True},
+            },
+            old_log_probs_shifted=old,
+        )
+        sent = out["context"]["old_log_probs_shifted"]
+        assert sent.dtype == torch.float32
+        assert out["context"]["temperature"] == 0.7
+        assert out["context"]["calculate_entropy"] is True
+        assert "temperature" not in out["kwargs"]
+        assert "calculate_entropy" not in out["kwargs"]
+        loss_mask = out["context"]["loss_mask"]
+        assert sent[1][loss_mask[1]].tolist() == pytest.approx([-0.7, -0.8])
+        assert sent[0][loss_mask[0]].tolist() == pytest.approx([-0.1, -0.2])
+        # The batch's own ``old_log_probs`` are still dropped.
+        assert "old_log_probs" not in out["kwargs"]
 
     def test_already_aligned_batch_is_passed_through(self):
         """An already-conformant batch must not pay for
