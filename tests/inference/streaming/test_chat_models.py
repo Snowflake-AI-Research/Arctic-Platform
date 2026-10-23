@@ -191,13 +191,6 @@ def test_reasoning_effort_reaches_the_template_as_the_family_names_it(
 
 
 @pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
-@pytest.mark.parametrize("effort", sorted(REASONING_EFFORTS - {"none"}))
-def test_the_table_never_maps_a_level_the_template_knows(architecture, effort):
-    model = replace(CHAT_MODELS[architecture], recognized_efforts=frozenset({effort}))
-    assert model.template_reasoning_effort(effort) == effort
-
-
-@pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
 def test_every_effort_table_ends(architecture):
     # template_reasoning_effort follows the table until it reaches a level the
     # table leaves alone, so a cycle would never return.
@@ -257,11 +250,19 @@ def test_every_chat_model_lists_the_efforts_its_template_takes():
 
 
 @pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
-@pytest.mark.parametrize("effort", sorted(REASONING_EFFORTS - {"none"}))
-def test_every_accepted_effort_reaches_a_level_the_template_takes(architecture, effort):
+def test_effort_mapping_stays_inside_the_template(architecture):
+    """Every effort reaches a level the template takes, and never remaps a known one.
+
+    One case per architecture, looping the efforts, instead of an architecture ×
+    effort pytest matrix that collected the same checks twice.
+    """
     accepted = TEMPLATE_EFFORTS[architecture]
-    level = CHAT_MODELS[architecture].template_reasoning_effort(effort)
-    assert accepted is ANY or level in accepted
+    model = CHAT_MODELS[architecture]
+    for effort in sorted(REASONING_EFFORTS - {"none"}):
+        level = model.template_reasoning_effort(effort)
+        assert accepted is ANY or level in accepted
+        known = replace(model, recognized_efforts=frozenset({effort}))
+        assert known.template_reasoning_effort(effort) == effort
 
 
 @pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
