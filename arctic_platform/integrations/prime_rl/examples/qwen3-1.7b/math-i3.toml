@@ -1,0 +1,66 @@
+# Qwen3-1.7B math — back to the stock PrimeIntellect recipe dataset. The qwen3-30b-a3b example
+# (examples/advanced/qwen3-30b-a3b/math.toml) trains on the `i3_math` taskset =
+# PrimeIntellect/INTELLECT-3-RL (math subset), scored deterministically by math-verify run in the
+# rollout runtime (no judge -> Cortex-safe, no PRIME_API_KEY needed). We swap the model down to
+# Qwen3-1.7B with batch 64 groups x group_size 8 = 512 rollouts/step. Caveat: INTELLECT-3-RL math
+# carries some wrong gold labels, which caps achievable reward; kept here because it is the dataset
+# the stock recipe ships with. i3_math has a built-in difficulty filter (default column
+# avg@8_qwen3_4b_instruct_2507, keeps all rows that have it) — left at default.
+
+# Qwen3-1.7B caps at max_position_embeddings=40960 (rope_scaling null), so seq_len must stay under it
+# — mirror the stock qwen3-30b-a3b recipe's 32768 (73728 like the 4B VLM is rejected as invalid_config).
+seq_len = 32768
+max_steps = 300
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-1.7B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 64   # 64 question-groups x group_size 8 = 512 rollouts/step
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 32768   # within Qwen3-1.7B's 40960 window; matches the stock 30b recipe
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "difficulty_pool" }
+
+[cortex.training]
+model_provider = "default"
+
+# Qwen3-1.7B is a dense text model — no `language_model_only` (that flag selects the LM tower of a
+# VLM like Qwen3.5-4B and is meaningless / an init-crash risk on a dense model).
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
