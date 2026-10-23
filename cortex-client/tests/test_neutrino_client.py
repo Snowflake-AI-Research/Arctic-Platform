@@ -1115,6 +1115,122 @@ class TestDataPlane:
         body = _wire_load(c._session.post.call_args.kwargs["data"])
         assert body == {"prompts": ["x"], "strict": False}
 
+    @pytest.mark.parametrize("wait_seconds", [None, 0])
+    def test_generate_without_wait_sends_no_param_or_timeout(self, wait_seconds):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1"})
+        c.generate("j1", prompts=["x"], wait_seconds=wait_seconds)
+        kwargs = c._session.post.call_args.kwargs
+        assert "params" not in kwargs
+        assert "timeout" not in kwargs
+
+    def test_generate_wait_sends_param_and_longer_read_timeout(self):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1"})
+        c.generate("j1", prompts=["x"], wait_seconds=40)
+        kwargs = c._session.post.call_args.kwargs
+        assert kwargs["params"] == {"wait_seconds": 40}
+        assert kwargs["timeout"] == 70
+
+    def test_generate_wait_only_on_final_chunk(self):
+        c = _make_client()
+        c._MAX_GENERATE_BYTES = 64 * 1024
+        c._session.post.side_effect = [
+            _make_response({"chunk_cached": True}),
+            _make_response({"request_id": "g1", "job_id": "j1"}),
+        ]
+        c.generate("j1", prompts=["x" * (70 * 1024)], wait_seconds=10)
+        first, last = c._session.post.call_args_list
+        assert "params" not in first.kwargs
+        assert "timeout" not in first.kwargs
+        assert last.kwargs["params"] == {"wait_seconds": 10}
+
+    def test_generate_wait_rejects_negative(self):
+        c = _make_client()
+        with pytest.raises(ValueError, match="wait_seconds"):
+            c.generate("j1", prompts=["x"], wait_seconds=-1)
+        c._session.post.assert_not_called()
+
+    def test_generate_wait_old_server_reply_polls(self, monkeypatch):
+        c = _make_client(
+            post_json={"request_id": "g1", "job_id": "j1"},
+            get_json={"status": "done", "result": {"results": [{"text": "ok"}]}},
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c.poll_request("j1", rid) == {"results": [{"text": "ok"}]}
+        c._session.get.assert_called_once()
+
+    def test_generate_wait_done_reply_needs_no_poll(self, monkeypatch):
+        c = _make_client(
+            post_json={
+                "request_id": "g1",
+                "job_id": "j1",
+                "status": "REQUEST_STATE_DONE",
+                "result": {"results": [{"text": "ok"}]},
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c.poll_request("j1", rid) == {"results": [{"text": "ok"}]}
+        c._session.get.assert_not_called()
+        assert c._finished_generate_replies == {}
+
+    def test_generate_wait_failed_reply_raises_on_poll(self, monkeypatch):
+        c = _make_client(
+            post_json={"request_id": "g1", "job_id": "j1", "status": "failed", "error": "boom"}
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        with pytest.raises(RuntimeError, match="boom"):
+            c.poll_request("j1", rid)
+        c._session.get.assert_not_called()
+
+    def test_generate_wait_running_reply_polls(self, monkeypatch):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1", "status": "running"})
+        c._session.get.side_effect = [
+            _make_response({"status": "running"}),
+            _make_response({"status": "done", "result": {"results": []}}),
+        ]
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c._finished_generate_replies == {}
+        assert c.poll_request("j1", rid) == {"results": []}
+        assert c._session.get.call_count == 2
+
+    def test_generate_wait_done_reply_with_cursor_drains_rest(self, monkeypatch):
+        c = _make_client(
+            post_json={
+                "request_id": "g1",
+                "job_id": "j1",
+                "status": "done",
+                "events": [],
+                "next_cursor": "c1",
+            },
+            get_json={"status": "done", "result": {"results": []}},
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c.poll_request("j1", rid) == {"results": []}
+        assert c._session.get.call_args.kwargs["params"] == {"cursor": "c1"}
+
+    def test_generate_wait_bounds_kept_replies(self):
+        c = _make_client()
+        c._MAX_FINISHED_GENERATE_REPLIES = 2
+        c._session.post.side_effect = [
+            _make_response({"request_id": rid, "job_id": "j1", "status": "done"})
+            for rid in ("g1", "g2", "g3")
+        ]
+        for _ in range(3):
+            c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert list(c._finished_generate_replies) == ["g2", "g3"]
+
+    def test_generate_wait_read_timeout_raises(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._session.post.side_effect = nc.requests.exceptions.ReadTimeout("read timed out")
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c._session.post.call_args.kwargs["timeout"] == 70
+
     def test_generate_stream_full_payload(self):
         c = _make_client(post_json={"request_id": "s1", "count": 2})
         out = c.generate_stream(

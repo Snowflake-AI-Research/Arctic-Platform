@@ -906,6 +906,7 @@ class NeutrinoClient:
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
         self._generate_request_ids: set[str] = set()
+        self._finished_generate_replies: dict[str, dict] = {}
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -1299,6 +1300,12 @@ class NeutrinoClient:
     # fast client-side with a clear message.
     _MAX_GENERATE_BYTES = 60 * 1024 * 1024  # 60 MB
 
+    # With ``wait_seconds``, the read timeout must outlast the server's wait.
+    _GENERATE_WAIT_READ_MARGIN_S = 30.0
+    # Bounds memory for finished generate replies that are never polled; a
+    # dropped entry only costs one normal poll.
+    _MAX_FINISHED_GENERATE_REPLIES = 1024
+
     def _check_generate_payload(self, op: str, body: bytes) -> None:
         if len(body) > self._MAX_GENERATE_BYTES:
             size_mb = len(body) / (1024 * 1024)
@@ -1386,6 +1393,7 @@ class NeutrinoClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        final_send_kwargs: dict[str, Any] | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -1405,6 +1413,8 @@ class NeutrinoClient:
         final_body: dict | None = None
         while idx < len(chunks):
             chunk = chunks[idx]
+            # Only the final POST starts the generation, so only it waits.
+            send_kwargs = (final_send_kwargs or {}) if idx == len(chunks) - 1 else {}
             try:
                 resp = self._send(
                     "POST",
@@ -1417,6 +1427,7 @@ class NeutrinoClient:
                         else _is_transient
                     ),
                     debug_context=debug_context,
+                    **send_kwargs,
                 )
             except requests.exceptions.HTTPError as exc:
                 detail = _chunk_group_error_detail(exc.response)
@@ -1507,6 +1518,7 @@ class NeutrinoClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        wait_seconds: float | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -1525,7 +1537,15 @@ class NeutrinoClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        With ``wait_seconds > 0`` the server may hold the call up to that long
+        (it caps the wait at 40 s). If the generation finishes within the
+        wait, the reply is kept and the next :meth:`poll_request` returns it
+        without an API call. Servers that do not support the wait reply as
+        before, and :meth:`poll_request` polls as usual.
         """
+        if wait_seconds is not None and wait_seconds < 0:
+            raise ValueError("wait_seconds must be >= 0")
         payload: dict = {"prompts": prompts}
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params
@@ -1544,9 +1564,23 @@ class NeutrinoClient:
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            final_send_kwargs=(
+                {
+                    "params": {"wait_seconds": wait_seconds},
+                    "timeout": wait_seconds + self._GENERATE_WAIT_READ_MARGIN_S,
+                }
+                if wait_seconds
+                else None
+            ),
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
+        state = self._normalize_request_status(response.get("status") or "")
+        if state in ("completed", "done", "succeeded", "failed", "cancelled", "canceled"):
+            replies = self._finished_generate_replies
+            replies[request_id] = self._decode_stream_result_events(response)
+            if len(replies) > self._MAX_FINISHED_GENERATE_REPLIES:
+                replies.pop(next(iter(replies)))
         return request_id
 
     def generate_stream(
@@ -1987,8 +2021,12 @@ class NeutrinoClient:
         )
         result_chunks: list[bytes] = []
         cursor: str | None = None
+        finished_reply = self._finished_generate_replies.pop(request_id, None)
         while time.monotonic() < deadline:
-            status = self.get_request_status(job_id, request_id, cursor=cursor)
+            if finished_reply is not None:
+                status, finished_reply = finished_reply, None
+            else:
+                status = self.get_request_status(job_id, request_id, cursor=cursor)
             state = self._normalize_request_status(status.get("status", ""))
             events = status.get("events") or []
             received_chunk = False
