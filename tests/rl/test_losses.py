@@ -56,6 +56,7 @@ from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_ROLLOUT
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_METRICS
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_RECOMPUTE
 from arctic_platform.rl.processors.grpo import _apply_m2po_masking
+from arctic_platform.rl.processors.grpo import _grpo_metrics_callback
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
 from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
 from arctic_platform.rl.processors.grpo import _sampler_kl
@@ -1240,13 +1241,22 @@ class TestMigratedGrpo(TestCasePlus):
             runs = {}
             for coef in (0.0, 0.25):
                 values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
-                loss, _ = LOSS_FNS[name]({"logprobs": values}, context, {}, {**config, "sampler_kl_coef": coef}, "cpu")
+                loss, metrics = LOSS_FNS[name](
+                    {"logprobs": values}, context, {}, {**config, "sampler_kl_coef": coef}, "cpu"
+                )
                 loss.backward()
-                runs[coef] = (loss.detach(), values.grad)
+                runs[coef] = (loss.detach(), values.grad, metrics)
             with self.subTest(name=name):
                 k1 = torch.where(sampled, sampler_logprobs - values.detach(), 0.0).sum() / 4
                 torch_assert_close(runs[0.25][0] - runs[0.0][0], 0.25 * k1)
                 torch_assert_close(runs[0.25][1] - runs[0.0][1], torch.where(sampled, -0.25 / 4, 0.0))
+                self.assertFalse(any(key.startswith("sampler_kl") for key in runs[0.0][2]))
+                metrics = dict(runs[0.25][2])
+                self.assertEqual(metrics["sampler_kl_coef"], 0.25)
+                self.assertEqual(metrics["sampler_kl_token_count"], float(sampled.sum()))
+                self.assertAlmostEqual(metrics["sampler_kl_sum"], float(k1 * 4), places=6)
+                _grpo_metrics_callback([], metrics)
+                self.assertAlmostEqual(metrics["sampler_kl"], float(k1 * 4 / sampled.sum()), places=6)
         context.pop("nll_mask")
         for key, invalid in (
             ("sampler_kl_coef", -0.01),

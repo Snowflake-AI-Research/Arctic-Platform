@@ -148,6 +148,8 @@ def _source_statistics(stat: dict, mask: torch.Tensor) -> dict[str, float]:
 
 
 def _grpo_metrics_callback(_worker_metrics: Sequence[dict], metrics: dict) -> None:
+    if {"sampler_kl_sum", "sampler_kl_token_count"}.issubset(metrics):
+        metrics["sampler_kl"] = float(metrics["sampler_kl_sum"]) / max(float(metrics["sampler_kl_token_count"]), 1.0)
     totals = {
         "grpo_stats_token_count",
         "grpo_importance_weight_sum",
@@ -484,6 +486,8 @@ def _internal_grpo_loss_fn(
                 teacher_log_ratio_sum=0.0,
                 teacher_clipped_log_ratio_sum=0.0,
             )
+        if sampler_kl_coef > 0.0:
+            metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
         return zero_loss, metrics
 
     # Degenerate-shard logprob sanitization. Under Ulysses SP a short/padded batch
@@ -553,6 +557,8 @@ def _internal_grpo_loss_fn(
         metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
             metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
+        if sampler_kl_coef > 0.0:
+            metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
     else:
         if use_sapo_loss and use_cispo_loss:
             raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
@@ -698,6 +704,13 @@ def _internal_grpo_loss_fn(
             loss = loss + sampler_kl_coef * sampler_kl_loss
 
         stats_mask = loss_mask if nll_mask is None else loss_mask & ~nll_mask
+        sampler_kl_metrics = {}
+        if sampler_kl_coef > 0.0:
+            sampler_kl_metrics = {
+                "sampler_kl_coef": sampler_kl_coef,
+                "sampler_kl_token_count": float(stats_mask.sum()),
+                "sampler_kl_sum": float(torch.where(stats_mask, sampler_kl.detach().double(), 0.0).sum()),
+            }
         metrics = {
             "approx_kl": _masked_mean_float(stat["approx_kl"].detach(), stats_mask),
             "importance_weight": _masked_mean_float(stat["importance_weight"].detach(), stats_mask),
@@ -707,6 +720,7 @@ def _internal_grpo_loss_fn(
         metrics.update(_source_statistics(stat, stats_mask))
         metrics["grpo_entropy_sum"] = float(torch.where(stats_mask, entropy.double(), 0.0).sum())
         metrics.update(stat.get("ratio_mask_metrics", {}))
+        metrics.update(sampler_kl_metrics)
         if nll_mask is not None:
             metrics.update(
                 nll_trainable_token_count=float(nll_mask.sum()),
