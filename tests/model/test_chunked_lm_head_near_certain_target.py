@@ -27,6 +27,8 @@ import torch
 
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
 
 VOCAB_SIZE = 64
 LABELS = torch.tensor([5, 37, 60])
@@ -52,7 +54,7 @@ def test_near_certain_target_matches_float64_log_softmax(kind, margin):
     Float64's own rounding is ``2.2e-16 * exp(margin)`` relative, 1.1e-7 at the largest margin here, so the
     reference holds well inside the bound. The pre-fix heads report 0 from a margin of 14 on.
     """
-    torch.manual_seed(0)
+    set_seed(0)
     logits = torch.randn(len(LABELS), VOCAB_SIZE)
     rows = torch.arange(len(LABELS))
     others = logits.clone()
@@ -69,8 +71,8 @@ def test_near_certain_target_matches_float64_log_softmax(kind, margin):
     expected = log_probs[rows, LABELS]
     expected.sum().backward()
 
-    torch.testing.assert_close(actual.reshape(-1).double(), expected.detach(), rtol=1e-5, atol=0.0)
-    torch.testing.assert_close(hidden.grad.reshape(len(LABELS), -1).double(), reference.grad, rtol=1e-5, atol=1e-30)
+    torch_assert_close(actual.reshape(-1).double(), expected.detach(), rtol=1e-5, atol=0.0)
+    torch_assert_close(hidden.grad.reshape(len(LABELS), -1).double(), reference.grad, rtol=1e-5, atol=1e-30)
     if entropy is not None:
         expected_entropy = -(log_probs.exp() * log_probs).sum(-1).detach()
-        torch.testing.assert_close(entropy.reshape(-1).double(), expected_entropy, rtol=0.0, atol=1e-5)
+        torch_assert_close(entropy.reshape(-1).double(), expected_entropy, rtol=0.0, atol=1e-5)
