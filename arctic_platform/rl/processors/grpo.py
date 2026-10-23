@@ -688,9 +688,11 @@ def _internal_grpo_loss_fn(
             # NLL targets were not sampled, so they carry no term.
             if nll_mask is not None:
                 sampler_kl = torch.where(nll_mask, 0.0, sampler_kl)
+            # The client's mask, not the M2PO-shrunk one: tokens dropped from the policy term keep their anchor,
+            # as they do under the ratio masks, which leave loss_mask unchanged.
             sampler_kl_loss = agg_loss(
                 sampler_kl,
-                loss_mask,
+                policy_loss_mask,
                 loss_agg_mode=loss_agg_mode,
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
@@ -706,10 +708,11 @@ def _internal_grpo_loss_fn(
         stats_mask = loss_mask if nll_mask is None else loss_mask & ~nll_mask
         sampler_kl_metrics = {}
         if sampler_kl_coef > 0.0:
+            sampler_kl_mask = policy_loss_mask if nll_mask is None else policy_loss_mask & ~nll_mask
             sampler_kl_metrics = {
                 "sampler_kl_coef": sampler_kl_coef,
-                "sampler_kl_token_count": float(stats_mask.sum()),
-                "sampler_kl_sum": float(torch.where(stats_mask, sampler_kl.detach().double(), 0.0).sum()),
+                "sampler_kl_token_count": float(sampler_kl_mask.sum()),
+                "sampler_kl_sum": float(torch.where(sampler_kl_mask, sampler_kl.detach().double(), 0.0).sum()),
             }
         metrics = {
             "approx_kl": _masked_mean_float(stat["approx_kl"].detach(), stats_mask),
