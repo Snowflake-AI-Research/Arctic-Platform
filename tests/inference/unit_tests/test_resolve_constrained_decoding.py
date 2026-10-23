@@ -248,7 +248,9 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
     import arctic_platform.inference.server.worker as worker_module
     from arctic_platform.inference.server.scheduler import Scheduler
 
-    collector = SimpleNamespace(drain_snapshots=lambda: [{"timestamp": 1.0}])
+    collector = SimpleNamespace(
+        drain_snapshots=lambda: [{"timestamp": 1.0}], totals=lambda: {}
+    )
     monkeypatch.setattr(worker_module, "get_collector", lambda: collector)
     WorkerClass = worker_module.InferenceWorker.__ray_metadata__.modified_class
     worker = _new_worker(WorkerClass)
