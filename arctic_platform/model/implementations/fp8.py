@@ -49,7 +49,7 @@ def keeps_fp32(tensor: Tensor) -> bool:
     return bool(getattr(tensor, KEEP_FP32_ATTR, False))
 
 
-_FP8_STORAGE_DTYPES = ("float8_e4m3fn", "float8_e5m2")
+_FP8_STORAGE_DTYPES = ("float8_e4m3fn", "float8_e5m2", "float8_e8m0fnu")
 
 
 def _fp8_storage_dtypes() -> tuple:
