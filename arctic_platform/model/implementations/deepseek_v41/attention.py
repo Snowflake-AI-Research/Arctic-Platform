@@ -314,8 +314,7 @@ class DeepseekV41Indexer(nn.Module):
         query = self.wq_b(query_residual).view(batch, queries, self.num_heads, self.head_dim)
         query = _rotate(query, rope_cache, packed.position_ids)
         weights = self.weights_proj(hidden) * self.score_scale
-        scores = torch.einsum("bqhd,bed->bqhe", query.float(), keys.float())
-        scores = (scores.relu() * weights.unsqueeze(-1).float()).sum(dim=2)
+        scores = _index_scores(query, keys, weights)
         visible, causal_len = _visible_entries(layout, packed, self.compress_ratio)
         candidates = None
         if self.is_candidate_source:
@@ -333,6 +332,30 @@ class DeepseekV41Indexer(nn.Module):
             visible = visible & shared.candidates[0]
         topk = _topk_indices(scores[0], visible, self.index_topk).unsqueeze(0)
         return topk, keys if self.owns_k else None, candidates
+
+
+_INDEX_SCORE_CHUNK_BYTES = 1 << 30
+
+
+def _index_scores(query: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Head-weighted ReLU scores ``(b, q, e)``, chunked over queries.
+
+    The per-head product is ``(b, q, h, e)`` fp32, which at long context dwarfs everything else in
+    the layer, so it is only ever materialized for a slice of queries.
+    """
+    batch, queries, heads, _ = query.shape
+    entries = keys.shape[1]
+    keys = keys.float()
+    weights = weights.float()
+    chunk = max(1, _INDEX_SCORE_CHUNK_BYTES // max(1, batch * heads * entries * 4))
+    if chunk >= queries:
+        return (torch.einsum("bqhd,bed->bqhe", query.float(), keys).relu() * weights.unsqueeze(-1)).sum(dim=2)
+    scores = query.new_empty(batch, queries, entries, dtype=torch.float32)
+    for start in range(0, queries, chunk):
+        end = min(start + chunk, queries)
+        part = torch.einsum("bqhd,bed->bqhe", query[:, start:end].float(), keys).relu()
+        scores[:, start:end] = (part * weights[:, start:end].unsqueeze(-1)).sum(dim=2)
+    return scores
 
 
 def _visible_entries(layout, packed: PackedContext, ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
