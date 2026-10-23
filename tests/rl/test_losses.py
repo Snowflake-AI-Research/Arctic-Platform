@@ -1292,6 +1292,35 @@ class TestMigratedGrpo(TestCasePlus):
             "cpu",
         )
 
+    def test_sampler_kl_anchors_tokens_dropped_by_m2po_and_ratio_masks(self):
+        sampler_logprobs = torch.tensor([[-1.5, -1.0, -0.5, -2.0]])
+        mask = torch.ones((1, 4), dtype=torch.bool)
+        context = {
+            "old_log_probs_shifted": sampler_logprobs,
+            # Token 3's proximal log-prob is far from the sampler's, so M2PO drops it from the policy term.
+            "prox_logp_shifted": torch.tensor([[-1.5, -1.0, -0.5, -4.0]]),
+            "advantages": torch.tensor([[1.0, -1.0, 1.0, -1.0]]),
+            "loss_mask": mask,
+        }
+        values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]])
+        self.assertFalse(_apply_m2po_masking(sampler_logprobs, context["prox_logp_shifted"], mask, 0.5)[0, 3])
+        self.assertFalse(_apply_m2po_masking(sampler_logprobs, values, mask, 0.1).all())
+        for masking in (
+            {"m2_threshold": 0.5},
+            {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_m2_threshold": 0.1},
+        ):
+            runs = {}
+            for coef in (0.0, 0.25):
+                logprobs = values.clone().requires_grad_()
+                loss, metrics = grpo_loss(
+                    {"logprobs": logprobs}, context, {}, {**masking, "sampler_kl_coef": coef}, "cpu"
+                )
+                loss.backward()
+                runs[coef] = (logprobs.grad, metrics)
+            with self.subTest(**masking):
+                torch_assert_close(runs[0.25][0] - runs[0.0][0], torch.full((1, 4), -0.25 / 4))
+                self.assertEqual(runs[0.25][1]["sampler_kl_token_count"], 4.0)
+
     def test_sampler_kl_estimators_give_the_kl_gradient_in_expectation_and_cap_their_tails(self):
         # Exact expectation over a categorical sampler q: E_q[d k(log p - log q) / dz] vs d KL(q || p) / dz = p - q.
         q = torch.tensor([0.5, 0.3, 0.15, 0.05])
