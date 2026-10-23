@@ -158,6 +158,42 @@ def assign_row_lpt(costs: Sequence[int], num_shards: int) -> list[list[int]]:
     return assignment
 
 
+def _pack_groups(sizes, costs, order, num_shards, cap):
+    """Place groups in ``order``, cheapest rank first, backtracking on a dead end.
+
+    The first pass is the greedy min-cost placement, so the result matches the
+    greedy pass whenever that pass fits every group. Backtracking only runs after a
+    dead end. Ranks with the same row count and cost are interchangeable, so a
+    dead end skips ranks that match one already tried. Returns ``{group: rank}``
+    or ``None``.
+    """
+    rows = [0] * num_shards
+    rank_costs = [0.0] * num_shards
+    placed: dict[int, int] = {}
+
+    def place(pos: int) -> bool:
+        if pos == len(order):
+            return True
+        index = order[pos]
+        tried = set()
+        for rank in sorted(range(num_shards), key=lambda candidate: (rank_costs[candidate], candidate)):
+            state = (rows[rank], rank_costs[rank])
+            if rows[rank] + sizes[index] > cap or state in tried:
+                continue
+            tried.add(state)
+            saved_rows, saved_cost = rows[rank], rank_costs[rank]
+            rows[rank] += sizes[index]
+            rank_costs[rank] += float(costs[index])
+            placed[index] = rank
+            if place(pos + 1):
+                return True
+            rows[rank], rank_costs[rank] = saved_rows, saved_cost
+            del placed[index]
+        return False
+
+    return placed if place(0) else None
+
+
 def assign_zorro_groups(
     groups: Sequence[Sequence[int]],
     costs: Sequence[float],
@@ -191,32 +227,22 @@ def assign_zorro_groups(
 
     cap = num_rows // num_shards
     order = sorted(range(len(groups)), key=lambda i: (len(groups[i]), costs[i]), reverse=True)
-    bins: list[list[int]] = [[] for _ in range(num_shards)]
-    bin_rows = [0] * num_shards
-    bin_costs = [0.0] * num_shards
     for index in order:
-        group = list(groups[index])
-        size = len(group)
+        size = len(groups[index])
         if size > cap:
             raise ValueError(
                 f"prompt group of {size} rows does not fit in a rank cap of {cap} "
                 f"(batch_size={num_rows}, num_shards={num_shards})"
             )
-        ranked = sorted(range(num_shards), key=lambda rank: bin_costs[rank])
-        chosen = next((rank for rank in ranked if bin_rows[rank] + size <= cap), None)
-        if chosen is None:
-            raise ValueError(
-                f"prompt group of {size} rows does not fit in any rank "
-                f"(batch_size={num_rows}, num_shards={num_shards}, cap={cap})"
-            )
-        bins[chosen].extend(group)
-        bin_rows[chosen] += size
-        bin_costs[chosen] += float(costs[index])
-    for rank, count in enumerate(bin_rows):
-        if count != cap:
-            raise ValueError(
-                f"rank {rank} has {count} rows after group assignment; expected {cap}"
-            )
+    placed = _pack_groups([len(group) for group in groups], costs, order, num_shards, cap)
+    if placed is None:
+        raise ValueError(
+            f"prompt groups do not fit into {num_shards} ranks of {cap} rows "
+            f"(batch_size={num_rows}, num_shards={num_shards})"
+        )
+    bins: list[list[int]] = [[] for _ in range(num_shards)]
+    for index in order:
+        bins[placed[index]].extend(list(groups[index]))
     return bins
 
 

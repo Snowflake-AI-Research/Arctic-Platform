@@ -42,6 +42,12 @@ def test_zorro_groups_stay_intact_and_adjacent():
     assert assignment == [[2, 3, 0, 1], [4, 5, 6, 7]]
 
 
+def test_zorro_groups_backtrack_when_greedy_dead_ends():
+    groups = [[0, 1, 2], [3, 4, 5], [6, 7], [8, 9], [10, 11]]
+    assignment = assign_zorro_groups(groups, [1.0] * 5, num_shards=2, num_rows=12)
+    assert {frozenset(rows) for rows in assignment} == {frozenset(range(6)), frozenset(range(6, 12))}
+
+
 def test_zorro_groups_raise_when_the_batch_does_not_divide():
     try:
         assign_zorro_groups([[0, 1], [2]], [1.0, 1.0], num_shards=2, num_rows=3)
@@ -166,65 +172,6 @@ def test_per_row_lists_follow_the_tensor_assignment():
     assert sorted(seen) == ["a", "b", "c", "d"]
 
 
-def _reorg_global_batch():
-    """Load ``reorg_global_batch`` without importing the RL package.
-
-    That package init requires the ``[sft]`` extra, and this module imports
-    ``tensordict`` only for a different function. The dev interpreter has neither.
-    """
-    import importlib.util
-    import types
-
-    import arctic_platform
-
-    root = Path(arctic_platform.__file__).resolve().parent
-    created = []
-
-    def install(name, module):
-        if name not in sys.modules:
-            sys.modules[name] = module
-            created.append(name)
-
-    tensordict = types.ModuleType("tensordict")
-    tensordict.TensorDict = dict
-    install("tensordict", tensordict)
-
-    rl = types.ModuleType("arctic_platform.rl")
-    rl.__path__ = [str(root / "rl")]
-    rl.__package__ = "arctic_platform.rl"
-    install("arctic_platform.rl", rl)
-
-    utils = types.ModuleType("arctic_platform.rl.utils")
-    utils.__path__ = [str(root / "rl" / "utils")]
-    utils.__package__ = "arctic_platform.rl.utils"
-    install("arctic_platform.rl.utils", utils)
-
-    debug = types.ModuleType("arctic_platform.rl.utils.debug")
-
-    def _silent(*_args, **_kwargs):
-        return None
-
-    class _Timer:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-    debug.pr = _silent
-    debug.pr0 = _silent
-    debug.SynchronizedWallClockTimerSimple = _Timer
-    debug.SynchronizedWallClockTimerSimpleDummy = _Timer
-    install("arctic_platform.rl.utils.debug", debug)
-
-    path = root / "rl" / "zorro_train" / "seqlen_balancing.py"
-    spec = importlib.util.spec_from_file_location("reorg_global_batch_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        for name in created:
-            sys.modules.pop(name, None)
-    return module.reorg_global_batch
-
-
 def _rank_sets(indices, num_workers):
     width = len(indices) // num_workers
     return [set(indices[rank * width : (rank + 1) * width]) for rank in range(num_workers)]
@@ -241,24 +188,8 @@ def _left_padded_prompt_batch():
     return input_ids, attention_mask
 
 
-def test_prompt_ids_keep_a_left_padded_group_that_reorg_splits():
-    reorg_global_batch = _reorg_global_batch()
+def test_prompt_ids_keep_a_left_padded_group_together():
     input_ids, attention_mask = _left_padded_prompt_batch()
-    position_ids = torch.arange(10).expand(4, 10).contiguous()
-    _, old_indices = reorg_global_batch(
-        {
-            "input_ids": input_ids.clone(),
-            "attention_mask": attention_mask.clone(),
-            "position_ids": position_ids.clone(),
-        },
-        response_length=1,
-        world_size=2,
-        max_token_len=100,
-        max_group_length_threshold=2,
-    )
-    old_ranks = _rank_sets(old_indices, 2)
-    assert {0, 1} not in old_ranks
-    assert {2, 3} not in old_ranks
 
     _, reorder = _split_batch(
         {
@@ -283,23 +214,8 @@ def test_prompt_ids_keep_a_left_padded_group_that_reorg_splits():
 
 
 def test_non_divisible_zorro_batch_names_the_failure():
-    reorg_global_batch = _reorg_global_batch()
     input_ids = torch.arange(6).view(3, 2)
     attention_mask = torch.ones(3, 2, dtype=torch.long)
-    position_ids = torch.arange(2).expand(3, 2).contiguous()
-    with pytest.raises(ValueError, match="shouldn't reach here"):
-        reorg_global_batch(
-            {
-                "input_ids": input_ids.clone(),
-                "attention_mask": attention_mask.clone(),
-                "position_ids": position_ids.clone(),
-            },
-            response_length=1,
-            world_size=2,
-            max_token_len=16,
-            max_group_length_threshold=2,
-        )
-
     with pytest.raises(ValueError, match="divisible"):
         _split_batch(
             {
@@ -316,23 +232,8 @@ def test_non_divisible_zorro_batch_names_the_failure():
         )
 
 
-def test_reorg_indexes_a_non_row_value_and_the_splitter_keeps_it():
-    reorg_global_batch = _reorg_global_batch()
+def test_splitter_keeps_a_non_row_value():
     input_ids, attention_mask = _left_padded_prompt_batch()
-    position_ids = torch.arange(10).expand(4, 10).contiguous()
-    with pytest.raises(TypeError, match="not subscriptable"):
-        reorg_global_batch(
-            {
-                "input_ids": input_ids.clone(),
-                "attention_mask": attention_mask.clone(),
-                "position_ids": position_ids.clone(),
-                "pad_token_id": 7,
-            },
-            response_length=1,
-            world_size=2,
-            max_token_len=100,
-            max_group_length_threshold=2,
-        )
 
     shards, reorder = _split_batch(
         {
