@@ -280,6 +280,20 @@ def split_dict(d: dict, num_chunks: int) -> list[dict]:
     return [{k: split_vals[k][i] for k in d} for i in range(num_chunks)]
 
 
+def _flatten_assignment(assignment: list[list[int]] | None) -> list[int] | None:
+    if assignment is None:
+        return None
+    return [row for rows in assignment for row in rows]
+
+
+def _reorder_rows(batch_data: dict, indices: list[int]) -> None:
+    n_rows = len(indices)
+    for key, value in list(batch_data.items()):
+        if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == n_rows:
+            index = torch.tensor(indices, dtype=torch.long, device=value.device)
+            batch_data[key] = value.index_select(0, index)
+
+
 def reconstruct_position_ids_(batch_data: dict) -> None:
     """Rebuild canonical 0-based per-sequence position_ids from attention_mask in-place.
 
@@ -351,20 +365,18 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     if meta_data.get("drop_position_ids", False) and "position_ids" not in batch_data:
         reconstruct_position_ids_(batch_data)
 
-    # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
-    # in rl/__init__.py → common.utils while this package is
-    # still initializing (circular after the rl→common move).
-    if meta_data.get("load_balancer", False):
-        from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
 
-        max_group_length_threshold = meta_data.get("zorro_train_max_rollouts", meta_data["rollout_n"])
-        batch_data, reorder_indices = reorg_global_batch(
-            batch_data,
-            response_length=meta_data["max_response_len"],
-            world_size=num_workers,
-            max_token_len=meta_data["max_token_len_per_gpu"],
-            max_group_length_threshold=max_group_length_threshold,
-        )
+    assignment = assign_balanced_batch(
+        num_workers,
+        meta_data,
+        input_ids=batch_data.get("input_ids"),
+        attention_mask=batch_data.get("attention_mask"),
+        prompt_group_ids=batch_data.get("prompt_group_ids"),
+    )
+    reorder_indices = _flatten_assignment(assignment)
+    if reorder_indices is not None:
+        _reorder_rows(batch_data, reorder_indices)
 
     batch_data_shards = split_dict(batch_data, num_workers)
     shards = []
