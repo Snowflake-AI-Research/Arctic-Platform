@@ -58,7 +58,7 @@ except ImportError:
     flash_mla_sparse_fwd = None  # type: ignore
 
 
-_VALID_SPARSE_MLA_BACKENDS = ("auto", "flashmla", "ref", "tilelang", "dense")
+_VALID_SPARSE_MLA_BACKENDS = ("auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense")
 _DEFAULT_SPARSE_MLA_BACKEND = "auto"
 _SPARSE_MLA_BWD_CHUNK = 64
 _configured_sparse_mla_backend: str | None = None
@@ -98,10 +98,15 @@ def set_sparse_mla_backend(backend: str) -> str:
             f"expected one of {_VALID_SPARSE_MLA_BACKENDS}"
         )
     if requested == "auto":
-        # The fused TileLang forward and backward; the FlashMLA forward pairs with the tiled reference backward
-        # (1.7x slower per step for GLM-5.3 at 256K on H200).
-        requested = "tilelang" if _tilelang_usable() else "ref"
-    if requested == "flashmla":
+        # FlashMLA's sparse forward with the fused TileLang backward when both are installed (the FlashMLA
+        # forward is 1.56x the TileLang forward for GLM-5.3 on H200: 19.5 vs 30.3 ms per 32K-query CP8 shard);
+        # else the TileLang forward and backward. FlashMLA's own pairing (``flashmla``) has a tiled reference
+        # backward, 1.7x slower per step.
+        if _tilelang_usable():
+            requested = "flashmla_tilelang" if flash_mla_available() else "tilelang"
+        else:
+            requested = "ref"
+    if requested in ("flashmla", "flashmla_tilelang"):
         _ensure_flash_mla_sparse_fwd()
     _configured_sparse_mla_backend = requested
     return requested

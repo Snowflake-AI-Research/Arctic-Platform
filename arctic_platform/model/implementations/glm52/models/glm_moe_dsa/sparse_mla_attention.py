@@ -41,6 +41,10 @@ def _resolve_sparse_mla_backend() -> str:
         return "flashmla"
     if backend == "ref":
         return "ref"
+    if backend == "flashmla_tilelang":
+        if not flash_mla_available() or sparse_mla_bwd is None:
+            raise ImportError("sparse_mla_backend='flashmla_tilelang' needs flash_mla and the TileLang MLA kernels")
+        return backend
     if backend in ("tilelang", "dense"):
         if sparse_mla_fwd_interface is None or sparse_mla_bwd is None:
             raise ImportError("TileLang MLA kernels are not available")
@@ -140,8 +144,8 @@ def sparse_mla_apply(q, kv, indices, sm_scale):
         return sparse_mla_flashmla_apply(q, kv, indices, sm_scale)
     if backend == "ref":
         return sparse_mla_ref_apply(q, kv, indices, sm_scale)
-    # tilelang and dense both use fused TileLang fwd+bwd kernels
-    return _SparseMLATilelang.apply(q, kv, indices, sm_scale)
+    # tilelang and dense both use fused TileLang fwd+bwd kernels; flashmla_tilelang swaps in FlashMLA's forward
+    return _SparseMLATilelang.apply(q, kv, indices, sm_scale, backend == "flashmla_tilelang")
 
 
 class Indexer(nn.Module):

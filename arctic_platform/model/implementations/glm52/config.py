@@ -8,7 +8,7 @@ from typing import Literal
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
 
-SparseMlaBackend = Literal["auto", "flashmla", "ref", "tilelang", "dense"]
+SparseMlaBackend = Literal["auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense"]
 
 
 @dataclass
