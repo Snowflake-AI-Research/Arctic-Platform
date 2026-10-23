@@ -78,6 +78,9 @@ def log_dp_shard_tokens(rank: int, tag: str, batch_data: dict, meta_data: dict |
 # shards ``batch`` and replicates ``meta``, so these must live in ``batch``.
 BATCH_DIM_CONTEXT_KEYS = frozenset(
     {
+        "dpo_pair_ids",
+        "dpo_is_chosen",
+        "dpo_reference_logps",
         "advantages",
         "old_log_probs",
         "old_log_probs_shifted",
@@ -248,6 +251,42 @@ def unpack_batch(batch: dict) -> tuple:
     return {}, batch_data, meta_data, processing
 
 
+def group_batch_rows(batch: dict, group_size: int) -> dict:
+    """Represent related rows as one item: [items, alternatives, ...]."""
+    rows = batch["input_ids"].shape[0]
+    grouped = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == rows:
+            value = value.reshape(rows // group_size, group_size, *value.shape[1:])
+        elif isinstance(value, list) and len(value) == rows:
+            value = [value[start : start + group_size] for start in range(0, rows, group_size)]
+        grouped[key] = value
+    return grouped
+
+
+def flatten_batch_rows(batch: dict) -> dict:
+    """Open grouped items into sequence rows at the packing/loss boundary."""
+    ids = batch.get("input_ids")
+    if not torch.is_tensor(ids) or ids.ndim != 3:
+        return batch
+    items, alternatives = ids.shape[:2]
+
+    def flatten(value):
+        if isinstance(value, dict):
+            return {key: flatten(child) for key, child in value.items()}
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == (items, alternatives):
+            return value.flatten(0, 1)
+        if (
+            isinstance(value, list)
+            and len(value) == items
+            and all(isinstance(item, list) and len(item) == alternatives for item in value)
+        ):
+            return [row for item in value for row in item]
+        return value
+
+    return {key: flatten(value) for key, value in batch.items()}
+
+
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
@@ -267,8 +306,9 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        chunk_size = (len(val) + num_chunks - 1) // num_chunks
-        return [val[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+        chunk_size, remainder = divmod(len(val), num_chunks)
+        offsets = [i * chunk_size + min(i, remainder) for i in range(num_chunks + 1)]
+        return [val[start:end] for start, end in zip(offsets, offsets[1:])]
     return [val] * num_chunks
 
 
