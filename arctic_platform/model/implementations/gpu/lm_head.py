@@ -267,10 +267,10 @@ def _get_sequence_chunked_logprob_fn():
                     )
 
                     # Pick out logits at target labels that fall in this vocab tile.
-                    mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
-                    idx = (labels_chunk[mask] - vocab_start).to(torch.long)
-                    target_logits[mask] = scaled_logits[mask, idx]
-                    m, s = online_logsumexp_update(m, s, scaled_logits, mask, idx)
+                    rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
+                    idx = (labels_chunk[rows] - vocab_start).to(torch.long)
+                    target_logits[rows] = scaled_logits[rows, idx]
+                    m, s = online_logsumexp_update(m, s, scaled_logits, rows, idx)
                     if grouped is not None:
                         grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
@@ -360,16 +360,15 @@ def _get_sequence_chunked_logprob_fn():
 
                     # d log_softmax(z)[t] / d z = onehot(t) - softmax(z).
                     grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
-                    mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
-                    if torch.any(mask):
-                        idx = (labels_chunk[mask] - vocab_start).to(torch.long)
-                        # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
-                        # where 1 - exp(z[t] - logz) rounds to 0.
-                        target_complement = torch.sigmoid(others_logz[start:end][mask] - scaled_logits[mask, idx])
-                        grad_logits[mask, idx] = (
-                            grad_chunk[mask] * target_complement
-                            - (normalizer_gradients - grad_chunk)[mask] * probs[mask, idx]
-                        )
+                    rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
+                    idx = (labels_chunk[rows] - vocab_start).to(torch.long)
+                    # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
+                    # where 1 - exp(z[t] - logz) rounds to 0.
+                    target_complement = torch.sigmoid(others_logz[start:end][rows] - scaled_logits[rows, idx])
+                    grad_logits[rows, idx] = (
+                        grad_chunk[rows] * target_complement
+                        - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
+                    )
                     if grouped is not None:
                         grouped.add_group_gradients_to_tile(
                             grad_logits,
