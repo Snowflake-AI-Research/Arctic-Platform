@@ -550,6 +550,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            # Models whose snapshot cannot sit in host memory convert shard by shard.
+            stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if fmt == "prime" else None
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
@@ -561,6 +563,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -573,6 +576,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
 
     # All ranks wait for master rank to finish conversion

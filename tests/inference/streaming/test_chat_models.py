@@ -42,9 +42,15 @@ LOADER_ARCHITECTURES = {
     "glm5_next": {"Glm5NextForConditionalGeneration"},
     "qwen4_exp": {"Qwen4ExpForConditionalGeneration"},
     "deepseek_v4": {"DeepseekV4ForCausalLM"},
+    "deepseek_v41": {"DeepseekV41ForCausalLM"},
 }
 # Trainable architectures deliberately left without chat mode, with the reason.
-TRAINED_WITHOUT_CHAT: dict[str, str] = {}
+TRAINED_WITHOUT_CHAT: dict[str, str] = {
+    "DeepseekV41ForCausalLM": (
+        "V4.1 spaces its DSML tool-call tags and takes a numeric reasoning budget; "
+        "vLLM's deepseek_v4 parsers read neither"
+    ),
+}
 
 
 def registered_loaders():
