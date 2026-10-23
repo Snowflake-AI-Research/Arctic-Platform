@@ -16,11 +16,12 @@ skips DeepSpeed, `transformers`, Ray and vLLM.
 
 ## Supported training regime
 
-Cortex sub-jobs expose training + sampling + weight-sync but no `/forward`
-sub-job, no disk-shared weight reload, and no colocation lifecycle. That
-constrains what runs correctly here:
+Cortex sub-jobs expose training + sampling + weight-sync. Policy log-probs
+use the training `forward` operation. There is no reference forward, no
+disk-shared weight reload, and no colocation lifecycle. That constrains what
+runs correctly here:
 
-* **Single-epoch on-policy GRPO only.** With `context.old_log_probs_shifted`
+* **Single-epoch on-policy GRPO.** With `context.old_log_probs_shifted`
   absent, the server-side GRPO loss defaults `old_log_probs =
   logprobs.detach()`, restoring π_old ≡ π_new. Multi-epoch PPO needs the
   rollout-time snapshot, which this backend cannot provide.
@@ -28,6 +29,9 @@ constrains what runs correctly here:
   from, so `use_kl_loss` / `use_kl_in_reward` must be off. Asking for them
   raises from `_CortexClientShim.fwd_no_grad` rather than substituting zeros,
   which would reduce the KL to a function of the current policy alone.
+* **`fwd_no_grad` returns the server logprobs.** It sends the on-prem
+  `{batch, meta}` payload, including `balance_batch` and `prompt_group_ids`,
+  and returns them under `batch["logprobs"]` and `batch["log_probs"]`.
 * **Clipping is inert, and `approx_kl` reads 0.0.** π_old is re-derived per
   `fwd_bwd` rather than snapshotted. With one optimizer step per collected
   batch — which is what SkyRL's Arctic trainer does, `policy_mini_batch_size`

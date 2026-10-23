@@ -38,20 +38,64 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
 }
 
 
+def to_cortex_fwd_payload(batch: dict) -> dict:
+    """On-prem SkyRL ``{batch, meta}`` → Cortex ``{args, kwargs, context, processing}``.
+
+    The on-prem client measures ``max_prompt_len`` and sends it with
+    ``zorro_train_enable``, ``max_response_len``, ``pad_token_id``, and the
+    row tensors (including ``prompts``). Those scalars stay on context. The
+    rows stay in the Verl layout the client built; this function does not
+    left-align them or invent the prompt boundary.
+    """
+    import torch
+
+    payload = dict(batch)
+    payload.pop("processing", None)
+    payload.pop("router_replay", None)
+    if "batch" in payload and isinstance(payload["batch"], dict):
+        tensors = dict(payload["batch"])
+        meta = dict(payload.get("meta") or {})
+    else:
+        tensors = dict(payload)
+        meta = dict(tensors.pop("context", None) or {})
+
+    input_ids = tensors.get("input_ids")
+    attention_mask = tensors.get("attention_mask")
+    if input_ids is None or attention_mask is None:
+        raise ValueError("cortex /forward requires input_ids and attention_mask")
+
+    if meta.get("zorro_train_enable"):
+        missing = _missing_zorro_meta_keys(meta)
+        if missing:
+            raise ValueError("ZoRRo meta is missing " + ", ".join(missing))
+        prompts = tensors.get("prompts")
+        if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
+            raise ValueError("ZoRRo forward requires batch['prompts'] with width max_prompt_len")
+
+    kwargs = {key: value for key, value in tensors.items() if torch.is_tensor(value)}
+    context = {
+        key: value
+        for key, value in meta.items()
+        if key != "dp_size" and not torch.is_tensor(value)
+    }
+    context["input_ids"] = input_ids
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
+    return {
+        "args": (),
+        "kwargs": kwargs,
+        "context": context,
+        "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+    }
+
+
 def zero_logprobs_like(batch: dict) -> torch.Tensor:
     """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
 
-    Cortex has no ``/forward``, so a caller asking for log-probs has nothing to
-    call. Zeros are sound only because nothing reads them: this lowering drops
-    ``old_log_probs`` and the server re-derives π_old from the live forward. A
-    reference-model request is refused in ``_CortexClientShim.fwd_no_grad``
-    instead, where zeros would quietly reduce the KL to a function of π_new.
-
-    Re-deriving π_old also makes the ratio exactly 1, so ``eps_clip`` never
-    binds. That is sound as long as the caller takes one optimizer step per
-    collected batch, which is what SkyRL's Arctic trainer does; a caller that
-    stepped several times per batch would be running uncorrected off-policy
-    updates.
+    ``fwd_no_grad`` does not use this. A policy snapshot comes back from the
+    training forward. A reference-model request is refused in
+    ``_CortexClientShim.fwd_no_grad``.
     """
     import torch
 
@@ -106,6 +150,18 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
         {k: move(k, v) for k, v in extra.items()},
         valid.to(attention_mask.dtype),
     )
+
+
+def _missing_zorro_meta_keys(meta: dict) -> list[str]:
+    """Keys the worker indexes directly once ZoRRo is on.
+
+    ``run_pipeline`` reads ``max_prompt_len`` when ``zorro_train_enable`` is set.
+    """
+    missing: list[str] = []
+    if meta.get("zorro_train_enable"):
+        if "max_prompt_len" not in meta:
+            missing.append("max_prompt_len")
+    return missing
 
 
 def to_cortex_fwd_bwd_payload(
@@ -187,6 +243,10 @@ def to_cortex_fwd_bwd_payload(
     for k in ("global_batch_size", "batch_num_tokens"):
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
+
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
 
     return {
         "args": (),
