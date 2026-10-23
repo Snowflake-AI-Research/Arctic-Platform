@@ -1011,6 +1011,48 @@ class TestCortexSharedHelper:
             )
 
 
+    def test_non_zorro_forward_left_aligns_leading_pads(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        out = to_cortex_fwd_payload(
+            {"batch": {"input_ids": ids, "attention_mask": attn}, "meta": {"zorro_train_enable": False}}
+        )
+        assert out["kwargs"]["input_ids"][0].tolist() == [1, 2, 0, 0]
+        assert out["kwargs"]["attention_mask"][0].tolist() == [1, 1, 0, 0]
+
+    def test_zorro_fwd_bwd_keeps_the_client_layout_and_the_snapshot(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[0, 5, 6, 7, 8], [0, 1, 2, 3, 4]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [0, 1, 1, 1, 1]])
+        prompts = torch.tensor([[0, 5, 6], [0, 1, 2]])
+        old = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 5)),
+                    "response_mask": torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]),
+                    "prompts": prompts,
+                    "old_log_probs": old,
+                },
+                "meta": {"zorro_train_enable": True, "max_prompt_len": 3, "balance_batch": True},
+            }
+        )
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["prompts"], prompts)
+        assert torch.equal(out["kwargs"]["old_log_probs"], old)
+        assert out["context"]["zorro_train_enable"] is True
+        assert out["context"]["max_prompt_len"] == 3
+
+
 class TestCortexShimSaveWeightsFailsLoud:
     """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
     share disk, so a silent no-op would leave sampling on stale weights."""

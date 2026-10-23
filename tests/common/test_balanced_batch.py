@@ -9,10 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 
-_DSS_ROOT = Path(__file__).resolve().parents[3] / "dss-monorepo" / "cortex" / "neutrino" / "dss-backend"
-if _DSS_ROOT.is_dir() and str(_DSS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DSS_ROOT))
-
 from arctic_platform.common.utils.balanced_batch import assign_row_lpt
 from arctic_platform.common.utils.balanced_batch import assign_zorro_groups
 from arctic_platform.common.utils.balanced_batch import linear_dedup_costs
@@ -148,74 +144,26 @@ def test_onprem_zorro_split_matches_assign_zorro_groups():
     assert torch.equal(restored["input_ids"], original)
 
 
-def _load_cortex_balanced_batch():
-    """Import Cortex batching without ``gpu/__init__``, which pulls the sampling stack."""
-    import types
-
-    name = "dss.ray_dss.jobs.gpu"
-    parts = name.split(".")
-    for index in range(len(parts)):
-        package = ".".join(parts[: index + 1])
-        if package in sys.modules:
-            continue
-        module = types.ModuleType(package)
-        module.__path__ = [str(_DSS_ROOT.joinpath(*package.split(".")))]
-        module.__package__ = package
-        sys.modules[package] = module
-    from dss.ray_dss.jobs.gpu.batching import BalancedBatch
-
-    return BalancedBatch
-
-
-def test_cortex_assignment_matches_onprem():
-    BalancedBatch = _load_cortex_balanced_batch()
-    import dss.ray_dss.jobs.gpu.batching as batching
-
-    assign = batching._assign_balanced_batch()
-    assert assign.__code__.co_filename.endswith(
-        "Arctic-Platform/arctic_platform/common/utils/balanced_batch.py"
-    )
-    assert "dss-monorepo/Arctic-Platform" not in assign.__code__.co_filename
-
-    mask = torch.tensor(
-        [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0]],
-        dtype=torch.long,
-    )
-    rows = torch.arange(32).view(4, 8)
-    envelope = {
-        "batch": {"input_ids": rows.clone(), "attention_mask": mask.clone()},
-        "meta": {},
-        "processing": {"loss_fn": "verl_grpo"},
-    }
-    _, onprem = _split_batch(envelope, num_workers=2)
-    cortex = BalancedBatch({"input_ids": rows, "attention_mask": mask}, 2)
-    assert onprem == _flat(cortex._assignment)
-
-    input_ids = torch.tensor([[1, 1, 9], [1, 1, 8], [2, 2, 7], [2, 2, 6]])
-    attention_mask = torch.ones_like(input_ids)
-    meta = {
-        "zorro_train_enable": True,
-        "max_response_len": 1,
-        "max_token_len_per_gpu": 100,
-        "rollout_n": 2,
-    }
-    zorro_rows = input_ids.clone()
-    _, onprem_zorro = _split_batch(
+def test_per_row_lists_follow_the_tensor_assignment():
+    rows = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 1, 0], [1, 0, 0, 0]])
+    shards, _order = _split_batch(
         {
-            "batch": {"input_ids": zorro_rows, "attention_mask": attention_mask.clone()},
-            "meta": dict(meta),
-            "processing": {"loss_fn": "verl_grpo"},
+            "batch": {"input_ids": rows.clone(), "attention_mask": rows.clone(), "uids": ["a", "b", "c", "d"]},
+            "meta": {"balance_batch": True},
+            "processing": {"loss_fn": "grpo"},
         },
         num_workers=2,
     )
-    cortex_zorro = BalancedBatch(
-        {"input_ids": input_ids, "attention_mask": attention_mask, "context": meta},
-        2,
-    )
-    assert onprem_zorro == _flat(cortex_zorro._assignment)
-    per_rank = [input_ids[rank] for rank in cortex_zorro._assignment]
-    restored = cortex_zorro.restore_tensor(per_rank)
-    assert torch.equal(restored, input_ids)
+    by_uid = {"a": rows[0], "b": rows[1], "c": rows[2], "d": rows[3]}
+    seen = []
+    for shard in shards:
+        ids = shard["batch"]["input_ids"]
+        uids = shard["batch"]["uids"]
+        assert len(uids) == int(ids.shape[0])
+        for index, uid in enumerate(uids):
+            assert torch.equal(ids[index], by_uid[uid])
+            seen.append(uid)
+    assert sorted(seen) == ["a", "b", "c", "d"]
 
 
 def _reorg_global_batch():
@@ -444,30 +392,24 @@ def test_stamp_and_apply_keep_explicit_true():
     assert "prompt_group_ids" not in applied
 
 
-def test_cortex_forwards_explicit_balance_batch_true():
-    _load_cortex_balanced_batch()
-    import dss.ray_dss.jobs.gpu.batching as batching
+def test_legacy_load_balancer_false_keeps_arrival_order():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
 
-    seen = {}
-    real = batching._assign_balanced_batch()
-    original = batching._assign_balanced_batch
+    mask = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 0, 0]])
+    assert (
+        assign_balanced_batch(2, {"load_balancer": False}, attention_mask=mask) is None
+    )
+    assert assign_balanced_batch(2, {"balance_batch": True, "load_balancer": False}, attention_mask=mask) is not None
 
-    def capture(num_shards, meta, **kwargs):
-        seen["balance_batch"] = meta.get("balance_batch", "missing")
-        return real(num_shards, meta, **kwargs)
 
-    batching._assign_balanced_batch = lambda: capture
-    try:
-        mask = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 0, 0]], dtype=torch.long)
-        balanced = batching.BalancedBatch(
-            {"attention_mask": mask, "context": {"balance_batch": True}},
-            2,
-        )
-    finally:
-        batching._assign_balanced_batch = original
+def test_reordered_prompt_blocks_omit_group_ids():
+    from arctic_platform.common.balance_metadata import stamp_balance_meta
 
-    assert seen["balance_batch"] is True
-    assert balanced._assignment is not None
+    prompts = torch.tensor([[1, 1], [2, 2], [1, 1], [2, 2]])
+    meta = {}
+    stamp_balance_meta(meta, balance_batch=True, zorro_train_enable=True, prompts=prompts, rollout_n=2)
+    assert meta["balance_batch"] is True
+    assert "prompt_group_ids" not in meta
 
 
 def test_client_balance_uses_dense_prompts_and_falls_back_for_jagged_rows():

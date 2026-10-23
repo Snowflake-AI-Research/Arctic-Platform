@@ -248,6 +248,18 @@ def unpack_batch(batch: dict) -> tuple:
     return {}, batch_data, meta_data, processing
 
 
+def _row_bounds(n_rows: int, num_chunks: int) -> list[tuple[int, int]]:
+    """Same cuts as ``torch.tensor_split``: the first ``n % k`` chunks are one longer."""
+    base, extra = divmod(n_rows, num_chunks)
+    bounds = []
+    start = 0
+    for index in range(num_chunks):
+        size = base + (1 if index < extra else 0)
+        bounds.append((start, start + size))
+        start += size
+    return bounds
+
+
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
@@ -267,8 +279,7 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        chunk_size = (len(val) + num_chunks - 1) // num_chunks
-        return [val[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+        return [val[start:end] for start, end in _row_bounds(len(val), num_chunks)]
     return [val] * num_chunks
 
 
@@ -287,11 +298,21 @@ def _flatten_assignment(assignment: list[list[int]] | None) -> list[int] | None:
 
 
 def _reorder_rows(batch_data: dict, indices: list[int]) -> None:
+    """Permute row-aligned tensors and lists into assignment order.
+
+    A value whose length is not the row count stays put. Lists use the same
+    index order as tensors so a per-row field cannot stay in arrival order
+    while its tensors move.
+    """
     n_rows = len(indices)
+    order = None
     for key, value in list(batch_data.items()):
         if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == n_rows:
-            index = torch.tensor(indices, dtype=torch.long, device=value.device)
-            batch_data[key] = value.index_select(0, index)
+            if order is None:
+                order = torch.tensor(indices, dtype=torch.long)
+            batch_data[key] = value.index_select(0, order.to(device=value.device))
+        elif isinstance(value, list) and len(value) == n_rows:
+            batch_data[key] = [value[row] for row in indices]
 
 
 def reconstruct_position_ids_(batch_data: dict) -> None:

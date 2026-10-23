@@ -43,9 +43,9 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
 
     The on-prem client measures ``max_prompt_len`` and sends it with
     ``zorro_train_enable``, ``max_response_len``, ``pad_token_id``, and the
-    row tensors (including ``prompts``). Those scalars stay on context. The
-    rows stay in the Verl layout the client built; this function does not
-    left-align them or invent the prompt boundary.
+    row tensors (including ``prompts``). Those scalars stay on context. ZoRRo
+    rows stay in the layout the client built. Every other request is
+    left-aligned, because Cortex's packer rejects leading padding.
     """
     import torch
 
@@ -71,6 +71,10 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         prompts = tensors.get("prompts")
         if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
             raise ValueError("ZoRRo forward requires batch['prompts'] with width max_prompt_len")
+    else:
+        aligned, _, attention_mask = _left_align_batch(tensors, attention_mask, {})
+        tensors = {**aligned, "attention_mask": attention_mask}
+        input_ids = tensors["input_ids"]
 
     kwargs = {key: value for key, value in tensors.items() if torch.is_tensor(value)}
     context = {
@@ -88,23 +92,6 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         "context": context,
         "processing": {"post": ["compute_logprobs"], "loss_fn": None},
     }
-
-
-def zero_logprobs_like(batch: dict) -> torch.Tensor:
-    """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
-
-    ``fwd_no_grad`` does not use this. A policy snapshot comes back from the
-    training forward. A reference-model request is refused in
-    ``_CortexClientShim.fwd_no_grad``.
-    """
-    import torch
-
-    body = batch.get("batch") if isinstance(batch, dict) else None
-    if not isinstance(body, dict):
-        body = batch if isinstance(batch, dict) else {}
-    ids = body.get("input_ids")
-    b, t = (int(ids.shape[0]), int(ids.shape[-1])) if torch.is_tensor(ids) else (1, 1)
-    return torch.zeros((b, max(t, 1)), dtype=torch.float32)
 
 
 # Padding sentinel per tensor. `labels` uses HF's ignore_index so a padded
@@ -182,8 +169,11 @@ def to_cortex_fwd_bwd_payload(
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
 
-    Rows are left-aligned on the way out (see :func:`_left_align_batch`) --
-    Cortex's packer rejects any other layout.
+    Non-ZoRRo rows are left-aligned on the way out (see :func:`_left_align_batch`).
+    Cortex's packer rejects any other layout. ZoRRo rows stay in the client
+    layout: left-aligning them moves response tokens into ``[:, max_prompt_len]``.
+    That path keeps ``old_log_probs`` so the snapshot from ``fwd_no_grad`` is
+    the ratio's π_old.
     """
     import torch
 
@@ -216,7 +206,19 @@ def to_cortex_fwd_bwd_payload(
     advantages = tensors.pop("advantages", None)
     if advantages is None:
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
-    tensors.pop("old_log_probs", None)
+    old_log_probs = tensors.pop("old_log_probs", None)
+
+    if meta.get("zorro_train_enable"):
+        return _to_cortex_zorro_fwd_bwd(
+            tensors,
+            meta,
+            processing_in,
+            input_ids,
+            attention_mask,
+            advantages,
+            loss_mask,
+            old_log_probs,
+        )
 
     forwarded = {"input_ids": input_ids}
     for k in ("position_ids", "labels"):
@@ -248,6 +250,58 @@ def to_cortex_fwd_bwd_payload(
 
     apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
 
+    return {
+        "args": (),
+        "kwargs": kwargs_out,
+        "context": context,
+        "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
+    }
+
+
+def _to_cortex_zorro_fwd_bwd(
+    tensors: dict,
+    meta: dict,
+    processing_in: dict | None,
+    input_ids,
+    attention_mask,
+    advantages,
+    loss_mask,
+    old_log_probs,
+) -> dict:
+    """ZoRRo wire shape. Rows are not left-aligned.
+
+    The worker slices the response at ``max_prompt_len``. Left-aligning a
+    shorter prompt moves response tokens into that slice and drops them from
+    the loss. ``old_log_probs`` stays on the batch so the ``fwd_no_grad``
+    snapshot is π_old.
+    """
+    import torch
+
+    prompts = tensors.get("prompts")
+    if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
+        raise ValueError("ZoRRo fwd_bwd requires batch['prompts'] with width max_prompt_len")
+    response_mask = tensors.get("response_mask", loss_mask)
+    kwargs_out: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prompts": prompts,
+        "response_mask": response_mask,
+    }
+    if torch.is_tensor(old_log_probs):
+        kwargs_out["old_log_probs"] = old_log_probs
+    if torch.is_tensor(tensors.get("position_ids")):
+        kwargs_out["position_ids"] = tensors["position_ids"]
+
+    caller_config = dict((processing_in or {}).get("config") or {})
+    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k not in proc_config and k in meta:
+            proc_config[k] = int(meta[k])
+
+    context: dict[str, Any] = {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask}
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, prompts)
     return {
         "args": (),
         "kwargs": kwargs_out,

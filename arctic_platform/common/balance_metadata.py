@@ -25,8 +25,9 @@ ZORRO_SPLIT_KEYS = (
 def rollout_prompt_group_ids(input_ids, prompts, rollout_n):
     """Block ids for a ZoRRo request with balancing enabled.
 
-    ``None`` when balancing is off or the row count is not a multiple of
-    ``rollout_n``. Each block must share prompt columns.
+    ``None`` when the row count is not a multiple of ``rollout_n``, prompts are
+    missing, or a rollout block does not share prompt columns. The caller then
+    omits the ids and the assigner groups by prompt columns.
     """
     import torch
 
@@ -37,13 +38,11 @@ def rollout_prompt_group_ids(input_ids, prompts, rollout_n):
     if width < 1 or rows % width != 0:
         return None
     if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[0]) != rows:
-        raise ValueError("load_balancer prompt_group_ids require batch prompts")
+        return None
     for start in range(0, rows, width):
         block = prompts[start : start + width]
         if not torch.equal(block, block[:1].expand_as(block)):
-            raise ValueError(
-                "load_balancer prompt_group_ids require each rollout block to share prompt columns"
-            )
+            return None
     return torch.arange(rows, dtype=torch.int64) // width
 
 
@@ -55,7 +54,7 @@ def assert_contiguous_rollout_blocks(prompts, rollout_n) -> None:
     import torch
 
     if not torch.is_tensor(prompts) or prompts.ndim != 2:
-        raise ValueError("load_balancer prompt_group_ids require batch prompts")
+        raise ValueError("balance_batch prompt_group_ids require batch prompts")
     rows = int(prompts.shape[0])
     width = int(rollout_n)
     if width < 1 or rows % width != 0:
@@ -64,7 +63,7 @@ def assert_contiguous_rollout_blocks(prompts, rollout_n) -> None:
         block = prompts[start : start + width]
         if not torch.equal(block, block[:1].expand_as(block)):
             raise ValueError(
-                "load_balancer prompt_group_ids require each rollout block to share prompt columns"
+                "balance_batch prompt_group_ids require each rollout block to share prompt columns"
             )
 
 
@@ -150,9 +149,10 @@ def stamp_balance_meta(meta: dict, *, balance_batch: bool, zorro_train_enable: b
     """Write the explicit balance switch onto on-prem meta.
 
     ``False`` keeps arrival order. ``True`` requests balancing and, for ZoRRo,
-    checks that each rollout block shares prompt columns. A valid ZoRRo block
-    also stores ``prompt_group_ids`` (``row // rollout_n``) so on-prem and Cortex
-    group the same rows.
+    stores ``prompt_group_ids`` (``row // rollout_n``) when each rollout block
+    shares prompt columns. A reordered batch omits the ids instead of raising,
+    and the assigner groups by prompt columns. These ids are the same key
+    ``prompt-mean`` reads, so they are written only for that rollout grouping.
     """
     for key in LEGACY_BALANCE_KEYS:
         meta.pop(key, None)
@@ -160,7 +160,6 @@ def stamp_balance_meta(meta: dict, *, balance_batch: bool, zorro_train_enable: b
     meta["balance_batch"] = True if balance_batch else False
     if not balance_batch or not zorro_train_enable:
         return
-    assert_contiguous_rollout_blocks(prompts, rollout_n)
     group_ids = rollout_prompt_group_ids(prompts, prompts, rollout_n)
     if group_ids is not None:
         meta["prompt_group_ids"] = group_ids
