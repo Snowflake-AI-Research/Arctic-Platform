@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import inspect
 import logging
 import os
 import time
+import types
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -19,7 +21,7 @@ from arctic_platform.inference.server.scheduler import (
     prefix_affinity_routing,
 )
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
-from arctic_platform.inference.server.worker import InferenceWorker
+from arctic_platform.inference.server.worker import WORKER_ACTOR_ID_ENV, InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
 
@@ -33,6 +35,25 @@ def _worker_result_failed(result: Any) -> bool:
     if isinstance(result, Exception):
         return True
     return isinstance(result, dict) and result.get("status") in {"error", "failed"}
+
+
+def _shut_down_cleanly(task: asyncio.Task, pending: set[asyncio.Task]) -> bool:
+    """Whether a worker's graceful ``shutdown`` RPC returned without error."""
+    if task in pending or not task.done() or task.cancelled() or task.exception() is not None:
+        return False
+    result = task.result()
+    return not isinstance(result, BaseException) and not _worker_result_failed(result)
+
+
+# Confirm budget when the kill runs because the caller was cancelled: enough
+# to kill the trees, short enough that cancellation is not held for the full
+# ARCTIC_WORKER_KILL_CONFIRM_TIMEOUT_S. ray.kill runs regardless.
+_CANCELLED_KILL_CONFIRM_TIMEOUT_S = 5.0
+
+
+def _kill_budget(exc: BaseException) -> float | None:
+    """The confirm budget for a kill in an ``except BaseException`` handler."""
+    return _CANCELLED_KILL_CONFIRM_TIMEOUT_S if isinstance(exc, asyncio.CancelledError) else None
 
 
 def _failed_worker_indices(results: list[Any]) -> list[int]:
@@ -127,6 +148,640 @@ async def _worker_node_id(worker: Any) -> Any:
         logger.warning("could not read a worker's Ray node id; numbering it as "
                        "if it shared a pod with the others", exc_info=True)
         return None
+
+
+# ----------------------------------------------------------------------
+# Hard kill. ``ray.kill`` only SIGKILLs the actor process and returns before
+# it has exited. The vLLM processes under an InferenceWorker are not Ray
+# actors: the mp executor runs EngineCore as a child process and the TP ranks
+# as its children, and by default Ray's own child cleanup does not run when
+# the parent is SIGKILLed. Once the actor is gone those processes are reparented and
+# nothing tracks them, yet they still hold GPU memory. So the tree is killed
+# from a task on the worker's node while the actor still roots it, and the
+# actor is only reported gone once the GCS says DEAD.
+#
+# Everything here reads the GCS directly rather than through the state API,
+# which needs the dashboard, and never calls into the actor: a worker whose
+# engine is wedged in startup cannot answer an RPC.
+# ----------------------------------------------------------------------
+
+_KILL_POLL_INTERVAL_S = 0.5
+# How long the per-node task waits for SIGKILLed processes to exit, and how
+# long the caller waits for that task, scheduling included. Both are well
+# below the confirm timeout, so a slow node cannot use up the time the later
+# stages (the TP-rank actors, the GCS confirmation) need.
+_TREE_KILL_WAIT_S = 5.0
+_TREE_KILL_TASK_TIMEOUT_S = 20.0
+# Class names of the per-rank actors vLLM's Ray executors create: the legacy
+# compiled-graph executor's RayWorkerWrapper, and RayExecutorV2's RayWorkerProc,
+# which vLLM 0.31 selects by default (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1).
+_VLLM_RAY_RANK_ACTOR_CLASSES = ("RayWorkerWrapper", "RayWorkerProc")
+# Slack when comparing a process's creation time with its actor's start time.
+_PID_REUSE_SLACK_S = 1.0
+# Extra time the rescan's kills get to exit, beyond the first wait's budget.
+_RESCAN_GRACE_S = 1.0
+
+
+def _kill_process_trees(
+    roots: list[tuple[int, float, bool]],
+    wait_s: float,
+    slack_s: float = _PID_REUSE_SLACK_S,
+    orphan_tags: tuple[str, ...] = (),
+    tag_env: str = WORKER_ACTOR_ID_ENV,
+    title_marker: str = "VLLM::",
+    gpu_device_prefix: str = "/dev/nvidia",
+    rescan_grace_s: float = _RESCAN_GRACE_S,
+) -> dict[str, Any]:
+    """SIGKILL the descendants of every ``(pid, started_by_s, kill_root)``
+    root, the root itself when ``kill_root``, and the orphaned vLLM
+    processes of the workers named in ``orphan_tags``.
+
+    Runs on the node that owns the pids. Descendants are collected before
+    anything is signalled, so a child cannot be reparented out of reach
+    first, and they are signalled before the orphan scan starts, so nothing
+    the scan reads can hold them up. A root created after ``started_by_s``
+    is a reused pid, not the actor, and is skipped. One process that cannot
+    be inspected or signalled (``AccessDenied``, e.g. a helper running as
+    another user) does not stop the others; it is returned under ``denied``.
+
+    The orphan scan finds what the tree walk cannot: processes whose parent
+    died before this ran (the worker itself, or EngineCore under a live
+    worker), and which were reparented away. A process is killed only if all
+    of these hold, checked in this order:
+
+    - it is orphaned: its parent is pid 1, gone, or a zombie. A process
+      whose parent is alive, a Ray worker for instance, is never touched;
+    - it has a GPU device (``gpu_device_prefix`` + a number) open;
+    - its command line carries vLLM's process title (``title_marker``);
+    - its environment names one of ``orphan_tags`` under ``tag_env``. The
+      worker sets that to its own actor id before it starts the engine, and
+      every vLLM process inherits it.
+
+    The first two read only ``/proc/<pid>/stat`` and ``/proc/<pid>/fd``.
+    The last two read the process's memory, which can block on a process in
+    uninterruptible sleep, so they are done only for orphaned GPU holders.
+
+    Of the orphaned vLLM GPU holders that are not killed, one that carries
+    no tag, or whose environment cannot be read, is returned under
+    ``unattributed``; one that carries another tag (another worker's, or the
+    dumping worker's in a CRIU-restored semi-p tree) under ``foreign``, as
+    ``(pid, tag)``.
+
+    Returns the pids signalled (``killed``, the orphans among them also
+    under ``orphans``), those still running after ``wait_s`` (a process in
+    uninterruptible sleep can outlive SIGKILL for a while, and its GPU memory
+    with it), and ``denied``, ``unattributed`` and ``foreign``. A zombie
+    counts as gone: it holds no memory.
+
+    Self-contained (no module globals) so that it can run as a by-value
+    task; see :func:`_by_value`.
+    """
+    import os
+    import time
+
+    import psutil
+
+    proc_fs = os.path.isdir("/proc/self/fd")
+
+    def running(proc):
+        try:
+            # is_running() also catches a pid reused since ``proc`` was made.
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.Error:
+            return True
+
+    def stat(pid):
+        """``(state, ppid)`` from /proc/<pid>/stat, or psutil off Linux."""
+        if not proc_fs:
+            proc = psutil.Process(pid)
+            return proc.status(), proc.ppid()
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            fields = f.read().rsplit(b")", 1)[1].split()
+        state = psutil.STATUS_ZOMBIE if fields[0] == b"Z" else "other"
+        return state, int(fields[1])
+
+    def orphaned(pid):
+        state, ppid = stat(pid)
+        if state == psutil.STATUS_ZOMBIE:
+            return False
+        if ppid <= 1:
+            return True
+        try:
+            return stat(ppid)[0] == psutil.STATUS_ZOMBIE
+        except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+            return True
+
+    def gpu_device(path):
+        return path.startswith(gpu_device_prefix) and path[len(gpu_device_prefix):].isdigit()
+
+    def holds_gpu(pid):
+        if not proc_fs:
+            return any(gpu_device(f.path) for f in psutil.Process(pid).open_files())
+        # Not psutil's open_files(): on Linux it lists regular files only,
+        # and GPU devices are character devices.
+        fd_dir = f"/proc/{pid}/fd"
+        for fd in os.listdir(fd_dir):
+            try:
+                if gpu_device(os.readlink(os.path.join(fd_dir, fd))):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def signal(procs, killed, denied):
+        for pid, proc in procs.items():
+            try:
+                proc.kill()
+                killed.append(pid)
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                denied.add(pid)
+
+    me = os.getpid()
+    targets = {}
+    denied = set()
+    for pid, started_by_s, kill_root in roots:
+        try:
+            root = psutil.Process(pid)
+            if started_by_s > 0 and root.create_time() > started_by_s + slack_s:
+                continue
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            denied.add(pid)
+            continue
+        try:
+            tree = root.children(recursive=True)
+        except psutil.NoSuchProcess:
+            tree = []
+        except psutil.Error:
+            # Cannot see the descendants; the root is still killed below.
+            denied.add(pid)
+            tree = []
+        if kill_root:
+            tree.append(root)
+        for proc in tree:
+            if proc.pid not in (me, 1):
+                targets[proc.pid] = proc
+    killed = []
+    signal(targets, killed, denied)
+    signalled = dict(targets)
+
+    orphan_group = {}
+    # Keyed by pid: a process that is neither killed nor tagged is seen again
+    # by the rescan, and is reported once.
+    unattributed = {}
+    foreign = {}
+    tags = set(orphan_tags)
+
+    def find_orphans(skip):
+        """Orphaned vLLM GPU holders, as ``{pid: proc}`` for this worker's
+        tags, plus the unattributed and foreign ones."""
+        found = {}
+        unattr = {}
+        forn = {}
+        for pid in psutil.pids():
+            if pid in skip or pid in (me, 1):
+                continue
+            try:
+                if not orphaned(pid) or not holds_gpu(pid):
+                    continue
+                proc = psutil.Process(pid)
+                if title_marker not in " ".join(proc.cmdline()):
+                    continue
+            except (OSError, ValueError, IndexError, psutil.Error):
+                continue
+            try:
+                tag = proc.environ().get(tag_env)
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error:
+                tag = None
+            if tag in tags:
+                found[pid] = proc
+            elif tag is None:
+                unattr[pid] = None
+            else:
+                forn[pid] = tag
+        return found, unattr, forn
+
+    def descendants_of(parents):
+        """Descendants of ``parents``, read from /proc stat only. Taken before
+        anything is signalled, so the list survives the parents' death."""
+        listed = {}
+        for parent in parents.values():
+            try:
+                for child in parent.children(recursive=True):
+                    listed.setdefault(child.pid, child)
+            except psutil.Error:
+                continue
+        return list(listed.values())
+
+    def vllm_children(candidates, skip):
+        """The candidates that hold a GPU device and run under vLLM's title,
+        and carry one of this worker's tags if their environment is readable.
+
+        A TP worker is a child of its EngineCore, which is alive while the
+        orphan check runs, so the orphan check never selects it. It is found
+        here instead, from the descendants captured before the orphan was
+        signalled. Run after the orphans are signalled, so a worker stuck in
+        an uninterruptible read delays only its own kill.
+        """
+        found = {}
+        for child in candidates:
+            if child.pid in skip or child.pid in found or child.pid in (me, 1):
+                continue
+            try:
+                if not holds_gpu(child.pid):
+                    continue
+                if title_marker not in " ".join(child.cmdline()):
+                    continue
+            except (OSError, ValueError, IndexError, psutil.Error):
+                continue
+            try:
+                tag_here = child.environ().get(tag_env)
+                readable = True
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error:
+                readable = False
+            # An unreadable environment says nothing either way, so only a
+            # readable one that names another worker excludes the child.
+            if readable and tag_here not in tags:
+                continue
+            found[child.pid] = child
+        return found
+
+    def reap_orphans():
+        """One cheap-first pass: signal the tagged orphans, then their vLLM
+        children. Returns the processes it signalled."""
+        if len(tags) == 0:
+            return {}
+        found, unattr, forn = find_orphans(signalled)
+        unattributed.update(unattr)
+        foreign.update(forn)
+        captured = descendants_of(found)
+        signal(found, killed, denied)
+        signalled.update(found)
+        orphan_group.update(found)
+        children = vllm_children(captured, signalled)
+        signal(children, killed, denied)
+        signalled.update(children)
+        orphan_group.update(children)
+        return {**found, **children}
+
+    def wait_exit(procs, end):
+        """Poll until each process has exited, or ``end``. Returns those still
+        running. Not psutil.wait_procs: that waits on a zombie until the
+        timeout, and a SIGKILLed child whose parent is still alive stays one."""
+        alive = list(procs)
+        while True:
+            alive = [proc for proc in alive if running(proc)]
+            if len(alive) == 0 or time.monotonic() >= end:
+                return alive
+            time.sleep(0.05)
+
+    start = time.monotonic()
+    end = start + wait_s
+    first = reap_orphans()
+    # Wait for the first group before rescanning, so that anything orphaned by
+    # that kill is caught by the rescan, not while its parent still runs.
+    wait_exit([signalled[pid] for pid in killed], end)
+    if first:
+        # Backstop: processes orphaned by the kill itself. Its fresh kills get a
+        # short grace of their own, within the task's budget, so they are not
+        # reported as still running just because the first wait used up wait_s.
+        end = min(max(end, time.monotonic() + rescan_grace_s), start + wait_s + rescan_grace_s)
+        reap_orphans()
+    alive = wait_exit([signalled[pid] for pid in killed], end)
+    return dict(
+        killed=sorted(killed),
+        alive=sorted(p.pid for p in alive),
+        denied=sorted(denied),
+        orphans=sorted(set(orphan_group) & set(killed)),
+        unattributed=sorted(unattributed),
+        foreign=sorted(foreign.items()),
+    )
+
+
+def _by_value(fn: Any) -> Any:
+    """A copy of ``fn`` that Ray ships by value.
+
+    Ray pickles a module-level function by reference, so the task's worker
+    would import this module, and torch and vLLM with it, just to signal a
+    few pids: seconds on a GPU node, and a failure if that import is what is
+    broken. Functions of ``__main__`` are pickled by value.
+    """
+    copy = types.FunctionType(fn.__code__, {"__builtins__": builtins}, fn.__name__, fn.__defaults__)
+    copy.__module__ = "__main__"
+    return copy
+
+
+_kill_process_trees_task = ray.remote(num_cpus=0, num_gpus=0, max_retries=0)(_by_value(_kill_process_trees))
+
+
+async def _kill_trees_on_node(
+    node_id: str,
+    roots: list[tuple[int, float, bool]],
+    timeout_s: float,
+    orphan_tags: tuple[str, ...] = (),
+) -> dict[str, list[int]]:
+    """Run :func:`_kill_process_trees` pinned to ``node_id``.
+
+    ``num_cpus=0`` so it is placed even when the node's CPUs are all
+    reserved, and an explicit strategy so a caller inside a placement group
+    does not capture it into a bundle.
+    """
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    ref = _kill_process_trees_task.options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+    ).remote(roots, min(_TREE_KILL_WAIT_S, max(timeout_s - 1.0, 0.1)), orphan_tags=orphan_tags)
+    try:
+        return await asyncio.wait_for(_await_maybe(ref), timeout=timeout_s)
+    except BaseException:
+        try:
+            ray.cancel(ref, force=True)
+        except Exception:
+            logger.debug("could not cancel the process-tree kill on node %s", node_id, exc_info=True)
+        raise
+
+
+async def _bounded_to_thread(fn: Any, *args: Any, deadline: float) -> Any:
+    """``fn(*args)`` in a thread, abandoned with ``TimeoutError`` at
+    ``deadline``. GCS calls block; a slow GCS must not hold shutdown past
+    its bound."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=remaining)
+
+
+def _actor_id_hex(worker: Any) -> str | None:
+    actor_id = getattr(worker, "_ray_actor_id", None)
+    return None if actor_id is None else actor_id.hex()
+
+
+def _job_actor_records(job_id_hex: str) -> dict[str, dict[str, Any]]:
+    """GCS rows, in every state, of the actors of one job, keyed by actor id."""
+    from ray._private import state
+
+    return state.actors(job_id=ray.JobID(bytes.fromhex(job_id_hex))) or {}
+
+
+def _actor_is_dead(record: dict[str, Any]) -> bool:
+    return not record or record.get("State") == "DEAD"
+
+
+def _driver_actor_records(
+    drivers: list[tuple[str, str, set[int]]],
+    started_after_s: float,
+    killed_at_s: float,
+) -> list[dict[str, Any]]:
+    """Live TP-rank actors of the Ray drivers among ``drivers``, given as
+    ``(node_id, node_ip, pids)``.
+
+    vLLM's Ray executor connects EngineCore to the cluster as its own driver,
+    so its per-rank actors belong to that driver's job. Ray kills them once
+    the driver dies, but asynchronously, and they hold the engine's GPUs
+    until then. A job is skipped when it started before ``started_after_s``
+    or ended before ``killed_at_s``: either way it is an earlier driver that
+    had the same pid. Detached actors outlive their driver by design and are
+    never touched. The job table names a driver's node only by IP in Ray
+    2.55; a node id is matched instead where the table has one.
+    """
+    from ray._private import state
+
+    if len(drivers) == 0:
+        return []
+    records = []
+    for job in state.jobs():
+        pid = job.get("DriverPid")
+        node_id = job.get("DriverNodeID")
+        matched = any(
+            pid in pids and (node_id == want_node if node_id else job.get("DriverIPAddress") == want_ip)
+            for want_node, want_ip, pids in drivers
+        )
+        if not matched:
+            continue
+        if job.get("StartTime", 0) / 1000.0 + _PID_REUSE_SLACK_S < started_after_s:
+            continue
+        ended = job.get("EndTime", 0) / 1000.0
+        if ended > 0 and ended + _PID_REUSE_SLACK_S < killed_at_s:
+            continue
+        for record in _job_actor_records(job["JobID"]).values():
+            if (
+                record.get("ActorClassName") in _VLLM_RAY_RANK_ACTOR_CLASSES
+                and not record.get("IsDetached", False)
+                and not _actor_is_dead(record)
+            ):
+                records.append(record)
+    return records
+
+
+async def _probe_actor_dead(worker: Any, timeout_s: float) -> bool | None:
+    """Fallback when the GCS cannot be read: ``True`` once a call raises
+    ``RayActorError``, ``False`` while it answers or hangs, ``None`` if the
+    handle cannot be probed."""
+    ready = getattr(worker, "__ray_ready__", None)
+    if ready is None:
+        return None
+    try:
+        await asyncio.wait_for(_await_maybe(ready.remote()), timeout=timeout_s)
+    except ray.exceptions.ActorUnavailableError:
+        return False
+    except ray.exceptions.RayActorError:
+        return True
+    except asyncio.TimeoutError:
+        return False
+    except Exception:
+        logger.debug("death probe failed", exc_info=True)
+        return None
+    return False
+
+
+def _read_actor_records(actor_ids: list[str | None]) -> list[dict[str, Any] | None]:
+    """GCS rows for ``actor_ids``: ``{}`` for an actor the GCS no longer
+    has, ``None`` where it cannot be read.
+
+    Ray 2.55 has no lookup by a list of ids, so the rows are read one job at
+    a time (an actor id embeds its job id): one GCS call per job per poll
+    rather than one per actor.
+    """
+    if not ray.is_initialized():
+        return [None] * len(actor_ids)
+    by_job: dict[str, dict[str, dict[str, Any]] | None] = {}
+    records: list[dict[str, Any] | None] = []
+    for actor_id in actor_ids:
+        if actor_id is None:
+            records.append(None)
+            continue
+        try:
+            job_id = ray.ActorID(bytes.fromhex(actor_id)).job_id.hex()
+        except Exception:
+            records.append(None)
+            continue
+        if job_id not in by_job:
+            try:
+                by_job[job_id] = _job_actor_records(job_id)
+            except Exception:
+                logger.debug("could not read the GCS actor rows of job %s", job_id, exc_info=True)
+                by_job[job_id] = None
+        rows = by_job[job_id]
+        records.append(None if rows is None else rows.get(actor_id, {}))
+    return records
+
+
+async def _kill_actor_trees(
+    records: list[dict[str, Any] | None],
+    labels: list[str],
+    kill_roots: list[bool],
+    deadline: float,
+    orphan_tags: list[str | None] | None = None,
+    node_hints: list[str | None] | None = None,
+) -> list[tuple[str, str, set[int]]]:
+    """Kill the process tree of every live actor in ``records``, one task per
+    node; the actor process itself only where ``kill_roots`` says so.
+
+    Where ``orphan_tags`` gives an actor id, the task on that actor's node
+    also kills that worker's orphaned vLLM processes (see
+    :func:`_kill_process_trees`). That covers a worker that is already dead
+    too: its node comes from its GCS row, which keeps the address, or from
+    ``node_hints`` once the GCS no longer has the row.
+
+    Returns ``(node_id, node_ip, pids signalled)`` per node."""
+    tags = orphan_tags or [None] * len(records)
+    hints = node_hints or [None] * len(records)
+    roots: dict[str, list[tuple[int, float, bool]]] = {}
+    node_tags: dict[str, set[str]] = {}
+    names: dict[str, list[str]] = {}
+    ips: dict[str, str] = {}
+    for record, label, kill_root, tag, hint in zip(records, labels, kill_roots, tags, hints):
+        address = (record or {}).get("Address") or {}
+        node_id = address.get("NodeID") or hint
+        if not node_id:
+            continue
+        pid = (record or {}).get("Pid", 0)
+        alive = bool(record) and not _actor_is_dead(record) and bool(pid)
+        if not alive and tag is None:
+            continue
+        if alive:
+            roots.setdefault(node_id, []).append((pid, record.get("StartTime", 0) / 1000.0, kill_root))
+        else:
+            roots.setdefault(node_id, [])
+        if tag is not None:
+            node_tags.setdefault(node_id, set()).add(tag)
+        names.setdefault(node_id, []).append(label)
+        ips.setdefault(node_id, address.get("IPAddress", ""))
+    timeout_s = min(_TREE_KILL_TASK_TIMEOUT_S, deadline - time.monotonic())
+    if len(roots) == 0 or timeout_s <= 0:
+        return []
+
+    results = await asyncio.gather(
+        *[
+            _kill_trees_on_node(node_id, node_roots, timeout_s, orphan_tags=tuple(sorted(node_tags.get(node_id, ()))))
+            for node_id, node_roots in roots.items()
+        ],
+        return_exceptions=True,
+    )
+    killed: list[tuple[str, str, set[int]]] = []
+    for node_id, result in zip(roots, results):
+        if isinstance(result, BaseException):
+            logger.error("Could not kill the process trees of %s on node %s: %r", names[node_id], node_id, result)
+            continue
+        killed.append((node_id, ips[node_id], set(result["killed"])))
+        if len(result.get("denied", [])) > 0:
+            logger.error(
+                "Not permitted to inspect or signal processes %s of %s on node %s; they may still hold GPU memory",
+                result["denied"],
+                names[node_id],
+                node_id,
+            )
+        if len(result.get("orphans", [])) > 0:
+            logger.warning(
+                "Killed orphaned vLLM processes %s of %s on node %s, left behind by a parent that had already died",
+                result["orphans"],
+                names[node_id],
+                node_id,
+            )
+        if len(result.get("foreign", [])) > 0:
+            logger.warning(
+                "Orphaned vLLM processes on node %s hold a GPU but carry another worker's id, so they were left "
+                "running while killing %s (pid, id): %s. A CRIU-restored semi-p engine carries the id of the "
+                "worker that dumped it",
+                node_id,
+                names[node_id],
+                [tuple(item) for item in result["foreign"]],
+            )
+        if len(result.get("unattributed", [])) > 0:
+            logger.error(
+                "Orphaned vLLM processes %s on node %s hold a GPU but name no worker, so they were left running "
+                "while killing %s; they may hold GPU memory. Setting "
+                "RAY_kill_child_processes_on_worker_exit_with_raylet_subreaper=true on the cluster lets Ray reap "
+                "such processes itself",
+                result["unattributed"],
+                node_id,
+                names[node_id],
+            )
+        if len(result["alive"]) > 0:
+            logger.error(
+                "Processes %s of %s on node %s are still running after SIGKILL",
+                result["alive"],
+                names[node_id],
+                node_id,
+            )
+        elif len(result["killed"]) > 0:
+            logger.info("Killed %s on node %s: pids %s", names[node_id], node_id, result["killed"])
+    return killed
+
+
+async def _wait_until_dead(
+    targets: list[tuple[str, Any, str | None]],
+    deadline: float,
+) -> list[str]:
+    """Poll ``(label, handle, actor_id)`` targets until each is DEAD or
+    ``deadline`` passes. Returns the labels not confirmed dead.
+
+    A failed read is retried until the deadline. Only a target with neither
+    an actor id nor a handle that can be probed is given up on at once, since
+    nothing about it can change.
+    """
+    unconfirmable: list[str] = []
+    # Labels the GCS or a probe has answered for at least once. A target that
+    # is still pending at the deadline is reported as unreadable only if it
+    # never was.
+    seen: set[str] = set()
+    pending = list(targets)
+    while True:
+        try:
+            records = await _bounded_to_thread(
+                _read_actor_records, [actor_id for _, _, actor_id in pending], deadline=deadline
+            )
+        except Exception:
+            records = [None] * len(pending)
+        still_alive = []
+        for target, record in zip(pending, records):
+            label, worker, actor_id = target
+            dead: bool | None = None if record is None else _actor_is_dead(record)
+            if dead is None and worker is not None:
+                dead = await _probe_actor_dead(worker, _KILL_POLL_INTERVAL_S)
+            if dead is None and actor_id is None:
+                unconfirmable.append(f"{label} (state unreadable)")
+                continue
+            if dead is not None:
+                seen.add(label)
+            if dead is not True:
+                still_alive.append(target)
+        pending = still_alive
+        remaining = deadline - time.monotonic()
+        if len(pending) == 0 or remaining <= 0:
+            return unconfirmable + [
+                label if label in seen else f"{label} (state unreadable)" for label, _, _ in pending
+            ]
+        await asyncio.sleep(min(_KILL_POLL_INTERVAL_S, remaining))
 
 
 def ensure_ray() -> int:
@@ -518,8 +1173,14 @@ class ReplicaPool:
         self._synced_lora_name = None
 
     async def _cleanup_failed_initialize(self) -> None:
-        await self._shutdown_workers(list(self._workers))
-        self._reset_lifecycle_state()
+        # Never raises: the caller re-raises the initialize error, and a
+        # cleanup error here would replace it.
+        try:
+            await self._shutdown_workers(list(self._workers))
+        except Exception:
+            logger.exception("Cleanup after a failed initialize raised; re-raising the initialize error")
+        finally:
+            self._reset_lifecycle_state()
 
     async def _shutdown_workers(self, workers: list[ray.actor.ActorHandle]) -> None:
         n = len(workers)
@@ -598,13 +1259,128 @@ class ReplicaPool:
         finally:
             for task in pending:
                 task.cancel()
+            # Only a worker whose graceful shutdown hung or failed has its own
+            # process SIGKILLed with its tree.
+            await self._kill_workers_and_confirm(
+                workers,
+                kill_roots=[not _shut_down_cleanly(task, pending) for task in tasks],
+            )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _kill_workers_and_confirm(
+        self,
+        workers: list[ray.actor.ActorHandle],
+        kill_roots: list[bool] | None = None,
+        *,
+        node_hints: list[str | None] | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        """Kill every worker with its process tree, and wait for it to die.
+
+        Returns once the GCS has each worker DEAD, or after ``timeout_s``
+        (default ``ARCTIC_WORKER_KILL_CONFIRM_TIMEOUT_S``) with an error
+        naming the workers it could not confirm. ``ray.kill`` reaches every
+        worker whatever the budget. Never raises: it runs on error paths
+        whose own exception is the one the caller has to see.
+
+        By default only each worker's descendants are SIGKILLed here,
+        collected while the worker still roots them, and its own process is
+        left to ``ray.kill``, so an ordinary unload or rebalance is not
+        reported as a worker that died unexpectedly. ``kill_roots`` marks the
+        workers whose own process is SIGKILLed with the tree as well: those
+        whose graceful shutdown hung or failed. See the comment above
+        :func:`_kill_process_trees`.
+
+        A worker that died before this ran leaves no tree to walk: its
+        EngineCore and TP processes have been reparented. So on each worker's
+        node (from its GCS row, or ``node_hints`` once the GCS has dropped
+        it) the task also kills the orphaned vLLM processes that carry that
+        worker's actor id in their environment and hold a GPU device open.
+        Attribution is by that inherited actor id, not by GPU index: Ray
+        2.55's GCS does not record which GPUs a dead actor had, and a GPU's
+        index does not reliably map to its ``/dev/nvidiaN`` device. An
+        orphaned vLLM process that holds a GPU but carries no actor id (an
+        engine started by an older worker, or one whose environment cannot
+        be read) is not killed; it is logged as an ERROR. The cluster-level
+        backstop for those is Ray's
+        ``RAY_kill_child_processes_on_worker_exit_with_raylet_subreaper``.
+
+        Semi-p limitation: a CRIU-restored engine's processes carry the actor
+        id of the worker that dumped the image, not of the worker that
+        restored it, so their orphans match no worker being killed. They are
+        logged as a WARNING with their pids and ids, and left running.
+
+        ``timeout_s`` bounds everything, the per-node task included, and
+        that task's scheduling. Under the short budget a cancelled caller
+        gets (``_CANCELLED_KILL_CONFIRM_TIMEOUT_S``), on a busy node the task
+        may not even start, and often only ``ray.kill`` lands.
+        """
+        try:
+            await self._kill_workers_and_confirm_impl(
+                workers, kill_roots or [False] * len(workers), node_hints, timeout_s
+            )
+        except Exception:
+            logger.exception("Hard kill of %d inference workers failed", len(workers))
+
+    async def _kill_workers_and_confirm_impl(
+        self,
+        workers: list[ray.actor.ActorHandle],
+        kill_roots: list[bool],
+        node_hints: list[str | None] | None,
+        timeout_s: float | None,
+    ) -> None:
+        if len(workers) == 0:
+            return
+        if timeout_s is None:
+            timeout_s = _env_float("ARCTIC_WORKER_KILL_CONFIRM_TIMEOUT_S", 60.0)
+        deadline = time.monotonic() + timeout_s
+        killed_at_s = time.time()
+        actor_ids = [_actor_id_hex(worker) for worker in workers]
+        labels = [f"worker {idx}" for idx in range(len(workers))]
+        records: list[dict[str, Any] | None] = [None] * len(workers)
+
+        killed: list[tuple[str, str, set[int]]] = []
+        try:
+            records = await _bounded_to_thread(_read_actor_records, actor_ids, deadline=deadline)
+            killed = await _kill_actor_trees(
+                records, labels, kill_roots, deadline, orphan_tags=actor_ids, node_hints=node_hints
+            )
+        except Exception:
+            logger.exception("Could not kill the process trees of %d inference workers", len(workers))
+        finally:
             for idx, worker in enumerate(workers):
                 try:
                     ray.kill(worker)
                 except Exception:
                     logger.debug("ray.kill failed for worker %d", idx, exc_info=True)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+
+        # vLLM's Ray executor puts the TP ranks in actors of their own, owned
+        # by EngineCore and so not in the trees killed above.
+        ranks: list[dict[str, Any]] = []
+        started = [r.get("StartTime", 0) / 1000.0 for r in records if r]
+        try:
+            if len(killed) > 0:
+                ranks = await _bounded_to_thread(
+                    _driver_actor_records, killed, min(started, default=0.0), killed_at_s, deadline=deadline
+                )
+            if len(ranks) > 0:
+                await _kill_actor_trees(
+                    ranks, [f"TP-rank actor {r['ActorID']}" for r in ranks], [True] * len(ranks), deadline
+                )
+        except Exception:
+            logger.exception("Could not kill the TP-rank actors of the killed engines")
+
+        targets = list(zip(labels, workers, actor_ids))
+        targets += [(f"TP-rank actor {r['ActorID']}", None, r["ActorID"]) for r in ranks]
+        survivors = await _wait_until_dead(targets, deadline)
+        if len(survivors) > 0:
+            logger.error(
+                "Could not confirm within %.1fs (ARCTIC_WORKER_KILL_CONFIRM_TIMEOUT_S) that these inference actors "
+                "are dead; GPU memory they hold may not be free yet: %s",
+                timeout_s,
+                survivors,
+            )
 
     def _worker_env(
         self,
@@ -983,23 +1759,24 @@ class ReplicaPool:
             raise RuntimeError("ReplicaPool not initialized")
 
         async with self._stream_lifecycle():
-            while len(self._workers) > target_count:
-                idx = len(self._workers) - 1
-                self._scheduler.mark_worker_unavailable(idx)
-                try:
-                    await self._scheduler.abort_streams(worker_idx=idx)
-                    await self._scheduler.drain_worker(idx)
-                finally:
-                    worker = self._workers.pop()
-                    if len(self._slots) > len(self._workers):
-                        self._slots.pop()
+            removed: list[ray.actor.ActorHandle] = []
+            try:
+                while len(self._workers) > target_count:
+                    idx = len(self._workers) - 1
+                    self._scheduler.mark_worker_unavailable(idx)
                     try:
-                        ray.kill(worker)
-                    except Exception:
-                        logger.warning("Failed to kill removed worker %d", idx, exc_info=True)
+                        await self._scheduler.abort_streams(worker_idx=idx)
+                        await self._scheduler.drain_worker(idx)
                     finally:
+                        removed.append(self._workers.pop())
+                        if len(self._slots) > len(self._workers):
+                            self._slots.pop()
                         self._scheduler.remove_last_worker()
-                    logger.info(f"Scaled down: removed worker {idx}")
+                        logger.info(f"Scaled down: removed worker {idx}")
+            finally:
+                # One kill for all of them, still under the lock, so a
+                # scale_up cannot hand their GPUs out before they are free.
+                await self._kill_workers_and_confirm(removed)
 
     async def scale_up(self, target_count: int) -> None:
         """Add workers until *target_count* are running.
@@ -1027,27 +1804,15 @@ class ReplicaPool:
                         self._worker_env(slot, count, extra_env),
                         self._model_id,
                     )
-                except asyncio.CancelledError:
-                    try:
-                        ray.kill(worker)
-                    except Exception:
-                        pass
-                    raise
-                except Exception:
-                    try:
-                        ray.kill(worker)
-                    except Exception:
-                        pass
+                except BaseException as exc:
+                    await self._kill_workers_and_confirm([worker], timeout_s=_kill_budget(exc))
                     raise
 
                 # The pool may have been torn down while we awaited the
                 # (slow) worker init. Don't touch the now-None scheduler;
                 # discard the freshly-built worker.
                 if self._scheduler is None:
-                    try:
-                        ray.kill(worker)
-                    except Exception:
-                        pass
+                    await self._kill_workers_and_confirm([worker])
                     logger.info(
                         "scale_up aborted: pool was shut down during worker init"
                     )
@@ -2054,10 +2819,10 @@ class ReplicaPool:
         preferred = self._slots[idx][1] if idx < len(self._slots) else idx
         node = None
         if not self._is_multi_node():
-            try:
-                ray.kill(old)
-            except Exception:
-                pass
+            # The replacement reuses these GPUs at once, so the old engine's
+            # processes have to be gone first, not just signalled.
+            node_hint = self._slots[idx][0] if idx < len(self._slots) else None
+            await self._kill_workers_and_confirm([old], node_hints=[node_hint])
             new_worker = self._make_worker()
             try:
                 node, slot, count = await self._place_new_worker(
@@ -2067,11 +2832,8 @@ class ReplicaPool:
                     self._worker_env(slot, count, extra_env),
                     self._model_id,
                 )
-            except BaseException:
-                try:
-                    ray.kill(new_worker)
-                except Exception:
-                    pass
+            except BaseException as exc:
+                await self._kill_workers_and_confirm([new_worker], timeout_s=_kill_budget(exc))
                 raise
         else:
             # vLLM's Ray child actors may release PG bundles asynchronously.
