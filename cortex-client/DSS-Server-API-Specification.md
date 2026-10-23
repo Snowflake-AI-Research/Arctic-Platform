@@ -167,6 +167,9 @@ GET /{job_id}/requests/{request_id}
 `NeutrinoClient.poll_request(job_id, request_id)` handles status normalization,
 backoff, DSSST1 result decoding, and cursor-addressed result chunks.
 
+Generate can also wait for its result with `?wait_seconds=N`; see
+[6.6](#66-generate---post-job_idgenerate).
+
 ### 3.2 Job states
 
 Customer-facing job states are:
@@ -231,6 +234,8 @@ The default is ten retries after the first attempt, with exponential jitter.
 
 Create-job uses the narrower connection-establishment retry predicate so an
 ambiguous response does not accidentally create a second server-assigned job.
+A generate that waits (`wait_seconds > 0`) retries only connection failures
+and HTTP 429/503 for the same reason: a retry could start a second generation.
 
 ### 3.6 Errors
 
@@ -792,6 +797,31 @@ Typical polled result:
 The backend can add fields such as log probabilities or action masks. For a
 request submitted by the same `NeutrinoClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
+
+#### Waiting for the result: `wait_seconds`
+
+`client.generate(..., wait_seconds=N)` sends `POST /{job_id}/generate?wait_seconds=N`
+so the server can hold the call until the generation finishes. This requires
+server support; until the server enables it, the parameter is a no-op and the
+call returns the plain handle.
+
+- `N` is a whole number of seconds. `None` or `0` means no wait (today's
+  behavior). A negative value, `bool`, or `float` raises `ValueError` before
+  anything is sent.
+- The server caps the wait, and may not wait at all.
+- No wait (parameter omitted or 0, waiting disabled on the server, or an older
+  server): the reply is the plain handle `{request_id, job_id}`.
+- The call waited: the reply is the same body `GET .../requests/{request_id}`
+  returns ([6.8](#68-poll-request---get-job_idrequestsrequest_id)), plus
+  `job_id`. The generation is finished only if `status` is terminal (done,
+  failed, cancelled). If the wait ran out, `status` is pending/running with no
+  result, and the caller polls as before.
+- `generate()` still returns only the request id. A terminal reply is kept,
+  and the next `poll_request()` returns it without an API call, through the
+  same decoding (DSSST1 results, `next_cursor` pages, failed raises).
+- The client keeps at most 1024 unpolled replies. When that many are kept,
+  further generates are sent without a wait, so no finished result is
+  dropped.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 

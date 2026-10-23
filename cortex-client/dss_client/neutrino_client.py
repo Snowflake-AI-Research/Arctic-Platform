@@ -70,6 +70,9 @@ def _debug_options_enabled() -> bool:
 #   504 Gateway Timeout      - upstream didn't respond in time
 #   409                      - ZMD restarting
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_DONE_REQUEST_STATES = frozenset({"completed", "done", "succeeded"})
+_FAILED_REQUEST_STATES = frozenset({"failed", "cancelled", "canceled"})
+_TERMINAL_REQUEST_STATES = _DONE_REQUEST_STATES | _FAILED_REQUEST_STATES
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -171,6 +174,17 @@ def _is_connect_error(exc: BaseException) -> bool:
         cause = exc.args[0] if exc.args else None
         reason = getattr(cause, "reason", None)
         return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
+    return False
+
+
+def _is_waited_generate_retryable(exc: BaseException) -> bool:
+    """A waited generate may already be running server-side, so only retry
+    failures that prove the server never accepted it."""
+    if _is_connect_error(exc):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        return resp is not None and resp.status_code in (429, 503)
     return False
 
 
@@ -1300,10 +1314,15 @@ class NeutrinoClient:
     # fast client-side with a clear message.
     _MAX_GENERATE_BYTES = 60 * 1024 * 1024  # 60 MB
 
-    # With ``wait_seconds``, the read timeout must outlast the server's wait.
-    _GENERATE_WAIT_READ_MARGIN_S = 30.0
-    # Bounds memory for finished generate replies that are never polled; a
-    # dropped entry only costs one normal poll.
+    # The server waits at most 40 s, and GS gives up at its wait + 30 s; the
+    # read timeout outlasts that so the client never gives up first.
+    _GENERATE_MAX_SERVER_WAIT_S = 40
+    _GENERATE_WAIT_READ_MARGIN_S = 45.0
+    # Kept replies hold full results until polled. Dropping one would lose the
+    # result (the server deletes a delivered result ~60 s later), so once full,
+    # generates are sent without a wait instead. 1024 matches the default
+    # pool_maxsize, so a caller can submit that many before polling and still
+    # get the wait.
     _MAX_FINISHED_GENERATE_REPLIES = 1024
 
     def _check_generate_payload(self, op: str, body: bytes) -> None:
@@ -1413,19 +1432,22 @@ class NeutrinoClient:
         final_body: dict | None = None
         while idx < len(chunks):
             chunk = chunks[idx]
+            send_kwargs: dict[str, Any] = {
+                "retry_on": (
+                    _is_chunk_post_transient
+                    if allow_group_restart
+                    else _is_transient
+                ),
+            }
             # Only the final POST starts the generation, so only it waits.
-            send_kwargs = (final_send_kwargs or {}) if idx == len(chunks) - 1 else {}
+            if idx == len(chunks) - 1 and final_send_kwargs:
+                send_kwargs.update(final_send_kwargs)
             try:
                 resp = self._send(
                     "POST",
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
-                    retry_on=(
-                        _is_chunk_post_transient
-                        if allow_group_restart
-                        else _is_transient
-                    ),
                     debug_context=debug_context,
                     **send_kwargs,
                 )
@@ -1539,16 +1561,23 @@ class NeutrinoClient:
           with a ``maximum model length`` error rather than client-side.
 
         With ``wait_seconds > 0`` (whole seconds) the server may hold the
-        call up to that long (it caps the wait at 40 s). If the generation
-        finishes within the wait, the reply is kept and the next :meth:`poll_request` returns it
-        without an API call. Servers that do not support the wait reply as
-        before, and :meth:`poll_request` polls as usual.
+        call up to that long (the server caps it, and may not wait at all).
+        If the generation finishes within the wait, the reply is kept and the
+        next :meth:`poll_request` returns it without an API call. Servers that
+        do not support the wait reply as before, and :meth:`poll_request`
+        polls as usual. A waited call is not retried once it may have reached
+        the server, so a read timeout or 5xx raises instead of submitting the
+        generation twice.
         """
         if wait_seconds is not None and (
             # bool is an int subclass; reject it explicitly.
             not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or wait_seconds < 0
         ):
-            raise ValueError("wait_seconds must be a non-negative int")
+            raise ValueError(
+                f"wait_seconds must be a non-negative integer; got {wait_seconds!r}"
+            )
+        if len(self._finished_generate_replies) >= self._MAX_FINISHED_GENERATE_REPLIES:
+            wait_seconds = None
         payload: dict = {"prompts": prompts}
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params
@@ -1570,7 +1599,14 @@ class NeutrinoClient:
             final_send_kwargs=(
                 {
                     "params": {"wait_seconds": wait_seconds},
-                    "timeout": wait_seconds + self._GENERATE_WAIT_READ_MARGIN_S,
+                    # (connect, read): only the read side waits; connect keeps
+                    # today's default.
+                    "timeout": (
+                        None,
+                        min(wait_seconds, self._GENERATE_MAX_SERVER_WAIT_S)
+                        + self._GENERATE_WAIT_READ_MARGIN_S,
+                    ),
+                    "retry_on": _is_waited_generate_retryable,
                 }
                 if wait_seconds
                 else None
@@ -1578,12 +1614,10 @@ class NeutrinoClient:
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
-        state = self._normalize_request_status(response.get("status") or "")
-        if state in ("completed", "done", "succeeded", "failed", "cancelled", "canceled"):
-            replies = self._finished_generate_replies
-            replies[request_id] = self._decode_stream_result_events(response)
-            if len(replies) > self._MAX_FINISHED_GENERATE_REPLIES:
-                replies.pop(next(iter(replies)))
+        if self._normalize_request_status(response.get("status")) in _TERMINAL_REQUEST_STATES:
+            # Kept raw; poll_request decodes it, so a bad payload raises there
+            # and the caller still gets the request id.
+            self._finished_generate_replies[request_id] = response
         return request_id
 
     def generate_stream(
@@ -1923,9 +1957,10 @@ class NeutrinoClient:
     # ─── Async request polling ────────────────────────────────────────────
 
     @staticmethod
-    def _normalize_request_status(status: str) -> str:
+    def _normalize_request_status(status: Any) -> str:
         """Normalize full enum names (``REQUEST_STATE_DONE``) to short form (``done``)."""
-        return status.lower().removeprefix("request_state_")
+        # str(): GS renders an enum value it doesn't know as a raw integer.
+        return str(status or "").lower().removeprefix("request_state_")
 
     @staticmethod
     def _decode_result_payload(result: dict) -> dict | None:
@@ -2027,7 +2062,8 @@ class NeutrinoClient:
         finished_reply = self._finished_generate_replies.pop(request_id, None)
         while time.monotonic() < deadline:
             if finished_reply is not None:
-                status, finished_reply = finished_reply, None
+                status = self._decode_stream_result_events(finished_reply)
+                finished_reply = None
             else:
                 status = self.get_request_status(job_id, request_id, cursor=cursor)
             state = self._normalize_request_status(status.get("status", ""))
@@ -2043,7 +2079,7 @@ class NeutrinoClient:
                 cursor = next_cursor
                 # Drain available result chunks without backing off.
                 continue
-            if state in ("completed", "done", "succeeded"):
+            if state in _DONE_REQUEST_STATES:
                 if result_chunks:
                     result = wire.decode_result_chunks(result_chunks)
                 else:
@@ -2061,7 +2097,7 @@ class NeutrinoClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 return result
-            if state in ("failed", "cancelled", "canceled"):
+            if state in _FAILED_REQUEST_STATES:
                 error = status.get("error", "")
                 if debug_label is not None:
                     logger.debug(
@@ -2112,7 +2148,10 @@ class NeutrinoClient:
             params=params or None,
             debug_context=debug_context,
         )
-        return self._decode_stream_result_events(resp.json())
+        status = resp.json()
+        if self._normalize_request_status(status.get("status")) in _TERMINAL_REQUEST_STATES:
+            self._finished_generate_replies.pop(request_id, None)
+        return self._decode_stream_result_events(status)
 
     def cancel_request(
         self,
@@ -2122,6 +2161,7 @@ class NeutrinoClient:
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> dict:
+        self._finished_generate_replies.pop(request_id, None)
         return self._operation(
             job_id,
             "cancel-request",

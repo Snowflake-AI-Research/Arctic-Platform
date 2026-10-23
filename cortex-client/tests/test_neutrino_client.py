@@ -1129,7 +1129,12 @@ class TestDataPlane:
         kwargs = c._session.post.call_args.kwargs
         assert kwargs["params"] == {"wait_seconds": 40}
         assert type(kwargs["params"]["wait_seconds"]) is int
-        assert kwargs["timeout"] == 70
+        assert kwargs["timeout"] == (None, 85)
+
+    def test_generate_wait_read_timeout_uses_server_cap(self):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1"})
+        c.generate("j1", prompts=["x"], wait_seconds=600)
+        assert c._session.post.call_args.kwargs["timeout"] == (None, 85)
 
     def test_generate_wait_only_on_final_chunk(self):
         c = _make_client()
@@ -1214,24 +1219,108 @@ class TestDataPlane:
         assert c.poll_request("j1", rid) == {"results": []}
         assert c._session.get.call_args.kwargs["params"] == {"cursor": "c1"}
 
-    def test_generate_wait_bounds_kept_replies(self):
+    def test_generate_wait_full_store_sends_without_wait(self):
         c = _make_client()
         c._MAX_FINISHED_GENERATE_REPLIES = 2
         c._session.post.side_effect = [
             _make_response({"request_id": rid, "job_id": "j1", "status": "done"})
-            for rid in ("g1", "g2", "g3")
-        ]
+            for rid in ("g1", "g2")
+        ] + [_make_response({"request_id": "g3", "job_id": "j1"})]
         for _ in range(3):
             c.generate("j1", prompts=["x"], wait_seconds=40)
-        assert list(c._finished_generate_replies) == ["g2", "g3"]
+        assert list(c._finished_generate_replies) == ["g1", "g2"]
+        last = c._session.post.call_args.kwargs
+        assert "params" not in last
+        assert "timeout" not in last
 
-    def test_generate_wait_read_timeout_raises(self):
+    def test_generate_wait_dssst1_reply_decodes_on_poll(self, monkeypatch):
+        from dss_client import wire
+
+        payload = wire.dumps(
+            {"results": [{"text": "ok", "token_ids": torch.tensor([1, 2], dtype=torch.int64)}]}
+        )
+        c = _make_client(
+            post_json={
+                "request_id": "g1",
+                "job_id": "j1",
+                "status": "REQUEST_STATE_DONE",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        rid = c.generate("j1", prompts=["x"], wait_seconds=40)
+        assert c.poll_request("j1", rid) == {"results": [{"text": "ok", "token_ids": [1, 2]}]}
+        c._session.get.assert_not_called()
+
+    def test_generate_wait_bad_reply_payload_raises_on_poll(self, monkeypatch):
+        c = _make_client(
+            post_json={
+                "request_id": "g1",
+                "job_id": "j1",
+                "status": "done",
+                "events": [
+                    {
+                        "type": "result",
+                        "index": 0,
+                        "result": {"wire_format": "DSSST1", "encoding": "hex"},
+                    }
+                ],
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.generate("j1", prompts=["x"], wait_seconds=40) == "g1"
+        with pytest.raises(RuntimeError, match="base64"):
+            c.poll_request("j1", "g1")
+
+    def test_generate_wait_integer_status_keeps_request_id(self):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1", "status": 7})
+        assert c.generate("j1", prompts=["x"], wait_seconds=40) == "g1"
+        assert c._finished_generate_replies == {}
+
+    def test_get_request_status_terminal_frees_kept_reply(self):
+        c = _make_client(
+            post_json={"request_id": "g1", "job_id": "j1", "status": "done"},
+            get_json={"status": "done", "result": {}},
+        )
+        c.generate("j1", prompts=["x"], wait_seconds=40)
+        c.get_request_status("j1", "g1")
+        assert c._finished_generate_replies == {}
+
+    def test_cancel_request_frees_kept_reply(self):
+        c = _make_client(post_json={"request_id": "g1", "job_id": "j1", "status": "done"})
+        c.generate("j1", prompts=["x"], wait_seconds=40)
+        c.cancel_request("j1", "g1")
+        assert c._finished_generate_replies == {}
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            nc.requests.exceptions.ReadTimeout("read timed out"),
+            nc.requests.exceptions.HTTPError(response=_make_response(status_code=504)),
+        ],
+    )
+    def test_generate_wait_does_not_retry_after_send(self, monkeypatch, error):
         c = _make_client()
-        c.max_retries = 0
-        c._session.post.side_effect = nc.requests.exceptions.ReadTimeout("read timed out")
-        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+        assert c.max_retries == 10
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        c._session.post.side_effect = error
+        with pytest.raises(type(error)):
             c.generate("j1", prompts=["x"], wait_seconds=40)
-        assert c._session.post.call_args.kwargs["timeout"] == 70
+        assert c._session.post.call_count == 1
+
+    def test_generate_wait_retries_503(self, monkeypatch):
+        c = _make_client()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        busy = _make_response(status_code=503)
+        busy.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=busy)
+        c._session.post.side_effect = [busy, _make_response({"request_id": "g1", "job_id": "j1"})]
+        assert c.generate("j1", prompts=["x"], wait_seconds=40) == "g1"
+        assert c._session.post.call_count == 2
 
     def test_generate_stream_full_payload(self):
         c = _make_client(post_json={"request_id": "s1", "count": 2})
