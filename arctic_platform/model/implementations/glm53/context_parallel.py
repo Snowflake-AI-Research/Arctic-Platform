@@ -657,8 +657,11 @@ def _sparse_attention_forward(
             )
             self._ap_flashinfer_dispatch_reported = True
     elif backend == "flashmla":
-        # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
-        padding = 576 - sparse_query.shape[-1]
+        query_width = sparse_query.shape[-1]
+        # FlashMLA's forward and the fused TileLang backward take the rope-free 512-wide latent as is: 18.3 + 112 ms
+        # against 19.7 + 129 ms zero-padded to 576 for one CP8 rank at 256K on H200. FlashMLA's reference-backward
+        # fallback keeps the padding, which leaves the dot products unchanged.
+        padding = 0 if _fused_sparse_mla_backward_available() else 576 - query_width
         if padding:
             sparse_query = F.pad(sparse_query, (0, padding))
             sparse_kv = F.pad(sparse_kv, (0, padding))
@@ -673,9 +676,10 @@ def _sparse_attention_forward(
         )
         if not getattr(self, "_ap_flashmla_dispatch_reported", False):
             get_logger().info(
-                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=fused",
+                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=%s backward=fused",
                 dist.get_rank() if dist.is_initialized() else 0,
-                576 - padding,
+                query_width,
+                sparse_query.shape[-1],
             )
             self._ap_flashmla_dispatch_reported = True
     else:

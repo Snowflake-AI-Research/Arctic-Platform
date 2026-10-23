@@ -285,7 +285,8 @@ def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, fus
     if expect_infer:
         assert flashinfer.call_args.args[0].shape[-1] == 512
     else:
-        assert flashmla.call_args.args[0].shape[-1] == 576
+        # Rope-free 512: unpadded for the fused TileLang backward, zero-padded to 576 for FlashMLA's own fallback.
+        assert flashmla.call_args.args[0].shape[-1] == (512 if fused else 576)
 
 
 @pytest.mark.parametrize(
@@ -566,7 +567,7 @@ def test_real_flashmla_padded_width_matches_original_reference():
 @pytest.mark.parametrize(
     "kv_lora_rank,rope_width,use_flashmla,capability",
     [
-        pytest.param(512, 0, True, None, id="rope-free-512-pads-to-576"),
+        pytest.param(512, 0, True, None, id="rope-free-512"),
         pytest.param(512, 64, True, None, id="native-576"),
         pytest.param(448, 64, False, None, id="query-512-values-not-512"),
         pytest.param(448, 128, False, None, id="query-576-values-not-512"),
@@ -611,8 +612,9 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     assert flash.call_count == int(use_flashmla)
     assert ref.call_count == 2 * int(not use_flashmla)
     if use_flashmla:
-        assert flash.call_args.args[0].shape[-1] == 576
-        assert flash.call_args.args[1].shape[-1] == 576
+        width = kv_lora_rank + rope_width if context_parallel._fused_sparse_mla_backward_available() else 576
+        assert flash.call_args.args[0].shape[-1] == width
+        assert flash.call_args.args[1].shape[-1] == width
     else:
         assert ref.call_args.args[0].shape[-1] == kv_lora_rank + rope_width
         assert ref.call_args.kwargs["value_dim"] == kv_lora_rank
@@ -646,8 +648,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
                 hidden.float().square().mean().backward()
                 torch.cuda.synchronize()
     assert flash.call_count == sparse_layers
-    assert flash.call_args.args[0].shape[-1] == 576
-    assert flash.call_args.args[1].shape[-1] == 576
+    width = 512 if context_parallel._fused_sparse_mla_backward_available() else 576
+    assert flash.call_args.args[0].shape[-1] == width
+    assert flash.call_args.args[1].shape[-1] == width
     grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
     assert grads and all(torch.isfinite(gradient).all() for gradient in grads)
 
