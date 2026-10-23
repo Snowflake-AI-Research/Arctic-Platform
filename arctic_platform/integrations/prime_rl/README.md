@@ -70,3 +70,18 @@ The SWE recipes use PrimeIntellect's sandbox service — verifiers' default `pri
 so an external user reproduces SWE with PrimeIntellect's own sandbox. Point
 `env.agent.runtime.*` at any other verifiers runtime (`docker`, `e2b`, `modal`, …) to use a
 different sandbox backend.
+
+## SWE grading policy
+
+`swe-grade.toml` sets `env.agent.grading_policy = true` (off by default): the rollout is
+terminated and its reward forced to 0 on a format-invalid turn (any non-OK renderer tool-call
+parse status), a per-turn output-budget overrun (a turn finishing on `length`), or a framework
+turn/token limit, and the disqualified fraction is logged as `grading_policy/disqualified`.
+
+This is applied over the **unmodified public `verifiers`** by a startup monkey-patch shipped in
+this package — `_grading_startup.py`, installed at the venv root with a `.pth` (`import … ;
+apply()`) so it runs at every interpreter startup, including the EnvWorker subprocesses that
+prime-rl spawns. There is **no verifiers fork** and nothing to pass at launch; the patch only
+adds an `AgentConfig.grading_policy` field, a `parse_issues` carrier on each `Response`, two
+response `@stop` predicates, and a disqualification branch in `Task.score`, and is a no-op unless
+a recipe opts in. See `_grading_startup.py` for the exact seams.
