@@ -256,7 +256,7 @@ def test_scale_up_keeps_stream_admission_open():
 
         new_handle = MagicMock()
         new_handle.initialize.remote = AsyncMock(side_effect=initialize)
-        pool._make_worker = lambda: new_handle
+        pool._make_worker = lambda *args, **kwargs: new_handle
         pool._engine_kwargs = lambda: {}
         scaling = asyncio.create_task(pool.scale_up(2))
         try:

@@ -55,22 +55,36 @@ from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
 
 if TYPE_CHECKING:
-    from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
 def _replica_pool_cls():
-    """Lazy import — training-only servers do not need arctic_inference / vLLM."""
+    """Lazy import — training-only servers do not need Arctic Inference / vLLM."""
     require_any_dep_group("rl")
-    from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.inference.server.replica_pool import ReplicaPool
 
     return ReplicaPool
 
 
 def _transfer_schedule_cls():
     require_any_dep_group("rl")
-    from arctic_inference.server.weight_sync.schedule import TransferSchedule
+    from arctic_platform.inference.server.weight_sync.schedule import TransferSchedule
 
     return TransferSchedule
+
+
+def _arctic_sampling_env(job_config) -> dict[str, str]:
+    """Env for vLLM workers when the job asked for the in-tree Arctic Inference plugin.
+
+    The plugin accepts vLLM 0.31 only.
+    """
+    if not getattr(job_config, "arctic_inference_config", None):
+        return {}
+    return {
+        "ARCTIC_INFERENCE_ENABLED": "1",
+        "VLLM_DISABLE_COMPILE_CACHE": "0",
+        "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "ARCTIC_INFERENCE_",
+    }
 
 
 logger = logging.getLogger(__name__)
@@ -183,7 +197,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             assert self.placement, "Placement groups must be created when colocate=True"
 
         self.training_workers = []
-        # ReplicaPool pulls in arctic_inference → vLLM; only build it when a
+        # ReplicaPool pulls in arctic_platform.inference → vLLM; only build it when a
         # sampling / vLLM-log-prob job is actually requested so training-only
         # SFT servers start without the inference stack.
         self.sampling_pool = _replica_pool_cls()() if self.sampling_gpus > 0 else None
@@ -234,15 +248,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
         colocate = self.colocate
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        # Let vLLM's CuMemAllocator free the weights (offload_weights=False)
-        # instead of the legacy manual offload, which reallocated param.data on
-        # each wake and changed weight addresses -> stale rollout CUDA graphs
-        # (compile on) -> grad-norm explosion. cumem keeps addresses stable.
-        offload_weights = False
-        results["sampling"] = await pool.sleep(level=level, offload_weights=offload_weights)
+        results["sampling"] = await pool.sleep(level=level)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and not lp_pool.sleeping:
-            results["log_prob"] = await lp_pool.sleep(level=level, offload_weights=offload_weights)
+            results["log_prob"] = await lp_pool.sleep(level=level)
         if colocate:
             await pool.close_weight_sync()
             if lp_pool is not None and lp_pool._config is not None:
@@ -255,28 +264,22 @@ class ArcticRLRayServerState(ArcticRLServerState):
         results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         return results
 
-    async def wake_inference(self, tags: list[str] | None = None, restore_weights: bool | None = None):
+    async def wake_inference(self, tags: list[str] | None = None):
         """Wake all inference engines, restoring GPU memory.
 
-        ``restore_weights`` overrides the default of restoring the CPU-offloaded
-        weights on a weights wake. Callers about to overwrite every weight (e.g.
-        the CUDA IPC sync) pass ``False`` to skip a redundant full-model CPU->GPU
-        copy that would otherwise double peak GPU memory at the wake.
+        The in-tree pool wakes by tag (``weights``, then ``kv_cache``). Weight
+        bytes come from the following sync, so this does not copy a CPU
+        checkpoint back onto the GPU.
         """
         if self.colocate:
             # Release cached GPU pages so cumem can remap.
             await self._empty_training_cache(self.training_workers)
-        colocate = self.colocate
-        if restore_weights is None:
-            restore = colocate and (tags is None or "weights" in tags)
-        else:
-            restore = restore_weights
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        results["sampling"] = await pool.wake_up(tags=tags, restore_weights=restore)
+        results["sampling"] = await pool.wake_up(tags=tags)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and lp_pool.sleeping:
-            results["log_prob"] = await lp_pool.wake_up(tags=tags, restore_weights=restore)
+            results["log_prob"] = await lp_pool.wake_up(tags=tags)
         return results
 
     async def reset_prefix_cache(self, job_id: int) -> dict[str, Any]:
@@ -375,13 +378,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                     model_cfg = build_model_config(
                         job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
                     )
-                if job_config.arctic_inference_config:
-                    extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
-                    # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
-                    # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
-                    extra_env["VLLM_DISABLE_COMPILE_CACHE"] = "0"
-                    # capture ARCTIC_INFERENCE_ENABLED from the client to the Ray TP workers
-                    extra_env["VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY"] = "ARCTIC_INFERENCE_"
+                extra_env.update(_arctic_sampling_env(job_config))
                 # set env variables before initialize
                 model_cfg.extra_env = dict(extra_env)
                 await pool.initialize(
@@ -393,7 +390,13 @@ class ArcticRLRayServerState(ArcticRLServerState):
                     extra_env=extra_env if extra_env else None,
                 )
             else:
-                await pool.initialize(model_cfg, num_replicas=num_replicas)
+                extra_env = _arctic_sampling_env(job_config)
+                if extra_env:
+                    model_cfg.extra_env = dict(extra_env)
+                await pool.initialize(
+                    model_cfg,
+                    num_replicas=num_replicas,
+                )
 
         elif job_type == "log_prob":
             gpus = self.log_prob_gpus
@@ -465,13 +468,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                             lp_vllm_cfg,
                             arctic_inference_config=job_config.arctic_inference_config,
                         )
-                    if job_config.arctic_inference_config:
-                        lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
-                        # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
-                        # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
-                        lp_extra_env["VLLM_DISABLE_COMPILE_CACHE"] = "0"
-                        # capture ARCTIC_INFERENCE_ENABLED from the client to the Ray TP workers
-                        lp_extra_env["VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY"] = "ARCTIC_INFERENCE_"
+                    lp_extra_env.update(_arctic_sampling_env(job_config))
                     # set env variables before initialize
                     model_cfg.extra_env = dict(lp_extra_env)
                     await pool.initialize(
@@ -483,7 +480,13 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         extra_env=lp_extra_env if lp_extra_env else None,
                     )
                 else:
-                    await pool.initialize(model_cfg, num_replicas=num_replicas)
+                    lp_extra_env = _arctic_sampling_env(job_config)
+                    if lp_extra_env:
+                        model_cfg.extra_env = dict(lp_extra_env)
+                    await pool.initialize(
+                        model_cfg,
+                        num_replicas=num_replicas,
+                    )
                 engine = "vllm"
 
         else:

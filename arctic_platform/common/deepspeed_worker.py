@@ -43,6 +43,7 @@ from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
+from arctic_platform.common.utils.tiled_logits import fill_logits_opt_from_worker_config
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
@@ -389,6 +390,7 @@ class DeepSpeedWorker:
 
         loss_object = _pop_loss_object(batch)
         args, batch_data, meta_data, processing = unpack_batch(batch)
+        meta_data = fill_logits_opt_from_worker_config(meta_data, getattr(self, "ds_worker_config", None))
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
                 batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
@@ -727,7 +729,7 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
-        from arctic_inference.server.weight_sync.sender import WeightSender
+        from arctic_platform.inference.server.weight_sync.sender import WeightSender
 
         self._weight_sender = WeightSender(
             group=group,
@@ -777,11 +779,13 @@ class DeepSpeedWorker:
         return {"status": "not_initialized"}
 
     def send_weights_ipc(self, group_id: int) -> dict:
-        """Save weights to shared memory for colocated (same-GPU) transfer."""
-        from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
+        """Colocated shared-memory transfer is not part of arctic_platform.inference.
 
-        weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
-        return save_weights_to_shm(weights, group_id)
+        Same-GPU sync uses ``WeightSender`` over the in-tree NCCL path.
+        """
+        raise RuntimeError(
+            f"send_weights_ipc is not implemented on arctic_platform.inference; use WeightSender (group_id={group_id})"
+        )
 
     def get_cuda_ipc_handles(self) -> dict:
         """Create CUDA IPC handles for all model parameters.
