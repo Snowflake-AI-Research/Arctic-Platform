@@ -19,7 +19,8 @@ With DFlash2 on Qwen3.8-27B the KV groups use 416- and 832-token blocks. A prefi
 B = floor((N - 1) / 832) * 832 - 832 and needs Mamba state saved at exactly B, but vLLM 0.31.0 ends
 prefill chunks on the 416 grid, so that state is never saved: prompts with odd floor((N - 1) / 416)
 never hit the prefix cache and the rest miss twice. This also ends a chunk at each replay boundary
-(one extra scheduler step per prompt) and does nothing without EAGLE groups. Remove once the pinned
+(one extra prefill chunk per prompt, two when its length is a multiple of the scheduler block)
+and does nothing without EAGLE groups. Remove once the pinned
 vLLM stops prefill at ``KVCacheCoordinator.get_replay_boundaries`` itself.
 """
 
