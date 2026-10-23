@@ -20,6 +20,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    sparse_mla_flashmla_fused_apply,
+)
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.glm53 import context_parallel
 from arctic_platform.testing_utils import require_torch_gpu
@@ -587,9 +590,10 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     attention = _dispatch_attention(kv_lora_rank, rope_width)
     attention = attention.to(device="cuda", dtype=torch.bfloat16)
     hidden_states = torch.randn(1, 4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    indices = torch.arange(4, device="cuda").expand(1, 4, -1)
+    # int32, as the model's own top-k selection returns them (the fused backward takes int32 indices).
+    indices = torch.arange(4, device="cuda", dtype=torch.int32).expand(1, 4, -1)
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", wraps=context_parallel._reference_sparse_mla
             ) as ref:
@@ -633,7 +637,7 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
             ):
@@ -658,12 +662,13 @@ def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_mode
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
-    with patch.object(
+    # With the fused TileLang backward installed, FlashMLA's forward and that backward take precedence.
+    with patch.object(context_parallel, "_fused_sparse_mla_backward_available", return_value=False), patch.object(
         context_parallel,
         "_flashinfer_sparse_mla_apply",
         wraps=context_parallel._flashinfer_sparse_mla_apply,
     ) as flashinfer:
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", side_effect=AssertionError("FlashMLA")):
+        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", side_effect=AssertionError("FlashMLA")):
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
             ):
