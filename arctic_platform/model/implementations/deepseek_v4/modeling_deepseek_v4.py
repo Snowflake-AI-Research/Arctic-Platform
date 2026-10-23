@@ -34,6 +34,7 @@ from arctic_platform.model.implementations.deepseek_v4.moe import DeepseekV4MoE
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 from arctic_platform.model.implementations.layers.norms import RMSNorm, RMSNormConfig
 
 
@@ -182,6 +183,17 @@ class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
         if fp8_weight_block_size(self.config) is not None:
             encode_e8m0_scales_(state_dict)
         return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+
+    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        # The chain skips keys a group does not hold, so one decoder layer or the
+        # top-level group (``layer_idx == -1``) goes through it whole.
+        if 0 <= layer_idx < self.config.num_hash_layers:
+            # Weight sync leaves this buffer out, but a saved checkpoint cannot route hash layers without it.
+            name = f"model.layers.{layer_idx}.mlp.router.tid2eid"
+            state_dict[name] = next(
+                buffer for key, buffer in self.named_buffers() if hf_export_param_name(key) == name
+            )
+        return self.convert_to_hf(state_dict)
 
     def init_buffers_post_meta(self) -> None:
         # `to_empty()` leaves every buffer uninitialized and this runs before `dcp_load`, so a

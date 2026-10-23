@@ -151,6 +151,30 @@ def test_published_expert_names_convert_to_platform_parameters():
     assert converted["model.embed_tokens.weight"].shape == (32, 64)
 
 
+def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    model = DeepseekV4ForCausalLM(_tiny_config())
+    model.model.layers[0].mlp.router.tid2eid.copy_(torch.arange(64).view(32, 2) % 4)
+
+    exported = dict(build_iter_full_hf_weights(model)())
+    assert not [name for name in exported if name.startswith("model.")]
+    assert "layers.1.attn.indexer.compressor.wkv.weight" in exported
+    assert "layers.1.ffn.gate.bias" in exported
+    assert "layers.0.ffn.gate.bias" not in exported
+
+    expected = dict(named_weight_sync_tensors(model))
+    expected["model.layers.0.mlp.router.tid2eid"] = model.model.layers[0].mlp.router.tid2eid
+    loaded = apply_hf_to_prime(dict(exported), model.conversion_chain(model.config))
+    assert sorted(loaded) == sorted(expected)
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor), name
+
+
 def test_official_fp8_checkpoint_keeps_packed_expert_weights():
     from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
     from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
