@@ -110,24 +110,28 @@ def widen_adapter(path: str | Path) -> None:
     os.replace(tmp, file)
 
 
-def export_adapter(zone_url: str, job_id: str, dest: str | Path, peft_config: dict) -> dict:
+def export_adapter(
+    zone_url: str, job_id: str, dest: str | Path, peft_config: dict, *, weights_only: bool = True
+) -> dict:
     """Write the job's live LoRA factors to ``dest`` as a standard PEFT adapter.
 
     The weights-only save's ``default/`` adapter is recorded but not used, because it can come out empty.
     The resumable DeepSpeed module state holds every parameter, so the factors come from there.
+    ``weights_only=False`` skips that save, for models whose HF export does not exist.
     """
     import torch
     from safetensors import safe_open
 
     dest = require_data_fast_path(dest, label="LoRA adapter export")
-    weights_root = dest.with_name(dest.name + "-weights-only")
-    zone_save(zone_url, job_id, "weights-only", weights_root)
-    packs = sorted(weights_root.glob("**/default/adapter_model.safetensors"))
     weights_only_tensors = None
-    if packs:
-        with safe_open(packs[-1], framework="pt") as f:
-            weights_only_tensors = len(list(f.keys()))
-    shutil.rmtree(weights_root, ignore_errors=True)
+    if weights_only:
+        weights_root = dest.with_name(dest.name + "-weights-only")
+        zone_save(zone_url, job_id, "weights-only", weights_root)
+        packs = sorted(weights_root.glob("**/default/adapter_model.safetensors"))
+        if packs:
+            with safe_open(packs[-1], framework="pt") as f:
+                weights_only_tensors = len(list(f.keys()))
+        shutil.rmtree(weights_root, ignore_errors=True)
 
     resumable_root = dest.with_name(dest.name + "-resumable")
     zone_save(zone_url, job_id, "resumable", resumable_root)
@@ -141,5 +145,6 @@ def export_adapter(zone_url: str, job_id: str, dest: str | Path, peft_config: di
         "source": str(states[-1]),
         "tensors": len(factors),
         "weights_only_adapter_tensors": weights_only_tensors,
+        "weights_only_saved": weights_only,
         "lora_B_max_abs": max(float(t.abs().max()) for k, t in factors.items() if ".lora_B." in k),
     }

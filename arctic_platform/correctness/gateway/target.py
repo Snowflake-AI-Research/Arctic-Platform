@@ -165,6 +165,7 @@ def run_target(
     warmup_batch=None,
     adapter_dir: str | Path | None = None,
     zone_url: str | Callable[[], str] | None = None,
+    weights_only_save: bool = True,
 ) -> dict:
     """Create the job, optionally warm up and export its LoRA adapter, then one fwd-bwd and a zero-LR step.
 
@@ -183,7 +184,7 @@ def run_target(
             client.poll_request(job_id, client.forward_backward(job_id, frame(warmup_batch)))
             client.poll_request(job_id, client.step(job_id, WARMUP_LR))
             url = zone_url() if callable(zone_url) else zone_url
-            exported = export_adapter(url, job_id, adapter_dir, peft_config)
+            exported = export_adapter(url, job_id, adapter_dir, peft_config, weights_only=weights_only_save)
             print(f"[target] adapter {exported} -> {adapter_dir}", flush=True)
         t0 = time.time()
         fwd = client.poll_request(job_id, client.forward_backward(job_id, frame(batch)))

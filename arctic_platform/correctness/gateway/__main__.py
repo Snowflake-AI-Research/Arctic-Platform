@@ -56,6 +56,7 @@ def cmd_reference(args) -> int:
     result = run(
         args.fixture,
         batch,
+        token_budget=args.token_budget,
         attn_implementation=args.attn_implementation,
         mixer_packing=uses_mixer_packing(args.fixture),
         fused_cross_entropy=args.fused_cross_entropy,
@@ -114,6 +115,7 @@ def cmd_target(args) -> int:
             "warmup_batch": arm_batch(args.fixture, args.arm, n_gpus, max_seq_len, seed=WARMUP_SEED)[1],
             "adapter_dir": out.with_name(out.stem + "-adapter").resolve(),
             "zone_url": args.zone_url or (lambda: zone_url_from_log(args.zone_log)),
+            "weights_only_save": not args.skip_weights_only_save,
         }
     result = run_target(make_client(args.gateway), body, batch, **lora)
     record = {
@@ -184,12 +186,20 @@ def main(argv=None) -> int:
     ref = sub.choices["reference"]
     ref.add_argument("--adapter", default=None, help="PEFT adapter exported by the matching LoRA target")
     ref.add_argument("--attn-implementation", default="sdpa")
+    ref.add_argument(
+        "--token-budget", type=int, default=65536, help="tokens per reference microbatch; eager attention needs less"
+    )
     tgt = sub.choices["target"]
     tgt.add_argument("--label", required=True, help="names the tree under test, e.g. pr or base")
     tgt.add_argument("--gateway", default=DEFAULT_GATEWAY)
     tgt.add_argument("--max-tokens-per-mb", type=int, default=None, help="override the config's microbatch")
     tgt.add_argument("--zone-url", default=None, help="training zone v0 server, for LoRA adapter export")
     tgt.add_argument("--zone-log", default=None, help="zone log announcing its server port, if --zone-url is unset")
+    tgt.add_argument(
+        "--skip-weights-only-save",
+        action="store_true",
+        help="export the adapter from the resumable save alone, for models without an HF weight export",
+    )
     summ = sub.add_parser("summarize")
     summ.add_argument("--results", required=True)
     summ.add_argument("--fixture", nargs="+", required=True, metavar="CONFIG=FIXTURE")

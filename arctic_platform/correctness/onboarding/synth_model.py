@@ -78,8 +78,16 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     text = getattr(cfg, "text_config", cfg)
     original = int(text.num_hidden_layers)
 
-    period = detect_block_period(list(getattr(text, "layer_types", []))) if hasattr(text, "layer_types") else 1
-    if period > 1 and num_layers % period != 0:
+    layer_types = list(getattr(text, "layer_types", None) or [])
+    period = detect_block_period(layer_types) if layer_types else 1
+    if period > 1 and 2 * period > len(layer_types):
+        # No repeating block: a prefix is valid when it still holds every type of every per-layer schedule.
+        for name in ("layer_types", "mlp_layer_types"):
+            schedule = list(getattr(text, name, None) or [])
+            missing = sorted(set(schedule) - set(schedule[:num_layers]))
+            if missing:
+                raise ValueError(f"num_layers={num_layers} drops {name} entries {missing} from the comparison")
+    elif period > 1 and num_layers % period != 0:
         raise ValueError(
             f"num_layers={num_layers} must be a multiple of the block period {period}; a partial block "
             "would drop a layer type from the comparison entirely"

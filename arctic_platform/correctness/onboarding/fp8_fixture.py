@@ -27,7 +27,14 @@ import shutil
 from pathlib import Path
 
 SHARD_BYTES = 5 * 1024**3
-SCALE_SUFFIX = "_scale_inv"
+DEFAULT_CARRY = ("quantization_config",)
+
+
+def scale_keys(key: str) -> tuple[str, ...]:
+    """Scale tensor names a quantized ``*.weight`` may carry: HF's ``weight_scale_inv`` or DeepSeek's ``scale``."""
+    if not key.endswith(".weight"):
+        return ()
+    return (f"{key}_scale_inv", key.removesuffix("weight") + "scale")
 
 
 def fp8_keys(source_map: dict, wanted: list[str]) -> list[str]:
@@ -36,21 +43,47 @@ def fp8_keys(source_map: dict, wanted: list[str]) -> list[str]:
         if key not in source_map:
             raise KeyError(f"{key} is missing from the FP8 source")
         keys.append(key)
-        if key.endswith(".weight") and f"{key}{SCALE_SUFFIX}" in source_map:
-            keys.append(f"{key}{SCALE_SUFFIX}")
+        keys.extend(scale for scale in scale_keys(key) if scale in source_map and scale not in wanted)
     return keys
 
 
-def build(source: str | Path, like: str | Path, dest: str | Path, *, shard_bytes: int = SHARD_BYTES) -> dict:
-    """Write ``dest`` with ``like``'s tensor names, config and sidecars, plus the source's quantization config."""
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
+def build(
+    source: str | Path,
+    like: str | Path,
+    dest: str | Path,
+    *,
+    carry: tuple[str, ...] = DEFAULT_CARRY,
+    shard_bytes: int = SHARD_BYTES,
+) -> dict:
+    """Write ``dest`` with ``like``'s tensor names, config and sidecars, plus the source's ``carry`` config keys."""
     source, like, dest = Path(source), Path(like), Path(dest)
     dest.mkdir(parents=True, exist_ok=False)
     source_map = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
     wanted = sorted(json.loads((like / "model.safetensors.index.json").read_text())["weight_map"])
     keys = fp8_keys(source_map, wanted)
+    shards = write_shards(source, source_map, keys, dest, shard_bytes=shard_bytes)
+
+    config = json.loads((like / "config.json").read_text())
+    source_config = json.loads((source / "config.json").read_text())
+    for key in carry:
+        config[key] = source_config[key]
+    (dest / "config.json").write_text(json.dumps(config, indent=2))
+    copy_sidecars(like, dest)
+    return {"tensors": len(keys), "scales": len(keys) - len(wanted), "shards": shards}
+
+
+def copy_sidecars(source: Path, dest: Path) -> None:
+    for path in source.iterdir():
+        if path.is_file() and not path.name.endswith((".safetensors", ".index.json")) and path.name != "config.json":
+            shutil.copyfile(path, dest / path.name)
+
+
+def write_shards(
+    source: Path, source_map: dict, keys: list[str], dest: Path, *, shard_bytes: int = SHARD_BYTES
+) -> int:
+    """Copy ``keys`` from ``source`` into ``dest`` as an indexed safetensors checkpoint; returns the shard count."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
 
     shards, shard, size = [], {}, 0
     handles = {}
@@ -75,14 +108,7 @@ def build(source: str | Path, like: str | Path, dest: str | Path, *, shard_bytes
         weight_map.update({k: name for k in tensors})
     index = {"metadata": {}, "weight_map": weight_map}
     (dest / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
-
-    config = json.loads((like / "config.json").read_text())
-    config["quantization_config"] = json.loads((source / "config.json").read_text())["quantization_config"]
-    (dest / "config.json").write_text(json.dumps(config, indent=2))
-    for path in like.iterdir():
-        if path.is_file() and not path.name.endswith((".safetensors", ".index.json")) and path.name != "config.json":
-            shutil.copyfile(path, dest / path.name)
-    return {"tensors": len(keys), "scales": sum(k.endswith(SCALE_SUFFIX) for k in keys), "shards": len(shards)}
+    return len(shards)
 
 
 def main(argv=None) -> int:
@@ -90,8 +116,11 @@ def main(argv=None) -> int:
     parser.add_argument("--source", required=True, help="full block-FP8 checkpoint")
     parser.add_argument("--like", required=True, help="reduced fixture whose tensor set and config to mirror")
     parser.add_argument("--dest", required=True)
+    parser.add_argument(
+        "--carry", nargs="+", default=list(DEFAULT_CARRY), help="source config keys to copy, e.g. expert_dtype"
+    )
     args = parser.parse_args(argv)
-    print(json.dumps(build(args.source, args.like, args.dest)))
+    print(json.dumps(build(args.source, args.like, args.dest, carry=tuple(args.carry))))
     return 0
 
 

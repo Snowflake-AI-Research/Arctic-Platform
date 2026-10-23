@@ -17,6 +17,8 @@
 
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import peft
 import pytest
@@ -28,6 +30,8 @@ from arctic_platform.correctness.gateway import compare
 from arctic_platform.correctness.gateway import lora_export
 from arctic_platform.correctness.gateway import target
 from arctic_platform.correctness.onboarding import fp8_fixture
+from arctic_platform.correctness.onboarding import layer_slice
+from arctic_platform.correctness.reference import deepseek_v4_reference
 
 LORA = {"peft_type": "LORA", "r": 2, "lora_alpha": 2, "target_modules": ["q_proj"], "task_type": "CAUSAL_LM"}
 
@@ -222,3 +226,98 @@ def test_fp8_fixture_keeps_scales_quantization_and_sidecars(tmp_path) -> None:
     assert (dest / "tokenizer_config.json").exists()
     with pytest.raises(KeyError, match="missing from the FP8 source"):
         fp8_fixture.fp8_keys({}, ["model.layers.0.mlp.weight"])
+
+
+def test_fp8_keys_take_deepseek_scale_siblings_once() -> None:
+    source = dict.fromkeys(["layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale", "layers.0.hc_attn_scale"], "f")
+    assert fp8_fixture.fp8_keys(source, ["layers.0.attn.wq_a.weight", "layers.0.hc_attn_scale"]) == [
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.wq_a.scale",
+        "layers.0.hc_attn_scale",
+    ]
+    assert fp8_fixture.fp8_keys(source, ["layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"]) == [
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.wq_a.scale",
+    ]
+
+
+def test_layer_slice_keeps_original_names_and_truncates_padded_lists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(layer_slice, "require_data_fast_path", lambda path, label: Path(path))
+    source, dest = tmp_path / "source", tmp_path / "dest"
+    source.mkdir()
+    tensors = {
+        "embed.weight": torch.ones(2),
+        "layers.0.attn.wq_a.weight": torch.ones(2),
+        "layers.0.attn.wq_a.scale": torch.ones(1),
+        "layers.1.attn.wq_a.weight": torch.ones(2),
+        "layers.10.attn.wq_a.weight": torch.ones(2),
+        "mtp.0.attn.wq_a.weight": torch.ones(2),
+    }
+    save_file(tensors, str(source / "model.safetensors"))
+    weight_map = dict.fromkeys(tensors, "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    (source / "config.json").write_text(
+        json.dumps(
+            {"num_hidden_layers": 3, "compress_ratios": [0, 4, 128, 0], "ids": [2], "num_nextn_predict_layers": 1}
+        )
+    )
+    (source / "tokenizer.json").write_text("{}")
+
+    assert layer_slice.slice_layers(source, dest, 1) == {"tensors": 3, "shards": 1}
+    index = json.loads((dest / "model.safetensors.index.json").read_text())["weight_map"]
+    assert sorted(index) == ["embed.weight", "layers.0.attn.wq_a.scale", "layers.0.attn.wq_a.weight"]
+    assert json.loads((dest / "config.json").read_text()) == {
+        "num_hidden_layers": 1,
+        "compress_ratios": [0],
+        "ids": [2],
+        "num_nextn_predict_layers": 0,
+    }
+    assert (dest / "tokenizer.json").exists()
+
+
+def test_deepseek_v4_kv_fake_quant_tiles_scales_and_passes_gradient() -> None:
+    x = torch.zeros(2, 192, dtype=torch.bfloat16)
+    x[0, :64] = 1.3
+    x[0, 64:128] = 0.75
+    x[0, 0] = 448.0 * 2.0**-3
+    x[0, 128:] = 3.14159
+    x[1, :64] = 1e-9
+    x.requires_grad_(True)
+
+    amax_floor = deepseek_v4_reference.fake_quant_kv(x, 64, floor_scale=False)
+    scale_floor = deepseek_v4_reference.fake_quant_kv(x, 64, floor_scale=True)
+
+    scale = 2.0**-3
+    expected = (torch.full((63,), 1.3) / scale).to(torch.float8_e4m3fn).float() * scale
+    assert torch.equal(amax_floor[0, 1:64].float(), expected)
+    assert amax_floor[0, 0] == 448.0 * scale
+    assert torch.equal(amax_floor[0, 64:128], x[0, 64:128])
+    assert torch.equal(amax_floor[:, 128:], x[:, 128:])
+    assert amax_floor[1, 0] == 2.0**-30
+    assert scale_floor[1, 0] == 0
+    amax_floor.sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+
+
+def test_deepseek_v4_rms_norm_returns_input_dtype() -> None:
+    norm = SimpleNamespace(weight=torch.full((4,), 2.0), variance_epsilon=0.0)
+    out = deepseek_v4_reference.rms_norm_forward(norm, torch.ones(1, 4, dtype=torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, torch.full((1, 4), 2.0, dtype=torch.bfloat16))
+
+
+def test_fp8_fixture_carries_listed_config_keys(tmp_path) -> None:
+    source, like, dest = tmp_path / "source", tmp_path / "like", tmp_path / "dest"
+    source.mkdir()
+    like.mkdir()
+    save_file({"w.weight": torch.ones(2, dtype=torch.bfloat16)}, str(source / "model.safetensors"))
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w.weight": "model.safetensors"}}))
+    (source / "config.json").write_text(json.dumps({"quantization_config": {"fmt": "e4m3"}, "expert_dtype": "fp4"}))
+    (like / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w.weight": "model.safetensors"}}))
+    (like / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+    fp8_fixture.build(source, like, dest, carry=("quantization_config", "expert_dtype"))
+    assert json.loads((dest / "config.json").read_text()) == {
+        "num_hidden_layers": 1,
+        "quantization_config": {"fmt": "e4m3"},
+        "expert_dtype": "fp4",
+    }
