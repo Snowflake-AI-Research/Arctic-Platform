@@ -977,18 +977,17 @@ class ArcticRLRayServer:
         # Empty-cache is the only training-worker operation in a public
         # colocated wake. Guard just that RPC, then wake vLLM outside the lock.
         # A latched training failure skips empty-cache so inference can still
-        # drain rollouts or shut down cleanly.
+        # drain rollouts or shut down cleanly. The gap before the vLLM wake is
+        # accepted: holding the lock across that call would stall every queued
+        # training op for the whole wake. A training op that starts in the gap
+        # can reallocate GPU pages before vLLM remaps them.
         if self.colocate:
             async with self._training_op_lock:
                 if not self._training_failed:
                     await self._await_training_refs(
-                        lambda: [
-                            self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)
-                        ]
+                        lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)]
                     )
-            results = await self.arctic_rl_ray_server_state.wake_inference.remote(
-                tags, empty_training_cache=False
-            )
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags, empty_training_cache=False)
         else:
             results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
