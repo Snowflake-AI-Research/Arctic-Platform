@@ -675,6 +675,21 @@ class TestCortexNoopOffload:
         assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
 
 
+class TestCortexSamplingSubJob:
+    def test_forwards_tensor_parallel_size(self):
+        """Neutrino's sampler reads TP from vllm_config and defaults to 1; n_gpus does not set it."""
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            sampling_gpus=16,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            sampling={"vllm": {"tensor_parallel_size": 16}},
+        )
+        (sampling,) = [sub for sub in cfg.to_cortex() if "inference_config" in sub]
+        assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 16
+
+
 class TestCortexBackendOnlyConstruction:
     def test_backend_config_does_not_initialize_jobs(self):
         """A bare CortexConfig builds transport plumbing but cannot create a job."""
