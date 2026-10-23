@@ -4,6 +4,7 @@ from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
+from arctic_platform.inference.vllm import mamba_replay_boundary_stop
 from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
@@ -65,6 +66,12 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("mamba_completion_refresh"),
     )
 
+    monkeypatch.setattr(
+        mamba_replay_boundary_stop,
+        "ensure_mamba_replay_boundary_stop",
+        lambda: calls.append("mamba_replay_boundary_stop"),
+    )
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -78,4 +85,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dflash_max_position",
         "mrope_yarn",
         "mamba_completion_refresh",
+        "mamba_replay_boundary_stop",
     ]
