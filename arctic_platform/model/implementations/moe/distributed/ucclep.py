@@ -358,6 +358,20 @@ def finalize_dispatch_tokens(
     return hidden_states, num_tokens_per_expert, state
 
 
+def finalize_dispatch_rows(
+    pending_state: _PendingDispatchState,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The receive buffer as delivered: each token once, its local expert ids (``-1`` elsewhere), its routing
+    weights. For expert kernels that gather and reduce the rows themselves (``combine_rows`` sends the result)."""
+    _sync_dispatch(pending_state.handle_id)
+    return pending_state.hidden_states, pending_state.dispatched_indices, pending_state.dispatched_scores
+
+
+def combine_rows(hidden_states: torch.Tensor, pending_state: _PendingDispatchState) -> torch.Tensor:
+    """Combine per-received-token outputs (already summed over this rank's experts) back to their source ranks."""
+    return _UcclEPCombine.apply(hidden_states, pending_state.handle_id)
+
+
 def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
     if state.permuted_scores is not None:
         hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
@@ -368,9 +382,11 @@ def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.
 register_ucclep_cuda_ops()
 
 __all__ = [
+    "combine_rows",
     "combine_tokens",
     "configure_num_sms",
     "dispatch_tokens_async",
+    "finalize_dispatch_rows",
     "finalize_dispatch_tokens",
     "sync_combine",
 ]

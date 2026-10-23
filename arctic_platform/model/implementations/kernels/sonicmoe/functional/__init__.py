@@ -1,0 +1,672 @@
+# ********************************************************************************
+# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
+# ********************************************************************************
+
+import itertools
+import logging
+from functools import partial
+
+import quack.autotuner
+import quack.gemm_config as _gc
+import torch
+import torch.nn.functional as F
+from quack.autotuner import AutotuneConfig
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm, gemm_act, gemm_tuned
+
+from ..enums import ActivationType, is_glu
+from .backward import (
+    _down_projection_backward_act,
+    _token_broadcast_backward,
+    _topk_softmax_bwd,
+    _up_projection_backward_act,
+)
+from .forward import _router_forward, _topk_softmax_fwd
+from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+
+
+
+# QuACK autotuning accelerators, applied at import. QuACK sweeps its whole config space
+# per problem key, and MoE keys move every step (M = routed tokens), so we shrink the
+# space and let nearby M share a cache entry. Search only; the math is unchanged.
+
+def _fast_sm90_configs(epilogue: str | None = None, tune_coop: bool = True) -> list[GemmConfig]:
+    """Reduced SM90 (Hopper) config space — drop-in for quack.gemm_config._get_sm90_configs.
+
+    Drops tile_n=208 (gated rejects non-multiples of 32; gather_A rejects it on SM90)
+    and the odd (128, 224) / (192, 128) tiles: 44 -> 28 configs, 18 -> 14 for "gated".
+    """
+    tile_n_vals = [128, 160, 192]
+    tile_mn_vals_coop = [(256, tile_n) for tile_n in tile_n_vals] + [(128, 256)]
+    tile_mn_vals_pingpong = [(128, tile_n) for tile_n in tile_n_vals]
+    if epilogue in ["gated"]:
+        tile_mn_vals_coop = [(m, n) for m, n in tile_mn_vals_coop if n % 32 == 0 and m != 192]
+        tile_mn_vals_pingpong = [(m, n) for m, n in tile_mn_vals_pingpong if n % 32 == 0]
+    tile_mn_vals = []
+    if tune_coop:
+        tile_mn_vals += [(m, n, False) for m, n in tile_mn_vals_coop]
+    tile_mn_vals += [(m, n, True) for m, n in tile_mn_vals_pingpong]
+    cluster = [(1, 2), (2, 1)]
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    return [
+        GemmConfig(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            pingpong=pingpong,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            swap_ab=swap_ab,
+            device_capacity=9,
+            is_dynamic_persistent=False,  # SM90 has no CLC-based dynamic persistent scheduler
+            use_tma_gather=False,  # TMA gather not supported on SM90
+        )
+        for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
+            tile_mn_vals, cluster, swap_ab_vals
+        )
+    ]
+
+
+def _fast_sm100_configs(epilogue: str | None = None) -> list[GemmConfig]:
+    """Reduced SM100 (Blackwell datacenter) config space — a drop-in for
+    quack.gemm_config._get_sm100_configs.
+    """
+    tile_n_vals = [128, 160, 192, 256]
+    tile_mn_cluster_vals = (
+        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
+        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, 512, (2, 1))]
+    )
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)  # no pingpong on SM100
+    use_clc_vals = [True, False]
+    use_tma_gather_vals = [True, False]
+    return [
+        GemmConfigCls(
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
+        )
+        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
+        )
+    ]
+
+
+# M-range quantization: what picks a config is the order of magnitude of M, not its
+# exact value, so the cache is keyed on a bucket of M — one every 3 powers of two, i.e.
+# each spanning 8x: M<=8, 8<M<=64, 64<M<=512, 512<M<=4096, ...
+def _bucketize_M(m: int) -> int:
+    """Every M shares one bucket: each GEMM structure (trailing dims, stride classes, dtypes) is tuned once.
+
+    Training receive buffers hold 1e4-1e6 tokens and routed rows that move with routing every layer, step and
+    DeepEP chunk. Any M bucket a rank had not hit before started a full autotuning sweep mid-training -- CUDA-graph
+    timing plus ``empty_cache`` -- on that rank while the others waited at the next collective (Qwen3.8 steps at
+    30-40 s instead of 12 s, still with one bucket above 4096 rows). The winning tile config does not depend on M
+    at these sizes (local change).
+    """
+    return 1 << 30
+
+
+# The experts' feature dims (hidden, intermediate, 2 x intermediate, experts), recorded by the callers.
+_FEATURE_DIMS: set[int] = set()
+
+
+def note_feature_dims(*dims: int) -> None:
+    """Keep these dims exact in autotune keys; every other dim is a token or routed-row count."""
+    _FEATURE_DIMS.update(dims)
+
+
+def _make_bucketized_key(self, args, kwargs) -> tuple:
+    """QuACK's autotune cache key, with every tensor's leading dim (M) bucketized, and every other dim that is not
+    an expert feature dim too: those are token or routed-row counts, which the weight-gradient GEMMs (variable-length
+    K) carry as trailing dims and which would otherwise start a sweep on every call (local change).
+
+    The feature dims stay exact, so structurally different GEMMs cannot alias onto one key,
+    and the stringified entries never collide with QuACK's own exact-shape keys.
+    """
+    all_args = {**dict(zip(self.arg_names, args)), **kwargs}
+    _args = {k: v for k, v in all_args.items() if k in self.arg_names}
+    key = [str(_args[k]) for k in self.keys if k in _args]
+    for arg in _args.values():
+        if isinstance(arg, torch.Tensor):
+            shape = [d if d in _FEATURE_DIMS else 1 << 30 for d in arg.shape]
+            if shape:
+                shape[0] = _bucketize_M(shape[0])
+            key.append(str(tuple(shape)))
+            # only the {0, 1, other} classes of a stride matter; same folding QuACK does
+            key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
+_orig_autotuner_call = quack.autotuner.Autotuner.__call__
+
+
+@torch.compiler.disable  # the tuner must never be traced
+def _autotuner_call_with_M_buckets(self, *args, **kwargs):
+    if len(self.configs) > 1:
+        bucket_key = _make_bucketized_key(self, args, kwargs)
+        if bucket_key in self.cache:
+            # An earlier M in this bucket was tuned already: reuse its winner, skip the
+            # sweep. Mirrors the cache-hit tail of the original __call__.
+            config = self.cache[bucket_key]
+            self.best_config = config
+            self.nargs = dict(zip(self.arg_names, args))
+            ret = self.fn(*args, **kwargs, **config.all_kwargs())
+            self.nargs = None
+            return ret
+
+    # First call with this GEMM structure: let QuACK tune for real, under its own exact-shape key ...
+    if len(self.configs) > 1:
+        logging.getLogger(__name__).warning("SonicMoE autotuning %s for %s", getattr(self.fn, "__name__", self.fn), bucket_key)
+    ret = _orig_autotuner_call(self, *args, **kwargs)
+
+    # ... then alias that winner onto the bucket key, for every later M in the bucket.
+    if len(self.configs) > 1 and hasattr(self, "best_config"):
+        self.cache[_make_bucketized_key(self, args, kwargs)] = self.best_config
+
+    return ret
+
+
+quack.autotuner.Autotuner.__call__ = _autotuner_call_with_M_buckets
+_gc._get_sm90_configs = _fast_sm90_configs
+_gc._get_sm100_configs = _fast_sm100_configs
+
+# gemm_tuned (plain GEMMs: down projection, dw1/dw2) captured its config list at
+# decoration time, so it needs an explicit rebuild. The per-epilogue autotuners behind
+# gemm_act / gemm_dact are built on first call and read the patched generators already.
+gemm_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
+
+
+class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, router_logits: torch.Tensor, E: int, K: int, is_softmax_over_topk: bool, norm_topk_probs: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        T = router_logits.size(0)
+
+        topk_router_score = torch.empty(T, K, dtype=torch.float32, device=router_logits.device)
+        topk_router_indices = torch.empty(T, K, dtype=torch.int32, device=router_logits.device)
+
+        _topk_softmax_fwd(
+            router_logits,
+            topk_router_score,
+            topk_router_indices,
+            E,
+            K,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
+        )
+
+        # Save router_logits for topk(softmax()) backward (recompute full softmax).
+        # For softmax(topk()) it's unused but save unconditionally for simplicity.
+        ctx.save_for_backward(topk_router_score, topk_router_indices, router_logits)
+        ctx.E = E
+        ctx.dtype = router_logits.dtype
+        ctx.is_softmax_over_topk = is_softmax_over_topk
+        ctx.norm_topk_probs = norm_topk_probs
+
+        return topk_router_score, topk_router_indices
+
+    @staticmethod
+    def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor):
+        T, K = dtopk_score.size()
+        E = ctx.E
+        topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
+        dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
+
+        _topk_softmax_bwd(
+            router_logits,
+            dlogits,
+            None,
+            dtopk_score,
+            topk_router_score,
+            topk_router_indices,
+            E,
+            K,
+            is_softmax_over_topk=ctx.is_softmax_over_topk,
+            norm_topk_probs=ctx.norm_topk_probs,
+        )
+
+        return dlogits, None, None, None, None
+
+
+class _UpProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        w1: torch.Tensor,
+        b1: torch.Tensor | None,
+        expert_frequency_offset: torch.Tensor,
+        total_expert_freq: int,
+        K: int,
+        x_gather_idx: torch.Tensor,
+        s_scatter_idx: torch.Tensor,
+        s_reverse_scatter_idx: torch.Tensor,
+        num_activated_expert_per_token_offset: torch.Tensor,
+        is_each_token_has_variable_activated_experts: bool,
+        activation_type: ActivationType,
+        is_inference_mode_enabled: bool,
+        concat_layout: bool = False,
+    ) -> torch.Tensor:
+        T, H = x.shape
+        I, H, E = w1.shape
+        is_glu_activation = is_glu(activation_type)
+        if is_glu_activation:
+            I //= 2
+        TK = total_expert_freq
+
+        a = torch.empty(TK, I, dtype=x.dtype, device=x.device)
+        h = (
+            torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
+            if (not is_inference_mode_enabled)
+            else None
+        )
+
+        gemm_act(
+            x,
+            w1.permute(2, 1, 0),
+            activation=activation_type.value,
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            preact_out=h,
+            postact_out=a,
+            store_preact=(not is_inference_mode_enabled),
+            bias=b1,
+            concat_layout=(
+                (("B", "bias") if b1 is not None else ("B",))
+                if concat_layout and is_glu_activation
+                else None
+            ),
+        )
+
+        ctx.T = T
+        ctx.TK = TK
+        ctx.E = E
+        ctx.K = K
+        ctx.H = H
+        ctx.I = I
+        ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
+        ctx.is_glu_activation = is_glu_activation
+        ctx.concat_layout = concat_layout and is_glu_activation
+
+        ctx.save_for_backward(
+            x,
+            w1,
+            b1,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        )
+
+        ctx.mark_non_differentiable(a)
+        ctx.set_materialize_grads(False)
+
+        return a, h
+
+    @staticmethod
+    def backward(ctx, _: None, dh: torch.Tensor):
+        T = ctx.T
+        TK = ctx.TK
+        E = ctx.E
+        K = ctx.K
+        H = ctx.H
+        is_glu_activation = ctx.is_glu_activation
+        is_each_token_has_variable_activated_experts = ctx.is_each_token_has_variable_activated_experts
+        concat_layout = ctx.concat_layout
+
+        (
+            x,
+            w1,
+            b1,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        ) = ctx.saved_tensors
+
+        dx_expanded = torch.empty(TK, H, dtype=dh.dtype, device=dh.device)
+        # Frozen experts (e.g. LoRA on attention only) need no weight gradient: skip its buffer and GEMM.
+        dw1 = torch.empty_like(w1) if ctx.needs_input_grad[1] else None
+        db1 = None if b1 is None else torch.empty_like(b1)
+
+        _up_projection_backward_act(
+            w1=w1,
+            dx_expanded=dx_expanded,
+            dh=dh,
+            db1=db1,
+            expert_frequency_offset=expert_frequency_offset,
+            is_glu_activation=is_glu_activation,
+            concat_layout=concat_layout,
+        )
+
+        if dw1 is not None:
+            gemm(
+                x.T,
+                dh,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+                concat_layout=(("out",) if concat_layout else None),
+            )
+
+        dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
+
+        _token_broadcast_backward(
+            dx_reduced=dx_reduced,
+            dx_expanded=dx_expanded,
+            s_reverse_scatter_idx=s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+            varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
+            H=H,
+            is_varlen_K=is_each_token_has_variable_activated_experts,
+        )
+
+        return dx_reduced, dw1, db1, *[None] * 13
+
+
+class _DownProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        a: torch.Tensor,
+        h: torch.Tensor,
+        w2: torch.Tensor,
+        b2: torch.Tensor | None,
+        topk_scores: torch.Tensor,
+        expert_frequency_offset: torch.Tensor,
+        T: int,
+        K: int,
+        x_gather_idx: torch.Tensor,
+        s_scatter_idx: torch.Tensor,
+        s_reverse_scatter_idx: torch.Tensor,
+        num_activated_expert_per_token_offset: torch.Tensor,
+        is_varlen_K: bool,
+        activation_type: ActivationType,
+    ) -> torch.Tensor:
+        TK = a.size(0)
+        H, I, E = w2.shape
+
+        y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
+
+        gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
+
+        o = torch.empty(T, H, device=a.device, dtype=a.dtype)
+        topk_scores = topk_scores.view(-1)
+
+        _router_forward(
+            y=y,
+            o=o,
+            topk_scores=topk_scores,
+            s_reverse_scatter_idx=s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+            varlen_K_max=(E if is_varlen_K else K),
+            H=H,
+            is_varlen_K=is_varlen_K,
+        )
+
+        ctx.T = T
+        ctx.K = K
+        ctx.is_varlen_K = is_varlen_K
+        ctx.activation_type = activation_type
+
+        ctx.save_for_backward(
+            h,
+            w2,
+            b2,
+            topk_scores,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+        )
+
+        return o
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        T = ctx.T
+        K = ctx.K
+        is_varlen_K = ctx.is_varlen_K
+        activation_type = ctx.activation_type
+
+        (
+            h,
+            w2,
+            b2,
+            topk_scores,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+        ) = ctx.saved_tensors
+
+        dw2 = torch.empty_like(w2) if ctx.needs_input_grad[2] else None
+        db2 = None if b2 is None else torch.empty_like(b2)
+        dh = torch.empty_like(h)
+
+        I = w2.size(1)
+        TK = x_gather_idx.size(0)
+
+        a_prime = torch.empty(TK, I, dtype=h.dtype, device=h.device)
+        ds = torch.empty_like(topk_scores)
+
+        _down_projection_backward_act(
+            dout=dout,
+            h=h,
+            w2=w2,
+            dh=dh,
+            ds=ds,
+            b2=b2,
+            db2=db2,
+            a_prime=a_prime,
+            topk_scores=topk_scores,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+            s_scatter_idx=s_scatter_idx,
+            activation_type=activation_type.value,
+        )
+
+        if dw2 is not None:
+            gemm(
+                dout.T,
+                a_prime,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
+
+        # TC top-K routing
+        if not is_varlen_K:
+            ds = ds.view(T, K)
+
+        return None, dh, dw2, db2, ds, *[None] * 10
+
+
+def moe_TC_softmax_topk_layer(
+    x: torch.Tensor,
+    router_w: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,
+    b2: torch.Tensor | None,
+    K: int,
+    stream_id: int,
+    activation_type: ActivationType | str = ActivationType.SWIGLU,
+    is_inference_mode_enabled: bool = False,
+    is_softmax_over_topk: bool = True,
+    norm_topk_probs: bool = False,
+    concat_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert ((b1 is None) and (b2 is None)) or (
+        (b1 is not None) and (b2 is not None)
+    ), "b1 and b2 has to be None or not None at the same time!"
+    E = router_w.size(0)
+    router_logits = F.linear(x, router_w)
+    topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
+        router_logits, E, K, is_softmax_over_topk, norm_topk_probs
+    )
+
+    T, K = topk_indices.size()
+    TK = T * K
+    device = topk_indices.device
+
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+    TC_topk_router_metadata_triton(
+        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+    )
+
+    if type(activation_type) == str:
+        activation_type = ActivationType(activation_type)
+
+    a, h = _UpProjection.apply(
+        x,
+        w1,
+        b1,
+        expert_frequency_offset,
+        TK,
+        K,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        None,
+        False,  # is_each_token_has_variable_activated_expert
+        activation_type,
+        is_inference_mode_enabled,
+        concat_layout,
+    )
+
+    o = _DownProjection.apply(
+        a,
+        h,
+        w2,
+        b2,
+        topk_scores,
+        expert_frequency_offset,
+        T,
+        K,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        None,
+        False,  # is_each_token_has_variable_activated_expert
+        activation_type,
+    )
+
+    return o, router_logits, expert_frequency
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Weight format requirements:
+# - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1)
+#     concat_layout=False (default): interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
+#     concat_layout=True:            concatenated [gate_row0, ..., gate_row_{I-1}, up_row0, ..., up_row_{I-1}]
+# - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
+
+
+# We assume token_indices is already SORTED ascendingly !!!
+#   and len(token_indices) = len(expert_indices) = len(router_scores)
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def moe_general_routing_inputs(
+    x: torch.Tensor,
+    router_scores: torch.Tensor,
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,
+    b2: torch.Tensor | None,
+    E: int,
+    stream_id: int,
+    activation_type: ActivationType,
+    is_inference_mode_enabled: bool = False,
+    concat_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert ((b1 is None) and (b2 is None)) or (
+        (b1 is not None) and (b2 is not None)
+    ), "b1 and b2 has to be None or not None at the same time!"
+
+    T = x.size(0)
+    TK = router_scores.size(0)
+    E = w2.size(-1)
+    device = router_scores.device
+
+    if router_scores.dtype != torch.float32:
+        router_scores = router_scores.float()
+
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
+
+    general_routing_router_metadata_triton(
+        token_indices,
+        expert_indices,
+        T,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    )
+
+    a, h = _UpProjection.apply(
+        x,
+        w1,
+        b1,
+        expert_frequency_offset,
+        TK,
+        None,  # K, not needed
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        True,  # is_each_token_has_variable_activated_expert
+        activation_type,
+        is_inference_mode_enabled,
+        concat_layout,
+    )
+
+    o = _DownProjection.apply(
+        a,
+        h,
+        w2,
+        b2,
+        router_scores,
+        expert_frequency_offset,
+        T,
+        None,  # K, not needed
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        True,  # is_each_token_has_variable_activated_expert
+        activation_type,
+    )
+
+    return o, expert_frequency

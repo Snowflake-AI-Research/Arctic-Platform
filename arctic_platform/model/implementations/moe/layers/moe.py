@@ -17,6 +17,8 @@ from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
+from ...kernels.sonic_experts import sonic_routed_experts
+from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
@@ -561,10 +563,18 @@ class GroupedExperts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None,
         scores: torch.Tensor | None = None,
+        expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs."""
+        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs.
+
+        With ``expert_indices`` the rows are the EP receive buffer as delivered instead (one row per token, ``[tokens,
+        top_k]`` local expert ids, ``-1`` elsewhere, and their scores), run through SonicMoE. Called through the PEFT
+        wrappers, so LoRA-trained experts see their merged weights here.
+        """
+        if expert_indices is not None:
+            return sonic_routed_experts(self, x, expert_indices, scores)
         if not uses_dispatch_ep(self.ep_comm_backend):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
@@ -832,6 +842,13 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py), called through self.experts
+        # so that PEFT merges any expert LoRA into the weights they read.
+        use_sonic = (
+            not self.score_before_experts
+            and hasattr(ep_comm, "finalize_dispatch_rows")
+            and sonic_routed_experts_applicable(experts)
+        )
 
         def dispatch_chunk(start: int, end: int):
             return dispatch_tokens_async(
@@ -844,6 +861,9 @@ class MoE(nn.Module):
             )
 
         def run_pending_chunk(pending_state):
+            if use_sonic:
+                hidden_states, indices, scores = ep_comm.finalize_dispatch_rows(pending_state)
+                return ep_comm.combine_rows(self.experts(hidden_states, None, scores, expert_indices=indices), pending_state)
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
