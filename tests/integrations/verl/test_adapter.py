@@ -211,8 +211,10 @@ def test_update_actor_stamps_balance_and_checks_prompt_blocks(verl_stub) -> None
     assert client.payloads[0]["meta"]["balance_batch"] is True
     assert client.payloads[0]["meta"]["prompt_group_ids"].tolist() == [0, 0]
 
-    with pytest.raises(ValueError, match="share prompt columns"):
-        asyncio.run(_run(_two_row_batch(same_prompt=False, dense_prompts=True)))
+    client.payloads.clear()
+    asyncio.run(_run(_two_row_batch(same_prompt=False, dense_prompts=True)))
+    assert client.payloads[0]["meta"]["balance_batch"] is True
+    assert "prompt_group_ids" not in client.payloads[0]["meta"]
 
 
 def test_update_actor_densifies_jagged_prompts(verl_stub) -> None:
