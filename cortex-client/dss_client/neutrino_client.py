@@ -1518,7 +1518,7 @@ class NeutrinoClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
-        wait_seconds: float | None = None,
+        wait_seconds: int | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -1538,14 +1538,17 @@ class NeutrinoClient:
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
 
-        With ``wait_seconds > 0`` the server may hold the call up to that long
-        (it caps the wait at 40 s). If the generation finishes within the
-        wait, the reply is kept and the next :meth:`poll_request` returns it
+        With ``wait_seconds > 0`` (whole seconds) the server may hold the
+        call up to that long (it caps the wait at 40 s). If the generation
+        finishes within the wait, the reply is kept and the next :meth:`poll_request` returns it
         without an API call. Servers that do not support the wait reply as
         before, and :meth:`poll_request` polls as usual.
         """
-        if wait_seconds is not None and wait_seconds < 0:
-            raise ValueError("wait_seconds must be >= 0")
+        if wait_seconds is not None and (
+            # bool is an int subclass; reject it explicitly.
+            not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or wait_seconds < 0
+        ):
+            raise ValueError("wait_seconds must be a non-negative int")
         payload: dict = {"prompts": prompts}
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params

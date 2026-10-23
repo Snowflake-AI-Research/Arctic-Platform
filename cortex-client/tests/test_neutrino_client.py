@@ -1128,6 +1128,7 @@ class TestDataPlane:
         c.generate("j1", prompts=["x"], wait_seconds=40)
         kwargs = c._session.post.call_args.kwargs
         assert kwargs["params"] == {"wait_seconds": 40}
+        assert type(kwargs["params"]["wait_seconds"]) is int
         assert kwargs["timeout"] == 70
 
     def test_generate_wait_only_on_final_chunk(self):
@@ -1143,10 +1144,11 @@ class TestDataPlane:
         assert "timeout" not in first.kwargs
         assert last.kwargs["params"] == {"wait_seconds": 10}
 
-    def test_generate_wait_rejects_negative(self):
+    @pytest.mark.parametrize("wait_seconds", [-1, 40.0, 1.5, True, "40"])
+    def test_generate_wait_rejects_negative_or_non_int(self, wait_seconds):
         c = _make_client()
         with pytest.raises(ValueError, match="wait_seconds"):
-            c.generate("j1", prompts=["x"], wait_seconds=-1)
+            c.generate("j1", prompts=["x"], wait_seconds=wait_seconds)
         c._session.post.assert_not_called()
 
     def test_generate_wait_old_server_reply_polls(self, monkeypatch):
