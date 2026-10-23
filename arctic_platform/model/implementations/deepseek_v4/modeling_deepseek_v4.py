@@ -107,6 +107,11 @@ KEEP_IN_FP32_MODULES = (
     "norm",
 )
 
+# The subset the published checkpoint stores in FP32 and whose consumers already upcast.
+# Norms are left out: the checkpoint holds them in bf16, and an FP32 RMSNorm weight would
+# promote its bf16 output.
+FP32_PARAMETERS = ("attn_hc", "ffn_hc", "hc_head", "sinks", "position_bias")
+
 
 class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
     config: DeepseekV4Config
@@ -142,6 +147,10 @@ class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
     @classmethod
     def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
         return any(module_name in name for module_name in KEEP_IN_FP32_MODULES)
+
+    @classmethod
+    def keeps_fp32_parameter(cls, name: str) -> bool:
+        return any(module_name in name for module_name in FP32_PARAMETERS)
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
@@ -332,6 +341,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        # Built under the bf16 default dtype, and the checkpoint load copies into each
+        # parameter's dtype, so these have to be FP32 before it.
+        for name, param in self.named_parameters():
+            if param.is_floating_point() and self.keeps_fp32_parameter(name):
+                param.data = param.data.float()
 
     def get_decoder(self):
         return self.model

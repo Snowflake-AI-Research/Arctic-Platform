@@ -151,6 +151,21 @@ def test_published_expert_names_convert_to_platform_parameters():
     assert converted["model.embed_tokens.weight"].shape == (32, 64)
 
 
+def test_checkpoint_fp32_parameters_are_built_in_fp32():
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+    model = DeepseekV4ForCausalLM._from_config(_tiny_config(), dtype=torch.bfloat16)
+    dtypes = {name: param.dtype for name, param in model.named_parameters()}
+    fp32 = sorted(name for name, dtype in dtypes.items() if dtype == torch.float32)
+    assert fp32 == sorted(name for name in dtypes if DeepseekV4ForCausalLM.keeps_fp32_parameter(name))
+    assert "model.layers.0.attn_hc.fn" in fp32
+    assert "model.layers.1.self_attn.sinks" in fp32
+    assert "model.layers.1.self_attn.compressor.position_bias" in fp32
+    assert "model.hc_head.hc_scale" in fp32
+    assert dtypes["model.layers.0.input_layernorm.weight"] == torch.bfloat16
+    assert dtypes["model.layers.0.self_attn.q_a_proj.weight"] == torch.bfloat16
+
+
 def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
     from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
     from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
