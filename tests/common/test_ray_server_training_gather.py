@@ -340,11 +340,12 @@ class TestGatherTrainingRefs(TestCasePlus):
         server.colocate = True
         server.jobs[2] = {"job_type": "sampling"}
 
-        async def _wake(tags=None):
-            log.append("empty")
+        async def _wake(tags=None, *, empty_training_cache=True):
+            self.assertFalse(empty_training_cache)
+            log.append("wake")
             return {"sampling": {}}
 
-        server.arctic_rl_ray_server_state = type("S", (), {})()
+        server.arctic_rl_ray_server_state = _State(log)
         server.arctic_rl_ray_server_state.wake_inference = _Remote(_wake)
 
         async def _run():
@@ -357,9 +358,31 @@ class TestGatherTrainingRefs(TestCasePlus):
                 self.assertNotIn("empty", log)
                 self.assertFalse(task.done())
             await task
-            self.assertEqual(log, ["empty"])
+            self.assertEqual(log, ["empty", "wake"])
 
         asyncio.run(_run())
+
+    def test_colocated_wake_skips_empty_cache_after_training_failure(self):
+        log = []
+        server = _server([])
+        server.colocate = True
+        server._training_failed = True
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _wake(tags=None, *, empty_training_cache=True):
+            self.assertFalse(empty_training_cache)
+            log.append("wake")
+            return {"sampling": {}}
+
+        server.arctic_rl_ray_server_state = _State(log)
+        server.arctic_rl_ray_server_state.wake_inference = _Remote(_wake)
+
+        async def _run():
+            result = await server.wake_inference(2)
+            self.assertEqual(result, {"job_id": 2, "sampling": {}})
+
+        asyncio.run(_run())
+        self.assertEqual(log, ["wake"])
 
     def test_sampling_weight_norm_failure_does_not_block_step(self):
         hold = asyncio.Event()
@@ -429,42 +452,27 @@ class TestGatherTrainingRefs(TestCasePlus):
 
         asyncio.run(_run())
 
-    def test_save_runs_after_the_training_latch(self):
-        class _Fail:
-            def __init__(self):
-                self.step = _Remote(self._step)
-
-            async def _step(self):
-                raise RuntimeError("boom")
-
-        class _Hang:
-            def __init__(self):
-                self.step = _Remote(self._step)
-
-            async def _step(self):
-                await asyncio.Event().wait()
-
-        server = _server([_Fail(), _Hang()])
+    def test_save_refuses_after_the_training_latch_without_advancing_latest(self):
         saved = []
 
         async def _save(path, export_hf):
             saved.append(path)
             return {"hf_path": None, "global_step": 1}
 
-        for worker in server.training_workers:
-            worker.save_checkpoint = _Remote(_save)
+        worker = type("W", (), {"save_checkpoint": _Remote(_save)})()
+        server = _server([worker])
+        server._training_failed = True
 
         async def _run():
-            with self.assertRaisesRegex(RuntimeError, "boom"):
-                await server.step(1)
-            self.assertTrue(server._training_failed)
             with tempfile.TemporaryDirectory() as root:
                 server.jobs[1]["checkpoint_path"] = root
-                result = await server.save(1, {})
-            self.assertEqual(result["global_step"], 1)
-            self.assertEqual(len(saved), 2)
-            self.assertTrue(server._training_failed)
-            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
-                await server.step(1)
+                latest = f"{root}/latest"
+                with open(latest, "w", encoding="utf-8") as f:
+                    f.write("7")
+                with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                    await server.save(1, {"step": 8})
+                with open(latest, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "7")
+            self.assertEqual(saved, [])
 
         asyncio.run(_run())
