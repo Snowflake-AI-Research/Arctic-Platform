@@ -175,7 +175,9 @@ signal that space must be freed.
 
 ### `deallocate(slot)` — coalesce upward
 
-```python
+The following pseudocode shows the buddy lookup and coalescing order:
+
+```text
 with _cv:
     _live.remove(slot)
     s = slot

@@ -304,9 +304,7 @@ is CPU-only.
 
 ## Framework integrations
 
-- **Axolotl** — plugin under `axolotl.integrations.arctic_platform.sft`. See the
-  workspace-level [USAGE.md](../../USAGE.md) (how to enable) and
-  [INTEGRATION.md](../../INTEGRATION.md) (how it is wired).
+**The maintained standalone recipe uses the Cortex client.** See [the SFT recipe](../recipes/sft/standalone/README.md) for configuration and execution. External framework plugins and their workspace-specific instructions are not included in this checkout.
 
 ## Examples
 

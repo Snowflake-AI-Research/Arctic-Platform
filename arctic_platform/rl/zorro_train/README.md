@@ -297,8 +297,8 @@ from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPa
 Reference harness around `Qwen3ModelOncePatcher` (the production patcher) for running deduplicated
 forward and backward passes; used by the demo and as a usage example.
 
-**Constructor:**
-```python
+**Constructor signature (not a call):**
+```text
 DeduplicatedActor(
     model_name_or_path: str,
     device: str = "cuda",

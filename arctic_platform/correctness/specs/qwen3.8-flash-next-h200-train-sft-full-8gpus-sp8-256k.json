@@ -1,0 +1,61 @@
+{
+  "applicable_tests": [
+    "single-step-grads"
+  ],
+  "arms": [
+    {
+      "active_tokens": 34513,
+      "dss_microbatches": 1,
+      "global_batch_size": 8,
+      "max_seq_len": 8192,
+      "name": "gas1",
+      "pad_fraction": 0.4733734130859375,
+      "total_tokens": 65536
+    },
+    {
+      "active_tokens": 138065,
+      "dss_microbatches": 4,
+      "global_batch_size": 32,
+      "max_seq_len": 8192,
+      "name": "gas4",
+      "pad_fraction": 0.4733238220214844,
+      "total_tokens": 262144
+    }
+  ],
+  "attn_implementations": [
+    "qsa_flex"
+  ],
+  "config_checksum": "3f8e4516b19a430a81abd6e0a121d8d37cdd563caefb285471ea1d836cb9c58c",
+  "config_id": "qwen3.8-flash-next-h200-train-sft-full-8gpus-sp8-256k",
+  "config_path": "arctic_platform/correctness/configs/qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config",
+  "inapplicable": {},
+  "model": {
+    "cache_path": "/data-fast/base-models/synthetic/de4b8e4d43b917e7706784d8bb445c9af86a3540-4L",
+    "content_hash": "76982bd0eb5f37fc",
+    "measured_reference_peak_gib": 47.810001850128174,
+    "num_hidden_layers": 4,
+    "param_count": 62948395456,
+    "seed": 0,
+    "sized_against_gib": 100.0,
+    "source_checkpoint": "/checkpoint/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "vision_depth": 2
+  },
+  "notes": [
+    "Single-GPU reference uses qsa_flex with 4 complete-cycle layers and peaks at 47.810 GiB."
+  ],
+  "param_name_map": {},
+  "test_settings": {},
+  "test_tolerances": {
+    "single-step-grads": {
+      "absolute": 0.058,
+      "calibration_runs": 16,
+      "computed_gate": 0.0576324462890625,
+      "minimum_gate": 0.001,
+      "multiplier": 4.0,
+      "raw_max_same_tensor_range": 0.014408111572265625,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 16 nondeterministic reference executions; 4x rounded upward in 1e-3 units",
+      "worst_tensor": "model.language_model.layers.1.ple.conv1d.weight"
+    }
+  }
+}
