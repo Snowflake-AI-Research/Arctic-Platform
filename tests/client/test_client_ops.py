@@ -25,18 +25,28 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from typing import Literal
+from typing import Optional
 
 import pytest
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import PositiveInt
 from pydantic import ValidationError
 
 from arctic_platform.client import OPS
+from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import AsyncArcticClient
 from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
+from arctic_platform.client import TrainingConfig
 from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
 from arctic_platform.client import requests as cluster_requests
@@ -703,6 +713,134 @@ class TestCortexBackendOnlyConstruction:
         assert _parent_id(42) == "42"
 
 
+# Mirror of Neutrino's ``ZorroTrainConfig`` in dss/ray_dss/models.py on the DSS
+# branch ``truwase/zorro-train`` (DSS #573, d7ef9b1b). The server model is
+# ``extra="forbid"``: a field added or renamed there must be added here and in
+# ``arctic_platform.client.config._cortex_zorro_train``.
+class _ServerZorroTrainConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enable: bool = False
+    response_len: Optional[PositiveInt] = None
+    temperature: Optional[float] = Field(default=None, gt=0)
+    use_unpad: bool = True
+    logits_optimization: Literal["none", "memory", "compute"] = "none"
+    logits_optimization_peak_mem_size_in_gib: int = Field(default=4, gt=0)
+    logits_compute_from_fp32_inputs: bool = False
+    logits_compute_in_fp32: bool = False
+
+
+class TestCortexZorroTrainingConfig:
+    """A ZoRRo ds_worker_config must reach Neutrino as ``training_config.pack=false``
+    plus a ``zorro_train`` block. Without them the job defaults to packed dispatch,
+    never installs the ZoRRo forward, and ``pack_microbatch`` rejects the batch."""
+
+    BASE_WORKER = {
+        "use_liger": True,
+        "enable_gradient_checkpointing": True,
+        "attn_implementation": "flash_attention_2",
+    }
+    # verbatim key set SkyRL's arctic_rl config emits with use_zorro on
+    ZORRO_WORKER = {
+        **BASE_WORKER,
+        "zorro_train_enable": True,
+        "response_len": 1024,
+        "max_token_len": 9216,
+        "rollout_n": 8,
+        "temperature": 1.0,
+        "use_unpad": True,
+        "logits_optimization": "memory",
+        "logits_optimization_peak_mem_size_in_gib": 4.0,
+        "logits_compute_from_fp32_inputs": False,
+        "logits_compute_in_fp32": True,
+    }
+
+    @staticmethod
+    def _training_config(worker: dict | None) -> dict:
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_worker_config": worker},
+        )
+        return cfg._cortex_training_sub_job()["training_config"]
+
+    def test_enabled_unpacks_and_forwards_zorro_block(self):
+        tc = self._training_config(self.ZORRO_WORKER)
+        assert tc["pack"] is False
+        assert tc["zorro_train"] == {
+            "enable": True,
+            "response_len": 1024,
+            "temperature": 1.0,
+            "use_unpad": True,
+            "logits_optimization": "memory",
+            "logits_optimization_peak_mem_size_in_gib": 4,
+            "logits_compute_from_fp32_inputs": False,
+            "logits_compute_in_fp32": True,
+        }
+
+    def test_client_only_keys_are_not_forwarded(self):
+        tc = self._training_config(self.ZORRO_WORKER)
+        for key in ("max_token_len", "rollout_n", "zorro_train_enable"):
+            assert key not in tc["zorro_train"]
+            assert key not in tc
+
+    def test_whole_float_peak_mem_lands_as_int(self):
+        peak = self._training_config(self.ZORRO_WORKER)["zorro_train"]["logits_optimization_peak_mem_size_in_gib"]
+        assert peak == 4 and type(peak) is int
+
+    def test_fractional_peak_mem_raises_instead_of_truncating(self):
+        worker = {**self.ZORRO_WORKER, "logits_optimization_peak_mem_size_in_gib": 2.5}
+        with pytest.raises(ValueError, match="logits_optimization_peak_mem_size_in_gib"):
+            self._training_config(worker)
+
+    @pytest.mark.parametrize("key", ["response_len", "temperature"])
+    def test_missing_required_field_raises(self, key):
+        worker = {k: v for k, v in self.ZORRO_WORKER.items() if k != key}
+        with pytest.raises(ValueError, match=key):
+            self._training_config(worker)
+
+    @pytest.mark.parametrize(("key", "value"), [("response_len", 0), ("response_len", 1.5), ("temperature", 0.0)])
+    def test_invalid_required_field_raises(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            self._training_config({**self.ZORRO_WORKER, key: value})
+
+    def test_optional_knobs_left_to_server_defaults(self):
+        worker = {**self.BASE_WORKER, "zorro_train_enable": True, "response_len": 512, "temperature": 0.7}
+        expected = {"enable": True, "response_len": 512, "temperature": 0.7}
+        assert self._training_config(worker)["zorro_train"] == expected
+
+    @pytest.mark.parametrize("enable", [None, False])
+    def test_disabled_emits_neither_pack_nor_zorro(self, enable):
+        worker = {k: v for k, v in self.ZORRO_WORKER.items() if k != "zorro_train_enable"}
+        if enable is not None:
+            worker["zorro_train_enable"] = enable
+        tc = self._training_config(worker)
+        assert "pack" not in tc and "zorro_train" not in tc
+        # leftover ZoRRo knobs must not change a non-ZoRRo job at all
+        assert tc == self._training_config(self.BASE_WORKER)
+
+    def test_emitted_block_validates_against_server_schema(self):
+        block = self._training_config(self.ZORRO_WORKER)["zorro_train"]
+        parsed = _ServerZorroTrainConfig.model_validate(block)
+        assert parsed.model_dump(include=set(block)) == block
+
+    def test_server_schema_mirror_rejects_client_only_keys(self):
+        # pins the reason max_token_len / rollout_n must stay off the wire
+        block = {**self._training_config(self.ZORRO_WORKER)["zorro_train"], "rollout_n": 8}
+        with pytest.raises(ValidationError, match="rollout_n"):
+            _ServerZorroTrainConfig.model_validate(block)
+
+    def test_server_schema_mirror_matches_dss(self):
+        models = pytest.importorskip("dss.ray_dss.models")
+        server = models.ZorroTrainConfig
+        assert set(server.model_fields) == set(_ServerZorroTrainConfig.model_fields)
+        tc = self._training_config(self.ZORRO_WORKER)
+        models.TrainingConfig.model_validate(tc)
+
+
 class TestCortexTransportNoopOps:
     """``wake_*`` / ``sleep_*`` short-circuit in the Cortex transport so the
     shim doesn't have to wrap each call — including the ones ``sync_weights``
@@ -1010,7 +1148,6 @@ class TestCortexSharedHelper:
                 },
             )
 
-
     def test_non_zorro_forward_left_aligns_leading_pads(self):
         import torch
 
@@ -1043,14 +1180,344 @@ class TestCortexSharedHelper:
                     "prompts": prompts,
                     "old_log_probs": old,
                 },
-                "meta": {"zorro_train_enable": True, "max_prompt_len": 3, "balance_batch": True},
+                "meta": {
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                    "balance_batch": True,
+                    "pad_token_id": 151643,
+                    "temperature": 0.7,
+                },
             }
         )
         assert torch.equal(out["kwargs"]["input_ids"], ids)
         assert torch.equal(out["kwargs"]["prompts"], prompts)
-        assert torch.equal(out["kwargs"]["old_log_probs"], old)
+        assert "old_log_probs" not in out["kwargs"]
+        assert torch.equal(out["context"]["old_log_probs_shifted"], old)
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
+        assert out["context"]["pad_token_id"] == 151643
+        assert out["context"]["temperature"] == 0.7
+
+
+class TestCortexPredictNextFrame:
+    """SkyRL scores ``input_ids[i]`` at column ``i``; Cortex weights column ``i``
+    by its prediction of ``input_ids[i + 1]`` (labels are ``roll(input_ids, -1)``)."""
+
+    @staticmethod
+    def _skyrl_batch():
+        """Three SkyRL rows, ``[pad | prompt | response | pad]`` with P=3, R=3."""
+        import torch
+
+        pad = 0
+        ids = torch.tensor(
+            [
+                [11, 12, 13, 21, 22, pad],  # p=3, r=2
+                [pad, pad, 14, 31, 32, 33],  # p=1, r=3
+                [15, 16, 17, 41, 42, 43],  # p=3, r=3, full width
+            ]
+        )
+        attn = torch.tensor([[1, 1, 1, 1, 1, 0], [0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+        loss_mask = torch.tensor([[0, 0, 0, 1, 1, 0], [0, 0, 0, 1, 1, 1], [0, 0, 0, 1, 1, 1]])
+        adv = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.4, 0.5, 0.0],
+                [0.0, 0.0, 0.0, -0.1, -0.2, -0.3],
+                [0.0, 0.0, 0.0, 0.7, 0.8, 0.9],
+            ]
+        )
+        return {"input_ids": ids, "attention_mask": attn, "loss_mask": loss_mask, "advantages": adv}
+
+    def test_skyrl_rows_are_aligned_then_shifted(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": self._skyrl_batch(), "meta": {"zorro_train_enable": False}}, response_aligned=True
+        )
+        ids = out["kwargs"]["input_ids"]
+        assert ids.tolist() == [[11, 12, 13, 21, 22, 0], [14, 31, 32, 33, 0, 0], [15, 16, 17, 41, 42, 43]]
+        loss_mask = out["context"]["loss_mask"]
+        assert loss_mask.int().tolist() == [[0, 0, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 0]]
+        assert torch.equal(
+            out["context"]["advantages"],
+            torch.tensor(
+                [[0.0, 0.0, 0.4, 0.5, 0.0, 0.0], [-0.1, -0.2, -0.3, 0.0, 0.0, 0.0], [0.0, 0.0, 0.7, 0.8, 0.9, 0.0]]
+            ),
+        )
+        # The targets Cortex scores at the active positions are exactly the responses.
+        labels = torch.roll(ids, shifts=-1, dims=-1)
+        assert [labels[row][loss_mask[row]].tolist() for row in range(3)] == [[21, 22], [31, 32, 33], [41, 42, 43]]
+        # The full-width row's last column would score its own first token (15).
+        assert labels[2, -1].item() == 15 and not loss_mask[2, -1]
+
+    def test_shift_follows_left_alignment(self):
+        """A pad gap inside a row closes up when aligned. Shifting first would
+        put the first target on the gap and drop it."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = {
+            "input_ids": torch.tensor([[5, 6, 0, 7, 8]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 1, 1]]),
+            "loss_mask": torch.tensor([[0, 0, 0, 1, 1]]),
+            "advantages": torch.tensor([[0.0, 0.0, 0.0, 2.0, 3.0]]),
+        }
+        out = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}}, response_aligned=True)
+        assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0]]
+        assert out["context"]["loss_mask"].int().tolist() == [[0, 1, 1, 0, 0]]
+        assert out["context"]["advantages"].tolist() == [[0.0, 2.0, 3.0, 0.0, 0.0]]
+
+    def test_default_frame_is_left_for_callers_already_in_it(self):
+        """Tinker builds ``response_mask`` and ``advantages`` in the Cortex frame."""
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        out = to_cortex_fwd_bwd_payload({"batch": self._skyrl_batch(), "meta": {}})
+        assert out["context"]["loss_mask"].int().tolist() == [
+            [0, 0, 0, 1, 1, 0],
+            [0, 1, 1, 1, 0, 0],
+            [0, 0, 0, 1, 1, 1],
+        ]
+
+    def test_caller_old_log_probs_shifted_are_not_shifted_again(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        old = torch.tensor([[0.0, 0.0, -1.0, -2.0, 0.0, 0.0], [0.0, 0.0, -3.0, -4.0, -5.0, 0.0], [0.0] * 6])
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": self._skyrl_batch(), "meta": {}}, old_log_probs_shifted=old, response_aligned=True
+        )
+        assert out["context"]["old_log_probs_shifted"][:2].tolist() == [
+            [0.0, 0.0, -1.0, -2.0, 0.0, 0.0],
+            [-3.0, -4.0, -5.0, 0.0, 0.0, 0.0],
+        ]
+
+    def test_zorro_rows_are_not_shifted(self):
+        """The patched forward returns one log-prob per response token."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = self._skyrl_batch()
+        batch["prompts"] = batch["input_ids"][:, :3]
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": batch, "meta": {"zorro_train_enable": True, "max_prompt_len": 3}}, response_aligned=True
+        )
+        assert torch.equal(out["context"]["loss_mask"], batch["loss_mask"].bool())
+        assert torch.equal(out["context"]["advantages"], batch["advantages"])
+
+    def test_skyrl_shim_sends_the_predict_next_frame(self):
+        import asyncio
+
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+
+        seen = {}
+
+        class Client:
+            async def fwd_bwd(self, payload):
+                seen["payload"] = payload
+                return {}
+
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = shim._unified_config = None
+        shim._client = Client()
+        asyncio.run(shim.fwd_bwd({"batch": self._skyrl_batch(), "meta": {}}))
+        assert seen["payload"]["context"]["loss_mask"][1].int().tolist() == [1, 1, 1, 0, 0, 0]
+
+
+class TestCortexActorConfig:
+    """SkyRL and verl send their loss settings as ``meta['actor_config']`` and no
+    ``processing.config``; the server's ``grpo`` reads them under its own names."""
+
+    # What SkyRL's ``_build_meta`` sends, plus keys grpo has no use for.
+    ACTOR = {
+        "loss_agg_mode": "seq-mean-token-mean",
+        "kl_loss_coef": 0.0,
+        "kl_loss_type": "low_var_kl",
+        "clip_ratio": 0.2,
+        "clip_ratio_low": 0.15,
+        "clip_ratio_high": 0.28,
+        "clip_ratio_c": 3.0,
+        "entropy_coeff": 0.001,
+        "use_kl_loss": False,
+        "calculate_entropy": True,
+        "rollout_n": 4,
+    }
+
+    @staticmethod
+    def _payload(meta, processing=None, zorro=False):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = {
+            "input_ids": torch.zeros((2, 4), dtype=torch.int64),
+            "attention_mask": torch.ones((2, 4), dtype=torch.int64),
+            "advantages": torch.zeros((2, 4)),
+            "response_mask": torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]]),
+        }
+        if zorro:
+            batch["prompts"] = batch["input_ids"][:, :2]
+            meta = {**meta, "zorro_train_enable": True, "max_prompt_len": 2}
+        return to_cortex_fwd_bwd_payload({"batch": batch, "meta": meta}, processing=processing)
+
+    def test_skyrl_actor_config_reaches_grpo(self):
+        from arctic_platform.rl.processors.grpo import _CORTEX_GRPO_VARIANT
+        from arctic_platform.rl.processors.grpo import _validate_plain_config
+
+        skyrl_processing = {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": "verl_grpo"}
+        cfg = self._payload({"actor_config": self.ACTOR, "global_batch_size": 8}, skyrl_processing)["processing"][
+            "config"
+        ]
+        assert cfg == {
+            "eps_clip": 0.15,
+            "eps_clip_higher": 0.28,
+            "c_clip": 3.0,
+            "loss_agg_mode": "seq-mean-token-mean",
+            "entropy_coeff": 0.001,
+            "use_kl_loss": False,
+            "kl_loss_coef": 0.0,
+            "kl_loss_type": "low_var_kl",
+            "global_batch_size": 8,
+        }
+        # The Cortex grpo rejects unknown keys; every forwarded one is known.
+        _validate_plain_config(cfg, _CORTEX_GRPO_VARIANT)
+
+    def test_explicit_processing_config_wins_over_actor_config(self):
+        cfg = self._payload(
+            {"actor_config": self.ACTOR}, {"config": {"eps_clip": 0.3, "loss_agg_mode": "token-mean"}}
+        )["processing"]["config"]
+        assert cfg["eps_clip"] == 0.3
+        assert cfg["loss_agg_mode"] == "token-mean"
+        assert cfg["eps_clip_higher"] == 0.28
+        assert cfg["entropy_coeff"] == 0.001
+
+    def test_unset_sides_fall_back_to_clip_ratio(self):
+        actor = {"clip_ratio": 0.25, "clip_ratio_low": None, "clip_ratio_high": None, "clip_ratio_c": None}
+        cfg = self._payload({"actor_config": actor})["processing"]["config"]
+        assert cfg == {"eps_clip": 0.25, "eps_clip_higher": 0.25, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+
+    def test_without_actor_config_defaults_are_unchanged(self):
+        cfg = self._payload({})["processing"]["config"]
+        assert cfg == {"eps_clip": 0.2, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+
+    def test_zorro_path_forwards_actor_config(self):
+        actor = {**self.ACTOR, "loss_agg_mode": "token-mean"}
+        cfg = self._payload({"actor_config": actor}, zorro=True)["processing"]["config"]
+        assert (cfg["eps_clip"], cfg["eps_clip_higher"], cfg["c_clip"]) == (0.15, 0.28, 3.0)
+        assert cfg["entropy_coeff"] == 0.001
+
+    def test_forwarded_clip_changes_the_server_loss(self):
+        """ratio = e^0.25 = 1.284 with A = 1: clipped at 1.28 by SkyRL's 0.28, at 1.2 by the default."""
+        import torch
+
+        from arctic_platform.rl.processors.grpo import _grpo_loss
+
+        actor = {**self.ACTOR, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+        context = {
+            "advantages": torch.tensor([[1.0]]),
+            "loss_mask": torch.tensor([[True]]),
+            "old_log_probs_shifted": torch.tensor([[0.0]]),
+        }
+        outputs = {"logprobs": torch.tensor([[0.25]])}
+        forwarded = self._payload({"actor_config": actor})["processing"]["config"]
+        default = self._payload({})["processing"]["config"]
+        loss, _ = _grpo_loss(outputs, context, forwarded, "cpu")
+        assert loss.item() == pytest.approx(-1.28)
+        loss, _ = _grpo_loss(outputs, context, default, "cpu")
+        assert loss.item() == pytest.approx(-1.2)
+
+
+class TestCortexZorroOldLogProbs:
+    """Cortex ``grpo`` reads π_old only as ``old_log_probs_shifted``."""
+
+    def test_snapshot_reaches_the_ratio_unshifted(self):
+        """Replays the server: context promoted onto the batch, then ZoRRo's
+        response-only flatten. Live log-probs are the snapshot + 0.1, so the
+        ratio is e^0.1 per token, not the 1 a missing π_old gives."""
+        import math
+
+        import torch
+
+        from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.rl.processors.grpo import _grpo_loss
+        from arctic_platform.rl.processors.pipeline import padded_tensor_2d_full_to_unpadded_tensor_1d_response
+
+        # max_prompt_len=3; row 0 has a 2-token response, row 1 a 1-token response.
+        ids = torch.tensor([[0, 5, 6, 7, 8], [1, 2, 3, 4, 0]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
+        response = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 0]])
+        old = torch.tensor([[0.0, 0.0, 0.0, -1.0, -2.0], [0.0, 0.0, 0.0, -0.5, 0.0]], dtype=torch.float64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": response.to(torch.float32),
+                    "response_mask": response,
+                    "prompts": ids[:, :3],
+                    "old_log_probs": old,
+                },
+                "meta": {"zorro_train_enable": True, "max_prompt_len": 3},
+            }
+        )
+        sent = out["context"]["old_log_probs_shifted"]
+        assert sent.dtype == torch.float32
+        assert sent.tolist() == old.to(torch.float32).tolist()
+
+        batch, meta = promote_batch_dim_to_batch(out["kwargs"], out["context"])
+        mask = batch["attention_mask"].bool()
+        flat = {
+            key: padded_tensor_2d_full_to_unpadded_tensor_1d_response(value, mask, 3)
+            for key, value in batch.items()
+            if key not in ("input_ids", "position_ids", "attention_mask") and value.shape == mask.shape
+        }
+        assert flat["old_log_probs_shifted"].tolist() == [[-1.0, -2.0, -0.5]]
+        live = flat["old_log_probs_shifted"] + 0.1
+        _, metrics = _grpo_loss({"logprobs": live}, {**meta, **flat}, out["processing"]["config"], "cpu")
+        assert metrics["importance_weight"] == pytest.approx(math.exp(0.1))
+        assert metrics["approx_kl"] == pytest.approx(0.1)
+
+
+class TestCortexZorroLossAggregation:
+    """ZoRRo responses reach the loss as one flattened row with no ``cu_seqlens``."""
+
+    def test_sequence_mean_collapses_on_the_flattened_shard(self):
+        """Per-token losses [1, 1] and [4]: the sequence mean is 2.5, the flattened row gives 2."""
+        import torch
+
+        from arctic_platform.rl.processors.functional import agg_loss
+
+        rows = agg_loss(
+            torch.tensor([[1.0, 1.0], [4.0, 0.0]]),
+            torch.tensor([[True, True], [True, False]]),
+            loss_agg_mode="seq-mean-token-mean",
+        )
+        flat = agg_loss(torch.tensor([[1.0, 1.0, 4.0]]), torch.ones(1, 3, dtype=torch.bool), "seq-mean-token-mean")
+        assert (rows.item(), flat.item()) == pytest.approx((2.5, 2.0))
+
+    @pytest.mark.parametrize("source", ["actor_config", "processing"])
+    @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum", "prompt-mean"])
+    def test_zorro_rejects_sequence_aggregation(self, source, mode):
+        meta = {"actor_config": {"loss_agg_mode": mode}} if source == "actor_config" else {}
+        processing = {"config": {"loss_agg_mode": mode}} if source == "processing" else None
+        with pytest.raises(ValueError, match=f"loss_agg_mode='token-mean', got '{mode}'"):
+            TestCortexActorConfig._payload(meta, processing, zorro=True)
+
+    def test_explicit_token_mean_rescues_a_sequence_actor_config(self):
+        out = TestCortexActorConfig._payload(
+            {"actor_config": {"loss_agg_mode": "seq-mean-token-mean"}},
+            {"config": {"loss_agg_mode": "token-mean"}},
+            zorro=True,
+        )
+        assert out["processing"]["config"]["loss_agg_mode"] == "token-mean"
+
+    def test_non_zorro_keeps_sequence_aggregation(self):
+        out = TestCortexActorConfig._payload({"actor_config": {"loss_agg_mode": "seq-mean-token-mean"}})
+        assert out["processing"]["config"]["loss_agg_mode"] == "seq-mean-token-mean"
 
 
 class TestCortexShimSaveWeightsFailsLoud:
@@ -1162,3 +1629,38 @@ class TestCortexShimForwardsLikeOnPrem:
         out = asyncio.run(self._shim(Client()).fwd_no_grad(self._batch(), reference_model=False))
         assert out["batch"]["logprobs"].shape == (2, 5)
         assert float(out["batch"]["logprobs"].sum()) == 10.0
+
+
+def test_zorro_is_only_compatible_with_arctic_rl_client(monkeypatch):
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    enabled = {"zorro_train_enable": True}
+    sft = ArcticSFTClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config=enabled),
+    )
+    plain = ArcticClientConfig(model_name="m", training_gpus=1, training=TrainingConfig(ds_worker_config=enabled))
+    nested = ArcticClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=TrainingConfig(
+            ds_worker_config={"zorro_train": {"enable": True, "response_len": 8, "temperature": 1.0}}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticSFTClient(sft)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticClient(plain)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        AsyncArcticClient(nested)
+
+    ArcticSFTClient(
+        ArcticSFTClientConfig(
+            model_name="m",
+            training_gpus=1,
+            training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config={"zorro_train_enable": False}),
+        )
+    )
+    ArcticRLClient(plain)
+    AsyncArcticRLClient(nested)

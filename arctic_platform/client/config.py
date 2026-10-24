@@ -367,6 +367,11 @@ class ArcticClientConfig(BaseModel):
             training["ds_config"] = _without_noop_offload(ds)
         if self.training.peft:
             training["peft_config"] = self.training.peft
+        if worker.get("zorro_train_enable"):
+            # Neutrino only installs the ZoRRo forward and keeps [B, S] rows when the
+            # job says so; per-batch ZoRRo payloads alone still go through packing.
+            training["pack"] = False
+            training["zorro_train"] = _cortex_zorro_train(worker)
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
@@ -401,6 +406,60 @@ def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
         return None
     params = ds_optimizer.get("params") or {}
     return {"name": ds_optimizer.get("type", "AdamW"), **params}
+
+
+_CORTEX_ZORRO_OPTIONAL_KEYS = (
+    "use_unpad",
+    "logits_optimization",
+    "logits_compute_from_fp32_inputs",
+    "logits_compute_in_fp32",
+)
+
+
+def _cortex_zorro_train(worker: dict[str, Any]) -> dict[str, Any]:
+    """Flat ZoRRo ``ds_worker_config`` keys → Neutrino ``training_config.zorro_train``.
+
+    Neutrino's ``ZorroTrainConfig`` is ``extra="forbid"``, so only its fields are
+    forwarded: ``max_token_len`` and ``rollout_n`` stay behind (``world_size`` is
+    injected server-side). Absent keys fall back to the server defaults.
+    ``response_len`` and ``temperature`` are required there when enabled, so a
+    missing or invalid value fails here at job build rather than as a server 4xx.
+    """
+    zorro: dict[str, Any] = {
+        "enable": True,
+        "response_len": _positive_whole_int(worker, "response_len"),
+        "temperature": _positive_float(worker, "temperature"),
+    }
+    for key in _CORTEX_ZORRO_OPTIONAL_KEYS:
+        if worker.get(key) is not None:
+            zorro[key] = worker[key]
+    if worker.get("logits_optimization_peak_mem_size_in_gib") is not None:
+        zorro["logits_optimization_peak_mem_size_in_gib"] = _positive_whole_int(
+            worker, "logits_optimization_peak_mem_size_in_gib"
+        )
+    return zorro
+
+
+def _positive_whole_int(worker: dict[str, Any], key: str) -> int:
+    """A positive int; whole floats (``4.0``) are accepted, fractional ones raise
+    instead of being truncated to a value the caller did not ask for."""
+    value = worker.get(key)
+    if value is None:
+        raise ValueError(f"zorro_train_enable requires ds_worker_config.{key} on Cortex")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"ds_worker_config.{key} must be a positive integer for Cortex ZoRRo, got {value!r}")
+    return value
+
+
+def _positive_float(worker: dict[str, Any], key: str) -> float:
+    value = worker.get(key)
+    if value is None:
+        raise ValueError(f"zorro_train_enable requires ds_worker_config.{key} on Cortex")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"ds_worker_config.{key} must be a number > 0 for Cortex ZoRRo, got {value!r}")
+    return float(value)
 
 
 def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
