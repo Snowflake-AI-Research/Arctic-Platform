@@ -664,14 +664,14 @@ def _helper_argv_expr(criu_argv):
 # CAP_SYS_RESOURCE.  A dump holds 8 MiB of page pipes, and once the budget is
 # spent criu cannot size the copy of a pipe it saves ("Unable to set a pipe
 # size"), so eight dumps at once can fail one.  A slot is an flock on one of
-# SEMIP_CONCURRENT_DUMPS files on the node's /data-fast, which the kernel
-# releases if the holder dies.
+# SEMIP_CONCURRENT_DUMPS files in the pod's /data-fast, which the kernel
+# releases if the holder dies.  Pods sharing a node do not share slots.
 _DUMP_SLOTS_DIR = "/data-fast/.semip-dump-slots"
 
 
 @contextlib.contextmanager
 def _dump_slot():
-    """Hold one of the node's ``SEMIP_CONCURRENT_DUMPS`` (default 2; 0 = no
+    """Hold one of the pod's ``SEMIP_CONCURRENT_DUMPS`` (default 2; 0 = no
     limit) dump slots, waiting for one to free up."""
     n = int(os.environ.get("SEMIP_CONCURRENT_DUMPS", "2"))
     if n <= 0:
@@ -705,7 +705,7 @@ def _dump_slot():
             break
         waited = time.monotonic() - t0
         if waited >= 1:
-            print(f"[semip] waited {waited:.1f}s for one of the node's {n} "
+            print(f"[semip] waited {waited:.1f}s for one of the pod's {n} "
                   f"dump slots", flush=True)
         yield
     finally:

@@ -1,4 +1,4 @@
-"""``worker._dump_slot``: at most SEMIP_CONCURRENT_DUMPS criu dumps per node.
+"""``worker._dump_slot``: at most SEMIP_CONCURRENT_DUMPS criu dumps per pod.
 
 Run from the package directory:
     cd arctic_inference/semi_persistence
