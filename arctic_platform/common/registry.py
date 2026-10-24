@@ -56,6 +56,7 @@ PUBLIC_LOSS_FNS = frozenset(
         "sft_ce",
         "verl_grpo",
         "causal_cross_entropy",
+        "weighted_logprob_sum",
     }
 )
 PUBLIC_POST_PROCESSORS = frozenset(
