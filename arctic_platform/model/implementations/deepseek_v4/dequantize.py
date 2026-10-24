@@ -65,6 +65,33 @@ def dequantize_weight(weight: Tensor, scale: Tensor) -> Tensor:
     return (values * scale_expanded).bfloat16()
 
 
+def dequantize_mxfp4(weight: Tensor, scale: Tensor) -> Tensor:
+    """Unpack packed MXFP4 expert weights to ``bfloat16``.
+
+    ``weight`` is ``int8`` with two e2m1 nibbles per byte on the last dim.
+    ``scale`` is ``float8_e8m0fnu`` or the same values already decoded to
+    ``float32``, one entry per 1×32 block. Leading dimensions (the expert
+    axis) are left in place.
+    """
+    if weight.dtype != torch.int8:
+        raise ValueError(f"MXFP4 expert weight arrived as {weight.dtype}, expected int8")
+    return dequantize_weight(weight, scale)
+
+
+def decode_e8m0_scales_(state_dict: StateDict) -> None:
+    """Decode every ``float8_e8m0fnu`` scale to float32. The values are powers of two."""
+    for key, value in list(state_dict.items()):
+        if value.dtype == torch.float8_e8m0fnu:
+            state_dict[key] = value.float()
+
+
+def encode_e8m0_scales_(state_dict: StateDict) -> None:
+    """Re-encode PrimeRL ``*_scale_inv`` tensors to the checkpoint's e8m0 scale dtype."""
+    for key, value in list(state_dict.items()):
+        if key.endswith("_scale_inv") and value.dtype != torch.float8_e8m0fnu:
+            state_dict[key] = value.to(dtype=torch.float8_e8m0fnu)
+
+
 def dequantize_state_dict_(state_dict: StateDict) -> None:
     """Dequantize every on-disk `*.weight` / `*.scale` pair in place, dropping the scale.
 

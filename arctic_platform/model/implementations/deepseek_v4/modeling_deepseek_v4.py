@@ -22,7 +22,10 @@ from arctic_platform.model.implementations.deepseek_v4.conversion_ops import app
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
 from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
+from arctic_platform.model.implementations.deepseek_v4.dequantize import decode_e8m0_scales_
 from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_state_dict_
+from arctic_platform.model.implementations.deepseek_v4.dequantize import encode_e8m0_scales_
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.deepseek_v4.hyperconnections import (
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
@@ -31,6 +34,7 @@ from arctic_platform.model.implementations.deepseek_v4.moe import DeepseekV4MoE
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 from arctic_platform.model.implementations.layers.norms import RMSNorm, RMSNormConfig
 
 
@@ -103,6 +107,11 @@ KEEP_IN_FP32_MODULES = (
     "norm",
 )
 
+# The subset the published checkpoint stores in FP32 and whose consumers already upcast.
+# Norms are left out: the checkpoint holds them in bf16, and an FP32 RMSNorm weight would
+# promote its bf16 output.
+FP32_PARAMETERS = ("attn_hc", "ffn_hc", "hc_head", "sinks", "position_bias")
+
 
 class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
     config: DeepseekV4Config
@@ -140,6 +149,10 @@ class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
         return any(module_name in name for module_name in KEEP_IN_FP32_MODULES)
 
     @classmethod
+    def keeps_fp32_parameter(cls, name: str) -> bool:
+        return any(module_name in name for module_name in FP32_PARAMETERS)
+
+    @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
         # The published checkpoint's `ffn.*` naming, the only unconverted naming that exists --
         # see `converting_deepseek_v4.py`'s module docstring.
@@ -163,15 +176,33 @@ class DeepseekV4PreTrainedModel(PreTrainedModelPrimeRL):
     def convert_to_prime(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         """Convert a HuggingFace state dict to PrimeRL format in-place.
 
-        Dequantizes the real checkpoint's fp8/MXFP4 weights to `bfloat16` first, on the raw
-        on-disk key names: a no-op for any snapshot that doesn't carry `.scale` siblings
-        (e.g. the plain-`bfloat16` mini test checkpoint).
+        A plain BF16 snapshot is dequantized, which is a no-op when no ``.scale``
+        siblings are present. The official FP8/MXFP4 checkpoint keeps those
+        packed weights and only decodes the e8m0 scales to float32.
         """
-        dequantize_state_dict_(state_dict)
-        return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
+        quantized = fp8_weight_block_size(self.config) is not None
+        if not quantized:
+            dequantize_state_dict_(state_dict)
+        converted = apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
+        if quantized:
+            decode_e8m0_scales_(converted)
+        return converted
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        if fp8_weight_block_size(self.config) is not None:
+            encode_e8m0_scales_(state_dict)
         return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+
+    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        # The chain skips keys a group does not hold, so one decoder layer or the
+        # top-level group (``layer_idx == -1``) goes through it whole.
+        if 0 <= layer_idx < self.config.num_hash_layers:
+            # Weight sync leaves this buffer out, but a saved checkpoint cannot route hash layers without it.
+            name = f"model.layers.{layer_idx}.mlp.router.tid2eid"
+            state_dict[name] = next(
+                buffer for key, buffer in self.named_buffers() if hf_export_param_name(key) == name
+            )
+        return self.convert_to_hf(state_dict)
 
     def init_buffers_post_meta(self) -> None:
         # `to_empty()` leaves every buffer uninitialized and this runs before `dcp_load`, so a
@@ -310,6 +341,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        # Built under the bf16 default dtype, and the checkpoint load copies into each
+        # parameter's dtype, so these have to be FP32 before it.
+        for name, param in self.named_parameters():
+            if param.is_floating_point() and self.keeps_fp32_parameter(name):
+                param.data = param.data.float()
 
     def get_decoder(self):
         return self.model
