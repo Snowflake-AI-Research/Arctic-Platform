@@ -15,6 +15,7 @@ from torch import nn
 
 from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
+from ..distributed.combine_replay import CombineReplay
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
 from ..routing_weights import apply_routing_weights
@@ -734,6 +735,8 @@ class MoE(nn.Module):
         )
         self.ep_comm_backend: EPCommBackend = "deepep"
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
+        # Set by full activation checkpointing (see CombineReplay); UCCL-EP replays the combine on recompute.
+        self.combine_replay: CombineReplay | None = None
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -834,6 +837,10 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        combine_kwargs = {}
+        if self.combine_replay is not None and self.ep_comm_backend == "uccl":
+            self.combine_replay.start()
+            combine_kwargs["replay"] = self.combine_replay
 
         def dispatch_chunk(start: int, end: int):
             return dispatch_tokens_async(
@@ -853,7 +860,7 @@ class MoE(nn.Module):
             routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
-            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None))
+            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
 
         # dispatch/combine are collectives over the EP group: every rank must issue the
         # same number of calls in both forward and backward or heavier ranks hang on

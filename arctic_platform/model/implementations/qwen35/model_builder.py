@@ -44,6 +44,7 @@ from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_P
 from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 
 from .config import ModelConfig
+from arctic_platform.model.implementations.moe.distributed.combine_replay import CombineReplay
 from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
@@ -688,6 +689,11 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
             # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
             # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
+            # The recompute runs past the combine, so it would run the EP all-to-all a second time just to
+            # rebuild the tensors saved after it; replay the forward's combined output instead.
+            for module in transformer_block.modules():
+                if isinstance(module, MoE):
+                    module.combine_replay = CombineReplay()
             transformer_block = checkpoint_wrapper(
                 transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
             )
