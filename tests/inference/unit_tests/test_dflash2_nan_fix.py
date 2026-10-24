@@ -1,11 +1,19 @@
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.model_states import mamba_hybrid
 
 from arctic_platform.inference.vllm.dflash2_nan_fix import (
+    GDNAttentionMetadataBuilderPatch,
     KVBlockZeroerPatch,
+    MambaHybridModelStatePatch,
     MambaManagerPatch,
     SingleTypeKVCacheManagerPatch,
     _sanitize_stale_gdn_metadata,
@@ -156,3 +164,103 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
     assert zeroer._meta is not None
     addresses = set(zeroer._meta[0].tolist())
     assert addresses == {conv_state.data_ptr(), recurrent_state.data_ptr()}
+
+
+@pytest.mark.parametrize(
+    "num_scheduled_tokens, num_draft_tokens, is_prefilling, padded_reqs, "
+    "expected",
+    [
+        # Drafted decode row, zero-draft decode row, one-token prefill tail.
+        ([3, 1, 1], [2, 0, 0], [False, False, True], 3, [2, 0, -1]),
+        # Nobody drafted this step; FULL-graph padding rows stay -1.
+        ([1, 1], None, [False, True], 4, [0, -1, -1, -1]),
+    ],
+)
+def test_zero_draft_decode_rows_are_spec_rows(monkeypatch,
+                                              num_scheduled_tokens,
+                                              num_draft_tokens, is_prefilling,
+                                              padded_reqs, expected):
+    num_reqs = len(num_scheduled_tokens)
+    query_start_loc = np.zeros(num_reqs + 1, dtype=np.int32)
+    query_start_loc[1:] = np.cumsum(num_scheduled_tokens)
+    num_tokens = int(query_start_loc[-1])
+    seq_lens = torch.full((num_reqs, ), 10, dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_reqs_after_padding=padded_reqs,
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens,
+        query_start_loc_np=query_start_loc,
+        query_start_loc=torch.from_numpy(query_start_loc),
+        max_query_len=None,
+        num_scheduled_tokens=np.array(num_scheduled_tokens, dtype=np.int32),
+        seq_lens_cpu_upper_bound=seq_lens,
+        seq_lens=seq_lens,
+        is_prefilling_np=np.array(is_prefilling),
+        prefill_runs_as_decode_np=None,
+        num_draft_tokens_per_req=(None if num_draft_tokens is None else
+                                  np.array(num_draft_tokens, dtype=np.int32)),
+        idx_mapping=torch.arange(num_reqs),
+        dcp_local_seq_lens=None,
+        positions=torch.zeros(num_tokens, dtype=torch.int64),
+        prompt_lens=None,
+    )
+    state = object.__new__(mamba_hybrid.MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state.num_accepted_tokens_gpu = torch.ones(num_reqs, dtype=torch.int32)
+    state._align_mode = False
+    state.recoverssm = None
+    state._orig_prepare_attn = MethodType(
+        MambaHybridModelStatePatch._orig_prepare_attn, state)
+    original_metadata_cls = mamba_hybrid.MambaHybridAttnMetadata
+    captured = {}
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata",
+                        lambda **kwargs: captured.update(kwargs))
+    mode = (CUDAGraphMode.FULL
+            if padded_reqs > num_reqs else CUDAGraphMode.NONE)
+
+    MambaHybridModelStatePatch.prepare_attn(state, input_batch, mode, (), {},
+                                            [], None)
+
+    metadata = captured["model_specific_attn_metadata"]
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == expected
+    assert mamba_hybrid.MambaHybridAttnMetadata is original_metadata_cls
+
+
+def test_all_zero_draft_batch_keeps_the_gdn_spec_path(monkeypatch):
+    # No pinned host memory without a GPU driver.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    builder = object.__new__(GDNAttentionMetadataBuilder)
+    builder.use_spec_decode = True
+    builder.num_spec = 3
+    builder.use_full_cuda_graph = False
+    builder.mamba_aligned_state_indices = torch.arange(
+        8, dtype=torch.int32).view(2, 4)
+    builder._orig_build = MethodType(
+        GDNAttentionMetadataBuilderPatch._orig_build, builder)
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=seq_lens,
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=64,
+        block_table_tensor=torch.zeros((2, 4), dtype=torch.int32),
+        slot_mapping=torch.zeros(2, dtype=torch.int64),
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        seq_lens_cpu_upper_bound=seq_lens,
+    )
+
+    metadata = GDNAttentionMetadataBuilderPatch.build(
+        builder, 0, common, torch.tensor([3, 1], dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32))
+
+    # The plain decode path reads column 0 and drops the accepted offset.
+    assert metadata.num_spec_decodes == 2
+    assert metadata.num_decodes == 0
+    assert metadata.num_accepted_tokens.tolist() == [3, 1]
+    assert metadata.spec_state_indices_tensor.tolist() == [[0, 1, 2, 3],
+                                                           [4, 5, 6, 7]]

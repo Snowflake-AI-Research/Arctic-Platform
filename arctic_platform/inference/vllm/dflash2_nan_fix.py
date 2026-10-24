@@ -15,11 +15,13 @@
 
 """Compatibility fixes for DFlash2 with GDN-backed hybrid models.
 
-Remove these patches after both upstream fixes are included in the pinned
+Remove these patches after the upstream fixes are included in the pinned
 vLLM release:
 
 * https://github.com/vllm-project/vllm/pull/51508
 * https://github.com/vllm-project/vllm/pull/56524
+* https://github.com/vllm-project/vllm/pull/56531 (v0.32.0), Model Runner V2
+  half: ``MambaHybridModelStatePatch`` and the draft counts in ``build``
 """
 
 from itertools import product as iprod
@@ -35,6 +37,11 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.worker.gpu.model_states import mamba_hybrid
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+    MambaHybridAttnMetadata,
+    MambaHybridModelState,
+)
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from arctic_platform.inference.patching import ArcticPatch
@@ -57,9 +64,44 @@ class GDNAttentionMetadataBuilderPatch(
 
     _orig_build = GDNAttentionMetadataBuilder.build
 
-    def build(self, *args, **kwargs):
-        metadata = self._orig_build(*args, **kwargs)
+    def build(self,
+              common_prefix_len,
+              common_attn_metadata,
+              num_accepted_tokens=None,
+              num_decode_draft_tokens_cpu=None,
+              fast_build=False):
+        drafts = num_decode_draft_tokens_cpu
+        if drafts is not None:
+            # build() reads the counts only as >= 0, and to fall back to plain
+            # decode (dropping the accepted offset) when all of them are 0.
+            drafts = drafts.masked_fill(drafts == 0, 1)
+        metadata = self._orig_build(common_prefix_len, common_attn_metadata,
+                                    num_accepted_tokens, drafts, fast_build)
         return _sanitize_stale_gdn_metadata(metadata)
+
+
+class MambaHybridModelStatePatch(ArcticPatch[MambaHybridModelState]):
+
+    _orig_prepare_attn = MambaHybridModelState.prepare_attn
+
+    def prepare_attn(self, input_batch, *args, **kwargs):
+        # A decode row without drafts is a spec row with 0 drafts, not a -1
+        # plain row: only the spec path applies its accepted offset.
+        def attn_metadata(**fields):
+            drafts = fields["num_decode_draft_tokens_cpu"]
+            if drafts is not None:
+                n = input_batch.num_reqs
+                is_decode = ~fields["is_prefilling"][:n] & torch.from_numpy(
+                    input_batch.num_scheduled_tokens > 0)
+                drafts[:n].masked_fill_(is_decode & (drafts[:n] < 0), 0)
+            return MambaHybridAttnMetadata(**fields)
+
+        # The counts are built mid-method; fix them as they are stored.
+        mamba_hybrid.MambaHybridAttnMetadata = attn_metadata
+        try:
+            return self._orig_prepare_attn(input_batch, *args, **kwargs)
+        finally:
+            mamba_hybrid.MambaHybridAttnMetadata = MambaHybridAttnMetadata
 
 
 class SingleTypeKVCacheManagerPatch(
@@ -262,6 +304,7 @@ def apply_dflash2_nan_fixes() -> None:
         return
 
     GDNAttentionMetadataBuilderPatch.apply_patch()
+    MambaHybridModelStatePatch.apply_patch()
     SingleTypeKVCacheManagerPatch.apply_patch()
     MambaManagerPatch.apply_patch()
     KVBlockZeroerPatch.apply_patch()
