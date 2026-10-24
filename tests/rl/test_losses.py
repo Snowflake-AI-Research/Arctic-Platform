@@ -1363,13 +1363,14 @@ class TestMigratedGrpo(TestCasePlus):
             packed = pack_sequences({**batch, "attention_mask": valid})
             packed.pop("_pack_meta")
             yield "pack_sequences", squeezed(packed)
-            # Dispatch: one DP shard / microbatch holding rows 2 and 0, packed, then cut into SP windows.
+            # Dispatch: one DP shard / microbatch holding rows 2 and 0, packed, then cut into SP windows; at sp=8 a
+            # window holds 2 tokens, as many as the shard has rows.
             index = torch.tensor([2, 0])
             shard = select_rows(
                 {"input_ids": rows["input_ids"], "position_ids": rows["position_ids"], "context": context}, index, 3
             )
             shard["attention_mask"] = valid.index_select(0, index)
-            for sp in (1, 2, 4):
+            for sp in (1, 2, 4, 8):
                 call, metadata = pad_packed_microbatch(*pack_microbatch(shard), sp)
                 for rank in range(sp):
                     window = token_shard(call, metadata, sp, rank)
