@@ -7,6 +7,7 @@ from deep_ep.utils import EventOverlap
 from torch.distributed import ProcessGroup
 
 from ..routing_weights import apply_routing_weights
+from .combine_replay import CombineReplay
 from .token_permute import permute_tokens
 from .token_permute import unpermute_tokens
 
@@ -163,6 +164,21 @@ class _DeepEPCombine(torch.autograd.Function):
         return grad_x, None
 
 
+class _DeepEPReplayedCombine(torch.autograd.Function):
+    """A recompute's combine, replayed from the original forward's output (``CombineReplay``). The recompute's
+    graph is discarded once the saved tensors are rebuilt, so this node never runs backward; it only releases
+    the handle of the recompute's dispatch and keeps the output attached to the graph like the combine's."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, handle_id: torch.Tensor, combined: torch.Tensor) -> torch.Tensor:
+        _handle_cache.pop(handle_id.item(), None)
+        return combined.clone()
+
+    @staticmethod
+    def backward(ctx, grad_combined: torch.Tensor) -> tuple[None, None, None]:
+        raise RuntimeError("a replayed DeepEP combine is only part of a recompute and has no backward")
+
+
 @torch.compiler.disable()
 def sync_combine() -> None:
     global _pending_combine_event
@@ -311,16 +327,29 @@ def finalize_dispatch_rows(
     return pending_state.hidden_states, pending_state.dispatched_indices, pending_state.dispatched_scores
 
 
-def combine_rows(hidden_states: torch.Tensor, pending_state: _PendingDispatchState) -> torch.Tensor:
+def _combine(hidden_states: torch.Tensor, handle_id: torch.Tensor, replay: CombineReplay | None) -> torch.Tensor:
+    if replay is None:
+        return _DeepEPCombine.apply(hidden_states, handle_id)
+    return replay.run(
+        lambda: _DeepEPCombine.apply(hidden_states, handle_id),
+        lambda combined: _DeepEPReplayedCombine.apply(hidden_states, handle_id, combined),
+    )
+
+
+def combine_rows(
+    hidden_states: torch.Tensor, pending_state: _PendingDispatchState, replay: CombineReplay | None = None
+) -> torch.Tensor:
     """Combine per-received-token outputs (already summed over this rank's experts) back to their source ranks."""
-    return _DeepEPCombine.apply(hidden_states, pending_state.handle_id)
+    return _combine(hidden_states, pending_state.handle_id, replay)
 
 
-def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
+def combine_tokens(
+    hidden_states: torch.Tensor, state: _DispatchState, replay: CombineReplay | None = None
+) -> torch.Tensor:
     if state.permuted_scores is not None:
         hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
     hidden_states = unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
-    return _DeepEPCombine.apply(hidden_states, state.handle_id)
+    return _combine(hidden_states, state.handle_id, replay)
 
 
 register_deepep_cuda_ops()
