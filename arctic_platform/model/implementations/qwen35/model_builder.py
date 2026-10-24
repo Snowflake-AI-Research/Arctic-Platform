@@ -358,6 +358,8 @@ def get_model(
         ),
     )
     model_config.use_cache = False
+    if config.dequantize_checkpoint and hasattr(model_config, "quantization_config"):
+        del model_config.quantization_config
     is_vlm_arch = is_vlm_architecture(model_config)
 
     # Fallback Qwen3.5 patch detection from loaded config model_type
@@ -543,6 +545,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
+                # Packed and dequantized conversions of one checkpoint must not share a cache.
+                fmt = "prime-dequantized"
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."

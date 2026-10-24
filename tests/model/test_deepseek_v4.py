@@ -228,6 +228,60 @@ def test_official_fp8_checkpoint_keeps_packed_expert_weights():
     assert moe.shared_expert.w1.dtype == torch.float8_e4m3fn
 
 
+@pytest.mark.parametrize("peft", [None, {"peft_type": "Lora", "r": 8}])
+def test_only_lora_keeps_the_official_checkpoint_packed(tmp_path, monkeypatch, peft):
+    from arctic_platform.model.implementations.deepseek_v4 import deepspeed_integration
+    from arctic_platform.model.loader import LoaderContext
+    from arctic_platform.model.loaders.deepseek_v4 import load_deepseek_v4
+
+    calls = []
+    monkeypatch.setattr(deepspeed_integration, "load_deepseek_v4_model", lambda **kwargs: calls.append(kwargs))
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=8),
+        patches={"peft": peft},
+    )
+    load_deepseek_v4(LoaderContext(spec=spec, parallel_groups={"ep_group": object()}))
+    assert calls[0]["dequantize_checkpoint"] is (peft is None)
+
+
+def test_dequantize_checkpoint_builds_bf16_modules_from_the_official_checkpoint(tmp_path):
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.qwen35.config import ModelConfig
+    from arctic_platform.model.implementations.qwen35.model_builder import get_model
+
+    config = _tiny_config()
+    config.moe_intermediate_size = 64
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    config.save_pretrained(tmp_path)
+    model = get_model(
+        ModelConfig(name=str(tmp_path), attn="eager", impl="custom", dequantize_checkpoint=True),
+        device=torch.device("meta"),
+        dtype=torch.bfloat16,
+    )
+    assert not hasattr(model.config, "quantization_config")
+    layer = model.model.layers[1]
+    assert not isinstance(layer.mlp.experts, Mxfp4GroupedExperts)
+    assert layer.mlp.experts.w1.dtype == torch.bfloat16
+    assert layer.self_attn.q_a_proj.weight.dtype == torch.bfloat16
+
+    state = {
+        "layers.1.ffn.experts.0.w1.weight": torch.full((64, 32), 0x22, dtype=torch.int8),
+        "layers.1.ffn.experts.1.w1.weight": torch.full((64, 32), 0x22, dtype=torch.int8),
+        "layers.1.ffn.experts.0.w1.scale": torch.ones(64, 2, dtype=torch.float8_e8m0fnu),
+        "layers.1.ffn.experts.1.w1.scale": torch.ones(64, 2, dtype=torch.float8_e8m0fnu),
+        "layers.1.attn.wq_a.weight": torch.ones(32, 64, dtype=torch.float8_e4m3fn),
+        "layers.1.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.float8_e8m0fnu),
+    }
+    converted = model.convert_to_prime(state)
+    assert not [name for name in converted if name.endswith("_scale_inv")]
+    experts = converted["model.layers.1.mlp.experts.w1"]
+    assert experts.dtype == torch.bfloat16
+    assert experts.shape == (2, 64, 64)
+    assert torch.all(experts == 1.0)
+    assert torch.all(converted["model.layers.1.self_attn.q_a_proj.weight"] == 1.0)
+
+
 def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
     from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
     from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
