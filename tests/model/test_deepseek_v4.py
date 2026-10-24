@@ -340,3 +340,29 @@ def test_sqrtsoftplus_scores_match_softplus_sqrt():
     expected = torch.nn.functional.softplus(torch.tensor([2.0], device="cuda")).sqrt()
     assert indices.item() == 0
     assert torch.allclose(scores, expected)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (
+            "base_model.model.model.layers.3.self_attn.q_a_proj.lora_A.weight",
+            "base_model.model.layers.3.attn.wq_a.lora_A.weight",
+        ),
+        (
+            "base_model.model.model.layers.0.self_attn.kv_proj.lora_B.weight",
+            "base_model.model.layers.0.attn.wkv.lora_B.weight",
+        ),
+        ("model.layers.12.self_attn.q_b_proj.lora_A.weight", "layers.12.attn.wq_b.lora_A.weight"),
+        ("model.layers.12.self_attn.o_b_proj.lora_B.weight", "layers.12.attn.wo_b.lora_B.weight"),
+        ("model.layers.1.self_attn.o_a_proj.lora_A.weight", "model.layers.1.self_attn.o_a_proj.lora_A.weight"),
+    ],
+)
+def test_lora_sync_uses_published_attention_names(name, expected):
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from arctic_platform.model.implementations.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+
+    assert vllm_lora_name(name) == expected
+    assert DeepseekV4ForCausalLM.vllm_lora_name(name) == expected
+    assert DeepseekV41ForCausalLM.vllm_lora_name(name) == expected

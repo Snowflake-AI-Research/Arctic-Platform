@@ -21,6 +21,7 @@ from arctic_platform.model.implementations.deepseek_v4.configuration_deepseek_v4
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
 from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
+from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
 from arctic_platform.model.implementations.deepseek_v4.dequantize import decode_e8m0_scales_
 from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_state_dict_
@@ -334,6 +335,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    vllm_lora_name = staticmethod(vllm_lora_name)
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__(config)

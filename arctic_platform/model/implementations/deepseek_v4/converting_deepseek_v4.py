@@ -16,6 +16,8 @@ broadcast, whose output vLLM's own loader reads back under the published names.
 
 from __future__ import annotations
 
+import re
+
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import (
     ConvOp,
     Drop,
@@ -152,3 +154,17 @@ def conversion_chain(config) -> list[ConvOp]:
         PrefixRename("layers.", "model.layers."),
     ]
     return ops
+
+
+# Attention projections a LoRA can target, as published. ``o_a_proj`` is a grouped linear in both
+# trainer and vLLM, so it is not one.
+_LORA_PROJECTIONS = {"q_a_proj": "wq_a", "q_b_proj": "wq_b", "kv_proj": "wkv", "o_b_proj": "wo_b"}
+_PRIME_LORA_MODULE = re.compile(r"(^|\.)model\.layers\.(\d+)\.self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """Rename a synced LoRA tensor from prime-rl's module tree to the published module it adapts."""
+    return _PRIME_LORA_MODULE.sub(
+        lambda m: f"{m.group(1)}layers.{m.group(2)}.attn.{_LORA_PROJECTIONS[m.group(3)]}.",
+        name,
+    )

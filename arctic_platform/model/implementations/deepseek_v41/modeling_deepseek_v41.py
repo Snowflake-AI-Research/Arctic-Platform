@@ -29,6 +29,7 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from arctic_platform.model.implementations.deepseek_v4.attention import PackedContext
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
+from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
 from arctic_platform.model.implementations.deepseek_v4.cp import gather_for_cp
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
@@ -375,6 +376,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    vllm_lora_name = staticmethod(vllm_lora_name)
 
     def __init__(self, config: DeepseekV41Config):
         super().__init__(config)
