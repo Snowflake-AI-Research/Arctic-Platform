@@ -288,21 +288,19 @@ def test_moe_output_cast_preserves_group_log_probs():
 
 
 @pytest.mark.parametrize("kind,chunks", [("moe", (2, None)), ("dense", (2, 5000))])
-def test_near_certain_bucket_keeps_its_log_probability(kind, chunks):
-    """A bucket holding all but exp(-18.6) or less of the mass matches float64 instead of rounding to exactly 0.
-
-    Row 0's first candidate (repeated, beside a padded slot) leads the rest of the vocabulary by 20.3 nats; row 1's
-    tail bucket leads its four candidates by 18.6. Float64's own error is ``2.2e-16 * exp(margin)`` relative.
-    """
+@pytest.mark.parametrize("width", [0, 4])
+def test_near_certain_bucket_keeps_its_log_probability(kind, chunks, width):
+    """Near-certain candidate and tail buckets retain their tiny negative log-probabilities."""
     weight = torch.zeros(VOCAB, 2)
     weight[8192, 0] = 30.0
     weight[VOCAB - 1, 1] = 20.0
     hidden = torch.eye(2)[None]
     labels = torch.tensor([[8192, VOCAB - 1]])
-    token_ids = torch.tensor([[[8192, 5, 8192, -1], [5, 6, 7, 8]]], dtype=torch.int32)
+    token_ids = torch.tensor([[[8192, 5, 8192, -1], [5, 6, 7, 8]]], dtype=torch.int32)[..., :width]
 
     output = _head(kind, hidden, weight, labels, token_ids, chunks)
     groups = output["group_log_probs"] if kind == "moe" else output[1]
 
     expected = _dense_groups((hidden @ weight.T).double(), token_ids)
+    # Float64's own relative error is 2.2e-16 * exp(margin), with margins up to 20.3 nats.
     torch_assert_close(groups.double(), expected, rtol=1e-5, atol=0)
