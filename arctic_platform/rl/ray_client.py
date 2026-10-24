@@ -408,6 +408,9 @@ class ArcticRLRayClient:
         the whole model (avoids OOM on big models, at the cost of round-trips).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's config; pass a value to override this call.
+
+        ``checksum_match`` in the response says whether every sampler rank received the trainer's weights (see
+        ``ArcticRLRayServer.weight_sync``).
         """
         request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,
@@ -424,8 +427,10 @@ class ArcticRLRayClient:
     async def weight_norm(self) -> dict[str, Any]:
         """Global L2 weight norm of the training and sampling engines.
 
-        Returns ``{"training_norm", "sampling_norm", ...}``. After a weight sync the two norms must match (the metric
-        is invariant to each engine's parameter sharding/fusion). Intended for tests verifying sync correctness.
+        Returns ``{"training_norm", "sampling_norm", ...}``. A debug check: ``sync_weights``'s ``checksum_match`` is
+        what verifies a sync. A structural refusal or a mismatch disables the check on this client: the response then
+        contains ``error_code`` and ``error`` and no norm fields, and a later call returns that without recomputing.
+        A sleeping sampler or a raised worker error is reported the same way and the next call tries again.
         """
         response = await self._arctic_rl_ray_server.weight_norm(self.training_job_id, self.sampling_job_id)
         pr0(f"[ArcticRLClient] weight_norm OUTPUT: {response=}")
