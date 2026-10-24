@@ -144,6 +144,12 @@ def markdown(result: dict) -> str:
     lines = [f"# Onboarding: {spec['name']}", "",
              f"**Verdict: {v}**", ""]
     lines += [f"- {r}" for r in reasons] + ([""] if reasons else [])
+    settings = ((result.get("perf") or {}).get("breakdown") or {}).get("settings")
+    if settings:
+        lines += [f"Degradation from semi_p's collective settings alone (plain matched / plain), not counted "
+                  f"against semi_p: TTFT x{_num(settings.get('ttft_ratio'))}, TPOT x{_num(settings.get('tpot_ratio'))}, "
+                  f"server p50 latency median x{_num(settings.get('median_latency_ratio'))}, engine throughput "
+                  f"median x{_num(settings.get('median_throughput_ratio'))}.", ""]
     lines += [
         "| | |", "|---|---|",
         f"| Model | `{spec['model_name']}` |",

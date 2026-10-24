@@ -340,6 +340,37 @@ def test_perf_score_gates_engine_throughput_and_reports_client():
     assert report._perf_status(client) == "info (below)"
 
 
+def test_perf_score_passes_a_gap_plain_matched_shows_too():
+    def c(srv, tok):
+        return {"concurrency": 2, "prompt": 16, "output": 96, "server_p50": srv, "tok_s": tok,
+                "client_p50": srv + 0.2, "errors": 0, "zero_id_responses": 0}
+
+    rows = [{"on": c(1.10, 170), "off": c(1.00, 190), "matched": c(1.10, 170)}]
+    lat = {s: {"ttft_short_s": 0.05, "ttft_long_s": 0.05, "tpot_s": t, "errors": 0}
+           for s, t in (("on", 0.0110), ("off", 0.0098), ("matched", 0.0112))}
+    tpot = {x["name"]: x for x in perf.score(rows, lat, 1, {})["checks"]}["TPOT ratio"]
+    assert tpot["passed"] and "passes against plain matched" in tpot["limit"]
+    del rows[0]["matched"], lat["matched"]
+    assert not {x["name"]: x for x in perf.score(rows, lat, 1, {})["checks"]}["TPOT ratio"]["passed"]
+
+
+def test_guided_json_that_does_not_parse_passes_only_when_plain_matched_agrees():
+    from arctic_platform.inference.semi_persistence.onboarding import correctness
+
+    def check(**variants):
+        return {"passed": True, "detail": "",
+                "variants": {v: {"passed": ok, "detail": "", "gated": True} for v, ok in variants.items()}}
+
+    agrees, differs, absent = check(off_matched=True), check(off_matched=False), check(on_miss=True)
+    for c in (agrees, differs, absent):
+        correctness.apply_guided_parse_rule(c, parses=False)
+    assert agrees["passed"] and not differs["passed"] and not absent["passed"]
+    assert "no off_matched job" in absent["detail"]
+    parsed = check(on_miss=True)
+    correctness.apply_guided_parse_rule(parsed, parses=True)
+    assert parsed["passed"]
+
+
 def test_publish_body_asks_a_miss_to_dump_and_publish():
     from arctic_platform.inference.semi_persistence.onboarding import publish
 
