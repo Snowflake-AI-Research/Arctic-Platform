@@ -157,6 +157,7 @@ def markdown(result: dict) -> str:
         f"| Tested as | {spec.get('copies', 1)} copies: {spec.get('test_n_gpus', spec['n_gpus'])} GPUs, "
         f"{spec.get('test_replicas', spec['replicas'])} replica(s) per job |",
         f"| Image tag | `{result.get('image_tag') or 'default'}` |",
+        *([f"| Published image | {result['published_image']} |"] if result.get("published_image") else []),
         f"| Run | {result.get('started_at')} to {result.get('finished_at')} UTC |",
         "",
     ]

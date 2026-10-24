@@ -433,6 +433,54 @@ def test_publish_outcome_needs_nothing_for_a_restore_from_the_mirror():
     assert publish.publish_outcome(lines)["status"].startswith("already published")
 
 
+def _fake_kubectl(ready_after):
+    """kubectl that reports 3 cache nodes, and each label ready once polled ``ready_after`` times."""
+    from types import SimpleNamespace
+
+    polls = {}
+
+    def run(argv, **_kwargs):
+        selector = argv[argv.index("-l") + 1]
+        if "=ready" not in selector:
+            return SimpleNamespace(stdout="node/a\nnode/b\nnode/c\n")
+        polls[selector] = polls.get(selector, 0) + 1
+        return SimpleNamespace(stdout="node/a\nnode/b\nnode/c\n" if polls[selector] > ready_after else "node/a\n")
+
+    return run
+
+
+def test_published_dirs_come_from_the_publish_summary(tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"m": {"status": "published", "slug": "Org-Model", "skeleton": "aaa_bbb_ccc",
+                                         "weight_hash": "ccc"}, "failed": {"status": "FAILED: x"}}))
+    assert verify.published_dirs(summary, "m") == ["image-cache/Org-Model/skeleton/aaa_bbb_ccc",
+                                                   "image-cache/Org-Model/weight/ccc"]
+    assert verify.published_dirs(summary, "failed") == []
+    assert verify.published_dirs(tmp_path / "missing.json", "m") == []
+
+
+def test_wait_verified_waits_for_every_node_then_reports():
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    dirs = ["image-cache/M/skeleton/k", "image-cache/M/weight/w"]
+    slept = []
+    note = verify.wait_verified(dirs, 600, "m", run=_fake_kubectl(ready_after=2), sleep=slept.append,
+                                clock=lambda: 0.0)
+    assert note == "skeleton and weights verified on 3/3 nodes" and len(slept) == 2
+    assert verify.wait_verified([], 600, "m").startswith("not checked")
+
+
+def test_wait_verified_gives_up_after_its_timeout():
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    ticks = iter(range(0, 10_000, 100))
+    with pytest.raises(RuntimeError, match="not verified on every node after 300s"):
+        verify.wait_verified(["image-cache/M/skeleton/k"], 300, "m", run=_fake_kubectl(ready_after=99),
+                             sleep=lambda _s: None, clock=lambda: float(next(ticks)))
+
+
 def test_cli_helpers():
     assert parse_kv_args(["a=1", "b=x=y"]) == {"a": "1", "b": "x=y"}
     with pytest.raises(SystemExit):

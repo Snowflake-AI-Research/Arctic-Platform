@@ -58,6 +58,8 @@ backend applies when it supports it. The report says whether it did; if not,
   (model, `max_seq_len`, `n_gpus`, every `vllm_config` field) must match the job
   that dumped it. A semi_p job that finds no image fails, telling you to set
   `semi_p` to false or add `SEMIP_DUMP_PUBLISH=1`, so `on_hit` fails the run.
+- `kubectl` access to the cluster, to wait for the published image to be
+  verified on every node (below). Without it the suite warns and submits anyway.
 - Free GPUs for all of a model's jobs at once: `copies x n_gpus` for each perf job
   (`on_hit`, `off_default`, `off_matched`) plus `n_gpus` for `on_miss`.
 - `on_miss` leaves its fresh image on the node's local disk; point
@@ -103,6 +105,18 @@ model with no entry stops the run before anything is submitted.
 | `job_<variant>` | none | Attach to running jobs instead of submitting (`on_job_id` / `off_job_id` still work) |
 | `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / `off_default` (per-step restore breakdown) |
 | `timeout_s` | `3600` | How long to wait for the jobs to reach `running` |
+| `publish_dir` | `<out_dir>/publish` | Where `publish` wrote `<image_tag>/summary.json` |
+| `verify_timeout_s` | `3600` | How long to wait for the published image to be verified on every node |
+
+A restore refuses a published skeleton or weights that its node has not yet
+verified, and the node cache verifies them on each node some minutes after the
+upload. So before submitting a model's jobs, the suite looks up the skeleton key
+and weight hash that `publish` recorded for the model and backend image in
+`<publish_dir>/<image_tag>/summary.json`, and waits until every `neutrino-pool-h200`
+and `neutrino-pool-b200` node carries their `model.neutrino.snowflake.com/...=ready`
+labels. The report's "Published image" row says how that went: verified on N/N
+nodes, or not checked (no summary entry, or no `kubectl`). If the wait times out,
+the model fails without submitting anything.
 
 ### Running unattended on a shared cluster
 
@@ -146,8 +160,10 @@ python -m arctic_platform.inference.semi_persistence.onboarding.publish config=c
 It submits one job per model with the flag, waits for the engine's
 `semi_p: published` line in the sub-job log (or a restore from an image that is
 published already), saves the log and cancels the job. Results are in
-`onboarding_reports/publish/<image_tag>/summary.json`. Then point the models'
-entries in `models/backends.json` at the image.
+`onboarding_reports/publish/<image_tag>/summary.json`; a re-run for some models
+keeps the other models' entries. Publishing ends with the upload: `onboard` is the
+one that waits for the nodes to verify the image. Then point the models' entries in
+`models/backends.json` at the image.
 
 ## Model files
 
