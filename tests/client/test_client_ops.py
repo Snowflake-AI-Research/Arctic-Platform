@@ -30,13 +30,17 @@ import pytest
 from pydantic import ValidationError
 
 from arctic_platform.client import OPS
+from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import AsyncArcticClient
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
+from arctic_platform.client import TrainingConfig
 from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
 from arctic_platform.client import requests as cluster_requests
@@ -1043,7 +1047,13 @@ class TestCortexSharedHelper:
                     "prompts": prompts,
                     "old_log_probs": old,
                 },
-                "meta": {"zorro_train_enable": True, "max_prompt_len": 3, "balance_batch": True},
+                "meta": {
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                    "balance_batch": True,
+                    "pad_token_id": 151643,
+                    "temperature": 0.7,
+                },
             }
         )
         assert torch.equal(out["kwargs"]["input_ids"], ids)
@@ -1051,6 +1061,8 @@ class TestCortexSharedHelper:
         assert torch.equal(out["kwargs"]["old_log_probs"], old)
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
+        assert out["context"]["pad_token_id"] == 151643
+        assert out["context"]["temperature"] == 0.7
 
 
 class TestCortexShimSaveWeightsFailsLoud:
@@ -1162,3 +1174,38 @@ class TestCortexShimForwardsLikeOnPrem:
         out = asyncio.run(self._shim(Client()).fwd_no_grad(self._batch(), reference_model=False))
         assert out["batch"]["logprobs"].shape == (2, 5)
         assert float(out["batch"]["logprobs"].sum()) == 10.0
+
+
+def test_zorro_is_only_compatible_with_arctic_rl_client(monkeypatch):
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    enabled = {"zorro_train_enable": True}
+    sft = ArcticSFTClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config=enabled),
+    )
+    plain = ArcticClientConfig(model_name="m", training_gpus=1, training=TrainingConfig(ds_worker_config=enabled))
+    nested = ArcticClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=TrainingConfig(
+            ds_worker_config={"zorro_train": {"enable": True, "response_len": 8, "temperature": 1.0}}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticSFTClient(sft)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticClient(plain)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        AsyncArcticClient(nested)
+
+    ArcticSFTClient(
+        ArcticSFTClientConfig(
+            model_name="m",
+            training_gpus=1,
+            training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config={"zorro_train_enable": False}),
+        )
+    )
+    ArcticRLClient(plain)
+    AsyncArcticRLClient(nested)

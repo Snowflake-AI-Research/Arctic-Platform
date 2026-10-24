@@ -302,6 +302,11 @@ def _to_cortex_zorro_fwd_bwd(
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
     apply_balance_metadata(context, meta, input_ids, prompts)
+    # The unpacked worker unpads with pad_token_id and the patched forward
+    # divides by temperature. Balance metadata does not carry either scalar.
+    for key in ("pad_token_id", "temperature"):
+        if key in meta:
+            context[key] = meta[key]
     return {
         "args": (),
         "kwargs": kwargs_out,
