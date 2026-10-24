@@ -26,7 +26,8 @@ block output back into each stream with a per-stream weight:
 Hugging Face runs ~10 elementwise passes over ``[T, hc * H]`` tensors per call, most in FP32 (7.6 ms forward, 23.7 ms
 forward + backward at 32K tokens x 4 x 2560 on an H200). Here it is three Triton passes each way (norm, mix and
 inject forward; inject, mix and norm backward) around the four GEMMs, rounding to BF16 at the tensors the Hugging
-Face module rounds. Only input gradients: callers keep the Hugging Face path when a hyper-connection weight trains.
+Face module rounds. When the hyper-connection weights train, their gradients come from the same backward: the GEMM
+weight gradients from the saved GEMM inputs and ``(1 + w)``'s from the normalized stream.
 """
 
 from __future__ import annotations
@@ -127,8 +128,11 @@ def _inject_bwd_kernel(dy_ptr, out_ptr, inj_ptr, dout_ptr, dinj_ptr, H, HC: tl.c
 
 
 def _stacked_down_inject(module) -> torch.Tensor:
-    """``[W_down; W_inject]``, cached on the module while its (frozen) weights are the same tensors."""
+    """``[W_down; W_inject]``: cached on the module while its frozen weights are the same tensors, rebuilt under
+    autograd every call when they train."""
     down, inject = module.input_mix_weight_down.weight, module.block_inject_weight.weight
+    if down.requires_grad or inject.requires_grad:
+        return torch.cat([down, inject], 0)
     key = (down.data_ptr(), inject.data_ptr(), down._version, inject._version)
     cached = getattr(module, "_dss_stacked_down_inject", None)
     if cached is None or cached[0] != key:
@@ -170,14 +174,23 @@ class _GatedResidualFn(torch.autograd.Function):
         _mix_bwd_kernel[(rows, triton.cdiv(hidden, _BLOCK_H))](
             dmixed.contiguous(), b, n, db, dn, hidden, HC=hc, BLOCK_H=_BLOCK_H
         )
+        _, need_norm_w, need_down_inject, need_up, _, _ = ctx.needs_input_grad
         da = torch.ops.aten.silu_backward(db @ w_up, a_div) / hc
         dl = (2 * dinj) * gate * (1 - gate) / hc
-        dn.addmm_(torch.cat([da, dl.to(da.dtype)], 1), w_down_inject)
+        dal = torch.cat([da, dl.to(da.dtype)], 1)
+        d_up = db.t().mm(F.silu(a_div)) if need_up else None
+        d_down_inject = dal.t().mm(n) if need_down_inject else None
+        dn.addmm_(dal, w_down_inject)
+        d_norm_w = None
+        if need_norm_w:
+            # n = x_hat * (1 + w) per stream: the weight's gradient is sum over tokens of dn * x_hat, in FP32.
+            x_hat = x.view(rows, hc, hidden).float() * rstd.view(rows, hc, 1)
+            d_norm_w = (dn.view(rows, hc, hidden).float() * x_hat).sum(0).flatten().to(norm_weight.dtype)
         dx = torch.empty_like(x)
         _norm_bwd_kernel[(rows * hc,)](
             dn, x, norm_weight, rstd, dx, hidden, HC=hc, BLOCK=triton.next_power_of_2(hidden), num_warps=8
         )
-        return dx, None, None, None, None, None
+        return dx, d_norm_w, d_down_inject, d_up, None, None
 
 
 class _InjectFn(torch.autograd.Function):
@@ -206,15 +219,9 @@ class _InjectFn(torch.autograd.Function):
 
 
 def fused_hyper_connection_supported(module, x: torch.Tensor) -> bool:
-    """The fused path covers frozen BF16 CUDA hyper connections whose stream count is a power of two."""
+    """The fused path covers BF16 CUDA hyper connections whose stream count is a power of two, frozen or training."""
     hc = module.hc_count
-    return (
-        x.is_cuda
-        and x.dtype == torch.bfloat16
-        and module.block_inject_weight is not None
-        and hc & (hc - 1) == 0
-        and not any(p.requires_grad for p in module.parameters())
-    )
+    return x.is_cuda and x.dtype == torch.bfloat16 and module.block_inject_weight is not None and hc & (hc - 1) == 0
 
 
 def gated_residual(module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
