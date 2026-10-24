@@ -31,6 +31,13 @@ def _checkpoint(tmp_path, *, n_routed_experts: int | None = None) -> str:
     return str(path)
 
 
+def _requires_sparse_attention_kernel():
+    from arctic_platform.model.implementations.deepseek_v4 import attention
+
+    if attention.dsv4_sparse_attn is None:
+        pytest.skip("building the attention needs the tilelang sparse-attention kernel")
+
+
 def _tiny_config():
     from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4Config
 
@@ -152,6 +159,7 @@ def test_published_expert_names_convert_to_platform_parameters():
 
 
 def test_checkpoint_fp32_parameters_are_built_in_fp32():
+    _requires_sparse_attention_kernel()
     from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
     model = DeepseekV4ForCausalLM._from_config(_tiny_config(), dtype=torch.bfloat16)
@@ -167,6 +175,7 @@ def test_checkpoint_fp32_parameters_are_built_in_fp32():
 
 
 def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
+    _requires_sparse_attention_kernel()
     from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
     from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
@@ -246,6 +255,7 @@ def test_only_lora_keeps_the_official_checkpoint_packed(tmp_path, monkeypatch, p
 
 
 def test_dequantize_checkpoint_builds_bf16_modules_from_the_official_checkpoint(tmp_path):
+    _requires_sparse_attention_kernel()
     from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
     from arctic_platform.model.implementations.qwen35.config import ModelConfig
     from arctic_platform.model.implementations.qwen35.model_builder import get_model
