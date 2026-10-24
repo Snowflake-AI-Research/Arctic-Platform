@@ -145,8 +145,16 @@ class GroupedLogProbAccumulator:
         self.candidate_logits[rows] = torch.where(in_tile, candidate_logits, self.candidate_logits[rows])
         self.tail_logits[rows] = torch.logaddexp(self.tail_logits[rows], scaled_logits.logsumexp(-1))
 
-    def normalized_log_probs(self, log_normalizer: torch.Tensor) -> torch.Tensor:
-        return self.groups - log_normalizer.to(torch.float32)[:, None]
+    def normalized_log_probs(self) -> torch.Tensor:
+        # log p_k = -softplus(logsumexp of the other buckets - bucket_k), from differences: groups - logz rounds a
+        # near-certain bucket to exactly 0 in float32. A token repeated among the candidates is counted once.
+        ids = torch.cat([self.token_ids, self.token_ids.new_full((len(self.token_ids), 1), -2)], -1)
+        sorted_ids, order = ids.sort(-1)
+        repeated = sorted_ids[:, 1:] == sorted_ids[:, :-1]
+        repeated = torch.cat([torch.zeros_like(repeated[:, :1]), repeated], -1)
+        unique = self.groups.masked_fill(torch.empty_like(repeated).scatter_(-1, order, repeated), float("-inf"))
+        others = unique[:, None, :].masked_fill(ids[:, :, None] == ids[:, None, :], float("-inf")).logsumexp(-1)
+        return -torch.nn.functional.softplus(others - self.groups)
 
     def combine_output_gradients(
         self,

@@ -300,7 +300,7 @@ def _get_sequence_chunked_logprob_fn():
             ctx.grouped = grouped
             if grouped is None:
                 return logprobs
-            return logprobs, grouped.normalized_log_probs(logz)
+            return logprobs, grouped.normalized_log_probs()
 
         @staticmethod
         def backward(ctx, grad_logprobs, grad_group_log_probs=None):
