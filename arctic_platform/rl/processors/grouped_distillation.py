@@ -372,7 +372,8 @@ def grouped_divergence(
         value.double().masked_fill(padding.to(value.device), -math.inf) for value in (log_teacher, log_student)
     )
     if log_student.requires_grad:
-        # Project along the bucket distribution before the head's float32 backward can cancel near-certain gradients.
+        # Over distinct ids the buckets are a log-softmax, so this leaves the logit gradient unchanged; summing to
+        # zero in float64 keeps the head's float32 q * sum(grad) from cancelling near-certain buckets' gradients.
         student_probs = torch.softmax(log_student.detach(), -1)
         log_student.register_hook(lambda grad: grad - student_probs * grad.sum(-1, keepdim=True))
 

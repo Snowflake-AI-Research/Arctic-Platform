@@ -1050,7 +1050,7 @@ def test_native_unpad_round_trips_token_outputs_with_trailing_dimensions():
 @pytest.mark.parametrize("beta", [0.0, 1.0])
 @pytest.mark.parametrize("kind", ["dense", "moe"])
 def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(beta, kind):
-    """Both heads preserve the zero KL gradient at a near-certain student/teacher match."""
+    """Both heads keep KL's zero gradient at a near-certain match; the head's float32 q * sum(grad) left 1.3e-5."""
     set_seed(0)
     vocab = 2 * 8192 + 37
     weight = torch.zeros(vocab, 2)
