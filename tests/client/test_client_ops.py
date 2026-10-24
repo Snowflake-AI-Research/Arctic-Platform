@@ -1191,7 +1191,8 @@ class TestCortexSharedHelper:
         )
         assert torch.equal(out["kwargs"]["input_ids"], ids)
         assert torch.equal(out["kwargs"]["prompts"], prompts)
-        assert torch.equal(out["kwargs"]["old_log_probs"], old)
+        assert "old_log_probs" not in out["kwargs"]
+        assert torch.equal(out["context"]["old_log_probs_shifted"], old)
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
         assert out["context"]["pad_token_id"] == 151643
@@ -1427,6 +1428,58 @@ class TestCortexActorConfig:
         assert loss.item() == pytest.approx(-1.28)
         loss, _ = _grpo_loss(outputs, context, default, "cpu")
         assert loss.item() == pytest.approx(-1.2)
+
+
+class TestCortexZorroOldLogProbs:
+    """Cortex ``grpo`` reads π_old only as ``old_log_probs_shifted``."""
+
+    def test_snapshot_reaches_the_ratio_unshifted(self):
+        """Replays the server: context promoted onto the batch, then ZoRRo's
+        response-only flatten. Live log-probs are the snapshot + 0.1, so the
+        ratio is e^0.1 per token, not the 1 a missing π_old gives."""
+        import math
+
+        import torch
+
+        from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.rl.processors.grpo import _grpo_loss
+        from arctic_platform.rl.processors.pipeline import padded_tensor_2d_full_to_unpadded_tensor_1d_response
+
+        # max_prompt_len=3; row 0 has a 2-token response, row 1 a 1-token response.
+        ids = torch.tensor([[0, 5, 6, 7, 8], [1, 2, 3, 4, 0]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
+        response = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 0]])
+        old = torch.tensor([[0.0, 0.0, 0.0, -1.0, -2.0], [0.0, 0.0, 0.0, -0.5, 0.0]], dtype=torch.float64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": response.to(torch.float32),
+                    "response_mask": response,
+                    "prompts": ids[:, :3],
+                    "old_log_probs": old,
+                },
+                "meta": {"zorro_train_enable": True, "max_prompt_len": 3},
+            }
+        )
+        sent = out["context"]["old_log_probs_shifted"]
+        assert sent.dtype == torch.float32
+        assert sent.tolist() == old.to(torch.float32).tolist()
+
+        batch, meta = promote_batch_dim_to_batch(out["kwargs"], out["context"])
+        mask = batch["attention_mask"].bool()
+        flat = {
+            key: padded_tensor_2d_full_to_unpadded_tensor_1d_response(value, mask, 3)
+            for key, value in batch.items()
+            if key not in ("input_ids", "position_ids", "attention_mask") and value.shape == mask.shape
+        }
+        assert flat["old_log_probs_shifted"].tolist() == [[-1.0, -2.0, -0.5]]
+        live = flat["old_log_probs_shifted"] + 0.1
+        _, metrics = _grpo_loss({"logprobs": live}, {**meta, **flat}, out["processing"]["config"], "cpu")
+        assert metrics["importance_weight"] == pytest.approx(math.exp(0.1))
+        assert metrics["approx_kl"] == pytest.approx(0.1)
 
 
 class TestCortexShimSaveWeightsFailsLoud:

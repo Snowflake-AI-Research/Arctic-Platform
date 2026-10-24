@@ -220,8 +220,8 @@ def to_cortex_fwd_bwd_payload(
     Non-ZoRRo rows are left-aligned on the way out (see :func:`_left_align_batch`).
     Cortex's packer rejects any other layout. ZoRRo rows stay in the client
     layout: left-aligning them moves response tokens into ``[:, max_prompt_len]``.
-    That path keeps ``old_log_probs`` so the snapshot from ``fwd_no_grad`` is
-    the ratio's π_old.
+    That path sends ``old_log_probs`` as ``old_log_probs_shifted`` so the
+    snapshot from ``fwd_no_grad`` is the ratio's π_old.
 
     ``response_aligned`` says ``loss_mask`` and ``advantages`` sit on the token
     they score (SkyRL and verl), while Cortex weights position ``i`` by its
@@ -327,8 +327,12 @@ def _to_cortex_zorro_fwd_bwd(
 
     The worker slices the response at ``max_prompt_len``. Left-aligning a
     shorter prompt moves response tokens into that slice and drops them from
-    the loss. ``old_log_probs`` stays on the batch so the ``fwd_no_grad``
-    snapshot is π_old.
+    the loss.
+
+    ``grpo`` reads π_old only as ``old_log_probs_shifted`` and otherwise uses
+    the live log-probs, a ratio of 1. The ``fwd_no_grad`` snapshot is sent
+    under that name without a shift: ZoRRo's log-probs, live and snapshot,
+    sit on the response token they score, the same columns as ``loss_mask``.
     """
     import torch
 
@@ -342,14 +346,14 @@ def _to_cortex_zorro_fwd_bwd(
         "prompts": prompts,
         "response_mask": response_mask,
     }
-    if torch.is_tensor(old_log_probs):
-        kwargs_out["old_log_probs"] = old_log_probs
     if torch.is_tensor(tensors.get("position_ids")):
         kwargs_out["position_ids"] = tensors["position_ids"]
 
     proc_config = _resolve_proc_config(meta, processing_in)
 
     context: dict[str, Any] = {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask}
+    if torch.is_tensor(old_log_probs):
+        context["old_log_probs_shifted"] = old_log_probs.to(torch.float32)
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
     apply_balance_metadata(context, meta, input_ids, prompts)
