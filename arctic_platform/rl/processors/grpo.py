@@ -244,16 +244,10 @@ def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]
     return coef, kind, float(cap)
 
 
-def _per_token_sampler_kl_weights(
-    weights: torch.Tensor | None, like: torch.Tensor, cu_seqlens: torch.Tensor | None
-) -> torch.Tensor | None:
-    """``sampler_kl_weights`` per token of ``like``; a 1-D tensor of one value per sequence (a ``cu_seqlens``
-    segment when packed, else a row) gives that value to each of the sequence's tokens."""
-    if weights is None or weights.ndim != 1 or weights.shape == like.shape:
-        return weights
-    if cu_seqlens is not None and weights.numel() == cu_seqlens.numel() - 1:
-        return torch.repeat_interleave(weights, torch.diff(cu_seqlens.to(weights.device)))
-    if cu_seqlens is None and like.ndim == 2 and weights.numel() == like.shape[0]:
+def _per_token_sampler_kl_weights(weights: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
+    """``sampler_kl_weights`` per token of padded ``[B, S]`` ``like``: a ``[B]`` tensor gives each row's tokens its
+    value. Packed calls hold it per token already (``ROW_BROADCAST_KEYS`` in ``arctic_platform.common.packing``)."""
+    if weights is not None and weights.ndim == 1 and like.ndim == 2 and weights.shape[0] == like.shape[0]:
         return weights[:, None].expand_as(like)
     return weights
 
@@ -973,8 +967,8 @@ def _grpo_loss(
         ``sampler_kl_type`` (default "k1": ``k = -log r``, whose gradient ``-β ∇ log p`` raises every sampled token
         regardless of advantage; "k2": ``(log r)^2 / 2``; "k3": ``r - 1 - log r``, zero gradient where r = 1),
         ``sampler_kl_ratio_cap`` (default 5.0, > 1, inf allowed; k2 and k3 continue linearly past
-        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token, or as one value per
-        sequence that each of its tokens takes (finite, non-negative, default 1; required to carry
+        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token, or on a padded request
+        as one value per sequence that each of its tokens takes (finite, non-negative, default 1; required to carry
         ``sequence_loss_weights`` under token-mean),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
@@ -1132,7 +1126,7 @@ def _grpo_loss(
                 "teacher_log_probs_shifted must exactly match prediction-aligned logprobs shape, "
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
             )
-    sampler_kl_weights = _per_token_sampler_kl_weights(input_data["sampler_kl_weights"], logprobs, cu_seqlens)
+    sampler_kl_weights = _per_token_sampler_kl_weights(input_data["sampler_kl_weights"], logprobs)
     input_data["sampler_kl_weights"] = sampler_kl_weights
     if sampler_kl_weights is not None and sampler_kl_weights.shape != logprobs.shape:
         raise ValueError(
@@ -1496,7 +1490,7 @@ def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
     _resolve_sampler_kl(config, context)
-    weights = _per_token_sampler_kl_weights(context.get("sampler_kl_weights"), mask, context.get("cu_seqlens"))
+    weights = _per_token_sampler_kl_weights(context.get("sampler_kl_weights"), mask)
     if weights is not None and weights.shape != mask.shape:
         raise ValueError(
             "sampler_kl_weights must match loss_mask shape or hold one value per sequence, got "
