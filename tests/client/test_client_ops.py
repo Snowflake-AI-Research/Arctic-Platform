@@ -25,8 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from typing import Literal
+from typing import Optional
 
 import pytest
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import PositiveInt
 from pydantic import ValidationError
 
 from arctic_platform.client import OPS
@@ -705,6 +711,134 @@ class TestCortexBackendOnlyConstruction:
         assert _parent_id("job-1") == "job-1"
         assert _parent_id("job-1:training:0") == "job-1"
         assert _parent_id(42) == "42"
+
+
+# Mirror of Neutrino's ``ZorroTrainConfig`` in dss/ray_dss/models.py on the DSS
+# branch ``truwase/zorro-train`` (DSS #573, d7ef9b1b). The server model is
+# ``extra="forbid"``: a field added or renamed there must be added here and in
+# ``arctic_platform.client.config._cortex_zorro_train``.
+class _ServerZorroTrainConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enable: bool = False
+    response_len: Optional[PositiveInt] = None
+    temperature: Optional[float] = Field(default=None, gt=0)
+    use_unpad: bool = True
+    logits_optimization: Literal["none", "memory", "compute"] = "none"
+    logits_optimization_peak_mem_size_in_gib: int = Field(default=4, gt=0)
+    logits_compute_from_fp32_inputs: bool = False
+    logits_compute_in_fp32: bool = False
+
+
+class TestCortexZorroTrainingConfig:
+    """A ZoRRo ds_worker_config must reach Neutrino as ``training_config.pack=false``
+    plus a ``zorro_train`` block. Without them the job defaults to packed dispatch,
+    never installs the ZoRRo forward, and ``pack_microbatch`` rejects the batch."""
+
+    BASE_WORKER = {
+        "use_liger": True,
+        "enable_gradient_checkpointing": True,
+        "attn_implementation": "flash_attention_2",
+    }
+    # verbatim key set SkyRL's arctic_rl config emits with use_zorro on
+    ZORRO_WORKER = {
+        **BASE_WORKER,
+        "zorro_train_enable": True,
+        "response_len": 1024,
+        "max_token_len": 9216,
+        "rollout_n": 8,
+        "temperature": 1.0,
+        "use_unpad": True,
+        "logits_optimization": "memory",
+        "logits_optimization_peak_mem_size_in_gib": 4.0,
+        "logits_compute_from_fp32_inputs": False,
+        "logits_compute_in_fp32": True,
+    }
+
+    @staticmethod
+    def _training_config(worker: dict | None) -> dict:
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_worker_config": worker},
+        )
+        return cfg._cortex_training_sub_job()["training_config"]
+
+    def test_enabled_unpacks_and_forwards_zorro_block(self):
+        tc = self._training_config(self.ZORRO_WORKER)
+        assert tc["pack"] is False
+        assert tc["zorro_train"] == {
+            "enable": True,
+            "response_len": 1024,
+            "temperature": 1.0,
+            "use_unpad": True,
+            "logits_optimization": "memory",
+            "logits_optimization_peak_mem_size_in_gib": 4,
+            "logits_compute_from_fp32_inputs": False,
+            "logits_compute_in_fp32": True,
+        }
+
+    def test_client_only_keys_are_not_forwarded(self):
+        tc = self._training_config(self.ZORRO_WORKER)
+        for key in ("max_token_len", "rollout_n", "zorro_train_enable"):
+            assert key not in tc["zorro_train"]
+            assert key not in tc
+
+    def test_whole_float_peak_mem_lands_as_int(self):
+        peak = self._training_config(self.ZORRO_WORKER)["zorro_train"]["logits_optimization_peak_mem_size_in_gib"]
+        assert peak == 4 and type(peak) is int
+
+    def test_fractional_peak_mem_raises_instead_of_truncating(self):
+        worker = {**self.ZORRO_WORKER, "logits_optimization_peak_mem_size_in_gib": 2.5}
+        with pytest.raises(ValueError, match="logits_optimization_peak_mem_size_in_gib"):
+            self._training_config(worker)
+
+    @pytest.mark.parametrize("key", ["response_len", "temperature"])
+    def test_missing_required_field_raises(self, key):
+        worker = {k: v for k, v in self.ZORRO_WORKER.items() if k != key}
+        with pytest.raises(ValueError, match=key):
+            self._training_config(worker)
+
+    @pytest.mark.parametrize(("key", "value"), [("response_len", 0), ("response_len", 1.5), ("temperature", 0.0)])
+    def test_invalid_required_field_raises(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            self._training_config({**self.ZORRO_WORKER, key: value})
+
+    def test_optional_knobs_left_to_server_defaults(self):
+        worker = {**self.BASE_WORKER, "zorro_train_enable": True, "response_len": 512, "temperature": 0.7}
+        expected = {"enable": True, "response_len": 512, "temperature": 0.7}
+        assert self._training_config(worker)["zorro_train"] == expected
+
+    @pytest.mark.parametrize("enable", [None, False])
+    def test_disabled_emits_neither_pack_nor_zorro(self, enable):
+        worker = {k: v for k, v in self.ZORRO_WORKER.items() if k != "zorro_train_enable"}
+        if enable is not None:
+            worker["zorro_train_enable"] = enable
+        tc = self._training_config(worker)
+        assert "pack" not in tc and "zorro_train" not in tc
+        # leftover ZoRRo knobs must not change a non-ZoRRo job at all
+        assert tc == self._training_config(self.BASE_WORKER)
+
+    def test_emitted_block_validates_against_server_schema(self):
+        block = self._training_config(self.ZORRO_WORKER)["zorro_train"]
+        parsed = _ServerZorroTrainConfig.model_validate(block)
+        assert parsed.model_dump(include=set(block)) == block
+
+    def test_server_schema_mirror_rejects_client_only_keys(self):
+        # pins the reason max_token_len / rollout_n must stay off the wire
+        block = {**self._training_config(self.ZORRO_WORKER)["zorro_train"], "rollout_n": 8}
+        with pytest.raises(ValidationError, match="rollout_n"):
+            _ServerZorroTrainConfig.model_validate(block)
+
+    def test_server_schema_mirror_matches_dss(self):
+        models = pytest.importorskip("dss.ray_dss.models")
+        server = models.ZorroTrainConfig
+        assert set(server.model_fields) == set(_ServerZorroTrainConfig.model_fields)
+        tc = self._training_config(self.ZORRO_WORKER)
+        models.TrainingConfig.model_validate(tc)
 
 
 class TestCortexTransportNoopOps:
