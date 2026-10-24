@@ -29,6 +29,7 @@ import time
 import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
+from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -36,14 +37,6 @@ logger = logging.getLogger(__name__)
 
 def _weight_sync_names_are_strict() -> bool:
     return os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") != "0"
-
-
-def _tensor_l2_sq(value: torch.Tensor, chunk_numel: int = 1 << 20) -> torch.Tensor:
-    total = torch.zeros((), dtype=torch.float64, device=value.device)
-    # reshape (not view) so non-contiguous parameters still checksum.
-    for chunk in value.detach().reshape(-1).split(chunk_numel):
-        total.add_(chunk.float().square().sum(dtype=torch.float64))
-    return total
 
 
 def _model_parameter_l2(
@@ -454,6 +447,11 @@ class WeightSyncExtension:
 
         If *engine_only* is True, only the NCCL rendezvous is performed.
         If *direct_mode* is True, per-weight send/recv is used (BF16 TP=1).
+
+        Every TP rank receives the full model, and ``recv_l2_sq`` is the sum of
+        squares of the full tensors this rank received. The zero-copy path
+        writes straight into (possibly padded) parameter views and does not
+        name what it received, so it reports no ``recv_l2_sq``.
         """
         from vllm.distributed.parallel_state import (
             get_tensor_model_parallel_world_size,
@@ -474,20 +472,41 @@ class WeightSyncExtension:
 
         tp = get_tensor_model_parallel_world_size()
 
+        recv_l2_sq: float | None = None
+        applied_source_l2_sq: float | None = None
+        skipped_source_names: list[str] | None = None
         if self.model_config.quantization:
             path = "fp8"
-            loaded, _ = self._load_fp8(model, engine)
+            loaded, recv_l2_sq = self._load_fp8(model, engine)
         elif tp == 1 and direct_mode:
             path = "direct_zero_copy"
             loaded = self._load_direct_zero_copy(model, engine)
         elif tp == 1:
             path = "direct"
-            loaded, _, _, _, _ = self._load_direct(model, engine)
+            (
+                loaded,
+                recv_l2_sq,
+                applied_source_l2_sq,
+                _,
+                skipped_source_names,
+            ) = self._load_direct(model, engine)
         else:
             path = "batched"
-            loaded, _, _, _, _ = self._load_batched(model, engine)
+            (
+                loaded,
+                recv_l2_sq,
+                applied_source_l2_sq,
+                _,
+                skipped_source_names,
+            ) = self._load_batched(model, engine)
 
-        return self._build_result(start, mem_before, path, loaded)
+        result = self._build_result(start, mem_before, path, loaded)
+        if recv_l2_sq is not None:
+            result["recv_l2_sq"] = recv_l2_sq
+        if applied_source_l2_sq is not None:
+            result["applied_source_l2_sq"] = applied_source_l2_sq
+            result["skipped_source_count"] = len(skipped_source_names or ())
+        return result
 
     # ------------------------------------------------------------------
     # Loading strategies
@@ -1086,7 +1105,11 @@ class WeightSyncExtension:
         raise RuntimeError(msg)
 
     def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict:
-        """Load weights from CUDA IPC handles (zero-copy, same GPU)."""
+        """Load weights from CUDA IPC handles (zero-copy, same GPU).
+
+        ``recv_l2_sq`` is the sum of squares of the full tensors the handles
+        opened, taken before ``model.load_weights`` shards or quantizes them.
+        """
         import base64
         import pickle
 
@@ -1105,6 +1128,7 @@ class WeightSyncExtension:
 
         loaded = 0
         missing = []
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, handle_dict in zip(names, handles_list):
             if physical_gpu_id not in handle_dict:
                 missing.append(name)
@@ -1113,6 +1137,7 @@ class WeightSyncExtension:
             args_list = list(args)
             args_list[6] = device_index
             src_tensor = func(*args_list)
+            recv_l2_sq.add_(_tensor_l2_sq(src_tensor))
             model.load_weights([(name, src_tensor)])
             loaded += 1
 
@@ -1125,10 +1150,16 @@ class WeightSyncExtension:
             )
 
         torch.cuda.synchronize()
-        return self._build_result(start, mem_before, "cuda_ipc", loaded)
+        result = self._build_result(start, mem_before, "cuda_ipc", loaded)
+        result["recv_l2_sq"] = recv_l2_sq.item()
+        return result
 
     def load_weights_cuda_ipc_chunk(self, ipc_payload: dict, validate_names=None) -> dict:
-        """Load one CUDA IPC chunk. Validate the full name set only on the last chunk."""
+        """Load one CUDA IPC chunk. Validate the full name set only on the last chunk.
+
+        ``recv_l2_sq`` covers this chunk only. The caller streaming the chunks
+        adds them up into the sync's total.
+        """
         import base64
         import pickle
 
@@ -1143,6 +1174,7 @@ class WeightSyncExtension:
 
         loaded = 0
         missing = []
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, handle_dict in zip(names, handles_list):
             if physical_gpu_id not in handle_dict:
                 missing.append(name)
@@ -1151,6 +1183,7 @@ class WeightSyncExtension:
             args_list = list(args)
             args_list[6] = device_index
             src_tensor = func(*args_list)
+            recv_l2_sq.add_(_tensor_l2_sq(src_tensor))
             model.load_weights([(name, src_tensor)])
             loaded += 1
 
@@ -1163,7 +1196,12 @@ class WeightSyncExtension:
             self._validate_weight_sync_names(model, validate_names, context="cuda_ipc_stream")
 
         torch.cuda.synchronize()
-        return {"loaded": loaded, "names": names, "elapsed_s": time.time() - start}
+        return {
+            "loaded": loaded,
+            "names": names,
+            "elapsed_s": time.time() - start,
+            "recv_l2_sq": recv_l2_sq.item(),
+        }
 
     def load_weights_from_shm_path(self, path: str) -> dict:
         """Load weights from a shared-memory file path."""
@@ -1171,6 +1209,7 @@ class WeightSyncExtension:
         return self._load_cpu_weights_into_model(weights)
 
     def _load_cpu_weights_into_model(self, weights: list) -> dict:
+        """``recv_l2_sq`` squares each full tensor on the GPU, before ``model.load_weights``."""
         start = time.time()
         model = self.model_runner.model
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -1179,15 +1218,24 @@ class WeightSyncExtension:
         self._offloaded_state = {}
 
         loaded = 0
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, cpu_tensor in weights:
-            model.load_weights([(name, cpu_tensor.to(self.device))])
+            tensor = cpu_tensor.to(self.device)
+            recv_l2_sq.add_(_tensor_l2_sq(tensor))
+            model.load_weights([(name, tensor)])
             loaded += 1
 
         torch.cuda.synchronize()
-        return self._build_result(start, mem_before, "cpu_to_gpu", loaded)
+        result = self._build_result(start, mem_before, "cpu_to_gpu", loaded)
+        result["recv_l2_sq"] = recv_l2_sq.item()
+        return result
 
     def compute_weight_norm(self) -> dict:
-        """Partial sum of squares of this TP rank's live parameters.
+        """Partial sum of squares of this TP rank's live parameters (debug only).
+
+        Weight-sync correctness is the transport checksum (``recv_l2_sq`` against
+        the trainer's ``sent_l2_sq``), which squares the full tensors before vLLM
+        shards them. This walk is what vLLM holds after placement.
 
         ``tp_size`` rides along so the caller that adds these up can tell whether the
         total is a whole model. A rank's parameters carry no usable mark of whether
@@ -1198,6 +1246,16 @@ class WeightSyncExtension:
         """
         from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
+        quantization = self.model_config.quantization
+        if quantization:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    f"weight norm is not defined for a {quantization}-quantized sampler: its "
+                    "packed weights and scales do not square to the trainer's weights"
+                ),
+                "disable": True,
+            }
         model = self.model_runner.model
         sq_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         num_params = 0
