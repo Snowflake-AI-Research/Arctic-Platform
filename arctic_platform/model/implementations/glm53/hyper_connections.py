@@ -28,9 +28,9 @@ streams once per direction:
 
 A fourth kernel, ``hc_gates``, turns each token's ``(2 + hc) * hc`` logits into ``pre``, ``post`` and
 the Sinkhorn-normalized ``comb``; the reference spends ~80 small kernels on that per site. Its
-backward recomputes the Sinkhorn iterates in registers instead of saving them. Gradients reach the
-streams and the sublayer output, not ``fn``/``base``/``scale``, so this path is only taken when
-those are frozen, as under LoRA.
+backward recomputes the Sinkhorn iterates in registers instead of saving them. When ``fn``/``base``/``scale``
+train (full fine-tuning), their gradients come from the same backward: ``fn``'s as ``(dL * r)^T X`` in FP32
+row chunks, ``base``'s and ``scale``'s from the gates' pre-scale logit gradient.
 """
 
 from __future__ import annotations
@@ -110,8 +110,12 @@ def _hc_logits_bwd_kernel(
     tl.store(dx_ptr + offset, (a[:, None] * g - b[:, None] * x).to(dx_ptr.dtype.element_ty), mask=mask)
 
 
+_FN_GRAD_ROWS = 2048  # rows of x upcast to FP32 at a time for fn's gradient
+
+
 class _HcLogitsFn(torch.autograd.Function):
-    """``F.linear(x * rsqrt(mean(x^2) + eps), fn)`` over flattened streams ``[T, K]``; gradients reach ``x``."""
+    """``F.linear(x * rsqrt(mean(x^2) + eps), fn)`` over flattened streams ``[T, K]``; gradients reach ``x`` and,
+    when it trains, ``fn``."""
 
     @staticmethod
     def forward(ctx, x: Tensor, fn: Tensor, eps: float) -> Tensor:
@@ -149,7 +153,15 @@ class _HcLogitsFn(torch.autograd.Function):
             _LOGIT_BWD_ROWS,
             _LOGIT_BWD_COLS,
         )
-        return dx, None, None
+        dfn = None
+        if ctx.needs_input_grad[1]:
+            scaled = grad * r[:, None]
+            dfn = torch.zeros(M, K, dtype=torch.float32, device=x.device)
+            for start in range(0, T, _FN_GRAD_ROWS):
+                end = min(start + _FN_GRAD_ROWS, T)
+                dfn.addmm_(scaled[start:end].t(), x[start:end].float())
+            dfn = dfn.to(fn.dtype)
+        return dx, dfn, None
 
 
 @triton.jit
@@ -417,9 +429,10 @@ def _hc_gates_bwd_kernel(
     sig_post = tl.sigmoid(post)
     dpre = tl.load(dpre_ptr + rows[:, None] * 4 + h[None, :], mask=mask[:, None], other=0.0)
     dpost = tl.load(dpost_ptr + rows[:, None] * 4 + h[None, :], mask=mask[:, None], other=0.0)
+    # The gradients of the scaled, biased logits; the caller applies ``scale`` (and reduces ``base`` / ``scale``).
     out = dlogits_ptr + rows[:, None] * 24 + h[None, :]
-    tl.store(out, dpre * sig_pre * (1 - sig_pre) * tl.load(scale_ptr), mask=mask[:, None])
-    tl.store(out + 4, dpost * 2 * sig_post * (1 - sig_post) * tl.load(scale_ptr + 1), mask=mask[:, None])
+    tl.store(out, dpre * sig_pre * (1 - sig_pre), mask=mask[:, None])
+    tl.store(out + 4, dpost * 2 * sig_post * (1 - sig_post), mask=mask[:, None])
 
     p = _hc_softmax(comb)
     x0 = p + eps
@@ -437,13 +450,12 @@ def _hc_gates_bwd_kernel(
         gy = g * (x / s)
         g = (g - tl.where(is_row, tl.sum(gy, axis=2)[:, :, None], tl.sum(gy, axis=1)[:, None, :])) / s
     dz = p * (g - tl.sum(g * p, axis=2)[:, :, None])
-    tl.store(
-        dlogits_ptr + rows[:, None, None] * 24 + 8 + cell[None], dz * tl.load(scale_ptr + 2), mask=mask[:, None, None]
-    )
+    tl.store(dlogits_ptr + rows[:, None, None] * 24 + 8 + cell[None], dz, mask=mask[:, None, None])
 
 
 class _HcGatesFn(torch.autograd.Function):
-    """``(pre, post, comb)`` of a four-stream site from its ``[T, 24]`` FP32 logits; gradients reach the logits."""
+    """``(pre, post, comb)`` of a four-stream site from its ``[T, 24]`` FP32 logits; gradients reach the logits and,
+    when they train, ``base`` and ``scale``."""
 
     @staticmethod
     def forward(ctx, logits: Tensor, base: Tensor, scale: Tensor, eps: float, iters: int):
@@ -465,11 +477,19 @@ class _HcGatesFn(torch.autograd.Function):
         dpre = torch.zeros(T, 4, device=logits.device) if dpre is None else dpre.float().contiguous()
         dpost = torch.zeros(T, 4, device=logits.device) if dpost is None else dpost.float().contiguous()
         dcomb = torch.zeros(T, 4, 4, device=logits.device) if dcomb is None else dcomb.float().contiguous()
-        dlogits = torch.empty_like(logits)
+        dz = torch.empty_like(logits)
         _hc_gates_bwd_kernel[(triton.cdiv(T, _GATE_ROWS),)](
-            logits, base, scale, dpre, dpost, dcomb, dlogits, T, ctx.eps, ctx.iters, _GATE_ROWS
+            logits, base, scale, dpre, dpost, dcomb, dz, T, ctx.eps, ctx.iters, _GATE_ROWS
         )
-        return dlogits, None, None, None, None
+        flat_scale = scale.reshape(-1)
+        groups = (slice(0, 4), slice(4, 8), slice(8, 24))
+        per_logit = torch.cat([flat_scale[i].expand(g.stop - g.start) for i, g in enumerate(groups)])
+        dlogits = dz * per_logit
+        dbase = dz.sum(0).reshape(base.shape).to(base.dtype) if ctx.needs_input_grad[1] else None
+        dscale = None
+        if ctx.needs_input_grad[2]:
+            dscale = torch.stack([(dz[:, g] * logits[:, g]).sum() for g in groups]).reshape(scale.shape).to(scale.dtype)
+        return dlogits, dbase, dscale, None, None
 
 
 class _HcMixFn(torch.autograd.Function):
@@ -498,8 +518,8 @@ class _HcMixFn(torch.autograd.Function):
 
 
 def fused_hyper_connection_applies(hc: nn.Module, streams: Tensor) -> bool:
-    """CUDA streams, GLM-5.3-Flash's four streams, and frozen ``fn``/``base``/``scale``."""
-    return streams.is_cuda and hc.hc_mult == 4 and not any(p.requires_grad for p in (hc.fn, hc.base, hc.scale))
+    """CUDA streams and GLM-5.3-Flash's four streams; ``fn``/``base``/``scale`` may be frozen or train."""
+    return streams.is_cuda and hc.hc_mult == 4
 
 
 def hyper_connection(hc: nn.Module, streams: Tensor) -> tuple[Tensor, Tensor, Tensor]:
