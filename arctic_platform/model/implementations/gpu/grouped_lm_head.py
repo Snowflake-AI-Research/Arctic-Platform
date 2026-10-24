@@ -146,7 +146,8 @@ class GroupedLogProbAccumulator:
         self.tail_logits[rows] = torch.logaddexp(self.tail_logits[rows], scaled_logits.logsumexp(-1))
 
     def normalized_log_probs(self) -> torch.Tensor:
-        # Count repeated candidates once when normalizing the vocabulary distribution.
+        # (bucket - peak) - softplus(logsumexp(others - peak)) keeps a near-certain bucket's tiny log-probability,
+        # which groups - logz rounds to exactly 0 in float32. A repeated candidate token counts once.
         ids = torch.cat([self.token_ids, self.token_ids.new_full((len(self.token_ids), 1), -2)], -1)
         sorted_ids, order = ids.sort(-1)
         repeated = sorted_ids[:, 1:] == sorted_ids[:, :-1]
@@ -154,7 +155,6 @@ class GroupedLogProbAccumulator:
         unique = self.groups.masked_fill(torch.empty_like(repeated).scatter_(-1, order, repeated), float("-inf"))
         peak, index = unique.max(-1, keepdim=True)
         others = (unique - peak).scatter_(-1, index, float("-inf")).logsumexp(-1, keepdim=True)
-        # Keep the near-certain bucket's small correction separate from the common offset.
         return (self.groups - peak) - torch.nn.functional.softplus(others)
 
     def combine_output_gradients(
