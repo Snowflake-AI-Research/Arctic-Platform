@@ -30,6 +30,7 @@ from typing import Union
 import ray
 import torch
 from ray.util.placement_group import placement_group
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoTokenizer
 
@@ -143,16 +144,34 @@ def create_arctic_rl_ray_server_state(**kwargs):
         env_port = os.environ.get("MASTER_PORT")
         kwargs["ds_master_port"] = int(env_port) if env_port else None
     sched_pg = placement_group([{"GPU": 0, "CPU": 1}])
-    return ray.remote(
-        num_cpus=0,
-        num_gpus=0,
-        scheduling_strategy=PlacementGroupSchedulingStrategy(
-            placement_group=sched_pg,
-            # Must be False: InferenceWorker / DeepSpeed actors need real GPU
-            # bundles; inheriting this CPU-only PG would raise ValueError at spawn.
-            placement_group_capture_child_tasks=False,
-        ),
-    )(ArcticRLRayServerState).remote(**kwargs)
+    kwargs["_server_placement_group"] = sched_pg
+    state = None
+    try:
+        state = ray.remote(
+            num_cpus=0,
+            num_gpus=0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=sched_pg,
+                # Must be False: InferenceWorker / DeepSpeed actors need real GPU
+                # bundles; inheriting this CPU-only PG would raise ValueError at spawn.
+                placement_group_capture_child_tasks=False,
+            ),
+        )(ArcticRLRayServerState).remote(**kwargs)
+        # Actor construction is asynchronous. Surface __init__ failures while
+        # the driver still has the scheduler PG handle needed to clean up.
+        ray.get(state.__ray_ready__.remote())
+        return state
+    except BaseException:
+        if state is not None:
+            try:
+                ray.kill(state)
+            except Exception:
+                logger.warning("Failed to kill partially constructed Ray server state", exc_info=True)
+        try:
+            remove_placement_group(sched_pg)
+        except Exception:
+            logger.warning("Failed to remove partial Ray server placement group", exc_info=True)
+        raise
 
 
 # TODO: add remote decorator
@@ -165,6 +184,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         log_prob_engine: str,
         colocate: bool,
         ds_master_port: int | None = None,
+        _server_placement_group: Any | None = None,
     ):
         total_gpus = training_gpus + sampling_gpus + log_prob_gpus
         if total_gpus == 0:
@@ -188,6 +208,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
         self.colocate = colocate
         # Driver-captured DeepSpeed rendezvous port (see create_arctic_rl_ray_server_state).
         self.ds_master_port = ds_master_port
+        self._server_placement_group = _server_placement_group
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
 
         # In colocated mode, create one STRICT_PACK placement group per Ray
         # node so each TP=tp group is guaranteed to live on a single physical
@@ -258,6 +281,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
 
     async def get_weight_sync_bucket_size(self) -> int:
         return self.weight_sync_bucket_size
+
+    async def get_server_placement_group(self):
+        """Return the CPU placement group that owns this state actor."""
+        return self._server_placement_group
 
     async def get_colocate(self) -> bool:
         return self.colocate
@@ -541,25 +568,116 @@ class ArcticRLRayServerState(ArcticRLServerState):
             raise ValueError(f"Job {job_id} not found")
 
         if info["job_type"] == "training":
-            await asyncio.gather(*[w.destroy.remote() for w in self.training_workers])
-            # refs = [w.destroy.remote() for w in self.training_workers]
-            # _ = ray.get(refs)
-            self.training_workers.clear()
+            await self._destroy_deepspeed_workers(self.training_workers)
         elif info["job_type"] == "sampling":
             await self.sampling_pool.shutdown()
-            # asyncio.run(self.sampling_pool.shutdown())
         elif info["job_type"] == "log_prob":
             if info.get("engine") == "deepspeed":
-                await asyncio.gather(*[w.destroy.remote() for w in self.log_prob_workers])
-                # refs = [w.destroy.remote() for w in self.log_prob_workers]
-                # _ = ray.get(refs)
-                self.log_prob_workers.clear()
+                await self._destroy_deepspeed_workers(self.log_prob_workers)
                 self.log_prob_tokenizer = None
             else:
                 await self.log_prob_pool.shutdown()
-                # asyncio.run(self.log_prob_pool.shutdown())
 
         return {"job_id": job_id}
+
+    async def _destroy_deepspeed_workers(self, workers: list[Any]) -> None:
+        """Gracefully release process groups, then terminate every Ray actor."""
+        owned = list(workers)
+        try:
+            if owned:
+                timeout_s = float(os.environ.get("ARCTIC_DEEPSPEED_WORKER_SHUTDOWN_TIMEOUT_S", "30"))
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(
+                            *[worker.destroy.remote() for worker in owned],
+                            return_exceptions=True,
+                        ),
+                        timeout=timeout_s,
+                    )
+                    failures = [result for result in results if isinstance(result, BaseException)]
+                    if failures:
+                        logger.warning("DeepSpeed worker destroy failed: %s", failures)
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out after %.3fs gracefully shutting down %d DeepSpeed worker(s)",
+                        timeout_s,
+                        len(owned),
+                    )
+        finally:
+            for worker in owned:
+                try:
+                    ray.kill(worker)
+                except Exception:
+                    logger.warning("Failed to kill DeepSpeed worker", exc_info=True)
+            workers.clear()
+
+    async def _shutdown_pool_if_initialized(self, pool: ReplicaPool | None) -> None:
+        # ReplicaPool has no public initialized predicate. Throughout this
+        # server module, _config is its established lifecycle contract:
+        # initialize sets it first and shutdown resets it to None.
+        if pool is not None and pool._config is not None:
+            await pool.shutdown()
+
+    def _remove_colocate_placement_groups(self) -> None:
+        placement = getattr(self, "placement", ColocatePlacement())
+        groups = list(placement.placement_groups)
+        try:
+            for group in groups:
+                try:
+                    remove_placement_group(group)
+                except Exception:
+                    logger.warning("Failed to remove colocated placement group", exc_info=True)
+        finally:
+            # Clear both the canonical owner and legacy compatibility aliases.
+            # Repeated shutdown must not attempt removal again.
+            self.placement = ColocatePlacement()
+            self.placement_groups = []
+            self.gpus_per_node = 0
+            self.n_bundles = 0
+            self.placement_group = None
+
+    async def shutdown(self) -> dict[str, Any]:
+        """Release all workers and colocated placement groups owned by this state."""
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return {"shutdown": True, "failures": 0}
+
+            failures: list[BaseException] = []
+            try:
+                # Failed client initialization may have registered only a
+                # prefix of its jobs. Destroy every registered job first.
+                for job_id, info in list(self.jobs.items()):
+                    try:
+                        await self.destroy(job_id, info["job_type"])
+                    except BaseException as exc:
+                        failures.append(exc)
+
+                # Also cover partial initialization or destroy() having popped
+                # a job before one of its cleanup operations failed.
+                for workers in (self.training_workers, self.log_prob_workers):
+                    try:
+                        await self._destroy_deepspeed_workers(workers)
+                    except BaseException as exc:
+                        failures.append(exc)
+                self.log_prob_tokenizer = None
+
+                for pool in (self.sampling_pool, self.log_prob_pool):
+                    try:
+                        await self._shutdown_pool_if_initialized(pool)
+                    except BaseException as exc:
+                        failures.append(exc)
+            finally:
+                self.jobs.clear()
+                self._remove_colocate_placement_groups()
+                self._shutdown_complete = True
+
+            if failures:
+                logger.warning(
+                    "Ray server state shutdown completed with %d failure(s): %s",
+                    len(failures),
+                    failures,
+                )
+            return {"shutdown": True, "failures": len(failures)}
 
 
 class ArcticRLRayServer:
@@ -637,6 +755,10 @@ class ArcticRLRayServer:
         self.sampling_pool = ray.get(arctic_rl_ray_server_state.get_sampling_pool.remote())  # type: ignore
         self.log_prob_pool = ray.get(arctic_rl_ray_server_state.get_log_prob_pool.remote())  # type: ignore
         self.colocate = ray.get(arctic_rl_ray_server_state.get_colocate.remote())  # type: ignore
+        self._server_placement_group = ray.get(
+            arctic_rl_ray_server_state.get_server_placement_group.remote()  # type: ignore
+        )
+        self._shutdown_complete = False
         # Serializes every RPC that drives ``training_workers``. Awaiting ObjectRefs
         # (instead of blocking ``ray.get``) lets the transport loop keep serving
         # generation, so two ops could otherwise overlap a DP collective.
@@ -767,6 +889,27 @@ class ArcticRLRayServer:
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+
+    async def shutdown(self) -> None:
+        """Release state-owned resources, then terminate the state actor."""
+        if self._shutdown_complete:
+            return
+        try:
+            # Ray ObjectRefs are awaitable; keeping this asynchronous avoids
+            # blocking the driver's transport loop during state cleanup.
+            await self.arctic_rl_ray_server_state.shutdown.remote()
+        finally:
+            try:
+                ray.kill(self.arctic_rl_ray_server_state)
+            except Exception:
+                logger.warning("Failed to kill ArcticRLRayServerState", exc_info=True)
+            if self._server_placement_group is not None:
+                try:
+                    remove_placement_group(self._server_placement_group)
+                except Exception:
+                    logger.warning("Failed to remove Ray server placement group", exc_info=True)
+                self._server_placement_group = None
+            self._shutdown_complete = True
 
     async def forward_backward(self, job_id: int, batch: dict) -> dict[str, Any]:
         from arctic_platform.rl.processors import prepare_request_loss
@@ -1240,25 +1383,14 @@ class ArcticRLRayServer:
         logger.warning("weight norm unavailable: %s", reason)
         return {"error_code": "weight_norm_unavailable", "error": reason}
 
-    async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
-        """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+    async def _weight_norm_sample_and_train(self) -> dict[str, Any]:
+        """One sampling + training norm read. Terminal outcomes carry ``error_code``; see ``weight_norm``.
 
-        A debug check only: ``weight_sync``'s ``checksum_match`` is what verifies a sync. The sampling side walks
-        vLLM's live parameters, which is exact only at ``tensor_parallel_size=1`` and for unquantized engines. A
-        structural refusal or a mismatch beyond ``_WEIGHT_NORM_RTOL`` disables the check on this client and returns
-        ``{error_code, error}`` with no norm fields. A later call on this client returns that result and does not
-        touch the workers. A sleeping sampler or a raised worker error is temporary: it returns the same shape and
-        the next call tries again. Every training rank joins the ZeRO-3 gather; reading only rank 0 would leave the
-        others blocked inside ``GatheredParameters``. A cancelled call still latches the training failure. A bad job
-        id, or a call after training has already failed, does not disable the check.
+        The sampling read runs outside ``_training_op_lock`` (a sleeping sampler must not block other training
+        RPCs), and the training read takes the lock only for its own gather. The two reads are therefore not
+        atomic with a concurrent ``weight_sync`` or training step; ``weight_norm`` retries once before treating a
+        divergence between them as real.
         """
-        if self._weight_norm_disabled is not None:
-            return {"error_code": "weight_norm_unavailable", "error": self._weight_norm_disabled}
-        try:
-            self._verify_job(training_job_id, "training")
-            self._verify_job(sampling_job_id, "sampling")
-        except Exception as exc:
-            return self._weight_norm_error(f"{type(exc).__name__}: {exc}")
         pool = self.sampling_pool
         if getattr(pool, "tp_size", 1) > 1:
             return self._disable_weight_norm(
@@ -1266,9 +1398,7 @@ class ArcticRLRayServer:
                 f"engine runs tensor_parallel_size={pool.tp_size}"
             )
         try:
-            sampling = (
-                await self._await_sampling_refs(lambda: [pool._workers[0].compute_weight_norm.remote()])
-            )[0]
+            sampling = (await self._await_sampling_refs(lambda: [pool._workers[0].compute_weight_norm.remote()]))[0]
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1291,19 +1421,48 @@ class ArcticRLRayServer:
         if not training_results or "norm" not in training_results[0]:
             return self._weight_norm_error("weight norm returned no norm")
         training = training_results[0]
-        training_norm = training["norm"]
-        sampling_norm = sampling["norm"]
-        if not _weight_norms_agree(training_norm, sampling_norm):
-            rel = abs(training_norm - sampling_norm) / max(abs(training_norm), abs(sampling_norm), 1e-30)
-            return self._disable_weight_norm(
-                f"weight norms diverge training={training_norm} sampling={sampling_norm} rel={rel:.2e}"
-            )
         return {
-            "training_norm": training_norm,
-            "sampling_norm": sampling_norm,
+            "training_norm": training["norm"],
+            "sampling_norm": sampling["norm"],
             "training_num_params": training["num_params"],
             "sampling_num_params": sampling["num_params"],
         }
+
+    async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
+        """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+        A debug check only: ``weight_sync``'s ``checksum_match`` is what verifies a sync. The sampling side walks
+        vLLM's live parameters, which is exact only at ``tensor_parallel_size=1`` and for unquantized engines. A
+        structural refusal, or a mismatch beyond ``_WEIGHT_NORM_RTOL`` that survives one retry (see
+        ``_weight_norm_sample_and_train``), disables the check on this client and returns ``{error_code, error}``
+        with no norm fields. A later call on this client returns that result and does not touch the workers. A
+        sleeping sampler or a raised worker error is temporary: it returns the same shape and the next call tries
+        again. Every training rank joins the ZeRO-3 gather; reading only rank 0 would leave the others blocked
+        inside ``GatheredParameters``. A cancelled call still latches the training failure. A bad job id, or a call
+        after training has already failed, does not disable the check.
+        """
+        if self._weight_norm_disabled is not None:
+            return {"error_code": "weight_norm_unavailable", "error": self._weight_norm_disabled}
+        try:
+            self._verify_job(training_job_id, "training")
+            self._verify_job(sampling_job_id, "sampling")
+        except Exception as exc:
+            return self._weight_norm_error(f"{type(exc).__name__}: {exc}")
+
+        result = await self._weight_norm_sample_and_train()
+        if "error_code" in result or _weight_norms_agree(result["training_norm"], result["sampling_norm"]):
+            return result
+
+        # A step or sync landing between the two (non-atomic) reads above can make them
+        # diverge even though the engines agree. Re-read both before disabling the check.
+        result = await self._weight_norm_sample_and_train()
+        if "error_code" in result or _weight_norms_agree(result["training_norm"], result["sampling_norm"]):
+            return result
+        training_norm, sampling_norm = result["training_norm"], result["sampling_norm"]
+        rel = abs(training_norm - sampling_norm) / max(abs(training_norm), abs(sampling_norm), 1e-30)
+        return self._disable_weight_norm(
+            f"weight norms diverge training={training_norm} sampling={sampling_norm} rel={rel:.2e}"
+        )
 
     async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
         """Colocated weight sync via CUDA IPC (zero-copy, same GPU)."""
