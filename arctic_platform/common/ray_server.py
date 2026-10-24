@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import time
 from typing import TYPE_CHECKING
@@ -118,6 +119,14 @@ else:
 # 29600, where a SIGKILL-reaped sender from a prior job can still squat the port and deadlock the next sync.
 _WEIGHT_SYNC_BASE_PORT = int(os.environ.get("ARL_WEIGHT_SYNC_PORT", 29600))
 _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
+# Debug-only comparison of the two engines' live-parameter norms. The transport checksum is what proves a sync.
+_WEIGHT_NORM_RTOL = 1e-3
+
+
+def _weight_norms_agree(training: float, sampling: float) -> bool:
+    if not (math.isfinite(training) and math.isfinite(sampling) and training > 0 and sampling > 0):
+        return False
+    return abs(training - sampling) / max(training, sampling) <= _WEIGHT_NORM_RTOL
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +648,8 @@ class ArcticRLRayServer:
         self._training_op_lock = asyncio.Lock()
         self._training_failed = False
         self._training_failure: BaseException | None = None
+        # Set to the reason ``weight_norm`` stopped. A later call returns that reason and does not touch the workers.
+        self._weight_norm_disabled: str | None = None
 
     def _raise_if_training_failed(self) -> None:
         if self._training_failed:
@@ -1101,6 +1112,13 @@ class ArcticRLRayServer:
         Uses NCCL for non-colocated mode (separate GPUs).  In colocated mode:
         - cuda_ipc=True: CUDA IPC (zero-copy, requires training weights on GPU)
         - cuda_ipc=False: CPU file path (slower, works when offloaded)
+
+        The result proves the sync: ``sent_l2_sq`` is the sum of squares of the full tensors the trainer shipped,
+        ``recv_l2_sq`` maps every sampler TP rank to the sum of squares of the full tensors it received (before vLLM
+        shards, fuses or quantizes them), and ``checksum_match`` says whether all of them agree within
+        ``checksum_rtol`` (see ``WEIGHT_CHECKSUM_RTOL``). A mismatch or a missing value is reported with
+        ``checksum_error`` and logged, not raised: the sampler has already been written by then, so raising cannot
+        restore its weights, and the caller decides whether a wrong-weights sampler should stop the run.
         """
         request = WeightSyncRequest(**body)
         training_job_id = request.source_sub_job_id
@@ -1140,6 +1158,12 @@ class ArcticRLRayServer:
 
         await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(sampling_job_id)
 
+        if results.get("checksum_match") is not True:
+            logger.warning(
+                "Weight sync from training job %s did not prove delivery: %s",
+                training_job_id,
+                results.get("checksum_error", "no checksum reported"),
+            )
         return {"job_id": training_job_id, **results}
 
         # schedule = TransferSchedule.build(
@@ -1206,23 +1230,77 @@ class ArcticRLRayServer:
         # logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         # return {"status": "ok"}
 
+    def _disable_weight_norm(self, reason: str) -> dict[str, str]:
+        """Turn the debug check off for the rest of the run and report why."""
+        self._weight_norm_disabled = reason
+        logger.warning("disabling weight_norm: %s", reason)
+        return {"error_code": "weight_norm_unavailable", "error": reason}
+
+    def _weight_norm_error(self, reason: str) -> dict[str, str]:
+        logger.warning("weight norm unavailable: %s", reason)
+        return {"error_code": "weight_norm_unavailable", "error": reason}
+
     async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
         """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
 
-        Both are computed as sqrt of the sum of squares over all params, which is invariant to how each engine shards
-        / fuses its parameters -- so after a weight sync the two values must match. Used by tests to verify sync
-        correctness.
+        A debug check only: ``weight_sync``'s ``checksum_match`` is what verifies a sync. The sampling side walks
+        vLLM's live parameters, which is exact only at ``tensor_parallel_size=1`` and for unquantized engines. A
+        structural refusal or a mismatch beyond ``_WEIGHT_NORM_RTOL`` disables the check on this client and returns
+        ``{error_code, error}`` with no norm fields. A later call on this client returns that result and does not
+        touch the workers. A sleeping sampler or a raised worker error is temporary: it returns the same shape and
+        the next call tries again. Every training rank joins the ZeRO-3 gather; reading only rank 0 would leave the
+        others blocked inside ``GatheredParameters``. A cancelled call still latches the training failure. A bad job
+        id, or a call after training has already failed, does not disable the check.
         """
-        self._verify_job(training_job_id, "training")
-        self._verify_job(sampling_job_id, "sampling")
-        async with self._training_op_lock:
-            training = (await self._await_training_refs(lambda: [self.training_workers[0].weight_norm.remote()]))[0]
+        if self._weight_norm_disabled is not None:
+            return {"error_code": "weight_norm_unavailable", "error": self._weight_norm_disabled}
+        try:
+            self._verify_job(training_job_id, "training")
+            self._verify_job(sampling_job_id, "sampling")
+        except Exception as exc:
+            return self._weight_norm_error(f"{type(exc).__name__}: {exc}")
+        pool = self.sampling_pool
+        if getattr(pool, "tp_size", 1) > 1:
+            return self._disable_weight_norm(
+                "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                f"engine runs tensor_parallel_size={pool.tp_size}"
+            )
+        try:
             sampling = (
-                await self._await_sampling_refs(lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()])
+                await self._await_sampling_refs(lambda: [pool._workers[0].compute_weight_norm.remote()])
             )[0]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return self._weight_norm_error(f"{type(exc).__name__}: {exc}")
+        if sampling.get("disable"):
+            reason = sampling.get("error") or sampling.get("error_code") or "weight norm returned no norm"
+            return self._disable_weight_norm(str(reason))
+        if sampling.get("error_code") or "norm" not in sampling:
+            reason = sampling.get("error") or sampling.get("error_code") or "weight norm returned no norm"
+            return self._weight_norm_error(str(reason))
+        try:
+            async with self._training_op_lock:
+                training_results = await self._await_training_refs(
+                    lambda: [worker.weight_norm.remote() for worker in self.training_workers]
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return self._weight_norm_error(f"{type(exc).__name__}: {exc}")
+        if not training_results or "norm" not in training_results[0]:
+            return self._weight_norm_error("weight norm returned no norm")
+        training = training_results[0]
+        training_norm = training["norm"]
+        sampling_norm = sampling["norm"]
+        if not _weight_norms_agree(training_norm, sampling_norm):
+            rel = abs(training_norm - sampling_norm) / max(abs(training_norm), abs(sampling_norm), 1e-30)
+            return self._disable_weight_norm(
+                f"weight norms diverge training={training_norm} sampling={sampling_norm} rel={rel:.2e}"
+            )
         return {
-            "training_norm": training["norm"],
-            "sampling_norm": sampling["norm"],
+            "training_norm": training_norm,
+            "sampling_norm": sampling_norm,
             "training_num_params": training["num_params"],
             "sampling_num_params": sampling["num_params"],
         }
@@ -1343,14 +1421,25 @@ class ArcticRLRayServer:
                     except (asyncio.CancelledError, Exception):
                         pass
                 raise sampling_error
-            await training_await
-            await sampling_await
+            send_results = await training_await
+            (pool_response,) = await sampling_await
         finally:
             for pending_await in (training_await, sampling_await):
                 if not pending_await.done():
                     pending_await.cancel()
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
-        return {"status": "ok"}
+        from arctic_platform.common.utils.weight_sync import received_checksums
+        from arctic_platform.common.weight_checksum import compare_weight_checksums
+
+        workers_results = pool_response.get("workers", [])
+        checksum = compare_weight_checksums(
+            {
+                f"training rank {g.sender_train_rank}": r.get("sent_l2_sq")
+                for g, r in zip(schedule.groups, send_results)
+            },
+            received_checksums([f"sampling replica {i}" for i in range(len(workers_results))], workers_results),
+        )
+        return {"status": "ok", **checksum}
 
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         self._verify_job(job_id, "log_prob")
