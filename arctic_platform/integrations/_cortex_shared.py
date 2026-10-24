@@ -77,11 +77,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         input_ids = tensors["input_ids"]
 
     kwargs = {key: value for key, value in tensors.items() if torch.is_tensor(value)}
-    context = {
-        key: value
-        for key, value in meta.items()
-        if key != "dp_size" and not torch.is_tensor(value)
-    }
+    context = {key: value for key, value in meta.items() if key != "dp_size" and not torch.is_tensor(value)}
     context["input_ids"] = input_ids
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
@@ -139,6 +135,22 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     )
 
 
+def _to_predict_next_frame(name: str, t):
+    """Move a response-aligned ``[B, S]`` tensor one column left.
+
+    Entry ``i`` scored ``input_ids[i]``; afterwards it weights the prediction
+    made at ``i``, which is of ``input_ids[i + 1]``. The last column predicts
+    past the row (DSS wraps it to the row's first token), so it is cleared.
+    """
+    import torch
+
+    if not torch.is_tensor(t) or t.dim() != 2:
+        raise ValueError(f"cortex fwd_bwd needs {name!r} as a [B, S] tensor to shift it into the predict-next frame")
+    out = torch.zeros_like(t)
+    out[:, :-1] = t[:, 1:]
+    return out
+
+
 def _missing_zorro_meta_keys(meta: dict) -> list[str]:
     """Keys the worker indexes directly once ZoRRo is on.
 
@@ -156,6 +168,7 @@ def to_cortex_fwd_bwd_payload(
     *,
     processing: dict | None = None,
     old_log_probs_shifted: torch.Tensor | None = None,
+    response_aligned: bool = False,
 ) -> dict:
     """Reshape a SkyRL fwd_bwd payload into Cortex's wire shape.
 
@@ -174,6 +187,14 @@ def to_cortex_fwd_bwd_payload(
     layout: left-aligning them moves response tokens into ``[:, max_prompt_len]``.
     That path keeps ``old_log_probs`` so the snapshot from ``fwd_no_grad`` is
     the ratio's π_old.
+
+    ``response_aligned`` says ``loss_mask`` and ``advantages`` sit on the token
+    they score (SkyRL and verl), while Cortex weights position ``i`` by its
+    prediction of token ``i + 1``. Non-ZoRRo rows are then shifted one column
+    after left alignment, because the frame is defined on the rows Cortex
+    receives. ZoRRo is never shifted: its patched forward returns one log-prob
+    per response token. ``old_log_probs_shifted`` is already in the Cortex
+    frame and is never shifted.
     """
     import torch
 
@@ -228,6 +249,9 @@ def to_cortex_fwd_bwd_payload(
     if old_log_probs_shifted is not None:
         scored["old_log_probs_shifted"] = old_log_probs_shifted.to(torch.float32)
     forwarded, scored, attention_mask = _left_align_batch(forwarded, attention_mask, scored)
+    if response_aligned:
+        for key in ("loss_mask", "advantages"):
+            scored[key] = _to_predict_next_frame(key, scored[key])
     input_ids = forwarded["input_ids"]
     context: dict[str, Any] = {
         "input_ids": input_ids,

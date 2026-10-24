@@ -166,7 +166,10 @@ class _CortexClientShim:
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
         processing = legacy_kwargs.pop("processing", None)
         legacy_kwargs.pop("router_replay", None)
-        return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
+        # SkyRL places loss_mask and advantages on the token they score.
+        return await self._client.fwd_bwd(
+            to_cortex_fwd_bwd_payload(batch, processing=processing, response_aligned=True)
+        )
 
     async def fwd_no_grad(self, batch: dict, **kwargs: Any) -> dict:
         # A reference model would need the log-prob sub-job. Zeros there would

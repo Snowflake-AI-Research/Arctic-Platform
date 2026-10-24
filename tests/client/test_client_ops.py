@@ -38,10 +38,10 @@ from pydantic import ValidationError
 from arctic_platform.client import OPS
 from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
-from arctic_platform.client import AsyncArcticClient
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import AsyncArcticClient
 from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
@@ -1148,7 +1148,6 @@ class TestCortexSharedHelper:
                 },
             )
 
-
     def test_non_zorro_forward_left_aligns_leading_pads(self):
         import torch
 
@@ -1197,6 +1196,134 @@ class TestCortexSharedHelper:
         assert out["context"]["max_prompt_len"] == 3
         assert out["context"]["pad_token_id"] == 151643
         assert out["context"]["temperature"] == 0.7
+
+
+class TestCortexPredictNextFrame:
+    """SkyRL scores ``input_ids[i]`` at column ``i``; Cortex weights column ``i``
+    by its prediction of ``input_ids[i + 1]`` (labels are ``roll(input_ids, -1)``)."""
+
+    @staticmethod
+    def _skyrl_batch():
+        """Three SkyRL rows, ``[pad | prompt | response | pad]`` with P=3, R=3."""
+        import torch
+
+        pad = 0
+        ids = torch.tensor(
+            [
+                [11, 12, 13, 21, 22, pad],  # p=3, r=2
+                [pad, pad, 14, 31, 32, 33],  # p=1, r=3
+                [15, 16, 17, 41, 42, 43],  # p=3, r=3, full width
+            ]
+        )
+        attn = torch.tensor([[1, 1, 1, 1, 1, 0], [0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+        loss_mask = torch.tensor([[0, 0, 0, 1, 1, 0], [0, 0, 0, 1, 1, 1], [0, 0, 0, 1, 1, 1]])
+        adv = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.4, 0.5, 0.0],
+                [0.0, 0.0, 0.0, -0.1, -0.2, -0.3],
+                [0.0, 0.0, 0.0, 0.7, 0.8, 0.9],
+            ]
+        )
+        return {"input_ids": ids, "attention_mask": attn, "loss_mask": loss_mask, "advantages": adv}
+
+    def test_skyrl_rows_are_aligned_then_shifted(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": self._skyrl_batch(), "meta": {"zorro_train_enable": False}}, response_aligned=True
+        )
+        ids = out["kwargs"]["input_ids"]
+        assert ids.tolist() == [[11, 12, 13, 21, 22, 0], [14, 31, 32, 33, 0, 0], [15, 16, 17, 41, 42, 43]]
+        loss_mask = out["context"]["loss_mask"]
+        assert loss_mask.int().tolist() == [[0, 0, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 0]]
+        assert torch.equal(
+            out["context"]["advantages"],
+            torch.tensor(
+                [[0.0, 0.0, 0.4, 0.5, 0.0, 0.0], [-0.1, -0.2, -0.3, 0.0, 0.0, 0.0], [0.0, 0.0, 0.7, 0.8, 0.9, 0.0]]
+            ),
+        )
+        # The targets Cortex scores at the active positions are exactly the responses.
+        labels = torch.roll(ids, shifts=-1, dims=-1)
+        assert [labels[row][loss_mask[row]].tolist() for row in range(3)] == [[21, 22], [31, 32, 33], [41, 42, 43]]
+        # The full-width row's last column would score its own first token (15).
+        assert labels[2, -1].item() == 15 and not loss_mask[2, -1]
+
+    def test_shift_follows_left_alignment(self):
+        """A pad gap inside a row closes up when aligned. Shifting first would
+        put the first target on the gap and drop it."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = {
+            "input_ids": torch.tensor([[5, 6, 0, 7, 8]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 1, 1]]),
+            "loss_mask": torch.tensor([[0, 0, 0, 1, 1]]),
+            "advantages": torch.tensor([[0.0, 0.0, 0.0, 2.0, 3.0]]),
+        }
+        out = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}}, response_aligned=True)
+        assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0]]
+        assert out["context"]["loss_mask"].int().tolist() == [[0, 1, 1, 0, 0]]
+        assert out["context"]["advantages"].tolist() == [[0.0, 2.0, 3.0, 0.0, 0.0]]
+
+    def test_default_frame_is_left_for_callers_already_in_it(self):
+        """Tinker builds ``response_mask`` and ``advantages`` in the Cortex frame."""
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        out = to_cortex_fwd_bwd_payload({"batch": self._skyrl_batch(), "meta": {}})
+        assert out["context"]["loss_mask"].int().tolist() == [
+            [0, 0, 0, 1, 1, 0],
+            [0, 1, 1, 1, 0, 0],
+            [0, 0, 0, 1, 1, 1],
+        ]
+
+    def test_caller_old_log_probs_shifted_are_not_shifted_again(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        old = torch.tensor([[0.0, 0.0, -1.0, -2.0, 0.0, 0.0], [0.0, 0.0, -3.0, -4.0, -5.0, 0.0], [0.0] * 6])
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": self._skyrl_batch(), "meta": {}}, old_log_probs_shifted=old, response_aligned=True
+        )
+        assert out["context"]["old_log_probs_shifted"][:2].tolist() == [
+            [0.0, 0.0, -1.0, -2.0, 0.0, 0.0],
+            [-3.0, -4.0, -5.0, 0.0, 0.0, 0.0],
+        ]
+
+    def test_zorro_rows_are_not_shifted(self):
+        """The patched forward returns one log-prob per response token."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = self._skyrl_batch()
+        batch["prompts"] = batch["input_ids"][:, :3]
+        out = to_cortex_fwd_bwd_payload(
+            {"batch": batch, "meta": {"zorro_train_enable": True, "max_prompt_len": 3}}, response_aligned=True
+        )
+        assert torch.equal(out["context"]["loss_mask"], batch["loss_mask"].bool())
+        assert torch.equal(out["context"]["advantages"], batch["advantages"])
+
+    def test_skyrl_shim_sends_the_predict_next_frame(self):
+        import asyncio
+
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+
+        seen = {}
+
+        class Client:
+            async def fwd_bwd(self, payload):
+                seen["payload"] = payload
+                return {}
+
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = shim._unified_config = None
+        shim._client = Client()
+        asyncio.run(shim.fwd_bwd({"batch": self._skyrl_batch(), "meta": {}}))
+        assert seen["payload"]["context"]["loss_mask"][1].int().tolist() == [1, 1, 1, 0, 0, 0]
 
 
 class TestCortexShimSaveWeightsFailsLoud:
