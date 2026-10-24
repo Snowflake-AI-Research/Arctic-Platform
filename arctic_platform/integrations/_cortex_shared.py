@@ -419,6 +419,11 @@ def _to_cortex_zorro_fwd_bwd(
     if meta.get("balance_batch") is not False and not torch.is_tensor(meta.get("prompt_group_ids")):
         meta["prompt_group_ids"] = _prompt_row_group_ids(prompts)
     apply_balance_metadata(context, meta, input_ids, prompts)
+    # The unpacked worker unpads with pad_token_id and the patched forward
+    # divides by temperature. Balance metadata does not carry either scalar.
+    for key in ("pad_token_id", "temperature"):
+        if key in meta:
+            context[key] = meta[key]
     return {
         "args": (),
         "kwargs": kwargs_out,
