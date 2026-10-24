@@ -15,6 +15,7 @@ from torch import nn
 
 from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
+from ..distributed.combine_replay import CombineReplay
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
 from ...kernels.sonic_experts import sonic_routed_experts
@@ -744,6 +745,8 @@ class MoE(nn.Module):
         )
         self.ep_comm_backend: EPCommBackend = "deepep"
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
+        # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
+        self.combine_replay: CombineReplay | None = None
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -851,6 +854,10 @@ class MoE(nn.Module):
             and hasattr(ep_comm, "finalize_dispatch_rows")
             and sonic_routed_experts_applicable(experts)
         )
+        combine_kwargs = {}
+        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
+            self.combine_replay.start()
+            combine_kwargs["replay"] = self.combine_replay
 
         def dispatch_chunk(start: int, end: int):
             return dispatch_tokens_async(
@@ -865,7 +872,8 @@ class MoE(nn.Module):
         def run_pending_chunk(pending_state):
             if use_sonic:
                 hidden_states, indices, scores = ep_comm.finalize_dispatch_rows(pending_state)
-                return ep_comm.combine_rows(self.experts(hidden_states, None, scores, expert_indices=indices), pending_state)
+                routed = self.experts(hidden_states, None, scores, expert_indices=indices)
+                return ep_comm.combine_rows(routed, pending_state, **combine_kwargs)
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
@@ -873,7 +881,7 @@ class MoE(nn.Module):
             routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
-            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None))
+            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
 
         # dispatch/combine are collectives over the EP group: every rank must issue the
         # same number of calls in both forward and backward or heavier ranks hang on
