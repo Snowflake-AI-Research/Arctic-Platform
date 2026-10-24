@@ -1482,6 +1482,44 @@ class TestCortexZorroOldLogProbs:
         assert metrics["approx_kl"] == pytest.approx(0.1)
 
 
+class TestCortexZorroLossAggregation:
+    """ZoRRo responses reach the loss as one flattened row with no ``cu_seqlens``."""
+
+    def test_sequence_mean_collapses_on_the_flattened_shard(self):
+        """Per-token losses [1, 1] and [4]: the sequence mean is 2.5, the flattened row gives 2."""
+        import torch
+
+        from arctic_platform.rl.processors.functional import agg_loss
+
+        rows = agg_loss(
+            torch.tensor([[1.0, 1.0], [4.0, 0.0]]),
+            torch.tensor([[True, True], [True, False]]),
+            loss_agg_mode="seq-mean-token-mean",
+        )
+        flat = agg_loss(torch.tensor([[1.0, 1.0, 4.0]]), torch.ones(1, 3, dtype=torch.bool), "seq-mean-token-mean")
+        assert (rows.item(), flat.item()) == pytest.approx((2.5, 2.0))
+
+    @pytest.mark.parametrize("source", ["actor_config", "processing"])
+    @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum", "prompt-mean"])
+    def test_zorro_rejects_sequence_aggregation(self, source, mode):
+        meta = {"actor_config": {"loss_agg_mode": mode}} if source == "actor_config" else {}
+        processing = {"config": {"loss_agg_mode": mode}} if source == "processing" else None
+        with pytest.raises(ValueError, match=f"loss_agg_mode='token-mean', got '{mode}'"):
+            TestCortexActorConfig._payload(meta, processing, zorro=True)
+
+    def test_explicit_token_mean_rescues_a_sequence_actor_config(self):
+        out = TestCortexActorConfig._payload(
+            {"actor_config": {"loss_agg_mode": "seq-mean-token-mean"}},
+            {"config": {"loss_agg_mode": "token-mean"}},
+            zorro=True,
+        )
+        assert out["processing"]["config"]["loss_agg_mode"] == "token-mean"
+
+    def test_non_zorro_keeps_sequence_aggregation(self):
+        out = TestCortexActorConfig._payload({"actor_config": {"loss_agg_mode": "seq-mean-token-mean"}})
+        assert out["processing"]["config"]["loss_agg_mode"] == "seq-mean-token-mean"
+
+
 class TestCortexShimSaveWeightsFailsLoud:
     """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
     share disk, so a silent no-op would leave sampling on stale weights."""

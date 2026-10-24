@@ -350,6 +350,13 @@ def _to_cortex_zorro_fwd_bwd(
         kwargs_out["position_ids"] = tensors["position_ids"]
 
     proc_config = _resolve_proc_config(meta, processing_in)
+    # The unpacked ZoRRo call flattens every response into one row with no
+    # cu_seqlens, so a per-sequence mean would treat the shard as one sequence.
+    if proc_config["loss_agg_mode"] != "token-mean":
+        raise ValueError(
+            f"ZoRRo on Cortex supports only loss_agg_mode='token-mean', got {proc_config['loss_agg_mode']!r}: "
+            "its responses reach the loss flattened, without sequence boundaries"
+        )
 
     context: dict[str, Any] = {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask}
     if torch.is_tensor(old_log_probs):
