@@ -439,7 +439,7 @@ def _to_cortex_zorro_fwd_bwd(
     for ZoRRo is refused before this runs. ``prompts`` is the original prompt
     block. When the caller did not send ``prompt_group_ids``, they are derived
     from that block. The snapshot is sent as ``context["old_log_probs_shifted"]``
-    in the caller's columns.
+    in the caller's columns. ``grpo`` reads π_old only under that name.
     """
     import torch
 
