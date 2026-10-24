@@ -23,11 +23,13 @@ import pytest
 import torch
 
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
+from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
 from arctic_platform.rl.processors import LOSS_FNS
 from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors import run_pipeline
 from arctic_platform.rl.processors.grouped_distillation import Divergence
 from arctic_platform.rl.processors.grouped_distillation import grouped_divergence
+from arctic_platform.testing_utils import set_seed
 
 _B, _S, _V, _M = 2, 6, 40, 4
 _KD_COEF = 0.7
@@ -1046,22 +1048,31 @@ def test_native_unpad_round_trips_token_outputs_with_trailing_dimensions():
 
 
 @pytest.mark.parametrize("beta", [0.0, 1.0])
-def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(beta):
-    """At KL's minimum (forward or reverse) the gradient is zero, also through the chunked head's float32 backward.
-
-    The head forms ``q * sum(grad)`` in float32. At a bucket holding all but 3.3e-5 of the mass that term cancels
-    against the bucket's own gradient (softmax cancellation, https://jonbarron.info/softmaxfix/), leaving a hidden
-    gradient of 1.3e-5 for reverse KL unless the student gradient already sums to zero.
-    """
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(beta, kind):
+    """Both heads preserve the zero KL gradient at a near-certain student/teacher match."""
+    set_seed(0)
     vocab = 2 * 8192 + 37
     weight = torch.zeros(vocab, 2)
     weight[8192, 0] = 20.0
-    weight[:, 1] = 0.1 * torch.randn(vocab, generator=torch.Generator().manual_seed(0))
+    weight[:, 1] = 0.1 * torch.randn(vocab)
     hidden = torch.ones(1, 1, 2, requires_grad=True)
     ids = torch.tensor([[[8192, 5, 6, 7]]])
-    _, groups = chunked_lm_head_logprobs(
-        hidden, weight, ids[..., 0], token_chunk_size=2, vocab_chunk_size=5000, fp32_lm_head=True, group_token_ids=ids
-    )
+    if kind == "dense":
+        _, groups = chunked_lm_head_logprobs(
+            hidden,
+            weight,
+            ids[..., 0],
+            token_chunk_size=2,
+            vocab_chunk_size=5000,
+            fp32_lm_head=True,
+            group_token_ids=ids,
+        )
+    else:
+        head = FusedOutputLinear(2, vocab, 2, fp32_lm_head=True)
+        groups = torch.func.functional_call(head, {"weight": weight}, (hidden, ids[..., 0]), {"group_token_ids": ids})[
+            "group_log_probs"
+        ]
 
     logits = (hidden @ weight.T).detach().double()[0, 0]
     outside = torch.ones(vocab, dtype=torch.bool)
