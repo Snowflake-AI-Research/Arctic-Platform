@@ -9,6 +9,7 @@ from torch.distributed import ProcessGroup
 
 from ..routing_weights import apply_routing_weights
 from ..token_combine import sum_rows_by_token
+from .combine_replay import CombineReplay
 from .uccl_ep import Buffer
 from .uccl_ep import EventOverlap
 
@@ -194,6 +195,21 @@ class _UcclEPCombine(torch.autograd.Function):
         return grad_x, None
 
 
+class _UcclEPReplayedCombine(torch.autograd.Function):
+    """A recompute's combine, replayed from the original forward's output (``CombineReplay``). The recompute's
+    graph is discarded once the saved tensors are rebuilt, so this node never runs backward; it only releases
+    the handle of the recompute's dispatch and keeps the output attached to the graph like the combine's."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, handle_id: torch.Tensor, combined: torch.Tensor) -> torch.Tensor:
+        _handle_cache.pop(handle_id.item(), None)
+        return combined.clone()
+
+    @staticmethod
+    def backward(ctx, grad_combined: torch.Tensor) -> tuple[None, None, None]:
+        raise RuntimeError("a replayed UCCL-EP combine is only part of a recompute and has no backward")
+
+
 @torch.compiler.disable()
 def sync_combine() -> None:
     for pending_event in _pending_combine_events:
@@ -357,11 +373,18 @@ def finalize_dispatch_tokens(
     return hidden_states, num_tokens_per_expert, state
 
 
-def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
+def combine_tokens(
+    hidden_states: torch.Tensor, state: _DispatchState, replay: CombineReplay | None = None
+) -> torch.Tensor:
     if state.permuted_scores is not None:
         hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
     hidden_states = _unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
-    return _UcclEPCombine.apply(hidden_states, state.handle_id)
+    if replay is None:
+        return _UcclEPCombine.apply(hidden_states, state.handle_id)
+    return replay.run(
+        lambda: _UcclEPCombine.apply(hidden_states, state.handle_id),
+        lambda combined: _UcclEPReplayedCombine.apply(hidden_states, state.handle_id, combined),
+    )
 
 
 register_ucclep_cuda_ops()
