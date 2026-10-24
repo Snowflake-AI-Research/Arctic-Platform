@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -89,6 +90,7 @@ def _server(workers):
     server._training_op_lock = asyncio.Lock()
     server._training_failed = False
     server._training_failure = None
+    server._weight_norm_disabled = None
     server.colocate = False
     return server
 
@@ -384,7 +386,7 @@ class TestGatherTrainingRefs(TestCasePlus):
         asyncio.run(_run())
         self.assertEqual(log, ["wake"])
 
-    def test_sampling_weight_norm_failure_does_not_block_step(self):
+    def test_sampling_weight_norm_failure_returns_error_and_does_not_block_step(self):
         hold = asyncio.Event()
         hold.set()
         worker = _Worker([], hold)
@@ -403,12 +405,364 @@ class TestGatherTrainingRefs(TestCasePlus):
         server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
 
         async def _run():
-            with self.assertRaisesRegex(RuntimeError, "sampler norm failed"):
-                await server.weight_norm(1, 2)
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(
+                result,
+                {
+                    "error_code": "weight_norm_unavailable",
+                    "error": "RuntimeError: sampler norm failed",
+                },
+            )
             self.assertFalse(server._training_failed)
             await server.step(1)
 
         asyncio.run(_run())
+
+    def test_training_weight_norm_failure_returns_error_and_does_not_latch(self):
+        hold = asyncio.Event()
+        hold.set()
+        worker = _Worker([], hold)
+
+        async def _norm():
+            raise RuntimeError("training norm failed")
+
+        worker.weight_norm = _Remote(_norm)
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _sampler_norm():
+            return {"norm": 1.0, "num_params": 1}
+
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(
+                result,
+                {
+                    "error_code": "weight_norm_unavailable",
+                    "error": "RuntimeError: training norm failed",
+                },
+            )
+            self.assertFalse(server._training_failed)
+            await server.step(1)
+
+        asyncio.run(_run())
+
+    def test_cancelled_training_weight_norm_latches(self):
+        """Worker 0 may be left inside the ZeRO-3 all-gather, which a later step's collectives could pair with."""
+        started = asyncio.Event()
+
+        async def _norm():
+            started.set()
+            await asyncio.Event().wait()
+
+        worker = type("W", (), {"weight_norm": _Remote(_norm)})()
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _sampler_norm():
+            return {"norm": 1.0, "num_params": 1}
+
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            task = asyncio.create_task(server.weight_norm(1, 2))
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(server._training_failed)
+            self.assertFalse(server._training_op_lock.locked())
+            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                await server.step(1)
+
+        asyncio.run(_run())
+
+    def test_weight_norm_invalid_job_returns_error(self):
+        server = _server([])
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(
+                result,
+                {
+                    "error_code": "weight_norm_unavailable",
+                    "error": "ValueError: Job 2 not found",
+                },
+            )
+            self.assertIsNone(server._weight_norm_disabled)
+
+        asyncio.run(_run())
+
+    def test_weight_norm_structural_refusal_disables_later_calls(self):
+        calls = {"training": 0, "sampling": 0}
+        hold = asyncio.Event()
+        hold.set()
+        worker = _Worker([], hold)
+
+        async def _norm():
+            calls["training"] += 1
+            return {"norm": 1.0, "num_params": 1}
+
+        async def _sampler_norm():
+            calls["sampling"] += 1
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": "exact only at tensor_parallel_size=1",
+                "disable": True,
+            }
+
+        worker.weight_norm = _Remote(_norm)
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            first = await server.weight_norm(1, 2)
+            second = await server.weight_norm(1, 2)
+            self.assertEqual(
+                first,
+                {"error_code": "weight_norm_unavailable", "error": "exact only at tensor_parallel_size=1"},
+            )
+            self.assertEqual(second, first)
+            self.assertFalse(server._training_failed)
+            await server.step(1)
+
+        asyncio.run(_run())
+        self.assertEqual(calls, {"training": 0, "sampling": 1})
+
+    def test_weight_norm_pool_tp_disables_without_calling_workers(self):
+        calls = {"n": 0}
+        server = _server([])
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _sampler_norm():
+            calls["n"] += 1
+            return {"norm": 1.0, "num_params": 1}
+
+        server.sampling_pool = type("P", (), {"tp_size": 2})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(result["error_code"], "weight_norm_unavailable")
+            self.assertIn("tensor_parallel_size=2", result["error"])
+            again = await server.weight_norm(1, 2)
+            self.assertEqual(again, result)
+
+        asyncio.run(_run())
+        self.assertEqual(calls["n"], 0)
+
+    def test_weight_norm_temporary_error_tries_again(self):
+        calls = {"training": 0, "sampling": 0}
+        hold = asyncio.Event()
+        hold.set()
+        worker = _Worker([], hold)
+
+        async def _norm():
+            calls["training"] += 1
+            return {"norm": 1.0, "num_params": 1}
+
+        async def _sampler_norm():
+            calls["sampling"] += 1
+            raise RuntimeError("sampler norm failed")
+
+        worker.weight_norm = _Remote(_norm)
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            first = await server.weight_norm(1, 2)
+            second = await server.weight_norm(1, 2)
+            self.assertEqual(
+                first,
+                {"error_code": "weight_norm_unavailable", "error": "RuntimeError: sampler norm failed"},
+            )
+            self.assertEqual(second, first)
+            self.assertIsNone(server._weight_norm_disabled)
+
+        asyncio.run(_run())
+        self.assertEqual(calls, {"training": 0, "sampling": 2})
+
+    def test_weight_norm_gathers_every_training_rank(self):
+        calls = []
+        hold = asyncio.Event()
+        hold.set()
+
+        def _worker(rank):
+            async def _norm():
+                calls.append(rank)
+                return {"norm": 1.0, "num_params": 3}
+
+            worker = _Worker([], hold)
+            worker.weight_norm = _Remote(_norm)
+            return worker
+
+        server = _server([_worker(0), _worker(1)])
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _sampler_norm():
+            return {"norm": 1.0, "num_params": 3}
+
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(result["training_norm"], 1.0)
+            self.assertEqual(result["sampling_norm"], 1.0)
+
+        asyncio.run(_run())
+        self.assertEqual(calls, [0, 1])
+
+    def test_weight_norm_after_training_failure_does_not_disable(self):
+        hold = asyncio.Event()
+        hold.set()
+        server = _server([_Worker([], hold)])
+        server._training_failed = True
+        server.jobs[2] = {"job_type": "sampling"}
+
+        async def _sampler_norm():
+            return {"norm": 1.0, "num_params": 1}
+
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(result["error_code"], "weight_norm_unavailable")
+            self.assertIn("refusing further training ops", result["error"])
+            self.assertIsNone(server._weight_norm_disabled)
+
+        asyncio.run(_run())
+
+    def test_weight_norm_mismatch_disables_the_check(self):
+        calls = {"training": 0, "sampling": 0}
+        hold = asyncio.Event()
+        hold.set()
+        worker = _Worker([], hold)
+
+        async def _norm():
+            calls["training"] += 1
+            return {"norm": 2.0, "num_params": 1}
+
+        async def _sampler_norm():
+            calls["sampling"] += 1
+            return {"norm": 1.0, "num_params": 1}
+
+        worker.weight_norm = _Remote(_norm)
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(result["error_code"], "weight_norm_unavailable")
+            self.assertIn("weight norms diverge", result["error"])
+            self.assertNotIn("training_norm", result)
+            again = await server.weight_norm(1, 2)
+            self.assertEqual(again, result)
+            self.assertFalse(server._training_failed)
+
+        asyncio.run(_run())
+        self.assertEqual(calls, {"training": 1, "sampling": 1})
+
+    def test_weight_sync_reports_a_checksum_mismatch_without_raising(self):
+        """The sampler is already written when the checksum is read, so raising would not restore it."""
+        hold = asyncio.Event()
+        hold.set()
+        log: list[str] = []
+        server = _server([_Worker(log, hold)])
+        server.jobs[1]["cuda_ipc"] = True
+        server.jobs[2] = {"job_type": "sampling"}
+        server.colocate = True
+        server.sampling_pool = object()
+        server.log_prob_pool = None
+        server.arctic_rl_ray_server_state = _State(log)
+        mismatch = {
+            "status": "ok",
+            "sent_l2_sq": 32.5,
+            "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+            "checksum_rtol": 1e-9,
+            "checksum_match": False,
+            "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+        }
+
+        async def _sync(workers, pool, lp_pool):
+            return mismatch
+
+        server._sync_weights_cuda_ipc = _sync
+
+        async def _run():
+            with self.assertLogs("arctic_platform.common.ray_server", level="WARNING") as logs:
+                result = await server.weight_sync(1, {"source_sub_job_id": 1, "target_sub_job_ids": [2]})
+            self.assertEqual(result, {"job_id": 1, **mismatch})
+            self.assertIn("did not prove delivery: received {'sampling replica 0 rank 0': 27.5}", logs.output[0])
+            self.assertFalse(server._training_failed)
+            await server.step(1)
+
+        asyncio.run(_run())
+
+    def test_nccl_sync_compares_each_sender_with_every_sampler_rank(self):
+        class _Sender:
+            def __init__(self, sent):
+                self.get_ip = _Remote(self._ip)
+                self.send_weights = _Remote(self._send)
+                self._sent = sent
+
+            async def _ip(self):
+                return "127.0.0.1"
+
+            async def _send(self):
+                return {"status": "done", "sent_l2_sq": self._sent}
+
+        class _Pool:
+            num_replicas = 2
+            tp_size = 2
+
+            async def sync_weights(self, groups, bucket_size):
+                return {"workers": [{"rank_recv_l2_sq": [32.5, 32.5]}, {"rank_recv_l2_sq": [32.5, 30.0]}]}
+
+        class _Schedule:
+            groups = [SimpleNamespace(group_id=0, sender_train_rank=0, world_size=5, replica_ids=[0, 1])]
+
+            @classmethod
+            def build(cls, **kwargs):
+                return cls()
+
+        async def _wake():
+            return None
+
+        server = _server([_Sender(32.5)])
+        server.weight_sync_ready = True
+        server.weight_sync_bucket_size = 1024
+        server.arctic_rl_ray_server_state = SimpleNamespace(wake_inference=_Remote(_wake))
+
+        async def _run():
+            async with server._training_op_lock:
+                with patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=_Schedule):
+                    return await server._sync_weights_nccl(server.training_workers, _Pool())
+
+        result = asyncio.run(_run())
+        self.assertEqual(result["sent_l2_sq"], 32.5)
+        self.assertEqual(
+            result["recv_l2_sq"],
+            {
+                "sampling replica 0 rank 0": 32.5,
+                "sampling replica 0 rank 1": 32.5,
+                "sampling replica 1 rank 0": 32.5,
+                "sampling replica 1 rank 1": 30.0,
+            },
+        )
+        self.assertFalse(result["checksum_match"])
+        self.assertEqual(result["checksum_error"], "received {'sampling replica 1 rank 1': 30.0}, sent 32.5")
 
     def test_training_hang_latches_and_destroy_still_runs(self):
         log: list[str] = []

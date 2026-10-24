@@ -19,6 +19,24 @@ from __future__ import annotations
 from typing import Any
 from typing import Mapping
 
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import StrictInt
+
+
+class RouterStatsStrides(BaseModel):
+    """Validated token/call strides for per-step router health statistics.
+
+    Training-callback config only (``training_config.debug``). Not loader options:
+    DSS filters these keys before building ``ModelSpec``.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    router_stats_sample_stride: StrictInt = Field(0, ge=0)
+    router_stats_call_stride: StrictInt = Field(1, ge=1)
+
 
 def training_debug_config(training_config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return ``training_config.debug`` with fallback to the legacy Prime-RL location."""
@@ -36,6 +54,23 @@ def training_debug_config(training_config: Mapping[str, Any]) -> Mapping[str, An
     if not isinstance(debug_config, Mapping):
         raise TypeError(f"{source} must be a mapping, got {type(debug_config).__name__}")
     return debug_config
+
+
+def router_stats_strides(training_config: Mapping[str, Any]) -> tuple[int, int]:
+    """Return the token and call strides of the per-step router health statistics; a token stride of 0 is off.
+
+    Statistics are taken on every ``router_stats_call_stride``-th router call (default 1), and within it router
+    entropy and replay agreement on every ``router_stats_sample_stride``-th token. Both values must be JSON
+    integers. Forward-only calls are included in the totals reported at the next optimizer step.
+    """
+    debug = training_debug_config(training_config)
+    opts = RouterStatsStrides.model_validate(
+        {
+            "router_stats_sample_stride": debug.get("router_stats_sample_stride", 0),
+            "router_stats_call_stride": debug.get("router_stats_call_stride", 1),
+        }
+    )
+    return opts.router_stats_sample_stride, opts.router_stats_call_stride
 
 
 def gradient_sample_max_numel(training_config: Mapping[str, Any]) -> int:
