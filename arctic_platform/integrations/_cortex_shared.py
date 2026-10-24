@@ -37,6 +37,41 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
     "entropy_coeff": 0.0,
 }
 
+# verl/SkyRL ``actor_config`` keys the server's ``grpo`` reads under the same name.
+_ACTOR_CONFIG_SAME_NAME = ("loss_agg_mode", "entropy_coeff", "use_kl_loss", "kl_loss_coef", "kl_loss_type")
+
+
+def _actor_loss_config(meta: dict) -> dict[str, Any]:
+    """``meta['actor_config']`` lowered onto ``grpo`` config keys.
+
+    verl's PPO clip bounds the ratio to ``[1 - clip_ratio_low, 1 + clip_ratio_high]``,
+    each side falling back to ``clip_ratio``; ``grpo`` spells that range
+    ``eps_clip`` / ``eps_clip_higher``. verl's dual-clip ``clip_ratio_c`` is
+    ``grpo``'s ``c_clip``. Unset (``None``) values are left to the defaults.
+    """
+    actor = meta.get("actor_config")
+    if not isinstance(actor, dict):
+        return {}
+    clip = actor.get("clip_ratio")
+    low, high = actor.get("clip_ratio_low"), actor.get("clip_ratio_high")
+    lowered = {
+        "eps_clip": clip if low is None else low,
+        "eps_clip_higher": clip if high is None else high,
+        "c_clip": actor.get("clip_ratio_c"),
+        **{key: actor.get(key) for key in _ACTOR_CONFIG_SAME_NAME},
+    }
+    return {key: value for key, value in lowered.items() if value is not None}
+
+
+def _resolve_proc_config(meta: dict, processing_in: dict | None) -> dict[str, Any]:
+    """Defaults, then the caller's ``actor_config``, then an explicit ``processing.config``."""
+    caller_config = dict((processing_in or {}).get("config") or {})
+    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **_actor_loss_config(meta), **caller_config}
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k not in proc_config and k in meta:
+            proc_config[k] = int(meta[k])
+    return proc_config
+
 
 def to_cortex_fwd_payload(batch: dict) -> dict:
     """On-prem SkyRL ``{batch, meta}`` → Cortex ``{args, kwargs, context, processing}``.
@@ -264,11 +299,7 @@ def to_cortex_fwd_bwd_payload(
         if k in forwarded:
             kwargs_out[k] = forwarded[k]
 
-    caller_config = dict((processing_in or {}).get("config") or {})
-    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
-    for k in ("global_batch_size", "batch_num_tokens"):
-        if k not in proc_config and k in meta:
-            proc_config[k] = int(meta[k])
+    proc_config = _resolve_proc_config(meta, processing_in)
 
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
@@ -316,11 +347,7 @@ def _to_cortex_zorro_fwd_bwd(
     if torch.is_tensor(tensors.get("position_ids")):
         kwargs_out["position_ids"] = tensors["position_ids"]
 
-    caller_config = dict((processing_in or {}).get("config") or {})
-    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
-    for k in ("global_batch_size", "batch_num_tokens"):
-        if k not in proc_config and k in meta:
-            proc_config[k] = int(meta[k])
+    proc_config = _resolve_proc_config(meta, processing_in)
 
     context: dict[str, Any] = {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask}
     from arctic_platform.common.balance_metadata import apply_balance_metadata

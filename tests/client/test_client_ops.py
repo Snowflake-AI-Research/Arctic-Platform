@@ -1326,6 +1326,109 @@ class TestCortexPredictNextFrame:
         assert seen["payload"]["context"]["loss_mask"][1].int().tolist() == [1, 1, 1, 0, 0, 0]
 
 
+class TestCortexActorConfig:
+    """SkyRL and verl send their loss settings as ``meta['actor_config']`` and no
+    ``processing.config``; the server's ``grpo`` reads them under its own names."""
+
+    # What SkyRL's ``_build_meta`` sends, plus keys grpo has no use for.
+    ACTOR = {
+        "loss_agg_mode": "seq-mean-token-mean",
+        "kl_loss_coef": 0.0,
+        "kl_loss_type": "low_var_kl",
+        "clip_ratio": 0.2,
+        "clip_ratio_low": 0.15,
+        "clip_ratio_high": 0.28,
+        "clip_ratio_c": 3.0,
+        "entropy_coeff": 0.001,
+        "use_kl_loss": False,
+        "calculate_entropy": True,
+        "rollout_n": 4,
+    }
+
+    @staticmethod
+    def _payload(meta, processing=None, zorro=False):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = {
+            "input_ids": torch.zeros((2, 4), dtype=torch.int64),
+            "attention_mask": torch.ones((2, 4), dtype=torch.int64),
+            "advantages": torch.zeros((2, 4)),
+            "response_mask": torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]]),
+        }
+        if zorro:
+            batch["prompts"] = batch["input_ids"][:, :2]
+            meta = {**meta, "zorro_train_enable": True, "max_prompt_len": 2}
+        return to_cortex_fwd_bwd_payload({"batch": batch, "meta": meta}, processing=processing)
+
+    def test_skyrl_actor_config_reaches_grpo(self):
+        from arctic_platform.rl.processors.grpo import _CORTEX_GRPO_VARIANT
+        from arctic_platform.rl.processors.grpo import _validate_plain_config
+
+        skyrl_processing = {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": "verl_grpo"}
+        cfg = self._payload({"actor_config": self.ACTOR, "global_batch_size": 8}, skyrl_processing)["processing"][
+            "config"
+        ]
+        assert cfg == {
+            "eps_clip": 0.15,
+            "eps_clip_higher": 0.28,
+            "c_clip": 3.0,
+            "loss_agg_mode": "seq-mean-token-mean",
+            "entropy_coeff": 0.001,
+            "use_kl_loss": False,
+            "kl_loss_coef": 0.0,
+            "kl_loss_type": "low_var_kl",
+            "global_batch_size": 8,
+        }
+        # The Cortex grpo rejects unknown keys; every forwarded one is known.
+        _validate_plain_config(cfg, _CORTEX_GRPO_VARIANT)
+
+    def test_explicit_processing_config_wins_over_actor_config(self):
+        cfg = self._payload(
+            {"actor_config": self.ACTOR}, {"config": {"eps_clip": 0.3, "loss_agg_mode": "token-mean"}}
+        )["processing"]["config"]
+        assert cfg["eps_clip"] == 0.3
+        assert cfg["loss_agg_mode"] == "token-mean"
+        assert cfg["eps_clip_higher"] == 0.28
+        assert cfg["entropy_coeff"] == 0.001
+
+    def test_unset_sides_fall_back_to_clip_ratio(self):
+        actor = {"clip_ratio": 0.25, "clip_ratio_low": None, "clip_ratio_high": None, "clip_ratio_c": None}
+        cfg = self._payload({"actor_config": actor})["processing"]["config"]
+        assert cfg == {"eps_clip": 0.25, "eps_clip_higher": 0.25, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+
+    def test_without_actor_config_defaults_are_unchanged(self):
+        cfg = self._payload({})["processing"]["config"]
+        assert cfg == {"eps_clip": 0.2, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+
+    def test_zorro_path_forwards_actor_config(self):
+        actor = {**self.ACTOR, "loss_agg_mode": "token-mean"}
+        cfg = self._payload({"actor_config": actor}, zorro=True)["processing"]["config"]
+        assert (cfg["eps_clip"], cfg["eps_clip_higher"], cfg["c_clip"]) == (0.15, 0.28, 3.0)
+        assert cfg["entropy_coeff"] == 0.001
+
+    def test_forwarded_clip_changes_the_server_loss(self):
+        """ratio = e^0.25 = 1.284 with A = 1: clipped at 1.28 by SkyRL's 0.28, at 1.2 by the default."""
+        import torch
+
+        from arctic_platform.rl.processors.grpo import _grpo_loss
+
+        actor = {**self.ACTOR, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+        context = {
+            "advantages": torch.tensor([[1.0]]),
+            "loss_mask": torch.tensor([[True]]),
+            "old_log_probs_shifted": torch.tensor([[0.0]]),
+        }
+        outputs = {"logprobs": torch.tensor([[0.25]])}
+        forwarded = self._payload({"actor_config": actor})["processing"]["config"]
+        default = self._payload({})["processing"]["config"]
+        loss, _ = _grpo_loss(outputs, context, forwarded, "cpu")
+        assert loss.item() == pytest.approx(-1.28)
+        loss, _ = _grpo_loss(outputs, context, default, "cpu")
+        assert loss.item() == pytest.approx(-1.2)
+
+
 class TestCortexShimSaveWeightsFailsLoud:
     """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
     share disk, so a silent no-op would leave sampling on stale weights."""
