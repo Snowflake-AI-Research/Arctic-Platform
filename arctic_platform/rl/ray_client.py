@@ -25,6 +25,7 @@ import logging
 from typing import Any
 
 import ray
+from ray.util.placement_group import remove_placement_group
 
 from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.rl.ray_server import ArcticRLRayServer
@@ -65,12 +66,15 @@ class ArcticRLRayClient:
             # Reconnect mode: attach to pre-existing jobs without calling /initialize.
             # Populated by reconnect_config(); used when passing a client across Ray
             # process boundaries where the live object cannot be serialized.
+            # The other process owns the state actor and its placement group.
+            self._owns_server_state = False
             self._training_job_id = config.training_job_id
             self._sampling_job_id = config.sampling_job_id
             self._log_prob_job_id = config.log_prob_job_id
 
             self._arctic_rl_ray_server_state = rl_server_state
         else:
+            self._owns_server_state = True
             self._training_job_id: int | None = None
             self._sampling_job_id: int | None = None
             self._log_prob_job_id: int | None = None
@@ -81,7 +85,16 @@ class ArcticRLRayClient:
                 log_prob_engine=config.log_prob_engine,
                 colocate=config.colocate,
             )
-            self._initialize_jobs(config)
+            try:
+                self._initialize_jobs(config)
+            except BaseException:
+                try:
+                    self._cleanup_failed_initialization()
+                except BaseException:
+                    # Initialization's exception is the actionable root cause.
+                    # Cleanup is best-effort and must never replace it.
+                    logger.warning("Unexpected partial-state cleanup failure", exc_info=True)
+                raise
 
         self._arctic_rl_ray_server = ArcticRLRayServer(self._arctic_rl_ray_server_state)
         pr0(
@@ -173,6 +186,28 @@ class ArcticRLRayClient:
 
         resp = ray.get(self._arctic_rl_ray_server_state.initialize.remote(job_config))
         return resp
+
+    def _cleanup_failed_initialization(self) -> None:
+        """Release state resources when construction fails after actor creation."""
+        server_pg = None
+        try:
+            server_pg = ray.get(self._arctic_rl_ray_server_state.get_server_placement_group.remote())
+        except BaseException:
+            logger.warning("Failed to read partial Ray server placement group", exc_info=True)
+        try:
+            ray.get(self._arctic_rl_ray_server_state.shutdown.remote())
+        except BaseException:
+            logger.warning("Failed to clean up partially initialized Ray server state", exc_info=True)
+        finally:
+            try:
+                ray.kill(self._arctic_rl_ray_server_state)
+            except Exception:
+                logger.warning("Failed to kill partially initialized Ray server state", exc_info=True)
+            if server_pg is not None:
+                try:
+                    remove_placement_group(server_pg)
+                except Exception:
+                    logger.warning("Failed to remove partial Ray server placement group", exc_info=True)
 
     async def _destroy_job(self, job_id: int, job_type: str) -> None:
         response = await self._arctic_rl_ray_server.destroy(job_id, job_type)
@@ -396,7 +431,12 @@ class ArcticRLRayClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict[str, Any]:
+    async def sync_weights(
+        self,
+        cuda_ipc: bool | None = None,
+        low_memory: bool | None = None,
+        strict_checksum: bool = True,
+    ) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         In non-colocated mode, uses NCCL.  In colocated mode:
@@ -410,7 +450,9 @@ class ArcticRLRayClient:
         ``cuda_ipc`` / ``low_memory`` default to the training job's config; pass a value to override this call.
 
         ``checksum_match`` in the response says whether every sampler rank received the trainer's weights (see
-        ``ArcticRLRayServer.weight_sync``).
+        ``ArcticRLRayServer.weight_sync``). ``strict_checksum`` (default ``True``) raises when it is ``False``: a
+        sampler with stale or corrupt weights must not keep training silently. Pass ``False`` to only get the dict
+        back (see ``checksum_error``) and decide for yourself.
         """
         request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,
@@ -422,6 +464,12 @@ class ArcticRLRayClient:
             request["low_memory"] = low_memory
         response = await self._arctic_rl_ray_server.weight_sync(self.training_job_id, request)
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
+        if strict_checksum and response.get("checksum_match") is False:
+            raise RuntimeError(
+                "weight sync did not prove delivery: "
+                f"{response.get('checksum_error', 'no detail reported')} "
+                f"(sent={response.get('sent_l2_sq')!r} recv={response.get('recv_l2_sq')!r})"
+            )
         return response
 
     async def weight_norm(self) -> dict[str, Any]:
@@ -463,15 +511,27 @@ class ArcticRLRayClient:
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Destroy all jobs and stop the local server if applicable."""
-        for job_type, job_id in [
-            ("training", self._training_job_id),
-            ("sampling", self._sampling_job_id),
-            ("log_prob", self._log_prob_job_id),
-        ]:
-            if job_id is not None:
-                await self._destroy_job(job_id, job_type)
+        """Destroy this client's jobs. Only the owner releases the state actor.
 
-        self._training_job_id = None
-        self._sampling_job_id = None
-        self._log_prob_job_id = None
+        A reconnected client (``config.training_job_id`` set) attaches to a state
+        actor another process created. ``destroy`` on that client still tears down
+        the jobs, but killing the actor or removing its scheduler placement group
+        would take the owner's server down mid-run.
+        """
+        try:
+            for job_type, job_id in [
+                ("training", self._training_job_id),
+                ("sampling", self._sampling_job_id),
+                ("log_prob", self._log_prob_job_id),
+            ]:
+                if job_id is not None:
+                    await self._destroy_job(job_id, job_type)
+        finally:
+            try:
+                if self._owns_server_state:
+                    await self._arctic_rl_ray_server.shutdown()
+            finally:
+                self._owns_server_state = False
+                self._training_job_id = None
+                self._sampling_job_id = None
+                self._log_prob_job_id = None

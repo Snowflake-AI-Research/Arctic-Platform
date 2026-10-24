@@ -106,6 +106,24 @@ def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) 
         )
 
 
+def _raise_on_weight_sync_mismatch(out: dict, strict_checksum: bool) -> None:
+    """Fail loudly when the server proved the sync did not land on the sampler.
+
+    ``checksum_match`` is only present when the transport computed one (see
+    ``ArcticRLRayServer.weight_sync``); a transport that reports none leaves the
+    sampler's state unverified and this is a no-op, as before. ``strict_checksum=False``
+    restores the old log-only behavior for a caller that wants to decide for itself.
+    """
+    if not strict_checksum:
+        return
+    if out.get("checksum_match") is False:
+        raise RuntimeError(
+            "weight sync did not prove delivery: "
+            f"{out.get('checksum_error', 'no detail reported')} "
+            f"(sent={out.get('sent_l2_sq')!r} recv={out.get('recv_l2_sq')!r})"
+        )
+
+
 def _maybe_print_server_profile(op: str, out: dict | None) -> None:
     """Echo the server's per-op timings when ARL_SFT_PROFILE is set; a no-op otherwise."""
     # TODO(generalize-profiling): extend profiling to every transport and workload in a
@@ -354,12 +372,17 @@ class ArcticClient(_ArcticClientCore):
         low_memory: bool | None = None,
         weight_format: str | None = None,
         bucket_size: int | None = None,
+        strict_checksum: bool = True,
     ) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
         call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only). ``bucket_size`` (bytes,
         Cortex only) raises the transfer bucket when one tensor exceeds the server default.
+
+        ``strict_checksum`` (default ``True``) raises if the server reports ``checksum_match=False``: the sampler
+        has stale or corrupt weights and training must not continue silently. Pass ``False`` to only log it (see
+        ``out["checksum_error"]``) and keep going.
         """
         _check_weight_format(self.config, weight_format)
         self.wake_inference(tags=["weights"])
@@ -374,6 +397,7 @@ class ArcticClient(_ArcticClientCore):
         )
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
+        _raise_on_weight_sync_mismatch(out, strict_checksum)
         return out
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
@@ -574,6 +598,7 @@ class AsyncArcticClient(_ArcticClientCore):
         low_memory: bool | None = None,
         weight_format: str | None = None,
         bucket_size: int | None = None,
+        strict_checksum: bool = True,
     ) -> dict:
         """Async twin of ArcticClient.sync_weights (staged wake → operation → wake → reset)."""
         _check_weight_format(self.config, weight_format)
@@ -589,6 +614,7 @@ class AsyncArcticClient(_ArcticClientCore):
         )
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
+        _raise_on_weight_sync_mismatch(out, strict_checksum)
         return out
 
     async def reset_prefix_cache(
