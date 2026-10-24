@@ -23,9 +23,17 @@ from arctic_platform.model.implementations.deepseek_v4.conversion_ops import (
     Rename,
     routed_experts_op,
 )
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 
 
-def _layer_ops(layer_idx: int, layer_type: str, *, is_hash: bool) -> list[ConvOp]:
+def _scale_rename(hf_weight: str, prime_weight: str) -> Rename:
+    return Rename(
+        hf_weight.removesuffix(".weight") + ".scale",
+        prime_weight.removesuffix(".weight") + ".weight_scale_inv",
+    )
+
+
+def _layer_ops(layer_idx: int, layer_type: str, *, is_hash: bool, quantized: bool) -> list[ConvOp]:
     """One layer's published names -> prime-rl's module names, one hop per key."""
     p = f"layers.{layer_idx}"
     attn, moe = f"{p}.attn", f"{p}.ffn"
@@ -87,12 +95,38 @@ def _layer_ops(layer_idx: int, layer_type: str, *, is_hash: bool) -> list[ConvOp
             Rename(f"{idx}.compressor.norm.weight", f"{prime_idx}.compressor.kv_norm.weight"),
             Rename(f"{idx}.compressor.ape", f"{prime_idx}.compressor.position_bias"),
         ]
+    if quantized:
+        ops += [
+            _scale_rename(f"{attn}.wq_a.weight", f"{prime_attn}.q_a_proj.weight"),
+            _scale_rename(f"{attn}.wq_b.weight", f"{prime_attn}.q_b_proj.weight"),
+            _scale_rename(f"{attn}.wkv.weight", f"{prime_attn}.kv_proj.weight"),
+            _scale_rename(f"{attn}.wo_a.weight", f"{prime_attn}.o_a_proj.weight"),
+            _scale_rename(f"{attn}.wo_b.weight", f"{prime_attn}.o_b_proj.weight"),
+            Rename(f"{moe}.shared_experts.w1.scale", f"{prime_moe}.shared_expert.w1_scale_inv"),
+            Rename(f"{moe}.shared_experts.w2.scale", f"{prime_moe}.shared_expert.w2_scale_inv"),
+            Rename(f"{moe}.shared_experts.w3.scale", f"{prime_moe}.shared_expert.w3_scale_inv"),
+            routed_experts_op(
+                p,
+                hf_experts="ffn.experts",
+                prime_experts="mlp.experts",
+                proj_order=(("w1_scale_inv", "w1"), ("w2_scale_inv", "w2"), ("w3_scale_inv", "w3")),
+                hf_proj_suffix=".scale",
+            ),
+        ]
+        if layer_type == "compressed_sparse_attention":
+            ops.append(
+                _scale_rename(
+                    f"{attn}.indexer.wq_b.weight",
+                    f"{prime_attn}.compressor.indexer.q_b_proj.weight",
+                )
+            )
     return ops
 
 
 def conversion_chain(config) -> list[ConvOp]:
     # Neither HF nor prime-rl instantiates the multi-token-prediction heads a V4 checkpoint
     # ships. They sit at the top level (`mtp.0.hc_attn_base`, ...), never nested inside a layer.
+    quantized = fp8_weight_block_size(config) is not None
     ops: list[ConvOp] = [
         Drop("mtp.", is_prefix=True),
         Rename("head.weight", "lm_head.weight"),
@@ -103,6 +137,7 @@ def conversion_chain(config) -> list[ConvOp]:
                 layer_idx,
                 config.layer_types[layer_idx],
                 is_hash=layer_idx < config.num_hash_layers,
+                quantized=quantized,
             )
         )
     # Every op above is written in the bare on-disk spelling, so the `model.` prefix that
