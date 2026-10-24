@@ -35,6 +35,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from arctic_platform.common.packing import pack_microbatch
+from arctic_platform.common.packing import pad_packed_microbatch
+from arctic_platform.common.packing import select_rows
+from arctic_platform.common.packing import token_shard
+from arctic_platform.common.packing import window_cu_seqlens
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
@@ -62,7 +67,9 @@ from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
 from arctic_platform.rl.processors.grpo import _sampler_kl
 from arctic_platform.rl.processors.grpo import compute_prox_logp_approximations
 from arctic_platform.rl.processors.grpo import grpo_loss
+from arctic_platform.rl.processors.packing import pack_sequences
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
 
 
@@ -1320,6 +1327,72 @@ class TestMigratedGrpo(TestCasePlus):
             with self.subTest(**masking):
                 torch_assert_close(runs[0.25][0] - runs[0.0][0], torch.full((1, 4), -0.25 / 4))
                 self.assertEqual(runs[0.25][1]["sampler_kl_token_count"], 4.0)
+
+    def test_sampler_kl_per_sequence_weights_train_like_their_per_token_expansion(self):
+        # Rows of 7, 3 and 6 real tokens, one weight per row, through every layout a worker's loss receives.
+        set_seed(0)
+        valid = torch.arange(8) < torch.tensor([[7], [3], [6]])
+        rows = {
+            "input_ids": torch.randint(1, 100, (3, 8)),
+            "position_ids": torch.arange(8).expand(3, 8),
+            "logprobs": -torch.rand((3, 8)) - 0.1,
+            "old_log_probs_shifted": -torch.rand((3, 8)) - 0.1,
+            "advantages": torch.randn((3, 8)),
+            "loss_mask": valid & (torch.arange(8) > 0),
+        }
+        row_weights = torch.tensor([0.5, 0.0, 2.0])
+        config = {"sampler_kl_coef": 0.25, "sampler_kl_type": "k3"}
+
+        def squeezed(call):
+            return {
+                k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v
+                for k, v in call.items()
+            }
+
+        def model_calls(weights):
+            batch = {**rows, "sampler_kl_weights": weights}
+            context = {k: v for k, v in batch.items() if k not in ("input_ids", "position_ids")}
+            resolve_loss("ap_grpo").batching_callback(
+                {
+                    "input_ids": rows["input_ids"],
+                    "processing": {"loss_fn": "ap_grpo", "config": config},
+                    "context": context,
+                }
+            )
+            yield "padded", batch
+            packed = pack_sequences({**batch, "attention_mask": valid})
+            packed.pop("_pack_meta")
+            yield "pack_sequences", squeezed(packed)
+            # Dispatch: one DP shard / microbatch holding rows 2 and 0, packed, then cut into SP windows.
+            index = torch.tensor([2, 0])
+            shard = select_rows(
+                {"input_ids": rows["input_ids"], "position_ids": rows["position_ids"], "context": context}, index, 3
+            )
+            shard["attention_mask"] = valid.index_select(0, index)
+            for sp in (1, 2, 4):
+                call, metadata = pad_packed_microbatch(*pack_microbatch(shard), sp)
+                for rank in range(sp):
+                    window = token_shard(call, metadata, sp, rank)
+                    flat = {"input_ids": window["input_ids"], **window["context"]}
+                    yield f"sp={sp} rank={rank}", {
+                        **squeezed(flat),
+                        "cu_seqlens": window_cu_seqlens(metadata, sp, rank),
+                    }
+
+        def trained(call):
+            call = dict(call)
+            logprobs = call.pop("logprobs").clone().requires_grad_()
+            resolve_loss("ap_grpo").validation_callback(call, config)
+            loss, _ = grpo_loss({"logprobs": logprobs}, call, {}, config, "cpu")
+            loss.backward()
+            return loss.detach(), logprobs.grad
+
+        per_token = row_weights[:, None].expand(3, 8).contiguous()
+        for (name, per_sequence_call), (_, per_token_call) in zip(model_calls(row_weights), model_calls(per_token)):
+            with self.subTest(layout=name):
+                expected, actual = trained(per_token_call), trained(per_sequence_call)
+                torch_assert_close(actual[0], expected[0], rtol=0, atol=0)
+                torch_assert_close(actual[1], expected[1], rtol=0, atol=0)
 
     def test_sampler_kl_estimators_give_the_kl_gradient_in_expectation_and_cap_their_tails(self):
         # Exact expectation over a categorical sampler q: E_q[d k(log p - log q) / dz] vs d KL(q || p) / dz = p - q.
