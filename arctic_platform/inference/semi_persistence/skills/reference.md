@@ -89,8 +89,8 @@ restoring job sets is visible there.
 | `stage()` | Snapshot main + drafter params GPU -> that worker's CPU buffer |
 | `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
 | `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
-| `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget; if the buffer is pageable, also form a small pinned ring (`SEMIP_RING_*`) |
-| `restore_weights()` | Execute the cached plan: buffer -> (pinned ring, if formed) -> one reused GPU staging buffer -> scatter |
+| `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget; if the buffer is pageable, also form a small pinned double buffer (`SEMIP_PINNED_BUFFER_*`) |
+| `restore_weights()` | Execute the cached plan: buffer -> (pinned double buffer, if formed) -> one reused GPU staging buffer -> scatter |
 
 `save_weights` / `load_weights` are optional: without them the staged
 weights stay inside the CRIU image, which is what the orchestrator does.
@@ -313,9 +313,8 @@ on reboot and lets `criu_restore` validate the image against the instance.
 | `SEMIP_REPLICA_ID`, `SEMIP_NUM_REPLICAS` | Set per worker by `ReplicaPool`: node-local slot and replicas on that node. With more than one, `model_dir` gains `/replica<K>`. Not a user flag |
 | `SEMIP_LOG_TARGET` | Where the pod log is opened. Default `/proc/1/fd/1`; point it at your own shell's stdout to keep a hand-run experiment out of a job's log. In a Ray actor, `tee_tree_to_ray` re-points it at a pipe of the actor's own |
 | `SEMIP_LOG_TO_RAY=0` | Keep the tree's output out of the Ray actor's stdout (`ct tui`, `ct download-log`); it then reaches the pod log only. Default on: the actor copies every line to both |
-| `SEMIP_RING_BYTES` | Pinned bytes per worker for the ring `plan_restore_weights` forms when the host copy is pageable. Default 2 GiB; `0` forms no ring, and `restore_weights` copies straight from pageable memory (slow). Read by `Instance` at plan time, so a restore job's `extra_env` reaches it |
-| `SEMIP_RING_SLOTS` | Slots the ring is split into. Default 4 (512 MiB each) |
-| `SEMIP_RING_COPY_THREADS` | Threads filling each slot from the pageable copy. Default 4 |
+| `SEMIP_PINNED_BUFFER_BYTES` | Pinned bytes per worker for the double buffer `plan_restore_weights` forms when the host copy is pageable, split into two halves: one fills from the pageable copy while the other copies to the GPU. Default 1 GiB (2 x 512 MiB); `0` forms none, and `restore_weights` copies straight from pageable memory (slow). The copy is bound by the fill, so more halves or bigger ones copied no faster on GLM TP=8 or Qwen TP=1. Read by `Instance` at plan time, so a restore job's `extra_env` reaches it |
+| `SEMIP_PINNED_BUFFER_THREADS` | Threads filling each half from the pageable copy. Default 4 |
 | `_SEMIP_CHILD_DROP_CAPS=1` | Internal only, set by the worker across the child's spawn. Not a user flag |
 
 ---

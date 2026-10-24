@@ -2379,7 +2379,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     # puts the real pinned-buffer sizes on the handle, and
     # plan_restore_weights() reads them synchronously when it is called.
     # No repin(): the host copy stays pageable, and plan_restore_weights()
-    # forms the small pinned ring restore_weights() stages it through.
+    # forms the small pinned double buffer restore_weights() stages it through.
     try:
         inst.criu_restore().wait()
         inst.cuda_restore(gpus=gpus).wait()
@@ -3480,7 +3480,7 @@ class _SemiPEngine:
         # frees the weight memory, and wake_up_weights() only re-allocates the
         # parameter tensors without repopulating them. Without it the model
         # generates from uninitialized weights and never errors. No
-        # plan_restore_weights() here: the chunk plan and the pinned ring
+        # plan_restore_weights() here: the chunk plan and the double buffer
         # formed at restore time stay on the workers across sleep.
         self._inst.wake_up_weights()
         self._inst.restore_weights()

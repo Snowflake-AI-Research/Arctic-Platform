@@ -62,16 +62,15 @@ _spawn_ctx = mp.get_context("spawn")
 _IMAGE_DIR = "image"
 _WEIGHT_DIR = "weight"
 
-# The pinned ring plan_restore_weights forms when the host copy is pageable,
-# per worker: _RING_BYTES split into _RING_SLOTS slots, each filled by
-# _RING_COPY_THREADS threads.  Each is overridable by the environment variable
-# beside it; SEMIP_RING_BYTES=0 forms no ring.  Read here, in the process that
+# The pinned double buffer plan_restore_weights forms when the host copy is
+# pageable, per worker: SEMIP_PINNED_BUFFER_BYTES split into two halves, each
+# filled by SEMIP_PINNED_BUFFER_THREADS threads while the other copies to the
+# GPU; SEMIP_PINNED_BUFFER_BYTES=0 forms none.  Read here, in the process that
 # drives the restore, and sent with the command: a restored child still has
 # the environment of the job that dumped it.
-_RING_SETTINGS = (
-    ("ring_bytes", "SEMIP_RING_BYTES", 2 * 2**30),
-    ("ring_slots", "SEMIP_RING_SLOTS", 4),
-    ("copy_threads", "SEMIP_RING_COPY_THREADS", 4),
+_PINNED_BUFFER_SETTINGS = (
+    ("buffer_bytes", "SEMIP_PINNED_BUFFER_BYTES", 2**30),
+    ("buffer_threads", "SEMIP_PINNED_BUFFER_THREADS", 4),
 )
 
 _next_instance_id = 0
@@ -807,12 +806,12 @@ class Instance:
 
         Two things, both cached on each worker.  The chunk plan, under a
         staging budget computed below.  And, when the host copy is pageable,
-        a small pinned ring that restore_weights stages it through: per
-        worker ``SEMIP_RING_BYTES`` (default 2 GiB) split into
-        ``SEMIP_RING_SLOTS`` (default 4) slots, each filled by
-        ``SEMIP_RING_COPY_THREADS`` (default 4) threads.  A host copy that is
-        already pinned (``repin``) needs no ring, and ``SEMIP_RING_BYTES=0``
-        forms none, leaving a slow direct copy from pageable memory.
+        a small pinned double buffer that restore_weights stages it through:
+        per worker ``SEMIP_PINNED_BUFFER_BYTES`` (default 1 GiB) split into
+        two halves, each filled by ``SEMIP_PINNED_BUFFER_THREADS`` (default
+        4) threads.  A host copy that is already pinned (``repin``) needs no
+        double buffer, and ``SEMIP_PINNED_BUFFER_BYTES=0`` forms none,
+        leaving a slow direct copy from pageable memory.
 
         The staging budget is computed from instance state populated by
         ``init`` (cold start) or by ``criu_restore`` reading meta.json
@@ -850,11 +849,11 @@ class Instance:
             util = self.vllm_config["gpu_memory_utilization"]
             allotment = int(self.total_gpu_bytes * util)
             mb = int(0.9 * min(pinned, allotment - pinned))
-        ring = {key: int(os.environ.get(env) or default)
-                for key, env, default in _RING_SETTINGS}
+        staging = {key: int(os.environ.get(env) or default)
+                   for key, env, default in _PINNED_BUFFER_SETTINGS}
         self._log(f"plan_restore_weights(max_buffer_bytes={mb}, "
-                  + ", ".join(f"{k}={v}" for k, v in ring.items()) + ")")
-        return self._send("plan_restore_weights", max_buffer_bytes=mb, **ring)
+                  + ", ".join(f"{k}={v}" for k, v in staging.items()) + ")")
+        return self._send("plan_restore_weights", max_buffer_bytes=mb, **staging)
 
     def restore_weights(self):
         """Copy the staged host copy into model parameters.
@@ -862,7 +861,7 @@ class Instance:
         Pure execution of what a prior ``plan_restore_weights()`` cached on
         each worker.  For each chunk of the plan, the worker copies a slice
         of the host copy to a single reused GPU staging buffer -- through
-        the pinned ring if the plan formed one, directly otherwise -- and
+        the pinned double buffer if the plan formed one, directly otherwise -- and
         then scatters into ``model.named_parameters()`` in place.  If no
         plan is cached (paths that skip ``plan_restore_weights``), falls
         back to a single-chunk direct copy.

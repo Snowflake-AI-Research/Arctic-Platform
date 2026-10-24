@@ -1,12 +1,12 @@
-"""The pinned ring plan_restore_weights forms and restore_weights stages through.
+"""The pinned double buffer plan_restore_weights forms and restore_weights stages through.
 
-``vllm_child`` imports torch and CUDA at module scope, so the ring functions are
-lifted out of the source -- the treatment ``test_pod_log`` gives its helpers --
-and run on CPU tensors with the CUDA pieces stubbed: registering is recorded
-instead of done, and the side stream and events do nothing. That checks the
-bookkeeping (which plans form a ring, that every byte arrives across slot
-boundaries, that nothing stays registered), not the overlap, which only a GPU
-shows.
+``vllm_child`` imports torch and CUDA at module scope, so the double-buffer
+functions are lifted out of the source -- the treatment ``test_pod_log`` gives
+its helpers -- and run on CPU tensors with the CUDA pieces stubbed: registering
+is recorded instead of done, and the side stream and events do nothing. That
+checks the bookkeeping (which plans form a double buffer, that every byte
+arrives across half boundaries, that nothing stays registered), not the
+overlap, which only a GPU shows.
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_NAMES = ("_semip_form_ring", "_semip_free_ring", "_semip_ring_h2d",
-          "_semip_plan_load_weights")
+_NAMES = ("_semip_form_double_buffer", "_semip_free_double_buffer",
+          "_semip_double_buffer_h2d", "_semip_plan_load_weights")
 
 
 class _Nop:
@@ -79,48 +79,48 @@ def _worker(total=10_000, pinned=False):
                                  _semip_pinned=pinned, device="cpu")
 
 
-def test_a_pageable_buffer_gets_the_ring_it_asks_for(child):
+def test_a_pageable_buffer_gets_the_double_buffer_it_asks_for(child):
     worker = _worker()
-    out = child._semip_plan_load_weights(worker, None, 4096, 4, 2)
-    ring = worker._semip_ring
-    assert len(ring["slots"]) == 4 and ring["slot_bytes"] == 1024
-    assert ring["copy_threads"] == 2
-    assert len(child.registered) == 4
-    assert (out["ring_bytes"], out["ring_slots"], out["pinned"]) == (4096, 4, False)
+    out = child._semip_plan_load_weights(worker, None, 4096, 2)
+    db = worker._semip_double_buffer
+    assert len(db["halves"]) == 2 and db["half_bytes"] == 2048
+    assert db["threads"] == 2
+    assert len(child.registered) == 2
+    assert (out["double_buffer_bytes"], out["pinned"]) == (4096, False)
 
 
-@pytest.mark.parametrize("pinned,ring_bytes", [
+@pytest.mark.parametrize("pinned,buffer_bytes", [
     (True, 4096),    # a repinned host copy is copied directly
-    (False, 0),      # SEMIP_RING_BYTES=0
+    (False, 0),      # SEMIP_PINNED_BUFFER_BYTES=0
     (False, None),   # a caller that sends no settings
 ])
-def test_no_ring_when_pinned_or_asked_for_none(child, pinned, ring_bytes):
+def test_no_double_buffer_when_pinned_or_asked_for_none(child, pinned, buffer_bytes):
     worker = _worker(pinned=pinned)
-    out = child._semip_plan_load_weights(worker, None, ring_bytes, 4, 2)
-    assert getattr(worker, "_semip_ring", None) is None
-    assert out["ring_bytes"] == 0 and not child.registered
+    out = child._semip_plan_load_weights(worker, None, buffer_bytes, 2)
+    assert getattr(worker, "_semip_double_buffer", None) is None
+    assert out["double_buffer_bytes"] == 0 and not child.registered
 
 
-def test_planning_again_replaces_the_ring_instead_of_leaking_it(child):
+def test_planning_again_replaces_the_double_buffer_instead_of_leaking_it(child):
     worker = _worker()
-    child._semip_plan_load_weights(worker, None, 4096, 4, 2)
-    child._semip_plan_load_weights(worker, None, 2048, 2, 2)
-    assert len(child.registered) == 2   # 6 if the first ring had leaked
-    assert child._semip_free_ring(worker) == 2048
-    assert not child.registered and worker._semip_ring is None
+    child._semip_plan_load_weights(worker, None, 4096, 2)
+    child._semip_plan_load_weights(worker, None, 2048, 2)
+    assert len(child.registered) == 2   # 4 if the first double buffer had leaked
+    assert child._semip_free_double_buffer(worker) == 2048
+    assert not child.registered and worker._semip_double_buffer is None
 
 
-@pytest.mark.parametrize("n,slot_bytes,slots,threads", [
-    (10_000, 1024, 4, 3),    # wraps the ring twice, ragged last piece
-    (1000, 1024, 4, 4),      # smaller than one slot
-    (4096, 1024, 4, 1),      # exactly fills the ring
+@pytest.mark.parametrize("n,half_bytes,threads", [
+    (10_000, 1024, 3),    # alternates halves ten times, ragged last piece
+    (1000, 1024, 4),      # smaller than one half
+    (2048, 1024, 1),      # exactly fills both halves
 ])
-def test_every_byte_arrives_slot_by_slot(child, n, slot_bytes, slots, threads):
+def test_every_byte_arrives_half_by_half(child, n, half_bytes, threads):
     worker = _worker(total=n)
-    child._semip_form_ring(worker, slot_bytes * slots, slots, threads)
+    child._semip_form_double_buffer(worker, 2 * half_bytes, threads)
     src = worker._semip_buf
     dst = torch.zeros(n + 7, dtype=torch.uint8)
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        child._semip_ring_h2d(worker._semip_ring, src, dst[:n], pool)
+        child._semip_double_buffer_h2d(worker._semip_double_buffer, src, dst[:n], pool)
     assert torch.equal(dst[:n], src)
     assert not dst[n:].any()

@@ -249,9 +249,9 @@ class InstanceBase(ABC):
 
         Splits the parameter index into chunks of ``<= budget`` bytes
         and caches the result on the worker.  If the host buffer is
-        pageable, also forms a small pinned ring on the worker
-        (``SEMIP_RING_BYTES``, ``SEMIP_RING_SLOTS``,
-        ``SEMIP_RING_COPY_THREADS``; ``SEMIP_RING_BYTES=0`` forms none).
+        pageable, also forms a small pinned double buffer on the worker
+        (``SEMIP_PINNED_BUFFER_BYTES``, ``SEMIP_PINNED_BUFFER_THREADS``;
+        ``SEMIP_PINNED_BUFFER_BYTES=0`` forms none).
         Subsequent ``restore_weights()`` calls execute the cached plan.
         """
 
@@ -262,7 +262,7 @@ class InstanceBase(ABC):
         Pure execution against the chunk plan cached by a prior
         ``plan_restore_weights()``.  For each chunk the worker copies
         a slice of the host buffer into a single reused GPU staging
-        buffer (PCIe H2D) -- through the pinned ring if the plan formed
+        buffer (PCIe H2D) -- through the pinned double buffer if the plan formed
         one, directly otherwise -- and then scatters into
         ``model.named_parameters()`` in place.  When no plan is cached,
         falls back to a single-chunk path identical to the pre-chunk
