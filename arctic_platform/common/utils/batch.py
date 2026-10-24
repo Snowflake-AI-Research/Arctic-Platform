@@ -249,6 +249,18 @@ def unpack_batch(batch: dict) -> tuple:
     return {}, batch_data, meta_data, processing
 
 
+def _row_bounds(n_rows: int, num_chunks: int) -> list[tuple[int, int]]:
+    """Same cuts as ``torch.tensor_split``: the first ``n % k`` chunks are one longer."""
+    base, extra = divmod(n_rows, num_chunks)
+    bounds = []
+    start = 0
+    for index in range(num_chunks):
+        size = base + (1 if index < extra else 0)
+        bounds.append((start, start + size))
+        start += size
+    return bounds
+
+
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
@@ -268,8 +280,7 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        chunk_size = (len(val) + num_chunks - 1) // num_chunks
-        return [val[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+        return [val[start:end] for start, end in _row_bounds(len(val), num_chunks)]
     return [val] * num_chunks
 
 
@@ -279,6 +290,30 @@ def split_dict(d: dict, num_chunks: int) -> list[dict]:
         return [{}] * num_chunks
     split_vals = {k: _split_value(v, num_chunks) for k, v in d.items()}
     return [{k: split_vals[k][i] for k in d} for i in range(num_chunks)]
+
+
+def _flatten_assignment(assignment: list[list[int]] | None) -> list[int] | None:
+    if assignment is None:
+        return None
+    return [row for rows in assignment for row in rows]
+
+
+def _reorder_rows(batch_data: dict, indices: list[int]) -> None:
+    """Permute row-aligned tensors and lists into assignment order.
+
+    A value whose length is not the row count stays put. Lists use the same
+    index order as tensors so a per-row field cannot stay in arrival order
+    while its tensors move.
+    """
+    n_rows = len(indices)
+    order = None
+    for key, value in list(batch_data.items()):
+        if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == n_rows:
+            if order is None:
+                order = torch.tensor(indices, dtype=torch.long)
+            batch_data[key] = value.index_select(0, order.to(device=value.device))
+        elif isinstance(value, list) and len(value) == n_rows:
+            batch_data[key] = [value[row] for row in indices]
 
 
 def reconstruct_position_ids_(batch_data: dict) -> None:
@@ -352,20 +387,18 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     if meta_data.get("drop_position_ids", False) and "position_ids" not in batch_data:
         reconstruct_position_ids_(batch_data)
 
-    # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
-    # in rl/__init__.py → common.utils while this package is
-    # still initializing (circular after the rl→common move).
-    if meta_data.get("load_balancer", False):
-        from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
 
-        max_group_length_threshold = meta_data.get("zorro_train_max_rollouts", meta_data["rollout_n"])
-        batch_data, reorder_indices = reorg_global_batch(
-            batch_data,
-            response_length=meta_data["max_response_len"],
-            world_size=num_workers,
-            max_token_len=meta_data["max_token_len_per_gpu"],
-            max_group_length_threshold=max_group_length_threshold,
-        )
+    assignment = assign_balanced_batch(
+        num_workers,
+        meta_data,
+        input_ids=batch_data.get("input_ids"),
+        attention_mask=batch_data.get("attention_mask"),
+        prompt_group_ids=batch_data.get("prompt_group_ids"),
+    )
+    reorder_indices = _flatten_assignment(assignment)
+    if reorder_indices is not None:
+        _reorder_rows(batch_data, reorder_indices)
 
     batch_data_shards = split_dict(batch_data, num_workers)
     shards = []

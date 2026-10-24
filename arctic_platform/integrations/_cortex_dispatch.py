@@ -16,8 +16,10 @@
 
 Translates the ``arctic_platform.rl`` config SkyRL hands us into a unified
 client config with a ``CortexConfig`` backend, wraps ``AsyncArcticRLClient``,
-and rewrites the two calls whose shapes diverge on Cortex: ``fwd_bwd`` (payload
-reshape) and ``fwd_no_grad`` (zeros stub — Cortex has no ``/forward``).
+and rewrites the two calls whose shapes diverge on Cortex: ``fwd_bwd`` and
+``fwd_no_grad``. Both send the on-prem ``{batch, meta}`` payload through the
+Cortex wire. ``fwd_no_grad`` returns the server logprobs under the names
+SkyRL reads.
 
 The legacy config is consumed as an input shape only; nothing here extends the
 legacy client. Reached via
@@ -30,7 +32,7 @@ import asyncio
 from typing import Any
 
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
-from arctic_platform.integrations._cortex_shared import zero_logprobs_like
+from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
 from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
 
 __all__ = ["create_cortex_client", "legacy_max_seq_len", "placement_timeout"]
@@ -167,19 +169,29 @@ class _CortexClientShim:
         return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
 
     async def fwd_no_grad(self, batch: dict, **kwargs: Any) -> dict:
-        # Cortex has no /forward; see zero_logprobs_like for why zeros are sound
-        # as the policy snapshot and never as pi_ref.
+        # A reference model would need the log-prob sub-job. Zeros there would
+        # turn a KL term into a function of the live policy.
         if kwargs.get("reference_model"):
             raise NotImplementedError(
                 "cortex backend cannot serve reference-model log-probs: it has no "
-                "/forward sub-job, and substituting zeros would silently corrupt "
+                "reference forward, and substituting zeros would silently corrupt "
                 "the KL term. Disable KL (e.g. SkyRL "
                 "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
                 "See docs/cortex-integration.md#supported-recipes."
             )
-        # Both spellings of each key: SkyRL reads them inconsistently by call site.
-        z = zero_logprobs_like(batch)
-        return {"batch": {"logprobs": z, "log_probs": z, "entropy": z, "entropies": z}}
+        result = await self._client.fwd_no_grad(to_cortex_fwd_payload(batch))
+        logprobs = result.get("logprobs") if isinstance(result, dict) else None
+        if logprobs is None and isinstance(result, dict):
+            body = result.get("batch")
+            if isinstance(body, dict):
+                logprobs = body.get("logprobs", body.get("log_probs"))
+        if logprobs is None:
+            raise RuntimeError(
+                "cortex forward returned no logprobs; "
+                f"got keys={list(result) if isinstance(result, dict) else type(result).__name__}"
+            )
+        # SkyRL reads logprobs and log_probs at different call sites.
+        return {"batch": {"logprobs": logprobs, "log_probs": logprobs}}
 
     async def save_weights(self, path: str) -> dict:
         # Cortex sub-jobs don't share disk; a silent no-op would leave
