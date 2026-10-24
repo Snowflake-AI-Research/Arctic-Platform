@@ -868,10 +868,14 @@ class MoE(nn.Module):
         # rank with 1-token dummy chunks (DeepEP's kernel rejects 0-token inputs). The
         # dummy outputs are concatenated so their backward collectives still fire, then
         # sliced off below.
-        local_num_chunks = (x.shape[0] + chunk_size - 1) // chunk_size
-        num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
-        torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
-        num_chunks = int(num_chunks_tensor.item())
+        # Unchunked, every rank sends its tokens as one chunk, so there is nothing to agree on; the all-reduce
+        # and its .item() would stall the stream and the host on the slowest EP rank once per MoE call.
+        num_chunks = 1
+        if self.deepep_token_chunk_size:
+            local_num_chunks = (x.shape[0] + chunk_size - 1) // chunk_size
+            num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
+            torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
+            num_chunks = int(num_chunks_tensor.item())
 
         chunk_bounds = [(start, min(start + chunk_size, x.shape[0])) for start in range(0, x.shape[0], chunk_size)]
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
