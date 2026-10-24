@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """CPU-only ownership tests for Ray server resource teardown."""
 
@@ -363,6 +375,7 @@ class TestRayClientLifecycle(TestCasePlus):
     def test_job_destroy_failure_still_runs_state_shutdown(self):
         log: list[str] = []
         client = object.__new__(ArcticRLRayClient)
+        client._owns_server_state = True
         client._training_job_id = 1
         client._sampling_job_id = 2
         client._log_prob_job_id = None
@@ -386,6 +399,46 @@ class TestRayClientLifecycle(TestCasePlus):
         self.assertIsNone(client._training_job_id)
         self.assertIsNone(client._sampling_job_id)
         self.assertIsNone(client._log_prob_job_id)
+        self.assertFalse(client._owns_server_state)
+
+    def test_reconnected_client_shutdown_leaves_the_state_actor_alive(self):
+        """A client attached via ``training_job_id`` destroys jobs and leaves the shared state."""
+        log: list[str] = []
+        state = object()
+
+        class _Server:
+            def __init__(self, server_state):
+                self.state = server_state
+
+            async def destroy(self, job_id, job_type):
+                log.append(f"destroy-{job_type}-{job_id}")
+                return {}
+
+            async def shutdown(self):
+                log.append("shutdown-server")
+
+        config = SimpleNamespace(training_job_id=1, sampling_job_id=2, log_prob_job_id=None)
+        with (
+            patch("arctic_platform.rl.ray_client.ArcticRLRayServer", _Server),
+            patch(
+                "arctic_platform.rl.ray_client.ray.kill",
+                side_effect=AssertionError("reconnected client must not kill the state actor"),
+            ),
+            patch(
+                "arctic_platform.common.ray_server.ray.kill",
+                side_effect=AssertionError("reconnected client must not kill the state actor"),
+            ),
+        ):
+            client = ArcticRLRayClient(config, state)
+
+        async def _run():
+            await client.shutdown()
+
+        asyncio.run(_run())
+        self.assertEqual(log, ["destroy-training-1", "destroy-sampling-2"])
+        self.assertIs(client.get_server_state(), state)
+        self.assertFalse(client._owns_server_state)
+        self.assertIsNone(client._training_job_id)
 
 
 class TestRayClientSyncWeightsChecksum(TestCasePlus):

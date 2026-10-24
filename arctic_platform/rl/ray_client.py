@@ -66,12 +66,15 @@ class ArcticRLRayClient:
             # Reconnect mode: attach to pre-existing jobs without calling /initialize.
             # Populated by reconnect_config(); used when passing a client across Ray
             # process boundaries where the live object cannot be serialized.
+            # The other process owns the state actor and its placement group.
+            self._owns_server_state = False
             self._training_job_id = config.training_job_id
             self._sampling_job_id = config.sampling_job_id
             self._log_prob_job_id = config.log_prob_job_id
 
             self._arctic_rl_ray_server_state = rl_server_state
         else:
+            self._owns_server_state = True
             self._training_job_id: int | None = None
             self._sampling_job_id: int | None = None
             self._log_prob_job_id: int | None = None
@@ -508,7 +511,13 @@ class ArcticRLRayClient:
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Destroy all jobs and stop the local server if applicable."""
+        """Destroy this client's jobs. Only the owner releases the state actor.
+
+        A reconnected client (``config.training_job_id`` set) attaches to a state
+        actor another process created. ``destroy`` on that client still tears down
+        the jobs, but killing the actor or removing its scheduler placement group
+        would take the owner's server down mid-run.
+        """
         try:
             for job_type, job_id in [
                 ("training", self._training_job_id),
@@ -519,8 +528,10 @@ class ArcticRLRayClient:
                     await self._destroy_job(job_id, job_type)
         finally:
             try:
-                await self._arctic_rl_ray_server.shutdown()
+                if self._owns_server_state:
+                    await self._arctic_rl_ray_server.shutdown()
             finally:
+                self._owns_server_state = False
                 self._training_job_id = None
                 self._sampling_job_id = None
                 self._log_prob_job_id = None
