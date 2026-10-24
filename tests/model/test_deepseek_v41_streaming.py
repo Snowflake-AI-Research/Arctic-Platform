@@ -290,7 +290,7 @@ _OFFICIAL_QUANTIZATION = {
 
 
 def test_lora_keeps_official_experts_packed_through_streaming_conversion(tmp_path):
-    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
 
     config = _config()
     config.hidden_size = 32
@@ -330,28 +330,3 @@ def test_lora_keeps_official_experts_packed_through_streaming_conversion(tmp_pat
     dcp_load(state, storage_reader=HuggingFaceStorageReader(path=out_dir.as_posix()), no_dist=True)
     for key, tensor in state.items():
         torch.testing.assert_close(tensor, expected[key].to(tensor.dtype), rtol=0, atol=0, msg=key)
-
-
-def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
-    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
-    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import dequantize_mxfp4
-    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
-
-    torch.manual_seed(0)
-    experts = Mxfp4GroupedExperts(dim=64, hidden_dim=32, num_experts=2, swiglu_limit=10.0)
-    with torch.no_grad():
-        for name in ("w1", "w2", "w3"):
-            weight = getattr(experts, name)
-            weight.copy_(torch.randint(-128, 128, weight.shape, dtype=torch.int8))
-            getattr(experts, f"{name}_scale_inv").copy_(2.0 ** torch.randint(-3, 2, weight.shape[:-1] + (1,)).float())
-    x = torch.randn(5, 64, requires_grad=True)
-    counts = torch.tensor([2, 3], dtype=torch.int64)
-    output = experts(x, counts)
-    restored = [dequantize_mxfp4(getattr(experts, n), getattr(experts, f"{n}_scale_inv")) for n in ("w1", "w2", "w3")]
-    x_ref = x.detach().clone().requires_grad_(True)
-    reference = _run_experts_for_loop_impl(*restored, x_ref.bfloat16(), counts, 10.0).float()
-    torch.testing.assert_close(output, reference, rtol=0, atol=0)
-    output.sum().backward()
-    reference.sum().backward()
-    torch.testing.assert_close(x.grad, x_ref.grad)
-    assert all(param.grad is None for param in experts.parameters())

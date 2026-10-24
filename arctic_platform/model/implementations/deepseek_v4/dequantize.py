@@ -65,6 +65,10 @@ def dequantize_weight(weight: Tensor, scale: Tensor) -> Tensor:
     return (values * scale_expanded).bfloat16()
 
 
+# The unpack makes int64 indices and float32 copies, about 30 bytes per packed byte.
+_EXPERTS_PER_DEQUANTIZE = 4
+
+
 def dequantize_mxfp4(weight: Tensor, scale: Tensor) -> Tensor:
     """Unpack packed MXFP4 expert weights to ``bfloat16``.
 
@@ -75,7 +79,13 @@ def dequantize_mxfp4(weight: Tensor, scale: Tensor) -> Tensor:
     """
     if weight.dtype != torch.int8:
         raise ValueError(f"MXFP4 expert weight arrived as {weight.dtype}, expected int8")
-    return dequantize_weight(weight, scale)
+    if weight.dim() < 3:
+        return dequantize_weight(weight, scale)
+    out = torch.empty((*weight.shape[:-1], 2 * weight.shape[-1]), dtype=torch.bfloat16, device=weight.device)
+    for start in range(0, weight.shape[0], _EXPERTS_PER_DEQUANTIZE):
+        end = start + _EXPERTS_PER_DEQUANTIZE
+        out[start:end] = dequantize_weight(weight[start:end], scale[start:end])
+    return out
 
 
 def decode_e8m0_scales_(state_dict: StateDict) -> None:

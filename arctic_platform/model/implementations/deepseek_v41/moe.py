@@ -25,9 +25,9 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
+from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
 from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_experts
-from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
 from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
