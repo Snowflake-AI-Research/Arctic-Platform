@@ -29,6 +29,7 @@ from arctic_platform.model.implementations.deepseek_v4.conversion_ops import Pre
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import Rename
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import StateDict
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import routed_experts_op
+from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_experts
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,16 @@ def _layer_ops(config, layer_idx: int) -> list[ConvOp]:
             proj_order=(("w1", "w1"), ("w2", "w2"), ("w3", "w3")),
         ),
     ]
+    if packs_experts(config):
+        ops.append(
+            routed_experts_op(
+                p,
+                hf_experts="ffn.experts",
+                prime_experts="mlp.experts",
+                proj_order=(("w1_scale_inv", "w1"), ("w2_scale_inv", "w2"), ("w3_scale_inv", "w3")),
+                hf_proj_suffix=".scale",
+            )
+        )
     if layer_idx in config.kv_source_layer_ids:
         comp, prime_comp = f"{attn}.compressor", f"{prime_attn}.compressor"
         ops += [

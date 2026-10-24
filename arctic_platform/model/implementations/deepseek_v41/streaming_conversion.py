@@ -18,7 +18,8 @@
 The conversion chain is replayed on key metadata only. Each output tensor is a list of source
 pieces whose bytes are written back to back, so a dim-0 ``Stack`` of per-expert tensors is
 the plain concatenation of the experts' bytes. Pass-through pieces are copied as raw byte
-ranges in bounded chunks; quantized pieces are dequantized one source tensor at a time. Peak
+ranges in bounded chunks; quantized pieces are dequantized, and packed-expert scales widened to
+float32, one source tensor at a time. Peak
 host memory is one chunk or one source tensor, never a whole shard, table, or model.
 """
 
@@ -46,6 +47,7 @@ from arctic_platform.model.implementations.deepseek_v4.conversion_ops import Sta
 from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_weight
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import RejectUnexplained
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import log_deferred_checkpoint_keys
+from arctic_platform.model.implementations.deepseek_v41.dequantize import is_packed_expert_scale
 from arctic_platform.model.implementations.deepseek_v41.dequantize import quantized_pairs
 
 logger = logging.getLogger(__name__)
@@ -95,6 +97,7 @@ class SourceTensor:
 class Piece:
     source: SourceTensor
     scale: SourceTensor | None = None
+    widen: bool = False
 
 
 @dataclass
@@ -138,20 +141,25 @@ def _source_files(source_path: Path) -> list[Path]:
     return sorted(source_path.glob("*.safetensors"))
 
 
-def _initial_plan(source_path: Path) -> dict[str, Planned]:
+def _initial_plan(source_path: Path, *, keep_experts: bool = False) -> dict[str, Planned]:
     sources: dict[str, SourceTensor] = {}
     for path in _source_files(source_path):
         for key, tensor in read_header(path).items():
             if key in sources:
                 raise ValueError(f"{key} appears in both {sources[key].file.name} and {path.name}")
             sources[key] = tensor
-    pairs = quantized_pairs(sources)
+    pairs = quantized_pairs(sources, keep_experts=keep_experts)
     scales = set(pairs.values())
     plan: dict[str, Planned] = {}
     for key, tensor in sources.items():
         if key in scales:
             continue
         scale_key = pairs.get(key)
+        if keep_experts and is_packed_expert_scale(key):
+            if tensor.dtype != "F8_E8M0":
+                raise ValueError(f"{key} is a packed-expert scale but dtype {tensor.dtype}")
+            plan[key] = Planned("F32", tensor.shape, [Piece(tensor, widen=True)])
+            continue
         if scale_key is None:
             plan[key] = Planned(tensor.dtype, tensor.shape, [Piece(tensor)])
             continue
@@ -199,8 +207,8 @@ def _replay(plan: dict[str, Planned], ops: list[ConvOp]) -> None:
             raise NotImplementedError(f"{type(op).__name__} has no streaming form")
 
 
-def plan_prime_conversion(source_path: Path, ops: list[ConvOp]) -> dict[str, Planned]:
-    plan = _initial_plan(Path(source_path))
+def plan_prime_conversion(source_path: Path, ops: list[ConvOp], *, keep_experts: bool = False) -> dict[str, Planned]:
+    plan = _initial_plan(Path(source_path), keep_experts=keep_experts)
     log_deferred_checkpoint_keys(plan)
     _replay(plan, ops)
     return plan
@@ -256,6 +264,12 @@ def _write_dequantized(destination, piece: Piece) -> None:
     destination.write(restored.view(torch.uint8).numpy().tobytes())
 
 
+def _write_widened(destination, piece: Piece) -> None:
+    with safe_open(piece.source.file, framework="pt", device="cpu") as tensors:
+        widened = tensors.get_tensor(piece.source.key).float().contiguous()
+    destination.write(widened.view(torch.uint8).numpy().tobytes())
+
+
 def _write_shard(path: Path, names: list[str], plan: dict[str, Planned], chunk_bytes: int) -> None:
     header: dict[str, dict] = {"__metadata__": {"format": "pt"}}
     offset = 0
@@ -277,7 +291,9 @@ def _write_shard(path: Path, names: list[str], plan: dict[str, Planned], chunk_b
             for name in names:
                 start = destination.tell()
                 for piece in plan[name].pieces:
-                    if piece.scale is None:
+                    if piece.widen:
+                        _write_widened(destination, piece)
+                    elif piece.scale is None:
                         _copy_range(destination, piece.source, handles, chunk_bytes)
                     else:
                         _write_dequantized(destination, piece)
@@ -297,9 +313,10 @@ def write_streaming_prime_cache(
     shard_target_bytes: int = SHARD_TARGET_BYTES,
     chunk_bytes: int = COPY_CHUNK_BYTES,
     workers: int = 8,
+    keep_experts: bool = False,
 ) -> dict[str, Planned]:
     """Write converted shards and, last, the HF index that marks the directory complete."""
-    plan = plan_prime_conversion(Path(source_path), ops)
+    plan = plan_prime_conversion(Path(source_path), ops, keep_experts=keep_experts)
     shards = _assign_shards(plan, shard_target_bytes)
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)

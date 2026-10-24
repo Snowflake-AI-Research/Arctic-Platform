@@ -278,3 +278,80 @@ def test_quantized_engram_table_survives_to_empty():
     assert table.scale.dtype == torch.float8_e8m0fnu
     table.to(dtype=torch.bfloat16)
     assert table.weight.dtype == torch.float8_e4m3fn
+
+
+_OFFICIAL_QUANTIZATION = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+
+
+def test_lora_keeps_official_experts_packed_through_streaming_conversion(tmp_path):
+    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
+
+    config = _config()
+    config.hidden_size = 32
+    config.moe_intermediate_size = 32
+    source = {name: tensor.contiguous() for name, tensor in _published_source(DeepseekV41ForCausalLM(config)).items()}
+    for layer in range(config.num_hidden_layers):
+        for expert in range(4):
+            for proj in ("w1", "w2", "w3"):
+                packed, pscale = _mxfp4_pair(32, 32, seed=layer * 100 + expert * 10 + int(proj[1]))
+                source[f"layers.{layer}.ffn.experts.{expert}.{proj}.weight"] = packed
+                source[f"layers.{layer}.ffn.experts.{expert}.{proj}.scale"] = pscale
+    source_dir = tmp_path / "source"
+    _write_source(source_dir, source)
+
+    config.quantization_config = dict(_OFFICIAL_QUANTIZATION)
+    model = DeepseekV41ForCausalLM(config)
+    experts = model.model.layers[1].mlp.experts
+    assert isinstance(experts, Mxfp4GroupedExperts)
+    assert not any(param.requires_grad for param in experts.parameters())
+
+    expected = model.convert_to_prime(copy.deepcopy(source))
+    assert expected["model.layers.1.mlp.experts.w1"].dtype == torch.int8
+    assert expected["model.layers.1.mlp.experts.w1"].shape == (4, 32, 16)
+    assert expected["model.layers.1.mlp.experts.w1_scale_inv"].dtype == torch.float32
+    assert expected["model.layers.1.mlp.experts.w1_scale_inv"].shape == (4, 32, 1)
+    assert expected["model.layers.0.self_attn.q_a_proj.weight"].dtype == torch.bfloat16
+
+    out_dir = tmp_path / "prime"
+    model.stream_convert_to_prime(source_dir, out_dir)
+    streamed = _read_all(out_dir)
+    assert set(streamed) == set(expected) == set(model.state_dict())
+    for key, tensor in expected.items():
+        assert streamed[key].dtype == tensor.dtype, key
+        assert torch.equal(streamed[key].view(torch.uint8), tensor.contiguous().view(torch.uint8)), key
+
+    state = DeepseekV41ForCausalLM(config).state_dict()
+    dcp_load(state, storage_reader=HuggingFaceStorageReader(path=out_dir.as_posix()), no_dist=True)
+    for key, tensor in state.items():
+        torch.testing.assert_close(tensor, expected[key].to(tensor.dtype), rtol=0, atol=0, msg=key)
+
+
+def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
+    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import dequantize_mxfp4
+    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
+
+    torch.manual_seed(0)
+    experts = Mxfp4GroupedExperts(dim=64, hidden_dim=32, num_experts=2, swiglu_limit=10.0)
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            weight = getattr(experts, name)
+            weight.copy_(torch.randint(-128, 128, weight.shape, dtype=torch.int8))
+            getattr(experts, f"{name}_scale_inv").copy_(2.0 ** torch.randint(-3, 2, weight.shape[:-1] + (1,)).float())
+    x = torch.randn(5, 64, requires_grad=True)
+    counts = torch.tensor([2, 3], dtype=torch.int64)
+    output = experts(x, counts)
+    restored = [dequantize_mxfp4(getattr(experts, n), getattr(experts, f"{n}_scale_inv")) for n in ("w1", "w2", "w3")]
+    x_ref = x.detach().clone().requires_grad_(True)
+    reference = _run_experts_for_loop_impl(*restored, x_ref.bfloat16(), counts, 10.0).float()
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    output.sum().backward()
+    reference.sum().backward()
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    assert all(param.grad is None for param in experts.parameters())

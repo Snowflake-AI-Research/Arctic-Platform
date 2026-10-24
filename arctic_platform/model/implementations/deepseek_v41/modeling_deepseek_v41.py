@@ -39,6 +39,7 @@ from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import log_deferred_checkpoint_keys
 from arctic_platform.model.implementations.deepseek_v41.dequantize import dequantize_state_dict_
+from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_experts
 from arctic_platform.model.implementations.deepseek_v41.engram import DeepseekV41Engram
 from arctic_platform.model.implementations.deepseek_v41.engram import EngramHasher
 from arctic_platform.model.implementations.deepseek_v41.engram import EngramLayout
@@ -204,11 +205,12 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     def convert_to_prime(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
         """Rename a published checkpoint onto this module tree, after dequantizing to bf16.
 
-        Engram embedding rows stay quantized. Vision, the aligner, image embeddings, and MTP are
-        logged and dropped. Any other leftover key raises.
+        Engram embedding rows stay quantized, and so do routed experts the config keeps packed.
+        Vision, the aligner, image embeddings, and MTP are logged and dropped. Any other leftover
+        key raises.
         """
         log_deferred_checkpoint_keys(state_dict)
-        dequantize_state_dict_(state_dict)
+        dequantize_state_dict_(state_dict, keep_experts=packs_experts(self.config))
         return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
@@ -216,7 +218,12 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
 
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
         """Write the converted cache shard by shard. The full snapshot never sits in memory."""
-        write_streaming_prime_cache(source_path, output_path, self.conversion_chain(self.config))
+        write_streaming_prime_cache(
+            source_path,
+            output_path,
+            self.conversion_chain(self.config),
+            keep_experts=packs_experts(self.config),
+        )
 
     def init_buffers_post_meta(self) -> None:
         # ``to_empty`` uninitializes non-persistent buffers before checkpoint load. Rotary tables,

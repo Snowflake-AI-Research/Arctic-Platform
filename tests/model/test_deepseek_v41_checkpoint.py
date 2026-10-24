@@ -303,6 +303,18 @@ def test_source_only_and_unknown_keys_are_rejected():
         assert name
 
 
+@pytest.mark.parametrize("peft", [None, {"peft_type": "Lora", "r": 8}])
+def test_only_lora_keeps_the_official_experts_packed(tmp_path, monkeypatch, peft):
+    from arctic_platform.model.implementations.deepseek_v41 import deepspeed_integration
+
+    calls = []
+    monkeypatch.setattr(deepspeed_integration, "load_deepseek_v41_model", lambda **kwargs: calls.append(kwargs))
+    path = _checkpoint(tmp_path, {"model_type": "deepseek_v41", "n_routed_experts": 384})
+    spec = ModelSpec(model_path_or_name=path, parallelism=ParallelismConfig(expert_parallel=8), patches={"peft": peft})
+    load_deepseek_v41(LoaderContext(spec=spec, parallel_groups={"ep_group": object()}))
+    assert calls[0]["dequantize_checkpoint"] is (peft is None)
+
+
 def test_loader_selection_options_and_groups(tmp_path):
     path = _checkpoint(tmp_path, {"model_type": "deepseek_v41", "n_routed_experts": 384})
     spec = ModelSpec(model_path_or_name=path, parallelism=ParallelismConfig(expert_parallel=8))

@@ -26,6 +26,8 @@ import torch
 from torch import nn
 
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_experts
+from arctic_platform.model.implementations.deepseek_v41.mxfp4_experts import Mxfp4GroupedExperts
 from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
@@ -69,6 +71,14 @@ class DeepseekV41MoE(MoE):
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
         )
+        if packs_experts(config):
+            self.experts = Mxfp4GroupedExperts(
+                dim=config.hidden_size,
+                hidden_dim=config.moe_intermediate_size,
+                num_experts=config.n_routed_experts,
+                swiglu_limit=config.swiglu_limit,
+            )
+            self.experts.set_ep_comm_backend(self.ep_comm_backend)
         self.layer_idx = layer_idx
         self.is_hash = False
         if config.vision_n_layers > 0:
@@ -78,7 +88,8 @@ class DeepseekV41MoE(MoE):
 
     def init_weights(self, init_std: float, buffer_device: torch.device) -> None:
         super().init_weights(init_std, buffer_device)
-        nn.init.trunc_normal_(self.experts.w3, mean=0.0, std=0.02)
+        if not isinstance(self.experts, Mxfp4GroupedExperts):
+            nn.init.trunc_normal_(self.experts.w3, mean=0.0, std=0.02)
         if self.bias_vl is not None:
             self.bias_vl.zero_()
 

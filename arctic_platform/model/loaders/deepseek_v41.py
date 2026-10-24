@@ -95,6 +95,8 @@ def _load(ctx: LoaderContext) -> LoadedModel:
         sp_group=groups.get("sp_group"),
         ep_group=groups["ep_group"],
         options=options,
+        # Packed MXFP4 experts are frozen, so only LoRA trains on them as published.
+        dequantize_checkpoint=ctx.spec.patches.peft is None,
     )
     return LoadedModel(model=model)
 
