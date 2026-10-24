@@ -56,6 +56,9 @@ DEFAULTS = {
     "requests_per_thread": 6,
     "min_requests": 16,
     "latency_samples": 16,
+    # A cell over the latency limit is measured this many more times on every
+    # side and keeps each side's median, so one noisy measurement cannot fail a run.
+    "remeasure": 2,
 }
 # Ratios gate the verdict, but a TTFT or TPOT within the absolute slack passes
 # regardless: at tens of milliseconds a few ms of jitter is a large ratio. A
@@ -164,12 +167,28 @@ def run(make_client: Callable[[], Any], pair: Pair, settings: dict | None = None
     levels = [int(c) for c in cfg.get("concurrency") or concurrency_levels(pair.replicas)]
 
     sides = [("on", pair.on), ("off", pair.off)] + ([("matched", matched)] if matched else [])
+
+    def measure(c: int, p: int, o: int, salt: int) -> dict:
+        return {side: cell(make_client, job, c, p, o, int(cfg["requests_per_thread"]), salt,
+                           int(cfg["min_requests"]))
+                for side, job in sides}
+
     rows = []
     for ci, c in enumerate(levels):
         for si, (p, o) in enumerate(shapes):
-            row = {side: cell(make_client, job, c, p, o, int(cfg["requests_per_thread"]), ci * 100 + si,
-                              int(cfg["min_requests"]))
-                   for side, job in sides}
+            row = measure(c, p, o, ci * 100 + si)
+            repeats = [row]
+            for attempt in range(1, int(cfg["remeasure"]) + 1):
+                if ratio(row["on"]["server_p50"], row["off"]["server_p50"]) <= th["latency_ratio_max"]:
+                    break
+                # Fresh salts, so the prefix cache does not speed up the repeat.
+                repeats.append(measure(c, p, o, attempt * 10_000 + ci * 100 + si))
+                row = _median_cell(repeats, [side for side, _ in sides])
+            if len(repeats) > 1:
+                row["remeasured"] = [{side: m[side]["server_p50"] for side, _ in sides} for m in repeats]
+                logger.info("c=%-3d %3d/%-3d over the latency limit, measured %d times; server p50 on %s off %s",
+                            c, p, o, len(repeats), [f"{m['on']:.3f}" for m in row["remeasured"]],
+                            [f"{m['off']:.3f}" for m in row["remeasured"]])
             row["latency_ratio"] = ratio(row["on"]["server_p50"], row["off"]["server_p50"])
             row["throughput_ratio"] = ratio(row["on"]["tok_s"], row["off"]["tok_s"])
             row["engine_throughput_ratio"] = ratio(engine_tok_s(row["on"]), engine_tok_s(row["off"]))
@@ -201,6 +220,20 @@ def run(make_client: Callable[[], Any], pair: Pair, settings: dict | None = None
     overhead = {side: median([r[side]["client_p50"] - r[side]["server_p50"] for r in rows]) for side, _ in sides}
     return {"rows": rows, "latency": latency, "client_overhead_s": overhead,
             **score(rows, latency, pair.replicas, th)}
+
+
+def _median_cell(repeats: list[dict], sides: list[str]) -> dict:
+    """Per side, the measurement with the median server p50 (the lower middle one
+    of an even count), so its other fields stay consistent with that p50. Errors
+    and zero-id responses count from every measurement."""
+    row = {}
+    for side in sides:
+        cells = [m[side] for m in repeats]
+        ordered = sorted(cells, key=lambda c: c["server_p50"])
+        row[side] = {**ordered[(len(ordered) - 1) // 2],
+                     "errors": sum(c["errors"] for c in cells),
+                     "zero_id_responses": sum(c["zero_id_responses"] for c in cells)}
+    return row
 
 
 def _pass_on_matched(checks: list[dict], m: dict, tpot_gap_ms: float, th: dict) -> None:

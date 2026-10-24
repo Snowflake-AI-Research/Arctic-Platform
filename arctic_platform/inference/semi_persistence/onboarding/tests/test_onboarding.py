@@ -354,6 +354,52 @@ def test_perf_score_passes_a_gap_plain_matched_shows_too():
     assert not {x["name"]: x for x in perf.score(rows, lat, 1, {})["checks"]}["TPOT ratio"]["passed"]
 
 
+def _scripted_perf(monkeypatch, on_grid_p50s):
+    """perf.run against fake jobs: the grid cell's semi_p p50 follows ``on_grid_p50s``
+    one measurement at a time; plain is always 0.200 s."""
+    from types import SimpleNamespace
+
+    on_p50s, salts = iter(on_grid_p50s), []
+
+    def cell(_make_client, job, concurrency, prompt_len, out_len, *_a):
+        if concurrency == 1:
+            srv = 0.05 + 0.004 * (out_len - 1)
+        else:
+            salts.append(_a[1])
+            srv = next(on_p50s) if job == "on" else 0.200
+        return {"concurrency": concurrency, "prompt": prompt_len, "output": out_len, "requests": 16,
+                "errors": 0, "first_error": "", "server_p50": srv, "server_p90": srv, "client_p50": srv + 0.2,
+                "client_p90": srv + 0.2, "tok_s": concurrency * out_len / srv, "zero_id_responses": 0}
+
+    monkeypatch.setattr(perf, "cell", cell)
+    pair = SimpleNamespace(on="on", off="off", max_seq_len=128, replicas=1)
+    result = perf.run(lambda: None, pair, {"shapes": [[16, 16]], "concurrency": [8]})
+    return result, {x["name"]: x for x in result["checks"]}["worst server p50 latency ratio"], salts
+
+
+def test_perf_remeasures_a_cell_over_the_latency_limit(monkeypatch):
+    # One repeat brings the cell within the limit, so it stops there.
+    result, check, salts = _scripted_perf(monkeypatch, [0.236, 0.205])
+    row = result["rows"][0]
+    assert [m["on"] for m in row["remeasured"]] == [0.236, 0.205]
+    assert row["on"]["server_p50"] == 0.205 and check["passed"]
+    assert len(set(salts)) == 2  # the repeat uses fresh prompts
+    # Still over after one repeat: a third measurement, and the median of three.
+    result, check, _ = _scripted_perf(monkeypatch, [0.236, 0.240, 0.210])
+    assert result["rows"][0]["on"]["server_p50"] == 0.236 and not check["passed"]
+
+
+def test_perf_fails_a_slowdown_that_repeats(monkeypatch):
+    result, check, _ = _scripted_perf(monkeypatch, [0.236, 0.240, 0.238])
+    assert len(result["rows"][0]["remeasured"]) == 3 and not check["passed"]
+    assert check["value"] == pytest.approx(0.238 / 0.200)
+
+
+def test_perf_does_not_remeasure_a_cell_within_the_limit(monkeypatch):
+    result, check, _ = _scripted_perf(monkeypatch, [0.210])
+    assert "remeasured" not in result["rows"][0] and check["passed"]
+
+
 def test_guided_json_that_does_not_parse_passes_only_when_plain_matched_agrees():
     from arctic_platform.inference.semi_persistence.onboarding import correctness
 

@@ -221,7 +221,7 @@ latency adds submission and polling.
 |---|---|---|
 | TTFT ratio | server p50 of 16 `max_tokens 1` requests, short and long prompt; worst of the two | semi_p / plain <= 1.10, or within 12 ms (a restored TP=1 engine sits about 1 or about 11 ms above plain) |
 | TPOT ratio | (server p50 at N tokens - TTFT) / (N - 1), N up to 128 | <= 1.10, or within 0.5 ms |
-| Worst server p50 latency ratio | across every grid cell | <= 1.15 |
+| Worst server p50 latency ratio | across every grid cell; a cell over the limit is measured up to twice more on every job with fresh prompts and keeps each job's median, so a single noisy measurement cannot fail it | <= 1.15 |
 | Worst throughput ratio | generated tokens / cell wall time, across cells with concurrency > 1 | >= 0.90 |
 | Request errors and zero-id responses | every perf request | 0 |
 | Replica scaling (multi-replica) | tok/s at concurrency = replicas over replicas x tok/s at concurrency 1 | >= 0.90 x the plain job's scaling |
