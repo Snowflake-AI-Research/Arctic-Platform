@@ -457,7 +457,7 @@ inst.cuda_restore(gpus=gpus).wait()
 inst.reinit_nccl().wait()
 inst.attach().load_weights().wait()
 inst.wake_up_weights().wait()
-inst.plan_restore_weights().wait()   # forms the pinned ring; no repin()
+inst.plan_restore_weights().wait()   # forms the pinned double buffer; no repin()
 inst.restore_weights().wait()
 inst.wake_up_kv_cache().wait()
 inst.rebind_graphs().wait()
@@ -522,10 +522,11 @@ remove that guard to "simplify" the sequence. See the primitive tables in
 [`reference.md`](reference.md).
 
 There is no `repin()` in the sequence. The host copy stays pageable, and
-`plan_restore_weights()` forms a small pinned ring per rank (2 GiB as 4 x 512
-MiB by default) that `restore_weights()` stages it through. Pinning the whole
-copy took 32 s on GLM TP=8 and locked 708 GiB per node. `SEMIP_RING_BYTES=0`
-in `extra_env` forms no ring and copies straight from pageable memory.
+`plan_restore_weights()` forms a small pinned double buffer per rank (1 GiB
+as 2 x 512 MiB by default) that `restore_weights()` stages it through. Pinning
+the whole copy took 32 s on GLM TP=8 and locked 708 GiB per node.
+`SEMIP_PINNED_BUFFER_BYTES=0` in `extra_env` forms none and copies straight
+from pageable memory.
 
 `attach()` takes **no arguments**. The prototype called `attach(pool)`, which
 is now a `TypeError`.
@@ -546,7 +547,7 @@ self._inst.wake_up_kv_cache()
 
 Omit `restore_weights()` and a model DSS slept and woke produces wrong output
 with no error anywhere. No `plan_restore_weights()` here: the plan and the
-pinned ring formed at restore time stay on the workers — which is another reason the guard above
+pinned double buffer formed at restore time stay on the workers — which is another reason the guard above
 matters, since a bad plan taints the wake path too. This is reachable in
 normal operation: `collective_rpc("sleep")` and `("wake_up")` are both part of
 the surface the DSS worker drives.

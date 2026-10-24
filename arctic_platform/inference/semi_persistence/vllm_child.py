@@ -18,11 +18,11 @@ Attach allocates CPU memory sized to model.named_parameters().  Stage
 snapshots the post-processed GPU parameters into that buffer.
 plan_restore_weights walks the param index once and caches a chunk plan
 (chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.  If the host
-buffer is pageable it also forms a small pinned ring (ring_bytes split
-into ring_slots slots) that restore_weights stages through.
+buffer is pageable it also forms a small pinned double buffer (buffer_bytes
+split into two halves) that restore_weights stages through.
 restore_weights then loops over the cached plan: per chunk, copy a
 slice of host memory into a single reused GPU staging buffer -- directly,
-or slot by slot through the ring -- and scatter into model parameters by
+or half by half through the double buffer -- and scatter into model parameters by
 name.  If no plan is cached, restore_weights falls back to a single-chunk
 path.
 
@@ -606,9 +606,9 @@ def _semip_stage(worker):
 
 
 def _semip_unpin(worker):
-    # The ring is registered memory too, and nothing registered may be left
-    # when a cuda_checkpoint follows.
-    _semip_free_ring(worker)
+    # The double buffer is registered memory too, and nothing registered may
+    # be left when a cuda_checkpoint follows.
+    _semip_free_double_buffer(worker)
     # Idempotent: the attach buffer starts unpinned, so a cudaHostUnregister on
     # an unregistered (or already-unpinned) buffer would hard-error.
     buf = getattr(worker, "_semip_buf", None)
@@ -631,47 +631,47 @@ def _semip_repin(worker):
     return buf.numel()
 
 
-def _semip_form_ring(worker, ring_bytes, n_slots, copy_threads):
-    """Pin ``n_slots`` slots of ``ring_bytes // n_slots`` for restore_weights.
+def _semip_form_double_buffer(worker, buffer_bytes, threads):
+    """Pin two halves of ``buffer_bytes`` for restore_weights.
 
     Registered with cudaHostRegister rather than allocated with
     ``pin_memory=True``: torch's caching host allocator keeps freed pinned
-    blocks, so the ring could never be given back.  One event per slot says
+    blocks, so the buffer could never be given back.  One event per half says
     when its last H2D copy is done; the copies run on a side stream.
     """
-    slot_bytes = int(ring_bytes) // int(n_slots)
-    slots = []
+    half_bytes = int(buffer_bytes) // 2
+    halves = []
     try:
-        for _ in range(int(n_slots)):
-            slot = torch.empty(slot_bytes, dtype=torch.uint8)
-            _repin_buffer(slot)
-            slots.append(slot)
+        for _ in range(2):
+            half = torch.empty(half_bytes, dtype=torch.uint8)
+            _repin_buffer(half)
+            halves.append(half)
     except BaseException:
-        for slot in slots:
-            _unpin_buffer(slot)
+        for half in halves:
+            _unpin_buffer(half)
         raise
-    worker._semip_ring = {
-        "slots": slots,
-        "events": [torch.cuda.Event() for _ in slots],
+    worker._semip_double_buffer = {
+        "halves": halves,
+        "events": [torch.cuda.Event() for _ in halves],
         "stream": torch.cuda.Stream(device=worker.device),
-        "slot_bytes": slot_bytes,
-        "copy_threads": max(1, int(copy_threads)),
+        "half_bytes": half_bytes,
+        "threads": max(1, int(threads)),
     }
 
 
-def _semip_free_ring(worker):
-    ring = getattr(worker, "_semip_ring", None)
-    if ring is None:
+def _semip_free_double_buffer(worker):
+    db = getattr(worker, "_semip_double_buffer", None)
+    if db is None:
         return 0
-    ring["stream"].synchronize()
-    for slot in ring["slots"]:
-        _unpin_buffer(slot)
-    worker._semip_ring = None
-    return len(ring["slots"]) * ring["slot_bytes"]
+    db["stream"].synchronize()
+    for half in db["halves"]:
+        _unpin_buffer(half)
+    worker._semip_double_buffer = None
+    return 2 * db["half_bytes"]
 
 
-def _semip_plan_load_weights(worker, max_buffer_bytes=None, ring_bytes=None,
-                             ring_slots=None, copy_threads=None):
+def _semip_plan_load_weights(worker, max_buffer_bytes=None, buffer_bytes=None,
+                             buffer_threads=None):
     buf = worker._semip_buf
     index = worker._semip_index
     total_bytes = buf.numel()
@@ -705,46 +705,44 @@ def _semip_plan_load_weights(worker, max_buffer_bytes=None, ring_bytes=None,
         plan.append((cur_lo, cur_hi, cur))
     worker._semip_chunk_plan = plan
     worker._semip_chunk_size = cs
-    # The ring is decided here, with the plan, and restore_weights only uses
-    # it: a pinned buffer needs none, and ring_bytes 0 (or unset) asks for
-    # none, leaving the slow direct copy from pageable memory.
-    _semip_free_ring(worker)
-    n_slots = int(ring_slots or 0)
-    if (not getattr(worker, "_semip_pinned", False) and ring_bytes
-            and n_slots > 0 and int(ring_bytes) >= n_slots):
-        _semip_form_ring(worker, ring_bytes, n_slots, copy_threads or 1)
-    ring = getattr(worker, "_semip_ring", None)
+    # The double buffer is decided here, with the plan, and restore_weights
+    # only uses it: a pinned host copy needs none, and buffer_bytes 0 (or
+    # unset) asks for none, leaving the slow direct copy from pageable memory.
+    _semip_free_double_buffer(worker)
+    if (not getattr(worker, "_semip_pinned", False) and buffer_bytes
+            and int(buffer_bytes) >= 2):
+        _semip_form_double_buffer(worker, buffer_bytes, buffer_threads or 1)
+    db = getattr(worker, "_semip_double_buffer", None)
     return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs,
             "free_bytes": free_bytes, "clamped": clamped,
-            "ring_bytes": len(ring["slots"]) * ring["slot_bytes"] if ring else 0,
-            "ring_slots": len(ring["slots"]) if ring else 0,
+            "double_buffer_bytes": 2 * db["half_bytes"] if db else 0,
             "pinned": bool(getattr(worker, "_semip_pinned", False))}
 
 
-def _semip_ring_h2d(ring, src, dst, pool):
-    """Copy host ``src`` into device ``dst`` slot by slot through the ring.
+def _semip_double_buffer_h2d(db, src, dst, pool):
+    """Copy host ``src`` into device ``dst`` half by half through the double buffer.
 
-    Filling a slot is a host memcpy split across the pool (``copy_`` drops the
+    Filling a half is a host memcpy split across the pool (``copy_`` drops the
     GIL; vLLM workers run one OpenMP thread, so a single ``copy_`` would use
-    one core).  Each slot's H2D runs on the side stream while the next slot
-    fills, and a slot is refilled only once its event says its copy is done.
+    one core).  Each half's H2D runs on the side stream while the other half
+    fills, and a half is refilled only once its event says its copy is done.
     """
-    slots, events, stream = ring["slots"], ring["events"], ring["stream"]
-    slot_bytes, threads = ring["slot_bytes"], ring["copy_threads"]
+    halves, events, stream = db["halves"], db["events"], db["stream"]
+    half_bytes, threads = db["half_bytes"], db["threads"]
     stream.wait_stream(torch.cuda.current_stream())
     n = src.numel()
-    for i, off in enumerate(range(0, n, slot_bytes)):
-        k = i % len(slots)
-        m = min(slot_bytes, n - off)
+    for i, off in enumerate(range(0, n, half_bytes)):
+        k = i % 2
+        m = min(half_bytes, n - off)
         events[k].synchronize()
-        slot = slots[k]
+        half = halves[k]
         step = -(-m // threads)
         list(pool.map(
-            lambda a: slot[a:min(a + step, m)].copy_(
+            lambda a: half[a:min(a + step, m)].copy_(
                 src[off + a:off + min(a + step, m)]),
             range(0, m, step)))
         with torch.cuda.stream(stream):
-            dst[off:off + m].copy_(slot[:m], non_blocking=True)
+            dst[off:off + m].copy_(half[:m], non_blocking=True)
             events[k].record(stream)
     stream.synchronize()
 
@@ -760,17 +758,17 @@ def _semip_restore_weights(worker):
         plan = [(0, total_bytes,
                  [(n, o, nb, dt, sh) for n, (o, nb, dt, sh) in index.items()])]
         cs = total_bytes
-    ring = getattr(worker, "_semip_ring", None)
-    pool = (ThreadPoolExecutor(max_workers=ring["copy_threads"])
-            if ring is not None else None)
+    db = getattr(worker, "_semip_double_buffer", None)
+    pool = (ThreadPoolExecutor(max_workers=db["threads"])
+            if db is not None else None)
     torch.cuda.synchronize()
     gpu_buf = torch.empty(cs, dtype=torch.uint8, device=worker.device)
     loaded = 0
     try:
         for chunk_lo, chunk_hi, members in plan:
             n = chunk_hi - chunk_lo
-            if ring is not None:
-                _semip_ring_h2d(ring, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
+            if db is not None:
+                _semip_double_buffer_h2d(db, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
             else:
                 gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
             torch.cuda.synchronize()
@@ -796,11 +794,11 @@ def _semip_restore_weights(worker):
     torch.cuda.empty_cache()
     return {"bytes": total_bytes, "loaded": loaded,
             "n_chunks": len(plan), "chunk_size": cs,
-            "staging": "ring" if ring is not None else "direct"}
+            "staging": "double_buffer" if db is not None else "direct"}
 
 
 def _semip_detach(worker):
-    _semip_free_ring(worker)
+    _semip_free_double_buffer(worker)
     buf = getattr(worker, "_semip_buf", None)
     total = buf.numel() if buf is not None else 0
     if buf is not None and getattr(worker, "_semip_pinned", False):
@@ -4070,8 +4068,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 mb = kwargs.get("max_buffer_bytes")
                 results = llm.collective_rpc(
                     _semip_plan_load_weights,
-                    args=(mb, kwargs.get("ring_bytes"), kwargs.get("ring_slots"),
-                          kwargs.get("copy_threads")))
+                    args=(mb, kwargs.get("buffer_bytes"), kwargs.get("buffer_threads")))
                 worker_bytes = [r["bytes"] for r in results]
                 chunk_bytes = [r["chunk_size"] for r in results]
                 n_chunks = [r["n_chunks"] for r in results]
@@ -4099,18 +4096,17 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                          min(chunk_bytes, default=0) / 2**30,
                          (f" -- clamped on rank(s) {clamped_ranks}"
                           if clamped_ranks else ""))
-                ring_bytes = [r["ring_bytes"] for r in results]
-                info["ring_bytes_per_worker"] = ring_bytes
-                if any(ring_bytes):
-                    slots = max(r["ring_slots"] for r in results)
-                    log.info("  ring: %d x %.0f MiB pinned per worker",
-                             slots, max(ring_bytes) / slots / 2**20)
+                db_bytes = [r["double_buffer_bytes"] for r in results]
+                info["double_buffer_bytes_per_worker"] = db_bytes
+                if any(db_bytes):
+                    log.info("  double buffer: 2 x %.0f MiB pinned per worker",
+                             max(db_bytes) / 2 / 2**20)
                 elif all(r["pinned"] for r in results):
-                    log.info("  ring: none (host copy pinned)")
+                    log.info("  double buffer: none (host copy pinned)")
                 else:
-                    log.info("  ring: none (ring_bytes=%s); restore_weights "
-                             "copies from pageable memory",
-                             kwargs.get("ring_bytes"))
+                    log.info("  double buffer: none (buffer_bytes=%s); "
+                             "restore_weights copies from pageable memory",
+                             kwargs.get("buffer_bytes"))
 
             elif cmd == "restore_weights":
                 if llm is None:
