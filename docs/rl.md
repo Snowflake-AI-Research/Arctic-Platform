@@ -206,9 +206,11 @@ its gradient `−β ∇ log p` raises each sampled token's probability regardles
 of its advantage), `"k2"` (`(log r)² / 2`) or `"k3"` (`r − 1 − log r`, zero
 gradient where `r = 1`). k1 and k3 are unbiased for the KL and its gradient.
 Past `|log r| = log(sampler_kl_ratio_cap)` (default `5.0`, `inf` allowed), k2
-and k3 continue linearly. The optional per-token batch tensor
-`sampler_kl_weights` (finite, non-negative) is `w`; under token-mean it is
-required to carry `sequence_loss_weights`. `ap_grpo` accepts only the baseline
+and k3 continue linearly. The optional batch tensor `sampler_kl_weights`
+(finite, non-negative) is `w`, per token or as one value per sequence (`[B]`,
+like `sequence_loss_weights`) that each of its tokens takes; under token-mean
+it is required to carry `sequence_loss_weights`.
+`ap_grpo` accepts only the baseline
 GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control
 keys below; the
 unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
