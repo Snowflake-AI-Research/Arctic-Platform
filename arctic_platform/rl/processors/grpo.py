@@ -959,8 +959,9 @@ def _grpo_loss(
         ``sampler_kl_type`` (default "k1": ``k = -log r``, whose gradient ``-β ∇ log p`` raises every sampled token
         regardless of advantage; "k2": ``(log r)^2 / 2``; "k3": ``r - 1 - log r``, zero gradient where r = 1),
         ``sampler_kl_ratio_cap`` (default 5.0, > 1, inf allowed; k2 and k3 continue linearly past
-        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token (finite, non-negative,
-        default 1; required to carry ``sequence_loss_weights`` under token-mean),
+        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token, or one value per sequence that every token of
+        that sequence takes (finite, non-negative, default 1; required to carry ``sequence_loss_weights`` under
+        token-mean),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -1118,6 +1119,15 @@ def _grpo_loss(
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
             )
     sampler_kl_weights = input_data["sampler_kl_weights"]
+    if sampler_kl_weights is not None and sampler_kl_weights.ndim == 1 and sampler_kl_weights.shape != logprobs.shape:
+        # One weight per sequence (like sequence_loss_weights) spares the client a dense [B, T] float tensor.
+        if cu_seqlens is not None:
+            lengths = torch.diff(cu_seqlens.to(sampler_kl_weights.device))
+            per_token = torch.repeat_interleave(sampler_kl_weights, lengths)
+            sampler_kl_weights = torch.nn.functional.pad(per_token, (0, logprobs.shape[0] - per_token.shape[0]))
+        else:
+            sampler_kl_weights = sampler_kl_weights[:, None].expand_as(logprobs)
+        input_data["sampler_kl_weights"] = sampler_kl_weights
     if sampler_kl_weights is not None and sampler_kl_weights.shape != logprobs.shape:
         raise ValueError(
             f"sampler_kl_weights must match logprobs shape, got {tuple(sampler_kl_weights.shape)} and "
