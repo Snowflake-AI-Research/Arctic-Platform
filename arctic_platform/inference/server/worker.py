@@ -381,6 +381,21 @@ def _is_address_in_use_error(exc: BaseException) -> bool:
     return False
 
 
+def _with_rank_recv_l2_sq(results: list[Any]) -> dict[str, Any]:
+    """Rank 0's weight-load result, plus every TP rank's ``recv_l2_sq``.
+
+    Each TP rank receives the full model on its own, so each rank's received
+    checksum must match the trainer's; rank 0's alone does not prove the others.
+    """
+    if not results:
+        return {}
+    head = dict(results[0])
+    head["rank_recv_l2_sq"] = [
+        r.get("recv_l2_sq") if isinstance(r, dict) else None for r in results
+    ]
+    return head
+
+
 def _ensure_arctic_vllm_patches() -> None:
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
         require_supported_vllm_version("InferenceWorker")
@@ -431,6 +446,11 @@ def _create_async_engine_args(
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
+    text_config_overrides = engine_kwargs.pop("text_config_overrides", None)
+    if text_config_overrides:
+        from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+        engine_kwargs["hf_overrides"] = text_config_hf_overrides(engine_kwargs["model"], text_config_overrides)
 
     try:
         engine_args = engine_args_cls(**engine_kwargs)
@@ -1690,7 +1710,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, direct_mode, reverse),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     @stream_lifecycle_change
     async def sync_weights_broadcast(
@@ -1796,7 +1816,7 @@ class InferenceWorker(StreamingWorkerMixin):
         results = await self.llm.collective_rpc(
             "load_weights_cuda_ipc", args=(ipc_payload,),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     async def load_weights_cuda_ipc_chunk(
         self, ipc_payload: dict, validate_names=None,
@@ -1806,18 +1826,56 @@ class InferenceWorker(StreamingWorkerMixin):
             "load_weights_cuda_ipc_chunk",
             args=(ipc_payload, validate_names),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     async def load_weights_from_shm_path(self, path: str) -> dict[str, Any]:
         """Load weights from a shared-memory file path."""
         results = await self.llm.collective_rpc(
             "load_weights_from_shm_path", args=(path,),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     async def compute_weight_norm(self) -> dict[str, Any]:
-        """Global L2 norm of the engine's live weights, summed across TP ranks."""
+        """Global L2 norm of the engine's live weights, summed across TP ranks.
+
+        Tensor parallelism and a quantized engine return an error result with
+        ``disable`` set, rather than a norm. Adding the ranks up is only a whole
+        model when every tensor is sharded, and a tensor each rank keeps whole (an
+        ``RMSNorm`` weight, a ``ReplicatedLinear`` weight, a row-parallel bias) would
+        land in the total once per rank. A sleeping sampler has those weights unmapped;
+        reading them is a CUDA fault that kills the engine, so that state returns an
+        error and does not set ``disable`` (sleep is temporary). This is a debug
+        check: the weight sync's own ``checksum_match`` shows the sampler received
+        the trainer's weights, at any TP size.
+        """
+        if self.state not in (WorkerLifecycleState.READY, WorkerLifecycleState.WEIGHTS_READY):
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": f"weight norm is not read while the sampler is {self.state.value}",
+            }
         results = await self.llm.collective_rpc("compute_weight_norm")
+        for result in results:
+            if result.get("error_code"):
+                unavailable = {
+                    "error_code": "weight_norm_unavailable",
+                    "error": result.get("error", result["error_code"]),
+                }
+                if result.get("disable"):
+                    unavailable["disable"] = True
+                return unavailable
+        tp_size = max((r.get("tp_size", 1) for r in results), default=1)
+        if tp_size > 1:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                    f"engine runs tensor_parallel_size={tp_size}. Replicated tensors would be "
+                    "counted once per rank, so the norm would not be comparable to the "
+                    "training engine's. The weight sync result's checksum_match verifies "
+                    "the sync at any tensor_parallel_size."
+                ),
+                "disable": True,
+            }
         sq_sum = sum(r["sq_sum"] for r in results)
         num_params = sum(r["num_params"] for r in results)
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}

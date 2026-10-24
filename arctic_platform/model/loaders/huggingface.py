@@ -20,8 +20,10 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
+from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
 
+from arctic_platform.common.text_config_overrides import apply_text_config_overrides
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -43,8 +45,10 @@ class HuggingfaceOptions(BaseModel):
             " are not available. The residual add and the following norm are one fused fp32 operation that reads the"
             " norm's weight, so with the liger patch, of the decoder-layer and final norms, only the first layer's"
             " input norm runs Liger's RMSNorm kernel. With sequence parallelism, the beta gate of every GatedDeltaNet"
-            " layer the sequence-parallel wrapper adapts follows this option, in any model. False loads the stock"
-            " model unchanged and evaluates that beta gate in b's own dtype. Other models are unaffected."
+            " layer the sequence-parallel wrapper adapts follows this option, in any model. False keeps these"
+            " operations stock and evaluates that beta gate in b's own dtype. Other models are unaffected. The"
+            " GatedDeltaNet output norm of the Qwen3.5 and Qwen3-Next families is evaluated in fp32 and rounded once,"
+            " as vLLM does, whatever this option is."
         ),
     )
     fp32_residual: bool = Field(
@@ -102,6 +106,12 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     if parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
         raise ValueError("huggingface sequence parallelism requires parallel_groups['sp_group']")
 
+    kwargs = {}
+    if len(ctx.spec.text_config_overrides) > 0:
+        config = AutoConfig.from_pretrained(ctx.spec.model_path_or_name)
+        apply_text_config_overrides(config, ctx.spec.text_config_overrides)
+        kwargs["config"] = config
+
     options = HuggingfaceOptions.model_validate(ctx.spec.loader_options)
     if options.fp32_parity and _is_local_qwen3_5_dense(str(ctx.spec.model_path_or_name)):
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import check_stock_classes
@@ -112,7 +122,11 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         ctx.spec.model_path_or_name,
         attn_implementation=ctx.spec.attn_implementation,
         dtype=ctx.spec.dtype,
+        **kwargs,
     )
+    from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
+
+    round_gated_norms_once(model)
     if options.fp32_parity:
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
 
