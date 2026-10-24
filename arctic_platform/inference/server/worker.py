@@ -920,6 +920,10 @@ class InferenceWorker(StreamingWorkerMixin):
             if not engine_kwargs.get("skip_tokenizer_init"):
                 self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
                     engine_kwargs["model"], self.llm.get_tokenizer())
+            # Chat renders through vLLM's in-process renderer, which the
+            # restored engine's wrapper does not have.
+            self._stream_chat_engine = False
+            logger.info("Chat mode is unavailable: a semi_p engine serves token and text prompts only")
             self.state = WorkerLifecycleState.READY
             self._maybe_init_reasoning_parser(reasoning_parser_name)
             logger.info(
