@@ -33,6 +33,10 @@ from .walk import map_batch_values
 # The loss ignore index every provider in this stack uses; also the pad value for packed ``labels``.
 IGNORE_INDEX = -100
 
+# Per-token leaves a request may send as one value per row ([B]); packing gives each of the row's tokens that value,
+# since a packed window can hold as many rows as tokens and its 1-D leaves no longer say which they count.
+ROW_BROADCAST_KEYS = frozenset({"sampler_kl_weights"})
+
 
 @dataclass(frozen=True)
 class PackMetadata:
@@ -129,6 +133,8 @@ def pack_microbatch(data: Dict[str, Any]) -> tuple[Dict[str, Any], PackMetadata]
         # ones would only mislead a model into treating pad-free packing as a single sequence.
         if key == "attention_mask":
             return DROP
+        if key in ROW_BROADCAST_KEYS and torch.is_tensor(value) and tuple(value.shape) == (batch_size,):
+            return torch.repeat_interleave(value, valid_sequence_lengths.to(value.device)).unsqueeze(0)
         if torch.is_tensor(value) and value.ndim >= 2 and tuple(value.shape[:2]) == (batch_size, sequence_length):
             rows = value.reshape(batch_size * sequence_length, *value.shape[2:])
             return rows.index_select(0, token_index.to(rows.device)).unsqueeze(0)
