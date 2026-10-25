@@ -371,6 +371,32 @@ def test_serve_core_branch():
     assert "_semip_serve_core" in _names(branch)
 
 
+def _command_branch(name):
+    handle = _nested(_child_loop(), "_handle_command")
+    branch = next(n for n in ast.walk(handle)
+                  if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                  and isinstance(n.test.comparators[0], ast.Constant)
+                  and n.test.comparators[0].value == name)
+    return ast.get_source_segment(open(_CHILD).read(), branch)
+
+
+def test_sleep_keeps_requests_and_resumes_the_scheduler_when_it_fails():
+    """An "abort" pause resets caches the routed-experts connector refuses to drop."""
+    src = _command_branch("sleep")
+    assert 'llm.sleep(level=2, mode="keep")' in src
+    on_failure = src[src.index("except BaseException:"):src.index("torch.cuda.synchronize")]
+    assert 'llm.wake_up(tags=["scheduling"])' in on_failure
+    assert on_failure.rstrip().endswith("raise")
+
+
+def test_a_serving_sleep_stages_lora_and_restore_weights_puts_it_back():
+    sleep = _command_branch("sleep")
+    stage = sleep.index("_semip_stage_lora")
+    assert "_served_core is not None" in sleep[:stage]
+    assert stage < sleep.index("llm.sleep(")
+    assert "_semip_restore_lora" in _command_branch("restore_weights")
+
+
 def test_child_applies_every_required_patch_before_building_the_engine():
     """The child builds its own ``LLM``, so it has to apply what the cold path
     applies. Naming patches one by one let it fall behind ``main``'s list."""

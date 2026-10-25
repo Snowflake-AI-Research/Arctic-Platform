@@ -811,6 +811,99 @@ def _semip_detach(worker):
     return total
 
 
+# LoRA state -- the adapter slots, their enabled flags and the punica index
+# buffers -- lives in plain tensor attributes that vLLM allocates with the
+# weights, so a level-2 sleep discards it as well.  It is not in the host copy:
+# a dumped engine holds no adapter, so the image would only carry empty slots.
+# A serving child stages it into a host buffer of its own before every sleep,
+# because adapters load and swap slots without any call semi-p sees, and puts
+# it back after restore_weights.  The first restore after CRIU has nothing
+# staged and zeroes it instead, which is the state vLLM creates it in.
+def _semip_lora_manager(worker):
+    return getattr(getattr(worker.model_runner, "lora_manager", None),
+                   "_adapter_manager", None)
+
+
+def _semip_lora_views(worker):
+    """A flat byte view of each CUDA storage behind the LoRA state, in a fixed order."""
+    manager = _semip_lora_manager(worker)
+    if manager is None:
+        return []
+    from vllm.lora.layers import BaseLayerWithLoRA
+
+    model = worker.model_runner.model
+    owned = {t.untyped_storage().data_ptr()
+             for t in [*model.parameters(), *model.buffers()]}
+    holders = [m for m in model.modules() if isinstance(m, BaseLayerWithLoRA)]
+    holders += list(getattr(manager, "punica_wrapper_mapping", {}).values())
+
+    # The punica wrapper keeps its per-batch metadata in dataclasses
+    # (LoRAKernelMeta), so the walk enters those as well as containers.
+    import dataclasses
+
+    visited = set()
+
+    def tensors(value):
+        if isinstance(value, torch.Tensor):
+            yield value
+            return
+        if id(value) in visited:
+            return
+        if isinstance(value, (list, tuple, dict)):
+            visited.add(id(value))
+            for item in (value.values() if isinstance(value, dict) else value):
+                yield from tensors(item)
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            visited.add(id(value))
+            for item in vars(value).values():
+                yield from tensors(item)
+
+    seen, views = set(), []
+    for holder in holders:
+        for value in vars(holder).values():
+            for t in tensors(value):
+                storage = t.untyped_storage()
+                ptr = storage.data_ptr()
+                if not t.is_cuda or ptr in owned or ptr in seen or storage.nbytes() == 0:
+                    continue
+                seen.add(ptr)
+                views.append(torch.empty(0, dtype=torch.uint8, device=t.device).set_(storage))
+    return views
+
+
+def _semip_stage_lora(worker):
+    views = _semip_lora_views(worker)
+    bufs = getattr(worker, "_semip_lora_bufs", None)
+    if bufs is None or [b.numel() for b in bufs] != [v.numel() for v in views]:
+        bufs = [torch.empty(v.numel(), dtype=torch.uint8) for v in views]
+        worker._semip_lora_bufs = bufs
+    for buf, view in zip(bufs, views):
+        buf.copy_(view)
+    torch.cuda.synchronize()
+    return sum(b.numel() for b in bufs)
+
+
+def _semip_restore_lora(worker):
+    views = _semip_lora_views(worker)
+    bufs = getattr(worker, "_semip_lora_bufs", None)
+    if bufs is None:
+        for view in views:
+            view.zero_()
+    else:
+        if [b.numel() for b in bufs] != [v.numel() for v in views]:
+            raise RuntimeError("LoRA state layout changed since it was staged")
+        for buf, view in zip(bufs, views):
+            view.copy_(buf)
+    torch.cuda.synchronize()
+    manager = _semip_lora_manager(worker)
+    if manager is not None:
+        # Makes the next step rebuild the punica metadata rather than trust
+        # what was put back: zeroes after CRIU map every token to slot 0.
+        manager._last_mapping = None
+        manager._last_slot_layout = None
+    return sum(v.numel() for v in views)
+
+
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     buf = worker._semip_buf
     index = worker._semip_index
@@ -3632,6 +3725,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         while engine is not None and engine.has_unfinished_requests():
             _process_step_outputs(engine.step())
 
+    def _lora_enabled():
+        return getattr(llm.llm_engine.vllm_config, "lora_config", None) is not None
+
     # The five rungs the post-restore pass drives to verify the rebind.  Still
     # wave 9's ladder: it is no longer a warmup, but keeping the shapes fixed
     # keeps its timings comparable against every earlier wave.
@@ -4181,7 +4277,23 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 # drain just runs the engine to completion as in a
                 # normal cold sleep.
                 _drain_engine()
-                llm.sleep(level=2)
+                if _served_core is not None and _lora_enabled():
+                    staged = sum(llm.collective_rpc(_semip_stage_lora))
+                    log.info("  staged %.2f MiB of LoRA state", staged / 2**20)
+                # "keep", not the default "abort": the engine is drained, so
+                # the two pause the same, and the routed-experts connector
+                # refuses the cache reset an "abort" pause makes.
+                try:
+                    llm.sleep(level=2, mode="keep")
+                except BaseException:
+                    # vLLM pauses the scheduler before it fails, and nothing
+                    # resumes it, so a failed sleep would stop all serving.
+                    try:
+                        llm.wake_up(tags=["scheduling"])
+                    except Exception:
+                        log.warning("  resuming the scheduler after a failed "
+                                    "sleep also failed", exc_info=True)
+                    raise
                 torch.cuda.synchronize(0)
                 torch.cuda.empty_cache()
                 # Set _dormant AFTER llm.sleep so the fail-fast in
@@ -4262,6 +4374,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB) "
                          "via %s", total_loaded, info["n_chunks"],
                          total_bytes / 2**30, "/".join(info["staging"]))
+                if _lora_enabled():
+                    lora_bytes = sum(llm.collective_rpc(_semip_restore_lora))
+                    log.info("  restored %.2f MiB of LoRA state", lora_bytes / 2**20)
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
