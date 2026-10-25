@@ -1740,6 +1740,13 @@ def _resolve_physical_gpus() -> list[int]:
     Every id matters, not just the first: ``cuda_restore`` validates the count
     against the image's ``tensor_parallel_size`` and raises on a mismatch, so a
     scalar would break every TP>1 restore.
+
+    Sorted, because rank ``k`` runs on the ``k``-th id. Ray lists a pod's GPUs
+    in a different order in every job, while plain vLLM puts rank ``k`` on the
+    ``k``-th GPU of its node. NCCL builds its rings over GPUs, so the order
+    decides the ranks' summation order: two GLM-5.3 TP=16 images cold-started
+    on different orders agreed with each other, and with plain, on one greedy
+    prompt in eight, while two plain jobs agreed on all eight.
     """
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     gpus: list[int] = []
@@ -1757,7 +1764,7 @@ def _resolve_physical_gpus() -> list[int]:
         gpus = [0]
     # Let the Instance child address the physical ids directly.
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-    return gpus
+    return sorted(gpus)
 
 
 def _local_gpu_uuids() -> list[str] | None:

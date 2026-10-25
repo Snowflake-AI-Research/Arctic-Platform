@@ -297,6 +297,13 @@ def test_tp1_replica_keeps_its_assigned_gpu():
     assert se._dump_placement({"gpus": [6]}, [6], "/k") == [6]
 
 
+def test_physical_gpus_come_back_in_index_order(monkeypatch):
+    """Rank k runs on the k-th id, and plain vLLM puts rank k on GPU k."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1,5,6,0,7,4,2")
+    assert se._resolve_physical_gpus() == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
 def test_unusable_meta_leaves_rays_order():
     for meta in ({}, {"gpus": [0, 1]}, {"gpus": [1, 1, 2]}):
         assert se._dump_placement(meta, [2, 0, 1], "/k") == [2, 0, 1]
