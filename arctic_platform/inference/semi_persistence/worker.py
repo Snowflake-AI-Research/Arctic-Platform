@@ -2037,6 +2037,10 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # cuda_restore succeeds (or the worker is torn down).
     cuda_broken = False
     cuda_broken_reason = None
+    # Set by a failed `sleep`, cleared by a later one that succeeds.  An
+    # engine that did not sleep still holds its weights and KV cache, so a
+    # checkpoint would capture all of it; refuse instead.
+    sleep_error = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -2054,6 +2058,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             _kill_process_tree(child_pid)
             log.info("exited")
             break
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and sleep_error is not None:
+            log.error("<<< %s FAILED (the engine failed to sleep: %s)",
+                      cmd, sleep_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
 
         if cmd == "cuda_checkpoint":
             _drain_pipe_generates()
@@ -2368,6 +2379,8 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
         _result_cmd, _, _result_error, _ = result
+        if _result_cmd == "sleep":
+            sleep_error = _result_error
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True

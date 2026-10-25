@@ -887,14 +887,6 @@ class InferenceWorker(StreamingWorkerMixin):
         # same way and for the same reason: AsyncEngineArgs rejects what it
         # does not know, and Ray actor handles are certainly that.
         semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
-        if semi_p and lora_adapter_path:
-            # A restored engine serves the base weights it was dumped with, and
-            # serving without the adapter returns plausible output that is
-            # wrong, so refuse before restoring.
-            raise ValueError(
-                f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
-                "a restored engine serves the base weights it was dumped "
-                "with. Disable semi_p for this job.")
 
         from arctic_platform.inference.semi_persistence import matched_baseline
         if not semi_p and matched_baseline.requested():

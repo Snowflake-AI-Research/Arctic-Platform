@@ -244,10 +244,17 @@ def test_semi_p_dumps_without_a_dropped_reasoning_parser(env):
     assert "reasoning_parser" not in kwargs
 
 
-def test_semi_p_refuses_a_lora_adapter(env):
-    with pytest.raises(ValueError, match="LoRA adapter"):
-        _initialize(env, semi_p=True, lora_adapter_path="/lora")
-    assert env.called("restore_and_attach") == []
+def test_semi_p_loads_the_checkpoint_adapter_into_the_restored_engine(
+        env, monkeypatch):
+    async def load(self, lora_path):
+        env.record("load_checkpoint_lora_adapter", self.llm, lora_path)
+
+    monkeypatch.setattr(env.worker.InferenceWorker.__ray_metadata__.modified_class,
+                        "_load_checkpoint_lora_adapter", load)
+    _initialize(env, semi_p=True, lora_adapter_path="/lora")
+    [(kwargs, _, _)] = env.called("restore_and_attach")
+    assert "lora_adapter_path" not in kwargs
+    assert env.called("load_checkpoint_lora_adapter") == [(env.attached, "/lora")]
 
 
 def test_semi_p_serves_router_replay(env):

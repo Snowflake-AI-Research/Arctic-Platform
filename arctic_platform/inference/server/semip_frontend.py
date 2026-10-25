@@ -21,11 +21,11 @@ from typing import Any
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
 
-# The weight-sync RPCs that write new weights into the engine. After one, the
-# host copy semi-p wakes from is stale.
+# The weight-sync RPCs that write new base or drafter weights into the engine.
+# After one, the host copy semi-p wakes from is stale. A LoRA sync is not one:
+# the child stages LoRA state at every sleep.
 _WEIGHT_UPDATE_RPCS = frozenset(
-    {"sync_weights", "sync_weights_broadcast", "sync_spec_weights",
-     "sync_lora_weights_broadcast"}
+    {"sync_weights", "sync_weights_broadcast", "sync_spec_weights"}
 )
 
 _DEATH_WATCH_INTERVAL_S = 1.0

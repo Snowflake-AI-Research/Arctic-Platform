@@ -2222,6 +2222,26 @@ def _raise_pid_floor() -> int | None:
         return None
 
 
+def _discard_image(model_dir: str) -> None:
+    """Turn a failed dump's image into a cache miss.
+
+    ``criu_dump`` writes ``meta.json``, which is all a hit looks for, so a dump
+    that fails after it would otherwise be restored by the next attempt. The
+    rest of ``image/`` is left: the next dump clears it before writing.
+    """
+    meta_path = os.path.join(model_dir, _IMAGE_DIR, "meta.json")
+    try:
+        os.remove(meta_path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.warning("semi_p: could not remove %s after a failed dump, so the "
+                       "next job will restore that image", meta_path, exc_info=True)
+        return
+    logger.warning("semi_p: removed %s after a failed dump, so the next job "
+                   "dumps again", meta_path)
+
+
 def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
           image_ref: str, driver_version: str) -> None:
     """Cold-start vLLM, capture an image into ``model_dir``, and destroy it.
@@ -2278,12 +2298,19 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         inst.save_weights()
         inst.detach()
         inst.sleep()
+        # Checked before the checkpoint: an engine that failed to sleep still
+        # holds its weights and KV cache, and dumping it anyway writes an
+        # image tens of times larger that later jobs restore as a hit.
+        inst.wait()
         inst.cuda_checkpoint()  # TP>1: destroy_nccl inside
         inst.criu_dump(meta_extra={"image_ref": image_ref,
                                    "driver_version": driver_version,
                                    "pid_floor": pid_floor,
                                    "unprivileged": _unprivileged_mode()})
         inst.wait()             # criu_dump destroys the child
+    except BaseException:
+        _discard_image(model_dir)
+        raise
     finally:
         # Frees the Instance's worker process; the vLLM child is already gone.
         # Guarded because a failure before init() leaves no queues to send on.
@@ -2564,6 +2591,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.save_weights(weights_dir=weights_dir)
         inst.detach()
         inst.sleep()
+        inst.wait()             # a failed sleep is never checkpointed; see _dump
         inst.arm_mq_park(ranks=list(range(local)))
         # Drops the graphs and tears NCCL down across every rank, including the
         # agents'. Theirs must follow, not lead.
@@ -2577,6 +2605,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.wait()
         ray.get(dumping)
     except BaseException:
+        _discard_image(model_dir)
         try:
             inst.teardown()
         except Exception:  # noqa: BLE001
