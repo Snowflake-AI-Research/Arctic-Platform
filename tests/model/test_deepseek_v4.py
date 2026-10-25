@@ -326,6 +326,7 @@ def test_mxfp4_expert_backward_through_grouped_gemms_matches_the_for_loop():
     from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
     from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
     from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
+    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_grouped_mm_impl
 
     torch.manual_seed(0)
     experts = Mxfp4GroupedExperts(dim=256, hidden_dim=128, num_experts=4, swiglu_limit=10.0).cuda()
@@ -344,6 +345,13 @@ def test_mxfp4_expert_backward_through_grouped_gemms_matches_the_for_loop():
     _run_experts_for_loop_impl(*weights, x_ref, counts, 10.0).backward(grad)
     relative = ((x.grad.float() - x_ref.grad.float()).norm() / x_ref.grad.float().norm()).item()
     assert relative < 1e-2, relative
+
+    # The saved gate/up backward runs the same grouped GEMMs autograd would, only without repeating the forward.
+    x_auto = x.detach().clone().requires_grad_(True)
+    output = _run_experts_grouped_mm_impl(*weights, x_auto, counts, 10.0)
+    output.backward(grad)
+    torch.testing.assert_close(experts(x.detach(), counts), output, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, x_auto.grad, rtol=1e-2, atol=1e-2 * x_auto.grad.abs().max().item())
 
 
 def test_sqrtsoftplus_scores_match_softplus_sqrt():

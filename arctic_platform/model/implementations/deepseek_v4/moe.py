@@ -18,7 +18,9 @@ from arctic_platform.model.implementations.moe.distributed.ep_backend import use
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
+from arctic_platform.model.implementations.moe.layers.moe import _apply_swiglu
 from arctic_platform.model.implementations.moe.layers.moe import _maybe_to_local
+from arctic_platform.model.implementations.moe.layers.moe import _offsets_must_cover_no_more_than_the_rows
 from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
 from arctic_platform.model.implementations.moe.layers.moe import _run_experts_grouped_mm_impl
 
@@ -26,8 +28,9 @@ _MXFP4_BLOCK = 32
 
 
 class _Mxfp4ExpertsFn(torch.autograd.Function):
-    """MXFP4 grouped expert forward. Backward recomputes the BF16 weights from the packed values and the input
-    gradient through the same grouped GEMMs as the forward (the weights are frozen, so autograd only runs dX)."""
+    """MXFP4 grouped expert forward. The weights are frozen, so the backward only needs dX: on CUDA it keeps the
+    gate and up projections from the forward and runs the three input-gradient grouped GEMMs on BF16 weights
+    restored from the packed values, without repeating the forward GEMMs. Elsewhere it recomputes the forward."""
 
     @staticmethod
     def forward(
@@ -43,30 +46,44 @@ class _Mxfp4ExpertsFn(torch.autograd.Function):
         swiglu_limit: float | None,
         use_grouped_mm: bool,
     ) -> Tensor:
-        ctx.save_for_backward(x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert)
         ctx.swiglu_limit = swiglu_limit
         ctx.use_grouped_mm = use_grouped_mm
-        return _mxfp4_experts(x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert, swiglu_limit, use_grouped_mm)
+        ctx.x_dtype = x.dtype
+        ctx.saved_projections = x.is_cuda and use_grouped_mm
+        if not ctx.saved_projections:
+            ctx.save_for_backward(x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert)
+            return _mxfp4_experts(x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert, swiglu_limit, use_grouped_mm)
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        x = x.bfloat16()
+        _offsets_must_cover_no_more_than_the_rows("gated", x, num_tokens_per_expert, offsets)
+        gate = torch._grouped_mm(x, dequantize_mxfp4(w1, s1).transpose(-2, -1), offs=offsets)
+        up = torch._grouped_mm(x, dequantize_mxfp4(w3, s3).transpose(-2, -1), offs=offsets)
+        hidden = _apply_swiglu(gate, up, swiglu_limit)
+        output = torch._grouped_mm(hidden, dequantize_mxfp4(w2, s2).transpose(-2, -1), offs=offsets)
+        ctx.save_for_backward(gate, up, w1, s1, w2, s2, w3, s3, offsets)
+        return output.to(ctx.x_dtype)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert = ctx.saved_tensors
+        if not ctx.saved_projections:
+            x, w1, s1, w2, s2, w3, s3, num_tokens_per_expert = ctx.saved_tensors
+            with torch.enable_grad():
+                x_in = x.detach().requires_grad_(True)
+                output = _mxfp4_experts(
+                    x_in, w1, s1, w2, s2, w3, s3, num_tokens_per_expert, ctx.swiglu_limit, ctx.use_grouped_mm
+                )
+                (grad_x,) = torch.autograd.grad(output, x_in, grad_output)
+            return grad_x, None, None, None, None, None, None, None, None, None
+        gate, up, w1, s1, w2, s2, w3, s3, offsets = ctx.saved_tensors
+        grad_hidden = torch._grouped_mm(grad_output.bfloat16().contiguous(), dequantize_mxfp4(w2, s2), offs=offsets)
         with torch.enable_grad():
-            x_in = x.detach().requires_grad_(True)
-            output = _mxfp4_experts(
-                x_in,
-                w1,
-                s1,
-                w2,
-                s2,
-                w3,
-                s3,
-                num_tokens_per_expert,
-                ctx.swiglu_limit,
-                ctx.use_grouped_mm,
-            )
-            (grad_x,) = torch.autograd.grad(output, x_in, grad_output)
-        return grad_x, None, None, None, None, None, None, None, None, None
+            gate_in = gate.detach().requires_grad_(True)
+            up_in = up.detach().requires_grad_(True)
+            hidden = _apply_swiglu(gate_in, up_in, ctx.swiglu_limit)
+            grad_gate, grad_up = torch.autograd.grad(hidden, (gate_in, up_in), grad_hidden)
+        grad_x = torch._grouped_mm(grad_gate, dequantize_mxfp4(w1, s1), offs=offsets)
+        grad_x += torch._grouped_mm(grad_up, dequantize_mxfp4(w3, s3), offs=offsets)
+        return grad_x.to(ctx.x_dtype), None, None, None, None, None, None, None, None, None
 
 
 def _mxfp4_experts(
