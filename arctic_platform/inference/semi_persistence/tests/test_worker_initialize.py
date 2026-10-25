@@ -151,6 +151,15 @@ def env(monkeypatch):
     monkeypatch.setattr(worker, "_create_async_engine_args", env.engine_args)
     monkeypatch.setattr(worker, "_resolve_chat_mode", lambda *a: (None, False))
     monkeypatch.setattr(worker, "_ensure_router_replay_vllm_patches", noop)
+    monkeypatch.setattr(
+        worker.InferenceWorker.__ray_metadata__.modified_class,
+        "_register_router_replay_shm",
+        lambda self, kwargs, vllm_config, model_id: env.record("router_replay_shm", model_id))
+    monkeypatch.setattr(
+        worker.InferenceWorker.__ray_metadata__.modified_class,
+        "_maybe_init_router_replay_tx",
+        lambda self, kwargs, rr_kwargs=None: env.record(
+            "router_replay_tx", bool(kwargs.get("enable_return_routed_experts"))))
     monkeypatch.setenv("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", "0")
     env.worker = worker
     return env
@@ -235,11 +244,17 @@ def test_semi_p_dumps_without_a_dropped_reasoning_parser(env):
     assert "reasoning_parser" not in kwargs
 
 
-@pytest.mark.parametrize("kwargs,match", [
-    ({"lora_adapter_path": "/lora"}, "LoRA adapter"),
-    ({"enable_return_routed_experts": True}, "routed experts"),
-])
-def test_semi_p_refuses_what_a_restore_cannot_serve(env, kwargs, match):
-    with pytest.raises(ValueError, match=match):
-        _initialize(env, semi_p=True, **kwargs)
+def test_semi_p_refuses_a_lora_adapter(env):
+    with pytest.raises(ValueError, match="LoRA adapter"):
+        _initialize(env, semi_p=True, lora_adapter_path="/lora")
     assert env.called("restore_and_attach") == []
+
+
+def test_semi_p_serves_router_replay(env):
+    _initialize(env, semi_p=True, enable_return_routed_experts=True,
+                router_replay_max_cache_bytes=1024)
+    [(kwargs, _, _)] = env.called("restore_and_attach")
+    assert kwargs["enable_return_routed_experts"] is True
+    assert "router_replay_max_cache_bytes" not in kwargs
+    assert env.called("router_replay_shm") == [("job-1",)]
+    assert env.called("router_replay_tx") == [(True,)]
