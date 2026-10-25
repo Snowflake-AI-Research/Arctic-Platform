@@ -408,6 +408,7 @@ def test_serve_core_raises_what_the_child_refused():
 class _FakeVllmAsyncLLM(_FakeAsyncLLM):
     built = []
     renderers = []
+    input_processors = []
     fail = None
 
     @classmethod
@@ -415,9 +416,12 @@ class _FakeVllmAsyncLLM(_FakeAsyncLLM):
         if cls.fail is not None:
             raise cls.fail
         cls.built.append((vllm_config, kwargs))
-        # What AsyncLLM.__init__ does first: build its renderer by name.
-        cls.renderers.append(
-            sys.modules["vllm.v1.engine.async_llm"].renderer_from_config(vllm_config))
+        # What AsyncLLM.__init__ does first: build its renderer, then its
+        # input processor on it, both by name.
+        module = sys.modules["vllm.v1.engine.async_llm"]
+        renderer = module.renderer_from_config(vllm_config)
+        cls.renderers.append(renderer)
+        cls.input_processors.append(module.InputProcessor(vllm_config, renderer))
         return cls()
 
 
@@ -426,6 +430,10 @@ _RING = object()
 
 def _own_renderer(vllm_config):
     return ("own renderer", vllm_config)
+
+
+def _own_input_processor(vllm_config, renderer):
+    return ("own input processor", renderer)
 
 
 @pytest.fixture
@@ -439,6 +447,7 @@ def asyncllm(monkeypatch):
         "vllm.v1": types.ModuleType("vllm.v1"),
         "vllm.v1.engine": types.ModuleType("vllm.v1.engine"),
         "vllm.v1.engine.async_llm": types.ModuleType("vllm.v1.engine.async_llm"),
+        "vllm.v1.engine.input_processor": types.ModuleType("vllm.v1.engine.input_processor"),
         "vllm.renderers": types.ModuleType("vllm.renderers"),
         "arctic_platform.inference.server.metrics":
             types.ModuleType("arctic_platform.inference.server.metrics"),
@@ -446,7 +455,10 @@ def asyncllm(monkeypatch):
     mods["vllm.utils.network_utils"].get_open_zmq_ipc_path = lambda: next(paths)
     mods["vllm.v1.engine.async_llm"].AsyncLLM = _FakeVllmAsyncLLM
     mods["vllm.v1.engine.async_llm"].renderer_from_config = _own_renderer
+    mods["vllm.v1.engine.async_llm"].InputProcessor = _own_input_processor
     mods["vllm.renderers"].renderer_from_config = lambda cfg: ("prebuilt", cfg)
+    mods["vllm.v1.engine.input_processor"].InputProcessor = (
+        lambda cfg, renderer: ("prebuilt input processor", renderer))
     mods["arctic_platform.inference.server.metrics"].RingStatLogger = _RING
     mods["vllm.v1.engine"].async_llm = mods["vllm.v1.engine.async_llm"]
     for name, mod in mods.items():
@@ -454,6 +466,7 @@ def asyncllm(monkeypatch):
     monkeypatch.setitem(sys.modules, _FRONTEND_NAME, fe)
     _FakeVllmAsyncLLM.built = []
     _FakeVllmAsyncLLM.renderers = []
+    _FakeVllmAsyncLLM.input_processors = []
     _FakeVllmAsyncLLM.fail = None
     spec = importlib.util.spec_from_file_location(
         "semip_asyncllm_under_test", os.path.join(_SERVER, "semip_asyncllm.py"))
@@ -536,7 +549,8 @@ def restored(monkeypatch):
 
 
 def _restore_and_attach(asyncllm, engine_kwargs, cfg, agents=None):
-    async def attach(handle, vllm_config, renderer=None, render_s=None):
+    async def attach(handle, vllm_config, renderer=None, render_s=None,
+                     input_processor=None):
         return handle, vllm_config
 
     asyncllm.attach = attach
@@ -584,7 +598,8 @@ def test_restore_and_attach_adds_no_reasoner_the_front_end_lacks(
     assert "reasoning_parser" not in kwargs
 
 
-def test_the_renderer_is_built_while_the_engine_restores(asyncllm, monkeypatch):
+def test_the_renderer_is_built_while_the_engine_restores(
+        asyncllm, monkeypatch, caplog):
     cfg = _vllm_config()
     inst = _Inst(pid=os.getpid(), summary=fe.core_summary(cfg))
     rendering = threading.Event()
@@ -600,10 +615,16 @@ def test_the_renderer_is_built_while_the_engine_restores(asyncllm, monkeypatch):
     monkeypatch.setattr(asyncllm, "renderer_from_config", renderer_from_config)
     monkeypatch.setitem(sys.modules, _ENGINE_NAME, types.SimpleNamespace(
         restore_engine=restore_engine))
-    llm = asyncio.run(asyncllm.restore_and_attach({"model": "/m"}, None, cfg))
+    with caplog.at_level(logging.INFO, logger=fe.logger.name):
+        llm = asyncio.run(asyncllm.restore_and_attach({"model": "/m"}, None, cfg))
     try:
         assert _FakeVllmAsyncLLM.renderers == [("prebuilt", cfg)]
-        assert sys.modules["vllm.v1.engine.async_llm"].renderer_from_config is _own_renderer
+        assert _FakeVllmAsyncLLM.input_processors == [
+            ("prebuilt input processor", ("prebuilt", cfg))]
+        module = sys.modules["vllm.v1.engine.async_llm"]
+        assert module.renderer_from_config is _own_renderer
+        assert module.InputProcessor is _own_input_processor
+        assert "renderer and input processor built during the restore" in caplog.text
     finally:
         llm._stop_death_watch()
 
@@ -616,7 +637,18 @@ def test_attach_without_a_prebuilt_renderer_lets_asyncllm_build_it(
         llm = asyncio.run(asyncllm.attach(_handle(inst), cfg))
     llm._stop_death_watch()
     assert _FakeVllmAsyncLLM.renderers == [("own renderer", cfg)]
+    assert _FakeVllmAsyncLLM.input_processors == [
+        ("own input processor", ("own renderer", cfg))]
     assert "renderer built by the AsyncLLM" in caplog.text
+
+
+def test_an_input_processor_is_not_used_without_its_renderer(asyncllm):
+    cfg = _vllm_config()
+    inst = _Inst(pid=os.getpid(), summary=fe.core_summary(cfg))
+    llm = asyncio.run(asyncllm.attach(_handle(inst), cfg, None, None, "stray"))
+    llm._stop_death_watch()
+    assert _FakeVllmAsyncLLM.input_processors == [
+        ("own input processor", ("own renderer", cfg))]
 
 
 def test_a_failed_renderer_build_falls_back_to_asyncllm(asyncllm, monkeypatch):
@@ -624,7 +656,26 @@ def test_a_failed_renderer_build_falls_back_to_asyncllm(asyncllm, monkeypatch):
         raise OSError("no processor config")
 
     monkeypatch.setattr(asyncllm, "renderer_from_config", broken)
-    assert asyncllm._build_renderer(_vllm_config()) == (None, None)
+    assert asyncllm._build_inputs(_vllm_config()) == (None, None, None)
+
+
+def test_a_failed_input_processor_build_keeps_the_renderer(
+        asyncllm, monkeypatch, caplog):
+    def broken(vllm_config, renderer):
+        raise ValueError("no generation config")
+
+    monkeypatch.setattr(asyncllm, "InputProcessor", broken)
+    cfg = _vllm_config()
+    renderer, input_processor, secs = asyncllm._build_inputs(cfg)
+    assert renderer == ("prebuilt", cfg) and input_processor is None
+    assert secs is not None
+    inst = _Inst(pid=os.getpid(), summary=fe.core_summary(cfg))
+    with caplog.at_level(logging.INFO, logger=fe.logger.name):
+        llm = asyncio.run(asyncllm.attach(_handle(inst), cfg, renderer, secs))
+    llm._stop_death_watch()
+    assert _FakeVllmAsyncLLM.input_processors == [
+        ("own input processor", ("prebuilt", cfg))]
+    assert "renderer built during the restore" in caplog.text
 
 
 def test_a_failed_restore_still_raises_after_the_renderer(asyncllm, monkeypatch):

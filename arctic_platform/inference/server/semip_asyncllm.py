@@ -23,6 +23,7 @@ import vllm.v1.engine.async_llm as _async_llm
 from vllm.renderers import renderer_from_config
 from vllm.utils.network_utils import get_open_zmq_ipc_path
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.input_processor import InputProcessor
 
 from arctic_platform.inference.server.metrics import RingStatLogger
 from arctic_platform.inference.server.semip_frontend import (
@@ -62,58 +63,73 @@ async def restore_and_attach(engine_kwargs: dict[str, Any], agents: Any,
     reasoner = getattr(vllm_config.structured_outputs_config, "reasoning_parser", None)
     if reasoner and not kwargs.get("reasoning_parser"):
         kwargs["reasoning_parser"] = reasoner
-    rendering = asyncio.ensure_future(asyncio.to_thread(_build_renderer, vllm_config))
+    building = asyncio.ensure_future(asyncio.to_thread(_build_inputs, vllm_config))
     try:
         handle = await asyncio.to_thread(restore_engine, kwargs, agents)
     finally:
-        renderer, render_s = await rendering
-    return await attach(handle, vllm_config, renderer, render_s)
+        renderer, input_processor, render_s = await building
+    return await attach(handle, vllm_config, renderer, render_s, input_processor)
 
 
-def _build_renderer(vllm_config: Any) -> tuple[Any, float | None]:
-    """The front end's renderer (tokenizer and multimodal processor), built
-    while the engine restores; ``(None, None)`` if that fails, and the
-    ``AsyncLLM`` then builds its own."""
+def _build_inputs(vllm_config: Any) -> tuple[Any, Any, float | None]:
+    """The front end's renderer (tokenizer and multimodal processor) and input
+    processor (which sizes a multimodal model's encoder cache), built while
+    the engine restores, and how long that took. A part that fails to build
+    is None, and the ``AsyncLLM`` then builds its own."""
     t0 = time.perf_counter()
     try:
         renderer = renderer_from_config(vllm_config)
     except Exception:  # noqa: BLE001 - AsyncLLM retries it and raises then
         logger.warning("semi_p: building the renderer during the restore "
                        "failed; the AsyncLLM will build it", exc_info=True)
-        return None, None
-    return renderer, time.perf_counter() - t0
+        return None, None, None
+    try:
+        input_processor = InputProcessor(vllm_config, renderer)
+    except Exception:  # noqa: BLE001 - as above
+        logger.warning("semi_p: building the input processor during the "
+                       "restore failed; the AsyncLLM will build it", exc_info=True)
+        input_processor = None
+    return renderer, input_processor, time.perf_counter() - t0
 
 
 @contextlib.contextmanager
-def _prebuilt_renderer(renderer: Any):
-    """Has ``AsyncLLM.__init__`` take ``renderer`` rather than build one.
+def _prebuilt_inputs(renderer: Any, input_processor: Any):
+    """Has ``AsyncLLM.__init__`` take ``renderer`` and ``input_processor``
+    rather than build them.
 
-    It calls its module's ``renderer_from_config`` by name; were that to
-    change, it would build its own, which is only slower.
+    It calls its module's ``renderer_from_config`` and ``InputProcessor`` by
+    name; were that to change, it would build its own, which is only slower.
     """
-    if renderer is None:
-        yield
-        return
-    original = _async_llm.renderer_from_config
-    _async_llm.renderer_from_config = lambda *args, **kwargs: renderer
+    swaps = [(name, value) for name, value in (
+        ("renderer_from_config", renderer), ("InputProcessor", input_processor))
+        if value is not None]
+    originals = {name: getattr(_async_llm, name) for name, _ in swaps}
+    for name, value in swaps:
+        setattr(_async_llm, name, lambda *args, _value=value, **kwargs: _value)
     try:
         yield
     finally:
-        _async_llm.renderer_from_config = original
+        for name, original in originals.items():
+            setattr(_async_llm, name, original)
 
 
 async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
-                 render_s: float | None = None) -> SemiPAsyncLLM:
+                 render_s: float | None = None,
+                 input_processor: Any = None) -> SemiPAsyncLLM:
     """Serve ``handle``'s restored engine with an ``AsyncLLM`` built from ``vllm_config``.
 
     ``vllm_config`` is the front end's own config, built from the same engine
     kwargs the image was dumped with; the child's core must agree with it on
     every identity field, or the attach fails before any request is sent.
-    ``renderer``, when given, is the one ``restore_and_attach`` built from
-    ``vllm_config`` during the restore, and ``render_s`` how long that took.
+    ``renderer`` and ``input_processor``, when given, are the ones
+    ``restore_and_attach`` built from ``vllm_config`` during the restore, and
+    ``render_s`` how long that took; ``input_processor`` is used only with
+    the ``renderer`` it was built on.
     Built on the event loop, as on the plain path. On failure the restored
     engine is torn down, since nothing else owns it yet.
     """
+    if renderer is None:
+        input_processor = None
     t0 = time.perf_counter()
     addresses = {"input_address": get_open_zmq_ipc_path(),
                  "output_address": get_open_zmq_ipc_path()}
@@ -133,7 +149,7 @@ async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
             logger.error("%s", message)
             raise RuntimeError(message)
         t1 = time.perf_counter()
-        with _prebuilt_renderer(renderer):
+        with _prebuilt_inputs(renderer, input_processor):
             llm = SemiPAsyncLLM.from_vllm_config(
                 vllm_config,
                 stat_loggers=[RingStatLogger],
@@ -146,8 +162,8 @@ async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
     llm._init_semi_p(handle.inst, handle.agents)
     llm._start_death_watch(llm._on_child_death)
     logger.info("semi_p: front end attached in %.2fs (serve_core %.2fs, "
-                "AsyncLLM %.2fs, renderer %s)", time.perf_counter() - t0,
-                t_serve, t_llm,
-                f"built during the restore in {render_s:.2f}s"
-                if renderer is not None else "built by the AsyncLLM")
+                "AsyncLLM %.2fs, %s)", time.perf_counter() - t0, t_serve, t_llm,
+                ("renderer and input processor" if input_processor is not None
+                 else "renderer") + f" built during the restore in {render_s:.2f}s"
+                if renderer is not None else "renderer built by the AsyncLLM")
     return llm
