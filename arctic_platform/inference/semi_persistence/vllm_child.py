@@ -2953,6 +2953,139 @@ def _log_graph_census(llm, log, when):
     return census
 
 
+# -- Serving the engine core over ZMQ ----------------------------------------
+#
+# After a restore, ``serve_core`` hands this child's ``EngineCore`` to a real
+# vLLM ``AsyncLLM`` front end in the server process.  The core stays where it
+# is; it gains vLLM's own socket threads and is driven by the main loop through
+# ``_semip_serving_tick`` instead of by ``LLMEngine.step``.
+
+# Commands a serving child refuses: requests arrive over the sockets, vLLM's
+# pause replaces semi-p's, and a dump would capture live sockets and threads.
+_SERVING_REFUSED_CMDS = frozenset(
+    {"generate", "pause", "resume", "prepare_criu_dump", "serve_core"})
+
+# How long an idle serving child waits for a request before checking the pipe.
+_SERVING_IDLE_WAIT_S = 0.005
+
+_SERVING_READY_TIMEOUT_S = 30.0
+
+
+def _semip_core_summary(vllm_config):
+    """The fields a front end must agree on with the core it attaches to.
+
+    A plain dict of plain values, so it crosses the pipe; the config itself
+    holds live modules.  ``server/semip_frontend.core_summary`` reads the same
+    fields from the front end's config, and a test keeps the two in step.
+    """
+    mc = vllm_config.model_config
+    pc = vllm_config.parallel_config
+    sc = vllm_config.scheduler_config
+    cc = vllm_config.cache_config
+    so = getattr(vllm_config, "structured_outputs_config", None)
+    spec = getattr(vllm_config, "speculative_config", None)
+    return {
+        "model": str(mc.model),
+        "tokenizer": str(mc.tokenizer),
+        "dtype": str(mc.dtype).removeprefix("torch."),
+        "tensor_parallel_size": int(pc.tensor_parallel_size),
+        "worker_extension_cls": str(getattr(pc, "worker_extension_cls", "") or ""),
+        "max_num_seqs": int(sc.max_num_seqs),
+        "max_num_batched_tokens": int(sc.max_num_batched_tokens),
+        "reasoning_parser": str(getattr(so, "reasoning_parser", "") or ""),
+        "structured_outputs_backend": str(getattr(so, "backend", "") or ""),
+        "speculative_method": str(getattr(spec, "method", "") or ""),
+        "num_speculative_tokens": int(
+            getattr(spec, "num_speculative_tokens", 0) or 0),
+        "lora": getattr(vllm_config, "lora_config", None) is not None,
+        "max_model_len": int(mc.max_model_len),
+        "block_size": int(cc.block_size),
+        "num_gpu_blocks": int(cc.num_gpu_blocks or 0),
+        "enable_prefix_caching": bool(cc.enable_prefix_caching),
+    }
+
+
+def _semip_serve_core(core, input_address, output_address):
+    """Turn this child's in-process ``EngineCore`` into a ZMQ-served one.
+
+    The object becomes an ``EngineCoreProc`` in place -- its scheduler, KV
+    cache and executor are the restored ones -- with the attributes
+    ``EngineCoreProc.__init__`` would have set, then vLLM's own input and
+    output socket threads.  The front end binds both addresses; the input
+    thread connects and sends the ready message the front end waits for.
+    """
+    import queue
+    import threading
+
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
+
+    core.__class__ = EngineCoreProc
+    core.input_queue = queue.Queue()
+    core.output_queue = queue.Queue()
+    core.engine_index = 0
+    core.engines_running = False
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.tensor_ipc_receiver = None
+    core.has_coordinator = False
+    core.frontend_stats_publish_address = None
+    core.publish_dp_lb_stats = False
+    core.last_counts = (0, 0)
+    core.addresses = None
+    core.process_input_queue_block = False
+    core.enable_fault_tolerance = False
+    core.model_executor.register_failure_callback(
+        lambda: core.input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, b"")))
+
+    identity = core.engine_index.to_bytes(length=2, byteorder="little")
+    ready = threading.Event()
+    input_thread = threading.Thread(
+        target=core.process_input_sockets,
+        args=([input_address], None, identity, ready),
+        daemon=True, name="semip-core-input")
+    input_thread.start()
+    core.output_thread = threading.Thread(
+        target=core.process_output_sockets,
+        args=([output_address], None, core.engine_index),
+        daemon=True, name="semip-core-output")
+    core.output_thread.start()
+
+    if not ready.wait(timeout=_SERVING_READY_TIMEOUT_S):
+        raise RuntimeError(
+            "engine core input thread "
+            + ("died" if not input_thread.is_alive() else "is not ready")
+            + f" after {_SERVING_READY_TIMEOUT_S:.0f}s")
+    return _semip_core_summary(core.vllm_config)
+
+
+def _semip_serving_tick(core, pipe_conn, asleep,
+                        idle_wait_s=_SERVING_IDLE_WAIT_S):
+    """One main-loop pass for a serving core; True when a pipe command waits.
+
+    Takes in what the input thread queued, then steps the core when it has
+    work.  An asleep core is never stepped: a paused scheduler still calls
+    ``execute_model``, and the executor is asleep.  Requests that arrive while
+    asleep still reach the scheduler and run after ``wake_up_kv_cache``.
+    """
+    import queue
+
+    core._process_input_queue()
+    if asleep:
+        return pipe_conn.poll(idle_wait_s)
+    if core.has_work():
+        core._process_engine_step()
+        return pipe_conn.poll(0)
+    if pipe_conn.poll(0):
+        return True
+    try:
+        request = core.input_queue.get(timeout=idle_wait_s)
+    except queue.Empty:
+        return False
+    core._handle_client_request(*request)
+    return pipe_conn.poll(0)
+
+
 def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     multinode=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
@@ -3166,6 +3299,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     _paused = False
     _dormant = False
     _saved_requests = []
+    # The core once ``serve_core`` has handed it to a front end; from then on
+    # the main loop drives it through ``_semip_serving_tick``.
+    _served_core = None
 
     def _alloc_engine_id():
         nonlocal _next_engine_id
@@ -3488,6 +3624,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 pipe_conn.send(("generate_done", elapsed, None, info))
 
     def _drain_engine():
+        if _served_core is not None:
+            while (_served_core.has_work()
+                   and not _served_core.is_scheduler_paused()):
+                _served_core._process_engine_step()
+            return
         while engine is not None and engine.has_unfinished_requests():
             _process_step_outputs(engine.step())
 
@@ -3690,6 +3831,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     def _handle_command(cmd, kwargs):
         nonlocal llm, engine
         nonlocal _paused, _dormant
+        nonlocal _served_core
 
         error = None
         info = {}
@@ -4789,6 +4931,19 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 log.info("  loaded weights: %.2f GiB across %d worker(s)",
                          total / 2**30, len(results))
 
+            elif cmd == "serve_core":
+                if llm is None:
+                    raise RuntimeError("serve_core requires an initialized engine")
+                if _active_reqs or llm.llm_engine.has_unfinished_requests():
+                    raise RuntimeError(
+                        "serve_core with semi-p requests in flight")
+                core = llm.llm_engine.engine_core.engine_core
+                info.update(_semip_serve_core(
+                    core, kwargs["input_address"], kwargs["output_address"]))
+                _served_core = core
+                log.info("  serving engine core: input=%s output=%s",
+                         kwargs["input_address"], kwargs["output_address"])
+
             else:
                 error = f"unknown command: {cmd}"
 
@@ -4807,10 +4962,15 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
     try:
         while True:
+            if _served_core is not None and not _semip_serving_tick(
+                    _served_core, pipe_conn, _dormant):
+                continue
+
             if engine is None and llm is not None:
                 engine = llm.llm_engine
 
-            has_active = (engine is not None
+            has_active = (_served_core is None
+                          and engine is not None
                           and engine.has_unfinished_requests()
                           and not _paused)
 
@@ -4834,6 +4994,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 break
 
             log.info(">>> %s", cmd)
+
+            if _served_core is not None and cmd in _SERVING_REFUSED_CMDS:
+                error = f"{cmd} refused: the engine core is serving a front end"
+                log.warning("<<< %s FAILED (0.000s): %s", cmd, error)
+                if cmd == "generate":
+                    pipe_conn.send(("generate_done", 0.0, error,
+                                    {"req_id": kwargs.get("req_id")}))
+                else:
+                    pipe_conn.send((cmd, 0.0, error, {}))
+                continue
 
             if cmd == "generate":
                 req_id = kwargs.get("req_id")
@@ -4893,6 +5063,12 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         log.error("FATAL in main loop (cmd=%s): %s: %s",
                   cmd, type(_fatal).__name__, _fatal)
         log.error("%s", _trace)
+        if _served_core is not None:
+            try:
+                _served_core._send_engine_dead()
+            except Exception:
+                log.warning("could not tell the front end the core died",
+                            exc_info=True)
         try:
             pipe_conn.send((
                 cmd if cmd is not None else "__fatal__",
