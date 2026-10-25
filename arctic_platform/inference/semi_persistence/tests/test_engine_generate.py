@@ -1,4 +1,4 @@
-"""Unit tests for ``_SemiPEngine``'s generate path in ``server/semip_engine.py``.
+"""Unit tests for ``_SemiPEngine``'s generate path in ``server/semip_frontend.py``.
 
 ``_SemiPEngine`` stands in for vLLM's ``AsyncLLM`` when a job restores a
 semi-p image. Two properties of ``AsyncLLM`` that callers rely on are checked
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import importlib.util
 import os
 import sys
 import threading
@@ -25,7 +26,21 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_image_cache_key import _PKG, se  # noqa: E402
+from test_image_cache_key import _PKG  # noqa: E402
+
+_FRONTEND = os.path.join(os.path.dirname(_PKG), "server", "semip_frontend.py")
+
+
+def _load_semip_frontend():
+    """semip_frontend.py from its file; it imports only the standard library."""
+    spec = importlib.util.spec_from_file_location("semip_frontend_under_test",
+                                                  _FRONTEND)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fe = _load_semip_frontend()
 
 
 def _load_apply_result():
@@ -97,7 +112,7 @@ class _FakeInstance:
 
 
 def _engine(inst):
-    return se._SemiPEngine(inst, tokenizer_path=None, model=None)
+    return fe._SemiPEngine(inst, tokenizer_path=None, model=None)
 
 
 async def _one(engine, prompt, reasoning_ended=None):
@@ -203,7 +218,7 @@ def test_sampling_params_forward_every_caller_field():
         extra_args={"dss_stop_token_sequences": [[1, 2]]},
         logit_bias={5: -1.0}, output_kind="DELTA", stream_interval=4,
         skip_clone=True, _all_stop_token_ids={7})
-    sp = se._sampling_params_to_dict(params)
+    sp = fe._sampling_params_to_dict(params)
     assert sp == {
         "n": 1, "temperature": 0.0, "max_tokens": None, "logprobs": 1,
         "structured_outputs": guided,
