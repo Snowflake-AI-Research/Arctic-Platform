@@ -45,7 +45,9 @@ async def restore_and_attach(engine_kwargs: dict[str, Any], agents: Any,
     limits are pinned into the kwargs the child builds its engine from,
     because the child uses ``LLM()``, whose usage-context defaults differ.
     Stats are turned on for the same kind of reason: ``LLM()`` turns them off,
-    and the core builds its stats objects with the engine.
+    and the core builds its stats objects with the engine. The reasoning
+    parser is pinned too: the worker adds chat's reasoner to ``vllm_config``
+    after building it, so the kwargs alone would build a core without one.
     """
     from arctic_platform.inference.server.semip_engine import restore_engine
 
@@ -54,6 +56,9 @@ async def restore_and_attach(engine_kwargs: dict[str, Any], agents: Any,
         if kwargs.get(key) is None:
             kwargs[key] = getattr(vllm_config.scheduler_config, key)
     kwargs.setdefault("disable_log_stats", False)
+    reasoner = getattr(vllm_config.structured_outputs_config, "reasoning_parser", None)
+    if reasoner and not kwargs.get("reasoning_parser"):
+        kwargs["reasoning_parser"] = reasoner
     handle = await asyncio.to_thread(restore_engine, kwargs, agents)
     return await attach(handle, vllm_config)
 

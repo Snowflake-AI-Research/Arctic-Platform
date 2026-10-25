@@ -553,6 +553,23 @@ def test_restore_and_attach_keeps_what_the_job_set(asyncllm, restored):
     assert kwargs["disable_log_stats"] is True
 
 
+def test_restore_and_attach_builds_the_core_with_the_front_ends_reasoner(
+        asyncllm, restored):
+    cfg = _vllm_config(structured_outputs_config=types.SimpleNamespace(
+        reasoning_parser="qwen3", backend="auto"))
+    _restore_and_attach(asyncllm, {"model": "/m"}, cfg)
+    [(kwargs, _)] = restored
+    assert kwargs["reasoning_parser"] == "qwen3"
+
+
+@pytest.mark.parametrize("over", [{}, {"structured_outputs_config": None}])
+def test_restore_and_attach_adds_no_reasoner_the_front_end_lacks(
+        asyncllm, restored, over):
+    _restore_and_attach(asyncllm, {"model": "/m"}, _vllm_config(**over))
+    [(kwargs, _)] = restored
+    assert "reasoning_parser" not in kwargs
+
+
 def _imported(path, anywhere=False):
     """Module names ``path`` imports, at module scope or (``anywhere``) at all."""
     with open(path) as handle:
