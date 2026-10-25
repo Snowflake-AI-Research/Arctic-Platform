@@ -34,6 +34,7 @@ directory of its model_dir. Logs saved from the GPU pod instead tag lines
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from datetime import datetime
@@ -68,19 +69,36 @@ VLLM_PHASES = {
 }
 
 
+def start_cursor(client: Any, job_id: str) -> str | None:
+    """A ``tail_logs`` cursor at the job's creation, or None if it has no
+    ``created_at``. Without a cursor the first page is the log's newest lines,
+    so a long log (many replicas) loses its start, where the restore markers are.
+    The service's cursor is an unpadded base64 RFC 3339 timestamp."""
+    created = client.get_job(job_id).get("created_at")
+    return base64.b64encode(str(created).encode()).decode().rstrip("=") if created else None
+
+
 def read_sub_job_log(client: Any, job_id: str, max_pages: int = 200) -> list[str]:
-    """The sub-job log so far. Pages until one comes back empty: a running job's
-    log never reports ``eof``, so ``stream_logs(follow=False)`` would not return."""
-    lines: list[str] = []
-    cursor = None
-    for _ in range(max_pages):
+    """The sub-job log so far, from the job's start. Pages until one comes back
+    empty: a running job's log never reports ``eof``, so
+    ``stream_logs(follow=False)`` would not return."""
+    try:
+        cursor = start_cursor(client, job_id)
         page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
+    except Exception as exc:  # noqa: BLE001 - fall back to the newest lines
+        logger.warning("sub-job log for %s from its start unavailable (%s); reading the newest lines", job_id, exc)
+        cursor, page = None, None
+    lines: list[str] = []
+    for _ in range(max_pages):
+        if page is None:
+            page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
         entries = page.get("entries") or []
         for entry in entries:
             lines.extend(log_text(entry).splitlines())
         cursor = page.get("next_cursor", cursor)
         if not entries or page.get("eof"):
             break
+        page = None
     return lines
 
 

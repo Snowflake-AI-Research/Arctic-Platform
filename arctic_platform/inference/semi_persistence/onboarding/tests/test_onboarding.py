@@ -7,6 +7,7 @@ repository root::
     python -m pytest arctic_platform/inference/semi_persistence/onboarding/tests
 """
 
+import base64
 import json
 
 import pytest
@@ -151,6 +152,37 @@ def test_restore_report_prefers_pod_logs_and_labels_each_pod():
     table = "\n".join(report.replica_table(r))
     assert "| bbbbb r0 | node-partition agent |" in table and "cuda_restore" in table
     assert startup.restore_report({"sub-job.log": RESTORE_LOG}, {})["steps_source"].startswith("sub-job log")
+
+
+class _LogService:
+    """``tail_logs`` as the service pages it: no cursor gives the newest
+    ``max_lines``; a cursor (base64 timestamp) gives the lines after it."""
+
+    def __init__(self, n, created_at="2026-01-01T00:00:00Z"):
+        self.lines = [f"line {i}" for i in range(n)]
+        self.created_at, self.cursors = created_at, []
+
+    def get_job(self, job_id):
+        return {"created_at": self.created_at}
+
+    def tail_logs(self, job_id, cursor=None, max_lines=1000, sub_job_type=None):
+        self.cursors.append(cursor)
+        if cursor is None:
+            start = max(0, len(self.lines) - max_lines)
+        elif cursor.startswith("at:"):
+            start = int(cursor[3:])
+        else:
+            assert base64.b64decode(cursor + "=" * (-len(cursor) % 4)).decode() == self.created_at
+            start = 0
+        end = min(start + max_lines, len(self.lines))
+        return {"entries": [{"_raw": x} for x in self.lines[start:end]], "next_cursor": f"at:{end}"}
+
+
+def test_sub_job_log_is_read_from_the_job_start():
+    svc = _LogService(2500)
+    assert startup.read_sub_job_log(svc, "J") == svc.lines
+    svc = _LogService(2500, created_at=None)
+    assert startup.read_sub_job_log(svc, "J") == svc.lines[-1000:] and svc.cursors[0] is None
 
 
 def test_parse_semi_p_sub_job_log_format_two_pods():
