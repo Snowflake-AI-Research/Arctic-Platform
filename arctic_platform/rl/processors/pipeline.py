@@ -68,6 +68,7 @@ from arctic_platform.common.utils.batch import META_FWD_SCALAR_KEYS
 from arctic_platform.common.utils.batch import _reject_meta_fwd_scalars_on_batch
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.common.utils.tiled_logits import memory_logprobs_entropy_from_hidden
+from arctic_platform.common.utils.tiled_logits import require_tied_lm_head
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
 from arctic_platform.rl.utils.debug import ProfilerContext
@@ -364,6 +365,19 @@ def _causal_lm_from_engine(engine):
     return getattr(engine, "module", engine)
 
 
+def _base_causal_lm(module):
+    """Return the causal LM under a PEFT wrapper.
+
+    PEFT's tuner calls ``self.model.forward(...)``, which skips forward hooks
+    registered on that inner module. Hook the unwrapped decoder instead.
+    """
+    if getattr(module, "peft_config", None) and callable(getattr(module, "get_base_model", None)):
+        base = module.get_base_model()
+        if base is not None:
+            return base
+    return module
+
+
 def _text_backbone(causal_lm):
     model = getattr(causal_lm, "model", None)
     if model is None:
@@ -592,8 +606,10 @@ def run_pipeline(
 
     captured: dict[str, Any] = {}
     handle = None
+    causal_lm = None
     if tile_lm_head:
-        causal_lm = _causal_lm_from_engine(engine)
+        causal_lm = _base_causal_lm(_causal_lm_from_engine(engine))
+        require_tied_lm_head(causal_lm)
         backbone = _text_backbone(causal_lm)
         if backbone is None:
             raise RuntimeError(
@@ -653,7 +669,6 @@ def run_pipeline(
                 f"projected sequence dim {logits.shape[-2]} (shape {tuple(logits.shape)}). "
                 "Full [T, V] logits were materialized."
             )
-        causal_lm = _causal_lm_from_engine(engine)
         input_ids = batch.get("input_ids")
         if input_ids is None:
             raise RuntimeError("logits_optimization=memory requires batch['input_ids']")
@@ -662,7 +677,7 @@ def run_pipeline(
             input_ids = input_ids.view(hidden.shape[:-1])
         labels = torch.roll(input_ids, shifts=-1, dims=-1)
         tiled_kwargs = dict(
-            temperature=meta["temperature"],
+            temperature=meta.get("temperature", 1.0),
             calculate_entropy=bool(meta.get("calculate_entropy")),
             peak_mem_gib=float(meta.get("logits_optimization_peak_mem_size_in_gib", 4) or 4),
             logits_compute_from_fp32_inputs=bool(meta.get("logits_compute_from_fp32_inputs", False)),
