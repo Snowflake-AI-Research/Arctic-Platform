@@ -2288,7 +2288,61 @@ def _collective_rpc_with_timeout(llm, fn, args, timeout_s=None, log=None):
     return box["result"]
 
 
-def _reinit_nccl(worker, port, master_addr=None, ifname=None):
+def _default_route_ifname(route_file="/proc/net/route"):
+    """The interface of this network namespace's IPv4 default route, or None."""
+    try:
+        with open(route_file) as f:
+            next(f, None)
+            for line in f:
+                fields = line.split()
+                if (len(fields) > 3 and fields[1] == "00000000"
+                        and int(fields[3], 16) & 0x1):  # RTF_UP
+                    return fields[0]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _single_node_job_nccl(worker, job_nccl_env):
+    """Give a restored single-node rank the restoring job's NCCL settings and
+    a routable bootstrap interface, ahead of ``_reinit_nccl``'s rebuild.
+
+    The cold start bound every NCCL socket to loopback so the image restores
+    on any node (``vllm_child_loop``), and a restored process keeps the dump
+    job's environment. A communicator to another pod -- a trainer's weight
+    sync -- needs a routable address and this job's settings (its
+    aws-ofi-nccl rails, say), and nothing is dumped after a restore, so from
+    here on NCCL bootstraps on the job's ``NCCL_SOCKET_IFNAME`` or, unset,
+    this pod's default-route interface. The rank's own groups are local and
+    run over NVLink/P2P either way. Returns ``nccl_bootstrap.reset()``'s
+    report, or None where the rank stays on loopback, which only a
+    communicator to another pod notices.
+    """
+    rank = getattr(worker, "rank", "?")
+    env = dict(job_nccl_env or {})
+    target = env.pop("NCCL_SOCKET_IFNAME", None) or _default_route_ifname()
+    os.environ.update(env)
+    if not target:
+        print(f"[semip] rank {rank}: no default route, so NCCL stays on "
+              f"loopback and a communicator to another pod will fail",
+              flush=True)
+        return None
+    import nccl_bootstrap
+    os.environ["NCCL_SOCKET_IFNAME"] = target
+    try:
+        report = nccl_bootstrap.reset()
+    except Exception as e:  # noqa: BLE001 - serving does not need it
+        os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+        print(f"[semip] rank {rank}: NCCL stays on loopback, since resetting "
+              f"its bootstrap failed ({type(e).__name__}: {e}); a communicator "
+              f"to another pod will fail", flush=True)
+        return None
+    print(f"[semip] rank {rank}: NCCL bootstraps on {target} with "
+          f"{len(env)} setting(s) from this job", flush=True)
+    return report
+
+
+def _reinit_nccl(worker, port, master_addr=None, ifname=None, job_nccl_env=None):
     """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
     canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
     look up.
@@ -2297,6 +2351,8 @@ def _reinit_nccl(worker, port, master_addr=None, ifname=None):
     from the environment: this process is restored, so its ``environ`` is the
     dump's and nothing the restoring job sets would be visible here.  It falls
     back to the inherited value so a single-node restore is unchanged.
+    ``job_nccl_env`` is the restoring job's NCCL settings, for the same reason;
+    a single-node rank takes them (see ``_single_node_job_nccl``).
     """
     import traceback
     import weakref
@@ -2318,6 +2374,8 @@ def _reinit_nccl(worker, port, master_addr=None, ifname=None):
             _net_reset = nccl_bootstrap.reset()
             print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
                   f"nccl_bootstrap.reset -> {_net_reset}", flush=True)
+        elif not _is_multinode():
+            _net_reset = _single_node_job_nccl(worker, job_nccl_env)
         # NVLS / SymmMem exchange fds that do not survive CRIU -> keep them off.
         # FlashInfer allreduce is off for a different reason -- the captured
         # graphs must hold `cross_device_reduce` nodes for the rebind to have
@@ -4948,7 +5006,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 port = int(kwargs.get("port") or 0) or get_open_port()
                 results = _collective_rpc_with_timeout(
                     llm, _reinit_nccl,
-                    (port, kwargs.get("master_addr"), kwargs.get("ifname")),
+                    (port, kwargs.get("master_addr"), kwargs.get("ifname"),
+                     kwargs.get("job_nccl_env")),
                     timeout_s=kwargs.get("timeout_s"), log=log)
                 failures = [r for r in results
                             if isinstance(r, dict) and not r.get("ok", True)]
