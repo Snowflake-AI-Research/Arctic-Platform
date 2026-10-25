@@ -24,6 +24,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -406,6 +407,7 @@ def test_serve_core_raises_what_the_child_refused():
 
 class _FakeVllmAsyncLLM(_FakeAsyncLLM):
     built = []
+    renderers = []
     fail = None
 
     @classmethod
@@ -413,10 +415,17 @@ class _FakeVllmAsyncLLM(_FakeAsyncLLM):
         if cls.fail is not None:
             raise cls.fail
         cls.built.append((vllm_config, kwargs))
+        # What AsyncLLM.__init__ does first: build its renderer by name.
+        cls.renderers.append(
+            sys.modules["vllm.v1.engine.async_llm"].renderer_from_config(vllm_config))
         return cls()
 
 
 _RING = object()
+
+
+def _own_renderer(vllm_config):
+    return ("own renderer", vllm_config)
 
 
 @pytest.fixture
@@ -430,16 +439,21 @@ def asyncllm(monkeypatch):
         "vllm.v1": types.ModuleType("vllm.v1"),
         "vllm.v1.engine": types.ModuleType("vllm.v1.engine"),
         "vllm.v1.engine.async_llm": types.ModuleType("vllm.v1.engine.async_llm"),
+        "vllm.renderers": types.ModuleType("vllm.renderers"),
         "arctic_platform.inference.server.metrics":
             types.ModuleType("arctic_platform.inference.server.metrics"),
     }
     mods["vllm.utils.network_utils"].get_open_zmq_ipc_path = lambda: next(paths)
     mods["vllm.v1.engine.async_llm"].AsyncLLM = _FakeVllmAsyncLLM
+    mods["vllm.v1.engine.async_llm"].renderer_from_config = _own_renderer
+    mods["vllm.renderers"].renderer_from_config = lambda cfg: ("prebuilt", cfg)
     mods["arctic_platform.inference.server.metrics"].RingStatLogger = _RING
+    mods["vllm.v1.engine"].async_llm = mods["vllm.v1.engine.async_llm"]
     for name, mod in mods.items():
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setitem(sys.modules, _FRONTEND_NAME, fe)
     _FakeVllmAsyncLLM.built = []
+    _FakeVllmAsyncLLM.renderers = []
     _FakeVllmAsyncLLM.fail = None
     spec = importlib.util.spec_from_file_location(
         "semip_asyncllm_under_test", os.path.join(_SERVER, "semip_asyncllm.py"))
@@ -522,7 +536,7 @@ def restored(monkeypatch):
 
 
 def _restore_and_attach(asyncllm, engine_kwargs, cfg, agents=None):
-    async def attach(handle, vllm_config):
+    async def attach(handle, vllm_config, renderer=None, render_s=None):
         return handle, vllm_config
 
     asyncllm.attach = attach
@@ -568,6 +582,60 @@ def test_restore_and_attach_adds_no_reasoner_the_front_end_lacks(
     _restore_and_attach(asyncllm, {"model": "/m"}, _vllm_config(**over))
     [(kwargs, _)] = restored
     assert "reasoning_parser" not in kwargs
+
+
+def test_the_renderer_is_built_while_the_engine_restores(asyncllm, monkeypatch):
+    cfg = _vllm_config()
+    inst = _Inst(pid=os.getpid(), summary=fe.core_summary(cfg))
+    rendering = threading.Event()
+
+    def renderer_from_config(vllm_config):
+        rendering.set()
+        return ("prebuilt", vllm_config)
+
+    def restore_engine(engine_kwargs, agents):
+        assert rendering.wait(5), "the restore ran before the renderer started"
+        return _handle(inst)
+
+    monkeypatch.setattr(asyncllm, "renderer_from_config", renderer_from_config)
+    monkeypatch.setitem(sys.modules, _ENGINE_NAME, types.SimpleNamespace(
+        restore_engine=restore_engine))
+    llm = asyncio.run(asyncllm.restore_and_attach({"model": "/m"}, None, cfg))
+    try:
+        assert _FakeVllmAsyncLLM.renderers == [("prebuilt", cfg)]
+        assert sys.modules["vllm.v1.engine.async_llm"].renderer_from_config is _own_renderer
+    finally:
+        llm._stop_death_watch()
+
+
+def test_attach_without_a_prebuilt_renderer_lets_asyncllm_build_it(
+        asyncllm, caplog):
+    cfg = _vllm_config()
+    inst = _Inst(pid=os.getpid(), summary=fe.core_summary(cfg))
+    with caplog.at_level(logging.INFO, logger=fe.logger.name):
+        llm = asyncio.run(asyncllm.attach(_handle(inst), cfg))
+    llm._stop_death_watch()
+    assert _FakeVllmAsyncLLM.renderers == [("own renderer", cfg)]
+    assert "renderer built by the AsyncLLM" in caplog.text
+
+
+def test_a_failed_renderer_build_falls_back_to_asyncllm(asyncllm, monkeypatch):
+    def broken(vllm_config):
+        raise OSError("no processor config")
+
+    monkeypatch.setattr(asyncllm, "renderer_from_config", broken)
+    assert asyncllm._build_renderer(_vllm_config()) == (None, None)
+
+
+def test_a_failed_restore_still_raises_after_the_renderer(asyncllm, monkeypatch):
+    def restore_engine(engine_kwargs, agents):
+        raise RuntimeError("criu restore failed")
+
+    monkeypatch.setitem(sys.modules, _ENGINE_NAME, types.SimpleNamespace(
+        restore_engine=restore_engine))
+    with pytest.raises(RuntimeError, match="criu restore failed"):
+        asyncio.run(asyncllm.restore_and_attach({"model": "/m"}, None, _vllm_config()))
+    assert _FakeVllmAsyncLLM.built == []
 
 
 def _imported(path, anywhere=False):

@@ -14,10 +14,13 @@ load it against fake vLLM modules.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any
 
+import vllm.v1.engine.async_llm as _async_llm
+from vllm.renderers import renderer_from_config
 from vllm.utils.network_utils import get_open_zmq_ipc_path
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -59,16 +62,55 @@ async def restore_and_attach(engine_kwargs: dict[str, Any], agents: Any,
     reasoner = getattr(vllm_config.structured_outputs_config, "reasoning_parser", None)
     if reasoner and not kwargs.get("reasoning_parser"):
         kwargs["reasoning_parser"] = reasoner
-    handle = await asyncio.to_thread(restore_engine, kwargs, agents)
-    return await attach(handle, vllm_config)
+    rendering = asyncio.ensure_future(asyncio.to_thread(_build_renderer, vllm_config))
+    try:
+        handle = await asyncio.to_thread(restore_engine, kwargs, agents)
+    finally:
+        renderer, render_s = await rendering
+    return await attach(handle, vllm_config, renderer, render_s)
 
 
-async def attach(handle: Any, vllm_config: Any) -> SemiPAsyncLLM:
+def _build_renderer(vllm_config: Any) -> tuple[Any, float | None]:
+    """The front end's renderer (tokenizer and multimodal processor), built
+    while the engine restores; ``(None, None)`` if that fails, and the
+    ``AsyncLLM`` then builds its own."""
+    t0 = time.perf_counter()
+    try:
+        renderer = renderer_from_config(vllm_config)
+    except Exception:  # noqa: BLE001 - AsyncLLM retries it and raises then
+        logger.warning("semi_p: building the renderer during the restore "
+                       "failed; the AsyncLLM will build it", exc_info=True)
+        return None, None
+    return renderer, time.perf_counter() - t0
+
+
+@contextlib.contextmanager
+def _prebuilt_renderer(renderer: Any):
+    """Has ``AsyncLLM.__init__`` take ``renderer`` rather than build one.
+
+    It calls its module's ``renderer_from_config`` by name; were that to
+    change, it would build its own, which is only slower.
+    """
+    if renderer is None:
+        yield
+        return
+    original = _async_llm.renderer_from_config
+    _async_llm.renderer_from_config = lambda *args, **kwargs: renderer
+    try:
+        yield
+    finally:
+        _async_llm.renderer_from_config = original
+
+
+async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
+                 render_s: float | None = None) -> SemiPAsyncLLM:
     """Serve ``handle``'s restored engine with an ``AsyncLLM`` built from ``vllm_config``.
 
     ``vllm_config`` is the front end's own config, built from the same engine
     kwargs the image was dumped with; the child's core must agree with it on
     every identity field, or the attach fails before any request is sent.
+    ``renderer``, when given, is the one ``restore_and_attach`` built from
+    ``vllm_config`` during the restore, and ``render_s`` how long that took.
     Built on the event loop, as on the plain path. On failure the restored
     engine is torn down, since nothing else owns it yet.
     """
@@ -91,11 +133,12 @@ async def attach(handle: Any, vllm_config: Any) -> SemiPAsyncLLM:
             logger.error("%s", message)
             raise RuntimeError(message)
         t1 = time.perf_counter()
-        llm = SemiPAsyncLLM.from_vllm_config(
-            vllm_config,
-            stat_loggers=[RingStatLogger],
-            client_addresses=addresses,
-        )
+        with _prebuilt_renderer(renderer):
+            llm = SemiPAsyncLLM.from_vllm_config(
+                vllm_config,
+                stat_loggers=[RingStatLogger],
+                client_addresses=addresses,
+            )
         t_llm = time.perf_counter() - t1
     except BaseException:
         _teardown(handle.inst, handle.agents)
@@ -103,5 +146,8 @@ async def attach(handle: Any, vllm_config: Any) -> SemiPAsyncLLM:
     llm._init_semi_p(handle.inst, handle.agents)
     llm._start_death_watch(llm._on_child_death)
     logger.info("semi_p: front end attached in %.2fs (serve_core %.2fs, "
-                "AsyncLLM %.2fs)", time.perf_counter() - t0, t_serve, t_llm)
+                "AsyncLLM %.2fs, renderer %s)", time.perf_counter() - t0,
+                t_serve, t_llm,
+                f"built during the restore in {render_s:.2f}s"
+                if renderer is not None else "built by the AsyncLLM")
     return llm
