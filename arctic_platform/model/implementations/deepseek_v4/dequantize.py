@@ -81,6 +81,10 @@ def dequantize_mxfp4(weight: Tensor, scale: Tensor) -> Tensor:
         raise ValueError(f"MXFP4 expert weight arrived as {weight.dtype}, expected int8")
     if weight.dim() < 3:
         return dequantize_weight(weight, scale)
+    if weight.is_cuda and scale.dtype == torch.float32:
+        from arctic_platform.model.implementations.kernels.deepseek_v4.mxfp4_dequant import mxfp4_to_bf16
+
+        return mxfp4_to_bf16(weight, scale)
     out = torch.empty((*weight.shape[:-1], 2 * weight.shape[-1]), dtype=torch.bfloat16, device=weight.device)
     for start in range(0, weight.shape[0], _EXPERTS_PER_DEQUANTIZE):
         end = start + _EXPERTS_PER_DEQUANTIZE
