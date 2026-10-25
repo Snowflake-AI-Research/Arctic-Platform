@@ -42,6 +42,9 @@ from arctic_platform.model.implementations.deepseek_v4.cp import gather_for_cp
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
 from arctic_platform.model.implementations.kernels.deepseek_v4 import IGNORE_SLOT
+from arctic_platform.model.implementations.kernels.deepseek_v4.index_scores import index_scores
+from arctic_platform.model.implementations.kernels.deepseek_v4.index_scores import index_scores_applies
+from arctic_platform.model.implementations.kernels.deepseek_v4.index_scores import split_keys
 from arctic_platform.model.implementations.layers.grouped_linear import GroupedLinear
 from arctic_platform.model.implementations.layers.norms import RMSNorm
 from arctic_platform.model.implementations.layers.norms import RMSNormConfig
@@ -320,15 +323,24 @@ class DeepseekV41Indexer(nn.Module):
         # Every per-query tensor below spans the whole sequence's entries, so at long context
         # they are only ever materialized for a slice of queries.
         entries = keys.shape[1]
-        chunk = max(1, _INDEX_CHUNK_BYTES // max(1, batch * self.num_heads * entries * 4))
-        score_keys = keys.float()
+        fused = batch == 1 and index_scores_applies(query, weights)
+        if fused:
+            # The fused scores keep no per-head intermediate, so the slice is sized by the scores themselves.
+            chunk = max(1, _INDEX_CHUNK_BYTES // max(1, entries * 4))
+            score_keys = split_keys(keys[0])
+        else:
+            chunk = max(1, _INDEX_CHUNK_BYTES // max(1, batch * self.num_heads * entries * 4))
+            score_keys = keys.float()
         topk = torch.empty(queries, self.index_topk, dtype=torch.long, device=hidden.device)
         candidates = torch.empty(
             batch, queries, entries if self.is_candidate_source else 0, dtype=torch.bool, device=hidden.device
         )
         for start in range(0, queries, chunk):
             rows = slice(start, min(start + chunk, queries))
-            scores = _index_scores(query[:, rows], score_keys, weights[:, rows])[0]
+            if fused:
+                scores = index_scores(query[0, rows], score_keys, weights[0, rows])
+            else:
+                scores = _index_scores(query[:, rows], score_keys, weights[:, rows])[0]
             tok_doc_idx = packed.tok_doc_idx[rows]
             visible, causal_len = _visible_entries(
                 layout, packed.position_ids[0, rows], tok_doc_idx, self.compress_ratio
