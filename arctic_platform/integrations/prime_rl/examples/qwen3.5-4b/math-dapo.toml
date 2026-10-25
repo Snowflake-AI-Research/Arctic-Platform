@@ -1,0 +1,70 @@
+# Qwen3.5-4B math — DAPO-Math-17k (open-r1 processed, AIME-level competition, 17398, clean flat prompt/solution).
+# The learnable frontier for this strong model: standard math is >=0.75 (too easy, flat-high); research
+# label noise or sits flat). DeepMath-103K is competition/olympiad level (difficulty 1-10, mean ~6.0,
+# arxivmath is 0.22 (too hard to improve, flat-low). AIME-level should start ~0.4-0.6 with room AND be
+# learnable. math_env + difficulty_pool + gate; judge off.
+# sampler adaptively concentrates on the learnable band (no static difficulty filter needed), and the
+# 0-variance gate keeps the trained batch signal-bearing. judge off (no PRIME_API_KEY on Cortex).
+# See [[project_i3math_label_noise_root_cause]].
+
+seq_len = 131072
+max_steps = 30
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 131072
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "math_env"
+env.taskset.dataset_name = "/modeling-code/boyiliu/dapo_math"
+env.taskset.dataset_subset = "default"
+env.taskset.dataset_split = "train"
+env.taskset.question_key = "prompt"
+env.taskset.answer_key = "solution"
+env.taskset.task.judge = "None"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "difficulty_pool" }
+curriculum.gates = { no_signal = { type = "advantage_range" } }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true

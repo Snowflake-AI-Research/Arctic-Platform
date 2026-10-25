@@ -1,0 +1,71 @@
+# Qwen3.5-4B math — arxivmath FILTERED to drop hopeless questions. The full arxivmath (2605 rows) is
+# ~57% hopeless for this 4B (empirical per-task solve rate == 0 over ~15 samples each in arxiv5-1020),
+# which buries the real reward/learning under unsolvable 0s (mean solve 0.206, same-task early->late
+# +0.023 = genuine but invisible learning). This dataset keeps the 1157 rows the model solves at least
+# occasionally (sr>0, plus never-sampled rows) and drops only the 1448 known-hopeless — easy/mastered
+# rows are KEPT (user: remove only the hopeless part, not the too-easy part). Expected: all-reward jumps
+# from ~0.20 toward ~0.45+ and the learning trend becomes visible. Same knobs as math-arxiv.toml (64k,
+# difficulty_pool sampler, judge off); built by _build_arxiv_filtered.py. See
+# [[project_i3math_label_noise_root_cause]].
+
+seq_len = 73728
+max_steps = 300
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 64   # 64 question-groups x group_size 8 = 512 rollouts/step (was 256 groups / 2048 rollouts);
+                  # ~4x fewer tokens/step -> ~4x faster cadence, noisier GRPO gradient per step.
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 65536
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "math_env"
+env.taskset.dataset_name = "/modeling-code/boyiliu/arxivmath_filtered"
+env.taskset.dataset_subset = "default"
+env.taskset.dataset_split = "train"
+env.taskset.question_key = "question"
+env.taskset.answer_key = "answer"
+env.taskset.task.judge = "None"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "difficulty_pool" }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true

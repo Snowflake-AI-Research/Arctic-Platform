@@ -1,0 +1,73 @@
+# Qwen3.5-4B math — like math-pool.toml (pool sampler + 0-variance gate, LR 1e-6) but filter floor
+# raised 0.1 -> 0.3. The residual ~7% bad labels in [0.1,0.9] concentrate at thinking-ref 0.125-0.375;
+# raising the floor drops that noisy band (-> ~3-4% residual) to curb the late reward erosion, while
+# keeping headroom. Targeted fix for math-pool/-lr rise-then-erode. See [[project_i3math_label_noise_root_cause]].
+# (i3_math, thinking-ref [0.1,0.9], CISPO, near-on-policy, 131072 + dense LM-head chunking) but adds
+# the pin's equivalent of the reference recipe's eviction/buffer:
+#   - curriculum.sampler = difficulty_pool: samples tasks RANDOMLY, weighted by observed per-task
+#     reward pools (default hard<=0.25 w0.2, normal<=0.75 w1.0, easy<=1.0 w0.2). Shuffles away the
+#     source-order task-mix noise AND down-weights mastered/too-hard tasks -> focuses the learning
+#     signal on the learnable middle (the "eviction/buffer" the reference did via easy/hard_threshold).
+#   - curriculum.gates.no_signal = advantage_range [0,0]: rejects 0-variance groups from training, so
+#     the admitted batch is all signal-bearing (default gates are empty -> we were wasting them).
+# (force_collect from the reference does not exist in this pin 84e94bf05c; this sampler+gate is the
+# equivalent.) See [[project_i3math_label_noise_root_cause]].
+
+seq_len = 131072
+max_steps = 30
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 131072
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.taskset.filter.column = "avg@8_qwen3_4b_thinking_2507"
+env.taskset.filter.min = 0.3
+env.taskset.filter.max = 0.9
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "difficulty_pool" }
+curriculum.gates = { no_signal = { type = "advantage_range" } }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true

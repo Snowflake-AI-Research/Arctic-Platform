@@ -1,0 +1,69 @@
+# Qwen3.5-4B math — arxivmath (MathArena/arxivmath-training, research-paper math, 2605, clean, flat).
+# DeepMath was still too easy: measured solve-rate 0.75 even at its hardest (difficulty 9). arxivmath is
+# label noise or sits flat). DeepMath-103K is competition/olympiad level (difficulty 1-10, mean ~6.0,
+# mostly 5-8), decontaminated, with verifiable final answers -> genuine headroom for Qwen3.5-4B and no
+# label-noise erosion. math_env is configurable, so just point it at DeepMath; the difficulty_pool
+# sampler adaptively concentrates on the learnable band (no static difficulty filter needed), and the
+# 0-variance gate keeps the trained batch signal-bearing. judge off (no PRIME_API_KEY on Cortex).
+# See [[project_i3math_label_noise_root_cause]].
+
+seq_len = 73728
+max_steps = 600
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 65536
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "math_env"
+env.taskset.dataset_name = "MathArena/arxivmath-training"
+env.taskset.dataset_subset = "default"
+env.taskset.dataset_split = "train"
+env.taskset.question_key = "question"
+env.taskset.answer_key = "answer"
+env.taskset.task.judge = "None"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "difficulty_pool" }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true

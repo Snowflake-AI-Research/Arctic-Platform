@@ -1,0 +1,62 @@
+# Qwen3.5-4B SWE — swe-long.toml (r2e-gym, max_steps 300, mg-0 via overlay) + DIFFICULTY-POOL SAMPLER
+# + 0-variance GATE. r2e-gym has a very high 0-variance group rate that worsens as the model improves
+# (mastered tasks -> all-solved groups), which was starving admission / crawling the step cadence.
+#   - curriculum.sampler = difficulty_pool: random weighted sampling that down-weights mastered
+#     (easy<=1.0 w0.2) and too-hard (hard<=0.25 w0.2) tasks, concentrating on the learnable middle ->
+#     fewer 0-variance groups generated -> faster steps + better signal. Also shuffles source order.
+#   - curriculum.gates.no_signal = advantage_range [0,0]: rejects any residual 0-variance groups from
+#     training. See [[project_r2e_group_variance_eviction]], [[project_i3math_label_noise_root_cause]].
+# (force_collect from the reference does not exist in this pin; sampler+gate is the equivalent.)
+
+seq_len = 131072
+max_steps = 300
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 96
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 256
+
+[[orchestrator.train.source]]
+name = "swe"
+env.taskset.id = "r2e-gym"
+env.agent.harness.id = "bash"
+env.agent.runtime.labels = ["qwen3.5-4b-cortex-swe", "swe"]
+curriculum.sampler = { type = "difficulty_pool" }
+curriculum.gates = { no_signal = { type = "advantage_range" } }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true

@@ -47,22 +47,21 @@ deliberately and re-run the dry run below after any bump.
 ## Run
 
 ```bash
-# Math (stock subprocess runtime, no sandbox):
+# SWE (r2e-gym with the agentic grading policy; sandbox via PrimeIntellect's sandbox
+# service — verifiers' default `prime` runtime):
 python -m arctic_platform.integrations.prime_rl.rl \
-  @ arctic_platform/integrations/prime_rl/examples/qwen3.6-35b-a3b/math.toml
-
-# SWE (sandbox via PrimeIntellect's sandbox service — verifiers' default `prime` runtime):
-python -m arctic_platform.integrations.prime_rl.rl \
-  @ arctic_platform/integrations/prime_rl/examples/qwen3.6-35b-a3b/swe.toml
+  @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/swe-grade.toml
 
 # Resolve-only, writes cortex_job_body.json and exits:
 python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
 ```
 
+A math recipe runs the same way (`--env-package math-env`); the one for the current
+math experiment is added here once its dataset is published.
+
 Cortex credentials come from `ARCTIC_CORTEX_*` (host, database, schema, PAT), read by
-`CortexConnectionConfig`. The recipes serve `Qwen/Qwen3.6-35B-A3B` from the Cortex model
-catalog, at half the scale of the upstream `qwen3-30b-a3b` recipes (batch 256, 512 in-flight,
-one 8-GPU training sub-job + one 8-GPU sampling sub-job).
+`CortexConnectionConfig`. The shipped SWE recipe serves `Qwen/Qwen3.5-4B` from the Cortex
+model catalog (one 8-GPU training sub-job + one 8-GPU sampling sub-job).
 
 ## Sandboxes
 

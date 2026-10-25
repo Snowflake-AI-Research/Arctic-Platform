@@ -1,0 +1,58 @@
+# Qwen3.5-4B (dense) math RL on Snowflake Cortex via the default training provider.
+# Faithful port of the public qwen3-30b-a3b/math.toml recipe (IPO default loss, max_off_policy_steps 8,
+# temp-1 untruncated sampling, no length penalty / custom loss), with the model swapped to Qwen3.5-4B
+# — the only Cortex-catalog-VALIDATED dense 4B (dense-rl-full-8x8). Adjust only on observed failure.
+#
+#   python -m arctic_platform.integrations.prime_rl.rl \
+#     @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/math.toml
+
+seq_len = 131072   # Qwen3.5-4B thinking is long (~31k+/problem); 32768 truncated ~82%. Known-good used 262144.
+max_steps = 20     # long context -> slower steps; truncation fix is visible by step 1-2
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 8
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 131072
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+# Dense model -> Cortex default training provider (no prime_rl/ep/sp block).
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+# Qwen3.5 is a VLM family; serve it text-only (matches the team's known-good 4B inference config).
+language_model_only = true

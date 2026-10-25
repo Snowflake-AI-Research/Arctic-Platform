@@ -1,0 +1,64 @@
+# SMOKE PROBE A (not a shipped recipe): baseline qwen3-8b math + a length penalty, 20 steps.
+# Tests whether penalizing long/truncated completions changes the all-reward collapse seen in
+# cortex-pub-math-8b-1014m. Identical to math.toml except [orchestrator] max_steps and the
+# [orchestrator.train.algo.length_penalty] block. Deliberate deviation from the original recipe.
+
+seq_len = 32768
+max_steps = 20
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-8B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 8
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.algo]
+type = "grpo"
+
+# Length penalty: subtracted from each reward before the GRPO baseline, normalized by the group's
+# own max output tokens. The longest (and truncated) rollouts take the biggest hit. Math is
+# single-turn (harness null) so only the output-token term matters.
+[orchestrator.train.algo.length_penalty]
+type = "linear"
+num_output_tokens_weight = 0.1
+num_input_tokens_weight = 0.0
+num_turns_weight = 0.0
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 32768
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1

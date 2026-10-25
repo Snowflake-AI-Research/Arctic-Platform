@@ -1,11 +1,9 @@
-# Qwen3-8B (dense) math RL on Snowflake Cortex via the default training provider — a smaller,
-# cheaper counterpart to the qwen3.6-35b-a3b MoE recipe. One 8-GPU training sub-job + one 8-GPU
-# sampling sub-job (TP 1 -> 8 replicas). Dense: no MoE expert/sequence parallelism.
-#
-#   python -m arctic_platform.integrations.prime_rl.rl \
-#     @ arctic_platform/integrations/prime_rl/examples/qwen3-8b/math.toml
+# SMOKE CONTROL (not a shipped recipe): the faithful qwen3-8b math recipe, no deviations, 35 steps.
+# The no-knob reference for the Control-vs-CISPO comparison — identical to math.toml plus max_steps,
+# run long enough to reach the baseline's sustained collapse zone (~step 24+).
 
 seq_len = 32768
+max_steps = 35
 
 [log]
 level = "debug"
@@ -46,7 +44,6 @@ env.taskset.id = "i3_math"
 env.agent.harness.id = "null"
 env.agent.runtime.type = "subprocess"
 
-# Dense model -> Cortex default training provider (no prime_rl/ep/sp block).
 [cortex.training]
 model_provider = "default"
 

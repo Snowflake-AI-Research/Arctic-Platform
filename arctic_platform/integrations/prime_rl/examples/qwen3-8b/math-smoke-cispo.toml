@@ -1,0 +1,58 @@
+# SMOKE PROBE B (not a shipped recipe): baseline qwen3-8b math + CISPO loss, 20 steps.
+# Tests whether a real upper cap on the importance weight (CISPO ratio_high=5) stops the all-reward
+# collapse seen in cortex-pub-math-8b-1014m, which ran the IPO default (is_weight_clip_max=1e4,
+# effectively uncapped). Identical to math.toml except [orchestrator] max_steps and [trainer.loss].
+# Deliberate deviation from the original recipe (which uses the IPO default).
+
+seq_len = 32768
+max_steps = 35
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-8B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+# CISPO: upper-caps the detached importance weight pi_theta/pi_inference at ratio_high (default 5),
+# vs IPO's default max_importance_ratio=1e4. ratio_low must be 0 for the Cortex grpo loss.
+[trainer.loss]
+type = "cispo"
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 8
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 32768
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1

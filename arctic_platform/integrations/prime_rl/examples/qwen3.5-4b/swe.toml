@@ -1,0 +1,54 @@
+# Qwen3.5-4B (dense) SWE RL on Snowflake Cortex via the default training provider.
+# Faithful port of the public qwen3-30b-a3b/swe recipe (IPO default, max_off_policy_steps 16, temp-1
+# untruncated, no custom loss), model -> validated Qwen3.5-4B, seq_len 131072 (4B thinking is long and
+# SWE is multi-turn; adjust up to 262144 on observed truncation). The EC2 sandbox-env runtime + mg-0
+# namespace/tunnel are layered in via the overlay. Adjust only on observed failure.
+
+seq_len = 131072
+max_steps = 15     # SWE steps are slow (multi-turn + sandbox + long gen); bounded diagnostic
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 16
+
+[orchestrator.train]
+group_size = 8
+
+# SWE prefix-cache thrashes at 512 in-flight; at 131072 context the sampler KV is the binding limit,
+# so hold in-flight at 256.
+[orchestrator.concurrency]
+initial_inflight = 256
+
+[[orchestrator.train.source]]
+name = "swe"
+env.taskset.id = "r2e-gym"
+env.agent.harness.id = "bash"
+env.agent.runtime.labels = ["qwen3.5-4b-cortex-swe", "swe"]
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+# Qwen3.5 is a VLM family; serve it text-only (matches the team's known-good 4B inference config).
+language_model_only = true
