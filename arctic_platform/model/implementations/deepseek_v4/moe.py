@@ -26,7 +26,8 @@ _MXFP4_BLOCK = 32
 
 
 class _Mxfp4ExpertsFn(torch.autograd.Function):
-    """MXFP4 grouped expert forward. Backward recomputes the BF16 weights from the packed values."""
+    """MXFP4 grouped expert forward. Backward recomputes the BF16 weights from the packed values and the input
+    gradient through the same grouped GEMMs as the forward (the weights are frozen, so autograd only runs dX)."""
 
     @staticmethod
     def forward(
@@ -62,7 +63,7 @@ class _Mxfp4ExpertsFn(torch.autograd.Function):
                 s3,
                 num_tokens_per_expert,
                 ctx.swiglu_limit,
-                False,
+                ctx.use_grouped_mm,
             )
             (grad_x,) = torch.autograd.grad(output, x_in, grad_output)
         return grad_x, None, None, None, None, None, None, None, None, None

@@ -321,6 +321,31 @@ def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
     assert experts.w1.grad is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the grouped expert GEMMs run on CUDA")
+def test_mxfp4_expert_backward_through_grouped_gemms_matches_the_for_loop():
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
+
+    torch.manual_seed(0)
+    experts = Mxfp4GroupedExperts(dim=256, hidden_dim=128, num_experts=4, swiglu_limit=10.0).cuda()
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            weight = getattr(experts, name)
+            weight.copy_(torch.randint(-128, 128, weight.shape, dtype=torch.int8))
+            getattr(experts, f"{name}_scale_inv").copy_(torch.exp2(torch.randint(-6, -2, getattr(experts, f"{name}_scale_inv").shape).float()))
+    counts = torch.tensor([40, 0, 72, 16], dtype=torch.int32, device="cuda")
+    x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    experts(x, counts).backward(grad)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weights = [dequantize_mxfp4(getattr(experts, n), getattr(experts, f"{n}_scale_inv")) for n in ("w1", "w2", "w3")]
+    _run_experts_for_loop_impl(*weights, x_ref, counts, 10.0).backward(grad)
+    relative = ((x.grad.float() - x_ref.grad.float()).norm() / x_ref.grad.float().norm()).item()
+    assert relative < 1e-2, relative
+
+
 def test_sqrtsoftplus_scores_match_softplus_sqrt():
     if not torch.cuda.is_available():
         pytest.skip("router histc on integer indices is CUDA-only")
