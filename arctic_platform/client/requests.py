@@ -25,6 +25,7 @@ the separate internal `transport.CLUSTER_OPS` vocabulary.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from os import PathLike
 from typing import Any
 
@@ -41,12 +42,21 @@ def get_job_request(job_id: JobId) -> Request:
     return Request("get-job", job_id)
 
 
+def get_experiment_run_request(job_id: JobId) -> Request:
+    return Request("get-experiment-run", job_id)
+
+
 def cancel_job_request(job_id: JobId) -> Request:
     return Request("cancel-job", job_id)
 
 
-def capacity_request(hardware: str | None = None) -> Request:
-    return Request("capacity", body={} if hardware is None else {"hardware": hardware})
+def capacity_request(hardware: str | None = None, breakdown: str | Iterable[str] | None = None) -> Request:
+    body = {}
+    if hardware is not None:
+        body["hardware"] = hardware
+    if breakdown is not None:
+        body["breakdown"] = breakdown if isinstance(breakdown, str) else tuple(breakdown)
+    return Request("capacity", body=body)
 
 
 def list_checkpoints_request(job_id: JobId) -> Request:
