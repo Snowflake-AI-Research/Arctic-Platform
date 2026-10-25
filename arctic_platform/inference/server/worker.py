@@ -979,7 +979,9 @@ class InferenceWorker(StreamingWorkerMixin):
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
-                if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                # semi_p is not retried here: the restore retries its own
+                # ports, so another attempt would only repeat a whole restore.
+                if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc

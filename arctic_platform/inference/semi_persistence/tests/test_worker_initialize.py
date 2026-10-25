@@ -60,6 +60,7 @@ class _Env:
         self.calls = []
         self.no_think_tokens = False
         self.async_llm_errors = []
+        self.restore_errors = []
         self.attached = types.SimpleNamespace(get_tokenizer=lambda: None)
 
     def record(self, name, *args):
@@ -88,6 +89,8 @@ class _Env:
 
     async def restore_and_attach(self, engine_kwargs, agents, vllm_config):
         self.record("restore_and_attach", dict(engine_kwargs), agents, vllm_config)
+        if self.restore_errors:
+            raise self.restore_errors.pop(0)
         return self.attached
 
     def matched_baseline(self):
@@ -215,6 +218,14 @@ def test_semi_p_restores_where_the_plain_path_builds(env):
 def test_semi_p_skips_the_plain_only_matched_baseline(env):
     _initialize(env, semi_p=True)
     assert not [n for n, _ in env.calls if n.startswith("matched_baseline")]
+
+
+def test_semi_p_restore_is_not_retried_on_address_in_use(env, monkeypatch):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", "5")
+    env.restore_errors = [_ADDRESS_IN_USE]
+    with pytest.raises(RuntimeError, match="EADDRINUSE"):
+        _initialize(env, semi_p=True)
+    assert len(env.called("restore_and_attach")) == 1
 
 
 def test_semi_p_dumps_without_a_dropped_reasoning_parser(env):
