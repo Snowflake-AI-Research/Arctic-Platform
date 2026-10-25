@@ -698,9 +698,13 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             # GLM-5.3-Flash's mHC remix after the MoE saves tensors that depend on the combined output, so the
             # recompute runs past the combine even with early stop and would run the EP all-to-all a second time
             # just to rebuild them; replay the forward's combined output instead.
-            for module in transformer_block.modules():
-                if isinstance(module, MoE):
-                    module.combine_replay = CombineReplay()
+            # Not under activation offload: the replay keeps each block's combined outputs on the GPU until its
+            # backward, while offload moves every other saved activation to the host, so at the lengths that need
+            # offload the held outputs cost more than the second all-to-all (DeepSeek-V4.1 LoRA at 256K: -21%).
+            if not ac_config.offload_config.enabled:
+                for module in transformer_block.modules():
+                    if isinstance(module, MoE):
+                        module.combine_replay = CombineReplay()
             transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE)
             full_layers += 1
 
