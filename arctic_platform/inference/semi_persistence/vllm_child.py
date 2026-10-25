@@ -628,6 +628,9 @@ def _semip_repin(worker):
         return buf.numel()
     _repin_buffer(buf)
     worker._semip_pinned = True
+    # restore_weights copies a pinned host copy directly; the chunk plan
+    # stands, as it does not depend on how the copy is staged.
+    _semip_free_double_buffer(worker)
     return buf.numel()
 
 

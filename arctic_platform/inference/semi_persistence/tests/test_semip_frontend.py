@@ -89,7 +89,7 @@ class _Inst:
 
     def __getattr__(self, cmd):
         if cmd in ("stage", "sleep", "wake_up_weights", "restore_weights",
-                   "wake_up_kv_cache", "teardown"):
+                   "wake_up_kv_cache", "teardown", "repin"):
             return lambda: self._do(cmd) or self
         raise AttributeError(cmd)
 
@@ -119,10 +119,13 @@ class _Front(fe._SemiPAsyncLLMMixin, _FakeAsyncLLM):
     pass
 
 
-def _front(inst=None, agents=(), **kwargs):
+def _front(inst=None, agents=(), pin=False, **kwargs):
+    """A front end; ``pin`` keeps the pin after the first sleep, which the
+    journals of most tests leave out."""
     inst = inst if inst is not None else _Inst()
     front = _Front(journal=inst.journal, **kwargs)
     front._init_semi_p(inst, list(agents))
+    front._pin_pending = front._pin_pending and pin
     return front, inst
 
 
@@ -187,6 +190,46 @@ def test_a_failed_weight_sync_still_restages():
         asyncio.run(front.collective_rpc("sync_weights"))
     asyncio.run(front.collective_rpc("sleep"))
     assert inst.journal[:2] == ["stage", "wait"]
+
+
+def test_the_first_sleep_pins_the_host_copy_and_the_wake_waits_for_it(caplog):
+    front, inst = _front(pin=True)
+    with caplog.at_level(logging.INFO, logger=fe.logger.name):
+        asyncio.run(front.collective_rpc("sleep"))
+        asyncio.run(front.collective_rpc("wake_up"))
+    assert inst.journal == ["sleep", "wait", "repin", "wait"] + _WAKE
+    assert "pinned the host copy in" in caplog.text
+    inst.journal.clear()
+    asyncio.run(front.collective_rpc("sleep"))
+    asyncio.run(front.collective_rpc("wake_up"))
+    assert inst.journal == ["sleep", "wait"] + _WAKE
+
+
+def test_a_sleep_waits_for_the_pin_too():
+    front, inst = _front(pin=True)
+    asyncio.run(front.collective_rpc("sleep"))
+    asyncio.run(front.collective_rpc("sleep"))
+    assert inst.journal == ["sleep", "wait", "repin", "wait", "sleep", "wait"]
+
+
+def test_semip_pin_host_copy_0_keeps_it_pageable(monkeypatch):
+    monkeypatch.setenv("SEMIP_PIN_HOST_COPY", "0")
+    front, inst = _front(pin=True)
+    asyncio.run(front.collective_rpc("sleep"))
+    asyncio.run(front.collective_rpc("wake_up"))
+    assert "repin" not in inst.journal
+
+
+def test_a_failed_pin_leaves_the_wake_to_the_double_buffer(caplog):
+    front, inst = _front(inst=_Inst(fail="repin"), pin=True)
+    with caplog.at_level(logging.WARNING, logger=fe.logger.name):
+        asyncio.run(front.collective_rpc("sleep"))
+        asyncio.run(front.collective_rpc("wake_up"))
+    assert inst.journal == ["sleep", "wait", "repin", "wait"] + _WAKE
+    assert "pinning the host copy failed" in caplog.text
+    inst.journal.clear()
+    asyncio.run(front.collective_rpc("sleep"))
+    assert inst.journal == ["sleep", "wait"]
 
 
 def test_a_failed_stage_does_not_sleep_on_a_stale_copy():

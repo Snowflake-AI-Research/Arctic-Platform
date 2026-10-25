@@ -70,7 +70,7 @@ _WEIGHT_DIR = "weight"
 # the environment of the job that dumped it.
 _PINNED_BUFFER_SETTINGS = (
     ("buffer_bytes", "SEMIP_PINNED_BUFFER_BYTES", 2**30),
-    ("buffer_threads", "SEMIP_PINNED_BUFFER_THREADS", 4),
+    ("buffer_threads", "SEMIP_PINNED_BUFFER_THREADS", 8),
 )
 
 _next_instance_id = 0
@@ -809,7 +809,7 @@ class Instance:
         a small pinned double buffer that restore_weights stages it through:
         per worker ``SEMIP_PINNED_BUFFER_BYTES`` (default 1 GiB) split into
         two halves, each filled by ``SEMIP_PINNED_BUFFER_THREADS`` (default
-        4) threads.  A host copy that is already pinned (``repin``) needs no
+        8) threads.  A host copy that is already pinned (``repin``) needs no
         double buffer, and ``SEMIP_PINNED_BUFFER_BYTES=0`` forms none,
         leaving a slow direct copy from pageable memory.
 
