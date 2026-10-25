@@ -73,8 +73,20 @@ a full cold start to rediscover.
 A DSS sampling job normally brings up its vLLM engine with a cold load: weights
 off disk, compile, capture graphs, roughly a minute for a 35B MoE. This
 integration lets the same job come up by **restoring a pre-warmed CRIU image**
-instead, in a second or two, by routing `InferenceWorker.initialize` to a
-`semi_persistence.Instance` rather than to `AsyncLLM`.
+instead, in a second or two. `InferenceWorker.initialize` restores the engine
+through a `semi_persistence.Instance` where it would build one, and then serves
+it through a real vLLM `AsyncLLM` attached to the restored engine core.
+
+> **Updated 2026-10-24: a restored engine is served by `AsyncLLM`.** Until then
+> the worker's `self.llm` was `_SemiPEngine`, a wrapper that sent whole
+> requests down the `Instance` pipe: no streaming, no chat, no weight sync, no
+> router replay, no LoRA. Now the restored child serves its `EngineCore` over
+> vLLM's own ZMQ protocol (`serve_core`), and `SemiPAsyncLLM`, an `AsyncLLM`
+> subclass, attaches to it the way vLLM attaches to an engine it did not
+> launch. Requests take the plain path; the `Instance` pipe carries only
+> sleep, wake and teardown. Sections 1, 3, 4, 5 and 8 describe the current
+> code; the incident narratives elsewhere still name `restore_and_wrap` and
+> `_SemiPEngine`, which is what ran at the time.
 
 The feature spans three repos, and nothing works until all three agree. That
 cross-repo contract is the reason this document exists: neither side is
@@ -103,13 +115,22 @@ dss/ray_dss/jobs/gpu/sampling.py  kwargs["semi_p"] = True          (coordinator,
 arctic_inference/server/worker.py InferenceWorker.initialize       (GPU pod)
   |                                pops semi_p* before AsyncEngineArgs
   v
-arctic_inference/server/semip_engine.py  restore_and_wrap(...)
+arctic_platform/inference/server/semip_asyncllm.py  restore_and_attach(...)
+  |                                pins scheduler limits, stats, reasoner
+  v
+arctic_platform/inference/server/semip_engine.py  restore_engine(...)
   |                                _resolve_model_dir derives the path
   v
 semi_persistence.Instance         criu_restore -> ... -> up
   |
   v
 $SEMIP_IMAGE_CACHE/<cfg12>_<env12>[/replica<K>]  image/ + weight/ + compilation/
+  |
+  v  (back in semip_asyncllm.attach)
+vllm_child serve_core             EngineCore -> ZMQ-served engine core
+  |
+  v
+SemiPAsyncLLM                     self.llm: AsyncLLM over that core
 ```
 
 Four properties of this chain are easy to get wrong:
@@ -120,12 +141,19 @@ Four properties of this chain are easy to get wrong:
 - **The config hop crosses a process boundary with no GPU.** `sampling.py`
   runs on the `num_gpus=0` coordinator, which has no baked cache. It only maps
   and forwards; every existence check belongs on the GPU pod.
-- **The adapter replaces `self.llm`.** Downstream server code calls `self.llm`
-  as if it were an `AsyncLLM`, so `_SemiPEngine` has to satisfy that surface,
-  not just `generate`.
+- **`self.llm` is a real `AsyncLLM`.** `SemiPAsyncLLM` is vLLM's class with a
+  mixin ahead of it in the MRO (`semip_frontend._SemiPAsyncLLMMixin`), so the
+  surface downstream server code calls is vLLM's own. The mixin overrides only
+  sleep, wake, `collective_rpc` (to route `sleep` / `wake_up` and to notice
+  weight syncs) and `close`.
+- **The front end and the core must agree.** Both are built from the same
+  engine kwargs, but in different processes: the worker through
+  `create_engine_config`, the child through `LLM()`. `attach` compares the
+  fields a front end depends on (`core_summary`, `compare_core_config`) and
+  fails the startup on any difference, before a request is sent.
 - **Teardown is not garbage collection.** The `Instance` owns an
   out-of-process worker and vLLM child, so `InferenceWorker.shutdown` must call
-  `close()` on the adapter before dropping the reference.
+  `close()` on `self.llm` before dropping the reference.
 
 ---
 
@@ -224,23 +252,34 @@ directory rather than two.
 
 ## 3. The worker hook
 
-`InferenceWorker.initialize` in `arctic_inference/server/worker.py` gains an
-early-return branch, placed **before** the `AsyncEngineArgs` construction and
-before the vLLM plugin force-load:
+`InferenceWorker.initialize` in `arctic_platform/inference/server/worker.py`
+changes in one place. A semi_p job runs the plain path's start-up unchanged --
+the vLLM patches, the engine kwargs with `WeightSyncExtension`,
+`create_engine_config`, chat mode, the router-replay shared memory -- and
+restores where the plain path builds:
 
 ```python
 semi_p = bool(engine_kwargs.pop("semi_p", False))
 engine_kwargs.pop("semi_p_model_dir", None)
+semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
+...
+vllm_config = engine_args.create_engine_config()
+...
 if semi_p:
-    from arctic_platform.inference.server.semip_engine import restore_and_wrap
-    self.llm = await asyncio.to_thread(restore_and_wrap, engine_kwargs)
-    self.state = WorkerLifecycleState.READY
-    self._maybe_init_reasoning_parser(reasoning_parser_name)
-    logger.info(...)
-    return
+    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+    self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
+else:
+    self.llm = AsyncLLM.from_vllm_config(vllm_config, stat_loggers=[RingStatLogger])
 ```
 
-Both `pop` calls are unconditional, before the branch, because
+Everything after that line runs for both paths: the router-replay transmitter,
+the grammar stop tokens, the reasoning parser, the checkpoint LoRA adapter
+(`lora_adapter_path`, loaded with `self.llm.add_lora`), then `READY`. The
+branch sits inside the address-in-use retry loop, but a semi_p failure is not
+retried there: the restore retries its own ports, so another attempt would
+only repeat a whole restore. `matched_baseline` stays plain-only.
+
+The `pop` calls are unconditional, before the branch, because
 `AsyncEngineArgs` rejects unknown kwargs on the cold path too. The second one
 discards its value: `semi_p_model_dir` is no longer a field here, but the dss
 branch actually deployed (`mert/semi-p-integration`) still *requires* it and
@@ -250,11 +289,13 @@ that names a directory is naming a cache key it cannot compute.
 
 The branch sits after `os.environ.update(extra_env)`, which is the first
 statement in `initialize` — that ordering is what makes `SEMIP_IMAGE_CACHE`
-readable inside `restore_and_wrap`.
+readable inside `restore_engine`.
 
-`asyncio.to_thread` matters: the restore is a long blocking sequence of
-queue round-trips to the worker process, and running it inline would stall the
-event loop that the health endpoint answers on.
+`restore_and_attach` runs `restore_engine` under `asyncio.to_thread`, and that
+matters: the restore is a long blocking sequence of queue round-trips to the
+worker process, and running it inline would stall the event loop that the
+health endpoint answers on. The `AsyncLLM` itself is built on the event loop,
+as on the plain path.
 
 `shutdown()` gains the matching teardown:
 
@@ -265,17 +306,21 @@ if callable(close):
 ```
 
 It is written defensively rather than as an `isinstance` check so the same
-path is inert for a real `AsyncLLM`.
+path is inert for a plain `AsyncLLM`. `SemiPAsyncLLM.close()` stops the
+death watch, shuts the `AsyncLLM` down, then tears down the `Instance` and any
+agents (`semip_frontend._teardown`).
 
 ---
 
-## 4. The adapter
+## 4. The restore and the front end
 
-`arctic_inference/server/semip_engine.py` holds two pieces:
+Three modules under `arctic_platform/inference/server/` split the work:
 
-- `restore_and_wrap(engine_kwargs, model_dir)` — resolves the physical GPUs,
-  reads the baked `vllm_config` from the image, runs the restore sequence, and
-  returns the adapter.
+- `semip_engine.restore_engine(engine_kwargs, agents)` — resolves the physical
+  GPUs, reads the baked `vllm_config` from the image, runs the restore
+  sequence, and returns a `RestoredEngine(inst, agents)` handle. It knows
+  nothing about front ends. (It was `restore_and_wrap` until 2026-10-24, and
+  returned the wrapper.)
 
   > **Correction.** It no longer only restores. A missing image used to raise
   > `FileNotFoundError`; it now cold-starts vLLM, dumps an image into
@@ -289,10 +334,28 @@ path is inert for a real `AsyncLLM`.
   > the image once it has restored; without the flag it raises, telling the
   > user to set `semi_p` to false or add the flag. See SKILL.md, "A miss fails
   > the job unless it sets `SEMIP_DUMP_PUBLISH=1`".
-- `_SemiPEngine` — stands in for `self.llm`. Forwards `generate` onto
-  `Instance.generate`, collects results out of `instance.generate_results`
-  keyed by `instance.last_req_id`, and maps the server's lifecycle calls onto
-  `pause` / `resume` / `sleep` / `teardown`.
+- `semip_asyncllm.restore_and_attach(engine_kwargs, agents, vllm_config)` —
+  pins into the kwargs what the child's `LLM()` would otherwise resolve
+  differently from the worker's `vllm_config` (`max_num_seqs`,
+  `max_num_batched_tokens`, `disable_log_stats=False`, and the chat reasoner
+  the worker adds after building its config), restores, then `attach`es:
+  sends the child `serve_core` with two ZMQ IPC addresses, compares the
+  configs, and builds `SemiPAsyncLLM.from_vllm_config(...,
+  client_addresses=...)`. On any failure it tears the restored engine down,
+  since nothing else owns it yet. It logs `semi_p: front end attached in
+  X.XXs (serve_core X.XXs, AsyncLLM X.XXs)`.
+- `semip_frontend` — vLLM-free, so the tests need no GPU: the mixin
+  (sleep, wake, weight-sync bookkeeping, a watch that fails the front end's
+  requests if the child dies, `close`), `_teardown`, and the config
+  comparison.
+
+In the child, `serve_core` (`vllm_child._semip_serve_core`) turns the live
+`EngineCore` into vLLM's ZMQ-served engine core in place and starts vLLM's
+input and output socket threads; the main loop then drives it through
+`_semip_serving_tick` instead of `LLMEngine.step`. A serving child refuses the
+old pipe-side request commands (`generate`, `pause`, `resume`) and
+`prepare_criu_dump`, which would capture live sockets and threads. The image
+holds no sockets: `serve_core` runs after the restore, never before a dump.
 
 **GPU resolution returns a list, not a scalar.** The `Instance` machinery
 enumerates *physical* devices through NVML and ignores `CUDA_VISIBLE_DEVICES`,
@@ -328,7 +391,7 @@ here — and `cuCheckpointProcessRestore` fails with a bare
 normal case, not an error; `meta.json` carries the dump node's `gpu_uuids`
 precisely so the map can be built.
 
-Under DSS you do not choose the placement — Ray does — so the adapter cannot
+Under DSS you do not choose the placement — Ray does — so the restore cannot
 fix this, only refuse it. `_check_gpu_placement` compares the image's
 `gpu_uuids` against local NVML and raises with the actionable message when the
 assignment happens to match the dumped indices and the UUIDs are foreign. If it
@@ -425,6 +488,12 @@ at all: ask for `gpu_memory_utilization: 0.8` against the 0.7 image and you
 silently get 0.7. `_log_config_divergence` logs the baked config and warns on
 every requested key it overrides, which is the only signal you get. Real
 validation needs a richer compatibility model and is still deferred.
+
+> **Mostly overtaken.** The image key now hashes the projected engine kwargs
+> (`cfg12`), so a job asking for 0.8 selects a different image -- a miss --
+> rather than restoring the 0.7 one. And the attach compares the restored
+> core against the front end's config on every field the front end depends
+> on, so a core built differently fails the start-up instead of serving.
 
 Importing the library is a module-level one-liner; the prototype's `SEMI_P_SRC`
 `sys.path` hack is gone:
@@ -533,11 +602,11 @@ is now a `TypeError`.
 
 ### Sleep and wake need a weight restore
 
-`_wake_blocking` is not the mirror of `_sleep_blocking`. `sleep()` is
-`llm.sleep(level=2)`, which **frees** the weight memory, and
-`wake_up_weights()` only re-allocates the parameter tensors without
-repopulating them. The wake path therefore needs three calls, matching
-`Orchestrator`:
+The mixin's `_wake_blocking` is not the mirror of `_sleep_blocking`. Semi-p
+always sleeps at level 2, whatever level the caller asks for, which **frees**
+the weight memory, and `wake_up_weights()` only re-allocates the parameter
+tensors without repopulating them. The wake path therefore needs three calls,
+matching `Orchestrator`:
 
 ```python
 self._inst.wake_up_weights()
@@ -550,7 +619,38 @@ with no error anywhere. No `plan_restore_weights()` here: the plan and the
 pinned double buffer formed at restore time stay on the workers — which is another reason the guard above
 matters, since a bad plan taints the wake path too. This is reachable in
 normal operation: `collective_rpc("sleep")` and `("wake_up")` are both part of
-the surface the DSS worker drives.
+the surface the DSS worker drives, and the mixin routes both here.
+
+`restore_weights()` copies back the host copy, so that copy has to hold the
+weights the engine is serving:
+
+- **A weight sync leaves it stale.** `collective_rpc` marks it stale after any
+  of `sync_weights`, `sync_weights_broadcast` or `sync_spec_weights`, even one
+  that raised part way, and the next sleep first runs `stage()` to copy the
+  GPU weights into it. A LoRA sync does not: LoRA state is not in the host
+  copy (below).
+- **LoRA state is staged by the child at every sleep.** The adapter slots,
+  their enabled flags and the punica index and metadata buffers are plain
+  tensors vLLM allocates with the weights, so level 2 drops them too, and
+  adapters load and swap slots with no call semi-p sees. A serving child copies
+  them into a host buffer of its own before each sleep (`staged %.2f MiB of
+  LoRA state`) and `restore_weights` puts them back (`restored %.2f MiB of
+  LoRA state`). The first restore after CRIU has nothing staged and zeroes
+  them, the state vLLM creates them in. Each restore also clears the adapter
+  manager's cached mapping, so the next step rebuilds the punica metadata.
+
+The child sleeps with `llm.sleep(level=2, mode="keep")`. The engine has been
+drained, so `"keep"` and the default `"abort"` pause the same, but router
+replay's routed-experts connector refuses the cache reset an `"abort"` pause
+makes. If the sleep fails anyway, the child resumes the scheduler before
+raising, since vLLM paused it and nothing else would resume it.
+
+**A failed sleep is never checkpointed.** An engine that did not sleep still
+holds its weights and KV cache, and an image of it is tens of times larger and
+is restored as a hit by every later job. Both dump paths wait on the sleep
+before the CUDA checkpoint, the semi-p worker refuses `cuda_checkpoint` and
+`criu_dump` after a failed sleep until one succeeds, and a failed dump removes
+the image's `meta.json`, so the next job dumps again.
 
 ---
 
@@ -710,47 +810,49 @@ has to bind sockets its dump can account for and close. See
   > nothing pops it. Such a job runs as an ordinary semi-p restore.
   > `sampling-tp1-semip-pool.json` is redundant, not an error case.
 
-- **Weight sync / RL.** `sync_weights`, `sync_weights_broadcast`,
-  `sync_spec_weights`, and `close_weight_sync` are deferred; the adapter
-  recognizes them as weight-sync RPCs and does not implement them. Semi-p is
-  for sampling jobs.
-- **LoRA adapters.** `lora_adapter_path` is popped and then ignored: the
-  worker's `_load_checkpoint_lora_adapter` call sits *after* the semi-p early
-  return, so `self.llm.add_lora` is never reached and the adapter does not
-  implement it. A semi-p job that sets the field gets base serving with no
-  error. Adding it means teaching the `Instance` child to load an adapter,
-  which is the same scope as weight sync.
-- **A tokenizer for a model that is only in the image.** `get_tokenizer()`
-  loads from `engine_kwargs["model"]`, which dss has already resolved to
-  `/mnt/neutrino/base-models/<org>/<model>` — a path a semi-p-only pod has no
-  reason to have populated, since avoiding that download is half the point.
-  Nothing on the plain sampling path calls it: it is reached only from
-  `_maybe_init_reasoning_parser` (inert unless the job sets `reasoning_parser`)
-  and from the action-mask builder (inert unless the request sets
-  `return_action_masks`). Set either on a pod with an empty `/mnt` and the
-  first request raises inside `AutoTokenizer.from_pretrained`, not at
-  `/initialize`. Run `local_model_cache.sh` for that model, or fall back to the
-  baked HF id, if those features are wanted.
+> **Updated 2026-10-24.** With the `AsyncLLM` front end, weight sync, LoRA,
+> streaming, chat, router replay and `reset_prefix_cache` are supported and
+> leave this list; the first two are kept below, marked, because their
+> semi-p-specific parts are worth knowing.
+
+- **Weight sync / RL — supported.** The weight-sync RPCs are `AsyncLLM`'s
+  `collective_rpc`, over ZMQ to the restored workers, which carry
+  `WeightSyncExtension` like a plain engine's. The only semi-p part is the
+  host copy: a base or drafter sync marks it stale, and the next sleep stages
+  the synced weights into it first (Section 5). Not yet exercised on GPU by a
+  trainer.
+- **LoRA adapters — supported.** `lora_adapter_path` loads through
+  `self.llm.add_lora` after the restore, as on the plain path, and synced
+  adapters arrive through `collective_rpc`. Enabling LoRA changes the engine
+  kwargs and so the image key, so a LoRA config has its own image. The adapter
+  state survives sleep because the child stages it at every sleep (Section 5).
+- **A tokenizer for a model that is only in the image.** No longer a semi-p
+  special case: the front end is built the way the plain path builds it, so
+  `create_engine_config` reads the model's config and `AsyncLLM` loads its
+  tokenizer at `/initialize`, from `engine_kwargs["model"]`. A semi-p pod
+  needs those files exactly as a plain one does, and a missing one fails the
+  start-up rather than the first request.
+
+  > **History.** With `_SemiPEngine`, `get_tokenizer()` was reached only from
+  > `_maybe_init_reasoning_parser` and the action-mask builder, so a pod with
+  > an empty `/mnt` restored fine and failed on the first request that needed
+  > it.
 
   > **Resolved incidentally, under `DSS_ALLOW_REMOTE_MODELS=1`.** That switch
   > (added for the dump path — see the correction in Section 9) leaves
   > `engine_kwargs["model"]` as the HF id rather than a `/mnt` path, which is
   > something `AutoTokenizer.from_pretrained` can resolve through `HF_HOME`. The
   > limitation stands for a gateway run *without* that switch.
-- **`reset_prefix_cache`.** `Instance` had this primitive in the prototype and
-  it did not survive into the published layout, while the server still calls it.
-  **Resolved: the adapter's method is a no-op returning `False`.** Tracing the
-  callers shows this is safe rather than merely convenient — `worker.py`'s
-  `reset_prefix_cache` is driven only from `replica_pool.py`, whose own callers
-  are both `_reset_prefix_cache_after_weight_sync`, and there is no HTTP route
-  for it anywhere. So weight sync is the only live caller, and weight sync
-  already raises. If it ever lands, restore the primitive across `instance.py`,
-  `worker.py` and `vllm_child.py` instead of relaxing the no-op.
-- **TP>1.** Section 5's sequence covers it and `_resolve_physical_gpus` now
-  returns the full GPU list, so the count check passes; `qwen_35b_tp2` and
-  `sampling-tp2-semip.json` exist to exercise it. Untested through DSS until
-  that runs. The library's TP support is described in
-  [`tp_DESIGN.md`](tp_DESIGN.md).
+- **`reset_prefix_cache` — supported.** It is `AsyncLLM`'s own, over ZMQ to
+  the restored core, so the reset after a weight sync
+  (`replica_pool._reset_prefix_cache_after_weight_sync`) really happens. With
+  `_SemiPEngine` it was a no-op returning `False`, which was safe only because
+  weight sync raised.
+- **TP>1.** Section 5's sequence covers it and `_resolve_physical_gpus`
+  returns the full GPU list, so the count check passes. Exercised through DSS
+  by onboarding: GLM-5.3 at TP=8 and TP=16 (two pods, Section 7a), and
+  Qwen3.6-35B-A3B as eight TP=1 replicas. The library's TP support is described
+  in [`tp_DESIGN.md`](tp_DESIGN.md).
 
 ---
 

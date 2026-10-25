@@ -326,7 +326,7 @@ accounting.
 ## 6. The cache key is the directory name
 
 `model_dir` is **derived, not supplied**. There is no `semi_p_model_dir` job
-field; `restore_and_wrap` computes the path before it knows whether an image
+field; `restore_engine` computes the path before it knows whether an image
 exists:
 
 ```
