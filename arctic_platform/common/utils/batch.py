@@ -94,6 +94,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "echo_observation_token_counts",
         "nll_mask",
         "teacher_log_probs_shifted",
+        "sampler_kl_weights",
         "versions",
         "prompt_group_ids",
         "prompt_token_counts",

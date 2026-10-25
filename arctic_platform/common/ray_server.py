@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -76,6 +77,14 @@ def _transfer_schedule_cls():
 
 
 logger = logging.getLogger(__name__)
+
+
+def _finished_task_error(task: asyncio.Task) -> BaseException | None:
+    """Exception from a finished task. A cancellation is reported, not raised."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
+
 
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
@@ -257,7 +266,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
         results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         return results
 
-    async def wake_inference(self, tags: list[str] | None = None, restore_weights: bool | None = None):
+    async def wake_inference(
+        self,
+        tags: list[str] | None = None,
+        restore_weights: bool | None = None,
+        empty_training_cache: bool = True,
+    ):
         """Wake all inference engines, restoring GPU memory.
 
         ``restore_weights`` overrides the default of restoring the CPU-offloaded
@@ -265,7 +279,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         the CUDA IPC sync) pass ``False`` to skip a redundant full-model CPU->GPU
         copy that would otherwise double peak GPU memory at the wake.
         """
-        if self.colocate:
+        if self.colocate and empty_training_cache:
             # Release cached GPU pages so cumem can remap.
             await self._empty_training_cache(self.training_workers)
         colocate = self.colocate
@@ -618,6 +632,147 @@ class ArcticRLRayServer:
         self.sampling_pool = ray.get(arctic_rl_ray_server_state.get_sampling_pool.remote())  # type: ignore
         self.log_prob_pool = ray.get(arctic_rl_ray_server_state.get_log_prob_pool.remote())  # type: ignore
         self.colocate = ray.get(arctic_rl_ray_server_state.get_colocate.remote())  # type: ignore
+        # Serializes every RPC that drives ``training_workers``. Awaiting ObjectRefs
+        # (instead of blocking ``ray.get``) lets the transport loop keep serving
+        # generation, so two ops could otherwise overlap a DP collective.
+        # ``_gather_training_refs`` covers forward / step / load. weight_sync,
+        # sleep/wake, empty-cache, and the training half of weight_norm take the
+        # same lock directly. ``save`` takes the lock but is allowed after a
+        # failure so a checkpoint can still be written. Sampling refs do not
+        # latch ``_training_failed``.
+        self._training_op_lock = asyncio.Lock()
+        self._training_failed = False
+        self._training_failure: BaseException | None = None
+
+    def _raise_if_training_failed(self) -> None:
+        if self._training_failed:
+            raise RuntimeError(
+                "training workers failed and did not finish; refusing further training ops"
+            ) from self._training_failure
+
+    def _cancel_training_ref(self, ref: Any, task: asyncio.Task) -> None:
+        task.cancel()
+        if isinstance(ref, ray.ObjectRef):
+            try:
+                ray.cancel(ref, force=False)
+            except Exception:
+                logger.warning("could not cancel training worker ref", exc_info=True)
+
+    def _reject_non_awaitable_refs(self, refs: list[Any]) -> None:
+        """Raise before any ref is scheduled. ``submit_refs`` has already returned."""
+        rejected = [type(ref).__name__ for ref in refs if not inspect.isawaitable(ref)]
+        if not rejected:
+            return
+        for ref in refs:
+            if inspect.iscoroutine(ref):
+                ref.close()
+        kinds = ", ".join(sorted(set(rejected)))
+        raise TypeError(f"training worker RPC must return an awaitable ObjectRef, got {kinds}")
+
+    def _mark_training_failed(self, error: BaseException | None) -> None:
+        self._training_failed = True
+        if self._training_failure is None:
+            self._training_failure = error or asyncio.CancelledError()
+
+    async def _await_training_refs(self, submit_refs, *, latch: bool = True, check_failed: bool = True):
+        """Await refs. Caller must already hold ``_training_op_lock`` for training refs.
+
+        The first failure cancels every ref still running, on the worker and in
+        this process, and marks the workers failed. The step result is
+        discarded, and a later training op is refused while a data-parallel
+        collective may still be running. Cancelling this await (client
+        disconnect, timeout) does the same.
+
+        ``latch=False`` is the sampling-worker path: a sampler error is raised
+        and does not block later ``step`` / ``weight_sync``. ``check_failed=False``
+        is the checkpoint recovery path: ``save`` may run after the latch is set.
+        """
+        if check_failed:
+            self._raise_if_training_failed()
+        refs = list(submit_refs())
+        self._reject_non_awaitable_refs(refs)
+        paired: list[tuple[Any, asyncio.Task]] = []
+        for ref in refs:
+
+            async def _consume(awaitable=ref):
+                return await awaitable
+
+            paired.append((ref, asyncio.ensure_future(_consume())))
+        tasks = [task for _, task in paired]
+        cancelled_collective = False
+
+        def _cancel_unfinished() -> None:
+            nonlocal cancelled_collective
+            for ref, task in paired:
+                if not task.done():
+                    self._cancel_training_ref(ref, task)
+                    cancelled_collective = True
+
+        try:
+            if tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            else:
+                done, pending = set(), set()
+            errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
+            if errors and pending:
+                _cancel_unfinished()
+            if latch and (cancelled_collective or (errors and pending)):
+                self._mark_training_failed(errors[0] if errors else None)
+            if errors and pending:
+                raise errors[0]
+            if errors:
+                raise errors[0]
+        except asyncio.CancelledError:
+            cancelled_collective = True
+            raise
+        finally:
+            _cancel_unfinished()
+            if latch and cancelled_collective:
+                self._mark_training_failed(None)
+        return [task.result() for _, task in paired]
+
+    async def _await_sampling_refs(self, submit_refs):
+        """Await sampler refs. A sampler failure does not latch training workers."""
+        return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
+
+    async def _await_weight_sync_refs(self, receive_task, send_tasks):
+        """Run send and receive together, cancelling a peer on transfer failure."""
+        training_await = asyncio.ensure_future(self._await_training_refs(lambda: send_tasks, check_failed=False))
+        sampling_await = asyncio.ensure_future(self._await_sampling_refs(lambda: [receive_task]))
+        try:
+            done, _pending = await asyncio.wait({training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION)
+            sampling_error = _finished_task_error(sampling_await) if sampling_await in done else None
+            training_error = _finished_task_error(training_await) if training_await in done else None
+            if training_error is not None:
+                if not sampling_await.done():
+                    sampling_await.cancel()
+                raise training_error
+            if sampling_error is not None:
+                if not training_await.done():
+                    training_await.cancel()
+                    try:
+                        await training_await
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise sampling_error
+            sent = await training_await
+            received = (await sampling_await)[0]
+            return received, sent
+        finally:
+            for pending_await in (training_await, sampling_await):
+                if not pending_await.done():
+                    pending_await.cancel()
+
+    async def _gather_training_refs(self, submit_refs):
+        """Submit and await worker ObjectRefs without blocking the transport loop.
+
+        ``submit_refs`` runs inside the lock so one op's ``.remote()`` calls stay
+        contiguous and cannot overlap another training-worker op.
+        """
+        self._raise_if_training_failed()
+        async with self._training_op_lock:
+            self._raise_if_training_failed()
+            return await self._await_training_refs(submit_refs)
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
@@ -692,14 +847,11 @@ class ArcticRLRayServer:
             log_dp_shard_tokens(shard_rank, "ray_split_batch", shard_batch, shard_meta)
 
         tname = timers.start("xyz fwd_bwd: gather + forward_backward")
-        # results = await asyncio.gather(*[
-        #     w.forward_backward.remote(s) for w, s in zip(workers, shards)
-        # ])
-
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
-            refs = [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
-            results = ray.get(refs)
+            results = await self._gather_training_refs(
+                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
+            )
 
         timers.stop_and_print_elapsed(tname)
         prof.report()
@@ -750,13 +902,6 @@ class ArcticRLRayServer:
             workers = self.training_workers
         if not workers:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
-        # import zlib
-        # body = zlib.decompress(body)
-
-        # shards = ray_split_batch(batch, len(workers))
-        # results = await asyncio.gather(*[
-        #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
-        # ])
 
         loss_object = prepare_request_loss(batch)
         sp_size = info.get("sp_size", 1)
@@ -765,8 +910,14 @@ class ArcticRLRayServer:
         )
         _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
-        refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
-        results = ray.get(refs)
+
+        def _submit_forward():
+            return [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
+
+        if job_type == "training":
+            results = await self._gather_training_refs(_submit_forward)
+        else:
+            results = await asyncio.gather(*_submit_forward())
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
@@ -792,9 +943,7 @@ class ArcticRLRayServer:
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
         # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
-        refs = [w.step.remote() for w in self.training_workers]
-        results = ray.get(refs)
+        results = await self._gather_training_refs(lambda: [w.step.remote() for w in self.training_workers])
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),
@@ -806,7 +955,12 @@ class ArcticRLRayServer:
         """Release ZeRO partition cache and PyTorch cached memory on all workers."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        results = await self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)
+        async with self._training_op_lock:
+            results = (
+                await self._await_training_refs(
+                    lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)]
+                )
+            )[0]
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
 
@@ -823,13 +977,18 @@ class ArcticRLRayServer:
         path, prune_root = resolve_checkpoint_save_paths(root, step)
         os.makedirs(path, exist_ok=True)
         export_hf = bool(body.get("export_hf", False))
-        results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
-        if step is not None:
-            with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
-                f.write(str(int(step)))
         limit = body.get("save_total_limit")
-        if limit is not None and int(limit) > 0 and self.training_workers:
-            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit)))
+        async with self._training_op_lock:
+            results = await self._await_training_refs(
+                lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers],
+            )
+            if step is not None:
+                with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
+                    f.write(str(int(step)))
+            if limit is not None and int(limit) > 0 and self.training_workers:
+                await self._await_training_refs(
+                    lambda: [self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))],
+                )
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
         return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
@@ -851,7 +1010,9 @@ class ArcticRLRayServer:
                         path = os.path.join(path, f"checkpoint-{int(f.read().strip())}")
                 except ValueError:
                     pass
-        steps = ray.get([w.load_checkpoint.remote(path) for w in self.training_workers])
+        steps = await self._gather_training_refs(
+            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers]
+        )
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
     async def sleep_inference(self, job_id: int, body: dict[str, Any] | int | None = None):
@@ -872,7 +1033,21 @@ class ArcticRLRayServer:
         """
         self._verify_job(job_id, "sampling")
         tags = body.get("tags") if isinstance(body, dict) else body
-        results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
+        # Empty-cache is the only training-worker operation in a public
+        # colocated wake. Guard just that RPC, then wake vLLM outside the lock.
+        # A latched training failure skips empty-cache so inference can still
+        # drain rollouts or shut down cleanly. The gap is acceptable because
+        # colocated async RL is not supported. A synchronous caller waits
+        # inside this wake and does not submit a training op until it returns.
+        if self.colocate:
+            async with self._training_op_lock:
+                if not self._training_failed:
+                    await self._await_training_refs(
+                        lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(self.training_workers)]
+                    )
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags, empty_training_cache=False)
+        else:
+            results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
 
     async def reset_prefix_cache(self, job_id: int, body: dict[str, Any] | None = None):
@@ -913,14 +1088,12 @@ class ArcticRLRayServer:
         else:
             mode = "all"
         workers = self.training_workers
-        loop = asyncio.get_running_loop()
         if mode == "non_lp":
-            refs = [w.offload_non_lp_states.remote() for w in workers]
+            results = await self._gather_training_refs(lambda: [w.offload_non_lp_states.remote() for w in workers])
         elif mode == "lp_params":
-            refs = [w.offload_lp_params.remote() for w in workers]
+            results = await self._gather_training_refs(lambda: [w.offload_lp_params.remote() for w in workers])
         else:
-            refs = [w.offload_to_cpu.remote() for w in workers]
-        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
+            results = await self._gather_training_refs(lambda: [w.offload_to_cpu.remote() for w in workers])
         logger.info("Offload training (mode=%s): %s", mode, results)
         return {"job_id": job_id, "workers": results}
 
@@ -928,9 +1101,7 @@ class ArcticRLRayServer:
         """Reload all training state to GPU (wake training workers)."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        loop = asyncio.get_running_loop()
-        refs = [w.backload_to_gpu.remote() for w in workers]
-        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
+        results = await self._gather_training_refs(lambda: [w.backload_to_gpu.remote() for w in workers])
         logger.info("Wake training: %s", results)
         return {"job_id": job_id, "workers": results}
 
@@ -1007,22 +1178,24 @@ class ArcticRLRayServer:
             request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
         )
 
-        if colocate:
-            lp_pool = self.log_prob_pool
-            if cuda_ipc:
-                if low_memory:
-                    # Slower, memory-efficient path: stream one gathered param
-                    # at a time so peak extra GPU memory is one full param per
-                    # GPU instead of the whole model (avoids OOM on big models).
-                    results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
+        async with self._training_op_lock:
+            self._raise_if_training_failed()
+            if colocate:
+                lp_pool = self.log_prob_pool
+                if cuda_ipc:
+                    if low_memory:
+                        # Slower, memory-efficient path: stream one gathered param
+                        # at a time so peak extra GPU memory is one full param per
+                        # GPU instead of the whole model (avoids OOM on big models).
+                        results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
+                    else:
+                        results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
                 else:
-                    results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
+                    sync_path = training_job_info.get("sync_path", None)
+                    assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
+                    results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)
             else:
-                sync_path = training_job_info.get("sync_path", None)
-                assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
-                results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)
-        else:
-            results = await self._sync_weights_nccl(workers, pool)
+                results = await self._sync_weights_nccl(workers, pool)
 
         await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(sampling_job_id)
 
@@ -1101,11 +1274,11 @@ class ArcticRLRayServer:
         """
         self._verify_job(training_job_id, "training")
         self._verify_job(sampling_job_id, "sampling")
-        loop = asyncio.get_running_loop()
-        training = await loop.run_in_executor(None, ray.get, self.training_workers[0].weight_norm.remote())
-        sampling = await loop.run_in_executor(
-            None, ray.get, self.sampling_pool._workers[0].compute_weight_norm.remote()
-        )
+        async with self._training_op_lock:
+            training = (await self._await_training_refs(lambda: [self.training_workers[0].weight_norm.remote()]))[0]
+            sampling = (
+                await self._await_sampling_refs(lambda: [self.sampling_pool._workers[0].compute_weight_norm.remote()])
+            )[0]
         return {
             "training_norm": training["norm"],
             "sampling_norm": sampling["norm"],
@@ -1160,7 +1333,7 @@ class ArcticRLRayServer:
 
         await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
-        sender_ips = await asyncio.gather(*[workers[r].get_ip.remote() for r in sender_ranks])
+        sender_ips = await self._await_training_refs(lambda: [workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
@@ -1170,8 +1343,8 @@ class ArcticRLRayServer:
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
-            await asyncio.gather(
-                *[
+            await self._await_training_refs(
+                lambda: [
                     workers[g.sender_train_rank].init_weight_sender.remote(
                         g,
                         schedule,

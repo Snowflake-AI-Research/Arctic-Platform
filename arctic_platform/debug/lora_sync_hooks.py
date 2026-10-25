@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import inspect
 import json
@@ -1256,7 +1255,7 @@ async def maybe_prepare_lora_training(server, workers, pool, schedule):
 
 async def maybe_lora_max_param_bytes(server, worker):
     if selected_lora_request() is None:
-        return await worker.max_param_bytes.remote()
+        return (await server._await_training_refs(lambda: [worker.max_param_bytes.remote()]))[0]
     prepared = getattr(server, "_ap_lora_training_preparation", None)
     _require(type(prepared) is dict and prepared["all_training_ranks_prepared"] is True, "all8 preparation required")
     manifest = prepared["rank_preparations"][0].get("emitted_manifest")
@@ -1277,18 +1276,11 @@ async def maybe_lora_max_param_bytes(server, worker):
 
 async def maybe_collect_lora_sync(server, receive_task, send_tasks):
     request = selected_lora_request()
+    received, sent = await server._await_weight_sync_refs(receive_task, send_tasks)
     if request is None:
-        from arctic_platform.debug.rl_sampler_evidence import maybe_sync_weights
+        from arctic_platform.debug.rl_sampler_evidence import maybe_sync_weights_result
 
-        return await maybe_sync_weights(receive_task, send_tasks)
-    results = await asyncio.gather(receive_task, *send_tasks, return_exceptions=True)
-    errors = [result for result in results if isinstance(result, BaseException)]
-    if errors:
-        error = RuntimeError("native LoRA sender or receiver failed")
-        for cause in errors:
-            error.add_note(repr(cause))
-        raise error from errors[0]
-    received, *sent = results
+        return maybe_sync_weights_result(received, sent)
     _require(
         len(sent) == 1
         and type(sent[0]) is dict

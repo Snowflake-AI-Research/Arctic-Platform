@@ -4059,6 +4059,13 @@ def test_lora_worker_preserves_post_constructor_source_error_when_shutdown_fails
 class Server:
     weight_sync_ready = False
 
+    async def _await_training_refs(self, submit_refs):
+        return await asyncio.gather(*submit_refs())
+
+    async def _await_weight_sync_refs(self, receive_task, send_tasks):
+        received, *sent = await asyncio.gather(receive_task, *send_tasks)
+        return received, sent
+
 
 class Pool:
     num_replicas = 1
@@ -4279,20 +4286,21 @@ def test_lora_hooks_installed_adapter_receipts_keep_judge_and_capacity_nonadmitt
     assert result["numerical"] is None
 
 
-def test_lora_hooks_transfer_drains_peer_failure_and_retains_both_causes(
+def test_lora_hooks_transfer_preserves_native_awaiter_failure(
     staged_request,
+    monkeypatch,
 ):
-    async def receive():
-        await asyncio.sleep(0)
-        raise RuntimeError("receiver failed")
+    server, receive_task, send_tasks = Server(), object(), [object()]
+    error = RuntimeError("sender failed")
 
-    async def send():
-        raise RuntimeError("sender failed")
+    async def collect(actual_receive, actual_send):
+        assert actual_receive is receive_task and actual_send is send_tasks
+        raise error
 
-    with pytest.raises(RuntimeError, match="sender or receiver") as caught:
-        asyncio.run(hooks.maybe_collect_lora_sync(Server(), receive(), [send()]))
-    assert any("receiver failed" in note for note in caught.value.__notes__)
-    assert any("sender failed" in note for note in caught.value.__notes__)
+    monkeypatch.setattr(server, "_await_weight_sync_refs", collect)
+    with pytest.raises(RuntimeError, match="sender failed") as caught:
+        asyncio.run(hooks.maybe_collect_lora_sync(server, receive_task, send_tasks))
+    assert caught.value is error
 
 
 def test_lora_hooks_production_calls_keep_prepare_before_init_and_sender_dispatch():
@@ -4457,8 +4465,16 @@ def test_lora_hooks_unselected_bucket_preserves_actual_native_max_parameter_rpc(
         return 16384
 
     worker = SimpleNamespace(max_param_bytes=SimpleNamespace(remote=native_max))
-    assert asyncio.run(hooks.maybe_lora_max_param_bytes(object(), worker)) == 16384
-    assert seen == ["original-rpc"]
+    server = Server()
+    original_await = server._await_training_refs
+
+    async def native_await(submit_refs):
+        seen.append("native-awaiter")
+        return await original_await(submit_refs)
+
+    monkeypatch.setattr(server, "_await_training_refs", native_await)
+    assert asyncio.run(hooks.maybe_lora_max_param_bytes(server, worker)) == 16384
+    assert seen == ["native-awaiter", "original-rpc"]
 
 
 # Lora training protocol.

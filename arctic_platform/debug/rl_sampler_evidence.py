@@ -51,10 +51,14 @@ def _worker_actor():
 
 
 async def maybe_sync_weights(receive_task, send_tasks):
-    results = await asyncio.gather(receive_task, *send_tasks)
+    received, *sent = await asyncio.gather(receive_task, *send_tasks)
+    return maybe_sync_weights_result(received, sent)
+
+
+def maybe_sync_weights_result(received, sent):
+    """Format completed receipts without changing the server's transfer awaiters."""
     if not enabled():
         return {"status": "ok"}
-    received, *sent = results
     if not isinstance(received, dict) or not isinstance(received.get("workers"), list) or not received["workers"]:
         raise RuntimeError("external pool did not return actual worker sync results")
     for worker in received["workers"]:

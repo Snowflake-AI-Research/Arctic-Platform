@@ -193,8 +193,22 @@ and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
 The term clamps the teacher-minus-policy log ratio to
 `[-teacher_clip_negative, teacher_clip]`; `teacher_clip_negative` is an
 optional finite non-negative lower-clip magnitude that defaults to
-`teacher_clip`. `ap_grpo` accepts only the baseline GRPO config keys
-(`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control keys below; the
+`teacher_clip`. Every GRPO name also accepts `sampler_kl_coef` (β, finite
+non-negative, default `0.0`), which adds `β · w · k(log r)` with
+`log r = logprobs − old_log_probs_shifted` on every policy token except
+`nll_mask` tokens, aggregated like the policy term: a per-token estimate of
+KL(sampler ‖ policy). It also covers tokens that `m2_threshold` or the ratio
+masks drop from the policy term. A request with `sampler_kl_coef > 0` must send
+`old_log_probs_shifted`. `sampler_kl_type` picks `k`: `"k1"` (default, `−log r`;
+its gradient `−β ∇ log p` raises each sampled token's probability regardless
+of its advantage), `"k2"` (`(log r)² / 2`) or `"k3"` (`r − 1 − log r`, zero
+gradient where `r = 1`). k1 and k3 are unbiased for the KL and its gradient.
+Past `|log r| = log(sampler_kl_ratio_cap)` (default `5.0`, `inf` allowed), k2
+and k3 continue linearly. The optional per-token batch tensor
+`sampler_kl_weights` (finite, non-negative) is `w`; under token-mean it is
+required to carry `sequence_loss_weights`. `ap_grpo` accepts only the baseline
+GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control
+keys below; the
 unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
 `kd_divergence`, `kd_beta`, and `kd_batch_num_tokens` keys. Any other key is
 rejected by name in the batching and validation callbacks and again in the
