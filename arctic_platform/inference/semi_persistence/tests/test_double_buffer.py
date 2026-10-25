@@ -23,7 +23,7 @@ torch = pytest.importorskip("torch")
 
 _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _NAMES = ("_semip_form_double_buffer", "_semip_free_double_buffer",
-          "_semip_double_buffer_h2d", "_semip_plan_load_weights")
+          "_semip_double_buffer_h2d", "_semip_plan_load_weights", "_semip_repin")
 
 
 class _Nop:
@@ -110,6 +110,18 @@ def test_planning_again_replaces_the_double_buffer_instead_of_leaking_it(child):
     assert len(child.registered) == 2   # 4 if the first double buffer had leaked
     assert child._semip_free_double_buffer(worker) == 2048
     assert not child.registered and worker._semip_double_buffer is None
+
+
+def test_pinning_the_host_copy_frees_the_double_buffer_and_keeps_the_plan(child):
+    worker = _worker()
+    child._semip_plan_load_weights(worker, None, 4096, 2)
+    plan = worker._semip_chunk_plan
+    assert child._semip_repin(worker) == worker._semip_buf.numel()
+    assert worker._semip_pinned and worker._semip_double_buffer is None
+    assert child.registered == {worker._semip_buf.data_ptr()}
+    assert worker._semip_chunk_plan is plan
+    assert child._semip_repin(worker) == worker._semip_buf.numel()
+    assert child.registered == {worker._semip_buf.data_ptr()}
 
 
 @pytest.mark.parametrize("n,half_bytes,threads", [

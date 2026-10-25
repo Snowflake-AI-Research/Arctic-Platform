@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
@@ -187,6 +188,8 @@ class _SemiPAsyncLLMMixin:
         self._agents = list(agents or ())
         self._host_copy_stale = False
         self._death_watch_stop: threading.Event | None = None
+        self._pin_pending = os.environ.get("SEMIP_PIN_HOST_COPY", "1") != "0"
+        self._pin: threading.Thread | None = None
 
     async def collective_rpc(self, method: str, timeout: float | None = None,
                              args: tuple = (), kwargs: dict | None = None):
@@ -214,6 +217,7 @@ class _SemiPAsyncLLMMixin:
         await asyncio.to_thread(self._wake_blocking)
 
     def _sleep_blocking(self):
+        self._await_pin()
         if self._host_copy_stale:
             logger.info("semi_p: staging the synced weights into the host "
                         "copy before sleep")
@@ -222,14 +226,44 @@ class _SemiPAsyncLLMMixin:
             self._host_copy_stale = False
         self._inst.sleep()
         self._inst.wait()
+        if self._pin_pending:
+            self._pin_pending = False
+            self._pin = threading.Thread(target=self._pin_host_copy,
+                                         daemon=True, name="semip-pin")
+            self._pin.start()
+
+    def _pin_host_copy(self):
+        # Pinned (cudaHostRegister), the host copy goes to the GPU directly
+        # at wake rather than through the double buffer's extra host copy,
+        # which bounds a node of waking replicas by memory bandwidth. Pinning
+        # stalls the child's loop for seconds (up to 16 s for eight 65 GiB
+        # copies at once), so it runs while the engine sleeps, after the first
+        # sleep, and a wake that comes sooner waits for it.
+        t0 = time.perf_counter()
+        try:
+            self._inst.repin()
+            self._inst.wait()
+        except Exception:  # noqa: BLE001 - the double buffer still works
+            logger.warning("semi_p: pinning the host copy failed; wakes keep "
+                           "staging it through the double buffer", exc_info=True)
+            return
+        logger.info("semi_p: pinned the host copy in %.2fs; wakes copy it to "
+                    "the GPU directly", time.perf_counter() - t0)
+
+    def _await_pin(self):
+        pin, self._pin = self._pin, None
+        if pin is not None:
+            pin.join()
 
     def _wake_blocking(self):
         # restore_weights() is not optional here: sleep() is level 2, which
         # frees the weight memory, and wake_up_weights() only re-allocates the
         # parameter tensors without repopulating them. Without it the model
         # generates from uninitialized weights and never errors. No
-        # plan_restore_weights() here: the chunk plan and the double buffer
-        # formed at restore time stay on the workers across sleep.
+        # plan_restore_weights() here: the chunk plan formed at restore time
+        # stays on the workers across sleep, and so does the double buffer
+        # until the host copy is pinned.
+        self._await_pin()
         self._inst.wake_up_weights()
         self._inst.restore_weights()
         self._inst.wake_up_kv_cache()
