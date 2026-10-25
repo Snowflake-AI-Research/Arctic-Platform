@@ -147,6 +147,14 @@ class _CortexClientShim:
             }
         )
 
+    def _job_packs(self) -> bool | None:
+        """Whether the training job packs rows, by the rule that set its ``training_config.pack``."""
+        from arctic_platform.client.config import cortex_job_packs
+
+        if self._unified_config is None:
+            return None
+        return cortex_job_packs(self._unified_config.training.ds_worker_config)
+
     def get_server_state(self) -> Any:
         return None  # Cortex has no in-process state
 
@@ -168,7 +176,7 @@ class _CortexClientShim:
         legacy_kwargs.pop("router_replay", None)
         # SkyRL places loss_mask and advantages on the token they score.
         return await self._client.fwd_bwd(
-            to_cortex_fwd_bwd_payload(batch, processing=processing, response_aligned=True)
+            to_cortex_fwd_bwd_payload(batch, processing=processing, response_aligned=True, packed=self._job_packs())
         )
 
     async def fwd_no_grad(self, batch: dict, **kwargs: Any) -> dict:
@@ -182,7 +190,7 @@ class _CortexClientShim:
                 "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
                 "See docs/cortex-integration.md#supported-recipes."
             )
-        result = await self._client.fwd_no_grad(to_cortex_fwd_payload(batch))
+        result = await self._client.fwd_no_grad(to_cortex_fwd_payload(batch, packed=self._job_packs()))
         logprobs = result.get("logprobs") if isinstance(result, dict) else None
         if logprobs is None and isinstance(result, dict):
             body = result.get("batch")

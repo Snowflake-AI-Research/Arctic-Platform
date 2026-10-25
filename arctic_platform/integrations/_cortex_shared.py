@@ -73,14 +73,34 @@ def _resolve_proc_config(meta: dict, processing_in: dict | None) -> dict[str, An
     return proc_config
 
 
-def to_cortex_fwd_payload(batch: dict) -> dict:
+def _resolve_packed(meta: dict, packed: bool | None) -> bool:
+    """Whether the request reaches the packed executor.
+
+    ``packed`` is the job's setting (:func:`arctic_platform.client.config.cortex_job_packs`).
+    ``None`` keeps the per-call rule: packed unless the meta asks for ZoRRo.
+    """
+    zorro = bool(meta.get("zorro_train_enable"))
+    if packed is None:
+        return not zorro
+    if packed and zorro:
+        raise ValueError(
+            "the request asks for ZoRRo (meta zorro_train_enable) but the Cortex training job packs rows; "
+            "create the job with ds_worker_config['zorro_train_enable']"
+        )
+    return packed
+
+
+def to_cortex_fwd_payload(batch: dict, *, packed: bool | None = None) -> dict:
     """On-prem SkyRL ``{batch, meta}`` → Cortex ``{args, kwargs, context, processing}``.
 
     The on-prem client measures ``max_prompt_len`` and sends it with
     ``zorro_train_enable``, ``max_response_len``, ``pad_token_id``, and the
     row tensors (including ``prompts``). Those scalars stay on context. ZoRRo
-    rows stay in the layout the client built. Every other request is
-    left-aligned, because Cortex's packer rejects leading padding.
+    rows, and every row bound for an unpacked job (``packed=False``), stay in
+    the layout the client built: the unpacked forward re-pads its log-probs onto
+    those columns, which the fwd_bwd call then sends back as ``old_log_probs``.
+    Rows bound for the packed executor are left-aligned, because Cortex's
+    packer rejects leading padding.
     """
     import torch
 
@@ -99,6 +119,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
     if input_ids is None or attention_mask is None:
         raise ValueError("cortex /forward requires input_ids and attention_mask")
 
+    job_packs = _resolve_packed(meta, packed)
     if meta.get("zorro_train_enable"):
         missing = _missing_zorro_meta_keys(meta)
         if missing:
@@ -106,6 +127,9 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         prompts = tensors.get("prompts")
         if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
             raise ValueError("ZoRRo forward requires batch['prompts'] with width max_prompt_len")
+    elif not job_packs:
+        if "pad_token_id" not in meta:
+            raise ValueError("unpacked forward requires meta['pad_token_id']: the worker unpads the rows with it")
     else:
         aligned, _, attention_mask = _left_align_batch(tensors, attention_mask, {})
         tensors = {**aligned, "attention_mask": attention_mask}
@@ -204,8 +228,20 @@ def to_cortex_fwd_bwd_payload(
     processing: dict | None = None,
     old_log_probs_shifted: torch.Tensor | None = None,
     response_aligned: bool = False,
+    packed: bool | None = None,
 ) -> dict:
     """Reshape a SkyRL fwd_bwd payload into Cortex's wire shape.
+
+    ``packed`` is whether the training job packs rows (see
+    :func:`arctic_platform.client.config.cortex_job_packs`); ``None`` infers it
+    from ``meta['zorro_train_enable']``. The caller's ``loss_fn`` and ``post``
+    survive only on an unpacked job, whose executor runs on-prem's
+    ``run_pipeline(pack=False)``: ZoRRo keeps ``verl_grpo`` (see
+    :func:`_to_cortex_zorro_verl_grpo`), and an unpacked job without ZoRRo
+    requires ``verl_grpo`` (see :func:`_to_cortex_unpacked_verl_grpo`). The
+    packed executor credits log-probs only to the literal post
+    ``compute_logprobs`` and scores the predict-next frame, so every packed
+    request is rewritten to ``grpo`` as described below.
 
     Any ``old_log_probs`` in the batch are dropped: server-side GRPO defaults
     π_old to ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch
@@ -264,6 +300,7 @@ def to_cortex_fwd_bwd_payload(
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
     old_log_probs = tensors.pop("old_log_probs", None)
 
+    job_packs = _resolve_packed(meta, packed)
     if meta.get("zorro_train_enable"):
         return _to_cortex_zorro_fwd_bwd(
             tensors,
@@ -274,6 +311,10 @@ def to_cortex_fwd_bwd_payload(
             advantages,
             loss_mask,
             old_log_probs,
+        )
+    if not job_packs:
+        return _to_cortex_unpacked_verl_grpo(
+            tensors, meta, processing_in, input_ids, attention_mask, advantages, loss_mask, old_log_probs
         )
 
     forwarded = {"input_ids": input_ids}
@@ -339,6 +380,10 @@ def _to_cortex_zorro_fwd_bwd(
     prompts = tensors.get("prompts")
     if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
         raise ValueError("ZoRRo fwd_bwd requires batch['prompts'] with width max_prompt_len")
+    if (processing_in or {}).get("loss_fn") == "verl_grpo":
+        return _to_cortex_zorro_verl_grpo(
+            tensors, meta, processing_in, input_ids, attention_mask, prompts, advantages, loss_mask, old_log_probs
+        )
     response_mask = tensors.get("response_mask", loss_mask)
     kwargs_out: dict[str, Any] = {
         "input_ids": input_ids,
@@ -374,4 +419,181 @@ def _to_cortex_zorro_fwd_bwd(
         "kwargs": kwargs_out,
         "context": context,
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
+    }
+
+
+def _to_cortex_zorro_verl_grpo(
+    tensors: dict,
+    meta: dict,
+    processing_in: dict,
+    input_ids,
+    attention_mask,
+    prompts,
+    advantages,
+    loss_mask,
+    old_log_probs,
+) -> dict:
+    """The on-prem ``verl_grpo`` request on the Cortex wire, for ZoRRo.
+
+    The ZoRRo worker runs the same ``run_pipeline`` as on-prem, which slices
+    every ``[B, S]`` loss tensor at ``max_prompt_len`` into one flat response
+    row. ``verl_grpo`` scores that row against the patched forward's
+    response-aligned log-probs, so the tensors and meta go out in the client's
+    layout, unshifted, under their on-prem names.
+
+    ``dp_size`` is left to DSS, which sets it to the shard count alongside the
+    global ``batch_num_tokens`` it derives from ``loss_mask``.
+    """
+    post = list(processing_in.get("post") or ["apply_temperature", "compute_entropy_and_logprobs"])
+    return _verl_grpo_wire(
+        "ZoRRo",
+        tensors,
+        meta,
+        processing_in,
+        post,
+        input_ids,
+        attention_mask,
+        prompts,
+        advantages,
+        loss_mask,
+        old_log_probs,
+    )
+
+
+def _to_cortex_unpacked_verl_grpo(
+    tensors: dict,
+    meta: dict,
+    processing_in: dict | None,
+    input_ids,
+    attention_mask,
+    advantages,
+    loss_mask,
+    old_log_probs,
+) -> dict:
+    """The on-prem ``verl_grpo`` request on the Cortex wire, for an unpacked job without ZoRRo.
+
+    DSS runs the stock forward through the same ``run_pipeline(pack=False)``
+    call as on-prem. Unlike ZoRRo, nothing here is sliced at
+    ``max_prompt_len``: the generic unpad flattens every ``[B, S]`` tensor by
+    ``attention_mask``, and ``compute_packing_info_for_batch`` derives each
+    row's ``sequence_offsets`` from ``attention_mask`` and its ``response_lens``
+    from the ``attention_mask`` columns at or past ``prompts.shape[1]``.
+    ``verl_grpo`` then places the predict-next log-probs on the token they
+    score inside those windows (``mask_and_pad_for_log_probs``), the column
+    frame it reads the unshifted ``response_mask`` / ``advantages`` /
+    ``old_log_probs`` in. So ``prompts`` and ``attention_mask`` must
+    both be sent, and the rows must keep the client layout: left-aligning
+    moves the prompt boundary off ``prompts.shape[1]``, and a one-column shift
+    moves every weight off its token.
+
+    DSS refuses a loss that needs token log-probs on the stock forward unless
+    ``post`` names ``compute_logprobs``. That post returns existing log-probs
+    unchanged, so it is appended after the caller's posts.
+    """
+    import torch
+
+    if (processing_in or {}).get("loss_fn") != "verl_grpo":
+        raise ValueError(
+            "an unpacked Cortex training job without ZoRRo runs on-prem's unpacked pipeline, and the client "
+            f"defines its wire shape only for loss_fn='verl_grpo'; got {(processing_in or {}).get('loss_fn')!r}. "
+            "Send verl_grpo, or create a packed job"
+        )
+    prompts = tensors.get("prompts")
+    if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
+        raise ValueError(
+            "unpacked verl_grpo fwd_bwd requires batch['prompts'] [B, P]: the worker reads each row's "
+            "response length from the attention_mask columns at or past prompts.shape[1]"
+        )
+    if "pad_token_id" not in meta:
+        raise ValueError("unpacked verl_grpo fwd_bwd requires meta['pad_token_id']: the worker unpads the rows with it")
+    response_mask = tensors.get("response_mask", loss_mask)
+    width = tuple(attention_mask.shape)
+    for name, value in (
+        ("response_mask", response_mask),
+        ("loss_mask", loss_mask),
+        ("advantages", advantages),
+        ("old_log_probs", old_log_probs),
+    ):
+        if torch.is_tensor(value) and tuple(value.shape) != width:
+            raise ValueError(
+                f"unpacked verl_grpo fwd_bwd needs {name!r} with the attention_mask shape {width}, "
+                f"got {tuple(value.shape)}: the worker unpads only tensors of that shape"
+            )
+    scored = response_mask.to(torch.bool)
+    prompt_width = int(prompts.shape[1])
+    if bool(scored[:, :prompt_width].any()) or bool((scored & ~attention_mask.to(torch.bool)).any()):
+        raise ValueError(
+            "unpacked verl_grpo fwd_bwd needs every response_mask token to be a valid token at or past "
+            f"column prompts.shape[1]={prompt_width}; the loss only scores those columns"
+        )
+    post = list(processing_in.get("post") or ["apply_temperature", "compute_entropy_and_logprobs"])
+    if "compute_logprobs" not in post:
+        post.append("compute_logprobs")
+    return _verl_grpo_wire(
+        "Unpacked training",
+        tensors,
+        meta,
+        processing_in,
+        post,
+        input_ids,
+        attention_mask,
+        prompts,
+        advantages,
+        loss_mask,
+        old_log_probs,
+    )
+
+
+def _verl_grpo_wire(
+    path: str,
+    tensors: dict,
+    meta: dict,
+    processing_in: dict,
+    post: list,
+    input_ids,
+    attention_mask,
+    prompts,
+    advantages,
+    loss_mask,
+    old_log_probs,
+) -> dict:
+    """``verl_grpo`` tensors and meta under their on-prem names, for an unpacked executor.
+
+    ``dp_size`` is left to DSS, which sets it to the shard count alongside the
+    global ``batch_num_tokens`` it derives from ``loss_mask``.
+    """
+    import torch
+
+    if not torch.is_tensor(old_log_probs):
+        raise ValueError(f"{path} verl_grpo fwd_bwd requires batch['old_log_probs'] [B, S]")
+    actor = meta.get("actor_config") if isinstance(meta.get("actor_config"), dict) else {}
+    loss_agg_mode = actor.get("loss_agg_mode", "token-mean")
+    # The unpacked call flattens every response into one row with no
+    # cu_seqlens, so a per-sequence mean would treat the shard as one sequence.
+    if loss_agg_mode != "token-mean":
+        raise ValueError(
+            f"{path} on Cortex supports only loss_agg_mode='token-mean', got {loss_agg_mode!r}: "
+            "its responses reach the loss flattened, without sequence boundaries"
+        )
+    kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask, "prompts": prompts}
+    if torch.is_tensor(tensors.get("position_ids")):
+        kwargs_out["position_ids"] = tensors["position_ids"]
+    context: dict[str, Any] = {
+        key: value for key, value in meta.items() if key != "dp_size" and not torch.is_tensor(value) and value is not None
+    }
+    context.update(
+        input_ids=input_ids,
+        response_mask=tensors.get("response_mask", loss_mask),
+        loss_mask=loss_mask,
+        advantages=advantages,
+        old_log_probs=old_log_probs.to(torch.float32),
+    )
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, prompts)
+    return {
+        "args": (),
+        "kwargs": kwargs_out,
+        "context": context,
+        "processing": {"post": post, "loss_fn": "verl_grpo", "config": dict(processing_in.get("config") or {})},
     }

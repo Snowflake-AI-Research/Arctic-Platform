@@ -367,10 +367,11 @@ class ArcticClientConfig(BaseModel):
             training["ds_config"] = _without_noop_offload(ds)
         if self.training.peft:
             training["peft_config"] = self.training.peft
-        if worker.get("zorro_train_enable"):
-            # Neutrino only installs the ZoRRo forward and keeps [B, S] rows when the
-            # job says so; per-batch ZoRRo payloads alone still go through packing.
+        if not cortex_job_packs(worker):
+            # Neutrino only keeps [B, S] rows, and only installs the ZoRRo forward,
+            # when the job says so; per-batch payloads alone still go through packing.
             training["pack"] = False
+        if worker.get("zorro_train_enable"):
             training["zorro_train"] = _cortex_zorro_train(worker)
         return self._cortex_sub_job("training", {"training_config": training})
 
@@ -398,6 +399,17 @@ class ArcticClientConfig(BaseModel):
         if self.seed is not None:
             sub["seed"] = self.seed
         return sub
+
+
+def cortex_job_packs(ds_worker_config: dict[str, Any] | None) -> bool:
+    """Whether the Cortex training job built from this ``ds_worker_config`` packs rows.
+
+    ZoRRo always runs unpacked. ``ds_worker_config["pack"] = False`` asks for
+    the unpacked stock forward without ZoRRo. The job builder and the fwd_bwd
+    payload builder both read this, so the payload matches the job's executor.
+    """
+    worker = ds_worker_config or {}
+    return not worker.get("zorro_train_enable") and worker.get("pack", True) is not False
 
 
 def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:

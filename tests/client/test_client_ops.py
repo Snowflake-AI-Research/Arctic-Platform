@@ -822,6 +822,42 @@ class TestCortexZorroTrainingConfig:
         # leftover ZoRRo knobs must not change a non-ZoRRo job at all
         assert tc == self._training_config(self.BASE_WORKER)
 
+    def test_unpacked_request_without_zorro_emits_only_pack(self):
+        tc = self._training_config({**self.BASE_WORKER, "pack": False})
+        assert tc["pack"] is False
+        assert "zorro_train" not in tc
+        assert {k: v for k, v in tc.items() if k != "pack"} == self._training_config(self.BASE_WORKER)
+
+    @pytest.mark.parametrize("pack", [None, True])
+    def test_zorro_unpacks_whatever_pack_says(self, pack):
+        worker = dict(self.ZORRO_WORKER) if pack is None else {**self.ZORRO_WORKER, "pack": pack}
+        tc = self._training_config(worker)
+        assert tc["pack"] is False
+        assert tc["zorro_train"] == self._training_config(self.ZORRO_WORKER)["zorro_train"]
+
+    @pytest.mark.parametrize("worker", [None, {}, {"pack": True}, {"zorro_train_enable": False}])
+    def test_packed_job_emits_no_pack_key(self, worker):
+        tc = self._training_config(worker)
+        assert "pack" not in tc and "zorro_train" not in tc
+
+    @pytest.mark.parametrize(
+        ("worker", "packs"),
+        [
+            (None, True),
+            ({}, True),
+            ({"pack": True}, True),
+            ({"pack": False}, False),
+            ({"zorro_train_enable": True}, False),
+            ({"zorro_train_enable": True, "pack": True}, False),
+        ],
+    )
+    def test_cortex_job_packs_matches_the_emitted_job(self, worker, packs):
+        from arctic_platform.client.config import cortex_job_packs
+
+        assert cortex_job_packs(worker) is packs
+        if not (worker or {}).get("zorro_train_enable"):
+            assert ("pack" not in self._training_config(worker)) is packs
+
     def test_emitted_block_validates_against_server_schema(self):
         block = self._training_config(self.ZORRO_WORKER)["zorro_train"]
         parsed = _ServerZorroTrainConfig.model_validate(block)
@@ -953,6 +989,7 @@ class TestCortexSharedHelper:
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
 
         ids = torch.zeros((2, 10), dtype=torch.int64)
         attn = torch.ones((2, 10), dtype=torch.int64)
@@ -963,12 +1000,40 @@ class TestCortexSharedHelper:
             "response_mask": torch.ones((2, 10), dtype=torch.int64),
         }
         opted_out = to_cortex_fwd_bwd_payload(
-            {"batch": batch, "meta": {"balance_batch": False, "load_balancer": True}}
+            {
+                "batch": batch,
+                "meta": {
+                    "balance_batch": False,
+                    "load_balancer": True,
+                    "zorro_load_balancer": True,
+                    "zorro_train_load_balancer": True,
+                },
+            }
         )
         assert opted_out["context"]["balance_batch"] is False
         assert "load_balancer" not in opted_out["context"]
+        assert "zorro_load_balancer" not in opted_out["context"]
+        assert "zorro_train_load_balancer" not in opted_out["context"]
+        forward_only = to_cortex_fwd_payload(
+            {
+                "batch": {**batch, "prompts": torch.zeros((2, 3), dtype=torch.int64)},
+                "meta": {
+                    "balance_batch": False,
+                    "load_balancer": True,
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                },
+            }
+        )
+        assert forward_only["context"]["balance_batch"] is False
+        assert "load_balancer" not in forward_only["context"]
         opted_in = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"balance_batch": True}})
         assert opted_in["context"]["balance_batch"] is True
+        grouped = to_cortex_fwd_bwd_payload(
+            {"batch": batch, "meta": {"balance_batch": True, "load_balancer": True}}
+        )
+        assert grouped["context"]["balance_batch"] is True
+        assert "load_balancer" not in grouped["context"]
         absent = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}})
         assert "balance_batch" not in absent["context"]
 
@@ -1184,6 +1249,8 @@ class TestCortexSharedHelper:
                     "zorro_train_enable": True,
                     "max_prompt_len": 3,
                     "balance_batch": True,
+                    "load_balancer": True,
+                    "zorro_train_load_balancer": True,
                     "pad_token_id": 151643,
                     "temperature": 0.7,
                 },
@@ -1197,6 +1264,9 @@ class TestCortexSharedHelper:
         assert out["context"]["max_prompt_len"] == 3
         assert out["context"]["pad_token_id"] == 151643
         assert out["context"]["temperature"] == 0.7
+        assert out["context"]["balance_batch"] is True
+        assert "load_balancer" not in out["context"]
+        assert "zorro_train_load_balancer" not in out["context"]
 
 
 class TestCortexPredictNextFrame:
@@ -1480,6 +1550,346 @@ class TestCortexZorroOldLogProbs:
         _, metrics = _grpo_loss({"logprobs": live}, {**meta, **flat}, out["processing"]["config"], "cpu")
         assert metrics["importance_weight"] == pytest.approx(math.exp(0.1))
         assert metrics["approx_kl"] == pytest.approx(0.1)
+
+
+class TestCortexZorroVerlGrpo:
+    """SkyRL's ``verl_grpo`` request keeps its loss on the ZoRRo Cortex wire."""
+
+    SKYRL_PROCESSING = {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": "verl_grpo"}
+
+    @staticmethod
+    def _skyrl_zorro_request():
+        """Two rows, max_prompt_len=3, response tensors left-padded to the row width."""
+        import torch
+
+        ids = torch.tensor([[0, 5, 6, 7, 8], [1, 2, 3, 4, 0]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
+        response = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 0]])
+        return {
+            "batch": {
+                "input_ids": ids,
+                "attention_mask": attn,
+                "prompts": ids[:, :3],
+                "position_ids": (attn.cumsum(-1) - 1).clamp(min=0),
+                "response_mask": response,
+                "loss_mask": response,
+                "advantages": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.0, -1.0, 0.0]]),
+                "old_log_probs": torch.tensor(
+                    [[0.0, 0.0, 0.0, -1.0, -2.0], [0.0, 0.0, 0.0, -0.5, 0.0]], dtype=torch.float64
+                ),
+            },
+            "meta": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 3,
+                "pad_token_id": 0,
+                "temperature": 1.0,
+                "dp_size": 8,
+                "batch_num_tokens": 3,
+                "global_batch_size": 2,
+                "rollout_is_weights": None,
+                "actor_config": {"loss_agg_mode": "token-mean", "entropy_coeff": 0.0, "use_kl_loss": False},
+                "policy_loss_config": {"loss_mode": "vanilla"},
+            },
+        }
+
+    def test_payload_keeps_the_on_prem_loss_and_names(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        request = self._skyrl_zorro_request()
+        out = to_cortex_fwd_bwd_payload(request, processing=self.SKYRL_PROCESSING, response_aligned=True)
+        assert out["processing"]["loss_fn"] == "verl_grpo"
+        assert out["processing"]["post"] == self.SKYRL_PROCESSING["post"]
+        context = out["context"]
+        # Unshifted: the patched forward scores each response token in place.
+        for key in ("response_mask", "advantages"):
+            assert torch.equal(context[key], request["batch"][key])
+        assert context["old_log_probs"].dtype == torch.float32
+        assert "old_log_probs_shifted" not in context
+        assert context["actor_config"] == request["meta"]["actor_config"]
+        assert context["max_prompt_len"] == 3
+        # DSS sets dp_size from the shard count.
+        assert "dp_size" not in context
+        assert "rollout_is_weights" not in context
+        assert set(out["kwargs"]) == {"input_ids", "attention_mask", "prompts", "position_ids"}
+
+    def test_flattened_shard_reaches_verl_grpo(self):
+        """Replays the worker: context promoted onto the batch, then ZoRRo's
+        response-only flatten, then the registered loss with DSS's dp_size."""
+        import torch
+
+        import arctic_platform.rl.processors  # noqa: F401  # registers verl_grpo before the loss module loads
+        from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.integrations.verl.grpo_loss import verl_grpo_loss
+        from arctic_platform.rl.processors.pipeline import padded_tensor_2d_full_to_unpadded_tensor_1d_response
+
+        out = to_cortex_fwd_bwd_payload(
+            self._skyrl_zorro_request(), processing=self.SKYRL_PROCESSING, response_aligned=True
+        )
+        batch, meta = promote_batch_dim_to_batch(out["kwargs"], out["context"])
+        mask = batch["attention_mask"].bool()
+        flat = {
+            key: padded_tensor_2d_full_to_unpadded_tensor_1d_response(value, mask, 3)
+            if key not in ("input_ids", "position_ids", "attention_mask") and value.shape == mask.shape
+            else value
+            for key, value in batch.items()
+        }
+        assert flat["response_mask"].shape == (1, 3)
+        meta = {**meta, "dp_size": 1}
+        live = flat["old_log_probs"].squeeze(0)
+        loss, metrics = verl_grpo_loss({"logprobs": live.unsqueeze(0)}, flat, meta, {}, "cpu")
+        # Ratio 1 everywhere: the loss is -sum(advantages) / batch_num_tokens.
+        assert loss.item() == pytest.approx(-(1.0 + 1.0 - 1.0) / 3)
+        assert metrics["actor/pg_loss.tokens"] == 3
+
+    def test_rejects_sequence_aggregation(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        request = self._skyrl_zorro_request()
+        request["meta"]["actor_config"]["loss_agg_mode"] = "seq-mean-token-mean"
+        with pytest.raises(ValueError, match="loss_agg_mode='token-mean', got 'seq-mean-token-mean'"):
+            to_cortex_fwd_bwd_payload(request, processing=self.SKYRL_PROCESSING)
+
+    def test_requires_the_old_policy_snapshot(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        request = self._skyrl_zorro_request()
+        del request["batch"]["old_log_probs"]
+        with pytest.raises(ValueError, match="old_log_probs"):
+            to_cortex_fwd_bwd_payload(request, processing=self.SKYRL_PROCESSING)
+
+
+class TestCortexUnpackedVerlGrpo:
+    """Without ZoRRo, the job's packing decides whether SkyRL's ``verl_grpo`` survives."""
+
+    SKYRL_PROCESSING = TestCortexZorroVerlGrpo.SKYRL_PROCESSING
+
+    @staticmethod
+    def _skyrl_request():
+        """The ZoRRo fixture's rows with ZoRRo off: prompts end at column 3.
+
+        ``old_log_probs`` are already on the token they score. SkyRL's client
+        does that move before the request leaves, and only for ``verl_grpo``.
+        """
+        request = TestCortexZorroVerlGrpo._skyrl_zorro_request()
+        request["meta"]["zorro_train_enable"] = False
+        return request
+
+    @staticmethod
+    def _payload(request, packed):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        return to_cortex_fwd_bwd_payload(
+            request, processing=TestCortexUnpackedVerlGrpo.SKYRL_PROCESSING, response_aligned=True, packed=packed
+        )
+
+    @pytest.mark.parametrize("packed", [True, None])
+    def test_packed_job_still_rewrites_to_grpo(self, packed):
+        """The packed-executor contract (also locked by tests/integrations/tinker/test_cortex_binder.py)."""
+        import torch
+
+        out = self._payload(self._skyrl_request(), packed)
+        assert out["processing"]["loss_fn"] == "grpo"
+        assert out["processing"]["post"] == ["compute_logprobs"]
+        context = out["context"]
+        assert "old_log_probs" not in context and "old_log_probs_shifted" not in context
+        assert "response_mask" not in context
+        assert "prompts" not in out["kwargs"]
+        # Row 0 left-aligned, then loss_mask / advantages shifted one column left.
+        assert out["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]
+        assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0], [1, 2, 3, 4, 0]]
+        assert context["loss_mask"].int().tolist() == [[0, 1, 1, 0, 0], [0, 0, 1, 0, 0]]
+        assert torch.equal(context["advantages"], torch.tensor([[0.0, 1.0, 1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0, 0.0]]))
+
+    def test_unpacked_job_keeps_the_on_prem_loss_and_names(self):
+        import torch
+
+        request = self._skyrl_request()
+        out = self._payload(request, packed=False)
+        assert out["processing"]["loss_fn"] == "verl_grpo"
+        assert out["processing"]["post"] == [*self.SKYRL_PROCESSING["post"], "compute_logprobs"]
+        assert out["processing"]["config"] == {}
+        kwargs, context = out["kwargs"], out["context"]
+        assert set(kwargs) == {"input_ids", "attention_mask", "prompts", "position_ids"}
+        # Client layout: not left-aligned.
+        for key in ("input_ids", "attention_mask", "prompts", "position_ids"):
+            assert torch.equal(kwargs[key], request["batch"][key])
+        # Unshifted, on-prem names.
+        for key in ("response_mask", "advantages"):
+            assert torch.equal(context[key], request["batch"][key])
+        assert torch.equal(context["loss_mask"], request["batch"]["loss_mask"].bool())
+        assert context["old_log_probs"].dtype == torch.float32
+        assert torch.equal(context["old_log_probs"], request["batch"]["old_log_probs"].float())
+        assert "old_log_probs_shifted" not in context
+        assert "dp_size" not in context
+        assert context["pad_token_id"] == 0
+        assert context["actor_config"] == request["meta"]["actor_config"]
+        assert context["batch_num_tokens"] == 3 and context["global_batch_size"] == 2
+
+    def test_caller_compute_logprobs_is_not_repeated(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        processing = {**self.SKYRL_PROCESSING, "post": ["compute_entropy_and_logprobs", "compute_logprobs"]}
+        out = to_cortex_fwd_bwd_payload(self._skyrl_request(), processing=processing, packed=False)
+        assert out["processing"]["post"] == ["compute_entropy_and_logprobs", "compute_logprobs"]
+
+    def test_appended_post_passes_server_logprobs_through(self):
+        """Appending compute_logprobs leaves the caller's log-probs unchanged."""
+        import torch
+
+        from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
+
+        lp = torch.tensor([[-1.0, -2.0, -3.0]])
+        out = compute_logprobs_post({"logprobs": lp, "logits": torch.zeros(1, 3, 4)}, {}, {}, "cpu")
+        assert out["logprobs"] is lp
+
+    def test_flattened_shard_reaches_verl_grpo(self):
+        """Replays the unpacked worker: context promoted onto the batch,
+        ``compute_packing_info_for_batch``, the generic unpad, then the
+        registered loss with DSS's dp_size."""
+        import torch
+
+        from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
+        from arctic_platform.integrations.verl.grpo_loss import verl_grpo_loss
+        from arctic_platform.rl.processors.pipeline import compute_packing_info_for_batch
+        from arctic_platform.rl.processors.pipeline import padded_tensor_2d_dict_to_unpadded_tensor_1d_dict
+
+        out = self._payload(self._skyrl_request(), packed=False)
+        batch, meta = promote_batch_dim_to_batch(out["kwargs"], out["context"])
+        assert meta["zorro_train_enable"] is False
+        batch = compute_packing_info_for_batch(batch)
+        assert batch["response_lens"].tolist() == [2, 1]
+        assert batch["sequence_offsets"].tolist() == [4, 8]
+        flat = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, batch["attention_mask"].bool())
+        # Rows [5 6 7 | 8 x] and [1 2 3 | 4]: responses at flat 2..3 and 7.
+        assert flat["response_mask"].squeeze(0).nonzero().flatten().tolist() == [2, 3, 7]
+        old = flat["old_log_probs"].squeeze(0)
+        assert old[[2, 3, 7]].tolist() == [-1.0, -2.0, -0.5]
+        # The stock forward's predict-next log-probs: entry j scores token j + 1.
+        # verl_grpo shifts those live values onto the token; old is already there.
+        live = torch.roll(old, shifts=-1)
+        meta = {**meta, "dp_size": 1}
+        loss, metrics = verl_grpo_loss({"logprobs": live.unsqueeze(0)}, flat, meta, {}, "cpu")
+        # Ratio 1 on every scored token: the loss is -sum(advantages) / batch_num_tokens.
+        assert loss.item() == pytest.approx(-(1.0 + 1.0 - 1.0) / 3)
+        assert metrics["actor/pg_loss.tokens"] == 3
+        assert metrics["actor/ppo_kl.sum"] == pytest.approx(0.0)
+        # A shifted payload would score the wrong column and move the ratio off 1.
+        off_by_one, _ = verl_grpo_loss({"logprobs": old.unsqueeze(0)}, flat, meta, {}, "cpu")
+        assert off_by_one.item() != pytest.approx(loss.item())
+
+    def test_unpacked_job_requires_verl_grpo(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        with pytest.raises(ValueError, match="loss_fn='verl_grpo'; got 'grpo'"):
+            to_cortex_fwd_bwd_payload(self._skyrl_request(), processing={"loss_fn": "grpo"}, packed=False)
+
+    def test_unpacked_job_requires_prompts(self):
+        request = self._skyrl_request()
+        del request["batch"]["prompts"]
+        with pytest.raises(ValueError, match="prompts"):
+            self._payload(request, packed=False)
+
+    def test_unpacked_job_requires_pad_token_id(self):
+        request = self._skyrl_request()
+        del request["meta"]["pad_token_id"]
+        with pytest.raises(ValueError, match="pad_token_id"):
+            self._payload(request, packed=False)
+
+    def test_unpacked_job_rejects_response_tokens_inside_the_prompt(self):
+        import torch
+
+        request = self._skyrl_request()
+        request["batch"]["response_mask"] = torch.tensor([[0, 0, 1, 1, 1], [0, 0, 0, 1, 0]])
+        with pytest.raises(ValueError, match="prompts.shape"):
+            self._payload(request, packed=False)
+
+    def test_unpacked_job_rejects_response_only_width(self):
+        request = self._skyrl_request()
+        request["batch"]["advantages"] = request["batch"]["advantages"][:, 3:]
+        with pytest.raises(ValueError, match="'advantages' with the attention_mask shape"):
+            self._payload(request, packed=False)
+
+    def test_unpacked_job_rejects_sequence_aggregation(self):
+        request = self._skyrl_request()
+        request["meta"]["actor_config"]["loss_agg_mode"] = "seq-mean-token-mean"
+        with pytest.raises(ValueError, match="loss_agg_mode='token-mean', got 'seq-mean-token-mean'"):
+            self._payload(request, packed=False)
+
+    def test_zorro_request_on_a_packed_job_raises(self):
+        request = TestCortexZorroVerlGrpo._skyrl_zorro_request()
+        with pytest.raises(ValueError, match="packs rows"):
+            self._payload(request, packed=True)
+
+    def test_zorro_payload_is_the_same_whether_packing_is_known(self):
+        import torch
+
+        request = TestCortexZorroVerlGrpo._skyrl_zorro_request()
+        inferred, explicit = self._payload(request, None), self._payload(request, False)
+        assert inferred["processing"] == explicit["processing"] == {**self.SKYRL_PROCESSING, "config": {}}
+        for part in ("kwargs", "context"):
+            assert inferred[part].keys() == explicit[part].keys()
+            for key, value in inferred[part].items():
+                same = torch.equal(value, explicit[part][key]) if torch.is_tensor(value) else value == explicit[part][key]
+                assert same, key
+
+    def test_unpacked_forward_keeps_the_client_layout(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
+
+        request = self._skyrl_request()
+        unpacked = to_cortex_fwd_payload(request, packed=False)
+        assert torch.equal(unpacked["kwargs"]["attention_mask"], request["batch"]["attention_mask"])
+        assert torch.equal(unpacked["kwargs"]["input_ids"], request["batch"]["input_ids"])
+        assert unpacked["context"]["pad_token_id"] == 0
+        packed = to_cortex_fwd_payload(request, packed=True)
+        assert packed["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]
+
+    def test_unpacked_forward_requires_pad_token_id(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
+
+        request = self._skyrl_request()
+        del request["meta"]["pad_token_id"]
+        with pytest.raises(ValueError, match="pad_token_id"):
+            to_cortex_fwd_payload(request, packed=False)
+
+    @pytest.mark.parametrize(("worker", "loss_fn"), [({"pack": False}, "verl_grpo"), (None, "grpo"), ({}, "grpo")])
+    def test_shim_payload_follows_the_job_it_creates(self, worker, loss_fn):
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+
+        seen = {}
+
+        class Client:
+            async def fwd_bwd(self, payload):
+                seen["fwd_bwd"] = payload
+                return {}
+
+            async def fwd_no_grad(self, payload):
+                seen["fwd_no_grad"] = payload
+                return {"logprobs": [[0.0] * 5, [0.0] * 5]}
+
+        config = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_worker_config": worker},
+        )
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = None
+        shim._unified_config = config
+        shim._client = Client()
+        asyncio.run(shim.fwd_bwd(self._skyrl_request(), processing=self.SKYRL_PROCESSING))
+        asyncio.run(shim.fwd_no_grad(self._skyrl_request()))
+        job = config._cortex_training_sub_job()["training_config"]
+        assert ("pack" in job) is (loss_fn == "verl_grpo")
+        assert "zorro_train" not in job
+        assert seen["fwd_bwd"]["processing"]["loss_fn"] == loss_fn
+        left_aligned = seen["fwd_no_grad"]["kwargs"]["attention_mask"][0].tolist() == [1, 1, 1, 1, 0]
+        assert left_aligned is (loss_fn == "grpo")
 
 
 class TestCortexZorroLossAggregation:
