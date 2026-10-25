@@ -522,11 +522,12 @@ def fused_hyper_connection_applies(hc: nn.Module, streams: Tensor) -> bool:
     return streams.is_cuda and hc.hc_mult == 4
 
 
-def hyper_connection(hc: nn.Module, streams: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """``Glm5NextTextHyperConnection.forward`` with fused stream passes: ``(post, comb, collapsed)``."""
+def hyper_connection_gates(hc: nn.Module, streams: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """A site's ``(pre, post, comb)`` from its streams ``[batch, length, hc, hidden]``, without the collapse; for
+    DeepSeek-V4.1, whose shifted mHC collapses each site's streams with the previous site's ``pre``."""
     batch, length, hc_mult, hidden = streams.shape
-    x = streams.reshape(batch * length, hc_mult, hidden).contiguous()
-    logits = _HcLogitsFn.apply(x.view(batch * length, hc_mult * hidden), hc.fn.float().contiguous(), hc.input_norm.eps)
+    x = streams.reshape(batch * length, hc_mult * hidden).contiguous()
+    logits = _HcLogitsFn.apply(x, hc.fn.float().contiguous(), hc.input_norm.eps)
     pre, post, comb = _HcGatesFn.apply(
         logits.contiguous(),
         hc.base.float().contiguous(),
@@ -534,12 +535,27 @@ def hyper_connection(hc: nn.Module, streams: Tensor) -> tuple[Tensor, Tensor, Te
         hc.hc_eps,
         hc.hc_sinkhorn_iters,
     )
-    collapsed = _HcCollapseFn.apply(x, pre)
     return (
+        pre.view(batch, length, hc_mult),
         post.view(batch, length, hc_mult),
         comb.view(batch, length, hc_mult, hc_mult),
-        collapsed.view(batch, length, hidden),
     )
+
+
+def collapse_streams(streams: Tensor, pre: Tensor) -> Tensor:
+    """``sum_h pre[..., h] * streams[..., h, :]`` in FP32, cast back to the streams' dtype."""
+    batch, length, hc_mult, hidden = streams.shape
+    collapsed = _HcCollapseFn.apply(
+        streams.reshape(batch * length, hc_mult, hidden).contiguous(),
+        pre.reshape(batch * length, hc_mult).float().contiguous(),
+    )
+    return collapsed.view(batch, length, hidden)
+
+
+def hyper_connection(hc: nn.Module, streams: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``Glm5NextTextHyperConnection.forward`` with fused stream passes: ``(post, comb, collapsed)``."""
+    pre, post, comb = hyper_connection_gates(hc, streams)
+    return post, comb, collapse_streams(streams, pre)
 
 
 def mix_streams(post: Tensor, comb: Tensor, sublayer_out: Tensor, streams: Tensor) -> Tensor:
