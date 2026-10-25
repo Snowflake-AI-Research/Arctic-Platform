@@ -124,6 +124,20 @@ def test_parse_semi_p_restore():
     assert startup.generate_counts({"zone-device-manager-abcde.log": RESTORE_LOG}) == {"abcde r0": 1}
 
 
+def test_parse_semi_p_counts_the_attach_in_key_to_ready():
+    log = RESTORE_LOG[:-1] + [
+        "00:00:21.500 [r0 child] INFO c.py:1 pid=3 <<< serve_core OK (0.400s)",
+        "00:00:24.000 [r0 engine] INFO x.py:1 pid=1 semi_p: front end attached in 3.00s "
+        "(serve_core 0.45s, AsyncLLM 2.50s)",
+        RESTORE_LOG[-1],
+    ]
+    r = startup.parse_semi_p(log)
+    rep = r["replicas"]["r0"]
+    assert rep["attach_s"] == 3.0 and rep["restore_s"] == 17.3 and rep["key_to_ready_s"] == 23.0
+    assert r["slowest_replica_steps"] == {"criu_restore": 3.3, "load_weights": 2.0, "serve_core": 0.4}
+    assert "| r0 | published image | 2.5 | 17.3 | 3.0 | 23.0 |" in "\n".join(report.replica_table(r))
+
+
 def test_restore_report_prefers_pod_logs_and_labels_each_pod():
     agent = ["00:00:05.000 [r0 worker] INFO w.py:1 pid=9 <<< criu_restore OK (4.000s)",
              "00:00:20.000 [r0 worker] INFO w.py:1 pid=9 <<< cuda_restore OK (15.000s)",
