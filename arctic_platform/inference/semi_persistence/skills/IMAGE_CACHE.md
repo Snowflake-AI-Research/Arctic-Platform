@@ -1026,7 +1026,11 @@ no error. Several things the plan had flagged as unverified are now answered:
   example, 35B TP=4 went from `[5,6,4,7]` to `[7,6,5,4]`, and 27B TP=2
   replica0 from `[6,7]` to `[0,1]`. Several replicas moved to a disjoint GPU
   set. The restored contexts still report dump-time PCI bus IDs (a known
-  risk), and nothing tripped on it.
+  risk), and nothing tripped on it. It did trip later, at TP=16 across two
+  pods: NCCL built its topology from those stale bus IDs, and a long prompt's
+  first token took three times plain's. A restore now puts each rank back on
+  the GPU index it was dumped on whenever the pod holds that index
+  (`semip_engine._dump_placement`).
 - **Eight concurrent TP=1 dumps and eight concurrent restores in one pod**
   work, once the dump unlinks only its own `/dev/shm` files (CRIU_PLUMBING
   Complication 3, which cost round 1 four of six Qwen dump jobs).
