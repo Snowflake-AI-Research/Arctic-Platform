@@ -305,11 +305,12 @@ class TestNoZorroPipelineMemoryRouting(TestCasePlus):
         self.assertNotIn("logits_to_keep", engine.last_kwargs or {})
         self.assertIn("logprobs", out["batch"])
 
-    def test_worker_fill_turns_none_meta_into_memory_path(self):
-        # C2 bug: launcher set ARCTIC_LOGITS_OPT on ds_worker_config only; client meta stayed "none".
+    def test_worker_fill_inherits_memory_when_the_client_omits_it(self):
         engine = _Engine(_CausalLM(8, 16))
+        meta = self._meta("none")
+        del meta["logits_optimization"]
         meta = fill_logits_opt_from_worker_config(
-            self._meta("none"),
+            meta,
             {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
         )
         out = run_pipeline(
@@ -326,6 +327,27 @@ class TestNoZorroPipelineMemoryRouting(TestCasePlus):
         self.assertEqual(engine.last_kwargs.get("logits_to_keep"), 1)
         self.assertIn("logprobs", out["batch"])
         self.assertNotIn("logits", out["batch"])
+
+    def test_explicit_none_keeps_full_logits_against_worker_memory(self):
+        engine = _Engine(_CausalLM(8, 16))
+        meta = fill_logits_opt_from_worker_config(
+            self._meta("none"),
+            {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
+        )
+        out = run_pipeline(
+            engine,
+            (),
+            self._batch(),
+            meta,
+            {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": None},
+            "cpu",
+            backward=False,
+            pack=False,
+            return_tensors=True,
+        )
+        self.assertEqual(meta["logits_optimization"], "none")
+        self.assertNotIn("logits_to_keep", engine.last_kwargs or {})
+        self.assertIn("logprobs", out["batch"])
 
     def test_memory_defaults_missing_temperature(self):
         engine = _Engine(_CausalLM(8, 16))
@@ -407,19 +429,29 @@ class TestNoZorroPipelineMemoryRouting(TestCasePlus):
 
 
 class TestFillLogitsOptFromWorkerConfig(TestCasePlus):
-    def test_fills_none_from_worker_memory(self):
-        meta = {"logits_optimization": "none", "temperature": 1.0}
+    def test_missing_or_none_inherits_worker_memory(self):
         worker = {
             "logits_optimization": "memory",
             "logits_optimization_peak_mem_size_in_gib": 8,
             "logits_compute_in_fp32": True,
         }
-        filled = fill_logits_opt_from_worker_config(meta, worker)
-        self.assertEqual(filled["logits_optimization"], "memory")
-        self.assertEqual(filled["logits_optimization_peak_mem_size_in_gib"], 8)
-        self.assertTrue(filled["logits_compute_in_fp32"])
-        self.assertEqual(filled["temperature"], 1.0)
-        self.assertEqual(meta["logits_optimization"], "none")
+        for meta in ({"temperature": 1.0}, {"logits_optimization": None, "temperature": 1.0}):
+            filled = fill_logits_opt_from_worker_config(meta, worker)
+            self.assertEqual(filled["logits_optimization"], "memory")
+            self.assertEqual(filled["logits_optimization_peak_mem_size_in_gib"], 8)
+            self.assertTrue(filled["logits_compute_in_fp32"])
+            self.assertEqual(filled["temperature"], 1.0)
+            self.assertIsNot(filled, meta)
+
+    def test_explicit_none_is_not_overridden(self):
+        meta = {"logits_optimization": "none", "temperature": 1.0}
+        filled = fill_logits_opt_from_worker_config(
+            meta,
+            {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
+        )
+        self.assertIs(filled, meta)
+        self.assertEqual(filled["logits_optimization"], "none")
+        self.assertNotIn("logits_optimization_peak_mem_size_in_gib", filled)
 
     def test_client_memory_wins_over_worker_none(self):
         meta = {"logits_optimization": "memory"}
@@ -432,6 +464,6 @@ class TestFillLogitsOptFromWorkerConfig(TestCasePlus):
         filled = fill_logits_opt_from_worker_config(meta, {"logits_optimization": "none"})
         self.assertIs(filled, meta)
 
-    def test_missing_meta_key_treated_as_none(self):
+    def test_missing_meta_key_inherits_worker(self):
         filled = fill_logits_opt_from_worker_config({}, {"logits_optimization": "compute"})
         self.assertEqual(filled["logits_optimization"], "compute")

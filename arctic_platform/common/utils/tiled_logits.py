@@ -436,11 +436,15 @@ _LOGITS_OPT_META_KEYS = (
 
 
 def fill_logits_opt_from_worker_config(meta: dict, ds_worker_config: dict | None) -> dict:
-    """Copy worker-init logits knobs into per-call meta when the client left them at ``none``."""
+    """Copy worker-init logits knobs into per-call meta when the client did not choose.
+
+    A missing value or ``None`` inherits the worker. An explicit ``none``,
+    ``memory``, or ``compute`` is the caller's choice and is left alone, so a
+    client can opt out of tiling on a worker configured for ``memory``.
+    """
     worker = ds_worker_config or {}
     worker_opt = worker.get("logits_optimization") or "none"
-    meta_opt = meta.get("logits_optimization") or "none"
-    if meta_opt != "none" or worker_opt == "none":
+    if meta.get("logits_optimization") or worker_opt == "none":
         return meta
     filled = dict(meta)
     for key in _LOGITS_OPT_META_KEYS:
