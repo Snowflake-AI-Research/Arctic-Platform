@@ -1959,6 +1959,39 @@ def _check_gpu_placement(meta: dict[str, Any], gpus: list[int],
         "recorded UUIDs", model_dir, gpus)
 
 
+def _dump_placement(meta: dict[str, Any], gpus: list[int],
+                    model_dir: str) -> list[int]:
+    """``gpus`` reordered so every rank lands on the index it was dumped on.
+
+    A restored rank keeps CUDA's dump-time view of its device, PCI bus id
+    included, and NCCL builds its topology from that bus id. Ray hands out a
+    pod's GPUs in no particular order, so restoring rank ``k`` onto
+    ``gpus[k]`` puts most ranks on a different slot than the one NCCL believes
+    they are on. Measured on GLM-5.3 at TP=16 restoring a published image: with
+    seven of the leader's eight ranks off their dumped index, NCCL picked NICs
+    for the wrong GPUs, left network devices idle and built 24 channels where a
+    matching placement builds 16, and a 1024-token prompt's first token took
+    662 ms against plain's 211 ms. Back on their dumped indices, 207 ms.
+
+    A GPU index names the same PCI slot on every node of a type, so putting
+    each rank back on its dumped index makes that stale view true again.
+    Ranks whose dumped index this pod was not given keep the remaining GPUs
+    in Ray's order; that is the TP=1 replica case, where only the network
+    devices of a weight sync see the difference.
+    """
+    baked = [int(g) for g in meta.get("gpus") or []]
+    if len(baked) != len(gpus) or len(set(baked)) != len(baked):
+        return list(gpus)
+    assigned = set(gpus)
+    placed = [g if g in assigned else None for g in baked]
+    spare = iter(g for g in gpus if g not in placed)
+    placed = [g if g is not None else next(spare) for g in placed]
+    if placed != list(gpus):
+        logger.info("semi_p: %s restores each rank onto the GPU index it was "
+                    "dumped on: %s (Ray assigned %s)", model_dir, placed, gpus)
+    return placed
+
+
 def _staging_budget_bytes(inst: Any) -> int | None:
     """Mirror ``plan_restore_weights``' own budget computation, for reporting.
 
@@ -2378,6 +2411,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     if mismatch:
         raise RuntimeError(f"semi_p: {model_dir}: {mismatch}")
     _check_device_visibility(meta, model_dir)
+    gpus = _dump_placement(meta, gpus, model_dir)
     _check_gpu_placement(meta, gpus, model_dir)
 
     logger.info("semi_p: restoring image model_dir=%s (dumped on %s) onto "
@@ -2647,6 +2681,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
     if mismatch:
         raise RuntimeError(f"semi_p: {model_dir}: {mismatch}")
     _check_device_visibility(meta, model_dir)
+    gpus = _dump_placement(meta, gpus, model_dir)
 
     leader_ip = _leader_ip()
     remote_ranks = [r for k in range(1, nnodes) for r in _node_ranks(k, local)]
