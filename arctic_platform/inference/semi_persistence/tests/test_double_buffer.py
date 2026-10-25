@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import os
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,6 +65,7 @@ def child():
         "_repin_buffer": lambda buf: registered.add(buf.data_ptr()),
         "_unpin_buffer": lambda buf: registered.remove(buf.data_ptr()),
         "_STAGING_FREE_FRACTION": 0.9,
+        "time": time,
     }
     exec(compile(ast.Module(body=funcs, type_ignores=[]), path, "exec"), ns)
     ns["registered"] = registered
@@ -121,6 +123,8 @@ def test_every_byte_arrives_half_by_half(child, n, half_bytes, threads):
     src = worker._semip_buf
     dst = torch.zeros(n + 7, dtype=torch.uint8)
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        child._semip_double_buffer_h2d(worker._semip_double_buffer, src, dst[:n], pool)
+        fill_s, wait_s = child._semip_double_buffer_h2d(
+            worker._semip_double_buffer, src, dst[:n], pool)
+    assert fill_s >= 0 and wait_s >= 0
     assert torch.equal(dst[:n], src)
     assert not dst[n:].any()

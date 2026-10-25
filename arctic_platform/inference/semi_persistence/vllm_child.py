@@ -731,20 +731,38 @@ def _semip_double_buffer_h2d(db, src, dst, pool):
     half_bytes, threads = db["half_bytes"], db["threads"]
     stream.wait_stream(torch.cuda.current_stream())
     n = src.numel()
+    fill_s = wait_s = 0.0
     for i, off in enumerate(range(0, n, half_bytes)):
         k = i % 2
         m = min(half_bytes, n - off)
+        t0 = time.perf_counter()
         events[k].synchronize()
+        t1 = time.perf_counter()
         half = halves[k]
         step = -(-m // threads)
         list(pool.map(
             lambda a: half[a:min(a + step, m)].copy_(
                 src[off + a:off + min(a + step, m)]),
             range(0, m, step)))
+        fill_s += time.perf_counter() - t1
+        wait_s += t1 - t0
         with torch.cuda.stream(stream):
             dst[off:off + m].copy_(half[:m], non_blocking=True)
             events[k].record(stream)
+    t0 = time.perf_counter()
     stream.synchronize()
+    return fill_s, wait_s + time.perf_counter() - t0
+
+
+def _cpu_throttled():
+    """``(nr_throttled, throttled_usec)`` from this pod's cgroup v2 ``cpu.stat``,
+    or None where it cannot be read."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            stat = dict(line.split() for line in f if line.strip())
+        return int(stat["nr_throttled"]), int(stat["throttled_usec"])
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def _semip_restore_weights(worker):
@@ -764,20 +782,26 @@ def _semip_restore_weights(worker):
     torch.cuda.synchronize()
     gpu_buf = torch.empty(cs, dtype=torch.uint8, device=worker.device)
     loaded = 0
+    fill_s = h2d_s = scatter_s = 0.0
     try:
         for chunk_lo, chunk_hi, members in plan:
             n = chunk_hi - chunk_lo
+            t0 = time.perf_counter()
             if db is not None:
-                _semip_double_buffer_h2d(db, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
+                fill, _ = _semip_double_buffer_h2d(db, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
+                fill_s += fill
             else:
                 gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
             torch.cuda.synchronize()
+            t1 = time.perf_counter()
             for name, off, nbytes, dtype, shape in members:
                 start = off - chunk_lo
                 src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
                 targets[name].copy_(src)
                 loaded += 1
             torch.cuda.synchronize()
+            h2d_s += t1 - t0
+            scatter_s += time.perf_counter() - t1
     finally:
         if pool is not None:
             pool.shutdown()
@@ -794,7 +818,8 @@ def _semip_restore_weights(worker):
     torch.cuda.empty_cache()
     return {"bytes": total_bytes, "loaded": loaded,
             "n_chunks": len(plan), "chunk_size": cs,
-            "staging": "double_buffer" if db is not None else "direct"}
+            "staging": "double_buffer" if db is not None else "direct",
+            "h2d_s": h2d_s, "fill_s": fill_s, "scatter_s": scatter_s}
 
 
 def _semip_detach(worker):
@@ -4365,15 +4390,24 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
             elif cmd == "restore_weights":
                 if llm is None:
                     raise RuntimeError("restore_weights requires init first")
+                throttled = _cpu_throttled()
                 results = llm.collective_rpc(_semip_restore_weights)
+                throttled = [b - a for a, b in zip(throttled, _cpu_throttled())] if throttled else None
                 total_bytes = sum(r["bytes"] for r in results)
                 total_loaded = sum(r["loaded"] for r in results)
                 info["bytes"] = total_bytes
                 info["n_chunks"] = max(r["n_chunks"] for r in results)
                 info["staging"] = sorted({r["staging"] for r in results})
+                for key in ("h2d_s", "fill_s", "scatter_s"):
+                    info[key] = round(max(r[key] for r in results), 3)
                 log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB) "
-                         "via %s", total_loaded, info["n_chunks"],
-                         total_bytes / 2**30, "/".join(info["staging"]))
+                         "via %s; slowest worker: host to GPU %.2fs (of it "
+                         "filling the double buffer %.2fs), scatter %.2fs; "
+                         "CPU throttled %s", total_loaded, info["n_chunks"],
+                         total_bytes / 2**30, "/".join(info["staging"]),
+                         info["h2d_s"], info["fill_s"], info["scatter_s"],
+                         f"{throttled[0]} period(s), {throttled[1] / 1e6:.2f}s"
+                         if throttled else "unknown")
                 if _lora_enabled():
                     lora_bytes = sum(llm.collective_rpc(_semip_restore_lora))
                     log.info("  restored %.2f MiB of LoRA state", lora_bytes / 2**20)
