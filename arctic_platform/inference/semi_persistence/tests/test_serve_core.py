@@ -369,3 +369,15 @@ def test_serve_core_branch():
                   and isinstance(n.test.comparators[0], ast.Constant)
                   and n.test.comparators[0].value == "serve_core")
     assert "_semip_serve_core" in _names(branch)
+
+
+def test_child_applies_every_required_patch_before_building_the_engine():
+    """The child builds its own ``LLM``, so it has to apply what the cold path
+    applies. Naming patches one by one let it fall behind ``main``'s list."""
+    with open(_CHILD) as handle:
+        src = handle.read()
+    apply = src.find("apply_required_vllm_patches()")
+    build = src.find("llm = LLM(**vllm_config)")
+    assert apply != -1, "the child must call apply_required_vllm_patches()"
+    assert build != -1
+    assert apply < build, "the patches must be in place before LLM() runs"

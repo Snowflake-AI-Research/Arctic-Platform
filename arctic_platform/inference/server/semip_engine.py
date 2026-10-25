@@ -3,9 +3,8 @@
 `InferenceWorker.initialize` normally builds an in-process vLLM ``AsyncLLM``.
 When a job sets ``semi_p: true`` we instead **restore a pre-warmed CRIU image**
 via ``arctic_platform.inference.semi_persistence.Instance``. ``restore_engine``
-does that and returns a ``RestoredEngine`` handle; the front ends that serve it
-are in ``semip_frontend.py`` and ``semip_asyncllm.py``. ``restore_and_wrap``
-wraps the handle in the default one, ``_SemiPEngine``.
+does that and returns a ``RestoredEngine`` handle; the ``AsyncLLM`` front end
+that serves it is in ``semip_asyncllm.py`` and ``semip_frontend.py``.
 
 The vLLM engine itself lives out-of-process inside the ``Instance``'s vLLM
 child; every call here forwards over the ``Instance`` queue/pipe and blocks, so
@@ -52,8 +51,6 @@ class RestoredEngine(NamedTuple):
     (``semip_frontend._teardown``).
     """
     inst: Any
-    tokenizer_path: str | None
-    model: str | None
     agents: tuple = ()
 
 
@@ -1403,7 +1400,7 @@ def _weights_dir_for_restore(model_dir: str, weight_root: str | None,
     Answered from the filesystem rather than remembered from whichever branch
     produced the image, so a hit, a fresh dump and a directory materialized
     from the mirror all get the right answer -- including on a second
-    ``restore_and_wrap`` call in this pod, which has no memory of the first.
+    ``restore_engine`` call in this pod, which has no memory of the first.
 
     A local dump's own ``weight/`` wins: this pod produced those shards, and
     they are the ones its image was dumped against. Otherwise the published
@@ -2249,7 +2246,7 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
 
     No ``filename`` / ``weights_dir`` overrides are passed. ``Instance`` derives
     ``<model_dir>/image`` and ``<model_dir>/weights``, which is exactly what
-    ``restore_and_wrap`` looks for and what ``criu_restore``'s exact-string
+    ``restore_engine`` looks for and what ``criu_restore``'s exact-string
     ``model_dir`` check requires; an override here could only disagree with the
     restore side.
 
@@ -2350,7 +2347,6 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
         raise ValueError(f"semi_p: image meta.json at {meta_path} has no vllm_config")
 
     _log_config_divergence(baked, engine_kwargs, model_dir, requested)
-    tokenizer_path = engine_kwargs.get("model") or baked.get("model")
     mismatch = _unprivileged_mismatch(meta)
     if mismatch:
         raise RuntimeError(f"semi_p: {model_dir}: {mismatch}")
@@ -2391,8 +2387,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
                            exc_info=True)
         raise
     logger.info("semi_p: restore complete model_dir=%s gpus=%s", model_dir, gpus)
-    return RestoredEngine(inst, tokenizer_path=tokenizer_path,
-                          model=baked.get("model"))
+    return RestoredEngine(inst)
 
 
 # ---------------------------------------------------------------------------
@@ -2619,7 +2614,6 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         raise ValueError(
             f"semi_p: image meta.json at {meta_path} has no vllm_config")
     _log_config_divergence(baked, engine_kwargs, model_dir, requested)
-    tokenizer_path = engine_kwargs.get("model") or baked.get("model")
     mismatch = _unprivileged_mismatch(meta)
     if mismatch:
         raise RuntimeError(f"semi_p: {model_dir}: {mismatch}")
@@ -2698,8 +2692,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         raise
     logger.info("semi_p: multi-node restore complete model_dir=%s gpus=%s",
                 model_dir, gpus)
-    return RestoredEngine(inst, tokenizer_path=tokenizer_path,
-                          model=baked.get("model"), agents=tuple(agents))
+    return RestoredEngine(inst, agents=tuple(agents))
 
 
 def _agent_gpus(local: int) -> list[int]:
@@ -3009,13 +3002,6 @@ def _tee_tree_to_ray() -> None:
     """
     import semip_logging  # on sys.path: this module imports Instance at the top
     semip_logging.tee_tree_to_ray()
-
-
-def restore_and_wrap(engine_kwargs: dict[str, Any],
-                     agents: list[Any] | None = None):
-    """``restore_engine``, served by the default ``_SemiPEngine`` (blocking)."""
-    from arctic_platform.inference.server.semip_frontend import _SemiPEngine
-    return _SemiPEngine.from_restored(restore_engine(engine_kwargs, agents))
 
 
 def restore_engine(engine_kwargs: dict[str, Any],
