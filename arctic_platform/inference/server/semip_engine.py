@@ -2,21 +2,18 @@
 
 `InferenceWorker.initialize` normally builds an in-process vLLM ``AsyncLLM``.
 When a job sets ``semi_p: true`` we instead **restore a pre-warmed CRIU image**
-via ``arctic_platform.inference.semi_persistence.Instance`` and wrap it in
-``_SemiPEngine``, which presents the subset of the ``AsyncLLM`` surface the
-worker touches.
+via ``arctic_platform.inference.semi_persistence.Instance``. ``restore_engine``
+does that and returns a ``RestoredEngine`` handle; the front ends that serve it
+are in ``semip_frontend.py`` and ``semip_asyncllm.py``. ``restore_and_wrap``
+wraps the handle in the default one, ``_SemiPEngine``.
 
 The vLLM engine itself lives out-of-process inside the ``Instance``'s vLLM
-child; every call here forwards over the ``Instance`` queue/pipe (blocking, so
-we run it via ``asyncio.to_thread`` and serialize with a lock).
-
-Coverage: full ``self.llm`` surface **except weight-sync**, which raises
-``NotImplementedError`` (deferred to a later take; never hit by pure sampling).
+child; every call here forwards over the ``Instance`` queue/pipe and blocks, so
+the worker runs it via ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import glob
 import hashlib
@@ -34,7 +31,6 @@ import threading
 import time
 import urllib.request
 import uuid
-from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 # The library's modules import their siblings by bare name (``import
@@ -46,10 +42,20 @@ from arctic_platform.inference.semi_persistence import Instance
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
 
-# collective_rpc method names that are weight-sync (RL) features. Deferred.
-_WEIGHT_SYNC_RPCS = frozenset(
-    {"sync_weights", "sync_weights_broadcast", "sync_spec_weights", "close_weight_sync"}
-)
+
+class RestoredEngine(NamedTuple):
+    """A restored engine, before any front end serves it.
+
+    ``inst`` is the leader's ``Instance``; ``agents`` are the ``SemipNodeAgent``
+    handles of the other node-partitions, empty on a single pod. Whoever takes
+    the handle owns both and must tear them down
+    (``semip_frontend._teardown``).
+    """
+    inst: Any
+    tokenizer_path: str | None
+    model: str | None
+    agents: tuple = ()
+
 
 # engine_kwargs keys that are dss/arctic plumbing rather than vLLM engine args,
 # and so must not reach the Instance's vllm_config on the dump path. The child
@@ -393,25 +399,6 @@ print(last)
 # TIME_WAIT for this long. See _restore_with_port_retry.
 _TIME_WAIT_S = 60.0
 _RESTORE_RETRY_SLEEP_S = 10.0
-
-# SamplingParams fields the Instance's vLLM child must not inherit: it reads
-# cumulative outputs once a request finishes, whatever the caller streams.
-_SAMPLING_PARAM_SKIP = frozenset({"output_kind", "stream_interval", "skip_clone"})
-
-
-def _sampling_params_to_dict(params: Any) -> dict[str, Any]:
-    """A vLLM ``SamplingParams`` as kwargs the child rebuilds it from.
-
-    Every field a caller can set (those ``from_optional`` takes) is copied,
-    ``None`` included: an explicit ``max_tokens=None`` means unbounded, where
-    an omitted one means vLLM's default of 16.
-    """
-    if isinstance(params, dict):
-        return dict(params)
-    import inspect
-    names = inspect.signature(type(params).from_optional).parameters
-    return {name: getattr(params, name) for name in names
-            if name not in _SAMPLING_PARAM_SKIP and hasattr(params, name)}
 
 
 def _log_config_divergence(baked: dict[str, Any],
@@ -2340,8 +2327,8 @@ def _unprivileged_mismatch(meta: dict[str, Any]) -> str | None:
 def _restore(model_dir: str, engine_kwargs: dict[str, Any],
              gpus: list[int], *,
              weights_dir: str | None = None,
-             requested: dict[str, Any] | None = None) -> "_SemiPEngine":
-    """Restore ``<model_dir>/image`` onto ``gpus`` and wrap it (blocking).
+             requested: dict[str, Any] | None = None) -> RestoredEngine:
+    """Restore ``<model_dir>/image`` onto ``gpus`` (blocking).
 
     Shared by all three entry paths -- an ordinary cache hit, the restore of an
     image this process has just dumped, and one materialized from the published
@@ -2404,8 +2391,8 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
                            exc_info=True)
         raise
     logger.info("semi_p: restore complete model_dir=%s gpus=%s", model_dir, gpus)
-    return _SemiPEngine(inst, tokenizer_path=tokenizer_path,
-                        model=baked.get("model"))
+    return RestoredEngine(inst, tokenizer_path=tokenizer_path,
+                          model=baked.get("model"))
 
 
 # ---------------------------------------------------------------------------
@@ -2616,7 +2603,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
 def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
                        gpus: list[int], agents: list[Any], *,
                        weights_dir: str | None, requested: dict[str, Any],
-                       after: str) -> "_SemiPEngine":
+                       after: str) -> RestoredEngine:
     """Restore every node-partition of one image and return the leader's engine."""
     import ray
     from arctic_platform.inference.semi_persistence import Instance
@@ -2711,8 +2698,8 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         raise
     logger.info("semi_p: multi-node restore complete model_dir=%s gpus=%s",
                 model_dir, gpus)
-    return _SemiPEngine(inst, tokenizer_path=tokenizer_path,
-                        model=baked.get("model"), agents=agents)
+    return RestoredEngine(inst, tokenizer_path=tokenizer_path,
+                          model=baked.get("model"), agents=tuple(agents))
 
 
 def _agent_gpus(local: int) -> list[int]:
@@ -2783,7 +2770,7 @@ def _restore_with_port_retry(model_dir: str, engine_kwargs: dict[str, Any],
                              gpus: list[int], *, after: str,
                              weights_dir: str | None = None,
                              requested: dict[str, Any] | None = None
-                             ) -> "_SemiPEngine":
+                             ) -> RestoredEngine:
     """``_restore``, retried while a recorded port is still in ``TIME_WAIT``.
 
     CRIU records every inet socket's local port and *rebinds* it at restore.
@@ -3025,10 +3012,18 @@ def _tee_tree_to_ray() -> None:
 
 
 def restore_and_wrap(engine_kwargs: dict[str, Any],
-                     agents: list[Any] | None = None) -> "_SemiPEngine":
-    """Bring a semi-p engine up and return a ``_SemiPEngine`` (blocking).
+                     agents: list[Any] | None = None):
+    """``restore_engine``, served by the default ``_SemiPEngine`` (blocking)."""
+    from arctic_platform.inference.server.semip_frontend import _SemiPEngine
+    return _SemiPEngine.from_restored(restore_engine(engine_kwargs, agents))
 
-    Intended to be called via ``asyncio.to_thread`` from the worker.
+
+def restore_engine(engine_kwargs: dict[str, Any],
+                   agents: list[Any] | None = None) -> RestoredEngine:
+    """Bring a semi-p engine up and return its ``RestoredEngine`` (blocking).
+
+    Intended to be called via ``asyncio.to_thread`` from the worker. The
+    caller hands the result to a front end, which then owns it.
 
     ``agents`` are the ``SemipNodeAgent`` handles for the other pods when this
     engine's TP group spans pods; ``None`` or empty is the single-pod case,
@@ -3149,8 +3144,8 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
 def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                                 vllm_config: dict[str, Any],
                                 paths: _ImagePaths, gpus: list[int],
-                                agents: list[Any]) -> "_SemiPEngine":
-    """``restore_and_wrap`` for an engine whose TP group spans pods.
+                                agents: list[Any]) -> RestoredEngine:
+    """``restore_engine`` for an engine whose TP group spans pods.
 
     Same shape as the single-pod path -- hit, else materialize, else dump if
     ``SEMIP_DUMP_PUBLISH`` asks for it, then restore and publish -- with every
@@ -3280,285 +3275,3 @@ def _node_source(skeleton_dir: str | None, node_rank: int) -> str | None:
     if not skeleton_dir:
         return None
     return os.path.join(skeleton_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
-
-
-def _dense_from_numpy(prompt_logprobs: Any) -> Any:
-    """Dense prompt logprobs cross the child's pipe as numpy; the worker wants
-    the tensors the dense patch produced. Anything else passes through."""
-    if not isinstance(prompt_logprobs, dict):
-        return prompt_logprobs
-    import torch
-    return {key: torch.from_numpy(value) if hasattr(value, "dtype") else value
-            for key, value in prompt_logprobs.items()}
-
-
-class _SemiPEngine:
-    """Stands in for ``self.llm`` (a vLLM ``AsyncLLM``) over a semi-p Instance.
-
-    Generates run concurrently, as they do on ``AsyncLLM``: each is its own
-    ``generate`` command, and the child batches every request it holds into
-    one engine step. Everything else (sleep, wake, pause, resume) runs alone,
-    after the in-flight generates finish and before any new one starts.
-    """
-
-    def __init__(self, inst: Any, *, tokenizer_path: str | None,
-                 model: str | None, agents: list[Any] | None = None):
-        self._inst = inst
-        self._tokenizer_path = tokenizer_path
-        self._model = model
-        self._tokenizer: Any = None
-        # Held by control operations for their whole run, and by a generate
-        # only while it submits.
-        self._lock = asyncio.Lock()
-        # req_id -> (loop, future) of each generate the child still holds.
-        # Written on the event loop, popped on the demuxer thread.
-        self._waiters: dict[str, tuple[asyncio.AbstractEventLoop,
-                                       asyncio.Future]] = {}
-        self._waiters_lock = threading.Lock()
-        self._inflight = 0
-        self._drained = asyncio.Event()
-        self._drained.set()
-        inst.add_cmd_listener("generate", self._on_generate_done)
-        # The other node-partitions of a pod-spanning engine. They hold GPUs and a
-        # restored process tree, so they have to come down with this engine;
-        # nothing else owns them.
-        self._agents = list(agents or ())
-
-    # -- generate -----------------------------------------------------------
-
-    async def generate(self, prompt_input: Any, params: Any,
-                       request_id: str | None = None,
-                       reasoning_ended: bool | None = None):
-        """Async generator yielding a single vLLM-``RequestOutput``-shaped final."""
-        sp = _sampling_params_to_dict(params)
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        async with self._lock:
-            with self._waiters_lock:
-                self._inst.generate([prompt_input], sp,
-                                    reasoning_ended=reasoning_ended)
-                self._waiters[self._inst.last_req_id] = (loop, future)
-            self._inflight += 1
-            self._drained.clear()
-        yield self._to_request_output(await future, sp)
-
-    def _on_generate_done(self, cmd: str, elapsed: float,
-                          error: object | None, info: Any) -> None:
-        """Demuxer listener: hand each finished generate to its waiter."""
-        rid = info.get("req_id") if isinstance(info, dict) else None
-        with self._waiters_lock:
-            if rid is None:
-                # The worker reports a dead child without a req_id, and
-                # nothing the child held will ever finish.
-                done = list(self._waiters.items())
-                self._waiters.clear()
-            else:
-                waiter = self._waiters.pop(rid, None)
-                done = [(rid, waiter)] if waiter is not None else []
-        for done_rid, (loop, future) in done:
-            result = self._inst.generate_results.pop(done_rid, None) or {}
-            loop.call_soon_threadsafe(self._settle, future, result, error)
-
-    def _settle(self, future: asyncio.Future, result: dict[str, Any],
-                error: object | None) -> None:
-        # Counted here, not where the caller awaits: a caller that gives up
-        # leaves its request running in the child all the same.
-        self._inflight -= 1
-        if not self._inflight:
-            self._drained.set()
-        if future.done():
-            return
-        if error is not None:
-            future.set_exception(
-                RuntimeError(f"semi_p: generate failed: {error}"))
-        else:
-            future.set_result(result)
-
-    @contextlib.asynccontextmanager
-    async def _exclusive(self):
-        """Run a control operation with no generate in flight."""
-        async with self._lock:
-            await self._drained.wait()
-            # Every generate failure already reached its caller through
-            # _settle, but the demuxer also latches the first one, and the
-            # control operation's own wait() would raise it as its own.
-            try:
-                self._inst.wait()
-            except RuntimeError as exc:
-                logger.debug("semi_p: dropping a reported generate error: %s",
-                             exc)
-            yield
-
-    @staticmethod
-    def _first(seq, i=0):
-        if isinstance(seq, (list, tuple)) and len(seq) > i:
-            return seq[i]
-        return None
-
-    def _to_request_output(self, res: dict[str, Any],
-                           sp: dict[str, Any] | None = None) -> SimpleNamespace:
-        # outputs: [[text per sample] per prompt]; take prompt 0, sample 0.
-        prompt_texts = self._first(res.get("outputs"))
-        text = self._first(prompt_texts) or ""
-
-        # completion_token_ids: [[ids per sample] per prompt].
-        token_ids = self._first(self._first(res.get("completion_token_ids")))
-        prompt_ids = self._first(res.get("prompt_token_ids"))
-        if token_ids is None or prompt_ids is None:
-            # Callers train on these ids, so a stand-in would be silently
-            # wrong rather than merely missing.
-            raise RuntimeError(
-                "semi_p: the restored engine reported no token ids for this "
-                f"request (result keys: {sorted(res)})")
-
-        logprobs = self._first(self._first(res.get("completion_logprobs")))
-        prompt_logprobs = _dense_from_numpy(
-            self._first(res.get("prompt_logprobs")))
-        sp = sp or {}
-        for name, value in (("logprobs", logprobs),
-                            ("prompt_logprobs", prompt_logprobs)):
-            if sp.get(name) is not None and value is None:
-                raise RuntimeError(
-                    f"semi_p: {name}={sp[name]} was requested but the "
-                    f"restored engine returned none")
-
-        finish_reasons = res.get("finish_reasons") or []
-        finish_reason = finish_reasons[0] if finish_reasons else "stop"
-
-        choice = SimpleNamespace(
-            index=0,
-            text=text,
-            token_ids=token_ids,
-            finish_reason=finish_reason,
-            logprobs=logprobs,
-            cumulative_logprob=None,
-        )
-        return SimpleNamespace(
-            outputs=[choice],
-            prompt_token_ids=prompt_ids,
-            prompt_logprobs=prompt_logprobs,
-            num_cached_tokens=res.get("num_cached_tokens"),
-        )
-
-    # -- tokenizer ----------------------------------------------------------
-
-    def get_tokenizer(self):
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self._tokenizer_path, trust_remote_code=True
-            )
-        return self._tokenizer
-
-    # -- sleep / wake / pause / resume / prefix-cache -----------------------
-
-    async def collective_rpc(self, method: str, args: tuple = (),
-                             kwargs: dict | None = None):
-        if method == "sleep":
-            async with self._exclusive():
-                await asyncio.to_thread(self._sleep_blocking)
-            return [None]
-        if method == "wake_up":
-            async with self._exclusive():
-                await asyncio.to_thread(self._wake_blocking)
-            return [None]
-        if method == "_arl_cuda_sync":
-            # CUDA barrier only needed for weight-sync; no-op for sampling.
-            return []
-        if method in _WEIGHT_SYNC_RPCS:
-            raise NotImplementedError(
-                f"semi_p: weight-sync not implemented yet ({method})"
-            )
-        raise NotImplementedError(f"semi_p: collective_rpc({method}) not supported")
-
-    def _sleep_blocking(self):
-        self._inst.sleep()
-        self._inst.wait()
-
-    def _wake_blocking(self):
-        # restore_weights() is not optional here: sleep() is level 2, which
-        # frees the weight memory, and wake_up_weights() only re-allocates the
-        # parameter tensors without repopulating them. Without it the model
-        # generates from uninitialized weights and never errors. No
-        # plan_restore_weights() here: the chunk plan and the double buffer
-        # formed at restore time stay on the workers across sleep.
-        self._inst.wake_up_weights()
-        self._inst.restore_weights()
-        self._inst.wake_up_kv_cache()
-        self._inst.wait()
-
-    async def pause_generation(self, mode: str = "keep", clear_cache: bool = False):
-        async with self._exclusive():
-            await asyncio.to_thread(self._pause_blocking)
-
-    def _pause_blocking(self):
-        self._inst.pause()
-        self._inst.wait()
-
-    async def resume_generation(self):
-        # Not _exclusive: a generate submitted while paused is parked in the
-        # child until this resume, so waiting for it to drain would deadlock.
-        async with self._lock:
-            await asyncio.to_thread(self._resume_blocking)
-
-    def _resume_blocking(self):
-        self._inst.resume()
-        self._inst.wait()
-
-    async def reset_prefix_cache(self) -> bool:
-        # No-op: the published Instance has no reset_prefix_cache primitive.
-        # The only live caller is replica_pool's post-weight-sync reset, and
-        # weight sync already raises NotImplementedError above, so returning
-        # False (reset did not happen) is honest and unreachable in practice.
-        # Restoring the primitive across instance/worker/vllm_child is the
-        # alternative if weight sync ever lands.
-        logger.debug("semi_p: reset_prefix_cache is a no-op")
-        return False
-
-    # -- teardown -----------------------------------------------------------
-
-    def close(self) -> None:
-        inst = getattr(self, "_inst", None)
-        if inst is not None:
-            try:
-                inst.teardown()
-                # teardown() is a non-blocking _send, and the actual kill of the
-                # vLLM child happens in the Instance's worker process when it
-                # picks the command up (_kill_process_tree in worker.py's
-                # teardown handler). Without this wait, /destroy lets the actor
-                # exit first, the worker dies before draining the command, and
-                # the child survives -- reparented to init, invisible to a
-                # `ps | grep vllm` because its comm is plain "python", and
-                # holding the entire GPU. That is exactly what a restored tree
-                # does: criu_restore sets child_proc=None, so worker_loop's
-                # force-kill branch is skipped and this handler is the only
-                # thing that reaps it. Bounded by the worker's own 30s/5s joins.
-                inst.wait()
-            except Exception:  # pragma: no cover - best effort
-                logger.warning("semi_p: teardown failed", exc_info=True)
-            self._inst = None
-            with self._waiters_lock:
-                waiters = list(self._waiters.values())
-                self._waiters.clear()
-            for loop, future in waiters:
-                loop.call_soon_threadsafe(
-                    self._settle, future, {}, "engine closed")
-        # Fan out to the other node-partitions. After the leader is down they hold a
-        # process tree that can never be driven again -- its executor was the
-        # leader's -- so leaving them alive would pin a pod's GPUs until the
-        # job ended.
-        agents, self._agents = list(getattr(self, "_agents", ())), []
-        if agents:
-            import ray
-            for agent in agents:
-                try:
-                    ray.get(agent.teardown.remote(), timeout=120)
-                except Exception:  # pragma: no cover - best effort
-                    logger.warning("semi_p: agent teardown failed",
-                                   exc_info=True)
-
-    def __del__(self):  # pragma: no cover - GC path
-        try:
-            self.close()
-        except Exception:
-            pass
