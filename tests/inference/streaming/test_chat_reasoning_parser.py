@@ -451,15 +451,25 @@ def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(
     assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
 
 
-def test_chat_support_is_false_on_a_semi_p_engine(fake_vllm, monkeypatch):
-    # The restored engine's wrapper has no model_config or renderer to chat with.
-    module = types.ModuleType("arctic_platform.inference.server.semip_engine")
-    module.restore_and_wrap = lambda engine_kwargs, agents: SimpleNamespace()
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    fake_vllm["architecture"] = "Qwen3ForCausalLM"
-    worker = start_worker(semi_p=True, skip_tokenizer_init=True)
+def test_a_semi_p_engine_reports_chat_support_as_a_plain_one_does(fake_vllm, monkeypatch):
+    # The restored engine is served by a real AsyncLLM, renderer included.
+    from arctic_platform.inference.server import chat as chat_module
 
-    assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
+    restored = []
+
+    async def restore_and_attach(engine_kwargs, agents, vllm_config):
+        restored.append(engine_kwargs)
+        return FakeEngine()
+
+    module = types.ModuleType("arctic_platform.inference.server.semip_asyncllm")
+    module.restore_and_attach = restore_and_attach
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: _ProbedEngine(model))
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker(semi_p=True)
+
+    assert len(restored) == 1
+    assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": True, "thinking_optional": True}
 
 
 def test_unknown_architecture_chat_is_unsupported_and_logged_once(fake_vllm, caplog):

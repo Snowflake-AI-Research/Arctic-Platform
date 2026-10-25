@@ -1,10 +1,11 @@
-"""Unit tests for the semi-p front ends' shared parts and the AsyncLLM attach.
+"""Unit tests for the semi-p ``AsyncLLM`` front end and its attach.
 
 ``server/semip_frontend.py`` imports no vLLM, so it is loaded from its file and
 driven against fakes: ``_SemiPAsyncLLMMixin`` over a fake ``AsyncLLM`` base, a
 fake ``Instance`` that journals the commands it is sent, and a real
 subprocess for the death watch. ``server/semip_asyncllm.py`` does import
-vLLM; its ``attach`` is loaded with fake vLLM modules in ``sys.modules``.
+vLLM; its ``restore_and_attach`` and ``attach`` are loaded with fake vLLM
+modules in ``sys.modules``.
 
 What none of this covers is the real ZMQ handshake between ``AsyncLLM`` and
 the child's core, which needs vLLM and a GPU pod.
@@ -30,12 +31,24 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_engine_generate import fe  # noqa: E402
 from test_image_cache_key import _PKG, se  # noqa: E402
 
 _SERVER = os.path.join(os.path.dirname(_PKG), "server")
 _CHILD = os.path.join(_PKG, "vllm_child.py")
 _FRONTEND_NAME = "arctic_platform.inference.server.semip_frontend"
+_ENGINE_NAME = "arctic_platform.inference.server.semip_engine"
+
+
+def _load_semip_frontend():
+    """semip_frontend.py from its file; it imports only the standard library."""
+    spec = importlib.util.spec_from_file_location(
+        "semip_frontend_under_test", os.path.join(_SERVER, "semip_frontend.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fe = _load_semip_frontend()
 
 
 # --------------------------------------------------------------------------
@@ -72,9 +85,6 @@ class _Inst:
         if failed is not None:
             raise RuntimeError(f"command {failed!r} failed: boom")
         return self
-
-    def add_cmd_listener(self, cmd, callback):
-        pass
 
     def __getattr__(self, cmd):
         if cmd in ("stage", "sleep", "wake_up_weights", "restore_weights",
@@ -180,21 +190,11 @@ def test_a_failed_weight_sync_still_restages():
 
 def test_a_failed_stage_does_not_sleep_on_a_stale_copy():
     front, inst = _front(inst=_Inst(fail="stage"))
-    front._mark_weights_updated()
+    front._host_copy_stale = True
     with pytest.raises(RuntimeError, match="stage"):
         asyncio.run(front.collective_rpc("sleep"))
     assert "sleep" not in inst.journal
     assert front._host_copy_stale is True
-
-
-def test_the_legacy_front_end_never_restages():
-    inst = _Inst()
-    engine = fe._SemiPEngine(inst, tokenizer_path=None, model=None)
-    asyncio.run(engine.collective_rpc("sleep"))
-    asyncio.run(engine.collective_rpc("wake_up"))
-    assert inst.journal == ["wait", "sleep", "wait", "wait"] + _WAKE
-    with pytest.raises(NotImplementedError):
-        asyncio.run(engine.collective_rpc("sync_weights"))
 
 
 # --------------------------------------------------------------------------
@@ -236,47 +236,6 @@ def test_close_tears_the_child_down_even_if_shutdown_raises():
     with pytest.raises(RuntimeError, match="zmq"):
         front.close()
     assert inst.journal == ["teardown", "wait"]
-
-
-def test_legacy_close_fails_waiters_and_tears_everything_down(fake_ray):
-    inst = _Inst()
-    engine = fe._SemiPEngine(inst, tokenizer_path=None, model=None,
-                             agents=[_Agent("n1")])
-
-    async def main():
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        engine._waiters["r"] = (loop, future)
-        engine._inflight = 1
-        engine.close()
-        with pytest.raises(RuntimeError, match="engine closed"):
-            await future
-
-    asyncio.run(main())
-    assert inst.journal == ["teardown", "wait"]
-    assert fake_ray == [("ray.get", "teardown-n1", 120)]
-    assert engine._inst is None and engine._agents == []
-
-
-def test_from_restored_carries_the_whole_handle():
-    inst = _Inst()
-    agents = (_Agent("n1"),)
-    handle = se.RestoredEngine(inst, tokenizer_path="/tok", model="/m",
-                               agents=agents)
-    engine = fe._SemiPEngine.from_restored(handle)
-    assert engine._inst is inst
-    assert engine._agents == list(agents)
-    assert (engine._tokenizer_path, engine._model) == ("/tok", "/m")
-
-
-def test_restore_and_wrap_serves_the_restored_handle(monkeypatch):
-    inst = _Inst()
-    handle = se.RestoredEngine(inst, tokenizer_path=None, model="/m")
-    monkeypatch.setattr(se, "restore_engine", lambda kwargs, agents: handle)
-    monkeypatch.setitem(sys.modules, _FRONTEND_NAME, fe)
-    engine = se.restore_and_wrap({"model": "/m"})
-    assert isinstance(engine, fe._SemiPEngine)
-    assert engine._inst is inst
 
 
 # --------------------------------------------------------------------------
@@ -490,8 +449,7 @@ def asyncllm(monkeypatch):
 
 
 def _handle(inst, agents=()):
-    return se.RestoredEngine(inst, tokenizer_path=None, model="/models/qwen",
-                             agents=tuple(agents))
+    return se.RestoredEngine(inst, agents=tuple(agents))
 
 
 def test_attach_serves_the_core_then_builds_asyncllm_on_its_addresses(
@@ -546,6 +504,53 @@ def test_attach_tears_down_when_the_child_refuses_serve_core(asyncllm):
         asyncio.run(asyncllm.attach(_handle(inst), _vllm_config()))
     assert inst.journal[-2:] == ["teardown", "wait"]
     assert _FakeVllmAsyncLLM.built == []
+
+
+@pytest.fixture
+def restored(monkeypatch):
+    """A fake ``semip_engine.restore_engine``, recording what it was asked for."""
+    calls = []
+    inst = _Inst()
+
+    def restore_engine(engine_kwargs, agents):
+        calls.append((engine_kwargs, agents))
+        return _handle(inst, agents or ())
+
+    monkeypatch.setitem(sys.modules, _ENGINE_NAME, types.SimpleNamespace(
+        restore_engine=restore_engine))
+    return calls
+
+
+def _restore_and_attach(asyncllm, engine_kwargs, cfg, agents=None):
+    async def attach(handle, vllm_config):
+        return handle, vllm_config
+
+    asyncllm.attach = attach
+    return asyncio.run(asyncllm.restore_and_attach(engine_kwargs, agents, cfg))
+
+
+def test_restore_and_attach_pins_the_front_ends_limits_into_the_dump(
+        asyncllm, restored):
+    cfg = _vllm_config()
+    engine_kwargs = {"model": "/models/qwen", "max_num_seqs": None}
+    handle, attached_cfg = _restore_and_attach(asyncllm, engine_kwargs, cfg,
+                                               agents=["n1"])
+    [(kwargs, agents)] = restored
+    assert kwargs == {"model": "/models/qwen", "max_num_seqs": 256,
+                      "max_num_batched_tokens": 8192,
+                      "disable_log_stats": False}
+    assert agents == ["n1"] and handle.agents == ("n1",)
+    assert attached_cfg is cfg
+    assert engine_kwargs == {"model": "/models/qwen", "max_num_seqs": None}
+
+
+def test_restore_and_attach_keeps_what_the_job_set(asyncllm, restored):
+    _restore_and_attach(asyncllm, {"model": "/m", "max_num_seqs": 64,
+                                   "disable_log_stats": True}, _vllm_config())
+    [(kwargs, _)] = restored
+    assert kwargs["max_num_seqs"] == 64
+    assert kwargs["max_num_batched_tokens"] == 8192
+    assert kwargs["disable_log_stats"] is True
 
 
 def _imported(path, anywhere=False):
