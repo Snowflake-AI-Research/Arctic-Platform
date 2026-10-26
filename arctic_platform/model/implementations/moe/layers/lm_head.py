@@ -282,7 +282,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         logprobs = torch.empty((n,), device=device, dtype=torch.float32)
         entropy = torch.empty((n,), device=device, dtype=torch.float32)
         logz = torch.empty((n,), device=device, dtype=torch.float32)
-        others_logz = torch.empty((n,), device=device, dtype=torch.float32)
+        others_minus_target = torch.empty((n,), device=device, dtype=torch.float32)
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -320,17 +320,19 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 if grouped is not None:
                     grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
-            # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]); the entropy adds the target back.
-            others_logz_chunk = m + torch.log(s)
-            logz_chunk = torch.logaddexp(others_logz_chunk, target_logits)
+            # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]), with the difference formed as
+            # (m - x[t]) + log(s) so it is not rounded at the max logit's scale; the entropy adds the target back.
+            log_s = torch.log(s)
+            others_minus_target_chunk = (m - target_logits) + log_s
+            logz_chunk = torch.logaddexp(m + log_s, target_logits)
             validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
             target_exp = torch.exp(target_logits - m)
             logz[start:end] = logz_chunk
-            others_logz[start:end] = others_logz_chunk
-            logprobs[start:end] = -torch.nn.functional.softplus(others_logz_chunk - target_logits)
+            others_minus_target[start:end] = others_minus_target_chunk
+            logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
             entropy[start:end] = logz_chunk - (t + target_exp * target_logits) / (s + target_exp)
 
-        ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_logz)
+        ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_minus_target)
         ctx.action_masks = action_masks
         ctx.chunk_size = chunk_size
         ctx.fp32_lm_head = fp32_lm_head
@@ -351,7 +353,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
             grad_entropy == 0.0
         ), "Backward through entropy is not implemented in FusedOutputLinear"
 
-        hidden, weight, labels, inv_temperature, logz, others_logz = ctx.saved_tensors
+        hidden, weight, labels, inv_temperature, logz, others_minus_target = ctx.saved_tensors
         action_masks = ctx.action_masks
         chunk_size: int = ctx.chunk_size
         fp32_lm_head: bool = ctx.fp32_lm_head
@@ -402,7 +404,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 idx = (labels_chunk[rows] - vocab_start).to(torch.long)
                 # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
                 # where 1 - exp(z[t] - logz) rounds to 0.
-                target_complement = torch.sigmoid(others_logz[start:end][rows] - scaled_logits[rows, idx])
+                target_complement = torch.sigmoid(others_minus_target[start:end][rows])
                 grad_logits[rows, idx] = (
                     grad_chunk[rows] * target_complement - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
                 )

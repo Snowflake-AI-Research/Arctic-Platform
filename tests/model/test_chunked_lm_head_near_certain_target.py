@@ -78,15 +78,40 @@ def test_near_certain_target_matches_float64_log_softmax(kind, margin):
         torch_assert_close(entropy.reshape(-1).double(), expected_entropy, rtol=0.0, atol=1e-5)
 
 
-def _near_certain_logits(margin):
+def _near_certain_logits(margin, target_logit=TARGET_LOGIT):
     set_seed(0)
     logits = torch.randn(len(LABELS), VOCAB_SIZE)
     rows = torch.arange(len(LABELS))
     others = logits.clone()
     others[rows, LABELS] = float("-inf")
-    logits += TARGET_LOGIT - margin - others.logsumexp(-1, keepdim=True)
-    logits[rows, LABELS] = TARGET_LOGIT
+    logits += target_logit - margin - others.logsumexp(-1, keepdim=True)
+    logits[rows, LABELS] = target_logit
     return logits
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+@pytest.mark.parametrize("target_logit", [30.0, 100.0])
+@pytest.mark.parametrize("margin", [17.0, 20.0])
+def test_near_certain_target_precision_does_not_depend_on_the_max_logit(kind, target_logit, margin):
+    """The margin is formed without rounding at the max logit's scale, so precision holds at large logits.
+
+    Forming ``logsumexp_{j != t} = m + log(s)`` first rounds it to ulp(m) (7.6e-6 at 100), an error the margin and
+    then the logprob and target gradient inherit. ``(m - x[t]) + log(s)`` is exact in its first term when the target
+    is the max, leaving only ``log(s)``'s rounding at the margin's own scale.
+    """
+    logits = _near_certain_logits(margin, target_logit)
+    rows = torch.arange(len(LABELS))
+    hidden = logits.reshape(1, len(LABELS), VOCAB_SIZE).requires_grad_(True)
+    actual, _ = _head(kind, hidden, LABELS.reshape(1, -1))
+    actual.sum().backward()
+
+    reference = logits.double().requires_grad_(True)
+    expected = torch.log_softmax(reference, -1)[rows, LABELS]
+    expected.sum().backward()
+
+    torch_assert_close(actual.reshape(-1).double(), expected.detach(), rtol=2e-6, atol=0.0)
+    target_gradients = hidden.grad.reshape(len(LABELS), -1)[rows, LABELS].double()
+    torch_assert_close(target_gradients, reference.grad[rows, LABELS], rtol=2e-6, atol=0.0)
 
 
 @pytest.mark.parametrize("kind", ["dense", "moe"])
