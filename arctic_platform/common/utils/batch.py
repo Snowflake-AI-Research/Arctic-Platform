@@ -104,6 +104,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "teacher_log_probs",
         "teacher_tail_log_prob",
         "kd_mask",
+        "logprob_weights_shifted",
     }
 )
 

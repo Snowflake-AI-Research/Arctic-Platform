@@ -428,6 +428,43 @@ named with its shape when it is a tensor, otherwise with its value. The ratio-ma
 offending keys without values, and a missing `nll_mask` is reported by name.
 The unprefixed `grpo_mixed_v1` applies the same rules.
 
+## Weighted cross-entropy
+
+`loss_fn="weighted_cross_entropy"` trains `L_surrogate = -sum(w * logprobs)` over
+the whole request, unnormalized, where `w` is `context.logprob_weights_shifted`, so
+`dL_surrogate/dlogprobs = -w`. A caller with a custom loss `L` computes
+`g = dL/dlogprobs` (from the log-probabilities of a forward pass) and sends
+`w = -g`; the model gradient is then that of `L`. With `w = loss_mask` it is the
+summed causal cross-entropy, so it also serves per-token weighted SFT, negative
+weights included.
+
+```python
+processing = {"loss_fn": "weighted_cross_entropy", "post": ["compute_logprobs"]}
+# context:
+#   loss_mask:               1 where a position predicts a real token
+#   logprob_weights_shifted: w, float32, same shape; position j weights the log-probability
+#                            of token j + 1. Any sign, zero outside loss_mask.
+```
+
+The request is rejected before any forward when the weights are missing, not
+float32, shaped differently from `loss_mask`, not finite, or nonzero where
+`loss_mask` is 0 or `labels` is -100; when `temperature` is not 1; or when
+`processing.config` has a key other than the server-stamped `dp_size`,
+`batch_num_tokens` and `global_batch_size` (the objective has no options).
+A non-finite log-probability where `loss_mask` is positive fails the loss.
+Request context wins the loss-scale keys and a conflicting config value raises,
+as for `causal_cross_entropy`.
+
+Each rank returns `dp_size * (its share of L_surrogate)`: DeepSpeed sums gradients
+over sequence-parallel ranks and averages them over data-parallel ranks, so the
+model gradient is that of `L_surrogate` under any data-, sequence- or
+expert-parallel split, and packed microbatches add. DSS averages the per-rank
+losses over data-parallel shards, so its `avg_loss` is `L_surrogate`; this
+package's native server sums them, so its `avg_loss` is `dp_size * L_surrogate`.
+On both, the summed metric `weighted_cross_entropy_objective_sum` is
+`L_surrogate`, and `weighted_cross_entropy_weighted_token_count` counts the
+nonzero weights.
+
 ## ZoRRo Train
 
 **What:** Prompt deduplication during RL forward/backward. Shared prompts are
