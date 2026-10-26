@@ -232,7 +232,7 @@ def _get_sequence_chunked_logprob_fn():
 
             logprobs = torch.empty(n_tokens, device=device, dtype=torch.float32)
             logz = torch.empty(n_tokens, device=device, dtype=torch.float32)
-            others_logz = torch.empty(n_tokens, device=device, dtype=torch.float32)
+            others_minus_target = torch.empty(n_tokens, device=device, dtype=torch.float32)
 
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
@@ -274,18 +274,21 @@ def _get_sequence_chunked_logprob_fn():
                     if grouped is not None:
                         grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
-                # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]). Cache both
-                # normalizers so backward can rebuild softmax without re-streaming logits.
-                others_logz_chunk = m + torch.log(s)
-                logz_chunk = torch.logaddexp(others_logz_chunk, target_logits)
+                # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]). The difference is formed as
+                # (m - x[t]) + log(s): m - x[t] is exactly 0 when the target is the max, whereas m + log(s) would
+                # round at the max logit's scale first. Cache it with logz so backward can rebuild softmax
+                # without re-streaming logits.
+                log_s = torch.log(s)
+                others_minus_target_chunk = (m - target_logits) + log_s
+                logz_chunk = torch.logaddexp(m + log_s, target_logits)
                 validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
                 logz[start:end] = logz_chunk
-                others_logz[start:end] = others_logz_chunk
-                logprobs[start:end] = -torch.nn.functional.softplus(others_logz_chunk - target_logits)
+                others_minus_target[start:end] = others_minus_target_chunk
+                logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
 
             # save_for_backward only takes tensors, so signal bias presence via
             # an attribute and append bias to the saved tuple when present.
-            saved: tuple[torch.Tensor, ...] = (hidden, weight, labels, inv_temperature, logz, others_logz)
+            saved: tuple[torch.Tensor, ...] = (hidden, weight, labels, inv_temperature, logz, others_minus_target)
             if bias is not None:
                 saved = saved + (bias,)
             ctx.save_for_backward(*saved)
@@ -302,7 +305,7 @@ def _get_sequence_chunked_logprob_fn():
         @staticmethod
         def backward(ctx, grad_logprobs, grad_group_log_probs=None):
             saved = ctx.saved_tensors
-            hidden, weight, labels, inv_temperature, logz, others_logz = saved[:6]
+            hidden, weight, labels, inv_temperature, logz, others_minus_target = saved[:6]
             bias = saved[6] if ctx.has_bias else None
             token_chunk_size: int = ctx.token_chunk_size
             vocab_chunk_size: int = ctx.vocab_chunk_size
@@ -364,7 +367,7 @@ def _get_sequence_chunked_logprob_fn():
                     idx = (labels_chunk[rows] - vocab_start).to(torch.long)
                     # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
                     # where 1 - exp(z[t] - logz) rounds to 0.
-                    target_complement = torch.sigmoid(others_logz[start:end][rows] - scaled_logits[rows, idx])
+                    target_complement = torch.sigmoid(others_minus_target[start:end][rows])
                     grad_logits[rows, idx] = (
                         grad_chunk[rows] * target_complement
                         - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
