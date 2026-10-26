@@ -161,14 +161,14 @@ class ReplicaPlan:
         slots = self.copy_slots[e, copy]
         return torch.where(valid, slots, selected)
 
-    def fetch(self, weights: tuple[Tensor, ...], group) -> tuple[Tensor, ...]:
-        """Each ``weights[k]`` is this rank's ``[L, ...]`` native expert stack; returns ``[L + S, ...]`` stacks with the
-        spare slots filled from their owners (zeros where a spare is empty), differentiably."""
-        from torch.distributed.nn.functional import all_to_all_single
-
-        ranks = len(self.table)
-        me = dist.get_rank(group)
-        L, S = self.experts_per_rank, self.spares
+    def _fetch_layout(self, me: int, device) -> tuple[Tensor, list[int], list[int], Tensor]:
+        """This rank's all-to-all layout under the plan, built once: the native rows it sends (grouped by destination
+        rank), the split sizes, and for each spare slot its row in the received buffer (the zero row if empty).
+        Cached on the device, so a fetch issues no host-to-device copy (which would stall the host every call)."""
+        cached = getattr(self, "_layout", None)
+        if cached is not None and cached[0] == me:
+            return cached[1]
+        ranks, L, S = len(self.table), self.experts_per_rank, self.spares
         send_rows: list[int] = []
         send_counts = [0] * ranks
         for r in range(ranks):
@@ -180,7 +180,29 @@ class ReplicaPlan:
         recv_counts = [0] * ranks
         for _, owner in recv_from:
             recv_counts[owner] += 1
-        index = torch.tensor(send_rows, dtype=torch.long, device=weights[0].device)
+        # Rows arrive grouped by source rank in rank order.
+        order = sorted(range(len(recv_from)), key=lambda k: (recv_from[k][1], k))
+        spare_rows = [len(recv_from)] * S
+        for arrival, k in enumerate(order):
+            spare_rows[recv_from[k][0]] = arrival
+        layout = (
+            torch.tensor(send_rows, dtype=torch.long).to(device),
+            send_counts,
+            recv_counts,
+            torch.tensor(spare_rows, dtype=torch.long).to(device),
+        )
+        self._layout = (me, layout)
+        return layout
+
+    def fetch(self, weights: tuple[Tensor, ...], group) -> tuple[Tensor, ...]:
+        """Each ``weights[k]`` is this rank's ``[L, ...]`` native expert stack; returns ``[L + S, ...]`` stacks with the
+        spare slots filled from their owners (zeros where a spare is empty), differentiably."""
+        from torch.distributed.nn.functional import all_to_all_single
+
+        S = self.spares
+        send_index, send_counts, recv_counts, spare_index = self._fetch_layout(dist.get_rank(group), weights[0].device)
+        num_recv = sum(recv_counts)
+        index = send_index
         differentiable = torch.is_grad_enabled() and any(w.requires_grad for w in weights)
         if not differentiable:
             # Frozen weights (e.g. packed MXFP4 codes and their FP32 scales): move raw bytes, whatever the dtypes.
@@ -188,24 +210,19 @@ class ReplicaPlan:
             raw = [w.contiguous().view(torch.uint8).reshape(w.shape[0], -1) for w in weights]
             sizes = [r.shape[1] for r in raw]
             packed = torch.cat([r.index_select(0, index) for r in raw], dim=1)
-            received = packed.new_empty((len(recv_from), sum(sizes)))
+            received = packed.new_empty((num_recv, sum(sizes)))
             dist.all_to_all_single(received, packed, recv_counts, send_counts, group=group)
         else:
             sizes = [w[0].numel() for w in weights]
             packed = torch.cat(
-                [w.index_select(0, index).reshape(len(send_rows), n) for w, n in zip(weights, sizes)], dim=1
+                [w.index_select(0, index).reshape(index.numel(), n) for w, n in zip(weights, sizes)], dim=1
             )
-            received = packed.new_empty((len(recv_from), sum(sizes)))
+            received = packed.new_empty((num_recv, sum(sizes)))
             received = all_to_all_single(received, packed.contiguous(), recv_counts, send_counts, group=group)
-        # Rows arrive grouped by source rank in rank order; put each into its spare slot, and an empty spare reads
-        # an appended zero row. Every rank's spares go through `received`, so every rank runs the all-to-all's
-        # backward collective too, including one whose spares are all empty.
-        order = sorted(range(len(recv_from)), key=lambda k: (recv_from[k][1], k))
-        spare_rows = [len(recv_from)] * S
-        for arrival, k in enumerate(order):
-            spare_rows[recv_from[k][0]] = arrival
+        # Every rank's spares go through `received`, so every rank runs the all-to-all's backward collective too,
+        # including one whose spares are all empty (they read an appended zero row).
         padded = torch.cat([received, received.new_zeros(1, received.shape[1])])
-        spare = padded.index_select(0, torch.tensor(spare_rows, dtype=torch.long, device=padded.device))
+        spare = padded.index_select(0, spare_index)
         out = []
         offset = 0
         for w, size in zip(weights, sizes):
@@ -247,7 +264,9 @@ class ExpertReplicaManager:
                 continue
             E = len(est)
             table, pieces = plan_replicas(est, E // ranks, ranks, self.spares)
-            self.plans[i] = ReplicaPlan.build(table, E, E // ranks, layer._replica_counts.device, pieces)
+            plan = ReplicaPlan.build(table, E, E // ranks, layer._replica_counts.device, pieces)
+            plan._fetch_layout(dist.get_rank(self.group), layer._replica_counts.device)  # while the host is synced
+            self.plans[i] = plan
 
 
 _MANAGERS: dict[int, ExpertReplicaManager] = {}
