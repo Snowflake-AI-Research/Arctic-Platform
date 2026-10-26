@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import peft
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 from safetensors.torch import save_file
 
@@ -273,6 +274,53 @@ def test_layer_slice_keeps_original_names_and_truncates_padded_lists(tmp_path, m
         "num_nextn_predict_layers": 0,
     }
     assert (dest / "tokenizer.json").exists()
+
+
+def test_layer_slice_renumbers_chosen_layers_and_caps_experts(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(layer_slice, "require_data_fast_path", lambda path, label: Path(path))
+    source, dest = tmp_path / "source", tmp_path / "dest"
+    (source / "inference").mkdir(parents=True)
+    (source / "inference" / "model.py").write_text("# model\n")
+    tensors = {
+        "embed.weight": torch.ones(2),
+        "layers.0.ffn.gate.weight": torch.arange(4.0).unsqueeze(1),
+        "layers.0.ffn.gate.bias": torch.arange(4.0),
+        "layers.0.ffn.experts.1.w1.weight": torch.ones(2),
+        "layers.0.ffn.experts.2.w1.weight": torch.ones(2),
+        "layers.1.attn.wq_a.weight": torch.ones(2),
+        "layers.5.attn.wq_a.weight": torch.full((2,), 5.0),
+        "vision.patch.weight": torch.ones(2),
+    }
+    save_file(tensors, str(source / "model.safetensors"))
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "model.safetensors")})
+    )
+    text = {"num_hidden_layers": 6, "n_routed_experts": 4, "compress_ratios": [0, 1, 2, 3, 4, 5, 0], "kv": [5]}
+    (source / "config.json").write_text(json.dumps({"text_config": text, "vision_config": {"n": 1}}))
+
+    layer_slice.slice_layers(source, dest, [0, 5], experts=2, drop=("vision.",), config={"kv": [1]})
+
+    index = json.loads((dest / "model.safetensors.index.json").read_text())["weight_map"]
+    assert sorted(index) == [
+        "embed.weight",
+        "layers.0.ffn.experts.1.w1.weight",
+        "layers.0.ffn.gate.bias",
+        "layers.0.ffn.gate.weight",
+        "layers.1.attn.wq_a.weight",
+    ]
+    with safe_open(str(dest / index["layers.1.attn.wq_a.weight"]), framework="pt") as f:
+        assert torch.equal(f.get_tensor("layers.1.attn.wq_a.weight"), torch.full((2,), 5.0))
+        assert torch.equal(f.get_tensor("layers.0.ffn.gate.bias"), torch.arange(2.0))
+        assert f.get_tensor("layers.0.ffn.gate.weight").shape == (2, 1)
+    config = json.loads((dest / "config.json").read_text())
+    assert config["text_config"] == {
+        "num_hidden_layers": 2,
+        "n_routed_experts": 2,
+        "compress_ratios": [0, 5],
+        "kv": [1],
+    }
+    assert config["vision_config"] == {"n": 1}
+    assert (dest / "inference" / "model.py").exists()
 
 
 def test_deepseek_v4_kv_fake_quant_tiles_scales_and_passes_gradient() -> None:

@@ -80,6 +80,12 @@ def job_body(
     tc = sub["training_config"]
     tc["n_gpus"] = tc["sp_size"] = tc["ep_size"] = n_gpus
     tc["max_seq_len"] = max_seq_len
+    # Full-world SP leaves one data-parallel replica, which DeepSpeed checks the batch size against.
+    ds = tc.get("ds_config") or {}
+    if "train_batch_size" in ds:
+        ds["train_batch_size"] = ds.get("train_micro_batch_size_per_gpu", 1) * ds.get("gradient_accumulation_steps", 1)
+    if "train_batch_size" in tc:
+        tc["train_batch_size"] = ds.get("train_batch_size", 1)
     configured = (tc.get("mb_spec") or {}).get("max_tokens_per_mb") or DEFAULT_MAX_TOKENS_PER_MB
     tc["mb_spec"] = {"max_tokens_per_mb": int(max_tokens_per_mb or configured)}
     # Plain SFT needs the model to return its loss, which prime_rl only does through fused cross-entropy.

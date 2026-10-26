@@ -43,6 +43,7 @@ def _shape(args) -> tuple[int, int]:
 def cmd_reference(args) -> int:
     import torch
 
+    from ..reference import deepseek_v41_official
     from ..reference.hf_single_gpu import run
     from ..reference.model_features import uses_mixer_packing
     from .lora_export import widen_adapter
@@ -53,16 +54,21 @@ def cmd_reference(args) -> int:
         widen_adapter(args.adapter)
     _, batch = arm_batch(args.fixture, args.arm, n_gpus, max_seq_len)
     t0 = time.time()
-    result = run(
-        args.fixture,
-        batch,
-        token_budget=args.token_budget,
-        attn_implementation=args.attn_implementation,
-        mixer_packing=uses_mixer_packing(args.fixture),
-        fused_cross_entropy=args.fused_cross_entropy,
-        peft_adapter_path=args.adapter,
-        device="cuda",
-    )
+    if deepseek_v41_official.is_deepseek_v41(args.fixture):
+        result = deepseek_v41_official.run(
+            args.fixture, batch, token_budget=args.token_budget, peft_adapter_path=args.adapter, device="cuda"
+        )
+    else:
+        result = run(
+            args.fixture,
+            batch,
+            token_budget=args.token_budget,
+            attn_implementation=args.attn_implementation,
+            mixer_packing=uses_mixer_packing(args.fixture),
+            fused_cross_entropy=args.fused_cross_entropy,
+            peft_adapter_path=args.adapter,
+            device="cuda",
+        )
     out = {
         "kind": "reference",
         "arm": args.arm,

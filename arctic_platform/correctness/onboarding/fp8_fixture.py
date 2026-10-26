@@ -25,6 +25,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from typing import Callable
 
 SHARD_BYTES = 5 * 1024**3
 DEFAULT_CARRY = ("quantization_config",)
@@ -79,19 +80,34 @@ def copy_sidecars(source: Path, dest: Path) -> None:
 
 
 def write_shards(
-    source: Path, source_map: dict, keys: list[str], dest: Path, *, shard_bytes: int = SHARD_BYTES
+    source: Path,
+    source_map: dict,
+    keys: list[str],
+    dest: Path,
+    *,
+    shard_bytes: int = SHARD_BYTES,
+    renamed: dict[str, str] | None = None,
+    transform: Callable | None = None,
 ) -> int:
-    """Copy ``keys`` from ``source`` into ``dest`` as an indexed safetensors checkpoint; returns the shard count."""
+    """Copy ``keys`` from ``source`` into ``dest`` as an indexed safetensors checkpoint; returns the shard count.
+
+    ``renamed`` maps a destination key to the source key it is read from, and ``transform(key, tensor)``
+    rewrites a tensor on the way.
+    """
     from safetensors import safe_open
     from safetensors.torch import save_file
 
+    renamed = renamed or {}
     shards, shard, size = [], {}, 0
     handles = {}
     for key in keys:
-        file = source_map[key]
+        source_key = renamed.get(key, key)
+        file = source_map[source_key]
         if file not in handles:
             handles[file] = safe_open(source / file, framework="pt")
-        tensor = handles[file].get_tensor(key)
+        tensor = handles[file].get_tensor(source_key)
+        if transform is not None:
+            tensor = transform(key, tensor).contiguous()
         nbytes = tensor.numel() * tensor.element_size()
         if shard and size + nbytes > shard_bytes:
             shards.append(shard)
