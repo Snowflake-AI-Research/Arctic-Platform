@@ -25,32 +25,36 @@ from arctic_platform.model.implementations.moe.expert_replicas import ReplicaPla
 from arctic_platform.model.implementations.moe.expert_replicas import plan_replicas
 
 
-def _rank_loads(weights, table, experts_per_rank):
-    ranks = len(table)
-    copies = {e: [e // experts_per_rank] for e in range(len(weights))}
-    for r, row in enumerate(table):
-        for e in row:
-            if e >= 0:
-                copies[e].append(r)
-    load = [0.0] * ranks
-    for e, rs in copies.items():
-        for r in rs:
-            load[r] += weights[e] / len(rs)
-    return load, copies
-
-
-def test_plan_lowers_the_hottest_rank_and_keeps_copies_on_distinct_ranks():
+def test_plan_moves_and_splits_load_to_near_balance_within_the_spare_slots():
     random.seed(0)
     E, P, S = 64, 8, 2
+    L = E // P
     weights = [random.paretovariate(1.2) for _ in range(E)]
     weights[5] *= 40  # one expert far hotter than any rank's average
-    table = plan_replicas(weights, E // P, P, S)
-    before = max(sum(weights[r * 8:(r + 1) * 8]) for r in range(P))
-    after, copies = _rank_loads(weights, table, E // P)
-    assert max(after) < before
+    table, pieces = plan_replicas(weights, L, P, S)
+    load = [0.0] * P
+    for e in range(E):
+        for r, amount in pieces.get(e, {e // L: weights[e]}).items():
+            load[r] += amount
+    before = max(sum(weights[r * L:(r + 1) * L]) for r in range(P))
+    assert max(load) < before and max(load) < 1.1 * sum(weights) / P
     assert all(len(row) == S for row in table)
-    assert all(len(set(rs)) == len(rs) for rs in copies.values())
-    assert len(copies[5]) > 1
+    for e, by_rank in pieces.items():
+        assert sum(by_rank.values()) == pytest.approx(weights[e])
+        for r in by_rank:
+            assert r == e // L or e in table[r]  # every non-owner piece sits in one of that rank's spare slots
+    assert len(pieces[5]) > 1
+
+
+def test_remap_gives_each_copy_its_share_of_the_tokens():
+    P, L, S = 4, 2, 1
+    table = [[-1], [0], [-1], [-1]]  # expert 0 (owner rank 0) has a copy on rank 1
+    plan = ReplicaPlan.build(table, P * L, L, "cpu", {0: {0: 1.0, 1: 3.0}})
+    counts = torch.bincount(plan.remap(torch.zeros(4000, 1, dtype=torch.long)).flatten(), minlength=plan.num_slots)
+    width = L + S
+    assert counts[0] == pytest.approx(1000, abs=5) and counts[1 * width + L] == pytest.approx(3000, abs=5)
+    moved = ReplicaPlan.build(table, P * L, L, "cpu", {0: {1: 2.0}})  # the copy takes all of expert 0
+    assert (moved.remap(torch.zeros(10, 1, dtype=torch.long)) == 1 * width + L).all()
 
 
 def test_remap_splits_a_replicated_experts_tokens_evenly_and_keeps_padding():
@@ -64,7 +68,7 @@ def test_remap_splits_a_replicated_experts_tokens_evenly_and_keeps_padding():
     expert0 = slots[:-1, 0]
     counts = torch.bincount(expert0, minlength=plan.num_slots)
     assert set(torch.nonzero(counts).flatten().tolist()) == {0, 1 * width + L, 2 * width + L}
-    assert counts[counts > 0].max() - counts[counts > 0].min() <= 1
+    assert counts[counts > 0].max() - counts[counts > 0].min() <= 3  # golden-ratio split of 300 positions
     assert (slots[:-1, 1] == (3 // L) * width + 3 % L).all()  # unreplicated expert keeps its native slot
     assert slots[-1, 0] == -1
 

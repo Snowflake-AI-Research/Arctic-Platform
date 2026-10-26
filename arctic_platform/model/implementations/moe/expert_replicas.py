@@ -17,10 +17,10 @@
 Every MoE call waits for the EP rank that received the most rows. A permutation of experts over ranks cannot split
 one hot expert, so each rank here also holds ``spares`` extra expert slots (``ARL_EXPERT_REPLICAS``). Before each
 micro-batch's forward, the EP group sums the routed-token counts every layer has seen since the last plan, keeps an
-exponential moving average of them, and gives each spare slot a copy of an expert (greedily: the heaviest per-copy
-share on the most-loaded rank goes to the least-loaded rank that has room and does not hold it yet, while that lowers
-the maximum). A replicated expert's tokens are split evenly over its copies by their position, so the forward, its
-checkpoint recompute and the backward route identically under one plan.
+exponential moving average of them, and spreads each expert's expected load over its owner and spare-slot copies
+(``plan_replicas``: a copy can take part or all of an expert's tokens, so this both moves and splits experts). Each
+copy gets its share of the expert's tokens by their position, so the forward, its checkpoint recompute and the
+backward route identically under one plan.
 
 The spare slots read the expert's current effective weights (LoRA-merged, or trained in full fine-tuning) from its
 owner in every call, through a differentiable all-to-all over the EP group, so their gradients go back to the owner's
@@ -38,41 +38,51 @@ import torch.distributed as dist
 from torch import Tensor
 
 
-def plan_replicas(weights: list[float], experts_per_rank: int, ranks: int, spares: int) -> list[list[int]]:
-    """Spare-slot assignment ``[rank][spare] -> expert`` (``-1`` empty) for per-expert ``weights`` on the contiguous
-    placement (expert ``e`` on rank ``e // experts_per_rank``)."""
+def plan_replicas(
+    weights: list[float], experts_per_rank: int, ranks: int, spares: int, tol: float = 1e-3
+) -> tuple[list[list[int]], dict[int, dict[int, float]]]:
+    """Spread each expert's load over its owner (expert ``e`` lives on rank ``e // experts_per_rank``) and up to
+    ``spares`` spare-slot copies per rank, in any proportions. Repeatedly levels the most-loaded rank against the
+    best target for its heaviest piece: a rank already holding that expert (free), else the least-loaded rank with a
+    free spare slot, moving half the load difference (at most the piece). This both moves experts (a copy can take an
+    expert's whole load) and splits hot ones. Returns the spare table ``[rank][spare] -> expert`` (``-1`` empty) and
+    ``{expert: {rank: load}}`` for every expert that is not entirely on its owner."""
     E = len(weights)
-    copies = {e: [e // experts_per_rank] for e in range(E)}
+    pieces: dict[int, dict[int, float]] = {e: {e // experts_per_rank: weights[e]} for e in range(E)}
     load = [0.0] * ranks
     for e in range(E):
         load[e // experts_per_rank] += weights[e]
     table = [[-1] * spares for _ in range(ranks)]
     free = [spares] * ranks
-    for _ in range(ranks * spares):
+    mean = sum(load) / ranks
+    for _ in range(8 * ranks * (spares + 1)):
         r_max = max(range(ranks), key=lambda r: load[r])
         best = None
-        held = sorted((e for e in range(E) if r_max in copies[e]), key=lambda e: -weights[e] / len(copies[e]))
+        held = sorted((e for e in range(E) if pieces[e].get(r_max, 0.0) > 0), key=lambda e: -pieces[e][r_max])
         for e in held:
-            c = len(copies[e])
-            share, new_share = weights[e] / c, weights[e] / (c + 1)
-            targets = [r for r in range(ranks) if free[r] and r not in copies[e]]
-            if not targets:
+            holders = [(load[r], r, False) for r in pieces[e] if r != r_max]
+            spare = [(load[r], r, True) for r in range(ranks) if free[r] and r not in pieces[e]]
+            if not holders and not spare:
                 continue
-            r_t = min(targets, key=lambda r: load[r])
-            # The copies' holders only get lighter, so the maximum drops as long as the target stays below it.
-            if load[r_t] + new_share < load[r_max]:
-                best = (e, r_t, share, new_share)
+            _, r_t, uses_spare = min(holders + spare)
+            x = min(pieces[e][r_max], (load[r_max] - load[r_t]) / 2)
+            if x > tol * mean:
+                best = (e, r_t, x, uses_spare)
                 break
         if best is None:
             break
-        e, r_t, share, new_share = best
-        for r in copies[e]:
-            load[r] -= share - new_share
-        load[r_t] += new_share
-        copies[e].append(r_t)
-        table[r_t][spares - free[r_t]] = e
-        free[r_t] -= 1
-    return table
+        e, r_t, x, uses_spare = best
+        pieces[e][r_max] -= x
+        pieces[e][r_t] = pieces[e].get(r_t, 0.0) + x
+        load[r_max] -= x
+        load[r_t] += x
+        if uses_spare:
+            table[r_t][spares - free[r_t]] = e
+            free[r_t] -= 1
+    return table, {e: p for e, p in pieces.items() if len(p) > 1 or e // experts_per_rank not in p}
+
+
+_PHI = 0.6180339887498949  # golden-ratio sequence: an even, deterministic split of token positions
 
 
 @dataclass
@@ -82,8 +92,8 @@ class ReplicaPlan:
     table: list[list[int]]  # [rank][spare] -> expert, -1 empty
     experts_per_rank: int
     spares: int
-    copies_count: Tensor  # [E] int64
-    copy_slots: Tensor  # [E, max_copies] int64
+    copy_slots: Tensor  # [E, max_copies] int64 physical slots, padded with the last one
+    copy_bounds: Tensor  # [E, max_copies] float64 cumulative token shares, 1.0 at and after the last copy
 
     @property
     def active(self) -> bool:
@@ -94,27 +104,60 @@ class ReplicaPlan:
         return len(self.table) * (self.experts_per_rank + self.spares)
 
     @classmethod
-    def build(cls, table: list[list[int]], num_experts: int, experts_per_rank: int, device) -> "ReplicaPlan":
-        ranks = len(table)
+    def build(
+        cls,
+        table: list[list[int]],
+        num_experts: int,
+        experts_per_rank: int,
+        device,
+        pieces: dict[int, dict[int, float]] | None = None,
+    ) -> "ReplicaPlan":
+        """``pieces`` gives each listed expert's load per rank (owner and spare copies); experts with spare copies
+        but no pieces entry split their tokens evenly over the copies."""
         spares = len(table[0]) if table else 0
         width = experts_per_rank + spares
-        slots: list[list[int]] = [[(e // experts_per_rank) * width + e % experts_per_rank] for e in range(num_experts)]
+        slot_of: dict[tuple[int, int], int] = {}
         for r, row in enumerate(table):
             for j, e in enumerate(row):
                 if e >= 0:
-                    slots[e].append(r * width + experts_per_rank + j)
+                    slot_of[(e, r)] = r * width + experts_per_rank + j
+        slots: list[list[int]] = []
+        shares: list[list[float]] = []
+        for e in range(num_experts):
+            owner = e // experts_per_rank
+            native = owner * width + e % experts_per_rank
+            copies = [r for (x, r) in slot_of if x == e]
+            if pieces is not None and e in pieces:
+                ranks = sorted(pieces[e])
+                total = sum(pieces[e].values())
+                es = [native if r == owner else slot_of[(e, r)] for r in ranks]
+                ws = [pieces[e][r] / total if total > 0 else float(r == owner) for r in ranks]
+            else:
+                es = [native] + [slot_of[(e, r)] for r in copies]
+                ws = [1.0 / len(es)] * len(es)
+            slots.append(es)
+            shares.append(ws)
         max_copies = max(len(s) for s in slots)
-        copy_slots = torch.tensor([s + [s[0]] * (max_copies - len(s)) for s in slots], dtype=torch.long)
-        copies_count = torch.tensor([len(s) for s in slots], dtype=torch.long)
-        return cls(table, experts_per_rank, spares, copies_count.to(device), copy_slots.to(device))
+        bounds = []
+        for ws in shares:
+            cum, acc = [], 0.0
+            for w in ws:
+                acc += w
+                cum.append(acc)
+            cum[-1] = 1.0
+            bounds.append(cum + [1.0] * (max_copies - len(cum)))
+        copy_slots = torch.tensor([s + [s[-1]] * (max_copies - len(s)) for s in slots], dtype=torch.long)
+        copy_bounds = torch.tensor(bounds, dtype=torch.float64)
+        return cls(table, experts_per_rank, spares, copy_slots.to(device), copy_bounds.to(device))
 
     def remap(self, selected: Tensor) -> Tensor:
-        """Logical expert ids ``[tokens, k]`` (``-1`` kept) -> physical slots, splitting each replicated expert's
-        tokens evenly over its copies by their flat position."""
+        """Logical expert ids ``[tokens, k]`` (``-1`` kept) -> physical slots, giving each copy of an expert its share
+        of the expert's tokens by their flat position."""
         valid = selected >= 0
         e = selected.clamp(min=0)
-        position = torch.arange(selected.numel(), device=selected.device).view_as(selected)
-        copy = position % self.copies_count[e]
+        position = torch.arange(selected.numel(), device=selected.device, dtype=torch.float64).view_as(selected)
+        u = torch.frac(position * _PHI)
+        copy = (u.unsqueeze(-1) >= self.copy_bounds[e]).sum(-1).clamp(max=self.copy_slots.shape[1] - 1)
         slots = self.copy_slots[e, copy]
         return torch.where(valid, slots, selected)
 
@@ -203,8 +246,8 @@ class ExpertReplicaManager:
             if sum(est) == 0:
                 continue
             E = len(est)
-            table = plan_replicas(est, E // ranks, ranks, self.spares)
-            self.plans[i] = ReplicaPlan.build(table, E, E // ranks, layer._replica_counts.device)
+            table, pieces = plan_replicas(est, E // ranks, ranks, self.spares)
+            self.plans[i] = ReplicaPlan.build(table, E, E // ranks, layer._replica_counts.device, pieces)
 
 
 _MANAGERS: dict[int, ExpertReplicaManager] = {}
