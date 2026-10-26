@@ -321,9 +321,12 @@ def _get_sequence_chunked_logprob_fn():
             vocab_size = weight.shape[0]
 
             # Accumulate in fp32 when requested, otherwise in each input's
-            # native dtype; we cast back to input dtypes on return.
+            # native dtype; we cast back to input dtypes on return. The hidden
+            # gradient is always fp32: it sums one product per vocab tile, and
+            # summing 32 of them in bf16 raised Gemma 4's parameter gradient
+            # norms by 1.2%.
             accum = torch.float32 if fp32_lm_head else None
-            grad_hidden = torch.zeros_like(hidden, dtype=accum or hidden.dtype)
+            grad_hidden = torch.zeros_like(hidden, dtype=torch.float32)
             grad_weight = torch.zeros_like(weight, dtype=accum or weight.dtype)
             grad_bias = torch.zeros_like(bias, dtype=accum or bias.dtype) if bias is not None else None
 
@@ -384,7 +387,7 @@ def _get_sequence_chunked_logprob_fn():
                     if squashed is not None:
                         grad_logits = grad_logits * (1 - squashed * squashed)
 
-                    grad_hidden[start:end].add_(grad_logits.to(grad_hidden.dtype) @ w_proj)
+                    grad_hidden[start:end].add_(grad_logits.to(w_proj.dtype) @ w_proj)
                     grad_weight[vocab_start:vocab_end].add_(grad_logits.to(grad_weight.dtype).t() @ h_proj)
                     if grad_bias is not None:
                         grad_bias[vocab_start:vocab_end].add_(grad_logits.to(grad_bias.dtype).sum(dim=0))
