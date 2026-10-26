@@ -1514,3 +1514,50 @@ class TestWeightedLogprobSum(TestCasePlus):
             "cpu",
         )
         self.assertAlmostEqual(loss.item(), 2.0, places=5)
+
+    def test_two_microbatches_sum_to_the_single_window(self):
+        from types import SimpleNamespace
+
+        from arctic_platform.rl.processors.pipeline import run_pipeline
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        self.assertIsNotNone(getattr(weighted_logprob_sum, PACKED_LOSS_REDUCTION_ATTR))
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+            "attention_mask": torch.ones(2, 4, dtype=torch.long),
+            "logprob_weights_shifted": torch.tensor([[1.0, 0.5, 0.0, 2.0], [1.0, 1.0, 0.0, 0.5]]),
+        }
+        meta = {"pad_token_id": 0}
+        processing = {"loss_fn": "weighted_logprob_sum", "post": []}
+
+        class Engine:
+            def __init__(self):
+                self.backward_losses = []
+                self.global_rank = 0
+
+            def train(self):
+                pass
+
+            def eval(self):
+                pass
+
+            def __call__(self, *args, **kwargs):
+                ids = kwargs["input_ids"]
+                logprobs = -ids.float()
+                return SimpleNamespace(logprobs=logprobs)
+
+            def backward(self, loss, scale_wrt_gas=True):
+                self.backward_losses.append((float(loss.detach()), scale_wrt_gas))
+
+        one = run_pipeline(
+            Engine(), (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=16
+        )
+        split_engine = Engine()
+        two = run_pipeline(
+            split_engine, (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=4
+        )
+        self.assertGreater(len(split_engine.backward_losses), 1)
+        self.assertAlmostEqual(one["avg_loss"], two["avg_loss"], places=5)
+        self.assertAlmostEqual(sum(loss for loss, _ in split_engine.backward_losses), one["avg_loss"], places=5)
+        self.assertTrue(all(scale is False for _, scale in split_engine.backward_losses))

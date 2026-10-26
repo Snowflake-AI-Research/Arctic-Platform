@@ -79,9 +79,7 @@ def compare_weight_checksums(
     elif any(not _checksums_agree(value, reference, rtol) for value in sent.values()):
         problems.append(f"training ranks sent different checksums {sent}")
     unreceived = [label for label, value in received.items() if value is None]
-    nonfinite_received = [
-        label for label, value in received.items() if value is not None and not math.isfinite(value)
-    ]
+    nonfinite_received = [label for label, value in received.items() if value is not None and not math.isfinite(value)]
     if not received or unreceived:
         problems.append(f"no received checksum from {unreceived or 'any sampling rank'}")
     elif nonfinite_received:
