@@ -77,6 +77,8 @@ def _fetch_worker(rank, world, port, results):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world)
+    # NCCL wants a group's first call to involve every rank; ranks without spares skip the fetch's P2P exchange.
+    torch.distributed.all_reduce(torch.zeros(1, device="cuda"))
     L, S = 2, 2
     # Rank r holds experts 2r, 2r+1; each expert's weights are filled with its id.
     table = [[-1, -1] for _ in range(world)]

@@ -39,14 +39,20 @@ from torch import Tensor
 
 
 def plan_replicas(
-    weights: list[float], experts_per_rank: int, ranks: int, spares: int, tol: float = 1e-3
+    weights: list[float],
+    experts_per_rank: int,
+    ranks: int,
+    spares: int,
+    tol: float = 1e-3,
+    node_of: list[int] | None = None,
 ) -> tuple[list[list[int]], dict[int, dict[int, float]]]:
     """Spread each expert's load over its owner (expert ``e`` lives on rank ``e // experts_per_rank``) and up to
     ``spares`` spare-slot copies per rank, in any proportions. Repeatedly levels the most-loaded rank against the
     best target for its heaviest piece: a rank already holding that expert (free), else the least-loaded rank with a
     free spare slot, moving half the load difference (at most the piece). This both moves experts (a copy can take an
     expert's whole load) and splits hot ones. Returns the spare table ``[rank][spare] -> expert`` (``-1`` empty) and
-    ``{expert: {rank: load}}`` for every expert that is not entirely on its owner."""
+    ``{expert: {rank: load}}`` for every expert that is not entirely on its owner. With ``node_of`` (each rank's node),
+    copies stay on their owner's node, so every fetch is intra-node."""
     E = len(weights)
     pieces: dict[int, dict[int, float]] = {e: {e // experts_per_rank: weights[e]} for e in range(E)}
     load = [0.0] * ranks
@@ -61,7 +67,12 @@ def plan_replicas(
         held = sorted((e for e in range(E) if pieces[e].get(r_max, 0.0) > 0), key=lambda e: -pieces[e][r_max])
         for e in held:
             holders = [(load[r], r, False) for r in pieces[e] if r != r_max]
-            spare = [(load[r], r, True) for r in range(ranks) if free[r] and r not in pieces[e]]
+            owner_node = None if node_of is None else node_of[e // experts_per_rank]
+            spare = [
+                (load[r], r, True)
+                for r in range(ranks)
+                if free[r] and r not in pieces[e] and (owner_node is None or node_of[r] == owner_node)
+            ]
             if not holders and not spare:
                 continue
             _, r_t, uses_spare = min(holders + spare)
@@ -83,6 +94,34 @@ def plan_replicas(
 
 
 _PHI = 0.6180339887498949  # golden-ratio sequence: an even, deterministic split of token positions
+
+
+class _PairwiseFetch(torch.autograd.Function):
+    """Rows ``packed[start:start + count]`` go to each send peer and ``out[start:start + count]`` comes from each
+    receive peer, as point-to-point NCCL operations between only the ranks that exchange rows (no collective over
+    the whole group, so ranks with nothing to exchange never wait). The backward returns the received rows'
+    gradients to their senders the same way."""
+
+    @staticmethod
+    def forward(ctx, packed: Tensor, sends: list, recvs: list, group, num_recv: int) -> Tensor:
+        out = packed.new_empty((num_recv, packed.shape[1]))
+        _exchange(packed, out, sends, recvs, group)
+        ctx.sends, ctx.recvs, ctx.group, ctx.rows = sends, recvs, group, packed.shape[0]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        grad_in = grad_out.new_zeros((ctx.rows, grad_out.shape[1]))
+        _exchange(grad_out.contiguous(), grad_in, ctx.recvs, ctx.sends, ctx.group)
+        return grad_in, None, None, None, None
+
+
+def _exchange(source: Tensor, target: Tensor, sends: list, recvs: list, group) -> None:
+    ops = [dist.P2POp(dist.isend, source[a:a + n], dist.get_global_rank(group, peer), group) for peer, a, n in sends]
+    ops += [dist.P2POp(dist.irecv, target[a:a + n], dist.get_global_rank(group, peer), group) for peer, a, n in recvs]
+    if ops:
+        for request in dist.batch_isend_irecv(ops):
+            request.wait()
 
 
 @dataclass
@@ -161,6 +200,19 @@ class ReplicaPlan:
         slots = self.copy_slots[e, copy]
         return torch.where(valid, slots, selected)
 
+    @staticmethod
+    def _pairs(send_counts: list[int], recv_counts: list[int]) -> tuple[list, list]:
+        """(peer, first row, rows) for every non-empty send and receive, rows grouped by peer in rank order."""
+        def runs(counts):
+            out, start = [], 0
+            for peer, n in enumerate(counts):
+                if n:
+                    out.append((peer, start, n))
+                start += n
+            return out
+
+        return runs(send_counts), runs(recv_counts)
+
     def _fetch_layout(self, me: int, device) -> tuple[Tensor, list[int], list[int], Tensor]:
         """This rank's all-to-all layout under the plan, built once: the native rows it sends (grouped by destination
         rank), the split sizes, and for each spare slot its row in the received buffer (the zero row if empty).
@@ -197,8 +249,6 @@ class ReplicaPlan:
     def fetch(self, weights: tuple[Tensor, ...], group) -> tuple[Tensor, ...]:
         """Each ``weights[k]`` is this rank's ``[L, ...]`` native expert stack; returns ``[L + S, ...]`` stacks with the
         spare slots filled from their owners (zeros where a spare is empty), differentiably."""
-        from torch.distributed.nn.functional import all_to_all_single
-
         S = self.spares
         send_index, send_counts, recv_counts, spare_index = self._fetch_layout(dist.get_rank(group), weights[0].device)
         num_recv = sum(recv_counts)
@@ -210,15 +260,13 @@ class ReplicaPlan:
             raw = [w.contiguous().view(torch.uint8).reshape(w.shape[0], -1) for w in weights]
             sizes = [r.shape[1] for r in raw]
             packed = torch.cat([r.index_select(0, index) for r in raw], dim=1)
-            received = packed.new_empty((num_recv, sum(sizes)))
-            dist.all_to_all_single(received, packed, recv_counts, send_counts, group=group)
+            received = _PairwiseFetch.apply(packed, *self._pairs(send_counts, recv_counts), group, num_recv)
         else:
             sizes = [w[0].numel() for w in weights]
             packed = torch.cat(
                 [w.index_select(0, index).reshape(index.numel(), n) for w, n in zip(weights, sizes)], dim=1
             )
-            received = packed.new_empty((num_recv, sum(sizes)))
-            received = all_to_all_single(received, packed.contiguous(), recv_counts, send_counts, group=group)
+            received = _PairwiseFetch.apply(packed.contiguous(), *self._pairs(send_counts, recv_counts), group, num_recv)
         # Every rank's spares go through `received`, so every rank runs the all-to-all's backward collective too,
         # including one whose spares are all empty (they read an appended zero row).
         padded = torch.cat([received, received.new_zeros(1, received.shape[1])])
@@ -243,6 +291,7 @@ class ExpertReplicaManager:
         self.layers: list = []
         self.estimates: list[list[float] | None] = []
         self.plans: list[ReplicaPlan | None] = []
+        self.node_of: list[int] | None = None  # each EP rank's node; copies stay on their owner's node
 
     def register(self, layer) -> int:
         self.layers.append(layer)
@@ -255,6 +304,13 @@ class ExpertReplicaManager:
         dist.all_reduce(counts, group=self.group)
         counts = counts.cpu().tolist()
         ranks = dist.get_world_size(self.group)
+        if self.node_of is None:
+            import socket
+
+            hosts = [None] * ranks
+            dist.all_gather_object(hosts, socket.gethostname(), group=self.group)
+            ids = {h: i for i, h in enumerate(dict.fromkeys(hosts))}
+            self.node_of = [ids[h] for h in hosts]
         for i, layer in enumerate(self.layers):
             layer._replica_counts.zero_()
             est = self.estimates[i]
@@ -263,7 +319,7 @@ class ExpertReplicaManager:
             if sum(est) == 0:
                 continue
             E = len(est)
-            table, pieces = plan_replicas(est, E // ranks, ranks, self.spares)
+            table, pieces = plan_replicas(est, E // ranks, ranks, self.spares, node_of=self.node_of)
             plan = ReplicaPlan.build(table, E, E // ranks, layer._replica_counts.device, pieces)
             plan._fetch_layout(dist.get_rank(self.group), layer._replica_counts.device)  # while the host is synced
             self.plans[i] = plan
