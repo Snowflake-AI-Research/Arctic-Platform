@@ -361,6 +361,25 @@ def _add_into_rows(out: torch.Tensor, delta: torch.Tensor, rows: int, cols: slic
     return _AddIntoRows.apply(out, delta, rows, cols.start, cols.stop)
 
 
+class _ReplicaCall:
+    """One MoE call's spare-slot plan; fetches the spares' weights once and reuses them across the call's chunks."""
+
+    def __init__(self, plan, group):
+        self.plan = plan
+        self.group = group
+        self.weights = None
+
+    def extend(self, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if self.weights is None:
+            self.weights = self.plan.fetch(weights, self.group)
+        return self.weights
+
+
+def _with_replica_slots(experts: nn.Module, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    call = getattr(experts, "_arl_replica_call", None)
+    return weights if call is None else call.extend(*weights)
+
+
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -565,6 +584,7 @@ class GroupedExperts(nn.Module):
         w1 = _maybe_to_local(self.w1)
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
+        w1, w2, w3 = _with_replica_slots(self, w1, w2, w3)
         if self.use_grouped_mm:
             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
@@ -765,6 +785,10 @@ class MoE(nn.Module):
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
         self.use_sonicmoe = moe_args.use_sonicmoe
+        # Online redundant experts (expert_replicas.py), registered on the first forward with ARL_EXPERT_REPLICAS.
+        self._replica_index = -1
+        self._replica_manager = None
+        self._replica_counts: torch.Tensor | None = None
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -855,11 +879,43 @@ class MoE(nn.Module):
 
         return routed_output
 
+    def _expert_replica_plan(self, num_tokens_per_expert: torch.Tensor):
+        """This micro-batch's spare-slot plan (``moe/expert_replicas.py``), or None without ``ARL_EXPERT_REPLICAS``.
+        The first registered layer replans at the start of each graph-building forward, so a micro-batch's forward,
+        recompute and backward share one plan."""
+        from ..distributed.expert_parallel import get_ep_group
+        from ..expert_replicas import manager_for
+        from ..expert_replicas import replica_spares
+
+        if not replica_spares():
+            return None
+        experts = _unwrap_experts(self.experts)
+        group = get_ep_group(experts)
+        if group is None:
+            return None
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        if self._replica_index < 0:
+            _install_recompute_detector()
+            self._replica_manager = manager_for(group)
+            self._replica_counts = torch.zeros_like(num_tokens_per_expert, dtype=torch.long)
+            self._replica_index = self._replica_manager.register(self)
+        building = torch.is_grad_enabled() and not _in_recompute()
+        if building and self._replica_index == 0:
+            self._replica_manager.replan()
+        if building:
+            with torch.no_grad():
+                self._replica_counts.add_(num_tokens_per_expert.to(torch.long))
+        plan = self._replica_manager.plans[self._replica_index]
+        return plan if plan is not None and plan.active else None
+
     def _run_deepep_routed_experts(
         self,
         x: torch.Tensor,
         selected_experts_indices: torch.Tensor,
         top_scores: torch.Tensor,
+        replica_plan=None,
     ) -> torch.Tensor:
         ep_comm = get_ep_comm_module(self.ep_comm_backend)
         combine_tokens = ep_comm.combine_tokens
@@ -875,6 +931,13 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        num_experts = experts.num_experts
+        if replica_plan is not None:
+            # Tokens go to physical slots (native experts and this plan's spares); the experts read the spares'
+            # weights from their owners once per call (expert_replicas.ReplicaPlan.fetch).
+            selected_experts_indices = replica_plan.remap(selected_experts_indices)
+            num_experts = replica_plan.num_slots
+            experts._arl_replica_call = _ReplicaCall(replica_plan, group)
         # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
         # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
         use_sonic = (
@@ -895,7 +958,7 @@ class MoE(nn.Module):
                 x[start:end],
                 selected_experts_indices[start:end],
                 top_scores[start:end],
-                num_experts=experts.num_experts,
+                num_experts=num_experts,
                 group=group,
                 score_before_experts=self.score_before_experts,
             )
@@ -941,6 +1004,7 @@ class MoE(nn.Module):
             pending_state = next_pending_state
 
         routed_outputs.append(run_pending_chunk(pending_state))
+        experts._arl_replica_call = None
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -990,7 +1054,8 @@ class MoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
+            plan = self._expert_replica_plan(num_tokens_per_expert)
+            routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores, plan)
             return routed_output.reshape(bs, slen, dim)
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
