@@ -81,12 +81,67 @@ class TestMemoryLogprobsFromHidden(TestCasePlus):
 
     def test_untied_embeddings_rejected(self):
         model = make_tied_lm_head_model(8, 16, device="cpu")
-        model.config.tie_word_embeddings = False
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
         hidden = torch.randn(2, 8)
         labels = torch.randint(0, 16, (2,))
         with self.assertRaises(ValueError) as ctx:
             memory_logprobs_entropy_from_hidden(model, hidden, labels, calculate_entropy=False)
-        self.assertIn("tie_word_embeddings", str(ctx.exception))
+        self.assertIn("lm_head.weight", str(ctx.exception))
+
+    def test_missing_input_embedding_rejected(self):
+        model = make_tied_lm_head_model(8, 16, device="cpu")
+        model.get_input_embeddings = None
+        model.embed_tokens = None
+        hidden = torch.randn(2, 8)
+        labels = torch.randint(0, 16, (2,))
+        with self.assertRaises(ValueError) as ctx:
+            memory_logprobs_entropy_from_hidden(model, hidden, labels, calculate_entropy=False)
+        self.assertIn("input embeddings", str(ctx.exception))
+
+    def test_more_shards_than_rows_matches_untiled(self):
+        set_seed(0)
+        hidden_size, vocab_size = 8, 16
+        model = make_tied_lm_head_model(hidden_size, vocab_size, device="cpu")
+        labels = torch.randint(0, vocab_size, (2,))
+        base = torch.randn(2, hidden_size)
+        h_ref = base.detach().clone().requires_grad_(True)
+        h_mem = base.detach().clone().requires_grad_(True)
+        model.lm_head.weight.grad = None
+        lp_ref, _ = tiled_logprobs_entropy_from_hidden(model, h_ref, labels, temperature=1.0, calculate_entropy=False)
+        lp_ref.sum().backward()
+        hidden_grad_ref = h_ref.grad.detach().clone()
+        weight_grad_ref = model.lm_head.weight.grad.detach().clone()
+
+        from arctic_platform.common.utils import tiled_logits as tiled_mod
+
+        row_counts = []
+
+        def _count(_module, inputs):
+            row_counts.append(int(inputs[0].shape[0]))
+
+        handle = model.lm_head.register_forward_pre_hook(_count)
+        original_sync = tiled_mod.sync_logits_num_shards
+        tiled_mod.sync_logits_num_shards = lambda num_shards, device: 5
+        model.lm_head.weight.grad = None
+        try:
+            lp_mem, _ = memory_logprobs_entropy_from_hidden(
+                model,
+                h_mem,
+                labels,
+                temperature=1.0,
+                calculate_entropy=False,
+                peak_mem_gib=8.0,
+            )
+            lp_mem.sum().backward()
+        finally:
+            tiled_mod.sync_logits_num_shards = original_sync
+            handle.remove()
+
+        torch_assert_close(lp_mem, lp_ref.detach())
+        torch_assert_close(h_mem.grad, hidden_grad_ref)
+        torch_assert_close(model.lm_head.weight.grad, weight_grad_ref)
+        self.assertIn(0, row_counts)
+        self.assertGreaterEqual(row_counts.count(0), 3)
 
 
 class TestComputeEntropyMemoryRaise(TestCasePlus):
@@ -137,9 +192,14 @@ class _CausalLM(torch.nn.Module):
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
         self.model = _Backbone(hidden_size)
+        self.embed_tokens = torch.nn.Embedding(vocab_size, hidden_size)
         self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
         self.lm_head.weight.ds_grad_is_ready = True
-        self.config = SimpleNamespace(vocab_size=vocab_size)
+        self.config = SimpleNamespace(vocab_size=vocab_size, tie_word_embeddings=True)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
     def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
         out = self.model(input_ids=input_ids, **kwargs)
@@ -245,11 +305,12 @@ class TestNoZorroPipelineMemoryRouting(TestCasePlus):
         self.assertNotIn("logits_to_keep", engine.last_kwargs or {})
         self.assertIn("logprobs", out["batch"])
 
-    def test_worker_fill_turns_none_meta_into_memory_path(self):
-        # C2 bug: launcher set ARCTIC_LOGITS_OPT on ds_worker_config only; client meta stayed "none".
+    def test_worker_fill_inherits_memory_when_the_client_omits_it(self):
         engine = _Engine(_CausalLM(8, 16))
+        meta = self._meta("none")
+        del meta["logits_optimization"]
         meta = fill_logits_opt_from_worker_config(
-            self._meta("none"),
+            meta,
             {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
         )
         out = run_pipeline(
@@ -267,21 +328,130 @@ class TestNoZorroPipelineMemoryRouting(TestCasePlus):
         self.assertIn("logprobs", out["batch"])
         self.assertNotIn("logits", out["batch"])
 
+    def test_explicit_none_keeps_full_logits_against_worker_memory(self):
+        engine = _Engine(_CausalLM(8, 16))
+        meta = fill_logits_opt_from_worker_config(
+            self._meta("none"),
+            {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
+        )
+        out = run_pipeline(
+            engine,
+            (),
+            self._batch(),
+            meta,
+            {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": None},
+            "cpu",
+            backward=False,
+            pack=False,
+            return_tensors=True,
+        )
+        self.assertEqual(meta["logits_optimization"], "none")
+        self.assertNotIn("logits_to_keep", engine.last_kwargs or {})
+        self.assertIn("logprobs", out["batch"])
+
+    def test_memory_defaults_missing_temperature(self):
+        engine = _Engine(_CausalLM(8, 16))
+        meta = self._meta("memory")
+        del meta["temperature"]
+        out = run_pipeline(
+            engine,
+            (),
+            self._batch(),
+            meta,
+            {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": None},
+            "cpu",
+            backward=False,
+            pack=False,
+            return_tensors=True,
+        )
+        self.assertIn("logprobs", out["batch"])
+        self.assertEqual(tuple(out["batch"]["logprobs"].shape), (2, 4))
+
+    def test_untied_rejected_before_forward(self):
+        model = _CausalLM(8, 16)
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+        engine = _Engine(model)
+        engine.calls = 0
+        original = engine.__call__
+
+        def _counting(*args, **kwargs):
+            engine.calls += 1
+            return original(*args, **kwargs)
+
+        engine.__call__ = _counting
+        with self.assertRaises(ValueError) as ctx:
+            run_pipeline(
+                engine,
+                (),
+                self._batch(),
+                self._meta("memory"),
+                {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": None},
+                "cpu",
+                backward=False,
+                pack=False,
+                return_tensors=True,
+            )
+        self.assertIn("lm_head.weight", str(ctx.exception))
+        self.assertEqual(engine.calls, 0)
+
+    def test_peft_wrapper_still_captures_hidden(self):
+        base = _CausalLM(8, 16)
+
+        class _PeftOuter(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self.peft_config = {"default": object()}
+
+            def get_base_model(self):
+                return self.inner
+
+            def forward(self, *args, **kwargs):
+                # PEFT tuners call the inner module's forward directly, skipping its hooks.
+                return self.inner.forward(*args, **kwargs)
+
+        engine = _Engine(_PeftOuter(base))
+        out = run_pipeline(
+            engine,
+            (),
+            self._batch(),
+            self._meta("memory"),
+            {"post": ["apply_temperature", "compute_entropy_and_logprobs"], "loss_fn": None},
+            "cpu",
+            backward=False,
+            pack=False,
+            return_tensors=True,
+        )
+        self.assertEqual(engine.last_kwargs.get("logits_to_keep"), 1)
+        self.assertIn("logprobs", out["batch"])
+        self.assertEqual(tuple(out["batch"]["logprobs"].shape), (2, 4))
+        self.assertEqual(len(base.model._forward_hooks), 0)
+
 
 class TestFillLogitsOptFromWorkerConfig(TestCasePlus):
-    def test_fills_none_from_worker_memory(self):
-        meta = {"logits_optimization": "none", "temperature": 1.0}
+    def test_missing_or_none_inherits_worker_memory(self):
         worker = {
             "logits_optimization": "memory",
             "logits_optimization_peak_mem_size_in_gib": 8,
             "logits_compute_in_fp32": True,
         }
-        filled = fill_logits_opt_from_worker_config(meta, worker)
-        self.assertEqual(filled["logits_optimization"], "memory")
-        self.assertEqual(filled["logits_optimization_peak_mem_size_in_gib"], 8)
-        self.assertTrue(filled["logits_compute_in_fp32"])
-        self.assertEqual(filled["temperature"], 1.0)
-        self.assertEqual(meta["logits_optimization"], "none")
+        for meta in ({"temperature": 1.0}, {"logits_optimization": None, "temperature": 1.0}):
+            filled = fill_logits_opt_from_worker_config(meta, worker)
+            self.assertEqual(filled["logits_optimization"], "memory")
+            self.assertEqual(filled["logits_optimization_peak_mem_size_in_gib"], 8)
+            self.assertTrue(filled["logits_compute_in_fp32"])
+            self.assertEqual(filled["temperature"], 1.0)
+            self.assertIsNot(filled, meta)
+
+    def test_explicit_none_is_not_overridden(self):
+        meta = {"logits_optimization": "none", "temperature": 1.0}
+        filled = fill_logits_opt_from_worker_config(
+            meta,
+            {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 8},
+        )
+        self.assertIs(filled, meta)
+        self.assertEqual(filled["logits_optimization"], "none")
+        self.assertNotIn("logits_optimization_peak_mem_size_in_gib", filled)
 
     def test_client_memory_wins_over_worker_none(self):
         meta = {"logits_optimization": "memory"}
@@ -294,6 +464,6 @@ class TestFillLogitsOptFromWorkerConfig(TestCasePlus):
         filled = fill_logits_opt_from_worker_config(meta, {"logits_optimization": "none"})
         self.assertIs(filled, meta)
 
-    def test_missing_meta_key_treated_as_none(self):
+    def test_missing_meta_key_inherits_worker(self):
         filled = fill_logits_opt_from_worker_config({}, {"logits_optimization": "compute"})
         self.assertEqual(filled["logits_optimization"], "compute")
