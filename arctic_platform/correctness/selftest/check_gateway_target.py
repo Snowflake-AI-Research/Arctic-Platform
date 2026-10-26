@@ -86,6 +86,23 @@ def test_grad_norms_fold_expert_stacks_and_take_the_owning_rank() -> None:
     assert per_expert == {"experts.w": [3.0, 4.0]}
 
 
+def test_frame_sends_model_style_labels_to_non_prime_rl_providers() -> None:
+    from cortex_training import wire
+
+    from arctic_platform.correctness.harness.batches import build_batch
+
+    catalog = _catalog()
+    assert target.labels_are_shifted(catalog)
+    catalog["sub_job_configs"][0]["training_config"]["model_provider"] = "huggingface"
+    assert not target.labels_are_shifted(catalog)
+
+    batch = build_batch("gas1", 2, 16, 32, seed=0)
+    for shifted, labels in ((True, batch.shifted_labels()), (False, batch.labels)):
+        payload = wire.loads(target.frame(batch, shifted=shifted))
+        assert torch.equal(payload["kwargs"]["labels"], labels)
+        assert payload["context"] == {"labels_are_shifted": shifted}
+
+
 def test_run_target_requires_lora_export_inputs() -> None:
     with pytest.raises(ValueError, match="LoRA target needs"):
         target.run_target(object(), _catalog(LORA), batch=None)

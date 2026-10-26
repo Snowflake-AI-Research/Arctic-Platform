@@ -95,7 +95,16 @@ def job_body(
     return body
 
 
-def frame(batch) -> bytes:
+def labels_are_shifted(body: dict) -> bool:
+    """Whether the training worker reads plain SFT labels as next-token targets.
+
+    dss-platform takes them as given only for the prime_rl provider. Hugging Face and Liger jobs get
+    model-style labels, which the worker shifts itself; it ignores ``context.labels_are_shifted``.
+    """
+    return training_config(body).get("model_provider", "prime_rl") == "prime_rl"
+
+
+def frame(batch, *, shifted: bool = True) -> bytes:
     import torch
     from cortex_training import wire
 
@@ -107,9 +116,9 @@ def frame(batch) -> bytes:
             "input_ids": batch.input_ids,
             "position_ids": positions,
             "attention_mask": attention_mask,
-            "labels": batch.shifted_labels(),
+            "labels": batch.shifted_labels() if shifted else batch.labels,
         },
-        "context": {"labels_are_shifted": True},
+        "context": {"labels_are_shifted": shifted},
     }
     return wire.dumps(payload, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
 
@@ -181,19 +190,20 @@ def run_target(
     peft_config = training_config(body).get("peft_config")
     if peft_config and (warmup_batch is None or adapter_dir is None or zone_url is None):
         raise ValueError("a LoRA target needs a warm-up batch, an adapter directory and the zone URL")
+    shifted = labels_are_shifted(body)
     job_id = client.create_job_from_body(body)["job_id"]
     print(f"[target] job {job_id}", flush=True)
     try:
         client.wait_for_job(job_id)
         exported = None
         if peft_config:
-            client.poll_request(job_id, client.forward_backward(job_id, frame(warmup_batch)))
+            client.poll_request(job_id, client.forward_backward(job_id, frame(warmup_batch, shifted=shifted)))
             client.poll_request(job_id, client.step(job_id, WARMUP_LR))
             url = zone_url() if callable(zone_url) else zone_url
             exported = export_adapter(url, job_id, adapter_dir, peft_config, weights_only=weights_only_save)
             print(f"[target] adapter {exported} -> {adapter_dir}", flush=True)
         t0 = time.time()
-        fwd = client.poll_request(job_id, client.forward_backward(job_id, frame(batch)))
+        fwd = client.poll_request(job_id, client.forward_backward(job_id, frame(batch, shifted=shifted)))
         stepped = client.poll_request(job_id, client.step(job_id, 0.0))
         norms, per_expert = grad_norms(stepped)
         fwd_metrics = fwd.get("metrics") or {}
