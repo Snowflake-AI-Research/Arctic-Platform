@@ -240,6 +240,39 @@ def chunked_logprobs_entropy_from_hidden(
     return logprobs, entropy
 
 
+def _split_rows(tensor: torch.Tensor, shards: int) -> list[torch.Tensor]:
+    """Split ``tensor`` along dim 0 into exactly ``shards`` pieces.
+
+    ``torch.chunk`` returns fewer pieces when ``shards`` exceeds the row count,
+    or when the chunk size rounds up and consumes the tensor early. A MAX
+    all-reduce can ask a short rank for more tiles than it has rows. Empty
+    pieces keep every rank on the same number of LM-head calls.
+    """
+    if not isinstance(shards, int) or shards < 1:
+        raise ValueError(f"logits tile count must be positive, got {shards}")
+    return list(torch.tensor_split(tensor, shards, dim=0))
+
+
+def require_tied_lm_head(model) -> None:
+    """Reject memory-mode tiling unless the LM head and input embedding are one Parameter.
+
+    ``TiledLogProbEntropy`` marks ``lm_head.weight`` as not ready so DeepSpeed
+    reduces it with the input embedding. A missing ``tie_word_embeddings`` flag
+    is not evidence that the parameters are tied.
+    """
+    lm_head = getattr(model, "lm_head", None)
+    head_weight = getattr(lm_head, "weight", None)
+    get_input = getattr(model, "get_input_embeddings", None)
+    embed = get_input() if callable(get_input) else getattr(model, "embed_tokens", None)
+    embed_weight = getattr(embed, "weight", None)
+    if head_weight is None or embed_weight is None or head_weight is not embed_weight:
+        raise ValueError(
+            "logits_optimization=memory requires lm_head.weight to be the same Parameter as "
+            "the input embeddings so DeepSpeed reduces them together "
+            "(TiledLogProbEntropy sets ds_grad_is_ready=False)."
+        )
+
+
 class TiledLogProbEntropy(torch.autograd.Function):
     """
     TiledLogProbEntropy implementation using gradient hooks (the grad hooks were copied from Axolotl). This has been adapted from TiledMLP in Deepspeed.
@@ -268,8 +301,8 @@ class TiledLogProbEntropy(torch.autograd.Function):
             ctx.calculate_entropy = calculate_entropy
             ctx.save_for_backward(hidden_states, labels)
 
-        hidden_states_shards = list(torch.chunk(hidden_states, chunks=shards, dim=0))
-        labels_shards = list(torch.chunk(labels, chunks=shards, dim=0))
+        hidden_states_shards = _split_rows(hidden_states, shards)
+        labels_shards = _split_rows(labels, shards)
 
         with torch.no_grad():
             logprobs_shards, entropy_shards = list(
@@ -314,8 +347,8 @@ class TiledLogProbEntropy(torch.autograd.Function):
 
         # return (None, None, hs_grad, None, None, None, None, None)
 
-        hs_shards = list(torch.chunk(hs, chunks=shards, dim=0))
-        labels_shards = list(torch.chunk(labels, chunks=shards, dim=0))
+        hs_shards = _split_rows(hs, shards)
+        labels_shards = _split_rows(labels, shards)
 
         # not using GradientAccumulator since it's not needed under deepspeed (needed for ddp/fsdp, so leaving the code here, but commented out)
         # Create a gradient accumulator for parameters
@@ -327,13 +360,25 @@ class TiledLogProbEntropy(torch.autograd.Function):
         for param in compute_params:
             param.ds_grad_is_ready = False
 
-        labels_step = labels_shards[0].shape[0]
-        shard_step = hs_shards[0].numel()
+        # tensor_split pieces are uneven, and a short rank has empty tiles after
+        # the MAX all-reduce. Striding by the first piece's size walks off the end.
+        hidden_starts = []
+        hidden_cursor = 0
+        for shard in hs_shards:
+            hidden_starts.append(hidden_cursor)
+            hidden_cursor += shard.numel()
+        row_starts = []
+        row_cursor = 0
+        for shard in labels_shards:
+            row_starts.append(row_cursor)
+            row_cursor += shard.shape[0]
+
         for i, hs_shard in enumerate(hs_shards):
             hs_shard.requires_grad_(hs_requires_grad)
 
-            shard_offset = i * shard_step
-            hs_shard.grad = hs_grad.view(-1).narrow(0, shard_offset, hs_shard.numel()).view_as(hs_shard)
+            n_hidden = hs_shard.numel()
+            if n_hidden:
+                hs_shard.grad = hs_grad.view(-1).narrow(0, hidden_starts[i], n_hidden).view_as(hs_shard)
 
             # Install hooks for this shard
             # is_last_shard = i + 1 == shards
@@ -342,28 +387,29 @@ class TiledLogProbEntropy(torch.autograd.Function):
             with torch.enable_grad():
                 logprobs_shard, entropy_shard = fn(model, hs_shard, labels_shards[i], temperature, calculate_entropy)
 
+            n_rows = labels_shards[i].shape[0]
             incoming_grad_shards = []
             tensors = []
             if entropy_shard is not None:
-                tensors += [entropy_shard]
-                incoming_grad_shards += [
-                    (
-                        entropy_grads.view(-1)
-                        .narrow(0, i * labels_step, labels_shards[i].shape[0])
-                        .view(labels_shards[i].shape[0])
-                    )
-                ]
-
-            tensors += [logprobs_shard]
-            incoming_grad_shards += [
-                (
-                    logprobs_grads.view(-1)
-                    .narrow(0, i * labels_step, labels_shards[i].shape[0])
-                    .view(labels_shards[i].shape[0])
+                tensors.append(entropy_shard)
+                entropy_grad = (
+                    entropy_grads.view(-1).narrow(0, row_starts[i], n_rows).view(n_rows)
+                    if entropy_grads is not None
+                    else torch.zeros_like(entropy_shard)
                 )
-            ]
+                incoming_grad_shards.append(entropy_grad)
 
-            torch.autograd.backward(tensors, incoming_grad_shards)
+            tensors.append(logprobs_shard)
+            logprobs_grad = (
+                logprobs_grads.view(-1).narrow(0, row_starts[i], n_rows).view(n_rows)
+                if logprobs_grads is not None
+                else torch.zeros_like(logprobs_shard)
+            )
+            incoming_grad_shards.append(logprobs_grad)
+
+            # Empty tiles still run backward so ZeRO all-gathers stay aligned.
+            if any(tensor.requires_grad for tensor in tensors):
+                torch.autograd.backward(tensors, incoming_grad_shards)
 
         # Clean up hooks
         # grad_accumulator.cleanup()
@@ -390,11 +436,15 @@ _LOGITS_OPT_META_KEYS = (
 
 
 def fill_logits_opt_from_worker_config(meta: dict, ds_worker_config: dict | None) -> dict:
-    """Copy worker-init logits knobs into per-call meta when the client left them at ``none``."""
+    """Copy worker-init logits knobs into per-call meta when the client did not choose.
+
+    A missing value or ``None`` inherits the worker. An explicit ``none``,
+    ``memory``, or ``compute`` is the caller's choice and is left alone, so a
+    client can opt out of tiling on a worker configured for ``memory``.
+    """
     worker = ds_worker_config or {}
     worker_opt = worker.get("logits_optimization") or "none"
-    meta_opt = meta.get("logits_optimization") or "none"
-    if meta_opt != "none" or worker_opt == "none":
+    if meta.get("logits_optimization") or worker_opt == "none":
         return meta
     filled = dict(meta)
     for key in _LOGITS_OPT_META_KEYS:
@@ -436,12 +486,7 @@ def memory_logprobs_entropy_from_hidden(
     flat_labels = labels.reshape(-1)
     if flat_hidden.shape[0] != flat_labels.shape[0]:
         raise ValueError(f"memory logits: hidden rows {flat_hidden.shape[0]} != labels {flat_labels.shape[0]}")
-    tied = getattr(getattr(model, "config", None), "tie_word_embeddings", None)
-    if tied is False:
-        raise ValueError(
-            "logits_optimization=memory requires tie_word_embeddings=True so DeepSpeed reduces "
-            "lm_head.weight with embed_tokens.weight (TiledLogProbEntropy sets ds_grad_is_ready=False)."
-        )
+    require_tied_lm_head(model)
     vocab_size = model.config.vocab_size
     chunk_rows = logits_chunk_rows(vocab_size, peak_mem_gib)
     num_shards = max(1, -(-flat_hidden.shape[0] // chunk_rows))

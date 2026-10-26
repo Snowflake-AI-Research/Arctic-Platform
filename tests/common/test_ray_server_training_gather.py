@@ -643,6 +643,7 @@ class TestGatherTrainingRefs(TestCasePlus):
         asyncio.run(_run())
 
     def test_weight_norm_mismatch_disables_the_check(self):
+        """A divergence that persists across the one retry is real and latches the check off."""
         calls = {"training": 0, "sampling": 0}
         hold = asyncio.Event()
         hold.set()
@@ -672,7 +673,42 @@ class TestGatherTrainingRefs(TestCasePlus):
             self.assertFalse(server._training_failed)
 
         asyncio.run(_run())
-        self.assertEqual(calls, {"training": 1, "sampling": 1})
+        # One retry inside the first call (the persistent-mismatch path reads both sides
+        # twice before disabling); the second call returns the latched result untouched.
+        self.assertEqual(calls, {"training": 2, "sampling": 2})
+
+    def test_weight_norm_transient_mismatch_is_not_disabled(self):
+        """A one-shot divergence (a step/sync landing between the two non-atomic reads) is retried, not latched."""
+        calls = {"training": 0, "sampling": 0}
+        hold = asyncio.Event()
+        hold.set()
+        worker = _Worker([], hold)
+
+        async def _norm():
+            calls["training"] += 1
+            return {"norm": 1.0, "num_params": 1}
+
+        async def _sampler_norm():
+            calls["sampling"] += 1
+            # Diverges only on the first read; agrees from the second read onward.
+            return {"norm": 2.0 if calls["sampling"] == 1 else 1.0, "num_params": 1}
+
+        worker.weight_norm = _Remote(_norm)
+        server = _server([worker])
+        server.jobs[2] = {"job_type": "sampling"}
+        server.sampling_pool = type("P", (), {})()
+        server.sampling_pool._workers = [type("W", (), {"compute_weight_norm": _Remote(_sampler_norm)})()]
+
+        async def _run():
+            result = await server.weight_norm(1, 2)
+            self.assertEqual(
+                result,
+                {"training_norm": 1.0, "sampling_norm": 1.0, "training_num_params": 1, "sampling_num_params": 1},
+            )
+            self.assertIsNone(server._weight_norm_disabled)
+
+        asyncio.run(_run())
+        self.assertEqual(calls, {"training": 2, "sampling": 2})
 
     def test_weight_sync_reports_a_checksum_mismatch_without_raising(self):
         """The sampler is already written when the checksum is read, so raising would not restore it."""
