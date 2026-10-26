@@ -33,6 +33,8 @@ from arctic_platform.model.loader import register_loader
 
 
 class GlmMoeDsaDebugOptions(BaseModel):
+    """Loader debug options (provider ``DebugModelConfig`` fields only)."""
+
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     num_layers: int | None = Field(None, gt=0)

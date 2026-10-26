@@ -26,9 +26,13 @@ from torch import nn
 from arctic_platform.model import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model import WeightExportContract
 from arctic_platform.model import gather_peft_adapter_state_dict
+from arctic_platform.model import hf_checkpoint_name_map
 from arctic_platform.model import hf_export_parameter_name
+from arctic_platform.model import hf_sync_name_map
 from arctic_platform.model import iter_lora_weights
 from arctic_platform.model import iter_model_weights
+from arctic_platform.model import read_checkpoint_weight_names
+from arctic_platform.model import requires_hf_weight_sync
 from arctic_platform.model import save_hf_pretrained
 from arctic_platform.model import save_peft_adapters
 from arctic_platform.model import supports_weight_format
@@ -391,3 +395,184 @@ def test_peft_wrapped_qwen3_5_moe_keeps_vllm_family_export(monkeypatch):
     names = _export_names(wrapped, "vllm", monkeypatch)
     assert "model.layers.0.mlp.gate.weight" in names
     assert "model.layers.0.mlp.experts.w13_weight" in names
+
+
+def _tiny_gemma3_checkpoint(tmp_path, checkpoint_name):
+    from safetensors.torch import save_file
+    from transformers import Gemma3Config
+    from transformers import Gemma3ForConditionalGeneration
+
+    config = Gemma3Config(
+        text_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 300,
+            "sliding_window": 8,
+        },
+        vision_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "image_size": 28,
+            "patch_size": 14,
+        },
+        mm_tokens_per_image=4,
+    )
+    state = {
+        checkpoint_name(name): tensor.contiguous()
+        for name, tensor in Gemma3ForConditionalGeneration(config).state_dict().items()
+        if name != "lm_head.weight"
+    }
+    config.save_pretrained(tmp_path)
+    save_file(state, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    return Gemma3ForConditionalGeneration.from_pretrained(tmp_path), set(state)
+
+
+def _nested_siglip(name):
+    return name.replace("model.vision_tower.", "model.vision_tower.vision_model.")
+
+
+def _legacy_llava(name):
+    name = _nested_siglip(name)
+    for live, saved in (
+        ("model.language_model.", "language_model.model."),
+        ("model.vision_tower.", "vision_tower."),
+        ("model.multi_modal_projector.", "multi_modal_projector."),
+    ):
+        if name.startswith(live):
+            return saved + name[len(live) :]
+    return name
+
+
+@pytest.mark.parametrize("with_checkpoint_dir", [False, True])
+@pytest.mark.parametrize("checkpoint_name", [_nested_siglip, _legacy_llava])
+def test_generic_hf_export_emits_the_loaded_checkpoint_names(tmp_path, checkpoint_name, with_checkpoint_dir):
+    model, checkpoint_names = _tiny_gemma3_checkpoint(tmp_path, checkpoint_name)
+    checkpoint_dir = str(tmp_path) if with_checkpoint_dir else None
+
+    exported = {
+        name
+        for name, _ in iter_model_weights(model, "hf", is_master=True, is_zero3=False, checkpoint_dir=checkpoint_dir)
+    }
+
+    assert "model.vision_tower.embeddings.patch_embedding.weight" in dict(model.named_parameters())
+    assert exported == checkpoint_names
+    assert requires_hf_weight_sync(model, checkpoint_dir)
+
+
+def test_hf_checkpoint_name_map_is_empty_without_load_renames():
+    assert hf_checkpoint_name_map(nn.Linear(2, 2)) == {}
+
+
+def _save_checkpoint_keys(path, names):
+    from safetensors.torch import save_file
+
+    save_file({name: torch.zeros(1) for name in names}, path / "model.safetensors")
+    return str(path)
+
+
+def _with_load_renames(monkeypatch, renames):
+    monkeypatch.setattr("arctic_platform.model.weight_export.hf_checkpoint_name_map", lambda _model: renames)
+
+
+def _named(*names):
+    return _Model([(name, nn.Parameter(torch.ones(1))) for name in names])
+
+
+def test_read_checkpoint_weight_names_prefers_the_index(tmp_path):
+    _save_checkpoint_keys(tmp_path, ["shard.weight"])
+    assert read_checkpoint_weight_names(str(tmp_path)) == {"shard.weight"}
+
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {"indexed.weight": "a"}}')
+    assert read_checkpoint_weight_names(str(tmp_path)) == {"indexed.weight"}
+    assert read_checkpoint_weight_names(str(tmp_path / "missing")) == set()
+
+
+def test_hf_sync_name_map_keeps_live_names_the_checkpoint_has(tmp_path, monkeypatch):
+    _with_load_renames(monkeypatch, {"model.layers.0.weight": "model.language_model.layers.0.weight"})
+    checkpoint_dir = _save_checkpoint_keys(tmp_path, ["model.layers.0.weight"])
+
+    assert hf_sync_name_map(_named("model.layers.0.weight"), checkpoint_dir) == {}
+
+
+def test_hf_sync_name_map_rejects_partial_translation(tmp_path, monkeypatch):
+    _with_load_renames(monkeypatch, {"vision.a.weight": "vision.vision_model.a.weight"})
+    checkpoint_dir = _save_checkpoint_keys(tmp_path, ["vision.vision_model.a.weight"])
+
+    with pytest.raises(RuntimeError, match="translation is incomplete"):
+        hf_sync_name_map(_named("vision.a.weight", "vision.b.weight", "lm_head.weight"), checkpoint_dir)
+
+
+def test_requires_hf_weight_sync_honors_model_flag_and_vllm_contract():
+    flagged = nn.Linear(2, 2)
+    flagged._requires_hf_weight_sync = True
+    direct = nn.Linear(2, 2)
+    register_weight_export(direct, WeightExportContract(vllm=lambda _model: lambda: iter(())))
+
+    assert requires_hf_weight_sync(flagged)
+    assert not requires_hf_weight_sync(direct)
+    assert not requires_hf_weight_sync(nn.Linear(2, 2))
+
+
+def test_generic_vllm_export_streams_unwrapped_names_without_a_contract():
+    model = _named("layers.0._checkpoint_wrapped_module.weight")
+
+    assert supports_weight_format(model, "vllm")
+    assert [name for name, _ in iter_model_weights(model, "vllm", is_master=True, is_zero3=False)] == [
+        "layers.0.weight"
+    ]
+
+
+def _install_gathered_parameters(monkeypatch, gathered):
+    deepspeed_module = ModuleType("deepspeed")
+    deepspeed_module.zero = SimpleNamespace(GatheredParameters=gathered)
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
+
+
+@pytest.mark.parametrize("is_master", [True, False])
+def test_generic_export_gathers_zero3_parameters_in_lockstep(monkeypatch, is_master):
+    full = torch.arange(4.0)
+    parameter = nn.Parameter(torch.empty(0))
+    parameter.ds_id = 0
+    entered = []
+
+    class GatheredParameters:
+        def __init__(self, gathered_parameter):
+            assert gathered_parameter is parameter
+
+        def __enter__(self):
+            entered.append(True)
+            parameter.data = full
+
+        def __exit__(self, *_exc):
+            parameter.data = torch.empty(0)
+
+    _install_gathered_parameters(monkeypatch, GatheredParameters)
+
+    weights = list(
+        iter_model_weights(_Model([("layers.0.weight", parameter)]), "hf", is_master=is_master, is_zero3=True)
+    )
+
+    assert entered == [True]
+    if is_master:
+        assert [name for name, _ in weights] == ["layers.0.weight"]
+        assert torch.equal(weights[0][1], full)
+    else:
+        assert weights == []
+
+
+@pytest.mark.parametrize("weight_format", ["hf", "vllm"])
+def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
+    parameter = nn.Parameter(torch.ones(2))
+    parameter.group_name = "ep_size_2"
+    parameter.allreduce = False
+    model = _Model([("experts.weight", parameter)])
+
+    assert not supports_weight_format(model, weight_format)
+    with pytest.raises(RuntimeError, match="EP-sharded models require an AP weight-export contract"):
+        list(iter_model_weights(model, weight_format, is_master=True, is_zero3=False))
