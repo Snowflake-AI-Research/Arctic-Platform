@@ -122,6 +122,21 @@ def _dssst1_result(payload: dict) -> dict:
 
 
 class TestForwardWire:
+    def test_chunked_frame_is_hashed_once(self, monkeypatch):
+        frame = wire.dumps({"x": torch.arange(20_000)})
+        original_sha256 = wire.hashlib.sha256
+        calls = []
+
+        def sha256(value):
+            calls.append(value)
+            return original_sha256(value)
+
+        monkeypatch.setattr(wire.hashlib, "sha256", sha256)
+        chunks = wire.encode_byte_chunks(frame, kind="request", max_bytes=16 * 1024)
+
+        assert len(chunks) > 1
+        assert calls == [frame]
+
     def test_posts_the_operation_envelope(self):
         """forward goes out as an /operation struct with the frame base64'd inside."""
         transport, send = _transport()

@@ -265,6 +265,7 @@ def _make_byte_chunk_frame(
     kind: str,
     operation: str | None,
     group_id: str | None,
+    frame_sha256: str,
     chunk_idx: int,
     total_chunks: int,
     start: int,
@@ -274,7 +275,7 @@ def _make_byte_chunk_frame(
     desc: dict[str, Any] = {
         "chunk_idx": chunk_idx,
         "total_chunks": total_chunks,
-        "frame_sha256": hashlib.sha256(frame).hexdigest(),
+        "frame_sha256": frame_sha256,
         "frame_size_bytes": len(frame),
     }
     if group_id is not None:
@@ -313,6 +314,7 @@ def encode_byte_chunks(
         import uuid
 
         group_id = str(uuid.uuid4())
+    frame_sha256 = hashlib.sha256(frame).hexdigest()
 
     if max_bytes <= 0:
         return [
@@ -321,6 +323,7 @@ def encode_byte_chunks(
                 kind=kind,
                 operation=operation,
                 group_id=group_id,
+                frame_sha256=frame_sha256,
                 chunk_idx=0,
                 total_chunks=1,
                 start=0,
@@ -338,6 +341,7 @@ def encode_byte_chunks(
                 kind=kind,
                 operation=operation,
                 group_id=group_id,
+                frame_sha256=frame_sha256,
                 chunk_idx=idx,
                 total_chunks=total,
                 start=start,
