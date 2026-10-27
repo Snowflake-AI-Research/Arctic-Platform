@@ -121,7 +121,8 @@ class DeepseekV41MoE(MoE):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend) and getattr(self.experts, "_ep_group", None) is not None:
-            routed = self._run_deepep_routed_experts(flat, selected, top_scores)
+            plan = self._expert_replica_plan(num_tokens_per_expert)
+            routed = self._run_deepep_routed_experts(flat, selected, top_scores, plan)
             return routed.reshape(batch, seq_len, dim)
 
         with _integer_histc_on_cpu():
