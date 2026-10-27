@@ -426,6 +426,22 @@ def _reinit_timeout_s():
     return _env_seconds(_REINIT_TIMEOUT_ENV, _REINIT_TIMEOUT_DEFAULT_S)
 
 
+# What a single-node child takes from the restoring job at reinit_nccl: the
+# NCCL and aws-ofi-nccl settings a communicator to another pod (a trainer's
+# weight sync) is built with. NCCL_DEBUG_FILE names a FILE* that did not
+# survive the dump, NVLS stays off for the restore's own reasons, and a
+# /proc/self/fd path means this process's fd, not the child's.
+_JOB_NCCL_ENV_PREFIXES = ("NCCL_", "OFI_NCCL_", "FI_")
+_JOB_NCCL_ENV_SKIP = frozenset({"NCCL_DEBUG_FILE", "NCCL_NVLS_ENABLE"})
+
+
+def _job_nccl_env():
+    """This job's NCCL, aws-ofi-nccl and libfabric settings."""
+    return {k: v for k, v in os.environ.items()
+            if k.startswith(_JOB_NCCL_ENV_PREFIXES) and k not in _JOB_NCCL_ENV_SKIP
+            and not v.startswith("/proc/self/fd/")}
+
+
 def _settle_timeout_s():
     """How long to wait for a CRIU-restored tree to quiesce, in seconds.
 
@@ -2037,6 +2053,10 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # cuda_restore succeeds (or the worker is torn down).
     cuda_broken = False
     cuda_broken_reason = None
+    # Set by a failed `sleep`, cleared by a later one that succeeds.  An
+    # engine that did not sleep still holds its weights and KV cache, so a
+    # checkpoint would capture all of it; refuse instead.
+    sleep_error = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -2054,6 +2074,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             _kill_process_tree(child_pid)
             log.info("exited")
             break
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and sleep_error is not None:
+            log.error("<<< %s FAILED (the engine failed to sleep: %s)",
+                      cmd, sleep_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
 
         if cmd == "cuda_checkpoint":
             _drain_pipe_generates()
@@ -2345,6 +2372,9 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                 # Resolve the budget here, where the environment is live, and
                 # hand it over as a kwarg.
                 kwargs = dict(kwargs, timeout_s=_reinit_timeout_s())
+            if cmd == "reinit_nccl" and "job_nccl_env" not in kwargs:
+                # Likewise for the NCCL settings the child applies there.
+                kwargs = dict(kwargs, job_nccl_env=_job_nccl_env())
             pipe.send((cmd, kwargs))
             result = _recv_sync()
         except (BrokenPipeError, ConnectionResetError, EOFError) as _pipe_err:
@@ -2368,6 +2398,8 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
         _result_cmd, _, _result_error, _ = result
+        if _result_cmd == "sleep":
+            sleep_error = _result_error
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True

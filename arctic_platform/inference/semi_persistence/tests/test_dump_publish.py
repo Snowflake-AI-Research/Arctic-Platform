@@ -1,7 +1,7 @@
 """Unit tests for ``SEMIP_DUMP_PUBLISH``: a miss dumps and publishes only on request.
 
 Loads ``server/semip_engine.py`` from its file the way ``test_image_cache_key``
-does, and drives ``restore_and_wrap`` with every GPU-, CRIU- and cluster-facing
+does, and drives ``restore_engine`` with every GPU-, CRIU- and cluster-facing
 step replaced, so what is tested is the decision: refuse the miss, or dump,
 restore and then publish.
 
@@ -67,7 +67,7 @@ def publish_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
-    """``restore_and_wrap`` with everything outside the decision recorded."""
+    """``restore_engine`` with everything outside the decision recorded."""
     calls = {"dump": 0, "restore": 0, "publish": []}
     paths = _paths(tmp_path)
     sys.modules["semip_logging"] = types.SimpleNamespace(
@@ -130,21 +130,21 @@ def test_miss_error_points_at_a_published_image_it_could_not_use():
 
 
 # --------------------------------------------------------------------------
-# restore_and_wrap's miss path
+# restore_engine's miss path
 # --------------------------------------------------------------------------
 
 
 def test_miss_without_the_flag_fails_before_dumping(engine):
     calls, _ = engine
     with pytest.raises(RuntimeError, match="semi_p to false"):
-        se.restore_and_wrap({})
+        se.restore_engine({})
     assert calls == {"dump": 0, "restore": 0, "publish": []}
 
 
 def test_miss_with_the_flag_dumps_restores_then_publishes(engine, monkeypatch):
     calls, paths = engine
     monkeypatch.setenv(se._DUMP_PUBLISH_ENV, "1")
-    assert se.restore_and_wrap({}) == "engine"
+    assert se.restore_engine({}) == "engine"
     assert calls["dump"] == 1 and calls["restore"] == 1
     assert calls["publish"] == [(paths, None, 1)]
 
@@ -156,7 +156,7 @@ def test_a_local_hit_ignores_the_flag(engine, monkeypatch):
     with open(os.path.join(image, "meta.json"), "w") as handle:
         handle.write("{}")
     monkeypatch.setenv(se._DUMP_PUBLISH_ENV, "1")
-    assert se.restore_and_wrap({}) == "engine"
+    assert se.restore_engine({}) == "engine"
     assert calls == {"dump": 0, "restore": 1, "publish": []}
 
 
@@ -164,7 +164,7 @@ def test_a_materialized_copy_needs_no_flag_and_publishes_nothing(engine,
                                                                  monkeypatch):
     calls, _ = engine
     monkeypatch.setattr(se, "_materialize_from_source", lambda *a, **k: True)
-    assert se.restore_and_wrap({}) == "engine"
+    assert se.restore_engine({}) == "engine"
     assert calls == {"dump": 0, "restore": 1, "publish": []}
 
 
@@ -177,7 +177,7 @@ def test_a_failed_restore_after_the_dump_publishes_nothing(engine, monkeypatch):
 
     monkeypatch.setattr(se, "_restore_with_port_retry", broken)
     with pytest.raises(RuntimeError, match="restore failed"):
-        se.restore_and_wrap({})
+        se.restore_engine({})
     assert calls["dump"] == 1 and calls["publish"] == []
 
 
