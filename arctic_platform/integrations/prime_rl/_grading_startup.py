@@ -131,8 +131,7 @@ def _apply() -> None:
             issues = [
                 str(status)
                 for tc in (result.get("tool_calls") or [])
-                if (status := getattr(tc, "status", None)) is not None
-                and status != ToolCallParseStatus.OK
+                if (status := getattr(tc, "status", None)) is not None and status != ToolCallParseStatus.OK
             ] or None
             try:
                 object.__setattr__(response, "parse_issues", issues)

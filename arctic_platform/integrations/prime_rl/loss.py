@@ -30,7 +30,8 @@ Masked tokens stay in the token-mean denominator on both sides.
 
 from typing import Any
 
-from prime_rl.configs.trainer import CISPOLossConfig, IPOLossConfig
+from prime_rl.configs.trainer import CISPOLossConfig
+from prime_rl.configs.trainer import IPOLossConfig
 
 
 def grpo_processing(loss: IPOLossConfig | CISPOLossConfig) -> dict[str, Any]:

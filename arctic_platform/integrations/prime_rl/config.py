@@ -16,18 +16,16 @@
 import os
 from typing import Any
 
-from pydantic import Field, model_validator
-from renderers import RendererConfig
-
 from prime_rl.configs.rl import RLConfig
-from prime_rl.configs.trainer import (
-    AdamWConfig,
-    CISPOLossConfig,
-    ConstantSchedulerConfig,
-    IPOLossConfig,
-    TrainerConfig,
-)
+from prime_rl.configs.trainer import AdamWConfig
+from prime_rl.configs.trainer import CISPOLossConfig
+from prime_rl.configs.trainer import ConstantSchedulerConfig
+from prime_rl.configs.trainer import IPOLossConfig
+from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig
+from pydantic import Field
+from pydantic import model_validator
+from renderers import RendererConfig
 
 
 class CortexConnectionConfig(BaseConfig):

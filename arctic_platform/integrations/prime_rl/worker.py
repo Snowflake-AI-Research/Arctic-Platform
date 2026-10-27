@@ -41,24 +41,29 @@ from typing import Any
 
 import orjson
 from aiohttp import web
-from arctic_platform.client import ArcticClientConfig, ArcticRLClient, AsyncArcticRLClient
-from arctic_platform.client import CortexConfig as ArcticCortexConfig
-from arctic_platform.client.requests import sync_weights_request
-from renderers import Renderer, ToolCallParseStatus, create_renderer
-from renderers.base import load_tokenizer
-
 from prime_rl import monitors
-from prime_rl.transports.batch import MicroBatch, setup_batch_receiver
-from prime_rl.transports.weights.base import (
-    FINISHED_MARKER,
-    RECEIVER_READY_MARKER,
-    SENDER_READY_MARKER,
-    STARTED_MARKER,
-)
+from prime_rl.transports.batch import MicroBatch
+from prime_rl.transports.batch import setup_batch_receiver
+from prime_rl.transports.weights.base import FINISHED_MARKER
+from prime_rl.transports.weights.base import RECEIVER_READY_MARKER
+from prime_rl.transports.weights.base import SENDER_READY_MARKER
+from prime_rl.transports.weights.base import STARTED_MARKER
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
-from prime_rl.utils.pathing import get_all_ckpt_steps, get_broadcast_dir, get_step_path
+from prime_rl.utils.pathing import get_all_ckpt_steps
+from prime_rl.utils.pathing import get_broadcast_dir
+from prime_rl.utils.pathing import get_step_path
 from prime_rl.utils.process import set_proc_title
+from renderers import Renderer
+from renderers import ToolCallParseStatus
+from renderers import create_renderer
+from renderers.base import load_tokenizer
+
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import ArcticRLClient
+from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import CortexConfig as ArcticCortexConfig
+from arctic_platform.client.requests import sync_weights_request
 
 from .config import CortexWorkerConfig
 from .jobs import sub_job_id
@@ -193,7 +198,10 @@ class CortexWorker:
     async def generate(self, prompt_ids: list[int], sampling_params: dict[str, Any], routing_key: str | None) -> dict:
         if len(prompt_ids) >= self.config.max_model_len:
             raise web.HTTPBadRequest(
-                text=f"Prompt of {len(prompt_ids)} tokens leaves no room under max_model_len {self.config.max_model_len}"
+                text=(
+                    f"Prompt of {len(prompt_ids)} tokens leaves no room under max_model_len"
+                    f" {self.config.max_model_len}"
+                )
             )
         params = sanitize_sampling_params(
             sampling_params, prompt_len=len(prompt_ids), max_model_len=self.config.max_model_len
@@ -211,7 +219,9 @@ class CortexWorker:
         if body.get("features") is not None or body.get("content_parts") is not None:
             raise web.HTTPBadRequest(text="Cortex sampling serves text-only prompts.")
         prompt_ids = [int(token_id) for token_id in body["token_ids"]]
-        result = await self.generate(prompt_ids, body.get("sampling_params") or {}, request.headers.get(SESSION_ID_HEADER))
+        result = await self.generate(
+            prompt_ids, body.get("sampling_params") or {}, request.headers.get(SESSION_ID_HEADER)
+        )
         token_ids = completion_token_ids(result)
         logprobs = sampled_logprobs(result, token_ids)
         response = {
@@ -247,7 +257,9 @@ class CortexWorker:
         messages, tools = body["messages"], body.get("tools")
         sampling_params = {key: body[key] for key in CHAT_SAMPLING_KEYS if body.get(key) is not None}
         sampling_params.update(body.get("extra_body") or {})
-        renderer = self.renderer_for(sampling_params.pop("chat_template_kwargs", None) or body.get("chat_template_kwargs"))
+        renderer = self.renderer_for(
+            sampling_params.pop("chat_template_kwargs", None) or body.get("chat_template_kwargs")
+        )
         async with self.renderer_lock:
             rendered = await asyncio.to_thread(renderer.render, messages, tools=tools, add_generation_prompt=True)
         prompt_ids = list(rendered.token_ids)
@@ -266,7 +278,11 @@ class CortexWorker:
                 "type": "function",
                 "function": {
                     "name": call.name,
-                    "arguments": call.arguments if isinstance(call.arguments, str) else orjson.dumps(call.arguments or {}).decode(),
+                    "arguments": (
+                        call.arguments
+                        if isinstance(call.arguments, str)
+                        else orjson.dumps(call.arguments or {}).decode()
+                    ),
                 },
             }
             for call in parsed.tool_calls
@@ -383,7 +399,9 @@ class CortexWorker:
         deadline = time.monotonic() + self.trainer.weight_broadcast.timeout
         while not (step_dir / RECEIVER_READY_MARKER).exists():
             if time.monotonic() > deadline:
-                raise TimeoutError(f"No receiver acknowledged policy v{step} within {self.trainer.weight_broadcast.timeout}s")
+                raise TimeoutError(
+                    f"No receiver acknowledged policy v{step} within {self.trainer.weight_broadcast.timeout}s"
+                )
             await asyncio.sleep(0.1)
         (step_dir / STARTED_MARKER).touch()
         timings = await self.sync_weights() if sync else {}
@@ -455,9 +473,10 @@ class CortexWorker:
             )
             await monitors.log(metrics, step=step)
             self.logger.success(
-                f"Step {step} | {metrics['time/step']:.1f}s | Loss {metrics.get('loss/mean', float('nan')):.4f} | "
-                f"Grad norm {metrics.get('optim/grad_norm', float('nan')):.4f} | "
-                f"{int(batch_stats['batch/num_samples'])} samples, {int(batch_stats['batch/num_loss_tokens'])} loss tokens"
+                f"Step {step} | {metrics['time/step']:.1f}s | Loss {metrics.get('loss/mean', float('nan')):.4f} | Grad"
+                f" norm {metrics.get('optim/grad_norm', float('nan')):.4f} |"
+                f" {int(batch_stats['batch/num_samples'])} samples, {int(batch_stats['batch/num_loss_tokens'])} loss"
+                " tokens"
             )
             step += 1
 

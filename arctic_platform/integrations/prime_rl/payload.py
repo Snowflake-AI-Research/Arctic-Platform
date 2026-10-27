@@ -26,7 +26,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from prime_rl.transports.batch import MicroBatch
 
 
@@ -86,10 +85,7 @@ def build_fwd_bwd_payload(
     LM head requires; the default (dense) provider's forward takes no such kwarg, so pass False.
     """
     samples = [
-        sample
-        for micro_batch in micro_batches
-        for sample in _split_samples(micro_batch)
-        if sample.loss_mask[1:].any()
+        sample for micro_batch in micro_batches for sample in _split_samples(micro_batch) if sample.loss_mask[1:].any()
     ]
     if not samples:
         raise ValueError("The training batch has no trainable tokens.")

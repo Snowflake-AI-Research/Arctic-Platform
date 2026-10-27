@@ -25,11 +25,14 @@ import time
 from typing import Any
 
 import httpx
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential_jitter
-
 from prime_rl.utils.logger import get_logger
+from tenacity import Retrying
+from tenacity import retry_if_exception
+from tenacity import stop_after_attempt
+from tenacity import wait_exponential_jitter
 
-from .config import CortexConnectionConfig, CortexRLConfig
+from .config import CortexConnectionConfig
+from .config import CortexRLConfig
 
 JOB_TERMINAL_STATES = ("failed", "done", "cancelled", "canceled")
 SUB_JOB_TYPES = ("training", "sampling")
