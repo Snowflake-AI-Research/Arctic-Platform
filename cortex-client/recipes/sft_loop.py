@@ -57,7 +57,7 @@ class Config:
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
     seed: int = 42
-    # huggingface for dense / LoRA; prime_rl for MoE with expert parallelism.
+    # huggingface for dense / LoRA; arctic for MoE with expert parallelism.
     model_provider: str = "huggingface"
     ep_size: int | None = None
 
