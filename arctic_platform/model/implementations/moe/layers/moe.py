@@ -879,15 +879,18 @@ class MoE(nn.Module):
 
         return routed_output
 
-    def _expert_replica_plan(self, num_tokens_per_expert: torch.Tensor):
-        """This micro-batch's spare-slot plan (``moe/expert_replicas.py``), or None without ``ARL_EXPERT_REPLICAS``.
-        The first registered layer replans at the start of each graph-building forward, so a micro-batch's forward,
-        recompute and backward share one plan."""
+    def _expert_replica_plan(self, num_tokens_per_expert: torch.Tensor, selected_experts_indices: torch.Tensor):
+        """This micro-batch's spare-slot plan (``moe/expert_replicas.py``, or ``moe/ultraep_replicas.py`` with
+        ``ARL_ULTRAEP_SPARES``), or None without either. The first registered layer replans at the start of each
+        graph-building forward (UltraEP: every forward plans its own call), so a micro-batch's forward, recompute and
+        backward share one plan."""
         from ..distributed.expert_parallel import get_ep_group
         from ..expert_replicas import manager_for
         from ..expert_replicas import replica_spares
+        from ..ultraep_replicas import ultraep_plan
+        from ..ultraep_replicas import ultraep_spares
 
-        if not replica_spares():
+        if not replica_spares() and not ultraep_spares():
             return None
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
@@ -895,6 +898,10 @@ class MoE(nn.Module):
             return None
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        if ultraep_spares():
+            _install_recompute_detector()
+            return ultraep_plan(self, experts, group, selected_experts_indices, building=not _in_recompute())
 
         if self._replica_index < 0:
             _install_recompute_detector()
@@ -1054,7 +1061,7 @@ class MoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            plan = self._expert_replica_plan(num_tokens_per_expert)
+            plan = self._expert_replica_plan(num_tokens_per_expert, selected_experts_indices)
             routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores, plan)
             return routed_output.reshape(bs, slen, dim)
 
