@@ -305,32 +305,18 @@ def _run_experts_grouped_mm_impl(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
-    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
     _offsets_must_cover_no_more_than_the_rows("gated", x, num_tokens_per_expert, offsets)
 
-    if x.is_cuda and scores is not None and not (w1.requires_grad or w2.requires_grad or w3.requires_grad):
-        from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
-
-        # Frozen gate and up stacked: one GEMM each way instead of two plus a sum of their input gradients.
-        w13 = torch.cat([w1, w3], dim=-2).bfloat16()
-        gate_up = torch._grouped_mm(x.bfloat16(), w13.transpose(-2, -1), offs=offsets)
-        rows = int(offsets[-1])
-        return scored_swiglu_down(gate_up, scores, w2, None, offsets, rows, limit=swiglu_limit).type_as(x)
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    if gate.is_cuda:
-        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
-
-        h = fused_swiglu(gate, up, swiglu_limit)
-    else:
-        h = _apply_swiglu(gate, up, swiglu_limit)
+    h = _apply_swiglu(gate, up, swiglu_limit)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
-    return out if scores is None else apply_routing_weights(out, scores)
+    return out
 
 
 class _AddIntoRows(torch.autograd.Function):
@@ -488,7 +474,9 @@ class GroupedExperts(nn.Module):
     def _forward_deepep(
         self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if scores is not None and not (self.use_grouped_mm and x.is_cuda):
+        # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can;
+        # the other paths scale their outputs here.
+        if scores is not None and not (self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda):
             return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -558,7 +546,7 @@ class GroupedExperts(nn.Module):
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
+            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
 
     def forward(
