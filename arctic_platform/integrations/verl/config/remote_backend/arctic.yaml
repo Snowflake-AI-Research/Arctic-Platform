@@ -46,6 +46,9 @@ train:
   # ZoRRo packing. False preserves arrival order.
   balance_batch: True
 
+  # False asks a Cortex training job for unpacked rows, so verl_grpo reaches it unchanged. ZoRRo is always unpacked. On-prem always runs unpacked and ignores this.
+  pack: True
+
   # ZoRRO training path. Server reads these flat (`zorro_train_<key>`) from ds_worker_config and per-call meta.
   zorro_train:
 
@@ -120,5 +123,7 @@ rollout:
 # Trainer <-> RL server communication settings.
 comms:
 
+  # ray or http. Cortex smokes set http; the on-prem default is ray.
+  protocol: ray
   # Drop position_ids on the wire; server reconstructs from attention_mask. Set False for mrope / 3D rope.
   drop_position_ids: True

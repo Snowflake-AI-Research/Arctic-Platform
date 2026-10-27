@@ -296,10 +296,18 @@ def test_stamp_and_apply_keep_explicit_true():
     from arctic_platform.common.balance_metadata import stamp_balance_meta
 
     prompts = torch.tensor([[1, 1], [1, 1], [2, 2], [2, 2]])
-    meta = {"load_balancer": True, "zorro_train_enable": True, "rollout_n": 2}
+    meta = {
+        "load_balancer": True,
+        "zorro_load_balancer": True,
+        "zorro_train_load_balancer": True,
+        "zorro_train_enable": True,
+        "rollout_n": 2,
+    }
     stamp_balance_meta(meta, balance_batch=True, zorro_train_enable=True, prompts=prompts, rollout_n=2)
     assert meta["balance_batch"] is True
     assert "load_balancer" not in meta
+    assert "zorro_load_balancer" not in meta
+    assert "zorro_train_load_balancer" not in meta
     assert meta["prompt_group_ids"].tolist() == [0, 0, 1, 1]
 
     context = {}
