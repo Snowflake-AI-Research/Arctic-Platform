@@ -14,11 +14,10 @@
 # limitations under the License.
 """Harbor environment backed by Snowflake Cortex Sandboxes.
 
-Use it from Harbor with ``--env snowflake`` (when installed from upstream
-Harbor) or the import-path form::
+Use it from Harbor with ``--env snowflake``::
 
-    harbor run -d terminal-bench@2.0 -a openhands-sdk \\
-        --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \\
+    harbor run -d terminal-bench@2.0 -a oracle \\
+        --env snowflake \\
         --ek connection=MY_CONNECTION --ek role=MY_ROLE \\
         --ek image_repo=DB.SCHEMA.REPO
 
@@ -33,13 +32,17 @@ import fnmatch
 import logging
 import re
 import shlex
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from typing import Literal
 from typing import override
 
+import pathspec
 from harbor.environments.base import BaseEnvironment
 from harbor.environments.base import ExecResult
 from harbor.environments.base import SandboxBuildFailedError
@@ -56,17 +59,21 @@ from arctic_platform.integrations.harbor.snowflake_sandbox import transfer
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import CopyStep
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import ReplayPlan
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import RunStep
+from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import UnsupportedDockerfileError
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import base_image
+from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import is_archive_file
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import plan_from_dockerfile
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import ImageRegistry
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import get_registry
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import LOST_EXIT
+from arctic_platform.integrations.harbor.snowflake_sandbox.shell import TIMED_OUT_MARKER
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import build_exec_argv
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import is_root
 
 try:
     from snowflake.sandbox import AsyncSandbox
     from snowflake.sandbox import Egress
+    from snowflake.sandbox.exceptions import SandboxExecError
     from snowflake.sandbox.exceptions import SandboxTransportError
 
     from arctic_platform.integrations.harbor.snowflake_sandbox.session import get_config
@@ -78,20 +85,40 @@ except ImportError:  # pragma: no cover - exercised only without the SDK
     class SandboxTransportError(Exception):  # type: ignore[no-redef]
         pass
 
+    class SandboxExecError(Exception):  # type: ignore[no-redef]
+        exit_code: int | None = None
+
 
 logger = logging.getLogger(__name__)
 
 ENVIRONMENT_TYPE = "snowflake-sandbox"
 
-_MEMORY_TIERS_GIB = (1, 4, 8, 16, 32, 64)
+MemoryTier = Literal["1g", "4g", "8g", "16g", "32g", "64g"]
+_MEMORY_TIERS: tuple[tuple[int, MemoryTier], ...] = (
+    (1, "1g"),
+    (4, "4g"),
+    (8, "8g"),
+    (16, "16g"),
+    (32, "32g"),
+    (64, "64g"),
+)
+# Preview limit is 100 live sandboxes per owner; leave headroom for other work.
 _DEFAULT_MAX_LIVE = 90
+# The SDK's own default exec budget is 3600s; agent turns can run longer.
 _DEFAULT_EXEC_TIMEOUT_S = 7200
-_SIGKILL_EXIT = 137
+# Extra stream budget beyond a command's own timeout, and re-attach attempts
+# after the exec stream drops.
 _STREAM_SLACK_S = 120
 _MAX_REATTACH = 5
 _LIVE_SLOTS: dict[int, asyncio.Semaphore] = {}
 _warned: set[str] = set()
 
+# Sandbox root has no capabilities, so apt can't drop privileges to `_apt` or
+# write its `_apt`-owned partial dirs. Run apt as root with root-owned cache and
+# list dirs, and drop Docker's apt-clean hook, which targets the old cache path.
+# The platform bind-mounts its own CA bundle (it also trusts the egress proxy),
+# so `update-ca-certificates` can't replace it; divert it behind a shim that
+# leaves the mounted bundle alone, so installing ca-certificates succeeds.
 _SANDBOX_PREP = r"""
 if [ -d /etc/apt/apt.conf.d ]; then
   mkdir -p /var/tmp/apt-cache/archives/partial /var/tmp/apt-lists/partial
@@ -132,15 +159,15 @@ def _csv(value: Any) -> tuple[str, ...]:
     return tuple(v.strip() for v in str(value).split(",") if v.strip())
 
 
-def memory_tier(memory_mb: int | None) -> str:
+def memory_tier(memory_mb: int | None) -> MemoryTier:
     """Smallest sandbox memory tier that fits ``memory_mb`` (default 4g)."""
     if not memory_mb:
         return "4g"
-    for gib in _MEMORY_TIERS_GIB:
+    for gib, tier in _MEMORY_TIERS:
         if memory_mb <= gib * 1024:
-            return f"{gib}g"
+            return tier
     raise ValueError(
-        f"Task needs {memory_mb} MB of memory; Cortex Sandboxes offer at most {_MEMORY_TIERS_GIB[-1]} GiB."
+        f"Task needs {memory_mb} MB of memory; Cortex Sandboxes offer at most {_MEMORY_TIERS[-1][0]} GiB."
     )
 
 
@@ -148,16 +175,30 @@ def _sandbox_tag(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value)[:120]
 
 
+def _load_dockerignore(context: Path) -> pathspec.PathSpec | None:
+    ignore_file = context / ".dockerignore"
+    if not ignore_file.is_file():
+        return None
+    lines = [
+        line.strip()
+        for line in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    return pathspec.PathSpec.from_lines("gitignore", lines) if lines else None
+
+
 class SnowflakeSandboxEnvironment(BaseEnvironment):
-    """Runs each Harbor trial in its own Cortex Sandbox container."""
+    """Runs each Harbor trial in its own Snowflake Cortex Sandbox container."""
 
     @classmethod
     @override
     def preflight(cls) -> None:
         if not _HAS_SDK:
             raise SystemExit(
-                "The Snowflake sandbox environment needs the Cortex Sandboxes SDK: "
-                "pip install snowflake-sandbox-python"
+                "The Snowflake sandbox environment needs the Cortex Sandboxes SDK. "
+                "Install it with:\n"
+                "  pip install 'harbor[snowflake]'\n"
+                "  uv tool install 'harbor[snowflake]'"
             )
         ImageRegistry.preflight()
 
@@ -181,8 +222,32 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         run_entrypoint: bool | str = True,
         **kwargs: Any,
     ) -> None:
+        """
+        Args:
+            connection: Snowflake connection name (``~/.snowflake/config.toml``).
+            role: Role the sandbox session runs as; it also needs USAGE/READ on
+                ``image_repo`` (and WRITE to mirror images into it).
+            image_repo: ``DATABASE.SCHEMA.REPOSITORY`` that task images are
+                mirrored into. Required unless every task uses a sandbox-path
+                ``prebuilt_image``.
+            prebuilt_image: Skip image resolution and use this image: either a
+                sandbox path (``/db/schema/repo/name:tag``) or a registry ref to
+                mirror.
+            egress_eai: Comma-separated external access integrations granted to
+                every sandbox. Needed for tasks or agents that reach hosts
+                outside Snowflake and the public package registries.
+            no_network_mode: ``reject`` (default) refuses ``no-network`` tasks,
+                because a closed sandbox can still reach Snowflake. ``closed``
+                runs them with ``Egress.only()`` anyway.
+            max_live: Cap on concurrently live sandboxes in this process.
+            exec_timeout_sec: Exec budget when Harbor passes no timeout.
+            idle_suspend: Sandbox idle-suspend timeout (platform default is 10m).
+            run_entrypoint: Start the image ENTRYPOINT at startup, as Docker does.
+        """
         if not _HAS_SDK:
             self.preflight()
+        # Read by `capabilities` and `_validate_definition`, which
+        # BaseEnvironment.__init__ calls, so they must exist before super().
         self._no_network_mode = str(no_network_mode).strip().lower()
         if self._no_network_mode not in {"reject", "closed"}:
             raise ValueError("no_network_mode must be 'reject' or 'closed'")
@@ -210,8 +275,17 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         self._workdir: str | None = None
         self._image_user: str | None = None
         self._entrypoint: list[str] | None = None
-        self._run_entrypoint = str(run_entrypoint).strip().lower() not in {"0", "false", "no", "off"}
+        self._base_env: dict[str, str] = {}
+        self._replay_env: dict[str, str] = {}
+        self._run_entrypoint = str(run_entrypoint).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         self._finished_execs: list[str] = []
+
+    # -- identity and capabilities ---------------------------------------
 
     @staticmethod
     @override
@@ -226,6 +300,10 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
     @property
     @override
     def capabilities(self) -> EnvironmentCapabilities:
+        # Egress is fixed at create time, and a "closed" sandbox can still
+        # reach Snowflake, so no-network is only claimed when the user opts in.
+        # Per-task host allowlists aren't supported: grants come from
+        # pre-created external access integrations, not the task's host list.
         return EnvironmentCapabilities(disable_internet=self._no_network_mode == "closed")
 
     @property
@@ -234,14 +312,16 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
 
     @override
     def _validate_definition(self) -> None:
+        if (self.environment_dir / "docker-compose.yaml").exists() or self.extra_docker_compose_paths:
+            raise ValueError("docker-compose tasks aren't supported by the Snowflake sandbox environment")
         if self._prebuilt_image:
             return
         require_agent_environment_definition(
             self.environment_dir,
             docker_image=self.task_env_config.docker_image,
         )
-        if (self.environment_dir / "docker-compose.yaml").exists():
-            raise ValueError("docker-compose tasks aren't supported by the Snowflake sandbox environment")
+
+    # -- sandbox handle ---------------------------------------------------
 
     def _require_sandbox(self) -> AsyncSandbox:
         if self._sandbox is None:
@@ -252,53 +332,90 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         return _LIVE_SLOTS.setdefault(self._max_live, asyncio.Semaphore(self._max_live))
 
     def _egress(self) -> Egress:
+        assert self.network_policy is not None
         if self.network_policy.network_mode == NetworkMode.NO_NETWORK:
             return Egress.only()
         if self._egress_eais:
             return Egress(external_access_integrations=self._egress_eais)
         return Egress()
 
-    async def _mirror(self, ref: str) -> str:
+    # -- image resolution -------------------------------------------------
+
+    async def _mirror(self, ref: str, *, force_build: bool = False) -> str:
         if ref.startswith("/"):
-            return ref
+            return ref  # already a sandbox image path
         if not self._image_repo:
             raise ValueError(
                 f"Task image {ref!r} must be mirrored into Snowflake: pass --ek image_repo=DATABASE.SCHEMA.REPOSITORY"
             )
         registry = get_registry(self._image_repo, connection=self._connection, role=self._role)
-        return await registry.ensure_image(ref)
+        return await registry.ensure_image(ref, force_build=force_build)
 
     async def _resolve_image(self, force_build: bool) -> tuple[str, ReplayPlan | None]:
+        """Return the sandbox image path and, for Dockerfile tasks, the replay plan."""
         if self._prebuilt_image:
-            image = await self._mirror(self._prebuilt_image)
-            self._workdir, self._image_user, self._entrypoint = await self._image_defaults(image)
+            image = await self._mirror(self._prebuilt_image, force_build=force_build)
+            (
+                self._workdir,
+                self._image_user,
+                self._entrypoint,
+                self._base_env,
+            ) = await self._image_defaults(image)
             return image, None
         docker_image = self.task_env_config.docker_image
         if should_use_prebuilt_docker_image(self.environment_dir, docker_image=docker_image, force_build=force_build):
-            image = await self._mirror(docker_image)
-            self._workdir, self._image_user, self._entrypoint = await self._image_defaults(image)
+            assert docker_image is not None
+            image = await self._mirror(docker_image, force_build=force_build)
+            (
+                self._workdir,
+                self._image_user,
+                self._entrypoint,
+                self._base_env,
+            ) = await self._image_defaults(image)
             return image, None
-        image = await self._mirror(base_image(self._dockerfile))
-        workdir, user, entrypoint = await self._image_defaults(image)
-        plan = plan_from_dockerfile(self._dockerfile, base_workdir=workdir, base_user=user, base_entrypoint=entrypoint)
+        image = await self._mirror(base_image(self._dockerfile), force_build=force_build)
+        workdir, user, entrypoint, base_env = await self._image_defaults(image)
+        self._base_env = base_env
+        try:
+            plan = plan_from_dockerfile(
+                self._dockerfile,
+                base_workdir=workdir,
+                base_user=user,
+                base_entrypoint=entrypoint,
+                base_env=base_env,
+            )
+        except UnsupportedDockerfileError as e:
+            raise SandboxBuildFailedError(str(e)) from e
         self._entrypoint = plan.entrypoint
         return image, plan
 
-    async def _image_defaults(self, image: str) -> tuple[str | None, str | None, list[str] | None]:
+    async def _image_defaults(self, image: str) -> tuple[str | None, str | None, list[str] | None, dict[str, str]]:
+        """WORKDIR, USER, ENTRYPOINT and ENV baked into ``image``, so exec matches Docker."""
         if not self._image_repo:
-            return None, None, None
+            return None, None, None, {}
         registry = get_registry(self._image_repo, connection=self._connection, role=self._role)
         try:
             config = await registry.image_config(image)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - metadata only; don't fail the trial over it
             logger.warning("Couldn't read image config for %s: %s", image, e)
-            return None, None, None
+            return None, None, None, {}
         workdir = config.get("WorkingDir") or None
         user = (config.get("User") or "").split(":")[0] or None
         entrypoint = config.get("Entrypoint") or None
-        return workdir, None if user in ("root", "0") else user, entrypoint
+        env_map: dict[str, str] = {}
+        for item in config.get("Env") or []:
+            if isinstance(item, str) and "=" in item:
+                k, v = item.split("=", 1)
+                env_map[k] = v
+        return (
+            workdir,
+            None if user in ("root", "0") else user,
+            entrypoint,
+            env_map,
+        )
 
     async def _start_entrypoint(self) -> None:
+        """Start the image ENTRYPOINT detached, as `docker run` would."""
         assert self._entrypoint is not None
         argv = [*self._entrypoint, "sh", "-c", "sleep infinity"]
         launch = (
@@ -309,13 +426,20 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         )
         result = await self.exec(launch, user="root", timeout_sec=60)
         if result.return_code != 0:
-            logger.warning("Couldn't start image ENTRYPOINT %s: %s", argv, result.stderr[-300:])
+            err_tail = (result.stderr or "")[-300:]
+            logger.warning("Couldn't start image ENTRYPOINT %s: %s", argv, err_tail)
+
+    # -- lifecycle --------------------------------------------------------
 
     @override
     async def start(self, force_build: bool) -> None:
         image, plan = await self._resolve_image(force_build)
 
-        if self.network_policy.network_mode == NetworkMode.PUBLIC and not self._egress_eais:
+        if (
+            self.network_policy is not None
+            and self.network_policy.network_mode == NetworkMode.PUBLIC
+            and not self._egress_eais
+        ):
             logger.warning(
                 "No egress_eai configured: sandboxes reach Snowflake and public package "
                 "registries only, not the general internet."
@@ -324,7 +448,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         await self._slots().acquire()
         self._slot_held = True
         try:
-            env = {**(plan.env if plan else {}), **self._startup_env()}
+            env = {**self._base_env, **self._startup_env()}
             started = time.monotonic()
             config = await get_config(self._connection, self._role)
             self._sandbox = await AsyncSandbox.create(
@@ -348,9 +472,15 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             )
             prep = await self.exec(_SANDBOX_PREP, user="root")
             if prep.return_code != 0:
-                logger.warning("Sandbox prep failed (%s): %s", prep.return_code, prep.stderr[-300:])
+                prep_tail = (prep.stderr or "")[-300:]
+                logger.warning(
+                    "Sandbox prep failed (%s): %s",
+                    prep.return_code,
+                    prep_tail,
+                )
             if plan is not None:
                 await self._replay(plan)
+                self._replay_env = dict(plan.env)
             await self.ensure_dirs(self._mount_targets(writable_only=True))
             await self._upload_environment_dir_after_start()
             if self._entrypoint and self._run_entrypoint:
@@ -362,7 +492,12 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
     async def _replay(self, plan: ReplayPlan) -> None:
         for step in plan.steps:
             if isinstance(step, RunStep):
-                result = await self.exec(step.command, cwd=step.workdir, env=step.env, user=step.user or "root")
+                result = await self.exec(
+                    step.command,
+                    cwd=step.workdir,
+                    env=step.env,
+                    user=step.user or "root",
+                )
                 if result.return_code != 0:
                     raise SandboxBuildFailedError(
                         f"Dockerfile RUN failed ({result.return_code}): {step.command[:200]}\n"
@@ -374,26 +509,74 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         self._image_user = plan.user if plan.user not in ("root", "0") else None
 
     async def _replay_copy(self, step: CopyStep) -> None:
-        context = self.environment_dir
+        context = self.environment_dir.resolve()
+        ignore_spec = _load_dockerignore(context)
         matched: list[Path] = []
-        for pattern in step.sources:
+        for raw_pattern in step.sources:
+            pattern = raw_pattern.lstrip("/") or "."
             if any(ch in pattern for ch in "*?["):
                 found = [
                     p for p in context.glob(pattern) if fnmatch.fnmatch(p.relative_to(context).as_posix(), pattern)
                 ]
             else:
                 found = [context / pattern]
+            for candidate in found:
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(context):
+                    raise SandboxBuildFailedError(f"COPY source escapes build context: {raw_pattern}")
             if not found or not all(p.exists() for p in found):
-                raise SandboxBuildFailedError(f"COPY source not found in build context: {pattern}")
+                raise SandboxBuildFailedError(f"COPY source not found in build context: {raw_pattern}")
             matched.extend(found)
 
         dest_is_dir = step.dest_is_dir or len(matched) > 1 or (len(matched) == 1 and matched[0].is_dir())
+        if not dest_is_dir and len(matched) == 1 and matched[0].is_file():
+            if step.dest == self._workdir:
+                dest_is_dir = True
+            else:
+                probe = await self.exec(f"test -d {shlex.quote(step.dest)}", user="root")
+                if probe.return_code == 0:
+                    dest_is_dir = True
+
         for src in matched:
+            rel_src = src.resolve().relative_to(context).as_posix()
+            if ignore_spec is not None and rel_src != "." and ignore_spec.match_file(rel_src):
+                continue
+            if step.is_add and is_archive_file(src):
+                raise SandboxBuildFailedError(f"ADD with automatic archive extraction is not supported: {src.name}")
             if src.is_dir():
-                await self.upload_dir(src, step.dest)
+                if ignore_spec is not None:
+                    with tempfile.TemporaryDirectory(prefix="harbor-sf-ctx-") as tmp_ctx:
+                        filtered_root = Path(tmp_ctx) / "ctx"
+                        filtered_root.mkdir(parents=True, exist_ok=True)
+                        for item in src.rglob("*"):
+                            rel = item.resolve().relative_to(context).as_posix()
+                            if ignore_spec.match_file(rel) or ignore_spec.match_file(rel + "/"):
+                                continue
+                            target_item = filtered_root / item.relative_to(src)
+                            if item.is_symlink():
+                                target_item.parent.mkdir(parents=True, exist_ok=True)
+                                target_item.symlink_to(item.readlink())
+                            elif item.is_dir():
+                                target_item.mkdir(parents=True, exist_ok=True)
+                            else:
+                                target_item.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(item, target_item)
+                        await self.upload_dir(filtered_root, step.dest)
+                else:
+                    await self.upload_dir(src, step.dest)
             else:
                 target = str(PurePosixPath(step.dest) / src.name) if dest_is_dir else step.dest
                 await self.upload_file(src, target)
+        if step.chmod:
+            chmod_res = await self.exec(
+                f"chmod -R {shlex.quote(step.chmod)} {shlex.quote(step.dest)}",
+                user="root",
+            )
+            if chmod_res.return_code != 0:
+                raise SandboxBuildFailedError(
+                    f"COPY --chmod={step.chmod} failed ({chmod_res.return_code}): "
+                    f"{(chmod_res.stderr or chmod_res.stdout or '')[-500:]}"
+                )
         if step.chown:
             _warn_once(
                 "chown",
@@ -410,7 +593,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             if self._sandbox is not None:
                 try:
                     await self._sandbox.terminate()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error("Error terminating sandbox %s: %s", self._sandbox.id, e)
                 finally:
                     self._sandbox = None
@@ -418,6 +601,8 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             if self._slot_held:
                 self._slots().release()
                 self._slot_held = False
+
+    # -- exec -------------------------------------------------------------
 
     @override
     async def exec(
@@ -435,28 +620,33 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         if not is_root(user):
             _warn_once(
                 "user",
-                "Cortex Sandboxes can't switch users; commands for user %r run as sandbox root with that user's"
-                " HOME/USER.",
+                "Cortex Sandboxes can't switch users; commands for user %r run as "
+                "sandbox root with that user's HOME/USER.",
                 user,
             )
         exec_id = uuid.uuid4().hex
         cleanup, self._finished_execs = self._finished_execs, []
+        merged_env = {**self._replay_env, **(self._merge_env(env) or {})}
         argv = build_exec_argv(
             command,
             exec_id,
             cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, self._workdir),
-            env=self._merge_env(env),
+            env=merged_env or None,
             user=user,
             timeout_sec=timeout_sec,
             cleanup=cleanup,
         )
         budget = timeout_sec + _STREAM_SLACK_S if timeout_sec else self._exec_timeout_sec
-        started = time.monotonic()
+        stdout = ""
+        stderr = ""
+        exit_code = -1
         for attempt in range(_MAX_REATTACH + 1):
             try:
                 stdout, stderr, exit_code = await self._read_exec_stream(sandbox, argv, budget)
                 break
-            except SandboxTransportError as e:
+            except (SandboxTransportError, SandboxExecError) as e:
+                if isinstance(e, SandboxExecError) and getattr(e, "exit_code", None) != -1:
+                    raise
                 if attempt == _MAX_REATTACH:
                     raise
                 logger.warning("Exec stream dropped (%s); re-attaching to %s", e, exec_id)
@@ -466,7 +656,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
 
         if exit_code == LOST_EXIT and "harbor: lost track of exec" in stderr:
             raise RuntimeError(f"Lost track of command after the exec stream dropped: {command[:200]}")
-        if timeout_sec and exit_code == _SIGKILL_EXIT and time.monotonic() - started >= timeout_sec - 1:
+        if timeout_sec and TIMED_OUT_MARKER in stderr:
             raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
 
         return ExecResult(stdout=stdout, stderr=stderr, return_code=exit_code)
@@ -479,27 +669,51 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         async for line in stream:
             (stdout if line.stream == "stdout" else stderr).append(line.data)
         exit_code = stream.exit_code
+        if exit_code is None or exit_code == -1:
+            raise SandboxTransportError("Exec stream closed without a terminal exit code")
         return (
             "\n".join(stdout) + ("\n" if stdout else ""),
             "\n".join(stderr) + ("\n" if stderr else ""),
-            exit_code if exit_code is not None else -1,
+            exit_code,
         )
 
     async def _root_exec(self, command: str) -> ExecResult:
         return await self.exec(command, user="root")
 
+    # -- files ------------------------------------------------------------
+
     @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await transfer.upload_path(self._require_sandbox(), self._root_exec, Path(source_path), target_path)
+        await transfer.upload_path(
+            self._require_sandbox(),
+            self._root_exec,
+            Path(source_path),
+            target_path,
+        )
 
     @override
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await transfer.upload_dir(self._require_sandbox(), self._root_exec, Path(source_dir), target_dir)
+        await transfer.upload_dir(
+            self._require_sandbox(),
+            self._root_exec,
+            Path(source_dir),
+            target_dir,
+        )
 
     @override
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        await transfer.download_path(self._require_sandbox(), self._root_exec, source_path, Path(target_path))
+        await transfer.download_path(
+            self._require_sandbox(),
+            self._root_exec,
+            source_path,
+            Path(target_path),
+        )
 
     @override
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        await transfer.download_dir(self._require_sandbox(), self._root_exec, source_dir, Path(target_dir))
+        await transfer.download_dir(
+            self._require_sandbox(),
+            self._root_exec,
+            source_dir,
+            Path(target_dir),
+        )

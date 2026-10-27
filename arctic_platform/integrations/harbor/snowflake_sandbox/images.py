@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import certifi
 
@@ -33,6 +34,7 @@ from arctic_platform.integrations.harbor.snowflake_sandbox.session import get_co
 
 _LAYER_VERSION = "ca1"
 _LOGIN_TTL_S = 45 * 60
+_SF_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ async def _run(*argv: str, stdin: bytes | None = None, timeout: float = 1800) ->
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         raise ImageMirrorError(f"{argv[0]} timed out after {timeout:.0f}s")
     if proc.returncode != 0:
@@ -70,8 +72,10 @@ class ImageRegistry:
 
     def __init__(self, image_repo: str, *, connection: str | None, role: str | None) -> None:
         parts = image_repo.strip().split(".")
-        if len(parts) != 3:
-            raise ValueError(f"image_repo must be DATABASE.SCHEMA.REPOSITORY, got {image_repo!r}")
+        if len(parts) != 3 or not all(_SF_IDENT.match(p) for p in parts):
+            raise ValueError(
+                f"image_repo must be DATABASE.SCHEMA.REPOSITORY with valid Snowflake identifiers, got {image_repo!r}"
+            )
         self.database, self.schema, self.repo = parts
         self.connection = connection
         self.role = role
@@ -81,12 +85,12 @@ class ImageRegistry:
         self._image_locks: dict[str, asyncio.Lock] = {}
         self._ca_tar: Path | None = None
 
-    async def _query(self, sql: str) -> list[dict]:
+    async def _query(self, sql: str) -> list[dict[str, Any]]:
         from snowflake.connector import DictCursor
 
         conn = await get_connector(self.connection, self.role)
 
-        def run() -> list[dict]:
+        def run() -> list[dict[str, Any]]:
             with conn.cursor(DictCursor) as cur:
                 return cur.execute(sql).fetchall()
 
@@ -100,7 +104,12 @@ class ImageRegistry:
             if rest is None:
                 raise ImageMirrorError("Snowflake connection has no REST session for a registry token")
             data = rest._token_request("ISSUE")["data"]
-            return json.dumps({"token": data["sessionToken"], "expires_in": data["validityInSecondsST"]})
+            return json.dumps(
+                {
+                    "token": data["sessionToken"],
+                    "expires_in": data["validityInSecondsST"],
+                }
+            )
 
         return await asyncio.to_thread(issue)
 
@@ -161,18 +170,35 @@ class ImageRegistry:
                 "(brew install crane, or see github.com/google/go-containerregistry)."
             )
 
-    async def ensure_image(self, source_ref: str) -> str:
-        digest = hashlib.sha256(f"{source_ref}|{_LAYER_VERSION}".encode()).hexdigest()[:16]
+    async def ensure_image(self, source_ref: str, *, force_build: bool = False) -> str:
+        await self._login()
+        try:
+            source_digest = (
+                await _run(
+                    "crane",
+                    "digest",
+                    "--platform",
+                    "linux/amd64",
+                    source_ref,
+                    timeout=120,
+                )
+            ).strip()
+        except ImageMirrorError:
+            source_digest = source_ref
+        digest = hashlib.sha256(f"{source_ref}|{source_digest}|{_LAYER_VERSION}".encode()).hexdigest()[:16]
         tag = f"{_slug(source_ref)}:{digest}"
         lock = self._image_locks.setdefault(tag, asyncio.Lock())
         async with lock:
-            await self._login()
             host = await self._registry_host()
             target = f"{host}{self.sandbox_prefix}/{tag}"
-            try:
-                await _run("crane", "digest", target, timeout=120)
-                logger.debug("Image %s already mirrored", target)
-            except ImageMirrorError:
+            need_mirror = force_build
+            if not need_mirror:
+                try:
+                    await _run("crane", "digest", target, timeout=120)
+                    logger.debug("Image %s already mirrored", target)
+                except ImageMirrorError:
+                    need_mirror = True
+            if need_mirror:
                 logger.info("Mirroring %s -> %s", source_ref, target)
                 await _run(
                     "crane",
@@ -188,10 +214,17 @@ class ImageRegistry:
                 )
         return f"{self.sandbox_prefix}/{tag}"
 
-    async def image_config(self, sandbox_path: str) -> dict:
+    async def image_config(self, sandbox_path: str) -> dict[str, Any]:
         await self._login()
         host = await self._registry_host()
-        raw = await _run("crane", "config", "--platform", "linux/amd64", f"{host}{sandbox_path}", timeout=120)
+        raw = await _run(
+            "crane",
+            "config",
+            "--platform",
+            "linux/amd64",
+            f"{host}{sandbox_path}",
+            timeout=120,
+        )
         return json.loads(raw).get("config") or {}
 
 
