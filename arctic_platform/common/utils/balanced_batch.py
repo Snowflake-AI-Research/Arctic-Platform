@@ -38,11 +38,9 @@ def assign_balanced_batch(
     """Assign rows for one request.
 
     ``balance_batch`` false keeps arrival order (``None``). ``True`` and a missing
-    key both balance. An explicit legacy ``load_balancer`` / ``zorro_load_balancer``
-    / ``zorro_train_load_balancer`` false also keeps arrival order when
-    ``balance_batch`` itself is absent. ZoRRo balances whole prompt groups. Every
-    other request balances individual sample lengths, using ``lengths`` when the
-    caller measured them and ``attention_mask`` otherwise.
+    key both balance. ZoRRo balances whole prompt groups. Every other request
+    balances individual sample lengths, using ``lengths`` when the caller
+    measured them and ``attention_mask`` otherwise.
     """
     if _balance_disabled(meta):
         return None
@@ -66,17 +64,9 @@ def assign_balanced_batch(
 def _balance_disabled(meta: dict) -> bool:
     """True when this request opted out of balancing.
 
-    ``balance_batch`` wins. When it is absent, an explicit false on a legacy
-    balancer key still opts out. A missing key balances.
+    ``balance_batch`` false keeps arrival order. A missing key balances.
     """
-    if meta.get("balance_batch") is False:
-        return True
-    if "balance_batch" in meta:
-        return False
-    return any(
-        meta.get(key) is False
-        for key in ("load_balancer", "zorro_load_balancer", "zorro_train_load_balancer")
-    )
+    return meta.get("balance_batch") is False
 
 
 def _mask_lengths(attention_mask) -> Optional[list[int]]:

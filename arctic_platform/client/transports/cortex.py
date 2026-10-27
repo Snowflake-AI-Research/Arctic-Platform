@@ -57,6 +57,9 @@ from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 
 logger = logging.getLogger(__name__)
+# Encode is local and finishes before the first POST. These ops are the ones
+# whose frame build dominates a step, so the driver can split it from the RPC.
+_ENCODE_TIMED_OPS = frozenset({"forward", "forward-backward"})
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
@@ -535,6 +538,12 @@ def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dic
         value = getattr(config, key)
         if value is not None:
             payload[key] = value
+    # Development-only. ARCTIC_CORTEX_IMAGE_TAG selects a dev image; leave it unset for a normal launch.
+    import os
+
+    tag = os.environ.get("ARCTIC_CORTEX_IMAGE_TAG", "").strip()
+    if tag:
+        payload["debug"] = {"job": {"image_tag": tag}}
     return payload
 
 
@@ -626,20 +635,36 @@ class CortexTransport(Transport):
 
     def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
         route = route or _route(request.op)
+        timed = request.op in _ENCODE_TIMED_OPS
+        started = time.perf_counter()
         url, sends = route.prepare(self._prefix, request)
-        return route, self._on_loop(self._deliver(route, request, url, sends))
+        if timed:
+            logger.info(
+                "timing/cortex_encode: %.4f op=%s chunks=%d",
+                time.perf_counter() - started,
+                request.op,
+                len(sends),
+            )
+        return route, self._on_loop(self._deliver(route, request, url, sends, timed=timed))
 
-    async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
+    async def _deliver(
+        self, route: _Route, request: Request, url: str, sends: list[Send], *, timed: bool = False
+    ) -> tuple[list[bytes], dict]:
+        started = time.perf_counter()
         try:
-            reply = await self._send_group(route, url, sends)
-            if not route.poll:
-                return [], reply
-            return await self._poll(route.submitted(request, reply))
-        except Exception as exc:
-            recovered = route.recover(request, exc) if route.recover is not None else None
-            if recovered is None:
-                raise
-            return [], recovered
+            try:
+                reply = await self._send_group(route, url, sends)
+                if not route.poll:
+                    return [], reply
+                return await self._poll(route.submitted(request, reply))
+            except Exception as exc:
+                recovered = route.recover(request, exc) if route.recover is not None else None
+                if recovered is None:
+                    raise
+                return [], recovered
+        finally:
+            if timed:
+                logger.info("timing/cortex_rpc: %.4f op=%s", time.perf_counter() - started, request.op)
 
     async def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
         try:

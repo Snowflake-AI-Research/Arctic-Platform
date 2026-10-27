@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from urllib.parse import unquote
 
 import pytest
@@ -136,6 +137,19 @@ class TestForwardWire:
 
         assert len(chunks) > 1
         assert calls == [frame]
+
+    def test_logs_encode_separately_from_the_rpc(self, caplog):
+        """prepare() is timed before the first POST; the send and poll are the rest."""
+        transport, send = _transport()
+        with caplog.at_level(logging.INFO, logger=cortex_module.logger.name):
+            transport.call(fwd_no_grad_request(transport.jobs, _batch()))
+            transport.call(fwd_bwd_request(transport.jobs, _batch()))
+
+        encode = [record.getMessage() for record in caplog.records if record.getMessage().startswith("timing/cortex_encode:")]
+        rpc = [record.getMessage() for record in caplog.records if record.getMessage().startswith("timing/cortex_rpc:")]
+        assert [message.rsplit(" op=", 1)[1] for message in encode] == ["forward chunks=1", "forward-backward chunks=1"]
+        assert [message.rsplit(" op=", 1)[1] for message in rpc] == ["forward", "forward-backward"]
+        assert send.posts
 
     def test_posts_the_operation_envelope(self):
         """forward goes out as an /operation struct with the frame base64'd inside."""
