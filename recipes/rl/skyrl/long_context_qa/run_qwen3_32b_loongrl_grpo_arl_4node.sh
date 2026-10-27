@@ -57,14 +57,13 @@ NUM_NODES=4
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))   # = 32
 
-# TP=4 -> 8 engine replicas. Smaller TP OOMs the ZeRO-3 param gather during
-# the optimizer step at this model size / mini-batch.
+# TP=4 -> 8 engine replicas. The launcher runs ZeRO stage 2.
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
 # FA3 on Hopper; set flash_attention_2 for A100/L40S.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
-ARCTIC_ZERO_STAGE=3
+ARCTIC_ZERO_STAGE=2
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 # 256 prompts x 8 samples = 2048 trajectories/step, 4 PPO mini-batches of 64
