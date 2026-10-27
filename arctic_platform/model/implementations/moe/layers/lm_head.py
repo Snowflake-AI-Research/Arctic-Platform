@@ -340,7 +340,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
 
         if grouped is None:
             return logprobs, entropy
-        return logprobs, entropy, grouped.normalized_log_probs()
+        return logprobs, entropy, grouped.normalized_log_probs(chunk_size)
 
     @staticmethod
     def backward(

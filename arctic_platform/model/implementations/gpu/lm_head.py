@@ -300,7 +300,7 @@ def _get_sequence_chunked_logprob_fn():
             ctx.grouped = grouped
             if grouped is None:
                 return logprobs
-            return logprobs, grouped.normalized_log_probs()
+            return logprobs, grouped.normalized_log_probs(token_chunk_size)
 
         @staticmethod
         def backward(ctx, grad_logprobs, grad_group_log_probs=None):
