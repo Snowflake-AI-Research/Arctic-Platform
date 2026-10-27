@@ -4442,8 +4442,12 @@ def test_lora_hooks_unselected_send_preserves_existing_debug_sender_callback(
 
     monkeypatch.delenv(hooks.REQUEST_ENV, raising=False)
     monkeypatch.delenv(hooks.DIGEST_ENV, raising=False)
-    weights, expected, seen = [("original", object())], object(), []
-    worker = SimpleNamespace(get_weights=lambda: weights)
+    weights, expected, seen = [("original", object())], {"status": "done"}, []
+    worker = SimpleNamespace(
+        get_weights=lambda: weights,
+        _weight_sender=object(),
+        _weights_l2_sq=lambda values: 32.5 if values is weights else pytest.fail("different transmitted weights"),
+    )
 
     def original_send(actual, values):
         seen.append((actual, values))
@@ -4451,6 +4455,7 @@ def test_lora_hooks_unselected_send_preserves_existing_debug_sender_callback(
 
     monkeypatch.setattr(weight_sync_evidence, "maybe_send_weights", original_send)
     assert hooks.maybe_send_lora_worker(worker) is expected
+    assert expected["sent_l2_sq"] == 32.5
     assert seen == [(worker, weights)]
 
 

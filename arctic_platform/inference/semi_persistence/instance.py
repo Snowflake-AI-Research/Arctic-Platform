@@ -62,6 +62,17 @@ _spawn_ctx = mp.get_context("spawn")
 _IMAGE_DIR = "image"
 _WEIGHT_DIR = "weight"
 
+# The pinned double buffer plan_restore_weights forms when the host copy is
+# pageable, per worker: SEMIP_PINNED_BUFFER_BYTES split into two halves, each
+# filled by SEMIP_PINNED_BUFFER_THREADS threads while the other copies to the
+# GPU; SEMIP_PINNED_BUFFER_BYTES=0 forms none.  Read here, in the process that
+# drives the restore, and sent with the command: a restored child still has
+# the environment of the job that dumped it.
+_PINNED_BUFFER_SETTINGS = (
+    ("buffer_bytes", "SEMIP_PINNED_BUFFER_BYTES", 2**30),
+    ("buffer_threads", "SEMIP_PINNED_BUFFER_THREADS", 4),
+)
+
 _next_instance_id = 0
 _id_lock = threading.Lock()
 
@@ -790,20 +801,21 @@ class Instance:
         self._log("wake_up_kv_cache")
         return self._send("wake_up_kv_cache")
 
-    def plan_restore_weights(self, max_buffer_bytes=None):
-        """Precompute the chunk plan that the next restore_weights() will consume.
+    def plan_restore_weights(self):
+        """Prepare everything the next restore_weights() will consume.
 
-        If ``max_buffer_bytes`` is given, it is passed through verbatim as
-        the staging-buffer cap.  Use this to force small chunks when
-        restoring an image whose checkpointed ``restore_weights`` does not
-        release the staging buffer back to the CUDA driver before the KV
-        cache is mapped (older images lack the ``torch.cuda.empty_cache()``
-        fix): a small staging buffer stays negligible even if it lingers in
-        torch's caching allocator, leaving room for ``wake_up_kv_cache``.
+        Two things, both cached on each worker.  The chunk plan, under a
+        staging budget computed below.  And, when the host copy is pageable,
+        a small pinned double buffer that restore_weights stages it through:
+        per worker ``SEMIP_PINNED_BUFFER_BYTES`` (default 1 GiB) split into
+        two halves, each filled by ``SEMIP_PINNED_BUFFER_THREADS`` (default
+        4) threads.  A host copy that is already pinned (``repin``) needs no
+        double buffer, and ``SEMIP_PINNED_BUFFER_BYTES=0`` forms none,
+        leaving a slow direct copy from pageable memory.
 
-        Otherwise self-computes the staging budget from instance state
-        populated by ``init`` (cold start) or by ``criu_restore`` reading
-        meta.json (restore):
+        The staging budget is computed from instance state populated by
+        ``init`` (cold start) or by ``criu_restore`` reading meta.json
+        (restore):
 
             allotment = self.total_gpu_bytes * gpu_memory_utilization
             budget    = min(self.pinned_cpu_bytes,
@@ -814,8 +826,7 @@ class Instance:
         is free, which ignores graph pools, the per-rank CUDA contexts
         mapped on every GPU, and activations -- so the worker clamps it
         against the free VRAM its own device reports (see
-        ``_STAGING_FREE_FRACTION``).  Passing ``max_buffer_bytes``
-        explicitly raises the bound; it does not defeat that clamp.
+        ``_STAGING_FREE_FRACTION``).
 
         The formula is self-validating: if ``budget`` ends up smaller
         than the largest single parameter, the child's plan walk raises
@@ -826,38 +837,39 @@ class Instance:
         ``max_buffer_bytes=None`` to the child, yielding the single-chunk
         fallback (today's behavior).
         """
-        if max_buffer_bytes is not None:
-            mb = int(max_buffer_bytes)
+        # At TP>1 the chunk budget is per-GPU, so use the largest
+        # per-worker staging shard, not the TP-aggregate
+        # ``pinned_cpu_bytes`` (which would overstate it ~N-fold and
+        # shrink chunks needlessly, or spuriously fail the
+        # "param exceeds chunk_size" check).
+        pinned = self.max_pinned_bytes_per_worker or self.pinned_cpu_bytes
+        if self.total_gpu_bytes <= 0 or pinned <= 0:
+            mb = None
         else:
-            # At TP>1 the chunk budget is per-GPU, so use the largest
-            # per-worker staging shard, not the TP-aggregate
-            # ``pinned_cpu_bytes`` (which would overstate it ~N-fold and
-            # shrink chunks needlessly, or spuriously fail the
-            # "param exceeds chunk_size" check).
-            pinned = self.max_pinned_bytes_per_worker or self.pinned_cpu_bytes
-            if self.total_gpu_bytes <= 0 or pinned <= 0:
-                mb = None
-            else:
-                util = self.vllm_config["gpu_memory_utilization"]
-                allotment = int(self.total_gpu_bytes * util)
-                mb = int(0.9 * min(pinned, allotment - pinned))
-        self._log(f"plan_restore_weights(max_buffer_bytes={mb})")
-        return self._send("plan_restore_weights", max_buffer_bytes=mb)
+            util = self.vllm_config["gpu_memory_utilization"]
+            allotment = int(self.total_gpu_bytes * util)
+            mb = int(0.9 * min(pinned, allotment - pinned))
+        staging = {key: int(os.environ.get(env) or default)
+                   for key, env, default in _PINNED_BUFFER_SETTINGS}
+        self._log(f"plan_restore_weights(max_buffer_bytes={mb}, "
+                  + ", ".join(f"{k}={v}" for k, v in staging.items()) + ")")
+        return self._send("plan_restore_weights", max_buffer_bytes=mb, **staging)
 
     def restore_weights(self):
-        """Copy staged weights from pinned CPU into model parameters.
+        """Copy the staged host copy into model parameters.
 
-        Pure execution against the chunk plan cached by a prior
-        ``plan_restore_weights()``.  For each chunk, the worker copies
-        a slice of the pinned buffer to a single reused GPU staging
-        buffer (PCIe H2D) and then scatters into
-        ``model.named_parameters()`` in place.  If no plan is cached
-        (paths that skip ``plan_restore_weights``), falls back to a
-        single-chunk path identical to the prior unbounded behavior.
+        Pure execution of what a prior ``plan_restore_weights()`` cached on
+        each worker.  For each chunk of the plan, the worker copies a slice
+        of the host copy to a single reused GPU staging buffer -- through
+        the pinned double buffer if the plan formed one, directly otherwise -- and
+        then scatters into ``model.named_parameters()`` in place.  If no
+        plan is cached (paths that skip ``plan_restore_weights``), falls
+        back to a single-chunk direct copy.
 
-        Requires a prior ``attach() -> ... -> stage()`` to have populated
-        the pinned buffer, and ``wake_up_weights()`` to have allocated
-        the destination parameter tensors.
+        Requires a prior ``attach() -> ... -> stage()`` (or
+        ``load_weights()``) to have populated the host copy, and
+        ``wake_up_weights()`` to have allocated the destination parameter
+        tensors.
         """
         self._log("restore_weights")
         return self._send("restore_weights")

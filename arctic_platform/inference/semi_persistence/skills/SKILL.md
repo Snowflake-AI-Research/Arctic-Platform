@@ -398,6 +398,13 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   an error: `Unable to drop capability 2` then `BUG at criu/pie/restorer.c:820`
   per task, the log stops with no `Restoring FAILED`, and the half-restored
   tasks strand at their recorded PIDs. See Complication 11.
+- **Concurrent dumps share one pipe budget.** Without `CAP_SYS_RESOURCE` or
+  `CAP_SYS_ADMIN`, a uid may hold `fs.pipe-user-pages-soft` (64 MiB) of pipes
+  across the node, and a dump holds 8 MiB of them. Eight replicas dumping at
+  once can spend it, and one dump fails with `Unable to set a pipe size`
+  (first seen at TP=1×8, 2026-10-24). `SEMIP_CONCURRENT_DUMPS` (default 2)
+  caps dumps per pod; pods sharing a node do not share the cap. See
+  Complication 11.
 - **Everything logs to the pod log, tagged by replica.** Since 2026-10-02 the
   worker, the vLLM child and its TP ranks write to PID 1's stdout
   (`/proc/1/fd/1`), and the parent's `semip.inst` and `semip_engine` records go

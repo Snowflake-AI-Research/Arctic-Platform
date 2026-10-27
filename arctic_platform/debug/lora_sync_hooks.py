@@ -1107,7 +1107,12 @@ def maybe_send_lora_worker(worker):
     if selected is None:
         from arctic_platform.debug.weight_sync_evidence import maybe_send_weights
 
-        return maybe_send_weights(worker, worker.get_weights())
+        weights = worker.get_weights()
+        sent_l2_sq = worker._weights_l2_sq(weights) if worker._weight_sender is not None else None
+        result = maybe_send_weights(worker, weights)
+        if worker._weight_sender is not None:
+            result["sent_l2_sq"] = sent_l2_sq
+        return result
     slot = getattr(worker, "_ap_owned_lora_preparation", None)
     _require(
         type(slot) is dict and slot["request"] == selected["training"],
@@ -1274,13 +1279,30 @@ async def maybe_lora_max_param_bytes(server, worker):
     return max(sizes)
 
 
-async def maybe_collect_lora_sync(server, receive_task, send_tasks):
+async def maybe_collect_lora_sync(server, receive_task, send_tasks, *, schedule=None):
     request = selected_lora_request()
     received, sent = await server._await_weight_sync_refs(receive_task, send_tasks)
     if request is None:
         from arctic_platform.debug.rl_sampler_evidence import maybe_sync_weights_result
 
-        return maybe_sync_weights_result(received, sent)
+        result = maybe_sync_weights_result(received, sent)
+        if schedule is not None:
+            from arctic_platform.common.utils.weight_sync import received_checksums
+            from arctic_platform.common.weight_checksum import compare_weight_checksums
+
+            workers_results = received.get("workers", [])
+            result.update(
+                compare_weight_checksums(
+                    {
+                        f"training rank {group.sender_train_rank}": receipt.get("sent_l2_sq")
+                        for group, receipt in zip(schedule.groups, sent)
+                    },
+                    received_checksums(
+                        [f"sampling replica {index}" for index in range(len(workers_results))], workers_results
+                    ),
+                )
+            )
+        return result
     _require(
         len(sent) == 1
         and type(sent[0]) is dict

@@ -451,6 +451,17 @@ def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(
     assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
 
 
+def test_chat_support_is_false_on_a_semi_p_engine(fake_vllm, monkeypatch):
+    # The restored engine's wrapper has no model_config or renderer to chat with.
+    module = types.ModuleType("arctic_platform.inference.server.semip_engine")
+    module.restore_and_wrap = lambda engine_kwargs, agents: SimpleNamespace()
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker(semi_p=True, skip_tokenizer_init=True)
+
+    assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
+
+
 def test_unknown_architecture_chat_is_unsupported_and_logged_once(fake_vllm, caplog):
     worker = start_worker()
 

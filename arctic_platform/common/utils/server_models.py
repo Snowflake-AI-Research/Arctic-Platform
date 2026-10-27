@@ -157,7 +157,9 @@ def sp_size_from_job_config(job_config: Any) -> int:
 
 
 class GenerateRequest(BaseModel):
-    prompts: list[str]
+    # Token-id prompts are what the TRL rollout sends, so the server does not
+    # tokenize the text a second time and insert specials the training row lacks.
+    prompts: list[str | list[int]]
     sampling_params: dict[str, Any] | None = None
     routing_key: Any = None
     strict: bool = False
@@ -211,7 +213,7 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    from arctic_inference.server.config import ModelConfig
+    from arctic_platform.inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
