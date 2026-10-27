@@ -58,7 +58,7 @@ NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 # single-node checkout empirically re-triggers the FlashInfer-workspace
 # assertion even with the AI cfg workaround — followup to isolate.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-ARCTIC_ZERO_STAGE=3
+ARCTIC_ZERO_STAGE=2
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 TRAIN_BSZ="${TRAIN_BSZ:-32}"

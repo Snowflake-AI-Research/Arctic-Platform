@@ -18,10 +18,9 @@
 #
 #   trainer.arctic_rl.attn_implementation=flash_attention_3
 #     SkyRL defaults to FA2, which the Cortex image does not ship; it ships FA3.
-#   trainer.arctic_rl.use_liger=false
-#     SkyRL defaults this on. The Cortex training image then runs a logprob
-#     post-step that raises unless the forward returned logits. Off, the
-#     server uses the ordinary loss and the step completes.
+#   trainer.arctic_rl.use_liger=true
+#     Image dev_20261026_083954_a6ba7da36f6 leaves labels on the logprob post
+#     and off the unpacked no-ZoRRo Liger call. ZoRRo is not wrapped.
 #   generator.inference_engine.external_server_urls=[http://cortex-managed, ...]
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
 #     which asserts one URL per engine. The URLs are placeholders -- generation
@@ -300,7 +299,7 @@ uv run --isolated --extra skyrl-train \
     trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
     trainer.arctic_rl.attn_implementation=flash_attention_3 \
-    trainer.arctic_rl.use_liger=false \
+    trainer.arctic_rl.use_liger=true \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \
