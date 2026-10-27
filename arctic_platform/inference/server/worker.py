@@ -381,6 +381,21 @@ def _is_address_in_use_error(exc: BaseException) -> bool:
     return False
 
 
+def _with_rank_recv_l2_sq(results: list[Any]) -> dict[str, Any]:
+    """Rank 0's weight-load result, plus every TP rank's ``recv_l2_sq``.
+
+    Each TP rank receives the full model on its own, so each rank's received
+    checksum must match the trainer's; rank 0's alone does not prove the others.
+    """
+    if not results:
+        return {}
+    head = dict(results[0])
+    head["rank_recv_l2_sq"] = [
+        r.get("recv_l2_sq") if isinstance(r, dict) else None for r in results
+    ]
+    return head
+
+
 def _ensure_arctic_vllm_patches() -> None:
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
         require_supported_vllm_version("InferenceWorker")
@@ -737,6 +752,29 @@ class WorkerLifecycleState(str, Enum):
     UNINITIALIZED = "uninitialized"
     READY = "ready"
     SLEEPING = "sleeping"
+    # Weights remapped; KV cache not allocated yet. Colocated sync wakes in
+    # two calls (``["weights"]``, then ``["kv_cache"]``) and generate is only
+    # legal after the second one.
+    WEIGHTS_READY = "weights_ready"
+
+
+def _normalize_wake_tags(tags: list[str] | None) -> set[str] | None:
+    if tags is None:
+        return None
+    return set(tags)
+
+
+def _is_full_wake(tags: list[str] | None) -> bool:
+    tag_set = _normalize_wake_tags(tags)
+    return tag_set is None or tag_set >= {"weights", "kv_cache"}
+
+
+def _is_weights_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"weights"}
+
+
+def _is_kv_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"kv_cache"}
 
 
 _ACTOR_LOG_HANDLER_MARK = "_arctic_actor_handler"
@@ -1386,7 +1424,9 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def is_healthy(self) -> bool:
         return self.llm is not None and self.state in (
-            WorkerLifecycleState.READY, WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.WEIGHTS_READY,
         )
 
     def get_state(self) -> str:
@@ -1518,7 +1558,10 @@ class InferenceWorker(StreamingWorkerMixin):
         Args:
             level: 1 = free KV cache only, 2 = free KV cache + weights.
         """
-        if self.state != WorkerLifecycleState.READY:
+        if self.state not in (
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.WEIGHTS_READY,
+        ):
             raise RuntimeError(f"Cannot sleep: worker state is {self.state.value}")
         await self.llm.collective_rpc("sleep", kwargs={"level": level})
         self.state = WorkerLifecycleState.SLEEPING
@@ -1528,21 +1571,66 @@ class InferenceWorker(StreamingWorkerMixin):
     async def wake_up(self, tags: list[str] | None = None) -> dict[str, Any]:
         """Restore GPU memory (reverse of :meth:`sleep`).
 
+        A colocated sync calls this twice: ``tags=["weights"]`` leaves the
+        worker in ``weights_ready`` with the KV cache still discarded, then
+        ``tags=["kv_cache"]`` allocates the cache and returns to ``ready``.
+        Treating the first call as a full wake drops the second one, and the
+        next generate reads the freed KV cache.
+
         Args:
-            tags: What to restore, e.g. ``["weights"]`` or
-                  ``["weights", "kv_cache"]``.  ``None`` restores everything.
+            tags: What to restore, e.g. ``["weights"]`` or ``["kv_cache"]``.
+                ``None`` or both tags restores everything.
         """
+        if self.state == WorkerLifecycleState.READY:
+            return {"status": "already_ready"}
+
+        if self.state == WorkerLifecycleState.WEIGHTS_READY:
+            if _is_weights_only_wake(tags):
+                return {"status": "already_weights_ready"}
+            if not (_is_kv_only_wake(tags) or _is_full_wake(tags)):
+                raise RuntimeError(
+                    f"Cannot wake up from weights_ready with tags={tags!r}; "
+                    "use tags=['kv_cache'] or a full wake"
+                )
+            return await self._wake_collective(
+                tags=["kv_cache"],
+                target_state=WorkerLifecycleState.READY,
+            )
+
         if self.state != WorkerLifecycleState.SLEEPING:
-            if self.state == WorkerLifecycleState.READY:
-                return {"status": "already_ready"}
             raise RuntimeError(f"Cannot wake up: worker state is {self.state.value}")
+
+        if _is_kv_only_wake(tags):
+            raise RuntimeError(
+                "Cannot wake kv_cache only from sleeping; wake weights first "
+                "(tags=['weights'])"
+            )
+
+        target = (
+            WorkerLifecycleState.READY
+            if _is_full_wake(tags)
+            else WorkerLifecycleState.WEIGHTS_READY
+        )
+        return await self._wake_collective(tags=tags, target_state=target)
+
+    async def _wake_collective(
+        self,
+        tags: list[str] | None,
+        target_state: WorkerLifecycleState,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         if tags is not None:
             kwargs["tags"] = tags
         await self.llm.collective_rpc("wake_up", kwargs=kwargs)
-        self.state = WorkerLifecycleState.READY
-        logger.info("Worker %d awake", os.getpid())
-        return {"status": "ready"}
+        self.state = target_state
+        logger.info(
+            "Worker %d awake (tags=%s, state=%s)",
+            os.getpid(),
+            tags,
+            self.state.value,
+        )
+        status = "ready" if target_state == WorkerLifecycleState.READY else "weights_ready"
+        return {"status": status}
 
     # ------------------------------------------------------------------
     # Weight sync
@@ -1626,7 +1714,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, direct_mode, reverse),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     @stream_lifecycle_change
     async def sync_weights_broadcast(
@@ -1726,6 +1814,75 @@ class InferenceWorker(StreamingWorkerMixin):
                   bucket_size, engine_only, reverse),
         )
         return results[0] if results else {}
+
+    async def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict[str, Any]:
+        """Load weights from CUDA IPC handles (zero-copy, same GPU)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc", args=(ipc_payload,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_cuda_ipc_chunk(
+        self, ipc_payload: dict, validate_names=None,
+    ) -> dict[str, Any]:
+        """Stream a single CUDA IPC param chunk (low-memory weight sync)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc_chunk",
+            args=(ipc_payload, validate_names),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_from_shm_path(self, path: str) -> dict[str, Any]:
+        """Load weights from a shared-memory file path."""
+        results = await self.llm.collective_rpc(
+            "load_weights_from_shm_path", args=(path,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def compute_weight_norm(self) -> dict[str, Any]:
+        """Global L2 norm of the engine's live weights, summed across TP ranks.
+
+        Tensor parallelism and a quantized engine return an error result with
+        ``disable`` set, rather than a norm. Adding the ranks up is only a whole
+        model when every tensor is sharded, and a tensor each rank keeps whole (an
+        ``RMSNorm`` weight, a ``ReplicatedLinear`` weight, a row-parallel bias) would
+        land in the total once per rank. A sleeping sampler has those weights unmapped;
+        reading them is a CUDA fault that kills the engine, so that state returns an
+        error and does not set ``disable`` (sleep is temporary). This is a debug
+        check: the weight sync's own ``checksum_match`` shows the sampler received
+        the trainer's weights, at any TP size.
+        """
+        if self.state not in (WorkerLifecycleState.READY, WorkerLifecycleState.WEIGHTS_READY):
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": f"weight norm is not read while the sampler is {self.state.value}",
+            }
+        results = await self.llm.collective_rpc("compute_weight_norm")
+        for result in results:
+            if result.get("error_code"):
+                unavailable = {
+                    "error_code": "weight_norm_unavailable",
+                    "error": result.get("error", result["error_code"]),
+                }
+                if result.get("disable"):
+                    unavailable["disable"] = True
+                return unavailable
+        tp_size = max((r.get("tp_size", 1) for r in results), default=1)
+        if tp_size > 1:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                    f"engine runs tensor_parallel_size={tp_size}. Replicated tensors would be "
+                    "counted once per rank, so the norm would not be comparable to the "
+                    "training engine's. The weight sync result's checksum_match verifies "
+                    "the sync at any tensor_parallel_size."
+                ),
+                "disable": True,
+            }
+        sq_sum = sum(r["sq_sum"] for r in results)
+        num_params = sum(r["num_params"] for r in results)
+        return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
     async def close_weight_sync(self) -> dict[str, Any]:
         """Destroy persistent NCCLEngine on all TP workers."""
