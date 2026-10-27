@@ -31,8 +31,8 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
-from pydantic import Field
 
+from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 
@@ -49,20 +49,6 @@ _OPTIMIZER_ALIASES = {
     "cpuadam": "deepspeed_cpu_adam",
     "deep_speed_cpu_adam": "deepspeed_cpu_adam",
 }
-
-
-class OptimizerSettings(BaseModel):
-    """Optimizer block handed to DeepSpeed after the caller has resolved aliases."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = "AdamW"
-    lr: float = 1e-5
-    weight_decay: float = 0.0
-    betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
-    eps: float = 1e-8
-    # ``None`` lets the model family decide. GLM-MoE leaves FusedAdam off.
-    fused: bool | None = None
 
 
 class TrainingEngineSpec(BaseModel):
