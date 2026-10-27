@@ -96,7 +96,7 @@ dev = [
 
 # Pulls [tinker], itself a superset of [cortex], so the transport tests can
 # import the client and the Tinker tests can import the SDK. Not [onprem]:
-# it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
+# it reaches [rl] -> [inference] -> vllm, and vLLM's build needs CUDA_HOME,
 # which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
     "arctic_platform[tinker]",
@@ -175,12 +175,9 @@ inference = [
     "xgrammar==0.2.7",
 ]
 
-# [sft] plus the published sampling package. On-prem still imports
-# arctic_inference; that package's Ray path is not the in-tree one.
-# arctic-inference[vllm] pulls vLLM. [rl] does not declare vLLM itself.
+# [sft] plus the in-tree Arctic Inference sampler. That extra pins vLLM.
 rl = [
-    "arctic_platform[sft]",
-    "arctic-inference[server,vllm]>=0.3.0",
+    "arctic_platform[sft,inference]",
 ]
 
 onprem = [

@@ -243,6 +243,50 @@ class TestOpMapping:
         assert _last(client).op == "wake-training"
 
 
+class TestSyncWeightsChecksum:
+    """``sync_weights``'s ``checksum_match`` must be acted on, not only logged (see ``ArcticRLRayServer.weight_sync``)."""
+
+    class _MismatchTransport(FakeTransport):
+        """A transport whose weight-sync op reports a failed checksum; every other op is a plain no-op."""
+
+        def call(self, request: Request) -> dict:
+            self.calls.append(request)
+            if request.op == "operation" and request.body.get("operation_type") == "weight-sync":
+                return {
+                    "sent_l2_sq": 32.5,
+                    "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+                    "checksum_rtol": 1e-9,
+                    "checksum_match": False,
+                    "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+                }
+            return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
+
+        async def acall(self, request: Request) -> dict:
+            return self.call(request)
+
+    def _build_mismatch(self, monkeypatch, cls):
+        monkeypatch.setattr(base_module, "make_transport", self._MismatchTransport)
+        return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_raises_on_checksum_mismatch(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        with pytest.raises(RuntimeError, match="did not prove delivery"):
+            _call(client, "sync_weights")
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_strict_checksum_false_returns_the_dict_instead(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        out = _call(client, "sync_weights", strict_checksum=False)
+        assert out["checksum_match"] is False
+        assert out["checksum_error"]
+
+    def test_sync_weights_missing_checksum_does_not_raise(self, client):
+        """A transport that never computed a checksum (the default ``FakeTransport``) is not a reported failure."""
+        out = _call(client, "sync_weights")
+        assert "checksum_match" not in out
+
+
 class TestLifecycle:
     def test_reconnect_config_copies_job_ids(self, client):
         """reconnect_config bakes the live job ids into a fresh config."""
