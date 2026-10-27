@@ -275,8 +275,8 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
     ]
     param_groups = [
-        {"params": decay_params, "weight_decay": optimizer.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": _aligned_first(decay_params), "weight_decay": optimizer.weight_decay},
+        {"params": _aligned_first(no_decay_params), "weight_decay": 0.0},
     ]
     param_groups = [group for group in param_groups if group["params"]]
     betas = (optimizer.betas[0], optimizer.betas[1])
@@ -323,6 +323,18 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     if not isinstance(zero_config, dict):
         return False
     return bool(zero_config.get("offload_optimizer"))
+
+
+def _aligned_first(params: list) -> list:
+    """``params`` with every parameter whose size is not a multiple of 8 elements moved to the end.
+
+    ZeRO flattens a group's parameters back to back and makes each one a view at its offset in that buffer, so
+    one parameter of, say, 3 elements leaves every parameter after it 2-byte aligned. cuBLAS then cannot use
+    Hopper's GEMMs on those weights (TMA needs 16-byte-aligned operands) and falls back to its SM80 kernels;
+    on GLM-5.3-Flash, whose 90 mHC scales are 3 elements each, 75% of the cuBLAS GEMM time went to those.
+    The sort is stable, so the order within each half is the model's.
+    """
+    return sorted(params, key=lambda param: param.numel() % 8 != 0)
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:

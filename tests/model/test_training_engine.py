@@ -227,6 +227,20 @@ def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
     assert captured["kwargs"] == {"lr": 3e-4, "betas": (0.8, 0.95), "eps": 1e-6, "adam_w_mode": True}
 
 
+def test_build_training_optimizer_keeps_flattened_weights_16_byte_aligned():
+    model = torch.nn.Module()
+    model.first = torch.nn.Linear(16, 16, bias=False)
+    model.scale = torch.nn.Parameter(torch.ones(3))  # like GLM-5.3-Flash's mHC scales
+    model.second = torch.nn.Linear(16, 16, bias=False)
+
+    optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), _ZERO2, fused=False)
+
+    (group,) = optimizer.param_groups
+    # ZeRO places each parameter at the running sum of the sizes before it.
+    assert [param.numel() for param in group["params"]] == [256, 256, 3]
+    assert group["params"][0] is model.first.weight and group["params"][1] is model.second.weight
+
+
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
     sentinel = object()
     calls = {}
