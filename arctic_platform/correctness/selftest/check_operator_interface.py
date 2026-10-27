@@ -3185,7 +3185,9 @@ def test_native_optimizer_scope_preserves_primary_error_and_closes_context(
 
 @pytest.mark.parametrize("managed", [False, True])
 @pytest.mark.parametrize("failure", [None, "target", "spawn"])
-def test_onboarding_validation_child_inherits_active_gateway_environment(tmp_path, monkeypatch, managed, failure):
+def test_onboarding_validation_child_inherits_active_gateway_environment(
+    tmp_path, monkeypatch, capsys, managed, failure
+):
     from arctic_platform.correctness.onboarding import onboard
 
     names = (
@@ -3207,6 +3209,9 @@ def test_onboarding_validation_child_inherits_active_gateway_environment(tmp_pat
     @contextmanager
     def gateway(namespace):
         assert namespace is args
+        output = capsys.readouterr().out
+        assert output.count("*** Validation: Target Run ***") == 1
+        assert "frozen 4-layer regression" in output
         events.append("enter")
         previous = {name: os.environ[name] for name in names}
         try:
