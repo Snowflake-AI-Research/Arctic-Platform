@@ -18,16 +18,30 @@
 
 from __future__ import annotations
 
+import contextlib
+import dis
+import fcntl
 import hashlib
 import importlib
+import inspect
 import json
 import math
+import os
 import re
+import shlex
 import shutil
+import stat
+import subprocess
+import sys
+import time
+import types
+import uuid
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from tempfile import TemporaryDirectory
+from tempfile import TemporaryFile
 
 import torch
 
@@ -39,7 +53,9 @@ from .dss_driver import StepResult
 from .dss_driver import fwd_bwd_step
 from .hosted import require_local_cortex_gateway
 from .hosted import save_and_resolve_checkpoint_id
+from .optimizer_capture import tensor_digest
 from .storage import require_data_fast_path
+from .transport import UnsafeCleanupError
 
 # Only these upstream checkpoint schema classes may extend torch's restricted loader.
 _SCHEMA_GLOBALS = {
@@ -58,6 +74,113 @@ _NATIVE_SOURCE_ROLES = {
     "zero_base",
     "engine",
 }
+
+
+_COLLECTOR_STATE = "_correctness_native_optimizer_collector"
+_CLEANUP_STATE = "_correctness_native_optimizer_cleanup"
+_SCOPE_STATE = "_correctness_native_optimizer_scope"
+
+
+def _native_serialized_tracing_matches(selected, template):
+    if (
+        selected.__code__ != template.__code__
+        or selected.__code__.co_filename != template.__code__.co_filename
+        or selected.__code__.co_firstlineno != template.__code__.co_firstlineno
+        or selected.__code__.co_qualname != template.__code__.co_qualname
+        or selected.__builtins__ is not template.__builtins__
+    ):
+        return False
+    codes, names = [template.__code__], set()
+    while codes:
+        code = codes.pop()
+        names.update(
+            instruction.argval
+            for instruction in dis.get_instructions(code)
+            if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME", "STORE_GLOBAL", "DELETE_GLOBAL"}
+        )
+        codes.extend(value for value in code.co_consts if isinstance(value, types.CodeType))
+    metadata = {"__name__", "__package__", "__file__", "__builtins__"}
+    dependencies = names - metadata
+    # Cloudpickle retains referenced globals, not an arbitrary replacement module namespace.
+    if not set(selected.__globals__) <= dependencies | metadata:
+        return False
+    for name in dependencies:
+        if name in template.__globals__:
+            if name not in selected.__globals__ or selected.__globals__[name] is not template.__globals__[name]:
+                return False
+        elif name in selected.__globals__:
+            return False
+    return all(
+        selected.__globals__.get(name) == template.__globals__.get(name) for name in metadata - {"__builtins__"}
+    )
+
+
+def _native_callback_origin(callback):
+    selected, seen = callback, set()
+    while hasattr(selected, "__wrapped__"):
+        if id(selected) in seen or not inspect.isfunction(selected):
+            raise ValueError("native optimizer callback has an unsupported wrapper")
+        seen.add(id(selected))
+        wrapped = selected.__wrapped__
+        if not inspect.isfunction(wrapped):
+            raise ValueError("native optimizer callback has an unsupported wrapper")
+        templates = [contextlib.contextmanager(wrapped)]
+        tracing_template = None
+        if selected.__module__ == "ray._private.worker" and selected.__name__ in {"is_initialized", "get", "put"}:
+            ray = importlib.import_module("ray")
+            if callback is not getattr(ray, selected.__name__, None):
+                raise ValueError("native optimizer callback requires the current public Ray function")
+            client_hook = importlib.import_module("ray._private.client_mode_hook")
+            auto_init_hook = importlib.import_module("ray._private.auto_init_hook")
+            templates.extend((client_hook.client_mode_hook(wrapped), auto_init_hook.wrap_auto_init(wrapped)))
+        if selected.__globals__.get("__name__") == "ray.util.tracing.tracing_helper":
+            tracing = importlib.import_module("ray.util.tracing.tracing_helper")
+            factory_name = "async_span_wrapper" if inspect.iscoroutinefunction(wrapped) else "span_wrapper"
+            factories = [
+                code
+                for code in tracing._inject_tracing_into_class.__code__.co_consts
+                if isinstance(code, types.CodeType) and code.co_name == factory_name and not code.co_freevars
+            ]
+            if len(factories) == 1:
+                # Calling the nested factory avoids the injector's mutation of method signatures.
+                factory = types.FunctionType(factories[0], vars(tracing))
+                tracing_template = factory(wrapped)
+                templates.append(tracing_template)
+        # Match executable code and every captured object, not only copied __wrapped__ metadata.
+        if not any(
+            (
+                selected.__code__ is template.__code__
+                and selected.__globals__ is template.__globals__
+                or template is tracing_template
+                and _native_serialized_tracing_matches(selected, template)
+            )
+            and selected.__defaults__ == template.__defaults__
+            and selected.__kwdefaults__ == template.__kwdefaults__
+            and len(selected.__closure__ or ()) == len(template.__closure__ or ())
+            and all(
+                actual.cell_contents is expected.cell_contents
+                for actual, expected in zip(selected.__closure__ or (), template.__closure__ or (), strict=True)
+            )
+            for template in templates
+        ):
+            raise ValueError("native optimizer callback has an unsupported wrapper")
+        selected = wrapped
+    return selected
+
+
+def verify_native_callback(callback, descriptor: dict) -> None:
+    if not callable(callback) or not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256"}:
+        raise ValueError("native optimizer callback requires an exact source descriptor")
+    selected = _native_callback_origin(callback)
+    path = Path(descriptor["path"])
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or inspect.getsourcefile(selected) != str(path)
+        or not path.is_file()
+        or hashlib.sha256(path.read_bytes()).hexdigest() != descriptor["sha256"]
+    ):
+        raise ValueError("native optimizer callback source drift or origin mismatch")
 
 
 def _native_sources(layout: dict) -> None:
@@ -137,6 +260,1122 @@ def _native_layout(layout: dict) -> dict:
         raise ValueError("native optimizer requires AdamW")
     _native_sources(layout)
     return layout
+
+
+def _native_runtime_sources(worker, sources: dict) -> None:
+    _native_sources({"source_files": sources})
+    checkpointer, engine = worker._checkpointer, worker._engine
+    zero = engine.optimizer
+    selected = {
+        "training": type(worker).save,
+        "expert_checkpointer": type(checkpointer).save_resumable,
+        "base_checkpointer": type(checkpointer).save_adapters,
+        "engine": type(engine).save_checkpoint,
+        "zero": type(zero).state_dict,
+        "zero_base": type(zero).backward,
+    }
+    for role, function in selected.items():
+        try:
+            verify_native_callback(function, sources[role])
+        except ValueError as error:
+            raise ValueError(f"native selected source origin mismatch: {role}") from error
+    _native_sources({"source_files": sources})
+
+
+def _native_worker_layout(worker, target: Path, tag: str, sources: dict) -> dict:
+    import deepspeed.utils.groups as ds_groups
+    import torch.distributed as dist
+
+    _native_runtime_sources(worker, sources)
+    engine, zero = worker._engine, worker._engine.optimizer
+    dp_order = dist.get_process_group_ranks(zero.dp_process_group)
+    world, global_rank = dist.get_world_size(), dist.get_rank()
+    if sorted(dp_order) != list(range(world)) or worker.rank != global_rank or worker.world_size != world:
+        raise ValueError("native collector requires the complete actual checkpoint DP group")
+    dp_rank = dist.get_rank(group=zero.dp_process_group)
+    if dp_order[dp_rank] != global_rank:
+        raise ValueError("native checkpoint DP rank order mismatch")
+    items, ep_rank, edp_rank = worker._checkpointer._expert_items_and_ranks(engine)
+    names = {parameter.group_name for _, parameter in items}
+    if len(names) != 1:
+        raise ValueError("native expert sidefile requires one selected expert group")
+    expert_group = ds_groups._get_expert_parallel_group(next(iter(names)))
+    ep_size = dist.get_world_size(group=expert_group)
+    groups = []
+    param_groups = zero.optimizer.param_groups
+    if len(param_groups) != len(zero.real_dp_process_group):
+        raise ValueError("native optimizer group/route count mismatch")
+    for index, group in enumerate(param_groups):
+        ordered = dist.get_process_group_ranks(zero.real_dp_process_group[index])
+        ranks = [dp_order.index(rank) for rank in ordered]
+        is_moe = group.get("moe", False)
+        if type(is_moe) is not bool:
+            raise ValueError("native optimizer MoE group marker must be boolean")
+        group_ep_rank = None
+        if is_moe:
+            name = group.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("native optimizer requires named expert groups")
+            group_ep_rank = dist.get_rank(group=ds_groups._get_expert_parallel_group(name))
+            if group_ep_rank != ep_rank or ranks.index(dp_rank) != edp_rank:
+                raise ValueError("native expert optimizer route differs from sidefile ownership")
+        elif ranks != list(range(world)):
+            raise ValueError("native dense optimizer requires checkpoint DP order")
+        groups.append({"name": group.get("name"), "moe": is_moe, "ranks": ranks, "ep_rank": group_ep_rank})
+    filename = Path(engine._get_zero_ckpt_name(str(target), tag))
+    match = _NATIVE_OPTIM_FILE.fullmatch(filename.name)
+    if filename.parent != target / tag or not match or int(match[1]) != dp_rank:
+        raise ValueError("native optimizer filename disagrees with its actual DP rank")
+    result = {
+        "global_rank": global_rank,
+        "checkpoint_rank": dp_rank,
+        "dp_order": dp_order,
+        "world_size": world,
+        "ep_size": ep_size,
+        "sp_size": worker.sp_size,
+        "model_mp_world_size": engine.mp_world_size,
+        "ep_rank": ep_rank,
+        "edp_rank": edp_rank,
+        "optimizer_mp_rank": int(match[2]),
+        "optimizer_filename": filename.name,
+        "groups": groups,
+        "ds_config": engine._config._param_dict,
+        "source_files": sources,
+    }
+    return json.loads(json.dumps(result, allow_nan=False))
+
+
+def _claim_native_checkpoint_root(state, target):
+    lease = state.get("checkpoint_lease")
+    if lease is None:
+        return
+    parent = Path(lease["checkpoint_parent"])
+    if target == parent or not target.is_relative_to(parent):
+        raise ValueError("native checkpoint root escaped its admitted parent")
+    if any(path.is_symlink() for path in (target, *target.parents)):
+        raise ValueError("native checkpoint ownership refuses symlinks")
+    control = parent / f".native-optimizer-{lease['scope_nonce']}"
+    marker = {"schema": "native-optimizer-root-owner-v1", **lease}
+    control.mkdir(parents=True, exist_ok=True)
+    if control.is_symlink() or not control.is_dir():
+        raise ValueError("native checkpoint control must be a regular directory")
+    descriptor = os.open(control / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "r+b") as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise ValueError("native checkpoint control lock must be a regular file")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not target.exists():
+            target.mkdir(parents=True)
+            identity = (target.stat().st_dev, target.stat().st_ino)
+            pending = {"identity": identity, "marker_identity": None}
+            state.setdefault("pending_roots", {})[str(target)] = pending
+            with (target / ".native-optimizer-owner.json").open("x") as stream:
+                metadata = os.fstat(stream.fileno())
+                pending["marker_identity"] = (metadata.st_dev, metadata.st_ino)
+                stream.write(json.dumps(marker, allow_nan=False) + "\n")
+        ownership = target / ".native-optimizer-owner.json"
+        if target.is_symlink() or ownership.is_symlink() or json.loads(ownership.read_text()) != marker:
+            raise ValueError("native checkpoint root is not owned by this scope")
+        identity = (target.stat().st_dev, target.stat().st_ino)
+        previous = state["roots"].get(str(target))
+        if previous is not None and previous != identity:
+            raise ValueError("native checkpoint root identity changed")
+        state["roots"][str(target)] = identity
+        state.get("pending_roots", {}).pop(str(target), None)
+
+
+def arm_native_optimizer_collector(
+    worker,
+    *,
+    parent_job_id: str,
+    training_child_id: str,
+    source_files: dict,
+    checkpoint_lease: dict | None = None,
+    nonce: str | None = None,
+) -> str:
+    """Arm one actual worker; transport and parent-to-child resolution belong to the caller."""
+    if (
+        not isinstance(parent_job_id, str)
+        or not parent_job_id
+        or not isinstance(training_child_id, str)
+        or not training_child_id
+        or worker.job_id != training_child_id
+        or _COLLECTOR_STATE in vars(worker)
+        or _CLEANUP_STATE in vars(worker)
+    ):
+        raise ValueError("native collector requires its actual owned training child and an unarmed worker")
+    sources = json.loads(json.dumps(source_files, allow_nan=False))
+    _native_runtime_sources(worker, sources)
+    if checkpoint_lease is not None:
+        checkpoint_lease = json.loads(json.dumps(checkpoint_lease, allow_nan=False))
+        if (
+            set(checkpoint_lease) != {"checkpoint_parent", "scope_nonce", "parent_job_id", "training_child_id"}
+            or checkpoint_lease["parent_job_id"] != parent_job_id
+            or checkpoint_lease["training_child_id"] != training_child_id
+            or re.fullmatch(r"[0-9a-f]{32}", checkpoint_lease["scope_nonce"]) is None
+        ):
+            raise ValueError("native checkpoint lease must bind its exact parent/child and scope nonce")
+        require_data_fast_path(checkpoint_lease["checkpoint_parent"], label="native checkpoint lease parent")
+    checkpointer, engine = worker._checkpointer, worker._engine
+    original = checkpointer.save_resumable
+    missing = object()
+    previous = vars(checkpointer).get("save_resumable", missing)
+    nonce = uuid.uuid4().hex if nonce is None else nonce
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise ValueError("native collector requires an exact hexadecimal nonce")
+    from .participation import ParticipationCapture
+    from .participation import weight_identity
+
+    if engine.global_steps != 0:
+        raise ValueError("native participation must be armed before the first backward")
+    model = engine.module
+    decoder_getter = getattr(model, "get_decoder", None)
+    head_getter = getattr(model, "get_output_embeddings", None)
+    decoder = decoder_getter() if callable(decoder_getter) else None
+    if decoder is None and hasattr(model, "model"):
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        decoder = get_language_model(model)
+    head = head_getter() if callable(head_getter) else getattr(model, "lm_head", None)
+    capture_sources = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (Path(inspect.getsourcefile(ParticipationCapture)), Path(inspect.getsourcefile(tensor_digest)))
+    }
+    participation = ParticipationCapture(model, decoder=decoder, head=head)
+
+    def capture_evidence():
+        for filename, digest in capture_sources.items():
+            if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
+                raise ValueError("native participation source drift")
+        return {
+            "participation": participation.result(),
+            "candidate_weights": {
+                name: weight_identity(participation.parameters[name].detach()) for name in participation.candidates
+            },
+            "participation_sources": capture_sources,
+        }
+
+    def save(selected_engine, target_dir, tag):
+        target = require_data_fast_path(target_dir, label="native collector checkpoint")
+        step = engine.global_steps
+        if (
+            selected_engine is not engine
+            or worker._engine is not engine
+            or worker._checkpointer is not checkpointer
+            or worker.job_id != training_child_id
+            or type(step) is not int
+            or step not in (0, 1)
+            or tag != f"global_step{step}"
+        ):
+            raise ValueError("native collector save scope or step changed")
+        before = _native_worker_layout(worker, target, tag, sources)
+        _claim_native_checkpoint_root(vars(worker)[_COLLECTOR_STATE], target)
+        result = original(selected_engine, str(target), tag)
+        if worker.job_id != training_child_id or worker._engine is not engine or engine.global_steps != step:
+            raise ValueError("native collector training child/engine changed during save")
+        after = _native_worker_layout(worker, target, tag, sources)
+        if before != after:
+            raise ValueError("native collector layout changed during save")
+        paths = [target / tag / after["optimizer_filename"]]
+        if after["checkpoint_rank"] == 0:
+            paths.append(target / tag / "mp_rank_00_model_states.pt")
+        if after["edp_rank"] == 0:
+            paths.append(target / tag / f"experts_ep_rank_{after['ep_rank']:03d}.pt")
+        if any(path.is_symlink() or not path.is_file() or not path.stat().st_size for path in paths):
+            raise ValueError("native collector is missing its actual written checkpoint files")
+        receipt = {
+            "schema": "native-ep-zero2-worker-save-v1",
+            "parent_job_id": parent_job_id,
+            "training_child_id": training_child_id,
+            "step": step,
+            "tag": tag,
+            "checkpoint_root": str(target),
+            "nonce": nonce,
+            "layout": after,
+            "written_files": {path.name: digest for path, digest in zip(paths, _checkpoint_hashes(paths).values())},
+            "written_file_sizes": {path.name: path.stat().st_size for path in paths},
+            **capture_evidence(),
+        }
+        _native_runtime_sources(worker, sources)
+        directory = target / tag / "native_optimizer_layout"
+        if directory.is_symlink():
+            raise ValueError("native collector receipt directory must not be a symlink")
+        directory.mkdir(exist_ok=True)
+        with (directory / f"rank{after['checkpoint_rank']:05d}.json").open("x") as stream:
+            stream.write(json.dumps(receipt, indent=2, allow_nan=False) + "\n")
+        _native_runtime_sources(worker, sources)
+        vars(worker)[_COLLECTOR_STATE]["saves"][(str(target), step)] = {
+            "receipt": receipt,
+            "identities": {
+                path.name: tuple(
+                    getattr(path.stat(), field)
+                    for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                )
+                for path in paths
+            },
+        }
+        return result
+
+    vars(worker)[_COLLECTOR_STATE] = {
+        "nonce": nonce,
+        "checkpointer": checkpointer,
+        "hook": save,
+        "saves": {},
+        "checkpoint_lease": checkpoint_lease,
+        "roots": {},
+        "pending_roots": {},
+        "participation": participation,
+        "restore": lambda: (
+            vars(checkpointer).pop("save_resumable")
+            if previous is missing
+            else setattr(checkpointer, "save_resumable", previous)
+        ),
+    }
+    try:
+        checkpointer.save_resumable = save
+    except BaseException:
+        participation.close()
+        del vars(worker)[_COLLECTOR_STATE]
+        raise
+    return nonce
+
+
+def _close_native_scope_worker(worker, nonce):
+    state = vars(worker).get(_COLLECTOR_STATE)
+    if state is None:
+        closed = vars(worker).get(_CLEANUP_STATE)
+        if closed is None:
+            return {"lease_owned": False, "roots": {}, "pending_roots": {}}
+        if not isinstance(closed, dict) or closed["nonce"] != nonce:
+            raise ValueError("native scope close requires its exact cached nonce")
+    else:
+        closed = {
+            "nonce": nonce,
+            "lease": state["checkpoint_lease"],
+            "roots": dict(state["roots"]),
+            "pending_roots": dict(state.get("pending_roots", {})),
+        }
+        finish_native_optimizer_collector(worker, nonce)
+        vars(worker)[_CLEANUP_STATE] = closed
+    return {
+        "lease_owned": isinstance(closed["lease"], dict),
+        "roots": closed["roots"],
+        "pending_roots": closed.get("pending_roots", {}),
+    }
+
+
+def _cleanup_native_scope_worker(worker, nonce, roots, pending_roots=None):
+    pending_roots = {} if pending_roots is None else pending_roots
+    closed = vars(worker).get(_CLEANUP_STATE)
+    if closed is None and not roots and not pending_roots and _COLLECTOR_STATE not in vars(worker):
+        return {"hooks_restored": True, "owned_roots_absent": True}
+    if not isinstance(closed, dict) or closed["nonce"] != nonce or not isinstance(closed["lease"], dict):
+        raise ValueError("native cleanup requires the closed worker's cached lease")
+    lease = closed["lease"]
+    parent = Path(lease["checkpoint_parent"])
+    marker = {"schema": "native-optimizer-root-owner-v1", **lease}
+    for raw, pending in pending_roots.items():
+        root = Path(raw)
+        if (
+            root == parent
+            or not root.is_relative_to(parent)
+            or any(path.is_symlink() for path in (root, *root.parents))
+        ):
+            raise ValueError("native cleanup refuses escaped or symlink pending roots")
+        if not root.exists():
+            continue
+        if (root.stat().st_dev, root.stat().st_ino) != tuple(pending["identity"]):
+            raise ValueError("native cleanup pending root identity changed")
+        ownership = root / ".native-optimizer-owner.json"
+        contents = list(root.iterdir())
+        if contents:
+            if contents != [ownership] or ownership.is_symlink() or not ownership.is_file():
+                raise ValueError("native cleanup preserves foreign pending root contents")
+            if pending["marker_identity"] is None or (ownership.stat().st_dev, ownership.stat().st_ino) != tuple(
+                pending["marker_identity"]
+            ):
+                raise ValueError("native cleanup pending marker identity changed")
+            ownership.unlink()
+        root.rmdir()
+    for raw, identity in roots.items():
+        root = Path(raw)
+        if (
+            root == parent
+            or not root.is_relative_to(parent)
+            or any(path.is_symlink() for path in (root, *root.parents))
+        ):
+            raise ValueError("native cleanup refuses escaped or symlink roots")
+        if not root.exists():
+            continue
+        if (root.stat().st_dev, root.stat().st_ino) != tuple(identity):
+            raise ValueError("native cleanup root identity changed")
+        ownership = root / ".native-optimizer-owner.json"
+        if ownership.is_symlink() or json.loads(ownership.read_text()) != marker:
+            raise ValueError("native cleanup preserves a foreign ownership marker")
+        for index, path in enumerate(root.rglob("*")):
+            if index >= 4096 or path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise ValueError("native cleanup preserves unsupported root contents")
+        shutil.rmtree(root)
+    control = parent / f".native-optimizer-{lease['scope_nonce']}"
+    if control.exists():
+        if control.is_symlink() or {path.name for path in control.iterdir()} != {"lock"}:
+            raise ValueError("native cleanup preserves foreign control contents")
+        lock = control / "lock"
+        if lock.is_symlink() or not lock.is_file():
+            raise ValueError("native cleanup control lock changed")
+        lock.unlink()
+        control.rmdir()
+    del vars(worker)[_CLEANUP_STATE]
+    return {"hooks_restored": True, "owned_roots_absent": all(not Path(raw).exists() for raw in roots)}
+
+
+def _native_scope_sources(request):
+    if request.get("schema") not in ("native-optimizer-scope-request-v1", "native-optimizer-owner-split-request-v1"):
+        raise ValueError("unsupported native optimizer scope request")
+    _native_sources({"source_files": request["source_files"]})
+    roles = {"gateway_snowapi", "gateway", "manager", "ray_get", "ray_actor"}
+    if request["schema"] == "native-optimizer-owner-split-request-v1":
+        roles.add("ray_is_initialized")
+    if not isinstance(request.get("route_sources"), dict) or set(request["route_sources"]) != roles:
+        raise ValueError("native scope requires its complete selected route sources")
+    verify_native_callback(make_native_optimizer_scope, request["helper_source"])
+    for descriptor in request["route_sources"].values():
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256"}:
+            raise ValueError("native scope source descriptor differs")
+        path = Path(descriptor["path"])
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != descriptor["sha256"]
+        ):
+            raise ValueError("native scope selected route source drift")
+    require_data_fast_path(request["checkpoint_parent"], label="native scope checkpoint parent")
+    if (
+        type(request.get("reserve_bytes")) is not int
+        or request["reserve_bytes"] < 0
+        or type(request.get("rpc_timeout_seconds")) not in (int, float)
+        or not math.isfinite(request["rpc_timeout_seconds"])
+        or not 0 < request["rpc_timeout_seconds"] <= 900
+        or not isinstance(request.get("allocation_hosts"), list)
+        or not request["allocation_hosts"]
+        or any(not isinstance(host, str) or not host for host in request["allocation_hosts"])
+        or len(set(request["allocation_hosts"])) != len(request["allocation_hosts"])
+    ):
+        raise ValueError("native scope requires exact allocation hosts and bounded explicit budgets")
+    if request["schema"] == "native-optimizer-owner-split-request-v1":
+        if type(request.get("expected_world_size")) is not int or request["expected_world_size"] <= 0:
+            raise ValueError("native split scope requires its explicit expected worker count")
+        descriptor = request.get("verify_parent_binding_source")
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256"}:
+            raise ValueError("native split scope requires its exact parent verifier source")
+        path = Path(descriptor["path"])
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != descriptor["sha256"]
+        ):
+            raise ValueError("native split parent verifier source drift")
+
+
+def _native_scope_actor_workers(owner, child_id, training_source):
+    selected_save = type(owner).save
+    original_class = type(owner).__ray_actor_class__
+    verify_native_callback(selected_save, training_source)
+    verify_native_callback(original_class.save, training_source)
+    if (
+        not inspect.ismethod(owner.save)
+        or owner.save.__self__ is not owner
+        or owner.save.__func__ is not selected_save
+        or _native_callback_origin(selected_save) is not _native_callback_origin(original_class.save)
+        or owner._info.job_id != child_id
+    ):
+        raise ValueError("native scope actual training actor selection differs")
+    hosts = [node.host for node in owner._info.layout for _ in node.gpu_ids]
+    workers = list(owner._workers)
+    if not workers or list(owner._rank_hosts) != hosts or len(workers) != len(hosts):
+        raise ValueError("native scope actual worker/rank-host layout differs")
+    actor_ids = [worker._actor_id.hex() for worker in workers]
+    if len(set(actor_ids)) != len(workers):
+        raise ValueError("native scope worker actor handles must be distinct")
+    verify_native_callback(type(owner).save, training_source)
+    return {"workers": workers, "rank_hosts": hosts, "actor_ids": actor_ids}
+
+
+def _native_scope_origin(callback, descriptor):
+    if not callable(callback) or inspect.getsourcefile(callback) != descriptor["path"]:
+        raise ValueError("native scope actual selected RPC origin differs")
+
+
+def _native_scope_arm_worker(worker, *, nonce, rank, world_size, lease, source_files, helper_source):
+    verify_native_callback(_native_scope_arm_worker, helper_source)
+    if worker.rank != rank or worker.world_size != world_size:
+        raise ValueError("native scope worker rank/world differs from its actual actor route")
+    armed = arm_native_optimizer_collector(
+        worker,
+        parent_job_id=lease["parent_job_id"],
+        training_child_id=lease["training_child_id"],
+        source_files=source_files,
+        checkpoint_lease=lease,
+        nonce=nonce,
+    )
+    try:
+        verify_native_callback(_native_scope_arm_worker, helper_source)
+        _native_runtime_sources(worker, source_files)
+    except BaseException:
+        _close_native_scope_worker(worker, nonce)
+        raise
+    return armed
+
+
+def _native_scope_save_receipt(worker, nonce, root, step, helper_source):
+    verify_native_callback(_native_scope_save_receipt, helper_source)
+    state = vars(worker).get(_COLLECTOR_STATE)
+    if not isinstance(state, dict) or state["nonce"] != nonce:
+        raise ValueError("native scope receipt requires the exact armed worker")
+    saved = state["saves"].get((str(root), step))
+    if saved is None:
+        raise ValueError("native scope requires each actual completed worker save")
+    receipt = json.loads(json.dumps(saved["receipt"], allow_nan=False))
+    _native_runtime_sources(worker, receipt["layout"]["source_files"])
+    verify_native_callback(_native_scope_save_receipt, helper_source)
+    return receipt
+
+
+def make_native_optimizer_scope(request, *, gateway_snowapi, gateway, manager, ray):
+    """Bind caller-held current MAIN objects; never discover another allocation or create a receiver."""
+    request = json.loads(json.dumps(request, allow_nan=False))
+    _native_scope_sources(request)
+    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
+    for module, name, role in (
+        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
+        (gateway, "dss.ray_dss.gateway_server", "gateway"),
+        (manager_module, "dss.ray_dss.zones.manager", "manager"),
+    ):
+        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+            raise ValueError("native scope requires the actual selected MAIN modules")
+    if type(manager) is not manager_module.ZoneManager or manager.zone_type.value != "training":
+        raise ValueError("native scope requires its actual current MAIN training manager")
+    verify_native_callback(manager.get_job, request["route_sources"]["manager"])
+    _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
+    if ray is not importlib.import_module("ray"):
+        raise ValueError("native scope requires the current installed Ray module")
+    get = ray.get
+    timeout = request["rpc_timeout_seconds"]
+
+    def route(session, job):
+        _native_scope_sources(request)
+        require_local_cortex_gateway(session.backend)
+        if job.client.config.backend != session.backend or job.job_type != "training":
+            raise ValueError("native scope requires the same local training client")
+        parent_id = job.client.transport.job_id
+        parent = gateway_snowapi._parents.get(parent_id)
+        if (
+            type(parent) is not gateway_snowapi.ParentRecord
+            or parent.parent_id != parent_id
+            or parent.state != "running"
+            or parent.cancel_requested
+        ):
+            raise ValueError("native scope requires its actual running gateway parent")
+        child = parent.children.get("training")
+        if type(child) is not gateway_snowapi.ChildRecord or child.role != "training" or not child.job_id:
+            raise ValueError("native scope requires the parent's actual training child, not a role token")
+        zone_id = gateway._jobs.get(child.job_id)
+        if zone_id != manager.zone_id or zone_id not in gateway._zones:
+            raise ValueError("native scope actual gateway child zone differs from its training manager")
+        verify_native_callback(manager.get_job, request["route_sources"]["manager"])
+        info = manager.get_job(child.job_id)
+        if info.job_id != child.job_id or info.zone_id != zone_id:
+            raise ValueError("native scope actual manager job differs")
+        actor = info.actor
+        _native_scope_origin(actor.__ray_call__.remote, request["route_sources"]["ray_actor"])
+        actual = get(
+            actor.__ray_call__.remote(_native_scope_actor_workers, child.job_id, request["source_files"]["training"]),
+            timeout=timeout,
+        )
+        if (
+            set(actual["rank_hosts"]) != set(request["allocation_hosts"])
+            or actual["rank_hosts"] != [node.host for node in info.layout for _ in node.gpu_ids]
+            or len(actual["workers"]) != session.slots
+        ):
+            raise ValueError("native scope actual workers must exactly cover the admitted allocation layout")
+        for worker in actual["workers"]:
+            _native_scope_origin(worker.__ray_call__.remote, request["route_sources"]["ray_actor"])
+        _native_scope_sources(request)
+        return parent_id, child.job_id, actor._actor_id.hex(), actual
+
+    @contextlib.contextmanager
+    def scope(session, job):
+        with _native_owned_worker_scope(request, lambda: route(session, job), get, client=job.client) as supplier:
+            yield supplier
+
+    _native_scope_sources(request)
+    return scope
+
+
+@contextlib.contextmanager
+def _native_owned_worker_scope(request, route, get, *, client=None, cleanup_state=None):
+    parent_id, child_id, actor_id, actual = route()
+    timeout = request["rpc_timeout_seconds"]
+    lease = {
+        "checkpoint_parent": request["checkpoint_parent"],
+        "scope_nonce": uuid.uuid4().hex,
+        "parent_job_id": parent_id,
+        "training_child_id": child_id,
+    }
+    # Cache dispatch and nonces before submitting arm, including missing acknowledgements.
+    owned, pending = [], []
+    complete = False
+    if client is not None:
+        if _SCOPE_STATE in vars(client) or "shutdown" in vars(client):
+            raise ValueError("native scope requires an unmodified client shutdown lifecycle")
+        shutdown = client.shutdown
+
+        def guarded_shutdown(*args, **kwargs):
+            if not complete:
+                raise RuntimeError("native optimizer owned cleanup incomplete; child release is blocked")
+            return shutdown(*args, **kwargs)
+
+        client.shutdown = guarded_shutdown
+        vars(client)[_SCOPE_STATE] = {"cleanup": None, "shutdown": guarded_shutdown}
+
+    def cleanup():
+        nonlocal complete
+        if complete:
+            return
+        errors, hosts, failed_hosts = [], {}, set()
+        for row in owned:
+            try:
+                closed = get(row["dispatch"](_close_native_scope_worker, row["nonce"]), timeout=timeout)
+                host = hosts.setdefault(row["host"], {"leader": None, "roots": {}, "pending_roots": {}})
+                if closed["lease_owned"] and host["leader"] is None:
+                    host["leader"] = row
+                for root, identity in closed["roots"].items():
+                    merged = host["roots"]
+                    if root in merged and tuple(merged[root]) != tuple(identity):
+                        raise ValueError("native cleanup same-host root identities disagree")
+                    merged[root] = identity
+                for root, pending_root in closed["pending_roots"].items():
+                    merged = host["pending_roots"]
+                    if root in merged and merged[root] != pending_root:
+                        raise ValueError("native cleanup same-host pending identities disagree")
+                    merged[root] = pending_root
+            except BaseException as exc:
+                failed_hosts.add(row["host"])
+                errors.append(exc)
+        for row in owned:
+            if row["host"] in failed_hosts:
+                continue
+            host = hosts[row["host"]]
+            try:
+                result = get(
+                    row["dispatch"](
+                        _cleanup_native_scope_worker,
+                        row["nonce"],
+                        host["roots"] if row is host["leader"] else {},
+                        host["pending_roots"] if row is host["leader"] else {},
+                    ),
+                    timeout=timeout,
+                )
+                if result != {"hooks_restored": True, "owned_roots_absent": True}:
+                    raise ValueError("native owned worker cleanup acknowledgement differs")
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise BaseExceptionGroup("native optimizer owned cleanup incomplete; do not release workers", errors)
+        if client is not None:
+            if vars(client).get("shutdown") is not guarded_shutdown:
+                raise ValueError("native scope preserves a foreign client shutdown hook")
+            del vars(client)["shutdown"]
+            del vars(client)[_SCOPE_STATE]
+        complete = True
+        if cleanup_state is not None:
+            cleanup_state["complete"] = True
+
+    if client is not None:
+        vars(client)[_SCOPE_STATE]["cleanup"] = cleanup
+    if cleanup_state is not None:
+        cleanup_state.update(cleanup=cleanup, complete=False)
+    try:
+        for rank, (worker, host) in enumerate(zip(actual["workers"], actual["rank_hosts"])):
+            nonce = uuid.uuid4().hex
+            dispatch = worker.__ray_call__.remote
+            owned.append({"dispatch": dispatch, "nonce": nonce, "host": host})
+            reference = dispatch(
+                _native_scope_arm_worker,
+                nonce=nonce,
+                rank=rank,
+                world_size=len(actual["workers"]),
+                lease=lease,
+                source_files=request["source_files"],
+                helper_source=request["helper_source"],
+            )
+            pending.append((reference, nonce))
+        for reference, nonce in pending:
+            if get(reference, timeout=timeout) != nonce:
+                raise ValueError("native scope actual worker arm acknowledgement differs")
+
+        def stable_route():
+            current = route()
+            if (
+                current[:3] != (parent_id, child_id, actor_id)
+                or current[3]["actor_ids"] != actual["actor_ids"]
+                or current[3]["rank_hosts"] != actual["rank_hosts"]
+            ):
+                raise ValueError("native scope current parent/child/worker route changed")
+
+        def supplier(root, *, step):
+            stable_route()
+            receipts = [
+                get(
+                    row["dispatch"](
+                        _native_scope_save_receipt, row["nonce"], str(root), step, request["helper_source"]
+                    ),
+                    timeout=timeout,
+                )
+                for row in owned
+            ]
+            by_checkpoint_rank = {}
+            for rank, (receipt, row) in enumerate(zip(receipts, owned)):
+                checkpoint_rank = receipt["layout"]["checkpoint_rank"]
+                if receipt["layout"]["global_rank"] != rank or checkpoint_rank in by_checkpoint_rank:
+                    raise ValueError("native scope saved worker rank binding differs")
+                by_checkpoint_rank[checkpoint_rank] = row
+            receipts.sort(key=lambda receipt: receipt["layout"]["checkpoint_rank"])
+
+            def read_worker(rank, filename, *, offset, length):
+                _native_scope_sources(request)
+                row = by_checkpoint_rank[rank]
+                return get(
+                    row["dispatch"](
+                        read_native_optimizer_checkpoint,
+                        row["nonce"],
+                        str(root),
+                        step=step,
+                        filename=filename,
+                        offset=offset,
+                        length=length,
+                    ),
+                    timeout=timeout,
+                )
+
+            consolidate_native_optimizer_checkpoints(
+                root,
+                receipts,
+                step=step,
+                read_worker=read_worker,
+                read_worker_source=request["helper_source"],
+                reserve_bytes=request["reserve_bytes"],
+            )
+            result = assemble_native_optimizer_layout(
+                root,
+                step=step,
+                parent_job_id=parent_id,
+                training_child_id=child_id,
+                expected_world_size=len(owned),
+                source_files=request["source_files"],
+            )
+            stable_route()
+            _native_scope_sources(request)
+            return result
+
+        yield supplier
+        stable_route()
+    finally:
+        cleanup()
+
+
+def _native_split_request(request):
+    _native_scope_sources(request)
+    if request["schema"] != "native-optimizer-owner-split-request-v1":
+        raise ValueError("native owner split requires its exact request schema")
+    return hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def resolve_native_optimizer_parent(request, parent_id, *, gateway_snowapi, gateway):
+    """Resolve only in the actual gateway owner; allocation fields remain caller expectations."""
+    request = json.loads(json.dumps(request, allow_nan=False))
+    digest = _native_split_request(request)
+    for module, name, role in (
+        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
+        (gateway, "dss.ray_dss.gateway_server", "gateway"),
+    ):
+        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+            raise ValueError("native parent resolution requires the actual gateway owner modules")
+    parent = gateway_snowapi._parents.get(parent_id)
+    if (
+        not isinstance(parent_id, str)
+        or not parent_id
+        or type(parent) is not gateway_snowapi.ParentRecord
+        or parent.parent_id != parent_id
+        or parent.state != "running"
+        or parent.cancel_requested
+    ):
+        raise ValueError("native parent resolution requires its actual running gateway parent")
+    child = parent.children.get("training")
+    if type(child) is not gateway_snowapi.ChildRecord or child.role != "training" or not child.job_id:
+        raise ValueError("native parent resolution requires the actual training child")
+    zone_id = gateway._jobs.get(child.job_id)
+    if not isinstance(zone_id, str) or not zone_id or zone_id not in gateway._zones:
+        raise ValueError("native parent resolution requires the actual gateway child zone")
+    result = {
+        "schema": "native-optimizer-parent-binding-v1",
+        "request_sha256": digest,
+        "parent_job_id": parent_id,
+        "training_child_id": child.job_id,
+        "zone_id": zone_id,
+        "allocation_expectation": {
+            "hosts": request["allocation_hosts"],
+            "world_size": request["expected_world_size"],
+        },
+    }
+    _native_split_request(request)
+    return result
+
+
+class _NativeOptimizerZoneScope:
+    def __init__(self, context, state):
+        self._context, self._state = context, state
+        self._entered = False
+
+    def __enter__(self):
+        if self._entered:
+            raise ValueError("native zone scope cannot be entered twice")
+        self._entered = True
+        return self._context.__enter__()
+
+    def __exit__(self, *exception):
+        return self._context.__exit__(*exception)
+
+    def cleanup(self):
+        """Retry only cached owned cleanup, even after arm/close failed or admission drifted."""
+        callback = self._state.get("cleanup")
+        if callback is None:
+            if self.cleanup_complete:
+                return
+            raise ValueError("native zone scope has no cached owned worker cleanup")
+        callback()
+
+    @property
+    def cleanup_complete(self):
+        return self._state.get("complete", False)
+
+
+def open_native_optimizer_zone_scope(request, binding, *, manager, ray, verify_parent_binding):
+    """Arm and collect in the actual zone owner; caller owns IPC and the client shutdown fence."""
+    request = json.loads(json.dumps(request, allow_nan=False))
+    binding = json.loads(json.dumps(binding, allow_nan=False))
+    digest = _native_split_request(request)
+    if (
+        set(binding)
+        != {"schema", "request_sha256", "parent_job_id", "training_child_id", "zone_id", "allocation_expectation"}
+        or binding["schema"] != "native-optimizer-parent-binding-v1"
+        or binding["request_sha256"] != digest
+        or any(
+            not isinstance(binding[key], str) or not binding[key]
+            for key in ("parent_job_id", "training_child_id", "zone_id")
+        )
+        or binding["allocation_expectation"]
+        != {"hosts": request["allocation_hosts"], "world_size": request["expected_world_size"]}
+    ):
+        raise ValueError("native zone scope requires its exact source-bound gateway binding")
+    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
+    if (
+        manager_module.__file__ != request["route_sources"]["manager"]["path"]
+        or type(manager) is not manager_module.ZoneManager
+        or manager.zone_type.value != "training"
+        or manager.zone_id != binding["zone_id"]
+    ):
+        raise ValueError("native zone scope requires its actual owning training manager")
+    _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
+    if ray is not importlib.import_module("ray"):
+        raise ValueError("native zone scope requires canonical initialized owner Ray")
+    verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
+    if ray.is_initialized() is not True:
+        raise ValueError("native zone scope requires already initialized owner Ray")
+    verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
+    verify_native_callback(verify_parent_binding, request["verify_parent_binding_source"])
+
+    def route():
+        _native_split_request(request)
+        verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
+        if ray.is_initialized() is not True:
+            raise ValueError("native zone scope owner Ray is no longer initialized")
+        verify_native_callback(verify_parent_binding, request["verify_parent_binding_source"])
+        fresh = verify_parent_binding(json.loads(json.dumps(binding, allow_nan=False)))
+        verify_native_callback(verify_parent_binding, request["verify_parent_binding_source"])
+        if type(fresh) is not dict or fresh != binding:
+            raise ValueError("native zone scope current gateway parent binding changed")
+        verify_native_callback(manager.get_job, request["route_sources"]["manager"])
+        if manager.zone_id != binding["zone_id"] or manager.zone_type.value != "training":
+            raise ValueError("native zone scope actual manager identity changed")
+        info = manager.get_job(binding["training_child_id"])
+        if info.job_id != binding["training_child_id"] or info.zone_id != binding["zone_id"]:
+            raise ValueError("native zone scope actual manager job differs")
+        actor = info.actor
+        _native_scope_origin(actor.__ray_call__.remote, request["route_sources"]["ray_actor"])
+        actual = ray.get(
+            actor.__ray_call__.remote(
+                _native_scope_actor_workers, binding["training_child_id"], request["source_files"]["training"]
+            ),
+            timeout=request["rpc_timeout_seconds"],
+        )
+        if (
+            set(actual["rank_hosts"]) != set(request["allocation_hosts"])
+            or actual["rank_hosts"] != [node.host for node in info.layout for _ in node.gpu_ids]
+            or len(actual["workers"]) != request["expected_world_size"]
+        ):
+            raise ValueError("native zone scope actual workers differ from allocation expectation")
+        for worker in actual["workers"]:
+            _native_scope_origin(worker.__ray_call__.remote, request["route_sources"]["ray_actor"])
+        verify_native_callback(manager.get_job, request["route_sources"]["manager"])
+        _native_split_request(request)
+        return binding["parent_job_id"], binding["training_child_id"], actor._actor_id.hex(), actual
+
+    state = {"complete": True}
+    return _NativeOptimizerZoneScope(_native_owned_worker_scope(request, route, ray.get, cleanup_state=state), state)
+
+
+def finish_native_optimizer_collector(worker, nonce: str) -> None:
+    """Restore the owned hook without making cleanup depend on fresh source admission."""
+    state = vars(worker).get(_COLLECTOR_STATE)
+    if not isinstance(state, dict) or nonce != state["nonce"]:
+        raise ValueError("native collector cleanup requires its exact armed nonce")
+    if vars(state["checkpointer"]).get("save_resumable") is not state["hook"]:
+        raise ValueError("native collector owned hook changed; refusing to overwrite another hook")
+    state["restore"]()
+    state["participation"].close()
+    del vars(worker)[_COLLECTOR_STATE]
+
+
+def read_native_optimizer_checkpoint(worker, nonce, root, *, step, filename, offset, length) -> dict:
+    """Read bounded bytes only from this armed worker's already completed owned save."""
+    state = vars(worker).get(_COLLECTOR_STATE)
+    if not isinstance(state, dict) or state["nonce"] != nonce:
+        raise ValueError("native checkpoint reader requires its armed nonce")
+    saved = state["saves"].get((str(root), step))
+    if saved is None or filename not in saved["identities"]:
+        raise ValueError("native checkpoint reader requires its exact completed save file")
+    if type(offset) is not int or offset < 0 or type(length) is not int or not 0 < length <= 8 << 20:
+        raise ValueError("native checkpoint reader requires a bounded byte range")
+    path = Path(root) / f"global_step{step}" / filename
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+    def identity():
+        if path.is_symlink():
+            raise ValueError("native checkpoint reader refuses symlinks")
+        return tuple(getattr(path.stat(), field) for field in fields)
+
+    if identity() != saved["identities"][filename]:
+        raise ValueError("native checkpoint reader file identity drift")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        raw = stream.read(length)
+    if identity() != saved["identities"][filename]:
+        raise ValueError("native checkpoint reader file identity drift")
+    return {
+        "offset": offset,
+        "size_bytes": saved["receipt"]["written_file_sizes"][filename],
+        "sha256": saved["receipt"]["written_files"][filename],
+        "bytes": raw,
+    }
+
+
+def consolidate_native_optimizer_checkpoints(
+    root, worker_receipts, *, step, read_worker, read_worker_source, reserve_bytes
+) -> None:
+    """Copy only witnessed worker files through the caller's admitted same-allocation transport."""
+    root = require_data_fast_path(root, label="native checkpoint consolidation")
+    verify_native_callback(read_worker, read_worker_source)
+    if type(reserve_bytes) is not int or reserve_bytes < 0 or type(step) is not int or step not in (0, 1):
+        raise ValueError("native consolidation requires an explicit disk reserve and valid step")
+    if not isinstance(worker_receipts, list) or not worker_receipts:
+        raise ValueError("native consolidation requires actual worker save receipts")
+    tag = root / f"global_step{step}"
+    if tag.is_symlink():
+        raise ValueError("native consolidation checkpoint tag symlink")
+    selected = []
+    names = set()
+    for rank, row in enumerate(worker_receipts):
+        if (
+            row.get("schema") != "native-ep-zero2-worker-save-v1"
+            or row.get("checkpoint_root") != str(root)
+            or row.get("step") != step
+            or row.get("tag") != tag.name
+            or row["layout"]["checkpoint_rank"] != rank
+            or set(row["written_files"]) != set(row["written_file_sizes"])
+        ):
+            raise ValueError("native consolidation worker save binding mismatch")
+        for name, digest in row["written_files"].items():
+            size = row["written_file_sizes"][name]
+            if (
+                Path(name).name != name
+                or name in names
+                or type(size) is not int
+                or size < 1
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ValueError("native consolidation duplicate or invalid file descriptor")
+            names.add(name)
+            selected.append((rank, tag / name, size, digest))
+    needed = 0
+    for _, path, size, digest in selected:
+        if path.is_symlink():
+            raise ValueError("native consolidation destination symlink")
+        if path.exists():
+            if not path.is_file() or path.stat().st_size != size or _checkpoint_hashes([path])[str(path)] != digest:
+                raise ValueError("native consolidation preserves mismatching existing files")
+        else:
+            needed += size
+    if shutil.disk_usage(root).free < needed + reserve_bytes:
+        raise ValueError("native consolidation has insufficient fresh disk budget")
+    verify_native_callback(read_worker, read_worker_source)
+    tag.mkdir(exist_ok=True)
+    for rank, path, size, digest in selected:
+        if path.exists():
+            continue
+        hasher = hashlib.sha256()
+        with path.open("xb") as stream:
+            offset = 0
+            while offset < size:
+                verify_native_callback(read_worker, read_worker_source)
+                length = min(8 << 20, size - offset)
+                block = read_worker(rank, path.name, offset=offset, length=length)
+                if (
+                    not isinstance(block, dict)
+                    or block.get("offset") != offset
+                    or block.get("size_bytes") != size
+                    or block.get("sha256") != digest
+                    or type(block.get("bytes")) is not bytes
+                    or len(block["bytes"]) != length
+                ):
+                    raise ValueError("native consolidation reader returned mismatching bytes")
+                stream.write(block["bytes"])
+                hasher.update(block["bytes"])
+                offset += length
+        if hasher.hexdigest() != digest:
+            raise ValueError("native consolidation file digest mismatch")
+    directory = tag / "native_optimizer_layout"
+    if directory.is_symlink():
+        raise ValueError("native consolidation receipt directory symlink")
+    directory.mkdir(exist_ok=True)
+    for rank, row in enumerate(worker_receipts):
+        path = directory / f"rank{rank:05d}.json"
+        if path.is_symlink():
+            raise ValueError("native consolidation receipt symlink")
+        if path.exists():
+            if json.loads(path.read_text()) != row:
+                raise ValueError("native consolidation preserves mismatching existing receipt")
+        else:
+            with path.open("x") as stream:
+                stream.write(json.dumps(row, indent=2, allow_nan=False) + "\n")
+    verify_native_callback(read_worker, read_worker_source)
+    for _, path, size, digest in selected:
+        if path.stat().st_size != size or _checkpoint_hashes([path])[str(path)] != digest:
+            raise ValueError("native consolidation file changed after copy")
+
+
+def assemble_native_optimizer_layout(
+    root: Path, *, step: int, parent_job_id: str, training_child_id: str, expected_world_size: int, source_files: dict
+) -> dict:
+    """Assemble complete same-allocation receipts after caller-owned peer file consolidation."""
+    root = require_data_fast_path(root, label="native optimizer receipt root")
+    if type(step) is not int or step not in (0, 1) or type(expected_world_size) is not int or expected_world_size < 1:
+        raise ValueError("invalid native optimizer receipt step or world size")
+    _native_sources({"source_files": source_files})
+    tag = f"global_step{step}"
+    directory = root / tag / "native_optimizer_layout"
+    paths = sorted(directory.glob("*.json"))
+    if directory.is_symlink() or len(paths) != expected_world_size:
+        raise ValueError("native collector requires every worker receipt")
+    rows = []
+    for rank, path in enumerate(paths):
+        if path.name != f"rank{rank:05d}.json" or path.is_symlink() or path.stat().st_size > 1 << 20:
+            raise ValueError("native collector receipt inventory mismatch")
+        row = json.loads(path.read_text())
+        expected = {
+            "schema": "native-ep-zero2-worker-save-v1",
+            "parent_job_id": parent_job_id,
+            "training_child_id": training_child_id,
+            "step": step,
+            "tag": tag,
+            "checkpoint_root": str(root),
+        }
+        if any(row.get(key) != value for key, value in expected.items()):
+            raise ValueError("native collector receipt child/step/root binding mismatch")
+        if not isinstance(row.get("nonce"), str) or re.fullmatch(r"[0-9a-f]{32}", row["nonce"]) is None:
+            raise ValueError("native collector requires actual armed nonce")
+        layout = row["layout"]
+        if layout["checkpoint_rank"] != rank or layout["world_size"] != expected_world_size:
+            raise ValueError("native collector receipt rank/world mismatch")
+        if set(row["written_files"]) != set(row["written_file_sizes"]):
+            raise ValueError("native collector file size coverage mismatch")
+        for name, digest in row["written_files"].items():
+            path = root / tag / name
+            if (
+                Path(name).name != name
+                or path.is_symlink()
+                or path.stat().st_size != row["written_file_sizes"][name]
+                or _checkpoint_hashes([path])[str(path)] != digest
+            ):
+                raise ValueError("native collector written checkpoint file drift")
+        rows.append(row)
+    first = rows[0]["layout"]
+    common = ("dp_order", "world_size", "ep_size", "sp_size", "model_mp_world_size", "ds_config", "source_files")
+    if first["source_files"] != source_files or sorted(first["dp_order"]) != list(range(expected_world_size)):
+        raise ValueError("native collector selected source or DP order mismatch")
+    groups = {}
+    for rank, row in enumerate(rows):
+        layout = row["layout"]
+        if any(layout[key] != first[key] for key in common) or layout["global_rank"] != first["dp_order"][rank]:
+            raise ValueError("native collector worker layout disagreement")
+        if len(layout["groups"]) != len(first["groups"]):
+            raise ValueError("native collector optimizer group count disagreement")
+        written = {layout["optimizer_filename"]}
+        if rank == 0:
+            written.add("mp_rank_00_model_states.pt")
+        if layout["edp_rank"] == 0:
+            written.add(f"experts_ep_rank_{layout['ep_rank']:03d}.pt")
+        if set(row["written_files"]) != written:
+            raise ValueError("native collector requires exact worker write coverage")
+        for index, group in enumerate(layout["groups"]):
+            base = first["groups"][index]
+            if (group["name"], group["moe"]) != (base["name"], base["moe"]):
+                raise ValueError("native collector optimizer group order disagreement")
+            if group["moe"]:
+                routes = groups.setdefault(group["name"], [None] * first["ep_size"])
+                ep_rank = group["ep_rank"]
+                if type(ep_rank) is not int or not 0 <= ep_rank < first["ep_size"]:
+                    raise ValueError("native collector expert rank mismatch")
+                if group["ranks"].index(rank) != layout["edp_rank"] or ep_rank != layout["ep_rank"]:
+                    raise ValueError("native collector expert DP order disagreement")
+                if routes[ep_rank] is not None and routes[ep_rank] != group["ranks"]:
+                    raise ValueError("native collector expert replicas disagree")
+                routes[ep_rank] = group["ranks"]
+            elif group["ranks"] != list(range(expected_world_size)):
+                raise ValueError("native collector dense DP order disagreement")
+    result = _native_layout(
+        {
+            "schema": "native-ep-zero2-layout-v1",
+            **{key: first[key] for key in ("world_size", "ep_size", "sp_size", "model_mp_world_size", "ds_config")},
+            "model_ep_rank": first["ep_rank"],
+            "optimizer_mp_ranks": [row["layout"]["optimizer_mp_rank"] for row in rows],
+            "expert_data_parallel_groups": groups,
+            "source_files": source_files,
+            "worker_bindings": {
+                "parent_job_id": parent_job_id,
+                "training_child_id": training_child_id,
+                "nonces": [row["nonce"] for row in rows],
+            },
+        }
+    )
+    _native_checkpoint_files(root, result)
+    _native_sources(result)
+    return result
 
 
 def _native_checkpoint_files(root: Path, layout: dict) -> tuple[Path, list[Path], list[Path]]:
@@ -309,6 +1548,22 @@ class _Snapshot:
     checkpoint_hashes: dict[str, str] | None = None
 
 
+def _native_checkpoint_parameter_name(name: str) -> str:
+    return ".".join(part for part in name.split(".") if part != "_checkpoint_wrapped_module")
+
+
+def _native_checkpoint_parameter_names(parameters: dict, description: str) -> dict[str, str]:
+    names = {}
+    for name in parameters:
+        if not isinstance(name, str):
+            raise ValueError(f"{description}: parameter name is not a string")
+        checkpoint_name = _native_checkpoint_parameter_name(name)
+        if checkpoint_name in names:
+            raise ValueError(f"{description} has duplicate checkpoint-wrapper parameter aliases: {name!r}")
+        names[checkpoint_name] = name
+    return names
+
+
 def _snapshot(
     root: Path,
     *,
@@ -349,27 +1604,53 @@ def _snapshot(
     if native is not None:
         if not isinstance(module, dict):
             raise ValueError("native checkpoint requires its replicated module payload")
+        # PyTorch state_dict removes checkpoint wrappers; named_parameters retains them.
+        module_names = _native_checkpoint_parameter_names(module, "native module")
         experts = [_load(path) for path in expert_files]
-        for shard in experts:
+        for path, shard in zip(expert_files, experts, strict=True):
             if not shard or set(shard) != set(experts[0]):
                 raise ValueError("inconsistent expert sidefile parameter coverage")
             for name, value in shard.items():
-                reference = module.get(name)
-                if (
-                    not isinstance(name, str)
-                    or not isinstance(value, torch.Tensor)
-                    or value.dtype != torch.bfloat16
-                    or value.layout != torch.strided
-                    or value.ndim < 1
-                    or value.numel() == 0
-                    or not isinstance(reference, torch.Tensor)
-                    or value.shape != reference.shape
-                    or reference.dtype != value.dtype
-                    or not bool(torch.isfinite(value).all())
-                ):
-                    raise ValueError("invalid expert sidefile tensor or module shape")
-        if any(not torch.equal(value, module[name]) for name, value in experts[native["model_ep_rank"]].items()):
+                reference = (
+                    module.get(module_names.get(_native_checkpoint_parameter_name(name)))
+                    if isinstance(name, str)
+                    else None
+                )
+                if not isinstance(name, str):
+                    reason = "parameter name is not a string"
+                elif not isinstance(value, torch.Tensor):
+                    reason = f"sidefile value is {type(value).__name__}, not a tensor"
+                elif value.dtype != torch.bfloat16:
+                    reason = f"sidefile dtype is {value.dtype}, expected {torch.bfloat16}"
+                elif value.layout != torch.strided:
+                    reason = f"sidefile layout is {value.layout}, expected {torch.strided}"
+                elif value.ndim < 1:
+                    reason = "sidefile tensor is scalar"
+                elif value.numel() == 0:
+                    reason = f"sidefile tensor is empty with shape {tuple(value.shape)}"
+                elif not isinstance(reference, torch.Tensor):
+                    reason = f"module value is {type(reference).__name__}, not a tensor"
+                elif value.shape != reference.shape:
+                    reason = f"sidefile shape {tuple(value.shape)} differs from module shape {tuple(reference.shape)}"
+                elif reference.dtype != value.dtype:
+                    reason = f"module dtype {reference.dtype} differs from sidefile dtype {value.dtype}"
+                elif not bool(torch.isfinite(value).all()):
+                    reason = "sidefile tensor contains nonfinite values"
+                else:
+                    continue
+                raise ValueError(
+                    f"invalid expert sidefile tensor or module shape: {path.name}, parameter {name!r}: {reason}"
+                )
+            _native_checkpoint_parameter_names(shard, path.name)
+        if any(
+            not torch.equal(value, module[module_names[_native_checkpoint_parameter_name(name)]])
+            for name, value in experts[native["model_ep_rank"]].items()
+        ):
             raise ValueError("rank-zero expert sidefile/module mismatch")
+        _native_checkpoint_parameter_names(
+            {name: None for group in shape_groups if isinstance(group, dict) for name in group},
+            "native param_shapes",
+        )
     for group in shape_groups:
         if not isinstance(group, dict) or not group:
             raise ValueError("param_shapes contains an empty or invalid group")
@@ -382,7 +1663,8 @@ def _snapshot(
             dimensions = tuple(_integer(dim, f"{name} shape") for dim in shape)
             if math.prod(dimensions) == 0:
                 raise ValueError(f"empty parameter shape for {name}")
-            if isinstance(module, dict) and name in module and tuple(module[name].shape) != dimensions:
+            module_name = module_names.get(_native_checkpoint_parameter_name(name)) if native is not None else name
+            if isinstance(module, dict) and module_name in module and tuple(module[module_name].shape) != dimensions:
                 raise ValueError(f"model/optimizer shape mismatch for {name}")
             entries[name] = dimensions
             names.add(name)
@@ -613,6 +1895,8 @@ def decode_optimizer_capture(
     expected_optimizer_config: dict | None = None,
     expected_learning_rate: float | None = None,
     expected_native_layout: dict | None = None,
+    participation_receipts: list[dict] | None = None,
+    expected_participation_job_id: str | None = None,
 ) -> Path:
     """Validate one real optimizer step and write named comparison tensors.
 
@@ -662,6 +1946,54 @@ def decode_optimizer_capture(
         _verify_native_inputs(before_dir, before)
         _verify_native_inputs(after_dir, after)
         _native_sources(native)
+    participation, inactive_weights = None, {}
+    if participation_receipts is not None:
+        from arctic_platform.debug.correctness_participation import merge_worker_receipts
+
+        from .participation import merge_rank_participation
+
+        if native is not None:
+            raise ValueError("ordinary participation receipts cannot replace native collector evidence")
+        merge_worker_receipts(
+            participation_receipts,
+            job_id=expected_participation_job_id,
+            world_size=len(after.shards),
+        )
+        for receipt in participation_receipts:
+            for filename, digest in receipt["after"]["participation_sources"].items():
+                if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
+                    raise ValueError("participation capture source drift")
+        shapes = {name: shape for group in after.shapes for name, shape in group.items()}
+        participation, inactive_weights = merge_rank_participation(
+            [receipt["before"] for receipt in participation_receipts],
+            [receipt["after"] for receipt in participation_receipts],
+            shapes,
+            {name: [0] for name in shapes},
+        )
+    if native is not None:
+        from .participation import merge_rank_participation
+
+        receipts = [
+            [
+                json.loads(path.read_text())
+                for path in sorted((root / f"global_step{snapshot.step}" / "native_optimizer_layout").glob("*.json"))
+            ]
+            for root, snapshot in ((before_dir, before), (after_dir, after))
+        ]
+        # Older explicit collector fixtures remain readable, but cannot match a new participation-aware reference.
+        if any("participation" in row for rows in receipts for row in rows):
+            if any(len(rows) != native["world_size"] for rows in receipts):
+                raise ValueError("native participation requires complete rank receipts")
+            for left, right in zip(*receipts, strict=True):
+                sources = left.get("participation_sources")
+                if not sources or sources != right.get("participation_sources"):
+                    raise ValueError("native participation source identity drift")
+                for filename, digest in sources.items():
+                    if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
+                        raise ValueError("native participation source drift")
+            shapes = {name: shape for group in after.shapes for name, shape in group.items()}
+            routes = {name: after.rank_routes[index] for index, group in enumerate(after.shapes) for name in group}
+            participation, inactive_weights = merge_rank_participation(*receipts, shapes, routes)
     output_dir.mkdir(parents=True)
     try:
         entries = []
@@ -669,6 +2001,13 @@ def decode_optimizer_capture(
             for name, shape in shapes.items():
                 master_before = _parameter(before, group_index, name, "fp32_master")
                 master_after = _parameter(after, group_index, name, "fp32_master")
+                if name in inactive_weights:
+                    from .participation import weight_identity
+
+                    inactive_weights[name]["master"] = {
+                        "before": weight_identity(master_before),
+                        "after": weight_identity(master_after),
+                    }
                 if native is not None:
                     master_before, master_after = master_before.float(), master_after.float()
                 master_after.sub_(master_before)
@@ -687,6 +2026,11 @@ def decode_optimizer_capture(
                 del master_before, master_after
         manifest = output_dir / "manifest.json"
         provenance = {}
+        if participation is not None:
+            from .participation import validate_inactive_weights
+
+            validate_inactive_weights(participation, inactive_weights)
+            provenance.update(participation=participation, inactive_weights=inactive_weights)
         if native is not None:
             _verify_native_inputs(before_dir, before)
             _verify_native_inputs(after_dir, after)
@@ -697,14 +2041,16 @@ def decode_optimizer_capture(
                 if after.groups[0][index].get("moe")
                 for name in shapes
             }
-            provenance = {
-                "native_layout": native,
-                "source_dtypes": {"master": "bfloat16", "exp_avg": "bfloat16", "exp_avg_sq": "bfloat16"},
-                "parameter_update_recipe": "FP32 difference of saved BF16 optimizer masters",
-                "expert_sidefiles_are_master_sources": False,
-                "frozen_expert_parameters": sorted(set(after.expert_shards[0]) - active_experts),
-                "runtime_provenance_is_caller_owned": True,
-            }
+            provenance.update(
+                {
+                    "native_layout": native,
+                    "source_dtypes": {"master": "bfloat16", "exp_avg": "bfloat16", "exp_avg_sq": "bfloat16"},
+                    "parameter_update_recipe": "FP32 difference of saved BF16 optimizer masters",
+                    "expert_sidefiles_are_master_sources": False,
+                    "frozen_expert_parameters": sorted(set(after.expert_shards[0]) - active_experts),
+                    "runtime_provenance_is_caller_owned": True,
+                }
+            )
         manifest.write_text(
             json.dumps(
                 {
@@ -734,6 +2080,627 @@ def _verify_native_inputs(root: Path, snapshot: _Snapshot) -> None:
         raise ValueError("native optimizer checkpoint input drift")
 
 
+_DENSE_OWNER = ".correctness-dense-optimizer-owner.json"
+_DENSE_RECEIPT = ".correctness-dense-optimizer-collection.json"
+
+
+def validate_dense_checkpoint_allocation(admission, *, expected_dp_world_size):
+    """Validate supplied same-allocation identities, not discovered or replacement nodes."""
+    from . import inference_export as transfer
+
+    nodes = transfer.validate_local_inference_allocation(admission)
+    if type(expected_dp_world_size) is not int or sum(node["slots"] for node in nodes) != expected_dp_world_size:
+        raise ValueError("dense checkpoint allocation must cover the complete DP world")
+    return nodes
+
+
+def _dense_root(request):
+    root = Path(request["binding"]["root"])
+    if root != require_data_fast_path(root, label="dense optimizer checkpoint") or root.is_symlink():
+        raise ValueError("dense checkpoint requires a canonical FAST root")
+    return root
+
+
+def _dense_identity(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("dense checkpoint root must be an owned real directory")
+    return [info.st_dev, info.st_ino, info.st_uid, info.st_mode]
+
+
+def _dense_check_root(request):
+    root = _dense_root(request)
+    identity = _dense_identity(root)
+    expected = request.get("root_identity")
+    if expected is not None and identity != expected:
+        raise ValueError("dense checkpoint root identity drift")
+    marker = root / _DENSE_OWNER
+    info = marker.lstat()
+    marker_identity = [
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    ]
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_size > 8192:
+        raise ValueError("dense checkpoint owner marker is not a bounded owned file")
+    if request.get("marker_identity", marker_identity) != marker_identity:
+        raise ValueError("dense checkpoint owner marker identity drift")
+    with os.fdopen(os.open(marker, os.O_RDONLY | os.O_NOFOLLOW), "r") as stream:
+        if (os.fstat(stream.fileno()).st_dev, os.fstat(stream.fileno()).st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("dense checkpoint owner marker inode changed")
+        if json.load(stream) != request["binding"]:
+            raise ValueError("dense checkpoint owner binding drift")
+        if os.fstat(stream.fileno()) != marker.lstat():
+            raise ValueError("dense checkpoint owner marker changed")
+    return root, identity
+
+
+def _dense_node_admission(request, deadline):
+    from . import inference_export as transfer
+    from .storage import parse_hostfile
+
+    admission = request["allocation"]
+    content = admission.get("hostfile_content")
+    if not isinstance(content, str) or not content or len(content.encode()) > 65536:
+        raise ValueError("dense checkpoint requires a bounded head hostfile snapshot")
+    snapshot = content.encode()
+    if hashlib.sha256(snapshot).hexdigest() != admission.get("hostfile_sha256"):
+        raise ValueError("dense checkpoint head hostfile snapshot hash differs")
+    with NamedTemporaryFile() as temporary:
+        temporary.write(snapshot)
+        temporary.flush()
+        parsed = parse_hostfile(temporary.name)
+    nodes = admission.get("nodes")
+    if (
+        not isinstance(nodes, list)
+        or not nodes
+        or any(not isinstance(node, dict) for node in nodes)
+        or [(node.get("host"), node.get("slots")) for node in nodes] != [(row.host, row.slots) for row in parsed]
+        or len({node.get("host") for node in nodes}) != len(nodes)
+        or len({node.get("hostname") for node in nodes}) != len(nodes)
+        or sum(node == request["node"] for node in nodes) != 1
+    ):
+        raise ValueError("dense checkpoint ordered head snapshot members differ from admitted nodes")
+    transfer._validate_local_node(request["node"], deadline)
+    try:
+        transfer._LOCAL_HOSTFILE.lstat()
+    except FileNotFoundError:
+        if request["node"] == nodes[0]:
+            raise ValueError("dense checkpoint head hostfile is required") from None
+        identity = {
+            "path": str(transfer._LOCAL_HOSTFILE),
+            "absent": True,
+            "hostfile_sha256": admission["hostfile_sha256"],
+        }
+        if request.get("hostfile_identity", identity) != identity:
+            raise ValueError("dense checkpoint node hostfile drift")
+        return identity
+    identity = transfer._local_hostfile_identity()
+    target = Path(identity["target_path"])
+    if (
+        transfer._regular_sha(target, deadline) != admission["hostfile_sha256"]
+        or target.read_text() != admission["hostfile_content"]
+        or transfer._local_hostfile_identity() != identity
+        or request.get("hostfile_identity", identity) != identity
+    ):
+        raise ValueError("dense checkpoint node hostfile drift")
+    return identity
+
+
+def _dense_manifest(request, deadline):
+    from . import inference_export as transfer
+
+    root, identity = _dense_check_root(request)
+    tag = root / request["binding"]["tag"]
+    _dense_identity(tag)
+    entries = []
+    for index, path in enumerate(root.rglob("*")):
+        if index >= 4096 or path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError("dense checkpoint contains unsupported entries")
+        if path.suffix != ".pt":
+            continue
+        if path.parent != tag or (path.name != "mp_rank_00_model_states.pt" and not _OPTIM_FILE.fullmatch(path.name)):
+            raise ValueError("dense checkpoint contains an unsupported tensor file")
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise ValueError("dense checkpoint requires exclusively owned regular tensor files")
+        before = transfer._fingerprint(path)
+        digest = transfer._regular_sha(path, deadline)
+        if before != transfer._fingerprint(path) or before[2] < 1:
+            raise ValueError("dense checkpoint file is empty or changed")
+        entries.append({"path": path.name, "size_bytes": before[2], "sha256": digest})
+    if _dense_check_root(request)[1] != identity:
+        raise ValueError("dense checkpoint root changed during inventory")
+    return {
+        "binding": request["binding"],
+        "node": request["node"],
+        "files": sorted(entries, key=lambda row: row["path"]),
+    }
+
+
+def _dense_sources():
+    from . import inference_export as transfer
+    from . import storage
+    from . import transport
+
+    return {
+        role: {"path": str(Path(path).resolve()), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+        for role, path in (
+            ("collector", __file__),
+            ("transfer", transfer.__file__),
+            ("storage", storage.__file__),
+            ("cleanup_contract", transport.__file__),
+        )
+    }
+
+
+def _dense_source_guard(request):
+    if _dense_sources() != request["source_files"]:
+        raise ValueError("dense checkpoint collection source drift")
+
+
+def _dense_worker_argv(python, role, request):
+    _dense_source_guard(request)
+    root = Path(__file__).resolve().parents[3]
+    checks = "".join(
+        f"if hashlib.sha256(pathlib.Path({row['path']!r}).read_bytes()).hexdigest() != {row['sha256']!r}:\n"
+        "    raise ValueError('dense checkpoint source drift before import')\n"
+        for row in request["source_files"].values()
+    )
+    code = (
+        f"import hashlib,pathlib,sys\nsys.path.insert(0,{str(root)!r})\n{checks}"
+        "from arctic_platform.correctness.harness import cortex_optimizer as m\n"
+        f"m._dense_worker({role!r},{request!r})"
+    )
+    return [python, "-B", "-c", code]
+
+
+@contextlib.contextmanager
+def _dense_argv(admission, node, role, request, deadline):
+    from . import inference_export as transfer
+
+    command = _dense_worker_argv(node["python"], role, request)
+    if node == admission["nodes"][0]:
+        yield command
+    else:
+        with transfer._local_ssh_argv(admission, node, {}, deadline) as argv:
+            argv[-1] = shlex.join(_dense_worker_argv(node["python"], "supervise", {**request, "operation": role}))
+            yield argv
+
+
+@contextlib.contextmanager
+def _dense_owned_processes():
+    from . import inference_export as transfer
+
+    children = []
+    primary = None
+    try:
+        yield children
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            transfer._stop_local_children(children)
+        except BaseException as exc:
+            error = UnsafeCleanupError(
+                "dense checkpoint owned process cleanup incomplete",
+                owned_children={str(child.pid): {"process_group": child.pid} for child in children},
+                shutdown_error=exc,
+            )
+            if primary is not None:
+                error.preserve_workload(primary)
+            raise error from exc
+
+
+def _dense_call(admission, node, role, request, deadline):
+    from . import inference_export as transfer
+
+    with _dense_argv(admission, node, role, request, deadline) as argv, _dense_owned_processes() as children:
+        child = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        children.append(child)
+        output, error = child.communicate(timeout=transfer._local_remaining(deadline))
+        transfer._local_remaining(deadline)
+        if child.returncode:
+            raise RuntimeError("dense checkpoint worker failed: " + error.decode(errors="replace")[-8000:])
+        if len(output) > transfer._LOCAL_METADATA_LIMIT:
+            raise ValueError("dense checkpoint worker receipt exceeds metadata bound")
+        return json.loads(output, object_pairs_hook=transfer._unique_object)
+
+
+def _dense_worker(role, request):
+    from . import inference_export as transfer
+
+    deadline = time.monotonic() + min(request["timeout_s"], request["deadline_epoch"] - time.time())
+    transfer._local_remaining(deadline)
+    _dense_source_guard(request)
+    hostfile = _dense_node_admission(request, deadline)
+    root = _dense_root(request)
+    if role == "supervise":
+        operation = request.get("operation")
+        if operation not in {"prepare", "manifest", "send", "close"}:
+            raise ValueError("unsupported dense checkpoint supervised operation")
+        with _dense_owned_processes() as children:
+            child = subprocess.Popen(_dense_worker_argv(sys.executable, operation, request), start_new_session=True)
+            children.append(child)
+            child.wait(timeout=transfer._local_remaining(deadline))
+            transfer._local_remaining(deadline)
+            if child.returncode:
+                raise RuntimeError("dense checkpoint supervised worker failed")
+        return
+    if role == "prepare":
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root.mkdir(mode=0o700)
+        with os.fdopen(os.open(root / _DENSE_OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+            json.dump(request["binding"], stream, sort_keys=True, allow_nan=False)
+        marker = (root / _DENSE_OWNER).lstat()
+        result = {
+            "binding": request["binding"],
+            "node": request["node"],
+            "root_identity": _dense_check_root(request)[1],
+            "hostfile_identity": hostfile,
+            "marker_identity": [
+                marker.st_dev,
+                marker.st_ino,
+                marker.st_uid,
+                marker.st_mode,
+                marker.st_size,
+                marker.st_mtime_ns,
+                marker.st_ctime_ns,
+            ],
+        }
+    elif role in {"manifest", "send"}:
+        manifest = _dense_manifest(request, deadline)
+        if role == "send":
+            if manifest != request["manifest"]:
+                raise ValueError("dense checkpoint changed before transfer")
+            transfer._stream_local_export(root / request["binding"]["tag"], manifest, deadline)
+            if _dense_manifest(request, deadline) != manifest:
+                raise ValueError("dense checkpoint changed after transfer")
+            if _dense_node_admission(request, deadline) != hostfile:
+                raise ValueError("dense checkpoint sender node identity changed")
+            _dense_source_guard(request)
+            return
+        result = manifest
+    elif role == "close":
+        if not os.path.lexists(root):
+            result = {"owned_root_absent": True}
+        else:
+            _dense_check_root(request)
+            for path in root.rglob("*"):
+                if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                    raise ValueError("dense checkpoint cleanup refuses changed entries")
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise RuntimeError("dense checkpoint cleanup requires symlink-safe removal")
+            shutil.rmtree(root)
+            result = {"owned_root_absent": True}
+    elif role == "receive":
+        result = _dense_receive(request, deadline)
+    else:
+        raise ValueError("unknown dense checkpoint collection operation")
+    if _dense_node_admission(request, deadline) != hostfile:
+        raise ValueError("dense checkpoint node identity changed")
+    _dense_source_guard(request)
+    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+
+
+def _dense_validate_manifests(binding, nodes, manifests, expected_dp_world_size):
+    if len(manifests) != len(nodes):
+        raise ValueError("dense checkpoint requires every allocation node receipt")
+    names, ranks = set(), set()
+    for node, manifest in zip(nodes, manifests):
+        if not isinstance(manifest, dict) or manifest.get("binding") != binding or manifest.get("node") != node:
+            raise ValueError("dense checkpoint receipt allocation or child binding drift")
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            raise ValueError("dense checkpoint file inventory required")
+        local_ranks = set()
+        for row in files:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("path"), str)
+                or row["path"] in names
+                or type(row.get("size_bytes")) is not int
+                or row["size_bytes"] < 1
+                or not isinstance(row.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+            ):
+                raise ValueError("dense checkpoint duplicate or invalid file")
+            name = row["path"]
+            match = _OPTIM_FILE.fullmatch(name)
+            if match is not None:
+                rank = int(match.group(1))
+                if rank in ranks:
+                    raise ValueError("dense checkpoint duplicate DP rank")
+                ranks.add(rank)
+                local_ranks.add(rank)
+            elif name != "mp_rank_00_model_states.pt":
+                raise ValueError("dense checkpoint unsupported filename")
+            names.add(name)
+        if len(local_ranks) != node["slots"]:
+            raise ValueError("dense checkpoint node shard count differs from admitted slots")
+    if ranks != set(range(expected_dp_world_size)) or "mp_rank_00_model_states.pt" not in names:
+        raise ValueError("dense checkpoint requires the full DP rank set and model file")
+
+
+def _dense_receive(request, deadline):
+    from . import inference_export as transfer
+
+    root, _ = _dense_check_root(request)
+    manifest = json.loads(
+        sys.stdin.buffer.readline(transfer._LOCAL_METADATA_LIMIT + 1), object_pairs_hook=transfer._unique_object
+    )
+    if manifest != request["manifest"]:
+        raise ValueError("dense checkpoint stream manifest mismatch")
+    tag = root / request["binding"]["tag"]
+    if tag.exists():
+        _dense_identity(tag)
+    else:
+        tag.mkdir(mode=0o700)
+    for row in manifest["files"]:
+        name = row["path"]
+        if name != "mp_rank_00_model_states.pt" and _OPTIM_FILE.fullmatch(name) is None:
+            raise ValueError("dense checkpoint stream filename mismatch")
+        if type(row["size_bytes"]) is not int or row["size_bytes"] < 1:
+            raise ValueError("dense checkpoint stream size mismatch")
+        digest, remaining = hashlib.sha256(), row["size_bytes"]
+        with transfer._open_exclusive(tag, name) as output:
+            while remaining:
+                transfer._local_remaining(deadline)
+                block = sys.stdin.buffer.read(min(1024**2, remaining))
+                if not block:
+                    raise ValueError("truncated dense checkpoint stream")
+                output.write(block)
+                digest.update(block)
+                remaining -= len(block)
+            output.flush()
+            os.fsync(output.fileno())
+        if digest.hexdigest() != row["sha256"] or transfer._regular_sha(tag / name, deadline) != row["sha256"]:
+            raise ValueError("dense checkpoint stream file hash mismatch")
+    if sys.stdin.buffer.read(1):
+        raise ValueError("extra bytes after dense checkpoint stream")
+    _dense_check_root(request)
+    return {"manifest_sha256": transfer.schema_sha(manifest), "files_verified": len(manifest["files"])}
+
+
+def _dense_copy_peer(admission, node, request, head_request, deadline):
+    from . import inference_export as transfer
+
+    with TemporaryFile() as errors:
+        with _dense_argv(admission, node, "send", request, deadline) as argv, _dense_owned_processes() as children:
+            sender = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                start_new_session=True,
+            )
+            children.append(sender)
+            receiver = subprocess.Popen(
+                _dense_worker_argv(sys.executable, "receive", {**head_request, "manifest": request["manifest"]}),
+                stdin=sender.stdout,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                start_new_session=True,
+            )
+            children.append(receiver)
+            sender.stdout.close()
+            output, _ = receiver.communicate(timeout=transfer._local_remaining(deadline))
+            sender.wait(timeout=transfer._local_remaining(deadline))
+            if sender.returncode or receiver.returncode:
+                errors.seek(0)
+                raise RuntimeError(
+                    "dense checkpoint transfer failed: " + errors.read().decode(errors="replace")[-8000:]
+                )
+            expected = {
+                "manifest_sha256": transfer.schema_sha(request["manifest"]),
+                "files_verified": len(request["manifest"]["files"]),
+            }
+            if len(output) > transfer._LOCAL_METADATA_LIMIT or json.loads(output) != expected:
+                raise ValueError("dense checkpoint persisted transfer receipt mismatch")
+
+
+@contextlib.contextmanager
+def _dense_snapshot_collection(root, admission, *, step, expected_dp_world_size, parent_job_id, training_child_id):
+    from . import inference_export as transfer
+
+    admission = json.loads(json.dumps(admission, allow_nan=False))
+    nodes = validate_dense_checkpoint_allocation(admission, expected_dp_world_size=expected_dp_world_size)
+    if (
+        type(step) is not int
+        or step not in (0, 1)
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", value) is None
+            for value in (parent_job_id, training_child_id)
+        )
+        or parent_job_id == training_child_id
+    ):
+        raise ValueError("dense checkpoint requires its exact initialized parent and training child")
+    timeout = admission.get("timeout_s", 1800.0)
+    reserve = admission.get("reserve_bytes", 0)
+    if (
+        type(timeout) not in (int, float)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+        or type(reserve) is not int
+        or reserve < 0
+    ):
+        raise ValueError("dense checkpoint requires a finite timeout and nonnegative disk reserve")
+    deadline = time.monotonic() + timeout
+    host_identity = {}
+    transfer._validate_local_allocation(admission, deadline, host_identity)
+    binding = {
+        "schema": "same-allocation-dense-optimizer-v1",
+        "allocation_sha256": transfer.schema_sha(admission),
+        "parent_job_id": parent_job_id,
+        "training_child_id": training_child_id,
+        "root": str(root),
+        "tag": f"global_step{step}",
+        "nonce": uuid.uuid4().hex,
+    }
+    owned = []
+    primary = None
+    proof = None
+    try:
+        for node in nodes:
+            request = {
+                "allocation": admission,
+                "node": node,
+                "binding": binding,
+                "timeout_s": timeout,
+                "deadline_epoch": time.time() + transfer._local_remaining(deadline),
+                "source_files": _dense_sources(),
+            }
+            if owned and request["source_files"] != owned[0][1]["source_files"]:
+                raise ValueError("dense checkpoint source changed before prepare")
+            owned.append((node, request))
+            prepared = _dense_call(admission, node, "prepare", request, deadline)
+            if (
+                not isinstance(prepared, dict)
+                or set(prepared) != {"binding", "node", "root_identity", "hostfile_identity", "marker_identity"}
+                or prepared["binding"] != binding
+                or prepared["node"] != node
+                or not isinstance(prepared["root_identity"], list)
+                or len(prepared["root_identity"]) != 4
+                or not isinstance(prepared["marker_identity"], list)
+                or len(prepared["marker_identity"]) != 7
+                or not isinstance(prepared["hostfile_identity"], dict)
+                or not prepared["hostfile_identity"]
+            ):
+                raise ValueError("dense checkpoint prepare acknowledgement binding mismatch")
+            request.update(prepared)
+
+        def collect(result):
+            nonlocal proof
+            if result.get("job_id") != training_child_id:
+                raise ValueError("dense checkpoint save returned a different training child")
+            transfer._validate_local_allocation(admission, deadline, host_identity)
+            _dense_source_guard(owned[0][1])
+            manifests = [_dense_call(admission, node, "manifest", request, deadline) for node, request in owned]
+            _dense_validate_manifests(binding, nodes, manifests, expected_dp_world_size)
+            needed = sum(row["size_bytes"] for manifest in manifests[1:] for row in manifest["files"])
+            if shutil.disk_usage(root).free < needed + reserve:
+                raise ValueError("dense checkpoint collection has insufficient fresh disk budget")
+            for (node, request), manifest in zip(owned[1:], manifests[1:]):
+                _dense_copy_peer(admission, node, {**request, "manifest": manifest}, owned[0][1], deadline)
+            model, shards = _checkpoint_files(root)
+            expected = {row["path"]: row for manifest in manifests for row in manifest["files"]}
+            for path in (model, *shards):
+                row = expected[path.name]
+                if path.stat().st_size != row["size_bytes"] or transfer._regular_sha(path, deadline) != row["sha256"]:
+                    raise ValueError("dense checkpoint consolidated file drift")
+            transfer._validate_local_allocation(admission, deadline, host_identity)
+            _dense_source_guard(owned[0][1])
+            proof = {
+                "binding": binding,
+                "node_manifests": manifests,
+                "node_preparations": [
+                    {key: request[key] for key in ("node", "root_identity", "marker_identity", "hostfile_identity")}
+                    for _, request in owned
+                ],
+                "peer_cleanup": [],
+                "source_files": owned[0][1]["source_files"],
+            }
+            return proof
+
+        yield collect
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        failures = []
+        for node, request in reversed(owned[1:]):
+            try:
+                cleanup_deadline = time.monotonic() + min(timeout, 120)
+                cleanup_request = {
+                    **request,
+                    "timeout_s": min(timeout, 120),
+                    "deadline_epoch": time.time() + min(timeout, 120),
+                }
+                if _dense_call(admission, node, "close", cleanup_request, cleanup_deadline) != {
+                    "owned_root_absent": True
+                }:
+                    raise ValueError("dense checkpoint owned cleanup acknowledgement mismatch")
+                if proof is not None:
+                    proof["peer_cleanup"].append({"node": node, "owned_root_absent": True})
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            shutdown = BaseExceptionGroup("dense checkpoint owned peer cleanup incomplete", failures)
+            error = UnsafeCleanupError(
+                "dense checkpoint owned peer cleanup incomplete",
+                owned_parent=parent_job_id,
+                owned_children={"training": training_child_id, "peer_roots": [binding["root"]]},
+                shutdown_error=shutdown,
+            )
+            if primary is not None:
+                error.preserve_workload(primary)
+            raise error from shutdown
+        if primary is None and proof is not None:
+            _dense_check_root(owned[0][1])
+            _dense_source_guard(owned[0][1])
+            with (root / _DENSE_RECEIPT).open("x") as stream:
+                json.dump(proof, stream, sort_keys=True, allow_nan=False)
+
+
+def _dense_verified_receipt(root, admission, *, step, parent_job_id, training_child_id, source_files):
+    from . import inference_export as transfer
+
+    proof = transfer.read_export_json(root / _DENSE_RECEIPT)
+    binding = proof.get("binding")
+    if (
+        not isinstance(binding, dict)
+        or set(binding)
+        != {
+            "schema",
+            "allocation_sha256",
+            "parent_job_id",
+            "training_child_id",
+            "root",
+            "tag",
+            "nonce",
+        }
+        or binding["schema"] != "same-allocation-dense-optimizer-v1"
+        or binding["allocation_sha256"] != transfer.schema_sha(admission)
+        or binding["parent_job_id"] != parent_job_id
+        or binding["training_child_id"] != training_child_id
+        or binding["root"] != str(root)
+        or binding["tag"] != f"global_step{step}"
+        or not isinstance(binding["nonce"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", binding["nonce"]) is None
+        or proof.get("source_files") != source_files
+    ):
+        raise ValueError("dense optimizer retained receipt binding drift")
+    _dense_source_guard(proof)
+    nodes = admission["nodes"]
+    _dense_validate_manifests(binding, nodes, proof["node_manifests"], sum(node["slots"] for node in nodes))
+    preparations = proof.get("node_preparations")
+    if (
+        not isinstance(preparations, list)
+        or len(preparations) != len(nodes)
+        or any(row.get("node") != node for row, node in zip(preparations, nodes))
+        or proof.get("peer_cleanup") != [{"node": node, "owned_root_absent": True} for node in reversed(nodes[1:])]
+    ):
+        raise ValueError("dense optimizer retained ownership or peer cleanup drift")
+    _dense_check_root({**preparations[0], "binding": binding})
+    expected = {row["path"]: row for manifest in proof["node_manifests"] for row in manifest["files"]}
+    model, shards = _checkpoint_files(root)
+    deadline = time.monotonic() + admission.get("timeout_s", 1800)
+    for path in (model, *shards):
+        row = expected[path.name]
+        if path.stat().st_size != row["size_bytes"] or transfer._regular_sha(path, deadline) != row["sha256"]:
+            raise ValueError("dense optimizer retained checkpoint byte drift")
+    return proof
+
+
 def _save_local_snapshot(
     client,
     root: Path,
@@ -741,11 +2708,53 @@ def _save_local_snapshot(
     step: int,
     expected_dp_world_size: int,
     expected_native_layout: dict | None = None,
+    native_layout_supplier=None,
+    dense_checkpoint_allocation: dict | None = None,
+    parent_job_id: str | None = None,
+    training_child_id: str | None = None,
 ) -> Path:
 
     root = require_data_fast_path(root, label="local optimizer checkpoint")
     if root.exists() or root.is_symlink():
         raise FileExistsError("local optimizer checkpoint must be new")
+    if dense_checkpoint_allocation is not None and (
+        expected_native_layout is not None or native_layout_supplier is not None
+    ):
+        raise ValueError("dense collection cannot substitute for a native EP supplier")
+    scope = (
+        contextlib.nullcontext(None)
+        if dense_checkpoint_allocation is None
+        else _dense_snapshot_collection(
+            root,
+            dense_checkpoint_allocation,
+            step=step,
+            expected_dp_world_size=expected_dp_world_size,
+            parent_job_id=parent_job_id,
+            training_child_id=training_child_id,
+        )
+    )
+    with scope as collect:
+        return _save_local_snapshot_files(
+            client,
+            root,
+            step=step,
+            expected_dp_world_size=expected_dp_world_size,
+            expected_native_layout=expected_native_layout,
+            native_layout_supplier=native_layout_supplier,
+            collect=collect,
+        )
+
+
+def _save_local_snapshot_files(
+    client,
+    root,
+    *,
+    step,
+    expected_dp_world_size,
+    expected_native_layout,
+    native_layout_supplier,
+    collect,
+):
     result = client.save_checkpoint(path=str(root), checkpoint_type="resumable", export_hf=False)
     if not isinstance(result, dict):
         raise ValueError("local optimizer save requires checkpoint metadata")
@@ -761,6 +2770,12 @@ def _save_local_snapshot(
         or result.get("stage_path")
     ):
         raise ValueError("local optimizer checkpoint receipt does not match its requested path and step")
+    if collect is not None:
+        collect(result)
+    if native_layout_supplier is not None:
+        expected_native_layout = _native_layout(native_layout_supplier(root, step=step))
+        if expected_native_layout["world_size"] != expected_dp_world_size:
+            raise ValueError("native supplier world size mismatch")
     for index, path in enumerate(root.rglob("*")):
         if index >= 4096 or path.is_symlink() or not path.resolve().is_relative_to(root):
             raise ValueError("local optimizer checkpoint has unsupported entries or symlinks")
@@ -771,10 +2786,35 @@ def _save_local_snapshot(
         _native_sources(expected_native_layout)
         model, shards, expert_files = _native_checkpoint_files(root, expected_native_layout)
     if model.parent != root / tag or len(shards) != expected_dp_world_size:
-        raise ValueError("local optimizer checkpoint has incorrect tag or DP shard count")
+        raise ValueError(
+            "local optimizer checkpoint metadata mismatch: "
+            f"expected tag={tag!r}, observed tag={model.parent.relative_to(root).as_posix()!r}; "
+            f"expected DP shard count={expected_dp_world_size}, observed DP shard count={len(shards)}"
+        )
     if any(path.stat().st_size == 0 for path in [model, *shards, *expert_files]):
         raise ValueError("local optimizer checkpoint contains empty tensor files")
     return root
+
+
+def _dense_training_child(transport, selector):
+    from .cortex import CorrectnessCortexTransport
+
+    if not isinstance(transport, CorrectnessCortexTransport) or not isinstance(selector, str) or not selector:
+        raise ValueError("dense optimizer requires its owned native training child binding")
+    bindings = getattr(transport, "_native_bindings", None)
+    children = getattr(transport, "_native_children", None)
+    binding = bindings.get(selector) if type(bindings) is dict else None
+    if (
+        type(binding) is not tuple
+        or len(binding) != 2
+        or binding[0] != "training"
+        or not isinstance(binding[1], str)
+        or not binding[1]
+        or type(children) is not dict
+        or children.get("training") != binding[1]
+    ):
+        raise ValueError("dense optimizer requires its owned native training child binding")
+    return binding[1]
 
 
 def capture_optimizer_step(
@@ -788,6 +2828,9 @@ def capture_optimizer_step(
     optimizer_config: dict,
     local_checkpoint: bool = False,
     expected_native_layout: dict | None = None,
+    native_layout_supplier=None,
+    native_layout_supplier_source: dict | None = None,
+    dense_checkpoint_allocation: dict | None = None,
 ) -> StepResult:
     """Save immediately around the existing step; decode without worker-local diagnostics."""
     if not isinstance(session.backend, CortexConfig):
@@ -798,31 +2841,130 @@ def capture_optimizer_step(
         raise ValueError("managed optimizer capture requires an initialized parent job")
     if type(expected_dp_world_size) is not int or expected_dp_world_size < 1:
         raise ValueError("expected_dp_world_size must be a positive integer")
+    if native_layout_supplier is None:
+        if native_layout_supplier_source is not None:
+            raise ValueError("native supplier source requires its selected callback")
+    else:
+        if expected_native_layout is not None or not local_checkpoint:
+            raise ValueError("native layout supplier requires an exclusive local capture route")
+        verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+        native_layout_supplier_source = dict(native_layout_supplier_source)
     native = None if expected_native_layout is None else _native_layout(expected_native_layout)
     if native is not None and (not local_checkpoint or native["world_size"] != expected_dp_world_size):
         raise ValueError("native EP capture requires local full-rank checkpoints and matching world size")
-    child_id = None
-    if native is not None:
-        child_id = job.client.jobs.training
-        if not isinstance(child_id, str) or not child_id:
+    child_id = training_selector = None
+    if native is not None or native_layout_supplier is not None:
+        training_selector = job.client.jobs.training
+        if not isinstance(training_selector, str) or not training_selector:
             raise ValueError("native EP capture requires its initialized training child")
+        if native_layout_supplier is None:
+            child_id = training_selector
     if local_checkpoint:
         require_local_cortex_gateway(session.backend)
         if job.client.config.backend != session.backend:
             raise ValueError("local optimizer capture requires the same verified loopback client backend")
+    if dense_checkpoint_allocation is not None:
+        if not local_checkpoint or native is not None or native_layout_supplier is not None:
+            raise ValueError("dense collection requires an exclusive local dense capture route")
+        validate_dense_checkpoint_allocation(
+            dense_checkpoint_allocation, expected_dp_world_size=expected_dp_world_size
+        )
+        dense_checkpoint_allocation = json.loads(json.dumps(dense_checkpoint_allocation, allow_nan=False))
+        dense_selector = job.client.jobs.training
+        dense_child_id = _dense_training_child(transport, dense_selector)
+        dense_sources = _dense_sources()
+
+        def verify_dense_binding():
+            if (
+                job.client.transport is not transport
+                or transport.job_id != job_id
+                or job.client.jobs.training != dense_selector
+                or _dense_training_child(transport, dense_selector) != dense_child_id
+            ):
+                raise ValueError("dense optimizer parent/training child changed")
+            _dense_source_guard({"source_files": dense_sources})
 
     output_dir = require_data_fast_path(output_dir, label="managed optimizer capture output")
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / "states"
     if destination.exists():
         raise FileExistsError("managed optimizer capture output already exists")
-    with TemporaryDirectory(prefix="snapshots-", dir=output_dir) as scratch:
+    snapshots = TemporaryDirectory(prefix="snapshots-", dir=output_dir, delete=False)
+    with snapshots as scratch, contextlib.ExitStack() as cleanup:
+        cleanup.callback(snapshots.cleanup)
         scratch = Path(scratch)
         options = {} if native is None else {"expected_native_layout": native}
+        save_options = options
+        if dense_checkpoint_allocation is not None:
+            save_options = {
+                "dense_checkpoint_allocation": dense_checkpoint_allocation,
+                "parent_job_id": job_id,
+                "training_child_id": dense_child_id,
+            }
+        if native_layout_supplier is not None:
+
+            def supply(root, *, step):
+                nonlocal native, child_id
+                verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+                try:
+                    actual = native_layout_supplier(root, step=step)
+                except BaseException as error:
+                    # A failed supplier RPC can leave its owner reading these inputs.
+                    cleanup.pop_all()
+                    error.add_note(
+                        f"Native optimizer supplier did not confirm completion for step {step}; "
+                        f"checkpoint inputs retained at {scratch}; no optimizer states published"
+                    )
+                    raise
+                verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+                actual = _native_layout(actual)
+                bindings = actual.get("worker_bindings")
+                if (
+                    actual["world_size"] != expected_dp_world_size
+                    or type(bindings) is not dict
+                    or set(bindings) != {"parent_job_id", "training_child_id", "nonces"}
+                    or bindings["parent_job_id"] != job_id
+                    or type(bindings["training_child_id"]) is not str
+                    or not bindings["training_child_id"]
+                    or (child_id is not None and bindings["training_child_id"] != child_id)
+                    or type(bindings["nonces"]) is not list
+                    or len(bindings["nonces"]) != expected_dp_world_size
+                    or any(
+                        type(nonce) is not str or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+                        for nonce in bindings["nonces"]
+                    )
+                    or len(set(bindings["nonces"])) != expected_dp_world_size
+                ):
+                    raise ValueError("native supplier requires exact actual parent/child/worker bindings")
+                if transport.job_id != job_id or job.client.jobs.training != training_selector:
+                    raise ValueError("native optimizer parent/training child changed during supply")
+                child_id = bindings["training_child_id"]
+                if native is not None and actual != native:
+                    raise ValueError("native supplier changed worker/layout bindings between saves")
+                if (
+                    assemble_native_optimizer_layout(
+                        root,
+                        step=step,
+                        parent_job_id=job_id,
+                        training_child_id=child_id,
+                        expected_world_size=expected_dp_world_size,
+                        source_files=actual["source_files"],
+                    )
+                    != actual
+                ):
+                    raise ValueError("native supplier layout differs from its completed worker save receipts")
+                verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+                native = actual
+                return actual
+
+            save_options = {"native_layout_supplier": supply}
         if local_checkpoint:
+            if dense_checkpoint_allocation is not None:
+                verify_dense_binding()
             before = _save_local_snapshot(
-                job.client, scratch / "before", step=0, expected_dp_world_size=expected_dp_world_size, **options
+                job.client, scratch / "before", step=0, expected_dp_world_size=expected_dp_world_size, **save_options
             )
+            options = {} if native is None else {"expected_native_layout": native}
             if native is not None:
                 baseline = _snapshot(
                     before,
@@ -834,13 +2976,24 @@ def capture_optimizer_step(
                     raise ValueError("native optimizer capture must start at step zero")
                 del baseline
                 _native_sources(native)
-                if transport.job_id != job_id or job.client.jobs.training != child_id:
+                if transport.job_id != job_id or job.client.jobs.training != training_selector:
                     raise ValueError("native optimizer parent/training child changed")
+            if native_layout_supplier is not None:
+                verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+            if dense_checkpoint_allocation is not None:
+                verify_dense_binding()
             result = fwd_bwd_step(session, job, body, learning_rate=learning_rate)
+            if dense_checkpoint_allocation is not None:
+                verify_dense_binding()
+            if native_layout_supplier is not None:
+                verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+                _native_sources(native)
+                if transport.job_id != job_id or job.client.jobs.training != training_selector:
+                    raise ValueError("native optimizer parent/training child changed during target")
             after = _save_local_snapshot(
-                job.client, scratch / "after", step=1, expected_dp_world_size=expected_dp_world_size, **options
+                job.client, scratch / "after", step=1, expected_dp_world_size=expected_dp_world_size, **save_options
             )
-            if native is not None and (transport.job_id != job_id or job.client.jobs.training != child_id):
+            if native is not None and (transport.job_id != job_id or job.client.jobs.training != training_selector):
                 raise ValueError("native optimizer parent/training child changed")
         else:
             from .inference_export import export_checkpoint
@@ -856,7 +3009,35 @@ def capture_optimizer_step(
             after = export_checkpoint(
                 job.client, job_id, after_id, scratch / "after", expected_dp_world_size=expected_dp_world_size
             )
+        input_hashes = (
+            None if native_layout_supplier is None else (_native_input_hashes(before), _native_input_hashes(after))
+        )
+        if dense_checkpoint_allocation is not None:
+            dense_receipts = {
+                label: _dense_verified_receipt(
+                    root,
+                    dense_checkpoint_allocation,
+                    step=step,
+                    parent_job_id=job_id,
+                    training_child_id=dense_child_id,
+                    source_files=dense_sources,
+                )
+                for label, root, step in (("before", before, 0), ("after", after, 1))
+            }
         decoded = scratch / "decoded"
+        participation_options = {}
+        if result.participation is not None and "rank_receipts" in result.participation:
+            actual_child = _dense_training_child(transport, job.client.jobs.training)
+            if (
+                job.client.transport is not transport
+                or transport.job_id != job_id
+                or result.participation.get("training_child_id") != actual_child
+            ):
+                raise ValueError("participation parent/training child changed during capture")
+            participation_options = {
+                "participation_receipts": result.participation["rank_receipts"],
+                "expected_participation_job_id": actual_child,
+            }
         manifest = Path(
             decode_optimizer_capture(
                 before,
@@ -865,6 +3046,7 @@ def capture_optimizer_step(
                 expected_optimizer_config=optimizer_config,
                 expected_learning_rate=learning_rate,
                 **options,
+                **participation_options,
             )
         )
         if not manifest.is_file() or not manifest.resolve().is_relative_to(decoded.resolve()):
@@ -874,8 +3056,57 @@ def capture_optimizer_step(
             raise ValueError("managed optimizer artifact must describe exactly step 1")
         if native is not None:
             _native_sources(native)
-            if transport.job_id != job_id or job.client.jobs.training != child_id:
+            if transport.job_id != job_id or job.client.jobs.training != training_selector:
                 raise ValueError("native optimizer parent/training child changed")
+        if native_layout_supplier is not None:
+            verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+            record = json.loads(manifest.read_text())
+            record["native_save_receipts"] = {
+                label: [
+                    json.loads(path.read_text())
+                    for path in sorted((root / tag / "native_optimizer_layout").glob("*.json"))
+                ]
+                for label, root, tag in (("before", before, "global_step0"), ("after", after, "global_step1"))
+            }
+            if any(len(rows) != expected_dp_world_size for rows in record["native_save_receipts"].values()):
+                raise ValueError("native capture requires retained complete worker save receipts")
+            for root, step in ((before, 0), (after, 1)):
+                if (
+                    assemble_native_optimizer_layout(
+                        root,
+                        step=step,
+                        parent_job_id=job_id,
+                        training_child_id=child_id,
+                        expected_world_size=expected_dp_world_size,
+                        source_files=native["source_files"],
+                    )
+                    != native
+                ):
+                    raise ValueError("native capture save receipts changed before publication")
+            manifest.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
+            if (_native_input_hashes(before), _native_input_hashes(after)) != input_hashes:
+                raise ValueError("native capture checkpoint input drift before publication")
+            _native_sources(native)
+            verify_native_callback(native_layout_supplier, native_layout_supplier_source)
+            if transport.job_id != job_id or job.client.jobs.training != training_selector:
+                raise ValueError("native optimizer parent/training child changed before publication")
+        if dense_checkpoint_allocation is not None:
+            verify_dense_binding()
+            record = json.loads(manifest.read_text())
+            record["dense_save_receipts"] = {
+                label: _dense_verified_receipt(
+                    root,
+                    dense_checkpoint_allocation,
+                    step=step,
+                    parent_job_id=job_id,
+                    training_child_id=dense_child_id,
+                    source_files=dense_sources,
+                )
+                for label, root, step in (("before", before, 0), ("after", after, 1))
+            }
+            if record["dense_save_receipts"] != dense_receipts:
+                raise ValueError("dense optimizer save receipts changed during decoding")
+            manifest.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
         relative_manifest = manifest.relative_to(decoded)
         decoded.rename(destination)
     return replace(result, optimizer_state_manifest=str(destination / relative_manifest))

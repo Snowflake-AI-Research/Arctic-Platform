@@ -225,6 +225,7 @@ def _optimizer_capture_worker_class() -> Any:
         """Add optimizer-state artifact capture for correctness harness jobs only."""
 
         def initialize(self, master_addr: str, job_config: dict) -> bool:
+            self._optimizer_participation_capture = None
             debug_config = _optimizer_capture_debug_config(job_config)
             optimizer_state_output_dir = debug_config.get("optimizer_state_output_dir")
             if optimizer_state_output_dir is not None:
@@ -245,6 +246,108 @@ def _optimizer_capture_worker_class() -> Any:
 
             with worker_adapter_scope(adapter["object_ref"], adapter["identity"]):
                 return super().initialize(master_addr, job_config)
+
+        def _arm_optimizer_participation(self) -> None:
+            if (
+                self._optimizer_state_output_dir is None
+                or getattr(self, "_optimizer_participation_capture", None) is not None
+            ):
+                return
+            from .participation import ParticipationCapture
+            from .participation import weight_identity
+
+            if self.engine.global_steps != 0:
+                raise ValueError("optimizer participation must be armed before the first backward")
+            model = self.engine.module
+            decoder_getter = getattr(model, "get_decoder", None)
+            head_getter = getattr(model, "get_output_embeddings", None)
+            decoder = decoder_getter() if callable(decoder_getter) else None
+            head = head_getter() if callable(head_getter) else getattr(model, "lm_head", None)
+            capture = ParticipationCapture(model, decoder=decoder, head=head)
+            try:
+                self._optimizer_participation_before = {
+                    "participation": capture.result(),
+                    "candidate_weights": {
+                        name: weight_identity(capture.parameters[name].detach()) for name in capture.candidates
+                    },
+                }
+            except BaseException:
+                capture.close()
+                raise
+            self._optimizer_participation_capture = capture
+
+        def _close_optimizer_participation(self) -> None:
+            capture = getattr(self, "_optimizer_participation_capture", None)
+            if capture is not None:
+                capture.close()
+                self._optimizer_participation_capture = None
+
+        def forward_backward(self, batch: dict) -> dict:
+            try:
+                if self._optimizer_state_output_dir is not None:
+                    self._optimizer_collective_check(self._arm_optimizer_participation)
+                return super().forward_backward(batch)
+            except BaseException:
+                self._close_optimizer_participation()
+                raise
+
+        def _optimizer_collective_check(self, callback, *, rank_zero: bool = False):
+            # Share local validation and file errors before peers enter another collective.
+            result, error = None, None
+            try:
+                if not rank_zero or self.rank == 0:
+                    result = callback()
+            except Exception as caught:
+                error = caught
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, None if error is None else f"{type(error).__name__}: {error}")
+            if error is not None:
+                raise error
+            for rank, message in enumerate(errors):
+                if message is not None:
+                    raise RuntimeError(f"optimizer capture failed on rank {rank}: {message}")
+            return result
+
+        def _optimizer_participation(self) -> tuple[dict, dict]:
+            from .participation import merge_rank_participation
+            from .participation import weight_identity
+
+            def observe():
+                capture = getattr(self, "_optimizer_participation_capture", None)
+                if capture is None:
+                    raise ValueError("optimizer capture requires genuine pre-backward participation")
+                return {
+                    "participation": capture.result(),
+                    "candidate_weights": {
+                        name: weight_identity(capture.parameters[name].detach()) for name in capture.candidates
+                    },
+                }
+
+            observed = self._optimizer_collective_check(observe)
+            capture = self._optimizer_participation_capture
+            rows = [None] * dist.get_world_size()
+            dist.all_gather_object(rows, {"before": self._optimizer_participation_before, "after": observed})
+
+            def merge():
+                shapes, routes = {}, {}
+                for name, parameter in capture.parameters.items():
+                    shapes[name] = list(parameter.shape)
+                    width = 1
+                    group_name = getattr(parameter, "group_name", None)
+                    if (
+                        group_name is not None
+                        and getattr(parameter, "allreduce", True) is False
+                        and parameter.dim() >= 2
+                    ):
+                        import deepspeed.utils.groups as ds_groups
+
+                        width = dist.get_world_size(group=ds_groups._get_expert_parallel_group(group_name))
+                    routes[name] = [None] * width
+                return merge_rank_participation(
+                    [row["before"] for row in rows], [row["after"] for row in rows], shapes, routes
+                )
+
+            return self._optimizer_collective_check(merge)
 
         def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
             group_name = getattr(param, "group_name", None)
@@ -300,6 +403,13 @@ def _optimizer_capture_worker_class() -> Any:
                     raise
                 return None, None
 
+        def _relink_optimizer_state(self) -> None:
+            optimizer = getattr(self.engine, "optimizer", None)
+            relink = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
+            if callable(relink):
+                optimizer._hp_optimizer_states_linked = False
+                relink()
+
         def _snapshot_optimizer_state_parameters(self) -> None:
             if self._optimizer_state_output_dir is None:
                 return
@@ -309,52 +419,60 @@ def _optimizer_capture_worker_class() -> Any:
 
             output_dir = Path(self._optimizer_state_output_dir)
             before_dir = output_dir / "before"
-            optimizer = getattr(self.engine, "optimizer", None)
-            relink_optimizer_state = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
-            if callable(relink_optimizer_state):
-                optimizer._hp_optimizer_states_linked = False
-                relink_optimizer_state()
-            if self.rank == 0:
+            self._optimizer_collective_check(self._relink_optimizer_state)
+
+            def prepare_directory():
                 shutil.rmtree(output_dir, ignore_errors=True)
                 before_dir.mkdir(parents=True)
-            dist.barrier()
+
+            self._optimizer_collective_check(prepare_directory, rank_zero=True)
             model = self.engine.module if hasattr(self.engine, "module") else self.engine
-            accumulated_gradients = self._bf16_accumulated_gradients()
-            inactive_parameters = (
-                {
-                    id(parameter)
-                    for parameters, has_gradients in zip(
-                        getattr(optimizer, "bf16_groups", []),
-                        getattr(optimizer, "fp32_groups_has_gradients", []),
-                        strict=True,
-                    )
-                    for parameter, has_gradient in zip(parameters, has_gradients, strict=True)
-                    if not has_gradient and parameter.grad is None
-                }
-                if accumulated_gradients is not None
-                else set()
-            )
+            accumulated_gradients = self._optimizer_collective_check(self._bf16_accumulated_gradients)
+            participation, _ = self._optimizer_participation()
+            self._optimizer_step_participation = participation
             for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
                 if not param.requires_grad:
                     continue
                 full_parameter = safe_get_full_fp32_param(param)
-                if full_parameter is None:
-                    raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
+
+                def validate_master():
+                    if full_parameter is None:
+                        raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
+
+                self._optimizer_collective_check(validate_master)
                 full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
                 gradient = (
                     accumulated_gradients.get(id(param))
                     if accumulated_gradients is not None
                     else safe_get_full_grad(param)
                 )
-                if gradient is None and id(param) not in inactive_parameters:
-                    raise RuntimeError(f"optimizer-state capture found no reduced gradient for {name}")
+                inactive = participation["parameters"][name]["state"] == "inactive"
+
+                def validate_gradient():
+                    if gradient is None and not inactive:
+                        raise RuntimeError(f"optimizer-state capture found no reduced gradient for {name}")
+                    if (
+                        gradient is not None
+                        and inactive
+                        and (not bool(gradient.isfinite().all()) or bool(torch.count_nonzero(gradient)))
+                    ):
+                        raise ValueError(f"inactive parameter {name} has a nonzero or nonfinite gradient")
+
+                self._optimizer_collective_check(validate_gradient)
                 if gradient is not None:
                     gradient = self._globalize_expert_optimizer_tensor(param, gradient)
                 exp_avg, exp_avg_sq = self._full_adam_moments(param)
+
+                def validate_moments():
+                    if (exp_avg is None) != (exp_avg_sq is None):
+                        raise RuntimeError(f"optimizer-state capture found incomplete Adam moments for {name}")
+
+                self._optimizer_collective_check(validate_moments)
                 if exp_avg is not None:
                     exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
                     exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
-                if self.rank == 0:
+
+                def save_before():
                     torch.save(
                         {
                             "name": name,
@@ -366,7 +484,10 @@ def _optimizer_capture_worker_class() -> Any:
                         },
                         before_dir / f"{index:06d}.pt",
                     )
-            if self.rank == 0:
+
+                self._optimizer_collective_check(save_before, rank_zero=True)
+
+            def save_before_state():
                 (before_dir / "state.json").write_text(
                     json.dumps(
                         {
@@ -379,6 +500,8 @@ def _optimizer_capture_worker_class() -> Any:
                     + "\n"
                 )
 
+            self._optimizer_collective_check(save_before_state, rank_zero=True)
+
         def _optimizer_state_artifact_metrics(self) -> dict[str, Any]:
             if self._optimizer_state_output_dir is None:
                 return {}
@@ -387,29 +510,61 @@ def _optimizer_capture_worker_class() -> Any:
 
             output_dir = Path(self._optimizer_state_output_dir)
             before_dir = output_dir / "before"
-            optimizer = getattr(self.engine, "optimizer", None)
-            relink_optimizer_state = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
-            if callable(relink_optimizer_state):
-                optimizer._hp_optimizer_states_linked = False
-                relink_optimizer_state()
+            self._optimizer_collective_check(self._relink_optimizer_state)
             model = self.engine.module if hasattr(self.engine, "module") else self.engine
+            from .participation import validate_inactive_weights
+            from .participation import weight_identity
+
+            participation, inactive_weights = self._optimizer_participation()
+
+            def validate_step_participation():
+                if participation != self._optimizer_step_participation:
+                    raise ValueError("optimizer participation changed during step")
+
+            self._optimizer_collective_check(validate_step_participation)
             entries = []
             for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
                 if not param.requires_grad:
                     continue
                 full_parameter = safe_get_full_fp32_param(param)
+
+                def validate_master():
+                    if full_parameter is None:
+                        raise RuntimeError(f"optimizer-state capture found no post-step FP32 master for {name}")
+
+                self._optimizer_collective_check(validate_master)
                 exp_avg, exp_avg_sq = self._full_adam_moments(param)
-                if exp_avg is None or exp_avg_sq is None:
-                    if self.rank == 0:
-                        (before_dir / f"{index:06d}.pt").unlink(missing_ok=True)
-                    continue
-                if full_parameter is None:
-                    raise RuntimeError(f"optimizer-state capture found no post-step FP32 master for {name}")
+                inactive = name in inactive_weights
+
+                def validate_moments():
+                    if (exp_avg is None) != (exp_avg_sq is None) or (
+                        not inactive and (exp_avg is None or exp_avg_sq is None)
+                    ):
+                        raise RuntimeError(f"active optimizer parameter {name} has no post-step Adam moments")
+
+                self._optimizer_collective_check(validate_moments)
                 full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
-                exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
-                exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
-                if self.rank == 0:
+                if exp_avg is not None:
+                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                if exp_avg_sq is not None:
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+
+                def save_after():
                     before = torch.load(before_dir / f"{index:06d}.pt", map_location="cpu", weights_only=True)
+                    if inactive:
+                        inactive_weights[name]["master"] = {
+                            "before": weight_identity(before["fp32_master"]),
+                            "after": weight_identity(full_parameter),
+                        }
+                        for value in (before["exp_avg"], before["exp_avg_sq"], exp_avg, exp_avg_sq):
+                            if value is not None and (
+                                not bool(value.isfinite().all()) or bool(torch.count_nonzero(value))
+                            ):
+                                raise ValueError(
+                                    f"inactive optimizer parameter {name} has nonzero or nonfinite moments"
+                                )
+                        (before_dir / f"{index:06d}.pt").unlink()
+                        return
                     filename = f"{index:06d}.pt"
                     torch.save(
                         {
@@ -426,36 +581,45 @@ def _optimizer_capture_worker_class() -> Any:
                     )
                     entries.append({"name": name, "file": filename, "shape": list(full_parameter.shape)})
                     (before_dir / f"{index:06d}.pt").unlink()
-            dist.barrier()
-            if self.rank != 0:
-                return {}
-            before_state = json.loads((before_dir / "state.json").read_text())
-            (before_dir / "state.json").unlink()
-            before_dir.rmdir()
-            manifest_path = output_dir / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "step": self.engine.global_steps,
-                        "before": before_state,
-                        "after": {
-                            "engine_global_step": int(self.engine.global_steps),
-                            "optimizer_steps": self._optimizer_step_values(),
-                            "learning_rates": [float(value) for value in self.engine.get_lr()],
+
+                self._optimizer_collective_check(save_after, rank_zero=True)
+
+            def publish_manifest():
+                validate_inactive_weights(participation, inactive_weights)
+                before_state = json.loads((before_dir / "state.json").read_text())
+                (before_dir / "state.json").unlink()
+                before_dir.rmdir()
+                manifest_path = output_dir / "manifest.json"
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "step": self.engine.global_steps,
+                            "before": before_state,
+                            "after": {
+                                "engine_global_step": int(self.engine.global_steps),
+                                "optimizer_steps": self._optimizer_step_values(),
+                                "learning_rates": [float(value) for value in self.engine.get_lr()],
+                            },
+                            "parameters": entries,
+                            "participation": participation,
+                            "inactive_weights": inactive_weights,
                         },
-                        "parameters": entries,
-                    },
-                    indent=2,
+                        indent=2,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            return {"optimizer_state_manifest": str(manifest_path)}
+                return {"optimizer_state_manifest": str(manifest_path)}
+
+            return self._optimizer_collective_check(publish_manifest, rank_zero=True) or {}
 
         def step(self, learning_rate: float | None = None) -> dict:
-            self._snapshot_optimizer_state_parameters()
-            result = super().step(learning_rate=learning_rate)
-            result.setdefault("metrics", {}).update(self._optimizer_state_artifact_metrics())
-            return result
+            try:
+                self._snapshot_optimizer_state_parameters()
+                result = super().step() if learning_rate is None else super().step(learning_rate=learning_rate)
+                result.setdefault("metrics", {}).update(self._optimizer_state_artifact_metrics())
+                return result
+            finally:
+                self._close_optimizer_participation()
 
     _OPTIMIZER_CAPTURE_WORKER = OptimizerCaptureDeepSpeedWorker
     return _OPTIMIZER_CAPTURE_WORKER

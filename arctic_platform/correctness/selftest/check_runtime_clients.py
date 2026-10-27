@@ -15,7 +15,6 @@
 
 """Static correctness selftests: runtime clients."""
 
-
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +34,7 @@ from pydantic import ValidationError
 from arctic_platform import wire
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
@@ -45,7 +45,6 @@ from arctic_platform.correctness.harness import hosted
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.batches import load as load_batch
 from arctic_platform.correctness.harness.config import LoadedConfig
-from arctic_platform.correctness.harness.config import ReviewedTrainingConfig
 from arctic_platform.correctness.harness.config import TestSpec as ConfigSpec
 from arctic_platform.correctness.harness.config import arms_for
 from arctic_platform.correctness.harness.config import load_config
@@ -55,23 +54,24 @@ from arctic_platform.correctness.harness.dss_driver import GatewaySession
 from arctic_platform.correctness.harness.dss_driver import _training_client_config
 from arctic_platform.correctness.harness.dss_driver import build_payload
 from arctic_platform.correctness.harness.hosted import HostedConnection
+from arctic_platform.correctness.harness.hosted import HostedTrainingJob
+from arctic_platform.correctness.harness.hosted import HostedTransport
 from arctic_platform.correctness.harness.hosted import is_local_cortex_gateway
 from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
 from arctic_platform.correctness.harness.hosted import save_and_resolve_checkpoint_id
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
+from arctic_platform.correctness.harness.transport import Checkpoint
 from arctic_platform.testing_utils import torch_assert_equal
 
 from .check_catalog_configuration import _applicable_tests_spec
 from .check_operator_interface import _cli_config_selection_write_config
 from .helpers import _synthetic_config_spec
 
+# Client backends.
 
-@pytest.fixture(autouse=True)
-def _synthetic_runtime_inputs(tmp_path, monkeypatch):
-    config, spec = _synthetic_config_spec(tmp_path / "inputs")
-    monkeypatch.setitem(globals(), "_cortex_port_CONFIG", config)
-    monkeypatch.setitem(globals(), "_cortex_port_ROOT", config.parents[3])
-    monkeypatch.setitem(globals(), "_driver_reviewed_config", config)
+
+_driver_reviewed_config: Path | None = None
+_cortex_port_CONFIG: Path | None = None
 
 
 def _client_backends_remote():
@@ -146,10 +146,10 @@ def test_client_backends_onboarding_uses_the_same_cortex_training_default():
 @pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_cortex_connection_uses_environment_or_pat_file(tmp_path, monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://from-env.test")
-    assert cli._client_backend(Namespace(backend="cortex")).base_url == "http://from-env.test"
+    assert cli._client_backend(Namespace()).base_url == "http://from-env.test"
     token = tmp_path / "pat"
     token.write_text("file-token\n")
-    backend = cli._client_backend(Namespace(backend="cortex", pat_file=token, host="host", database="db", schema="sc"))
+    backend = cli._client_backend(Namespace(pat_file=token, host="host", database="db", schema="sc"))
     assert backend.pat.get_secret_value() == "file-token"
     assert "file-token" not in repr(backend)
     assert isinstance(cli._client_backend(Namespace(backend="onprem")), OnPremConfig)
@@ -276,16 +276,7 @@ def test_client_backends_remote_run_never_probes_local_allocation(tmp_path, monk
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, *args, **kwargs: seen.append(cfg.config_id))
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
     args = cli.parse_args(
-        [
-            "run",
-            "--backend",
-            "cortex",
-            "--all-configs",
-            "--config-dir",
-            str(config_dir),
-            "--base-url",
-            _client_backends_remote().base_url,
-        ]
+        ["run", "--all-configs", "--config-dir", str(config_dir), "--base-url", _client_backends_remote().base_url]
     )
     assert cli._run_configs(args) == 0
     assert len(seen) == 2
@@ -363,9 +354,11 @@ def test_client_backends_cortex_config_forwards_worker_settings_without_mutation
         model_name="model",
         training_gpus=8,
         backend=_client_backends_remote(),
-        training=ReviewedTrainingConfig(ds_worker_config=worker, full_determinism=True),
+        training=TrainingConfig(ds_worker_config=worker, full_determinism=True),
+        source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "parent"},
     )
     wire = config.to_cortex()[0]
+    assert wire["source_checkpoint_info"] == config.source_checkpoint_info
     assert wire["training_config"]["sp_size"] == 8
     assert wire["training_config"]["prime_rl"] == worker["prime_rl"]
     assert wire["training_config"]["debug"] == {"full_determinism": True, "full_determinism_must_comply": False}
@@ -375,8 +368,15 @@ def test_client_backends_cortex_config_forwards_worker_settings_without_mutation
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_rejects_checkpoint_resume_options_not_in_part_one():
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+@pytest.mark.parametrize("source", [{}, {"checkpoint_id": "cp_saved"}, {"checkpoint_id": "", "source_job_id": "p"}])
+def test_client_backends_cortex_resume_requires_complete_source_identity(source):
+    with pytest.raises(ValidationError, match="checkpoint_id and source_job_id"):
+        CortexTrainingConfig(model_name="model", backend=_client_backends_remote(), source_checkpoint_info=source)
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_onprem_refuses_cortex_checkpoint_identity():
+    with pytest.raises(ValidationError, match="requires CortexConfig"):
         CortexTrainingConfig(
             model_name="model", source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "p"}
         )
@@ -450,6 +450,26 @@ def test_client_backends_inapplicable_check_is_not_also_a_cortex_failure(tmp_pat
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cortex_unsupported_checks_fail_before_batch_or_reference(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(config_id="unit", n_gpus=8, training={}, at_gpu_width=lambda width: cfg)
+    spec = _applicable_tests_spec(["single-step-optimizer"])
+    monkeypatch.setattr(runner, "build_batch", lambda *args, **kwargs: pytest.fail("must reject before batches"))
+    results = runner.execute(
+        cfg,
+        spec,
+        [],
+        vocab_size=128,
+        select=["single-step-optimizer"],
+        client_backend=_client_backends_remote(),
+        workdir=tmp_path,
+    )
+    assert len(results) == 1
+    assert results[0].outcome is Outcome.FAIL
+    assert results[0].summary == "published Cortex fixture required"
+    assert "--cortex-fixture" in results[0].reason
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("check", ["single-step-grads", "single-step-optimizer"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(config_id="unit", n_gpus=8, training={}, at_gpu_width=lambda width: cfg)
@@ -473,6 +493,53 @@ def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tm
     else:
         assert results[0].reason == runner.cortex_unavailable_reason(runner.registered_tests()[check])
         assert "--backend onprem" not in results[0].reason
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cli_rejects_unsupported_cortex_checks_without_reading_model(tmp_path, monkeypatch):
+    import transformers
+
+    path = _cli_config_selection_write_config(tmp_path / "configs", "h200")
+    spec = _applicable_tests_spec(["single-step-grads"])
+    captured = []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported Cortex check must not load local or catalog model metadata")
+
+    monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, path, arms, **kwargs: (spec, arms))
+    monkeypatch.setattr(cli, "_catalog_vocab_size", forbidden)
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", forbidden)
+    monkeypatch.setattr(cli, "_finish", lambda results, *args, **kwargs: captured.extend(results) or 1)
+    assert (
+        cli.main(
+            [
+                "run",
+                "--config",
+                str(path),
+                "--test",
+                "single-step-grads",
+                "--base-url",
+                _client_backends_remote().base_url,
+            ]
+        )
+        == 1
+    )
+    assert captured and all((result.outcome is Outcome.FAIL for result in captured))
+    assert "--cortex-fixture" in captured[0].reason
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cortex_sft_body_does_not_select_the_rl_processor():
+    from arctic_platform import wire
+
+    body = {
+        "batch": {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+        "processing": {"loss_fn": "sft"},
+    }
+    lowered = dss_driver.cortex_training_body(body)
+    assert "processing" not in lowered
+    decoded = wire.loads(wire.dumps(lowered))
+    torch_assert_equal(decoded["kwargs"]["labels"], body["batch"]["labels"])
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
@@ -517,9 +584,12 @@ def test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_me
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
+@pytest.mark.parametrize("path", ["hosted", "driver"])
 @pytest.mark.parametrize("cancel_fails", [False, True])
-def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, cancel_fails):
+def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, path, cancel_fails):
     from arctic_platform.correctness.harness import cortex as cortex_transport
+    from arctic_platform.correctness.harness import hosted
+    from arctic_platform.correctness.harness.config import load_config
 
     transport = CorrectnessCortexTransport(_client_backends_remote())
     events = []
@@ -541,16 +611,67 @@ def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_pat
     monkeypatch.setattr(transport, "_send", send)
     monkeypatch.setattr(cortex_transport, "CorrectnessCortexTransport", lambda *args, **kwargs: transport)
     with pytest.raises(RuntimeError, match="no capacity"):
-        payload = {"model_name": "model", "training_config": {"n_gpus": 8}}
-        with dss_driver.gateway(tmp_path, 8, backend=_client_backends_remote()) as gateway_session:
-            with dss_driver.running_job(gateway_session, payload):
-                pytest.fail("failed startup must not yield a job")
+        if path == "hosted":
+            cfg = load_config(_cli_config_selection_write_config(tmp_path / "configs", "h200"))
+            with hosted.HostedTransport(_client_backends_remote(), cfg) as hosted_transport:
+                with hosted_transport.job():
+                    pytest.fail("failed startup must not yield a job")
+        else:
+            payload = {"model_name": "model", "training_config": {"n_gpus": 8}}
+            with dss_driver.gateway(tmp_path, 8, backend=_client_backends_remote()) as gateway_session:
+                with dss_driver.running_job(gateway_session, payload):
+                    pytest.fail("failed startup must not yield a job")
     assert events == ["cancel", "close"]
     assert transport.job_id is None
     assert session.closed and transport._session is None
 
 
-_driver_reviewed_config: Path | None = None
+# Cortex e2e.
+
+
+_cortex_e2e_ROOT = Path(__file__).resolve().parents[1]
+
+
+_cortex_e2e_FULL_SNAPSHOT = "/data-fast/tmp/e2e-full-test/hf/hub/models--Qwen--Qwen3-8B/snapshots/pinned"
+
+
+@pytest.fixture(autouse=False)
+def _cortex_e2e_no_network(monkeypatch):
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unit tests must not access the network")
+
+    monkeypatch.setattr(requests.Session, "request", forbidden)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", forbidden)
+    closes = []
+    original_close = CortexTransport._close_session
+
+    async def close(transport):
+        assert asyncio.get_running_loop() is transport._loop
+        session = transport._session
+        await original_close(transport)
+        assert transport._session is None
+        assert session is None or session.closed
+        closes.append(transport)
+
+    monkeypatch.setattr(CortexTransport, "_close_session", close)
+    yield closes
+    for transport in set(closes):
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
+
+
+# Cortex model identity.
+
+
+_cortex_model_identity_ROOT = Path(__file__).resolve().parents[1]
+
+
+_cortex_model_identity_SPEC = _cortex_model_identity_ROOT / "specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json"
+
+
+# Cortex port.
+
+_driver_reviewed_root = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
@@ -591,8 +712,7 @@ def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monke
             pytest.fail("unsupported fields must not yield")
 
 
-_cortex_port_ROOT: Path | None = None
-_cortex_port_CONFIG: Path | None = None
+_cortex_port_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=False)
@@ -738,7 +858,22 @@ def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workar
         torch.testing.assert_close(target["position_ids"], reference_batch.position_ids, rtol=0, atol=0)
 
 
+# Hosted.
+
+
 _hosted_CONNECTION = HostedConnection(host="server", database="DB", schema="SCHEMA", pat="not-a-token")
+
+_hosted_LOCAL_CHECKPOINT_ID = "cp_00000000-0000-0000-0000-000000000001"
+
+_hosted_LOCAL_STAGE = {
+    "location_type": "S3",
+    "bucket": "synthetic-control-bucket",
+    "prefix": f"jobs/saving-parent/checkpoints/{_hosted_LOCAL_CHECKPOINT_ID}/",
+}
+
+
+def _hosted_config():
+    return load_config(_driver_reviewed_config)
 
 
 def _hosted_wire(cfg, **kwargs) -> dict:
@@ -794,6 +929,47 @@ class _hosted_Client:
         self.closed = True
 
 
+def test_hosted_the_created_sub_job_is_the_config_file_s_training_sub_job() -> None:
+    """Whatever the operator wrote reaches the server: typed fields as themselves, the rest as passthrough."""
+    cfg = _hosted_config()
+    wire = _hosted_wire(cfg)
+    assert wire["job_type"] == "training"
+    assert wire["model_name"] == cfg.model_name
+    assert wire["dtype"] == cfg.sub_job["dtype"]
+    assert wire["seed"] == cfg.sub_job["seed"]
+    for key, value in cfg.training.items():
+        if key in {"optimizer", "debug"}:
+            continue
+        assert wire["training_config"][key] == value, key
+    for key, value in cfg.training["optimizer"].items():
+        assert wire["training_config"]["optimizer"]["name" if key == "type" else key] == value, key
+
+
+def test_hosted_building_a_sub_job_leaves_the_loaded_config_alone() -> None:
+    """The client canonicalizes the optimizer block it is handed, and the rest of the run reads that block."""
+    cfg = _hosted_config()
+    before = json.dumps(cfg.sub_job, sort_keys=True)
+    _hosted_wire(cfg)
+    assert json.dumps(cfg.sub_job, sort_keys=True) == before
+
+
+def test_hosted_optimizer_state_loading_is_left_at_the_server_default() -> None:
+    """A resume that restores the moments is what is wanted: both jobs read one config, so DP size is equal."""
+    assert "load_optimizer_states" not in _hosted_wire(_hosted_config())["training_config"]
+
+
+def test_hosted_an_ordinary_sub_job_carries_no_source_checkpoint() -> None:
+    assert "source_checkpoint_info" not in _hosted_wire(_hosted_config())
+
+
+def test_hosted_a_resumed_sub_job_names_the_checkpoint_and_the_job_that_saved_it() -> None:
+    wire = _hosted_wire(_hosted_config(), source_checkpoint_info={"checkpoint_id": "cp_1", "source_job_id": "job-a"})
+    source = wire["source_checkpoint_info"]
+    assert source["checkpoint_id"] == "cp_1"
+    assert source["source_job_id"] == "job-a"
+    assert source.get("is_external", False) is False
+
+
 def test_hosted_the_checkpoint_id_is_the_stage_path_segment() -> None:
     """The DeepSpeed tag beside it names a directory inside the saving job and resolves from nowhere else."""
     client = _hosted_Client(
@@ -822,6 +998,64 @@ def test_hosted_a_save_that_cannot_be_identified_is_an_error() -> None:
         save_and_resolve_checkpoint_id(client, "job-1", "resumable")
 
 
+def test_hosted_one_iteration_is_a_forward_backward_then_a_step_at_the_requested_rate() -> None:
+    """The loss is the forward-backward's, so it is read before the step that follows changes a parameter."""
+    client = _hosted_Client(losses=[2.5])
+    body = {"args": (), "kwargs": {}}
+    loss = HostedTrainingJob(client, "job-1").fwd_bwd_step(body, learning_rate=0.001)
+    assert loss == 2.5
+    assert client.calls == [("fwd-bwd", body), ("step", 0.001)]
+
+
+def test_hosted_a_forward_backward_that_reports_no_loss_is_an_error() -> None:
+
+    class Silent(_hosted_Client):
+
+        def fwd_bwd(self, body):
+            return {"metrics": {}}
+
+    with pytest.raises(RuntimeError, match="no avg_loss"):
+        HostedTrainingJob(Silent(), "job-1").fwd_bwd_step({}, learning_rate=0.001)
+
+
+def test_hosted_a_job_releases_its_gpus_when_its_block_ends(monkeypatch) -> None:
+    client = _hosted_Client()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
+        with transport.job() as job:
+            assert job.job_id == "job-1"
+            assert client.cancelled == []
+        assert client.cancelled == ["job-1"]
+    assert client.closed
+
+
+def test_hosted_a_job_releases_its_gpus_when_the_block_raises(monkeypatch) -> None:
+    client = _hosted_Client()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ZeroDivisionError):
+        with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
+            with transport.job():
+                raise ZeroDivisionError
+    assert client.cancelled == ["job-1"]
+
+
+def test_hosted_a_resumed_job_is_created_from_the_checkpoint_it_was_given(monkeypatch) -> None:
+    client = _hosted_Client()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
+        with transport.job(resume_from=Checkpoint(reference="cp_1", source_job="job-a")):
+            pass
+    body, hardware = client.created[0]
+    assert body["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
+    assert hardware == "H200"
+
+
+def test_hosted_creating_a_job_before_the_transport_is_entered_is_an_error() -> None:
+    with pytest.raises(RuntimeError, match="entered first"):
+        with HostedTransport(_hosted_CONNECTION, _hosted_config()).job():
+            pass
+
+
 def test_hosted_the_connection_does_not_render_its_token() -> None:
     assert "not-a-token" not in repr(_hosted_CONNECTION)
 
@@ -835,6 +1069,23 @@ def test_hosted_an_ambiguous_catalog_delta_is_refused() -> None:
     client = _hosted_Client(added=[{"checkpoint_id": "cp_one"}, {"checkpoint_id": "cp_two"}])
     with pytest.raises(RuntimeError, match="cannot be identified"):
         save_and_resolve_checkpoint_id(client, "job-1", "resumable")
+
+
+def test_hosted_checkpoint_jobs_preserve_dss_engine_gas_and_width(monkeypatch) -> None:
+    client = _hosted_Client()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    cfg = _hosted_config().at_gpu_width(8)
+    with HostedTransport(_hosted_CONNECTION, cfg) as transport:
+        with transport.job():
+            pass
+        with transport.job(resume_from=Checkpoint("cp_new", "job-1")):
+            pass
+    assert len(client.created) == 2
+    for payload, hardware in client.created:
+        assert hardware == "H200"
+        assert payload["training_config"]["n_gpus"] == 8
+        assert payload["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
+    assert client.cancelled == ["job-1", "job-2"]
 
 
 def _hosted_local_backend(url="http://127.0.0.1:8003", **kwargs):
@@ -888,6 +1139,17 @@ class _hosted_LocalClient(_hosted_Client):
         )
 
 
+def _hosted_local_checkpoint(root):
+    return hosted.LocalCortexCheckpoint(
+        _hosted_LOCAL_CHECKPOINT_ID,
+        "owned-source",
+        str(root),
+        "global_step10",
+        10,
+        stage_info=deepcopy(_hosted_LOCAL_STAGE),
+    )
+
+
 @pytest.mark.parametrize("checkpoint_type", ["resumable", "weights-only"])
 def test_hosted_local_save_uses_a_fresh_fast_path_without_catalog(monkeypatch, tmp_path, checkpoint_type) -> None:
     root = tmp_path / "retained-checkpoint"
@@ -902,6 +1164,48 @@ def test_hosted_local_save_uses_a_fresh_fast_path_without_catalog(monkeypatch, t
     assert saved_root == root.resolve()
     assert result is client.save_result
     assert client.calls == [("save", checkpoint_type, str(root))]
+    assert marker.read_text(encoding="ascii") == "preserve"
+
+
+def test_hosted_local_resumable_checkpoint_keeps_the_saving_job_identity(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    client = _hosted_LocalClient(
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": _hosted_LOCAL_CHECKPOINT_ID,
+            "stage_info": deepcopy(_hosted_LOCAL_STAGE),
+        }
+    )
+    checkpoint = HostedTrainingJob(client, "owned-parent", local_gateway=True).save_resumable()
+    assert checkpoint == hosted.LocalCortexCheckpoint(
+        _hosted_LOCAL_CHECKPOINT_ID, "owned-parent", str(root), "global_step10", 10, stage_info=_hosted_LOCAL_STAGE
+    )
+    assert checkpoint.stage_info is not client.save_result["stage_info"]
+    assert client.calls == [("save", "resumable", str(root))]
+
+
+def test_hosted_local_resumable_save_without_durable_identity_retains_output_and_releases_job(
+    monkeypatch, tmp_path
+) -> None:
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    marker = root / "retained-evidence"
+    marker.write_text("preserve", encoding="ascii")
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    client = _hosted_LocalClient(
+        save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10}
+    )
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="only a FAST path/tag"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job() as job:
+                job.save_resumable()
+    assert client.calls == [("save", "resumable", str(root))]
+    assert client.cancelled == ["job-1"] and client.closed
     assert marker.read_text(encoding="ascii") == "preserve"
 
 
@@ -956,6 +1260,191 @@ def test_hosted_local_save_rejects_invalid_checkpoint_type_before_creating_stora
         hosted._save_local_checkpoint(_hosted_LocalClient(), "unknown")
 
 
+def test_hosted_local_resume_creates_a_fresh_full_model_job_then_loads_before_training(monkeypatch, tmp_path) -> None:
+    cfg = _hosted_config()
+    before = json.dumps(cfg.sub_job, sort_keys=True)
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    (root / "latest").write_text("global_step10\n", encoding="ascii")
+    client = _hosted_LocalClient(
+        losses=[2.5],
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": _hosted_LOCAL_CHECKPOINT_ID,
+            "stage_info": deepcopy(_hosted_LOCAL_STAGE),
+        },
+    )
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with HostedTransport(_hosted_local_backend(), cfg) as transport:
+        with transport.job() as first:
+            checkpoint = first.save_resumable()
+        assert client.cancelled == ["job-1"]
+        with transport.job(resume_from=checkpoint) as resumed:
+            assert resumed.job_id == "job-2"
+            assert client.calls[-1] == ("load", _hosted_LOCAL_CHECKPOINT_ID, _hosted_LOCAL_STAGE)
+            assert resumed.fwd_bwd_step({"args": (), "kwargs": {}}, learning_rate=0.001) == 2.5
+    assert client.cancelled == ["job-1", "job-2"]
+    assert client.calls == [
+        ("save", "resumable", str(root)),
+        ("load", _hosted_LOCAL_CHECKPOINT_ID, _hosted_LOCAL_STAGE),
+        ("fwd-bwd", {"args": (), "kwargs": {}}),
+        ("step", 0.001),
+    ]
+    for payload, hardware in client.created:
+        assert payload["model_name"] == cfg.model_name == "Qwen/Qwen3-8B"
+        assert "source_checkpoint_info" not in payload
+        assert hardware == "H200"
+        assert payload["training_config"]["n_gpus"] == cfg.n_gpus == 4
+        assert payload["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
+    assert json.dumps(cfg.sub_job, sort_keys=True) == before
+    assert root.is_dir()
+    assert (root / "latest").read_text(encoding="ascii") == "global_step10\n"
+    assert client.closed
+
+
+def test_hosted_local_resume_load_failure_releases_fresh_job_and_retains_checkpoint(monkeypatch, tmp_path) -> None:
+
+    class FailingLoad(_hosted_LocalClient):
+
+        def load_checkpoint(self, checkpoint_id, *, stage_info=None):
+            super().load_checkpoint(checkpoint_id, stage_info=stage_info)
+            raise RuntimeError("runtime load unavailable")
+
+    client = FailingLoad()
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="runtime load unavailable"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=_hosted_local_checkpoint(tmp_path)):
+                raise AssertionError("must not train before a successful load")
+    assert client.cancelled == ["job-1"]
+    assert client.calls == [("load", _hosted_LOCAL_CHECKPOINT_ID, _hosted_LOCAL_STAGE)]
+    assert tmp_path.is_dir()
+    assert (tmp_path / "latest").read_text(encoding="ascii") == "global_step10\n"
+    assert client.closed
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"checkpoint_tag": "global_step0", "version": 0},
+        {"checkpoint_tag": "global_step10", "version": True},
+        {"checkpoint_tag": "global_step10", "version": 9},
+    ],
+)
+def test_hosted_local_resume_rejects_unconfirmed_or_wrong_step_and_releases_fresh_job(
+    monkeypatch, tmp_path, result
+) -> None:
+
+    class IncorrectLoad(_hosted_LocalClient):
+
+        def load_checkpoint(self, checkpoint_id, *, stage_info=None):
+            super().load_checkpoint(checkpoint_id, stage_info=stage_info)
+            return hosted._local_load_metadata({"checkpoint_id": checkpoint_id, **result}, checkpoint_id)
+
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    client = IncorrectLoad()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="local checkpoint load"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=_hosted_local_checkpoint(tmp_path)):
+                raise AssertionError("must not train before confirmed restored step")
+    assert client.cancelled == ["job-1"]
+    assert client.calls == [("load", _hosted_LOCAL_CHECKPOINT_ID, _hosted_LOCAL_STAGE)]
+    assert tmp_path.is_dir()
+    assert client.closed
+
+
+@pytest.mark.parametrize("marker", [None, b"", b"cp_123", b"global_step-1", b"\xff", b"global_step10" + b" " * 129])
+def test_hosted_local_resume_rejects_path_with_missing_or_invalid_marker_before_allocating_job(
+    monkeypatch, tmp_path, marker
+) -> None:
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a FAST marker must not authorize cross-job resume")
+
+    if marker is not None:
+        (tmp_path / "latest").write_bytes(marker)
+    monkeypatch.setattr(hosted, "ArcticClient", unexpected)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+
+
+def test_hosted_local_resume_refuses_a_path_with_a_symlink_latest_marker(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "real-marker"
+    target.write_text("global_step10\n", encoding="ascii")
+    (tmp_path / "latest").symlink_to(target)
+    client = _hosted_LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+    assert client.created == client.calls == client.cancelled == []
+    assert target.read_text(encoding="ascii") == "global_step10\n"
+
+
+def test_hosted_local_resume_refuses_a_path_with_a_nonregular_latest_marker(monkeypatch, tmp_path) -> None:
+    (tmp_path / "latest").mkdir()
+    client = _hosted_LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+    assert client.created == client.calls == client.cancelled == []
+    assert (tmp_path / "latest").is_dir()
+
+
+@pytest.mark.parametrize("reference", ["cp_hosted", "relative/checkpoint", "/tmp/checkpoint", "/data-fast"])
+def test_hosted_local_resume_rejects_nonfast_or_nonabsolute_reference_before_job_creation(
+    monkeypatch, reference
+) -> None:
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("invalid reference must not create a training job")
+
+    monkeypatch.setattr(hosted, "ArcticClient", unexpected)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=Checkpoint(reference, "owned-source")):
+                pass
+
+
+def test_hosted_local_resume_refuses_a_valid_fast_marker_before_allocating_job(monkeypatch, tmp_path) -> None:
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    client = _hosted_LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                raise AssertionError("a valid FAST marker is not a durable identity")
+    assert client.created == client.calls == client.cancelled == []
+    assert (tmp_path / "latest").read_text(encoding="ascii") == "global_step10\n"
+
+
+def test_hosted_local_resume_requires_explicit_stage_before_allocating_job(monkeypatch, tmp_path) -> None:
+    checkpoint = hosted.LocalCortexCheckpoint(
+        _hosted_LOCAL_CHECKPOINT_ID, "owned-source", str(tmp_path), "global_step10", 10
+    )
+    client = _hosted_LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="explicit stage_info"):
+        with HostedTransport(_hosted_local_backend(), _hosted_config()) as transport:
+            with transport.job(resume_from=checkpoint):
+                raise AssertionError("a checkpoint id alone cannot resolve another parent's store")
+    assert client.created == client.calls == client.cancelled == []
+
+
+# Hosted determinism.
+
+
 def test_hosted_determinism_training_client_config_pins_determinism() -> None:
     cfg = LoadedConfig(
         config_id="x",
@@ -978,3 +1467,11 @@ def test_hosted_determinism_training_client_config_pins_determinism() -> None:
     debug = wire["training_config"]["debug"]
     assert debug["full_determinism"] is True
     assert debug["full_determinism_must_comply"] is False
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_runtime_inputs(tmp_path, monkeypatch):
+    config, spec = _synthetic_config_spec(tmp_path / "inputs")
+    monkeypatch.setitem(globals(), "_cortex_port_CONFIG", config)
+    monkeypatch.setitem(globals(), "_cortex_port_ROOT", config.parents[3])
+    monkeypatch.setitem(globals(), "_driver_reviewed_config", config)

@@ -15,7 +15,6 @@
 
 """Static correctness selftests: reference records."""
 
-
 from __future__ import annotations
 
 import builtins
@@ -24,6 +23,7 @@ import hashlib
 import json
 import os
 import shlex
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Barrier
 from threading import Event
+from types import FunctionType
+from types import MethodType
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +47,7 @@ from arctic_platform.correctness.harness.config import ArmDefinition
 from arctic_platform.correctness.harness.config import TestTolerance as Tolerance
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
+from arctic_platform.correctness.reference import hf_single_gpu
 from arctic_platform.correctness.reference.hf_single_gpu import fixed_row_groups
 from arctic_platform.correctness.reference.hf_single_gpu import mixer_boundaries
 from arctic_platform.correctness.reference.hf_single_gpu import mixer_call_inputs
@@ -52,6 +55,18 @@ from arctic_platform.correctness.reference.hf_single_gpu import reference_row_gr
 
 from .check_catalog_configuration import _applicable_tests_spec
 from .helpers import _synthetic_config_spec
+
+# Checkpoint calibration.
+
+
+def test_checkpoint_calibration_qwen38_calibration_requires_four_gas4_microbatches():
+    for slots in (8, 16):
+        assert ArmDefinition("gas1", slots, 8192).microbatches(10240, slots) == 1
+        assert ArmDefinition("gas4", slots * 4, 8192).microbatches(10240, slots) == 4
+
+
+# Prepared reference runner.
+
 
 _prepared_reference_runner_STEP_CHECKS = ["single-step-grads", "single-step-optimizer"]
 
@@ -296,6 +311,41 @@ def test_prepared_reference_runner_prepare_mode_measures_hf_once_and_never_start
     assert measurements["grad_norms"] == {"layer.weight": 1.0}
 
 
+@pytest.mark.parametrize("override", [None, "eager"])
+def test_reference_attention_runner_uses_same_glm_backend_in_measurement_and_identity(
+    _prepared_reference_runner_prepared_runner, monkeypatch, override
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.cfg.sub_job["model_name"] = "zai-org/GLM-5.3-Flash-BF16"
+    control.cfg.training["attn_implementation"] = "sparse_mla"
+    control.missing.add(("single-step-grads", "gas1"))
+    expected = override or "sdpa"
+    calls = []
+
+    def reference(model, batch, output, **kwargs):
+        assert kwargs["attn"] == expected
+        assert control.recipes[-1][2]["attention"] == expected
+        assert control.contexts[-1].attn_implementation == "sparse_mla"
+        calls.append(kwargs)
+        return {
+            **{key: value for key, value in control.record.items() if not key.startswith("optimizer_")},
+            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert (
+        control.execute(
+            selected=["single-step-grads"],
+            selected_arms=control.arms[:1],
+            prepare_references=True,
+            reference_attn=override,
+        )
+        == []
+    )
+    assert len(calls) == len(control.published) == 1
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
 @pytest.mark.parametrize("arm_name", ["gas1", "gas4"])
 def test_prepared_reference_runner_combined_prepare_reuses_optimizer_calibration(
     _prepared_reference_runner_prepared_runner, monkeypatch, arm_name
@@ -355,6 +405,130 @@ def test_prepared_reference_runner_combined_prepare_reuses_optimizer_calibration
     assert records["single-step-optimizer"]["optimizer_norm_gate"] == retained["optimizer_norm_gate"]
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_reference_runs(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys, workers
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.update(("single-step-optimizer", arm.name) for arm in control.arms)
+    calls = []
+
+    def reference(model, batch, output, **kwargs):
+        calls.append((batch.name, kwargs["deterministic"]))
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert control.execute(prepare_references=True, reference_calibration_workers=workers) == []
+    output = capsys.readouterr().out
+    for arm in control.arms:
+        assert f"Optimizer calibration {arm.name}" in output
+        for completed in range(1, 17):
+            assert f"{completed}/16" in output
+        assert output.index(f"Optimizer calibration {arm.name}") < output.index(
+            f"*** Optimizer Norm Summary: {arm.name} ***"
+        )
+        assert calls.count((f"batch-{arm.name}.pt", True)) == 1
+        assert calls.count((f"batch-{arm.name}.pt", False)) == 16
+    assert len(control.published) == 2
+    assert all(
+        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 16
+        for identity, measurements in control.published
+    )
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
+@pytest.mark.parametrize("available", [8, 16])
+def test_optimizer_calibration_defaults_to_two_eight_gpu_waves_per_arm(
+    _prepared_reference_runner_prepared_runner, monkeypatch, available
+):
+    from threading import Barrier
+    from threading import Lock
+
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.update(("single-step-optimizer", arm.name) for arm in control.arms)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
+    barrier = Barrier(8, timeout=10)
+    lock = Lock()
+    active = set()
+    completed = {}
+    baseline = []
+
+    def reference(model, batch, output, **kwargs):
+        arm = batch.stem.removeprefix("batch-")
+        if kwargs["deterministic"]:
+            assert kwargs["cuda_device"] is None
+            baseline.append(arm)
+        else:
+            index = int(output.stem.rsplit("-", 1)[-1])
+            device = kwargs["cuda_device"]
+            with lock:
+                assert device == index % 8
+                assert device not in active
+                if index >= 8:
+                    assert completed[arm] >= set(range(8))
+                active.add(device)
+            try:
+                barrier.wait()
+            finally:
+                with lock:
+                    active.remove(device)
+                    completed.setdefault(arm, set()).add(index)
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert control.execute(prepare_references=True) == []
+    assert not active
+    assert baseline == [arm.name for arm in control.arms]
+    assert completed == {arm.name: set(range(16)) for arm in control.arms}
+    assert len(control.published) == len(control.arms)
+    assert all(
+        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 16
+        for identity, measurements in control.published
+    )
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
+def test_optimizer_calibration_failed_run_leaves_partial_progress_without_publication(
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.add(("single-step-optimizer", "gas1"))
+    count = 0
+
+    def reference(model, batch, output, **kwargs):
+        nonlocal count
+        if not kwargs["deterministic"]:
+            count += 1
+            if count == 2:
+                raise RuntimeError("synthetic calibration failure")
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    with pytest.raises(RuntimeError, match="synthetic calibration failure"):
+        control.execute(
+            selected_arms=control.arms[:1],
+            prepare_references=True,
+            reference_calibration_workers=1,
+        )
+    output = capsys.readouterr().out
+    assert "Optimizer calibration gas1" in output and "1/16" in output
+    assert "16/16" not in output and "Optimizer Norm Summary" not in output
+    assert control.published == []
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
 def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_reference(
     _prepared_reference_runner_prepared_runner, monkeypatch, capsys
 ):
@@ -408,6 +582,9 @@ def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_
     assert "maximum_pairwise_norm_delta=0.000000000e+00\n\n" in output
 
 
+# Reference grouping.
+
+
 def test_reference_grouping_mixer_packing_preserves_one_row_reference_default() -> None:
     groups = reference_row_groups([8192] * 4, 8192, 65536, mixer_packing=True)
     assert groups == [[0], [1], [2], [3]]
@@ -450,8 +627,10 @@ def test_reference_grouping_mixer_call_inputs_flatten_only_multirow_varlen_calls
     assert one_kwargs["seq_idx"].shape == (1, 4)
 
 
-_reference_records_GRADS = "single-step-grads"
+# Reference records.
 
+
+_reference_records_GRADS = "single-step-grads"
 
 _reference_records_OPTIMIZER = "single-step-optimizer"
 
@@ -1775,70 +1954,222 @@ def test_reference_observability_calibration_error_keeps_existing_record_and_doe
     assert not any("done" in line for line in matching)
 
 
-@pytest.mark.parametrize("workers", [1, 2])
-def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_reference_runs(
-    _prepared_reference_runner_prepared_runner, monkeypatch, capsys, workers
-):
-    control = _prepared_reference_runner_prepared_runner
-    control.missing.update(("single-step-optimizer", arm.name) for arm in control.arms)
-    calls = []
+# Actual HF execution provenance.
 
-    def reference(model, batch, output, **kwargs):
-        calls.append((batch.name, kwargs["deterministic"]))
-        return {
-            "loss": 3.0,
-            "grad_norms": {"layer.weight": 3.0},
-            "optimizer_state_manifest": str(control.target_manifest),
-        }
 
-    monkeypatch.setattr(runner, "run_reference", reference)
-    assert control.execute(prepare_references=True, reference_calibration_workers=workers) == []
-    output = capsys.readouterr().out
-    for arm in control.arms:
-        assert f"Optimizer calibration {arm.name}" in output
-        for completed in range(1, 6):
-            assert f"{completed}/5" in output
-        assert output.index(f"Optimizer calibration {arm.name}") < output.index(
-            f"*** Optimizer Norm Summary: {arm.name} ***"
-        )
-        assert calls.count((f"batch-{arm.name}.pt", True)) == 1
-        assert calls.count((f"batch-{arm.name}.pt", False)) == 5
-    assert len(control.published) == 2
-    assert all(
-        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 5
-        for identity, measurements in control.published
+class _ReferenceExecutionModel:
+    def __init__(self, config):
+        self.config = config
+
+    def forward(self, input_ids):
+        return input_ids
+
+
+class _ReferenceExecutionDecoder(_ReferenceExecutionModel):
+    def forward(self, input_ids):
+        return input_ids + 1
+
+
+@pytest.fixture
+def _reference_execution_engine():
+    def config(layers, attention):
+        values = {"model_type": "synthetic", "num_hidden_layers": layers, "use_cache": False}
+        return SimpleNamespace(values=values, to_dict=lambda: values, _attn_implementation=attention)
+
+    return hf_single_gpu.ReferenceEngine(
+        model=_ReferenceExecutionModel(config(4, "sdpa")),
+        decoder=_ReferenceExecutionDecoder(config(4, "eager")),
+        head=None,
+        hidden_size=1,
+        head_name=None,
+        device="cpu",
     )
-    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
 
 
-def test_optimizer_calibration_failed_run_leaves_partial_progress_without_publication(
-    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+def test_reference_execution_witness_records_actual_configurations_and_selected_forward(_reference_execution_engine):
+    engine = _reference_execution_engine
+    witness = hf_single_gpu.execution_witness(engine, requested_attention="flash_attention_3")
+    assert witness["schema"] == "hf-reference-execution-v1"
+    assert witness["requested_attention"] == "flash_attention_3"
+    assert witness["effective_configurations"] == {
+        "model": {
+            "config": {"model_type": "synthetic", "num_hidden_layers": 4, "use_cache": False},
+            "attention_implementation": "sdpa",
+        },
+        "decoder": {
+            "config": {"model_type": "synthetic", "num_hidden_layers": 4, "use_cache": False},
+            "attention_implementation": "eager",
+        },
+    }
+    assert (
+        witness["effective_configurations_sha256"]
+        == hashlib.sha256(
+            json.dumps(witness["effective_configurations"], sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+    )
+    for name, cls in (("model", _ReferenceExecutionModel), ("decoder", _ReferenceExecutionDecoder)):
+        implementation = witness["implementations"][name]
+        assert implementation["class"]["module"] == cls.__module__
+        assert implementation["class"]["qualname"] == cls.__qualname__
+        assert implementation["forward"]["qualname"] == cls.forward.__qualname__
+        assert implementation["class"]["source"] == records.file_identity(__file__)
+        assert implementation["forward"]["source"] == records.file_identity(__file__)
+        assert len(implementation["forward"]["python_code_sha256"]) == 64
+    assert json.loads(json.dumps(witness, allow_nan=False)) == witness
+    engine.model.config.values["num_hidden_layers"] = 99
+    assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
+
+
+def test_reference_execution_witness_hashes_loaded_forward_separately_from_file(_reference_execution_engine):
+    engine = _reference_execution_engine
+    original = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+    engine.decoder.forward = MethodType(_ReferenceExecutionModel.forward, engine.decoder)
+    changed = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+    assert changed["implementations"]["decoder"]["class"] == original["implementations"]["decoder"]["class"]
+    assert (
+        changed["implementations"]["decoder"]["forward"]["source"]
+        == original["implementations"]["decoder"]["forward"]["source"]
+    )
+    assert (
+        changed["implementations"]["decoder"]["forward"]["python_code_sha256"]
+        != original["implementations"]["decoder"]["forward"]["python_code_sha256"]
+    )
+
+
+def test_reference_execution_witness_code_digest_is_checkout_independent(_reference_execution_engine, tmp_path):
+    engine = _reference_execution_engine
+    original = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+    source = tmp_path / "relocated-reference.py"
+    source.write_bytes(Path(__file__).read_bytes())
+    forward = _ReferenceExecutionDecoder.forward
+    relocated = FunctionType(forward.__code__.replace(co_filename=str(source)), forward.__globals__, forward.__name__)
+    engine.decoder.forward = MethodType(relocated, engine.decoder)
+    changed = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+    assert (
+        changed["implementations"]["decoder"]["forward"]["source"]
+        == original["implementations"]["decoder"]["forward"]["source"]
+    )
+    assert (
+        changed["implementations"]["decoder"]["forward"]["python_code_sha256"]
+        == original["implementations"]["decoder"]["forward"]["python_code_sha256"]
+    )
+
+
+def test_reference_execution_witness_preserves_upstream_config_and_effective_attention(_reference_execution_engine):
+    from transformers import PretrainedConfig
+
+    config = PretrainedConfig(dtype=torch.bfloat16, use_cache=False)
+    config._attn_implementation = "eager"
+    _reference_execution_engine.model.config = config
+    _reference_execution_engine.decoder.config = config
+    witness = hf_single_gpu.execution_witness(_reference_execution_engine, requested_attention="sdpa")
+    for value in witness["effective_configurations"].values():
+        assert value["config"] == json.loads(config.to_json_string(use_diff=False))
+        assert value["attention_implementation"] == "eager"
+        assert json.loads(json.dumps(value, allow_nan=False)) == value
+
+
+@pytest.mark.parametrize("defect", ["native-forward", "nonfinite-config"])
+def test_reference_execution_witness_rejects_unrecordable_runtime(_reference_execution_engine, defect):
+    engine = _reference_execution_engine
+    if defect == "native-forward":
+        engine.decoder.forward = len
+        message = "inspectable Python forward"
+    else:
+        engine.model.config.values["invalid"] = float("nan")
+        message = "Out of range float"
+    with pytest.raises(ValueError, match=message):
+        hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+
+
+@pytest.mark.parametrize("change", [None, "config", "forward", "source"])
+def test_reference_execution_witness_survives_run_and_rejects_execution_changes(
+    _reference_execution_engine, monkeypatch, tmp_path, change
 ):
-    control = _prepared_reference_runner_prepared_runner
-    control.missing.add(("single-step-optimizer", "gas1"))
-    count = 0
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
 
-    def reference(model, batch, output, **kwargs):
-        nonlocal count
-        if not kwargs["deterministic"]:
-            count += 1
-            if count == 2:
-                raise RuntimeError("synthetic calibration failure")
-        return {
-            "loss": 3.0,
-            "grad_norms": {"layer.weight": 3.0},
-            "optimizer_state_manifest": str(control.target_manifest),
-        }
-
-    monkeypatch.setattr(runner, "run_reference", reference)
-    with pytest.raises(RuntimeError, match="synthetic calibration failure"):
-        control.execute(
-            selected_arms=control.arms[:1],
-            prepare_references=True,
-            reference_calibration_workers=1,
+    engine = _reference_execution_engine
+    if change == "source":
+        source = tmp_path / "changing-forward.py"
+        source.write_bytes(Path(__file__).read_bytes())
+        forward = _ReferenceExecutionDecoder.forward
+        relocated = FunctionType(
+            forward.__code__.replace(co_filename=str(source)), forward.__globals__, forward.__name__
         )
-    output = capsys.readouterr().out
-    assert "Optimizer calibration gas1" in output and "1/5" in output
-    assert "5/5" not in output and "Optimizer Norm Summary" not in output
-    assert control.published == []
-    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+        engine.decoder.forward = MethodType(relocated, engine.decoder)
+    monkeypatch.setattr(hf_single_gpu, "build_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    def forward(*args, **kwargs):
+        if change == "config":
+            engine.model.config.values["num_hidden_layers"] = 8
+        elif change == "forward":
+            engine.decoder.forward = MethodType(_ReferenceExecutionModel.forward, engine.decoder)
+        elif change == "source":
+            source.write_bytes(source.read_bytes() + b"\n# changed after reference start\n")
+        return hf_single_gpu.ForwardBackwardResult(
+            loss=1.25,
+            gradients={},
+            active_tokens=8,
+            microbatches=1,
+            skipped_no_grad=["indexer.weight"],
+            participation={
+                "schema": PARTICIPATION_SCHEMA,
+                "parameters": {
+                    "indexer.weight": {
+                        "shape": [1],
+                        "state": "inactive",
+                        "evidence": {
+                            "kind": "integer-selector",
+                            "module": "indexer",
+                            "module_class": "Glm5NextTextIndexer",
+                            "calls": 1,
+                            "integer_outputs_only": True,
+                            "forward_sha256": "0" * 64,
+                        },
+                    }
+                },
+            },
+        )
+
+    monkeypatch.setattr(hf_single_gpu, "forward_backward", forward)
+    if change is not None:
+        with pytest.raises(ValueError, match="changed during execution"):
+            hf_single_gpu.run("unused", None, device="cpu", attn_implementation="sdpa")
+        return
+    result = hf_single_gpu.run("unused", None, device="cpu", attn_implementation="sdpa")
+    assert result.reference_execution == hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
+    assert result.skipped_no_grad == ["indexer.weight"]
+
+
+def test_reference_execution_witness_cli_and_compact_record_preserve_provenance(
+    _reference_execution_engine, _reference_records_ctx, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.harness import batches
+    from arctic_platform.correctness.reference import __main__ as reference_cli
+
+    witness = hf_single_gpu.execution_witness(_reference_execution_engine, requested_attention="sdpa")
+    result = hf_single_gpu.ReferenceResult(
+        **_reference_records_measurements(),
+        peak_gib=0.0,
+        skipped_no_grad=["indexer.weight"],
+        reference_execution=witness,
+    )
+    output = tmp_path / "reference.json"
+    monkeypatch.setattr(
+        sys, "argv", ["reference", "--model", "unused", "--batch", "unused", "--out", str(output), "--seed", "42"]
+    )
+    monkeypatch.setattr(batches, "load", lambda *args: None)
+    monkeypatch.setattr(hf_single_gpu, "run", lambda *args, **kwargs: result)
+    reference_cli.main()
+    measurements = json.loads(output.read_text())
+    assert measurements["reference_execution"] == witness
+    assert measurements["skipped_no_grad"] == ["indexer.weight"]
+    identity = {"check_id": _reference_records_GRADS, "config_id": _reference_records_ctx.config_id}
+    path = records.publish_record(_reference_records_ctx, identity, measurements)
+    original = path.read_bytes()
+    _reference_records_no_hf(monkeypatch)
+    assert records.load_record(_reference_records_ctx, identity) == measurements
+    assert path.read_bytes() == original

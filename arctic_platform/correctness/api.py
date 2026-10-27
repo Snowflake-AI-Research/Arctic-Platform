@@ -51,7 +51,6 @@ class RunRequest:
 
 @dataclass(frozen=True)
 class RunOptions:
-    peft_adapter: Path | None = None
     backend: str = "cortex-training"
     host: str | None = None
     database: str | None = None
@@ -67,11 +66,14 @@ class RunOptions:
     case: tuple[str, ...] = ()
     out: Path | None = None
     reference_records_dir: Path | None = None
+    peft_adapter: Path | None = None
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
     test_spec: Path | None = None
     historical_gradient_references: Path | None = None
     historical_gradient_references_sha256: str | None = None
+    dense_checkpoint_allocation: Path | None = None
+    dense_checkpoint_allocation_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +200,7 @@ def options_from_args(args: Namespace) -> RunOptions:
 
 def run(request: RunRequest, options: RunOptions | None = None, *, executor: Callable | None = None) -> BatchResult:
     """Run selected cases sequentially with short output and complete saved logs."""
+    from .harness.execution import _load_dense_checkpoint_allocation
     from .harness.execution import _load_historical_gradient_references
     from .harness.execution import run_batch
 
@@ -205,6 +208,7 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
     if options.test_spec is not None and (request.config is None or request.all_configs):
         raise ValueError("--test-spec requires one explicit --config")
     args = _namespace(request, options)
+    _load_dense_checkpoint_allocation(args)
     _load_historical_gradient_references(args)
     selected = select(request)
     return run_batch(args, selected=selected, executor=executor)

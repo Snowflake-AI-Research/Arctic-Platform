@@ -14,24 +14,30 @@
 # limitations under the License.
 
 
-"Supervised gateway jobs, explicit request packing, and owned cleanup."
+"Training gateway ownership and explicit request packing."
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import copy
 import fcntl
+import hashlib
 import json
 import math
 import os
+import select
 import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -51,12 +57,10 @@ from .config import ReviewedTrainingConfig
 from .config import correctness_microbatch_tokens
 from .cortex import CorrectnessClient as ArcticClient
 from .cortex import CortexTrainingConfig
+from .storage import _ds_ssh
 from .storage import parse_hostfile
 from .storage import require_data_fast_path
-
-
-class UnsafeCleanupError(RuntimeError):
-    """Owned resources may remain; do not start another correctness workload."""
+from .transport import UnsafeCleanupError
 
 
 @dataclass
@@ -66,6 +70,7 @@ class StepResult:
     model_calls: Optional[int] = None
     packed_rows: Optional[int] = None
     optimizer_state_manifest: Optional[str] = None
+    participation: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -97,8 +102,9 @@ def available_gpus() -> int:
 
 _STANDARD_MASTER_PORT = 29500
 _RAY_PROCESS_PATTERN = (
-    r"([r]aylet|[g]cs_server|[d]ashboard.py|[m]onitor.py|[l]og_monitor.py|[d]efault_worker.py|ray::)"
+    r"([r]aylet|[g]cs_server|[d]ashboard.py|[m]onitor.py|[l]og_monitor.py|[d]efault_worker.py|[r]ay::)"
 )
+_GATEWAY_PROC_ROOT = Path("/proc")
 
 
 def _allocation_hostfile() -> Path | None:
@@ -107,11 +113,10 @@ def _allocation_hostfile() -> Path | None:
         path = Path(value)
         if path.is_file():
             return path
-    default = Path("/data-fast/hostfile")
-    return default if default.is_file() else None
-
-
-_GATEWAY_PROC_ROOT = Path("/proc")
+    for default in (Path("/data-fast/hostfile"), Path("/job/hostfile")):
+        if default.is_file():
+            return default
+    return None
 
 
 def _gateway_state_directory() -> Path:
@@ -133,7 +138,10 @@ def _gateway_process_identity(pid: int) -> dict | None:
 def _stop_stale_gateway(gateway: dict, log_path: str) -> None:
     if _gateway_process_identity(gateway["pid"]) != gateway:
         return
-    print(f"Stopping stale owned Cortex-training gateway (PID {gateway['pid']}); log: {log_path}", flush=True)
+    print(
+        f"Stopping stale owned Cortex-training gateway (PID {gateway['pid']}); log: {log_path}",
+        flush=True,
+    )
     os.kill(gateway["pid"], signal.SIGTERM)
     deadline = time.monotonic() + 120
     while _gateway_process_identity(gateway["pid"]) == gateway:
@@ -204,6 +212,7 @@ def _recover_owned_gateway(record_path: Path) -> None:
         if _gateway_process_identity(owner["pid"]) == owner:
             raise UnsafeCleanupError("another correctness command still owns the local gateway; stop it first")
         if _gateway_process_identity(gateway["pid"]) != gateway:
+            _reap_owned_gateway_descendants(gateway, record["token"])
             record_path.unlink()
             return
         environment = (_GATEWAY_PROC_ROOT / str(gateway["pid"]) / "environ").read_bytes().split(b"\0")
@@ -211,6 +220,7 @@ def _recover_owned_gateway(record_path: Path) -> None:
         if marker not in environment or os.getpgid(gateway["pid"]) != gateway["pid"]:
             raise ValueError("live process does not match the recorded harness-owned gateway")
         _stop_stale_gateway(gateway, record["log"])
+        _reap_owned_gateway_descendants(gateway, record["token"])
         record_path.unlink()
     except UnsafeCleanupError:
         raise
@@ -253,62 +263,601 @@ def recover_local_cortex_gateway() -> None:
 
 
 @contextlib.contextmanager
-def local_cortex_gateway(directory: Path) -> Iterator[str]:
+def local_cortex_gateway(
+    directory: Path,
+    *,
+    gateway_module: str = "dss.ray_dss.gateway_server",
+    allocation_members: dict | None = None,
+    gateway_command_builder=None,
+    gateway_command_source: dict | None = None,
+) -> Iterator[str]:
     """Recover an orphan, then start and close this command's owned DSS service."""
+    if gateway_module not in (
+        "dss.ray_dss.gateway_server",
+        "arctic_platform.correctness.harness.gateway",
+        "arctic_platform.debug.correctness_participation",
+    ):
+        raise ValueError("unsupported correctness gateway module")
+    if allocation_members is not None and gateway_module != "arctic_platform.correctness.harness.gateway":
+        raise ValueError("explicit allocation identities require the correctness gateway")
+    options = {} if allocation_members is None else {"allocation_members": allocation_members}
+    if gateway_command_builder is not None or gateway_command_source is not None:
+        from .cortex_optimizer import verify_native_callback
+
+        if gateway_module != "dss.ray_dss.gateway_server":
+            raise ValueError("native gateway command builder requires the upstream DSS gateway")
+        verify_native_callback(gateway_command_builder, gateway_command_source)
+        options.update(
+            gateway_command_builder=gateway_command_builder,
+            gateway_command_source=gateway_command_source,
+        )
     with _owned_gateway_slot() as record_path:
-        with _started_local_cortex_gateway(directory, record_path) as url:
+        with _started_local_cortex_gateway(directory, record_path, gateway_module=gateway_module, **options) as url:
             yield url
 
 
 @contextlib.contextmanager
-def _started_local_cortex_gateway(directory: Path, record_path: Path) -> Iterator[str]:
-    import requests
+def _started_local_cortex_gateway(
+    directory: Path,
+    record_path: Path,
+    *,
+    gateway_module: str = "dss.ray_dss.gateway_server",
+    allocation_members: dict | None = None,
+    gateway_command_builder=None,
+    gateway_command_source: dict | None = None,
+) -> Iterator[str]:
     import torch
 
     directory.mkdir(parents=True, exist_ok=True)
     hostfile = _allocation_hostfile()
-    if hostfile is None and Path("/job/hostfile").is_file():
-        hostfile = Path("/job/hostfile")
     if hostfile is None:
         hostfile = directory / "hostfile"
         hostfile.write_text(f"{socket.gethostname()} slots={torch.cuda.device_count()}\n")
+    previous = os.environ.get("DSS_CORRECTNESS_TMPDIR")
+    prepared = None
+    if gateway_module == "arctic_platform.correctness.harness.gateway":
+        options = {} if allocation_members is None else {"allocation_members": allocation_members}
+        prepared = _prepare_gateway_scratch(directory, hostfile, **options)
+        os.environ["DSS_CORRECTNESS_TMPDIR"] = prepared["path"]
+    command_options = {}
+    if gateway_command_builder is not None or gateway_command_source is not None:
+        command_options.update(
+            gateway_command_builder=gateway_command_builder,
+            gateway_command_source=gateway_command_source,
+        )
+    try:
+        with _launch_local_cortex_gateway(
+            directory, record_path, hostfile, gateway_module=gateway_module, **command_options
+        ) as url:
+            yield url
+    finally:
+        if prepared is not None:
+            if previous is None:
+                os.environ.pop("DSS_CORRECTNESS_TMPDIR", None)
+            else:
+                os.environ["DSS_CORRECTNESS_TMPDIR"] = previous
+
+
+def _gateway_scratch_identity(info: os.stat_result) -> list[int]:
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_uid]
+
+
+def _gateway_scratch_entries(host_bytes: bytes) -> list:
+    if not host_bytes or len(host_bytes) > 65536:
+        raise ValueError("scratch hostfile snapshot must contain bounded allocation metadata")
+    with tempfile.NamedTemporaryFile() as snapshot:
+        snapshot.write(host_bytes)
+        snapshot.flush()
+        entries = parse_hostfile(snapshot.name)
+    if not entries or len({entry.host for entry in entries}) != len(entries):
+        raise ValueError("scratch hostfile snapshot requires unique allocation members")
+    return entries
+
+
+def _gateway_scratch_members(host_bytes: bytes, members: dict) -> dict:
+    """Validate explicit node identities against the exact head hostfile snapshot."""
+    entries = _gateway_scratch_entries(host_bytes)
+    if not isinstance(members, dict) or members.keys() != {entry.host for entry in entries}:
+        raise ValueError("scratch allocation identities must cover exactly the unique hostfile members")
+    for entry in entries:
+        member = members[entry.host]
+        if (
+            not isinstance(member, dict)
+            or set(member) != {"host", "address", "boot_id", "slots"}
+            or any(not isinstance(member[key], str) or not member[key] for key in ("host", "address", "boot_id"))
+            or entry.host not in {member["host"], member["address"]}
+            or type(member["slots"]) is not int
+            or member["slots"] != entry.slots
+        ):
+            raise ValueError("scratch allocation member, address, boot or slots binding differs")
+    if any(len({member[key] for member in members.values()}) != len(entries) for key in ("host", "address")):
+        raise ValueError("scratch allocation identities contain duplicate nodes or addresses")
+    return members
+
+
+def _gateway_scratch_node(request: dict) -> dict:
+    receipt = {
+        "token": request["token"],
+        "host": socket.gethostname(),
+        "path": request["path"],
+        "ok": False,
+    }
+    try:
+        hostfile = Path(request["hostfile"])
+        members = request.get("allocation_members")
+        transported = "hostfile_base64" in request
+        if members is None and not transported:
+            host_bytes = hostfile.read_bytes()
+            hosts = {row.host for row in parse_hostfile(hostfile)}
+        else:
+            # Allocation hostfiles are head-local; peers authenticate the transported snapshot.
+            host_bytes = base64.b64decode(request["hostfile_base64"], validate=True)
+            if members is None:
+                hosts = {row.host for row in _gateway_scratch_entries(host_bytes)}
+            else:
+                members = _gateway_scratch_members(host_bytes, members)
+                hosts = set(members)
+        host_sha = hashlib.sha256(host_bytes).hexdigest()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        address = socket.gethostbyname(receipt["host"])
+        receipt.update(
+            boot_id=boot,
+            address=address,
+            hostfile_sha256=host_sha,
+            python=str(Path(sys.executable).resolve()),
+        )
+        if (
+            host_sha != request["hostfile_sha256"]
+            or not hosts.intersection({receipt["host"], address})
+            or str(Path(sys.executable).resolve()) != request["python"]
+        ):
+            raise ValueError("scratch allocation member, hostfile or interpreter differs")
+        if members is not None:
+            selected = [key for key in members if key in {receipt["host"], address}]
+            if len(selected) != 1:
+                raise ValueError("scratch allocation member selection is ambiguous or missing")
+            expected = members[selected[0]]
+            if (expected["host"], expected["address"], expected["boot_id"]) != (receipt["host"], address, boot):
+                raise ValueError("scratch allocation node address or boot differs from supplied identity")
+            receipt.update(member=selected[0], slots=expected["slots"])
+        root = Path(request["path"])
+        if not root.is_absolute() or root.resolve() != root or not root.is_relative_to("/data-fast"):
+            raise ValueError("scratch parent must be a canonical FAST descendant")
+        if root == Path("/data-fast"):
+            raise ValueError("scratch parent cannot be the FAST root")
+        identities = []
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        current = Path("/")
+        created = False
+        try:
+            for part in root.parts[1:]:
+                current /= part
+                try:
+                    next_descriptor = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                except FileNotFoundError:
+                    if not current.is_relative_to("/data-fast") or current == Path("/data-fast"):
+                        raise ValueError("existing FAST anchor required")
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    next_descriptor = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    if current == root:
+                        created = True
+                os.close(descriptor)
+                descriptor = next_descriptor
+                identities.append((current, _gateway_scratch_identity(os.fstat(descriptor))))
+            info = os.fstat(descriptor)
+            if info.st_uid != os.geteuid():
+                raise ValueError("scratch parent is not owned by the executing user")
+            for path, identity in identities:
+                if _gateway_scratch_identity(path.lstat()) != identity:
+                    raise ValueError("scratch ancestor identity changed")
+            if (
+                (not transported and hashlib.sha256(hostfile.read_bytes()).hexdigest() != host_sha)
+                or Path("/proc/sys/kernel/random/boot_id").read_text().strip() != boot
+                or socket.gethostname() != receipt["host"]
+                or socket.gethostbyname(receipt["host"]) != address
+            ):
+                raise ValueError("scratch allocation identity changed")
+            receipt.update(
+                ok=True,
+                created=created,
+                identity=_gateway_scratch_identity(info),
+                boot_id=boot,
+                address=address,
+                hostfile_sha256=host_sha,
+                python=str(Path(sys.executable).resolve()),
+            )
+        finally:
+            os.close(descriptor)
+    except Exception:
+        receipt["error"] = traceback.format_exc()
+    return receipt
+
+
+def _prepare_gateway_scratch(directory: Path, hostfile: Path, *, allocation_members: dict | None = None) -> dict:
+    """Prepare the exact same-allocation scratch parent before starting a gateway."""
+    token = uuid.uuid4().hex
+    root = Path(os.environ.get("DSS_CORRECTNESS_TMPDIR") or f"/data-fast/tmp/correctness-gateway-{token}")
+    if not root.is_absolute() or root.resolve() != root or not root.is_relative_to("/data-fast"):
+        raise ValueError("gateway scratch parent must be a canonical FAST descendant")
+    host_bytes = hostfile.read_bytes()
+    entries = _gateway_scratch_entries(host_bytes)
+    hosts = {row.host for row in entries}
+    if not hosts or len(hosts) != len(entries):
+        raise ValueError("gateway scratch preparation requires unique allocation members")
+    host_identity = hostfile.stat()
+    host_link_identity = hostfile.lstat()
+    request = {
+        "token": token,
+        "path": str(root),
+        "hostfile": str(hostfile.absolute()),
+        "hostfile_sha256": hashlib.sha256(host_bytes).hexdigest(),
+        "hostfile_base64": base64.b64encode(host_bytes).decode("ascii"),
+        "python": str(Path(sys.executable).resolve()),
+    }
+    marker = "CORRECTNESS_GATEWAY_SCRATCH "
+    raw_path = directory / f"scratch-preparation-{token}.transport.log"
+    receipt_path = directory / f"scratch-preparation-{token}.json"
+    result = {
+        "path": str(root),
+        "request": request,
+        "nodes": {},
+        "transport_log": str(raw_path),
+        "ok": False,
+    }
+    primary = None
+    try:
+        if allocation_members is not None:
+            members = _gateway_scratch_members(host_bytes, allocation_members)
+            if members.keys() != hosts:
+                raise ValueError("scratch hostfile changed while reading allocation members")
+            request.update(
+                allocation_members=copy.deepcopy(members),
+            )
+        source = Path(__file__).resolve()
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        import_roots = list(dict.fromkeys([str(source.parents[3]), *sys.path]))
+        script = (
+            "import hashlib, json, sys\nfrom pathlib import Path\n"
+            f"sys.path[:] = {import_roots!r}\n"
+            f"source = Path({str(source)!r})\n"
+            f"assert hashlib.sha256(source.read_bytes()).hexdigest() == {digest!r}, 'scratch source differs'\n"
+            "from arctic_platform.correctness.harness import dss_driver as module\n"
+            "assert Path(module.__file__).resolve() == source, 'scratch import differs'\n"
+            f"assert hashlib.sha256(source.read_bytes()).hexdigest() == {digest!r}, 'scratch source changed'\n"
+            f"receipt = module._gateway_scratch_node(json.loads({json.dumps(request)!r}))\n"
+            f"print({marker!r} + json.dumps(receipt), flush=True)\n"
+        )
+        encoded = base64.b64encode(script.encode()).decode()
+        with raw_path.open("xb") as stream:
+            process = subprocess.Popen(
+                [
+                    _ds_ssh(),
+                    "-f",
+                    str(hostfile),
+                    f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -",
+                ],
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                result["transport_exit"] = process.wait(timeout=120)
+            except BaseException as exc:
+                try:
+                    _reap_gateway_scratch_transport(process)
+                    result["transport_group_empty"] = True
+                except Exception as cleanup:
+                    result["transport_cleanup_error"] = traceback.format_exc()
+                    exc.add_note(f"Scratch transport cleanup remains unverified: {cleanup}")
+                raise
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                result["transport_group_empty"] = True
+            else:
+                _reap_gateway_scratch_transport(process)
+                raise ValueError("scratch transport left descendants after its direct child exited")
+        with raw_path.open("rb") as stream:
+            consumed = 0
+            while line := stream.readline(65537):
+                consumed += len(line)
+                if len(line) > 65536 or consumed > 1024**2:
+                    raise ValueError("scratch transport metadata exceeds bounded reader limit; full log retained")
+                prefix, separator, raw = line.decode().partition(marker)
+                if not separator:
+                    continue
+                host = prefix.strip().removesuffix(":").strip()
+                if host not in hosts or host in result["nodes"]:
+                    raise ValueError("unexpected or duplicate scratch allocation receipt")
+                row = json.loads(raw)
+                result["nodes"][host] = row
+                if (
+                    not isinstance(row, dict)
+                    or row.get("token") != token
+                    or row.get("path") != str(root)
+                    or row.get("ok") is not True
+                    or row.get("hostfile_sha256") != request["hostfile_sha256"]
+                    or row.get("python") != request["python"]
+                    or not row.get("boot_id")
+                    or not isinstance(row.get("identity"), list)
+                    or len(row["identity"]) != 4
+                    or any(type(value) is not int for value in row["identity"])
+                    or row["identity"][3] != os.geteuid()
+                    or not stat.S_ISDIR(row["identity"][2])
+                    or not isinstance(row.get("host"), str)
+                    or not row["host"]
+                    or host not in {row["host"], row.get("address")}
+                ):
+                    raise ValueError(f"scratch allocation preparation rejected {host}: {row}")
+                if allocation_members is not None:
+                    expected = request["allocation_members"][host]
+                    if (
+                        row.get("member") != host
+                        or (row["host"], row.get("address"), row["boot_id"])
+                        != (expected["host"], expected["address"], expected["boot_id"])
+                        or type(row.get("slots")) is not int
+                        or row["slots"] != expected["slots"]
+                    ):
+                        raise ValueError(f"scratch allocation receipt identity differs for {host}: {row}")
+        if (
+            result["transport_exit"]
+            or result["nodes"].keys() != hosts
+            or len({row["host"] for row in result["nodes"].values()}) != len(hosts)
+            or hostfile.read_bytes() != host_bytes
+            or any(
+                (
+                    _gateway_scratch_identity(actual),
+                    actual.st_size,
+                    actual.st_mtime_ns,
+                    actual.st_ctime_ns,
+                )
+                != (
+                    _gateway_scratch_identity(expected),
+                    expected.st_size,
+                    expected.st_mtime_ns,
+                    expected.st_ctime_ns,
+                )
+                for actual, expected in (
+                    (hostfile.stat(), host_identity),
+                    (hostfile.lstat(), host_link_identity),
+                )
+            )
+        ):
+            raise ValueError("scratch allocation transport, members or hostfile identity differs")
+        result["ok"] = True
+    except BaseException as exc:
+        result["error"] = traceback.format_exc()
+        exc.add_note(f"Scratch preparation evidence: {receipt_path}; full transport: {raw_path}")
+        primary = exc
+        raise
+    finally:
+        try:
+            with receipt_path.open("x") as stream:
+                json.dump(result, stream, indent=2)
+                stream.write("\n")
+        except Exception as exc:
+            if primary is None:
+                raise
+            primary.add_note(f"Could not publish scratch preparation receipt: {exc}")
+    return result
+
+
+def _reap_gateway_scratch_transport(process) -> None:
+    """Reap only the transport session created by this scratch preparation."""
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            process.wait(timeout=10)
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                process.wait(timeout=10)
+                return
+            time.sleep(0.05)
+    process.wait(timeout=10)
+    raise RuntimeError("scratch transport process group did not quiesce within its cleanup deadline")
+
+
+def _owned_gateway_descendants(gateway: dict, token: str) -> list[dict]:
+    """Find token-bound children, including workers that detached into another session."""
+    leader = _gateway_process_identity(gateway["pid"])
+    descendants = []
+    marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode()
+    for directory in _GATEWAY_PROC_ROOT.iterdir():
+        if not directory.name.isdecimal() or int(directory.name) == gateway["pid"]:
+            continue
+        original_session = False
+        try:
+            fields = (directory / "stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[0] in {"Z", "X"}:
+                continue
+            original_session = int(fields[3]) == gateway["pid"]
+            if not original_session and directory.stat().st_uid != gateway["uid"]:
+                continue
+            identity = _gateway_process_identity(int(directory.name))
+            if identity is None:
+                continue
+            environment = (directory / "environ").read_bytes().split(b"\0")
+            if not original_session and marker not in environment:
+                continue
+            if (
+                (original_session and int(fields[2]) != gateway["pid"])
+                or identity["uid"] != gateway["uid"]
+                or int(identity["start_time"]) < int(gateway["start_time"])
+                or identity["start_time"] != fields[19]
+                or marker not in environment
+            ):
+                if _gateway_process_identity(int(directory.name)) is None:
+                    continue
+                raise UnsafeCleanupError(
+                    f"process {directory.name} in the owned gateway session failed ownership validation"
+                )
+            descendants.append(identity)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            if not original_session:
+                continue
+            # Linux may revoke environ access between a killed task's stat reads.
+            if _gateway_process_identity(int(directory.name)) is None:
+                continue
+            raise
+    if descendants and leader is not None and leader != gateway:
+        raise UnsafeCleanupError("owned gateway PID was reused; refusing descendant cleanup")
+    return descendants
+
+
+def _open_gateway_pidfd(pid: int) -> int:
+    """Pin a Linux process even on Python builds made against older libc headers."""
+    if sys.platform != "linux":
+        raise UnsafeCleanupError("owned gateway descendant cleanup requires Linux pidfds")
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        open_pidfd = libc.pidfd_open
+    except AttributeError as exc:
+        raise UnsafeCleanupError("Linux libc does not expose pidfd_open for safe descendant cleanup") from exc
+    open_pidfd.argtypes = [ctypes.c_int, ctypes.c_uint]
+    open_pidfd.restype = ctypes.c_int
+    descriptor = open_pidfd(pid, 0)
+    if descriptor < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return descriptor
+
+
+def _reap_owned_gateway_descendants(gateway: dict, token: str, *, timeout: float = 10) -> None:
+    """Reap token-bound local descendants even after the gateway itself has exited."""
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                descendants = _owned_gateway_descendants(gateway, token)
+                break
+            except UnsafeCleanupError:
+                # Exiting Ray agents can clear their environment before becoming zombies.
+                # Wait for verified absence; never signal a process that failed ownership.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        if not descendants:
+            return
+        print(
+            f"Stopping owned gateway descendants {[entry['pid'] for entry in descendants]}"
+            f" with {signal.Signals(signum).name}.",
+            flush=True,
+        )
+        for identity in descendants:
+            try:
+                descriptor = _open_gateway_pidfd(identity["pid"])
+            except ProcessLookupError:
+                continue
+            try:
+                # A pidfd pins the recipient; validate its birth again after opening it.
+                if _gateway_process_identity(identity["pid"]) != identity:
+                    raise UnsafeCleanupError("gateway descendant identity changed before signalling")
+                _send_gateway_pidfd_signal(descriptor, signum)
+            except ProcessLookupError:
+                pass
+            finally:
+                os.close(descriptor)
+        deadline = time.monotonic() + timeout
+        # Once pinned and signalled, wait on births without rereading an exiting task's environ.
+        while any(_gateway_process_identity(entry["pid"]) == entry for entry in descendants):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    if _owned_gateway_descendants(gateway, token):
+        raise UnsafeCleanupError("owned gateway descendants survived bounded teardown")
+
+
+@contextlib.contextmanager
+def _launch_local_cortex_gateway(
+    directory: Path,
+    record_path: Path,
+    hostfile: Path,
+    *,
+    gateway_module: str,
+    gateway_command_builder=None,
+    gateway_command_source: dict | None = None,
+) -> Iterator[str]:
+    import requests
+
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     log_path = directory / "gateway.log"
-    print(f"\n*** Target: Starting Cortex Training Gateway ***\nGateway log: {log_path}\n", flush=True)
+    print(
+        f"\n*** Target: Starting Cortex Training Gateway ***\nGateway log: {log_path}\n",
+        flush=True,
+    )
     previous_handlers = {}
+    token = uuid.uuid4().hex
 
     def interrupt(signum, frame):
         raise KeyboardInterrupt(f"received {signal.Signals(signum).name}; stopping owned Cortex-training gateway")
 
-    with log_path.open("w") as log:
+    with _gateway_owner_guard(directory, record_path, token), log_path.open("w") as log:
         process = None
-        token = uuid.uuid4().hex
+        gateway = None
         try:
             if threading.current_thread() is threading.main_thread():
                 for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                     previous_handlers[signum] = signal.getsignal(signum)
                     signal.signal(signum, interrupt)
+            command = [
+                sys.executable,
+                "-m",
+                gateway_module,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--backend",
+                "gpu",
+                "--hostfile",
+                str(hostfile),
+            ]
+            if gateway_command_builder is not None or gateway_command_source is not None:
+                from .cortex_optimizer import verify_native_callback
+
+                if gateway_module != "dss.ray_dss.gateway_server":
+                    raise ValueError("native gateway command builder requires the upstream DSS gateway")
+                verify_native_callback(gateway_command_builder, gateway_command_source)
+                options = command[3:]
+                command = gateway_command_builder(tuple(command))
+                verify_native_callback(gateway_command_builder, gateway_command_source)
+                if (
+                    type(command) not in (list, tuple)
+                    or len(command) <= len(options)
+                    or any(type(value) is not str or not value or "\0" in value for value in command)
+                    or command[0] != sys.executable
+                    or list(command[-len(options) :]) != options
+                ):
+                    raise ValueError("native gateway command builder must preserve interpreter and runtime options")
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "dss.ray_dss.gateway_server",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(port),
-                    "--backend",
-                    "gpu",
-                    "--hostfile",
-                    str(hostfile),
-                ],
+                command,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                env={**os.environ, "DSS_CORRECTNESS_GATEWAY_OWNER": token},
+                # Ray retitles its agents; keep the ownership marker readable in /proc/environ.
+                env={**os.environ, "DSS_CORRECTNESS_GATEWAY_OWNER": token, "SPT_NOENV": "1"},
             )
             owner = _gateway_process_identity(os.getpid())
             gateway = _gateway_process_identity(process.pid)
@@ -351,10 +900,12 @@ def _started_local_cortex_gateway(directory: Path, record_path: Path) -> Iterato
                 try:
                     if process is not None:
                         print(
-                            f"Stopping owned Cortex-training gateway (PID {process.pid}); log: {log_path}", flush=True
+                            f"Stopping owned Cortex-training gateway (PID {process.pid}); log: {log_path}",
+                            flush=True,
                         )
                         if process.poll() is None:
                             process.terminate()
+                            shutdown_error = None
                             try:
                                 process.wait(timeout=120)
                             except subprocess.TimeoutExpired as exc:
@@ -364,14 +915,23 @@ def _started_local_cortex_gateway(directory: Path, record_path: Path) -> Iterato
                                     # The group can exit between the timeout and signal; still reap the owned child.
                                     pass
                                 process.wait()
-                                raise UnsafeCleanupError(
+                                shutdown_error = UnsafeCleanupError(
                                     "owned Cortex-training gateway did not shut down cleanly; inspect"
                                     f" {log_path} before retrying"
-                                ) from exc
+                                )
+                                shutdown_error.__cause__ = exc
                         else:
                             process.wait()
+                            shutdown_error = None
+                        if gateway is not None:
+                            _reap_owned_gateway_descendants(gateway, token)
+                        if shutdown_error is not None:
+                            raise shutdown_error
                         record_path.unlink(missing_ok=True)
-                        print("Owned Cortex-training gateway stopped and reaped.", flush=True)
+                        print(
+                            "Owned Cortex-training gateway stopped and reaped.",
+                            flush=True,
+                        )
                 except UnsafeCleanupError:
                     raise
                 except Exception as exc:
@@ -398,17 +958,16 @@ def _run_on_allocation(script: str) -> subprocess.CompletedProcess[str]:
     return completed
 
 
-def _stop_and_verify_gateway_runtime() -> None:
-    """Stop every Ray process in the allocation and prove the standard rendezvous port is reusable."""
-    ray_bin = Path(sys.executable).resolve().parent / "ray"
-    _run_on_allocation(f"{shlex.quote(str(ray_bin))} stop --force")
+def _verify_gateway_runtime_idle() -> None:
+    """Refuse occupied resources without stopping any allocation processes."""
     port_probe = (
         "import socket; "
         "s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
         f"s.bind(('', {_STANDARD_MASTER_PORT})); s.close()"
     )
     _run_on_allocation(
-        f"! pgrep -af {shlex.quote(_RAY_PROCESS_PATTERN)} >/dev/null && "
+        f"pgrep -af {shlex.quote(_RAY_PROCESS_PATTERN)}\n"
+        'status=$?\nif [ "$status" -ne 1 ]; then exit 1; fi\n'
         f"{shlex.quote(sys.executable)} -c {shlex.quote(port_probe)}"
     )
 
@@ -429,21 +988,23 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
     os.environ["MASTER_PORT"] = str(_STANDARD_MASTER_PORT)
     ray_cluster = None
     previous_hostfile = None
+    start_attempted = False
     try:
+        _verify_gateway_runtime_idle()
         ray_cluster = _load_gateway_ray_cluster()
         previous_hostfile = ray_cluster._HOSTFILE
         if not include_peers:
             ray_cluster._HOSTFILE = os.devnull
-        _stop_and_verify_gateway_runtime()
+        start_attempted = True
         ray_cluster.init_ray_cluster(auto_attach=False)
         yield
     finally:
         try:
-            try:
-                if ray_cluster is not None:
+            if start_attempted:
+                try:
                     ray_cluster._shutdown()
-            finally:
-                _stop_and_verify_gateway_runtime()
+                finally:
+                    _verify_gateway_runtime_idle()
         except Exception as exc:
             raise UnsafeCleanupError(
                 "gateway runtime cleanup failed; inspect owned resources before retrying"
@@ -463,7 +1024,11 @@ def gateway(
 ) -> Iterator[GatewaySession]:
     workdir = require_data_fast_path(tmp_dir, label="gateway workdir")
     workdir.mkdir(parents=True, exist_ok=True)
-    yield GatewaySession(workdir=workdir, slots=slots, backend=backend if backend is not None else OnPremConfig())
+    yield GatewaySession(
+        workdir=workdir,
+        slots=slots,
+        backend=backend if backend is not None else OnPremConfig(),
+    )
 
 
 def _ds_optimizer(value: Any) -> dict | None:
@@ -475,6 +1040,8 @@ def _ds_optimizer(value: Any) -> dict | None:
 
 
 def _training_client_config(session: GatewaySession, payload: dict) -> ArcticClientConfig:
+    if "local_model_dir" in payload and not isinstance(getattr(session, "backend", None), CortexConfig):
+        raise ValueError("initial training model directory requires local Cortex")
     tc = deepcopy(payload["training_config"])
     n_gpus = int(tc.pop("n_gpus"))
     max_seq_len = int(tc.pop("max_seq_len", 8192))
@@ -515,14 +1082,17 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
         ),
         backend=backend,
         **({"hardware": payload.get("hardware")} if isinstance(backend, CortexConfig) else {}),
+        **(
+            {"initial_training_model_dir": payload["local_model_dir"]}
+            if "local_model_dir" in payload and isinstance(backend, CortexConfig)
+            else {}
+        ),
     )
 
 
 @contextlib.contextmanager
 def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
     job_type = str(payload.get("job_type", "training"))
-    if job_type != "training":
-        raise ValueError("P1 supports supervised training jobs only")
     config = _training_client_config(session, payload)
     if isinstance(session.backend, OnPremConfig):
         config.to_onprem(job_type)
@@ -579,13 +1149,14 @@ def cortex_training_body(body: dict) -> dict:
         if set(processing) != {"loss_fn"}:
             raise ValueError("Cortex SFT does not support request-level processing options; use --backend onprem")
         processing = {}
-    if processing:
-        raise ValueError("P1 Cortex requests support supervised SFT only")
     lowered = {
         "args": (),
         "kwargs": tensors,
         "context": dict(body.get("meta") or {}),
     }
+    # No processing dictionary selects supervised dispatch; a dictionary selects the RL pipeline.
+    if processing:
+        lowered["processing"] = processing
     return lowered
 
 
@@ -605,7 +1176,10 @@ def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Pa
         checkpoint_root / "default",
         *sorted(checkpoint_root.glob("global_step*/default"), reverse=True),
     ]
-    source = next((path for path in candidates if (path / "adapter_model.safetensors").is_file()), None)
+    source = next(
+        (path for path in candidates if (path / "adapter_model.safetensors").is_file()),
+        None,
+    )
     if source is None or not (source / "adapter_config.json").is_file():
         raise RuntimeError(f"initial adapter checkpoint produced no PEFT pack under {checkpoint_root}")
     if not json.loads((source / "adapter_config.json").read_text()).get("peft_type"):
@@ -660,7 +1234,12 @@ def build_payload(
     mb_spec["max_tokens_per_mb"] = correctness_microbatch_tokens(_max_tokens_per_mb_of(tc))
     tc["mb_spec"] = mb_spec
     debug = dict(tc.get("debug") or {})
-    debug.update({"gradient_norms_per_param": gradient_norms_per_param, "gradient_sample_max_numel": 0})
+    debug.update(
+        {
+            "gradient_norms_per_param": gradient_norms_per_param,
+            "gradient_sample_max_numel": 0,
+        }
+    )
     if determinism == "off":
         debug["full_determinism"] = False
         debug["full_determinism_must_comply"] = False
@@ -803,4 +1382,68 @@ def fwd_bwd_step(session: GatewaySession, job: ArcticJob, body: dict, learning_r
         optimizer_state_manifest=_rank_owned_path(
             stepped.get("optimizer_state_manifest") or step_metrics.get("optimizer_state_manifest")
         ),
+        participation=stepped.get("participation") or step_metrics.get("participation"),
     )
+
+
+def _send_gateway_pidfd_signal(descriptor: int, signum: int) -> None:
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(descriptor, signum)
+        return
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        send = libc.pidfd_send_signal
+    except AttributeError as exc:
+        raise UnsafeCleanupError("Linux libc does not expose pidfd_send_signal for safe cleanup") from exc
+    send.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    send.restype = ctypes.c_int
+    if send(descriptor, signum, None, 0) < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+@contextlib.contextmanager
+def _gateway_owner_guard(directory: Path, record_path: Path, token: str) -> Iterator[None]:
+    """A pipe lifetime guard survives owner SIGKILL without monitoring unrelated services."""
+    reader, writer = os.pipe()
+    guard = None
+    log_path = directory / "gateway-cleanup.log"
+    try:
+        with log_path.open("w") as log:
+            guard = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("gateway_cleanup.py")),
+                    str(reader),
+                    str(record_path.resolve()),
+                    token,
+                ],
+                pass_fds=(reader,),
+                stdout=subprocess.PIPE,
+                stderr=log,
+                start_new_session=True,
+            )
+            os.close(reader)
+            reader = None
+            if not select.select([guard.stdout], [], [], 30)[0] or guard.stdout.readline() != b"ready\n":
+                raise UnsafeCleanupError(f"owned gateway cleanup guard did not start; inspect {log_path}")
+            try:
+                yield
+            finally:
+                os.write(writer, b"done\n")
+                os.close(writer)
+                writer = None
+                if guard.wait(timeout=30) != 0:
+                    raise UnsafeCleanupError(f"owned gateway cleanup guard failed; inspect {log_path}")
+    finally:
+        if reader is not None:
+            os.close(reader)
+        if writer is not None:
+            os.close(writer)
+        if guard is not None:
+            if guard.poll() is None:
+                guard.kill()
+                guard.wait()
+            guard.stdout.close()

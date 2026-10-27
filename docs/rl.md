@@ -19,17 +19,15 @@ rewards, and advantage estimation; Arctic owns the heavy compute.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Shared server details (CLI, endpoints, metrics, colocation):
-[`common.md`](common.md). Training-only SFT (no sampling) is planned in a
-forthcoming SFT PR.
+**Shared server details are in [common.md](common.md).** Training-only supervised fine-tuning (SFT), without sampling, is documented in [sft.md](sft.md).
 
-## vs planned SFT
+## SFT And RL
 
-| | SFT (planned) | RL |
+| | SFT | RL |
 |---|---|---|
 | Jobs | training only | training + sampling (+ optional log_prob) |
-| Client | forthcoming `arctic_platform.sft` | `arctic_platform.rl` factory (async HTTP/Ray) |
-| Loss path | planned `sft` / `sft_ce` | `run_pipeline` (e.g. GRPO) |
+| Client | `arctic_platform.sft.ArcticSFTClient` (blocking) | `arctic_platform.rl` factory (async HTTP/Ray) |
+| Loss path | `run_sft_pipeline` with `sft` / `sft_ce` | `run_pipeline` (e.g. GRPO) |
 | Extra ops | — | `generate`, `log_probs`, `sync_weights`, sleep/wake |
 
 ## Entry points
@@ -142,12 +140,12 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
         "max_prompt_len": int,
         "max_response_len": int,
         "zorro_train_enable": bool,   # optional per-call override
-        ...
+        # Additional context fields depend on the selected loss.
     },
     "processing": {
         "loss_fn": "ap_grpo",          # or "grpo" / dotted path
         "post": ["ap_compute_logprobs", ...],  # Cortex post is "compute_logprobs"
-        "config": {"eps_clip": 0.2, ...},
+        "config": {"eps_clip": 0.2},    # Additional options depend on the selected loss.
     },
 }
 ```
@@ -195,8 +193,22 @@ and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
 The term clamps the teacher-minus-policy log ratio to
 `[-teacher_clip_negative, teacher_clip]`; `teacher_clip_negative` is an
 optional finite non-negative lower-clip magnitude that defaults to
-`teacher_clip`. `ap_grpo` accepts only the baseline GRPO config keys
-(`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control keys below; the
+`teacher_clip`. Every GRPO name also accepts `sampler_kl_coef` (β, finite
+non-negative, default `0.0`), which adds `β · w · k(log r)` with
+`log r = logprobs − old_log_probs_shifted` on every policy token except
+`nll_mask` tokens, aggregated like the policy term: a per-token estimate of
+KL(sampler ‖ policy). It also covers tokens that `m2_threshold` or the ratio
+masks drop from the policy term. A request with `sampler_kl_coef > 0` must send
+`old_log_probs_shifted`. `sampler_kl_type` picks `k`: `"k1"` (default, `−log r`;
+its gradient `−β ∇ log p` raises each sampled token's probability regardless
+of its advantage), `"k2"` (`(log r)² / 2`) or `"k3"` (`r − 1 − log r`, zero
+gradient where `r = 1`). k1 and k3 are unbiased for the KL and its gradient.
+Past `|log r| = log(sampler_kl_ratio_cap)` (default `5.0`, `inf` allowed), k2
+and k3 continue linearly. The optional per-token batch tensor
+`sampler_kl_weights` (finite, non-negative) is `w`; under token-mean it is
+required to carry `sequence_loss_weights`. `ap_grpo` accepts only the baseline
+GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control
+keys below; the
 unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
 `kd_divergence`, `kd_beta`, and `kd_batch_num_tokens` keys. Any other key is
 rejected by name in the batching and validation callbacks and again in the

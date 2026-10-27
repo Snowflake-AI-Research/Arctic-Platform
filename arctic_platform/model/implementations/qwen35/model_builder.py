@@ -36,6 +36,8 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
+from arctic_platform.debug.lora_sync_hooks import maybe_observe_checkpoint_reader
+from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
@@ -499,6 +501,8 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    model.__dict__.pop("_ap_preserved_mtp_weights", None)
+    model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
@@ -528,6 +532,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             f"please remove the directory {config.name} and run again"
         )
         snapshot_path = Path(config.name)
+
+    maybe_capture_reduced_fixture_mtp(model, snapshot_path, config)
 
     # Dynamically convert between different weight formats if needed.
     conversion = None
@@ -593,7 +599,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         del state_dict["lm_head.weight"]
     dcp_load(
         state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        storage_reader=maybe_observe_checkpoint_reader(
+            HuggingFaceStorageReader(path=snapshot_path.as_posix()), model, state_dict, config, parallel_dims
+        ),
     )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:

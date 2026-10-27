@@ -20,7 +20,7 @@ cuBLAS workspace string a caller puts in the environment. This module is only wh
 process does to itself: pin the ATen and cuDNN reduction orders, and ask flash attention for a
 deterministic backward when the installed kernel will give one at this model's head dimension.
 
-Shared by every reference entry point. A reference capture that was not reduction-order pinned would
+Shared by every reference entry point. A hundred-step trajectory that was not reduction-order pinned would
 drift away from the engine it is compared against under its own optimizer steps, and measure that drift
 instead of the engine.
 """

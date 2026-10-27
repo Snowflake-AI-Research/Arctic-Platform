@@ -94,6 +94,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "echo_observation_token_counts",
         "nll_mask",
         "teacher_log_probs_shifted",
+        "sampler_kl_weights",
         "versions",
         "prompt_group_ids",
         "prompt_token_counts",
@@ -299,13 +300,69 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
     batch_data["position_ids"] = (attention_mask_long.cumsum(dim=-1) - 1).clamp_(min=0) * attention_mask_long
 
 
-def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
+def sequence_parallel_worker_groups(worker_info: list[dict] | None, num_workers: int, sp_size: int) -> list[list[int]]:
+    """Bind ordered SP rank memberships to worker-list indices, without assuming rank layout."""
+    num_workers = resolve_parallelism_degree(num_workers, "num_workers")
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    dp_sp_world_size(num_workers, sp_size)
+    if worker_info is None:
+        if sp_size > 1:
+            raise ValueError(
+                "sequence-parallel data-plane is not implemented without actual worker SP membership; "
+                "supply get_sequence_parallel_info results for logical-DP preparation"
+            )
+        return [[index] for index in range(num_workers)]
+    if not isinstance(worker_info, list) or len(worker_info) != num_workers:
+        raise ValueError("SP membership requires one record per worker")
+    rank_indices: dict[int, int] = {}
+    for index, info in enumerate(worker_info):
+        if not isinstance(info, dict):
+            raise ValueError("SP membership record must be a dict")
+        rank, size, local_rank = info.get("rank"), info.get("sp_size"), info.get("sp_rank")
+        ranks = info.get("sp_ranks")
+        if (
+            type(rank) is not int
+            or not 0 <= rank < num_workers
+            or rank in rank_indices
+            or type(info.get("world_size")) is not int
+            or info["world_size"] != num_workers
+            or type(size) is not int
+            or size != sp_size
+            or type(local_rank) is not int
+            or not 0 <= local_rank < sp_size
+            or not isinstance(ranks, list)
+            or len(ranks) != sp_size
+            or any(type(peer) is not int or not 0 <= peer < num_workers for peer in ranks)
+            or len(set(ranks)) != sp_size
+            or ranks[local_rank] != rank
+        ):
+            raise ValueError("inconsistent worker SP membership")
+        rank_indices[rank] = index
+    groups: list[list[int]] = []
+    covered: set[int] = set()
+    for info in worker_info:
+        rank, ranks = info["rank"], info["sp_ranks"]
+        if rank in covered:
+            continue
+        if covered.intersection(ranks):
+            raise ValueError("worker SP groups overlap")
+        indices = [rank_indices[peer] for peer in ranks]
+        if any(worker_info[index]["sp_ranks"] != ranks for index in indices):
+            raise ValueError("workers disagree on ordered SP group membership")
+        groups.append(indices)
+        covered.update(ranks)
+    return groups
+
+
+def _split_batch(
+    batch: dict, num_workers: int, sp_size: int = 1, *, worker_sp_info: list[dict] | None = None
+) -> tuple[list[dict], list | None]:
     """Split a batch across workers and stamp the DP loss scale.
 
-    The cutter produces ``num_workers`` disjoint row shards and stamps
-    ``dp_size=num_workers``. Sequence-parallel replication (one logical DP
-    shard copied across an SP group, then token-sharded) is not implemented,
-    so ``sp_size > 1`` is rejected rather than silently mixing samples.
+    Without sequence parallelism (SP), cut one disjoint row shard per worker and
+    stamp ``dp_size = num_workers``. With SP, each group is one logical
+    data-parallel (DP) replica: split rows across groups, replicate within each
+    group, and stamp ``dp_size = num_workers // sp_size``.
     ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
@@ -314,20 +371,19 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
       * **list** of microbatch dicts (Arctic SFT trainer, H3): each entry is one
         GAS microbatch already; DP-shard each microbatch independently so the
         worker skips concat→``split_dict`` and avoids cross-GAS re-padding.
+
+    With actual ``worker_sp_info``, split logical DP rows and replicate each shard
+    across its ordered SP group. This is preparation, not native token partition:
+    an SP consumer must still partition packed tokens, align causal targets and
+    assemble sequence-local results. Unbound native callers continue to reject.
     """
+    groups = sequence_parallel_worker_groups(worker_sp_info, num_workers, sp_size)
+    dp_size = len(groups)
     _, batch_data, meta_data, processing = unpack_batch(batch)
 
     reorder_indices = None
     meta_data = dict(meta_data)
-    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
-    if sp_size > 1:
-        raise ValueError(
-            "sequence-parallel data-plane is not implemented: _split_batch still "
-            "cuts one disjoint shard per worker. Refuse sp_size>1 until shards "
-            f"are replicated across an SP group. Got sp_size={sp_size}."
-        )
-    dp_sp_world_size(num_workers, sp_size)
-    meta_data.update(dp_size=num_workers)
+    meta_data.update(dp_size=dp_size)
 
     if isinstance(batch_data, list):
         if not batch_data:
@@ -339,9 +395,10 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
             mb = dict(mb)  # shallow copy before optional in-place reconstruct
             if meta_data.get("drop_position_ids", False) and "position_ids" not in mb:
                 reconstruct_position_ids_(mb)
-            mb_shards = split_dict(mb, num_workers)
-            for i, shard in enumerate(mb_shards):
-                per_worker[i].append(shard)
+            mb_shards = split_dict(mb, dp_size)
+            for group, shard in zip(groups, mb_shards):
+                for index in group:
+                    per_worker[index].append(dict(shard))
         shards = [dict(batch=per_worker[i], meta=meta_data, processing=processing) for i in range(num_workers)]
         return shards, reorder_indices
 
@@ -361,16 +418,16 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
         batch_data, reorder_indices = reorg_global_batch(
             batch_data,
             response_length=meta_data["max_response_len"],
-            world_size=num_workers,
+            world_size=dp_size,
             max_token_len=meta_data["max_token_len_per_gpu"],
             max_group_length_threshold=max_group_length_threshold,
         )
 
-    batch_data_shards = split_dict(batch_data, num_workers)
-    shards = []
-    for i in range(num_workers):
-        shard = dict(batch=batch_data_shards[i], meta=meta_data, processing=processing)
-        shards.append(shard)
+    batch_data_shards = split_dict(batch_data, dp_size)
+    shards = [None] * num_workers
+    for group, shard in zip(groups, batch_data_shards):
+        for index in group:
+            shards[index] = dict(batch=dict(shard), meta=meta_data, processing=processing)
     return shards, reorder_indices
 
 

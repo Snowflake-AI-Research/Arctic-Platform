@@ -190,8 +190,41 @@ def _frozen_spec(
     def case_checksum(collection):
         return tuple((a.name, a.global_batch_size, a.max_seq_len) for a in collection)
 
-    spec_checksum = case_checksum(spec.arms)
-    current_checksum = case_checksum(arm_defs)
+    selected_arms = arm_defs
+    reviewed_arms = spec.arms
+    if cases:
+        wanted = set(cases)
+        current_names = [arm.name for arm in arm_defs]
+        reviewed_names = [arm.name for arm in spec.arms]
+        selection_error = None
+        if len(wanted) != len(cases):
+            selection_error = "selected case names must be unique"
+        elif len(set(current_names)) != len(current_names) or len(set(reviewed_names)) != len(reviewed_names):
+            selection_error = "current and reviewed case catalogs must contain unique names"
+        elif unknown := wanted - set(current_names):
+            selection_error = (
+                f"unknown case(s) {', '.join(sorted(unknown))}; this config has {', '.join(current_names)}"
+            )
+        elif missing := wanted - set(reviewed_names):
+            selection_error = f"reviewed spec does not cover selected case(s) {', '.join(sorted(missing))}"
+        if selection_error is not None:
+            results.append(
+                TestResult(
+                    test_id="-",
+                    config_id=cfg.config_id,
+                    outcome=TestOutcome.FAIL,
+                    summary="case selection mismatch",
+                    reason=selection_error,
+                )
+            )
+            print(f"skip {path.name}: {selection_error}", flush=True)
+            return None
+        selected_arms = [arm for arm in arm_defs if arm.name in wanted]
+        reviewed_by_name = {arm.name: arm for arm in spec.arms}
+        reviewed_arms = [reviewed_by_name[arm.name] for arm in selected_arms]
+
+    spec_checksum = case_checksum(reviewed_arms)
+    current_checksum = case_checksum(selected_arms)
     if spec_checksum != current_checksum:
         results.append(
             TestResult(
@@ -228,18 +261,7 @@ def _frozen_spec(
         print(f"skip {path.name}: spec does not cover {attention}; run onboarding", flush=True)
         return None
 
-    if not cases:
-        return spec, arm_defs
-    wanted = set(cases)
-    unknown = wanted - {a.name for a in arm_defs}
-    if unknown:
-        print(
-            f"skip {path.name}: unknown case(s) {', '.join(sorted(unknown))}; "
-            f"this config has {', '.join(a.name for a in arm_defs)}",
-            flush=True,
-        )
-        return None
-    return spec, [a for a in arm_defs if a.name in wanted]
+    return spec, selected_arms
 
 
 def _finish(
@@ -411,6 +433,7 @@ def _configure_regression_target(args):
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
     args = _configure_regression_target(args)
+    dense_checkpoint_allocation = _load_dense_checkpoint_allocation(args)
     historical_gradient_references = _load_historical_gradient_references(args)
     test_spec = getattr(args, "test_spec", None)
     if test_spec is not None and (not args.config or args.all_configs):
@@ -438,6 +461,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     if local_fixture:
         require_local_cortex_gateway(backend)
     config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)
+    if dense_checkpoint_allocation is not None and len(config_paths) != 1:
+        raise ValueError("dense checkpoint allocation requires exactly one resolved config")
     if test_spec is not None and len(config_paths) != 1:
         raise SystemExit("--test-spec requires exactly one resolved config")
     results: List[TestResult] = []
@@ -487,6 +512,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             print(f"skip {path.name}: {exc}", flush=True)
             continue
         if cfg.is_rl:
+            if dense_checkpoint_allocation is not None:
+                raise ValueError("dense checkpoint allocation does not support reinforcement-learning configs")
             for test in reference_tests().values():
                 if args.test and test.test_id not in args.test:
                     continue
@@ -537,7 +564,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
         managed_gateway = (
-            local_cortex_gateway(Path(args.out))
+            local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.correctness_participation")
             if getattr(args, "_automatic_cortex_gateway", False)
             else nullcontext(None)
         )
@@ -598,6 +625,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         select=args.test or None,
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
+                        **(
+                            {"dense_checkpoint_allocation": copy.deepcopy(dense_checkpoint_allocation)}
+                            if dense_checkpoint_allocation is not None
+                            else {}
+                        ),
                         **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
                         **({"local_cortex_fixture": True} if local_fixture else {}),
                         **(
@@ -685,6 +717,7 @@ def run_batch(args, *, selected, executor=None):
     from .reference_records import ReferencePrerequisiteError
 
     started = time.monotonic()
+    _load_dense_checkpoint_allocation(args)
     _load_historical_gradient_references(args)
     out = Path(args.out) if args.out is not None else correctness_logdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
@@ -959,6 +992,10 @@ def parse_args(argv=None):
     r.add_argument(
         "--test-spec", type=Path, help="reviewed private spec for one explicit config; integrity checks apply"
     )
+    r.add_argument("--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON")
+    r.add_argument(
+        "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+    )
     r.add_argument("--test", action="append", help="test id (repeatable); default every applicable test")
     r.add_argument(
         "--case",
@@ -1048,3 +1085,59 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     return args.func(args)
+
+
+def _load_dense_checkpoint_allocation(args, *, allow_automatic_gateway: bool = False) -> dict | None:
+    """Read a pinned same-job allocation before optimizer selection can be grouped."""
+    path = getattr(args, "dense_checkpoint_allocation", None)
+    expected = getattr(args, "dense_checkpoint_allocation_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--dense-checkpoint-allocation and --dense-checkpoint-allocation-sha256 are required together"
+        )
+    if path is None:
+        return None
+    selected = getattr(args, "test", None)
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or not selected
+        or "single-step-optimizer" not in selected
+        or not set(selected) <= {"single-step-grads", "single-step-optimizer"}
+        or getattr(args, "backend", "cortex") != "cortex"
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+        or not getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
+        or getattr(args, "peft_adapter", None) is not None
+    ):
+        raise ValueError("dense checkpoint allocation requires one explicit local Cortex first-two optimizer config")
+    backend_args = args
+    if allow_automatic_gateway and not any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        # Metadata admission precedes onboarding's owned gateway; never supply this URL to the target.
+        backend_args = copy.copy(args)
+        backend_args.base_url = "http://127.0.0.1:1"
+    require_local_cortex_gateway(_client_backend(backend_args))
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("dense checkpoint allocation requires a full lowercase SHA256")
+    with Path(path).open("rb") as handle:
+        raw = handle.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("dense checkpoint allocation exceeds metadata bound or SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate dense checkpoint allocation key: {key}")
+            result[key] = value
+        return result
+
+    admission = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(admission, dict):
+        raise ValueError("dense checkpoint allocation must be a JSON object")
+    json.dumps(admission, allow_nan=False)
+    return admission

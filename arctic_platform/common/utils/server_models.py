@@ -35,6 +35,7 @@ DEFAULT_SEED = 42
 # and ``ds_worker_config`` / ``ModelSpec.parallelism.sequence_parallel`` carry
 # it on the worker-shaped configs.
 _DS_WORKER_SP_PATHS: tuple[tuple[str, ...], ...] = (
+    ("ds_worker_config", "sp_size"),
     ("ds_worker_config", "sequence_parallel"),
     ("ds_worker_config", "sequence_parallel_size"),
     ("ds_worker_config", "parallelism", "sequence_parallel"),

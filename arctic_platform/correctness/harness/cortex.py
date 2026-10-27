@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlencode
@@ -34,6 +35,8 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel
+from pydantic import StrictInt
+from pydantic import model_validator
 from typing_extensions import Self
 
 from arctic_platform import wire
@@ -43,21 +46,26 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.transport import JobHandles
-from arctic_platform.client.transport import initialize_or_cleanup
+from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _raise_for_status
+from arctic_platform.client.transports.cortex import _Route
 from arctic_platform.client.transports.cortex import _SendPolicy
 
 from .config import ReviewedClientConfig
 from .config import TestSpec
 from .config import hash_directory
 from .storage import require_data_fast_path
+from .transport import UnsafeCleanupError
 
 
 class CortexTrainingConfig(ReviewedClientConfig):
     """Keep DSS's extra creation fields outside the production config adapter."""
 
     hardware: str | None = None
+    source_checkpoint_info: dict[str, str] | None = None
+    inference_tensor_parallel_size: StrictInt | None = None
+    initial_training_model_dir: str | None = None
 
     @classmethod
     def from_reviewed(cls, native: ArcticClientConfig, **updates) -> Self:
@@ -65,7 +73,86 @@ class CortexTrainingConfig(ReviewedClientConfig):
         for key in ("training", "sampling"):
             if isinstance(raw.get(key), BaseModel):
                 raw[key] = raw[key].model_dump()
+        vllm = (raw.get("sampling") or {}).get("vllm", {})
+        if "tensor_parallel_size" in vllm and "inference_tensor_parallel_size" not in updates:
+            raw["inference_tensor_parallel_size"] = vllm["tensor_parallel_size"]
         return cls.model_validate(raw)
+
+    @model_validator(mode="after")
+    def _check_source(self) -> Self:
+        if self.initial_training_model_dir is not None:
+            from .hosted import require_local_cortex_gateway
+            from .inference_export import validate_initial_training_model_dir
+
+            if (
+                not isinstance(self.backend, CortexConfig)
+                or not self.training_gpus
+                or self.sampling_gpus
+                or self.log_prob_gpus
+                or self.source_checkpoint_info is not None
+            ):
+                raise ValueError("initial training model directory requires training-only local Cortex")
+            require_local_cortex_gateway(self.backend)
+            validate_initial_training_model_dir(self.initial_training_model_dir)
+        if self.training_gpus and self.sampling_gpus:
+            formats = (self.training.weight_format, self.sampling.weight_format)
+            if any(value is not None for value in formats) and (formats[0] or "vllm") != (formats[1] or "vllm"):
+                raise ValueError("training and sampling weight formats must agree")
+        inference = self.sampling.arctic_inference_config or {}
+        allowed = {
+            "num_replicas",
+            "router_replay",
+            "max_num_batched_tokens",
+            "max_inflight_choices_per_replica",
+            "multiplex_job_id",
+            "peft_config",
+            "semi_p",
+            "model_options",
+        }
+        unsupported = set(inference) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported Cortex inference fields: {sorted(unsupported)}")
+        replicas = inference.get("num_replicas")
+        if replicas is not None:
+            if type(replicas) is not int or replicas <= 0:
+                raise ValueError("explicit sampling replicas require a positive integer")
+            if self.inference_tensor_parallel_size is None or self.sampling_gpus <= 0:
+                raise ValueError("explicit sampling replicas require explicit tensor parallelism and sampling GPUs")
+        replay = inference.get("router_replay")
+        if replay is not None:
+            if not isinstance(replay, dict) or set(replay) - {"enabled", "max_cache_bytes", "mode"}:
+                raise ValueError("sampling router replay must contain only supported replay fields")
+            if "enabled" in replay and type(replay["enabled"]) is not bool:
+                raise ValueError("sampling router replay enabled must be a boolean")
+            if "max_cache_bytes" in replay and (
+                type(replay["max_cache_bytes"]) is not int or replay["max_cache_bytes"] <= 0
+            ):
+                raise ValueError("sampling router replay cache must be a positive integer")
+            if replay.get("mode", "strict") != "strict":
+                raise ValueError("sampling router replay mode must be strict")
+        if self.inference_tensor_parallel_size is not None:
+            if not isinstance(self.backend, CortexConfig) or self.inference_tensor_parallel_size <= 0:
+                raise ValueError("explicit inference tensor parallelism requires a positive size and CortexConfig")
+            pipeline = self.sampling.vllm.get("pipeline_parallel_size", 1)
+            if type(pipeline) is not int or pipeline <= 0:
+                raise ValueError("explicit inference pipeline parallelism requires a positive integer")
+            expected_gpus = self.inference_tensor_parallel_size * pipeline
+            if replicas is None:
+                allocations = (self.sampling_gpus, self.log_prob_gpus)
+                if not any(allocations) or any(size not in (0, expected_gpus) for size in allocations):
+                    raise ValueError("inference allocation must equal tensor times pipeline parallelism")
+            elif self.sampling_gpus != replicas * expected_gpus or self.log_prob_gpus not in (0, expected_gpus):
+                raise ValueError("sampling allocation must equal replicas times tensor times pipeline parallelism")
+            tensor = self.sampling.vllm.get("tensor_parallel_size")
+            if type(tensor) is not int or tensor != self.inference_tensor_parallel_size:
+                raise ValueError("explicit inference tensor parallelism differs from sampling configuration")
+        if self.source_checkpoint_info is not None:
+            if not isinstance(self.backend, CortexConfig):
+                raise ValueError("source_checkpoint_info requires CortexConfig")
+            source = self.source_checkpoint_info
+            if set(source) != {"checkpoint_id", "source_job_id"} or not all(source.values()):
+                raise ValueError("source_checkpoint_info requires checkpoint_id and source_job_id")
+        return self
 
     def _cortex_training_sub_job(self) -> dict:
         sub = super()._cortex_training_sub_job()
@@ -77,13 +164,34 @@ class CortexTrainingConfig(ReviewedClientConfig):
         debug.setdefault("full_determinism", self.training.full_determinism)
         extra["debug"] = debug
         sub["training_config"] = {**extra, **sub["training_config"]}
+        if self.source_checkpoint_info is not None:
+            sub["source_checkpoint_info"] = dict(self.source_checkpoint_info)
+        if self.initial_training_model_dir is not None:
+            sub["local_model_dir"] = self.initial_training_model_dir
+        return sub
+
+    def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict:
+        sub = super()._cortex_inference_sub_job(job_type, n_gpus)
+        inference = deepcopy(self.sampling.arctic_inference_config or {})
+        if job_type != "sampling":
+            inference.pop("num_replicas", None)
+            inference.pop("router_replay", None)
+        for key, value in inference.items():
+            if key in sub["inference_config"] and sub["inference_config"][key] != value:
+                raise ValueError(f"conflicting Cortex inference field: {key}")
+        sub["inference_config"] = {**inference, **sub["inference_config"]}
+        if self.inference_tensor_parallel_size is not None:
+            sub = deepcopy(sub)
+            sub["inference_config"].setdefault("vllm_config", {})[
+                "tensor_parallel_size"
+            ] = self.inference_tensor_parallel_size
+        if self.source_checkpoint_info is not None:
+            sub["source_checkpoint_info"] = dict(self.source_checkpoint_info)
         return sub
 
 
 class CorrectnessClient(ArcticClient):
     def __init__(self, config: ArcticClientConfig) -> None:
-        if config.sampling_gpus or config.log_prob_gpus:
-            raise ValueError("part one supports training-only gradient and optimizer checks")
         if isinstance(config, ReviewedClientConfig) and isinstance(config.backend, CortexConfig):
             config = CortexTrainingConfig.from_reviewed(config)
         elif isinstance(config, ReviewedClientConfig):
@@ -97,7 +205,27 @@ class CorrectnessClient(ArcticClient):
 
         self.config = config
         self.transport = CorrectnessCortexTransport(config.backend)
-        self.jobs = initialize_or_cleanup(self.transport, client_config=config)
+        try:
+            self.jobs = self.transport.initialize(config)
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
+
+    def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
+        try:
+            self.shutdown()
+        except BaseException as error:
+            if exc_value is not None:
+                error.add_note(
+                    "Original workload traceback:\n"
+                    + "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+                )
+                if not isinstance(exc_value, Exception) and isinstance(error, Exception):
+                    exc_value.add_note(f"Shutdown also failed: {type(error).__name__}: {error}")
+                    raise exc_value.with_traceback(exc_traceback) from error
+                if isinstance(error, UnsafeCleanupError):
+                    error.preserve_workload(exc_value)
+            raise
 
 
 MANIFEST = "_neutrino_manifest.json"
@@ -236,7 +364,23 @@ def _load_local_fixture(backend: CortexConfig, spec: TestSpec) -> dict:
 
 
 LOCAL_NATIVE_FORWARD_ENV = "ARCTIC_CORRECTNESS_LOCAL_NATIVE_FORWARD"
-_NATIVE_ROLES = {"training": "training"}
+LOCAL_CHECKPOINT_BRIDGE_ENV = "ARCTIC_CORRECTNESS_LOCAL_CHECKPOINT_BRIDGE"
+_NATIVE_ROLES = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
+
+
+class _LocalLoadRoute(_Route):
+    def submitted(self, request, reply):
+        if not isinstance(reply, dict):
+            raise RuntimeError("local checkpoint load returned malformed submission metadata")
+        request_id = reply.get("request_id")
+        if request_id is not None:
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError("local checkpoint load returned no valid request_id")
+            return request_id
+        from .hosted import _local_load_metadata
+
+        _local_load_metadata(reply, request.body["checkpoint_id"])
+        return reply
 
 
 class CorrectnessCortexTransport(CortexTransport):
@@ -247,11 +391,12 @@ class CorrectnessCortexTransport(CortexTransport):
     def initialize(self, client_config: CortexTrainingConfig) -> JobHandles:
         self.hardware = client_config.hardware
         self._native_gateway = os.environ.get(LOCAL_NATIVE_FORWARD_ENV) == "1"
+        self._native_checkpoint_bridge = os.environ.get(LOCAL_CHECKPOINT_BRIDGE_ENV) == "1"
         self._native_children = {}
         self._native_bindings = {}
         self._local_shutdown_parent = None
         self._local_shutdown_children = {}
-        if self._native_gateway:
+        if self._native_gateway or self._native_checkpoint_bridge:
             from .hosted import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
@@ -302,6 +447,10 @@ class CorrectnessCortexTransport(CortexTransport):
         required = []
         if client_config.gpus_for("training") > 0:
             required.append("/forward")
+        if client_config.gpus_for("log_prob") > 0:
+            required.append("/log-probs")
+        if self._native_checkpoint_bridge:
+            required.extend(("/correctness/save-checkpoint", "/correctness/load-checkpoint"))
         for path in required:
             path_config = paths.get(path) if isinstance(paths, dict) else None
             operation = path_config.get("post") if isinstance(path_config, dict) else None
@@ -356,7 +505,7 @@ class CorrectnessCortexTransport(CortexTransport):
         return result
 
     def _native_request(self, request):
-        if request.op == "save":
+        if request.op in {"save", "load-checkpoint"}:
             from .hosted import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
@@ -364,7 +513,8 @@ class CorrectnessCortexTransport(CortexTransport):
         if self.job_id is None or binding is None:
             raise ValueError("local native request must target this client's owned child job")
         role, child = binding
-        if request.op not in {"forward", "save"} or role != "training":
+        allowed = {"training"} if request.op in {"forward", "save", "load-checkpoint"} else {"log_prob", "sampling"}
+        if role not in allowed:
             raise ValueError(f"local native {request.op} cannot target a {role} child job")
         if request.op == "save":
             body = request.body
@@ -379,26 +529,56 @@ class CorrectnessCortexTransport(CortexTransport):
                 or body.get("save_total_limit") is not None
             ):
                 raise ValueError("local checkpoint save requires a canonical path and native save options")
-            url = f"{self.config.base_url.rstrip('/')}/save-checkpoint?{urlencode({'job_id': child})}"
+            bridge = self._native_checkpoint_bridge and body["checkpoint_type"] == "resumable"
+            route = "correctness/save-checkpoint" if bridge else "save-checkpoint"
+            url = f"{self.config.base_url.rstrip('/')}/{route}?{urlencode({'job_id': child})}"
             return url, {"json": {"path": str(root), "checkpoint_type": body["checkpoint_type"]}}
+        if request.op == "load-checkpoint":
+            from .hosted import require_local_checkpoint_id
+
+            body = request.body
+            if request.binary or not isinstance(body, dict) or set(body) - {"checkpoint_id", "stage_info"}:
+                raise ValueError("native checkpoint load accepts checkpoint_id only, never paths or source jobs")
+            if body.get("stage_info") is not None:
+                raise ValueError("native checkpoint load must resolve this owned gateway's retained store")
+            checkpoint_id = require_local_checkpoint_id(body.get("checkpoint_id"))
+            url = f"{self.config.base_url.rstrip('/')}/correctness/load-checkpoint?{urlencode({'job_id': child})}"
+            return url, {"json": {"checkpoint_id": checkpoint_id}}
         url = f"{self.config.base_url.rstrip('/')}/{request.op}?{urlencode({'job_id': child})}"
         body = {key: value for key, value in request.body.items() if value is not None}
-        return url, {"data": wire.dumps(body), "headers": {"Content-Type": "application/octet-stream"}}
+        if request.op == "forward":
+            return url, {"data": wire.dumps(body), "headers": {"Content-Type": "application/octet-stream"}}
+        return url, {"json": body}
 
     def _native_result(self, request, payload):
-        result = json.loads(payload) if request.op == "save" else wire.loads(payload)
+        result = json.loads(payload) if request.op in {"save", "load-checkpoint"} else wire.loads(payload)
         if not isinstance(result, dict):
             raise ValueError("local native gateway response must be an object")
         child = self._native_bindings[str(request.job_id)][1]
         if "job_id" in result and result["job_id"] != child:
             raise ValueError("local native gateway response names a different child job")
+        if request.op == "load-checkpoint":
+            from .gateway import NATIVE_STORE_SCHEMA
+            from .hosted import _local_load_metadata
+
+            if result.get("correctness_native_store") != NATIVE_STORE_SCHEMA:
+                raise RuntimeError("native checkpoint load returned no owned store identity")
+            return _local_load_metadata(result, request.body["checkpoint_id"])
         return result
 
     def _uses_native_route(self, request) -> bool:
+        if (
+            request.op == "load-checkpoint"
+            and getattr(self, "_native_checkpoint_bridge", False)
+            and self._is_local_gateway()
+            and isinstance(request.body, dict)
+            and request.body.get("stage_info") is None
+        ):
+            return True
         # SnowAPI saves choose their own directory; only the native route accepts a local path.
         if request.op == "save" and request.body.get("path") is not None and self._is_local_gateway():
             return True
-        return getattr(self, "_native_gateway", False) and request.op == "forward"
+        return getattr(self, "_native_gateway", False) and request.op in {"forward", "log-probs"}
 
     def call(self, request) -> dict:
         if not self._uses_native_route(request):
@@ -418,6 +598,59 @@ class CorrectnessCortexTransport(CortexTransport):
         if self.job_id is None:
             raise RuntimeError("checkpoint catalog requires an initialized Cortex job")
         return self.call(list_checkpoints_request(self.job_id))
+
+    def load_checkpoint(self, checkpoint_id: str, *, stage_info: dict | None = None) -> dict:
+        return self.call(
+            Request(
+                "load-checkpoint",
+                self.jobs.training,
+                {"checkpoint_id": checkpoint_id, "stage_info": stage_info},
+            )
+        )
+
+    def _submit(self, request, route=None):
+        if request.op != "load-checkpoint" or not self._is_local_gateway():
+            return super()._submit(request, route)
+        from .hosted import _local_load_metadata
+        from .hosted import _local_stage_info
+        from .hosted import require_local_checkpoint_id
+        from .hosted import require_local_cortex_gateway
+
+        require_local_cortex_gateway(self.config)
+        parent = getattr(self, "_local_shutdown_parent", None)
+        token = None if parent is None else f"{parent}:training:0"
+        if (
+            parent is None
+            or self.job_id != parent
+            or getattr(self, "_local_shutdown_children", {}).get("training") != token
+            or self.jobs.training != token
+            or request.job_id != token
+        ):
+            raise ValueError("local checkpoint load requires this client's newly owned training child")
+        body = request.body
+        if request.binary or not isinstance(body, dict) or set(body) - {"checkpoint_id", "stage_info"}:
+            raise ValueError(
+                "local checkpoint load accepts checkpoint_id/stage_info only; no path, step or source_job_id"
+            )
+        checkpoint_id = require_local_checkpoint_id(body.get("checkpoint_id"))
+        stage_info = _local_stage_info(body.get("stage_info"), checkpoint_id)
+        canonical = Request(
+            "load-checkpoint",
+            request.job_id,
+            {
+                "checkpoint_id": checkpoint_id,
+                "stage_info": stage_info,
+            },
+        )
+        route = _LocalLoadRoute(
+            method="POST",
+            path="/{job}/load",
+            poll=True,
+            policy=_SendPolicy(max_retries=0),
+            normalize=lambda result: _local_load_metadata(result, checkpoint_id),
+        )
+        url, sends = route.prepare(self._prefix, canonical)
+        return route, self._on_loop(self._deliver(route, canonical, url, sends))
 
     def _shutdown_send(self, method: str, url: str, deadline: float) -> dict:
         remaining = deadline - time.monotonic()
@@ -488,10 +721,19 @@ class CorrectnessCortexTransport(CortexTransport):
         except BaseException as error:
             primary = error
             if parent is not None:
-                error.add_note(
+                ownership = (
                     f"Local gateway cancellation was not verified for owned parent {parent!r}; "
                     f"owned children: {self._local_shutdown_children!r}"
                 )
+                error.add_note(ownership)
+                if isinstance(error, Exception) and self._is_local_gateway():
+                    primary = UnsafeCleanupError(
+                        f"{ownership}; cancellation failed: {type(error).__name__}: {error}",
+                        owned_parent=parent,
+                        owned_children=self._local_shutdown_children,
+                        shutdown_error=error,
+                    )
+                    raise primary from error
             raise
         finally:
             self.job_id = None

@@ -16,7 +16,7 @@ Onboarding and regression start and stop their own gateway automatically; do not
 
 The assumption is that you are already inside an Arctic-Platform clone.
 
-```bash
+```
 # assuming you're already in the AP clone
 git checkout -b stas/correctness-testing-p1
 pip install -e '.[correctness]'
@@ -97,7 +97,9 @@ All subsequent commands run from the checkout root.
 
 ## Step 3. Config Onboard
 
-**Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with five nondeterministic calibration runs and both gradient accumulation step (GAS) arms, GAS1 and GAS4. Five runs is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
+**Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with sixteen nondeterministic calibration samples per gradient accumulation step (GAS) arm, GAS1 and GAS4. Sixteen samples is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
+
+**Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Sixteen samples require two waves of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
 
 ```bash
 python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3-129m-one-h200.json
@@ -107,11 +109,11 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
 
-**Gradient calibration uses five nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
+**Gradient calibration uses sixteen nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
 
 **Optimizer calibration shows a `tqdm` progress bar for each GAS arm, with elapsed time and ETA after every completed HF run.** Onboarding finishes with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, retained in `onboarding.log` as well as the terminal.
 
-**Each optimizer arm uses one deterministic baseline plus five calibration repeats.** Each repeat starts an independent HF process, loads the fixture and saves optimizer state, so startup and capture time can dominate a tiny model. With one HF worker, both arms require twelve processes in total. Compatible completed preparation is reused after a failed validation; regression uses prepared records without recalibrating. Existing records retain their original run counts and reviewed gates.
+**Each optimizer arm uses one deterministic baseline plus sixteen calibration repeats.** Each repeat starts an independent HF process, loads the fixture and saves optimizer state, so startup and capture time can dominate a tiny model. Both arms require thirty-four processes in total; calibration repeats overlap according to the local worker count. Compatible completed preparation is reused after a failed validation; regression uses prepared records without recalibrating. Existing records retain their original run counts and reviewed gates.
 
 **To onboard only one check, add `--test single-step-grads` or `--test single-step-optimizer`.** Missing fixture prerequisites are handled automatically. An RL config is reported as inapplicable for these two supervised-reference checks; onboarding does not manufacture SFT measurements for RL.
 
@@ -131,14 +133,14 @@ python -m arctic_platform.correctness onboard \
 ```bash
 python -m arctic_platform.correctness run \
   --config ./work/configs/tiny-qwen3-129m-one-h200.json \
-  --out ./work/reports/both
+  --out ./work/reports/output1
 ```
 
-Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run ends with its total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, after the report paths and any error guidance. A missing prepared reference or failed execution is not a numerical pass. The [operator guide](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/running-tests.md) includes single-check and multi-config commands, plus how to adapt the example to another supported model.
+Read `./work/reports/output1/report.md`, `report.json`, and `full.log`. Every run ends with its total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, after the report paths and any error guidance. A missing prepared reference or failed execution is not a numerical pass. The [operator guide](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/running-tests.md) includes single-check and multi-config commands, plus how to adapt the example to another supported model.
 
 **The command names the selected checks before execution.** For the unflagged demo above, it prints `Selected tests: single-step-grads, single-step-optimizer` beneath the configuration/test-pair count.
 
-**The gateway log is retained under `./work/reports/both/cases/<config-id>/<group>/gateway.log`; no second terminal or manual shutdown is needed.** `./work/reports/both/full.log` records the exact gateway log path and detailed execution progress. An explicitly configured `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing service and leaves it running; add `--local-cortex-fixture` for reduced-fixture checks on that loopback service. Remove stale host, base URL or PAT settings when switching back to automatic local execution. A multi-node run needs the allocation's real same-job hostfile and working `ds_ssh`. Reference preparation prints per-worker progress and complete log paths under `./work/logs`; compact reference records and large tensor scratch are separate from these durable logs.
+**The gateway log is retained under `./work/reports/output1/cases/<config-id>/<group>/gateway.log`; no second terminal or manual shutdown is needed.** `./work/reports/output1/full.log` records the exact gateway log path and detailed execution progress. An explicitly configured `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing service and leaves it running; add `--local-cortex-fixture` for reduced-fixture checks on that loopback service. Remove stale host, base URL or PAT settings when switching back to automatic local execution. A multi-node run needs the allocation's real same-job hostfile and working `ds_ssh`. Reference preparation prints per-worker progress and complete log paths under `./work/logs`; compact reference records and large tensor scratch are separate from these durable logs.
 
 **A gateway shutdown failure stops subsequent workloads and makes the command fail, even when the numerical comparisons passed.** Inspect `full.log` and the recorded `gateway.log` before retrying; automatic gateway shutdown is not proof that every detached Ray worker has exited.
 
@@ -188,11 +190,11 @@ You can ignore this step and only do it if you need to free up space on the shar
 rm ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
+**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/output1/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
 
 ```bash
 rm -r ./work/logs/correctness-demo/
-rm -r ./work/reports/both/
+rm -r ./work/reports/output1/
 ```
 
 **Use the retained imported config for future runs after cleanup.**
@@ -200,7 +202,7 @@ rm -r ./work/reports/both/
 ```bash
 python -m arctic_platform.correctness run \
   --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
-  --out ./work/reports/both
+  --out ./work/reports/output1
 ```
 
 

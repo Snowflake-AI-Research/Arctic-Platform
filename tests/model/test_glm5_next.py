@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import json
 import types
 from unittest.mock import Mock
@@ -96,6 +97,252 @@ def _tiny_config():
         video_start_token_id=6,
         video_end_token_id=7,
     )
+
+
+def _auxiliary_model(count=1):
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(
+        text_config=types.SimpleNamespace(
+            model_type="glm5_next_text", num_hidden_layers=2, num_nextn_predict_layers=count
+        )
+    )
+    return model
+
+
+def _auxiliary_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.2."
+    tensors = {
+        prefix + "eh_proj.weight": torch.ones(2, 4, dtype=torch.bfloat16),
+        prefix + "enorm.weight": torch.ones(4, dtype=torch.float32),
+        prefix + "hnorm.weight": torch.ones(4, dtype=torch.bfloat16),
+        prefix + "mlp.experts.0.down_proj.weight": torch.ones(4, 4).to(torch.float8_e4m3fn),
+        prefix + "mlp.experts.0.down_proj.weight_scale_inv": torch.ones(1, 1, dtype=torch.float32),
+        "model.language_model.layers.0.input_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16),
+    }
+    save_file(tensors, tmp_path / "model-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "model-00001.safetensors")})
+    )
+    return {name: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
+
+
+def test_glm53_captures_auxiliary_mixed_dtypes_without_trainables(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    original = _auxiliary_checkpoint(tmp_path)
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    exported = dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+    assert set(exported) == set(original)
+    assert not dict(model.named_parameters()) and not dict(model.named_buffers())
+    for name, value in exported.items():
+        assert value.dtype == original[name].dtype
+        torch_assert_equal(value.view(torch.uint8), original[name].view(torch.uint8))
+        assert value.device.type == "cpu"
+
+
+def test_glm53_auxiliary_capture_rejects_missing_and_changed_shards(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    _auxiliary_checkpoint(tmp_path)
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    index = tmp_path / "model.safetensors.index.json"
+    mapping = json.loads(index.read_text())
+    mapping["weight_map"]["model.language_model.layers.2.enorm.weight"] = "missing.safetensors"
+    index.write_text(json.dumps(mapping))
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
+
+
+def test_glm53_auxiliary_source_failure_reaches_peers(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    observed = []
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: observed.append(value[0]))
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
+    assert observed and observed[0] is not None
+
+
+def test_glm53_auxiliary_capture_nonmaster_never_opens_source(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: None)
+    monkeypatch.setattr(auxiliary_weights, "_capture", lambda *args: pytest.fail("nonmaster read"))
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    assert not hasattr(model, auxiliary_weights.STATE_ATTRIBUTE)
+
+
+def _reviewed_auxiliary_fixture(tmp_path, inventory="absent"):
+    from safetensors.torch import save_file
+
+    original = _auxiliary_checkpoint(tmp_path)
+    tensors = {"model.language_model.layers.0.input_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16)}
+    if inventory != "absent":
+        tensors.update(original)
+    if inventory == "partial":
+        tensors.pop("model.language_model.layers.2.eh_proj.weight")
+    if inventory == "unexpected":
+        tensors["model.language_model.layers.3.enorm.weight"] = torch.ones(4)
+    save_file(tensors, tmp_path / "model-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "model-00001.safetensors")})
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text", "num_hidden_layers": 2, "num_nextn_predict_layers": 1},
+            }
+        )
+    )
+    files = [
+        {"path": path.name, "size_bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in sorted(tmp_path.iterdir())
+    ]
+    request = {
+        "schema_version": 1,
+        "config_id": "glm-reduced-fixture",
+        "fixture_locator": "ap-correctness/glm-reduced",
+        "reference_path": str((tmp_path / "reference").resolve()),
+        "reviewed_hash": "0123456789abcdef",
+        "fixture_sha256": (
+            hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        ),
+        "files": files,
+        "source_checkpoint": "zai-org/GLM-5.3-Flash",
+        "num_hidden_layers": 2,
+        "vision_depth": None,
+        "materialization": "pretrained-prefix-reduction",
+    }
+    config = types.SimpleNamespace(
+        name=request["fixture_locator"], debug=types.SimpleNamespace(reduced_fixture_mtp=request)
+    )
+    return _auxiliary_model(), config, original
+
+
+def test_glm53_unauthorized_reduced_fixture_still_requires_original_auxiliary_weights(tmp_path, monkeypatch):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+
+    model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
+    config.debug.reduced_fixture_mtp = None
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="original prediction layer is incomplete"):
+        maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+
+
+def test_glm53_authenticated_reduced_fixture_loads_without_auxiliary_but_full_export_remains_strict(
+    tmp_path, monkeypatch
+):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
+    setattr(model, auxiliary_weights.STATE_ATTRIBUTE, "stale capture")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+    assert not hasattr(model, auxiliary_weights.STATE_ATTRIBUTE)
+    with pytest.raises(RuntimeError, match="requires captured original prediction layers"):
+        list(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+
+
+def test_glm53_authenticated_complete_auxiliary_inventory_is_preserved(tmp_path, monkeypatch):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    model, config, original = _reviewed_auxiliary_fixture(tmp_path, "complete")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+    exported = dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+    assert exported.keys() == original.keys()
+    for name, tensor in exported.items():
+        torch_assert_equal(tensor.view(torch.uint8), original[name].view(torch.uint8))
+
+
+@pytest.mark.parametrize("inventory", ["partial", "unexpected"])
+def test_glm53_authenticated_reduced_fixture_rejects_partial_or_unexpected_auxiliary_inventory(
+    tmp_path, monkeypatch, inventory
+):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+
+    model, config, _ = _reviewed_auxiliary_fixture(tmp_path, inventory)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="partial or unexpected GLM"):
+        maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+
+
+@pytest.mark.parametrize("change", ["bytes", "count", "family"])
+def test_glm53_reduced_fixture_rejects_changed_bytes_or_runtime_configuration(tmp_path, monkeypatch, change):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+
+    model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
+    if change == "bytes":
+        with (tmp_path / "model-00001.safetensors").open("ab") as stream:
+            stream.write(b"changed")
+    elif change == "count":
+        model.config.text_config.num_nextn_predict_layers = 2
+    else:
+        model.config.text_config.model_type = "other"
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="bytes differ|runtime model differs|configured prediction weights"):
+        maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+
+
+@pytest.mark.parametrize("peer", [["ValueError: peer bytes differ", False], [None, False]])
+def test_glm53_reduced_fixture_peer_failure_or_inventory_disagreement_reaches_every_rank(tmp_path, monkeypatch, peer):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+
+    model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_object", lambda rows, local: rows.__setitem__(slice(None), [local, peer])
+    )
+    with pytest.raises(RuntimeError, match="peer bytes differ|decisions differ"):
+        maybe_capture_reduced_fixture_mtp(model, tmp_path, config)
+
+
+@pytest.mark.parametrize("include_skipped,rank", [(False, 0), (True, 0), (True, 1)])
+def test_glm53_full_hf_export_auxiliary_scope(monkeypatch, include_skipped, rank):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    model = _auxiliary_model()
+    ordinary = torch.ones(4)
+    auxiliary = torch.ones(4, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        glm.qwen_ds,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([("trained.weight", ordinary)]),
+    )
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", auxiliary)]))
+    exported = dict(glm._build_iter_full_hf_weights_with_auxiliary(model)(include_skipped=include_skipped))
+    assert exported["trained.weight"] is ordinary
+    assert ("inactive.weight" in exported) == (include_skipped and rank == 0)
+    assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
+
+
+def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    value = torch.ones(4)
+    monkeypatch.setattr(
+        glm.qwen_ds,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([("inactive.weight", value)]),
+    )
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", value)]))
+    with pytest.raises(RuntimeError, match="collides"):
+        list(glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True))
 
 
 def test_glm53_flash_family_dispatch_uses_model_type(tmp_path):
@@ -256,6 +503,131 @@ def test_glm53_hf_prime_conversion_round_trip():
     assert state.keys() == expected.keys()
     for name, tensor in expected.items():
         torch.testing.assert_close(state[name], tensor)
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_packed_hf_experts_convert_without_losing_weights(suffix):
+    prefix = "model.language_model.layers.3.mlp"
+    gate_up = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4)
+    down = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    router = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    bias = torch.tensor([0.25, 0.5])
+    shared = {
+        name: torch.full(shape, value)
+        for name, shape, value in (
+            ("gate_proj", (3, 4), 1.0),
+            ("down_proj", (4, 3), 2.0),
+            ("up_proj", (3, 4), 3.0),
+        )
+    }
+    state = {
+        f"{prefix}.experts.gate_up_proj{suffix}": gate_up.clone(),
+        f"{prefix}.experts.down_proj{suffix}": down.clone(),
+        f"{prefix}.gate.weight": router.clone(),
+        f"{prefix}.gate.e_score_correction_bias": bias.clone(),
+        **{f"{prefix}.shared_experts.{name}.weight": weight.clone() for name, weight in shared.items()},
+    }
+
+    convert_hf_layer_to_prime(state, 3)
+
+    expected = {
+        f"{prefix}.experts.w1": gate_up[:, :3],
+        f"{prefix}.experts.w2": down,
+        f"{prefix}.experts.w3": gate_up[:, 3:],
+        f"{prefix}.router.gate.weight": router,
+        f"{prefix}.expert_bias": bias,
+        **{
+            f"{prefix}.shared_expert.{prime}": shared[hf]
+            for prime, hf in (
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            )
+        },
+    }
+    assert state.keys() == expected.keys()
+    for name, weight in expected.items():
+        torch_assert_equal(state[name], weight)
+
+
+def test_glm53_packed_hf_state_loads_strictly_into_native_model():
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+
+    from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_to_prime
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    set_seed(0)
+    config = _tiny_config()
+    source = Glm5NextForConditionalGeneration(config)
+    native = Glm5NextForConditionalGenerationPrimeRL(config)
+    state = convert_hf_to_prime(source.state_dict())
+
+    native.load_state_dict(state, strict=True)
+
+    for name, weight in native.state_dict().items():
+        torch_assert_equal(weight, state[name])
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_packed_hf_fp8_scales_and_other_layers_are_preserved(suffix):
+    prefix = "model.language_model.layers.3.mlp"
+    gate_up = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4).to(torch.float8_e4m3fn)
+    down = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3).to(torch.float8_e4m3fn)
+    gate_up_scale = torch.arange(12, dtype=torch.float32).reshape(2, 6, 1) + 1
+    down_scale = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1) + 1
+    shared_scale = torch.full((1, 1), 0.5)
+    untouched = {
+        "model.language_model.layers.13.mlp.experts.gate_up_proj": gate_up.clone(),
+        "model.language_model.layers.3.self_attn.q_proj.weight": torch.ones(4, 4),
+        "model.language_model.embed_tokens.weight": torch.ones(8, 4),
+    }
+    state = {
+        **untouched,
+        f"{prefix}.experts.gate_up_proj{suffix}": gate_up,
+        f"{prefix}.experts.gate_up_proj.weight_scale_inv": gate_up_scale,
+        f"{prefix}.experts.down_proj{suffix}": down,
+        f"{prefix}.experts.down_proj.weight_scale_inv": down_scale,
+        f"{prefix}.gate.weight": torch.ones(2, 4),
+        f"{prefix}.gate.e_score_correction_bias": torch.ones(2),
+    }
+    for name, shape in (("gate_proj", (3, 4)), ("down_proj", (4, 3)), ("up_proj", (3, 4))):
+        state[f"{prefix}.shared_experts.{name}.weight"] = torch.ones(shape).to(torch.float8_e4m3fn)
+        state[f"{prefix}.shared_experts.{name}.weight_scale_inv"] = shared_scale.clone()
+
+    convert_hf_layer_to_prime(state, 3)
+
+    for name, expected in untouched.items():
+        assert state[name] is expected
+    for projection, weight, scale in (
+        ("w1", gate_up[:, :3], gate_up_scale[:, :3]),
+        ("w2", down, down_scale),
+        ("w3", gate_up[:, 3:], gate_up_scale[:, 3:]),
+    ):
+        assert state[f"{prefix}.experts.{projection}"].dtype == torch.float8_e4m3fn
+        torch_assert_equal(state[f"{prefix}.experts.{projection}"].float(), weight.float())
+        torch_assert_equal(state[f"{prefix}.experts.{projection}_scale_inv"], scale)
+        torch_assert_equal(state[f"{prefix}.shared_expert.{projection}_scale_inv"], shared_scale)
+    assert not any(name.startswith(f"{prefix}.experts.gate_up_proj") for name in state)
+
+
+@pytest.mark.parametrize("missing_projection", ["gate_up_proj", "down_proj"])
+def test_glm53_packed_hf_fp8_rejects_missing_scales(missing_projection):
+    prefix = "model.language_model.layers.3.mlp"
+    state = {
+        f"{prefix}.experts.gate_up_proj": torch.ones(2, 6, 4).to(torch.float8_e4m3fn),
+        f"{prefix}.experts.gate_up_proj.weight_scale_inv": torch.ones(2, 6, 1),
+        f"{prefix}.experts.down_proj": torch.ones(2, 4, 3).to(torch.float8_e4m3fn),
+        f"{prefix}.experts.down_proj.weight_scale_inv": torch.ones(2, 4, 1),
+        f"{prefix}.gate.weight": torch.ones(2, 4),
+        f"{prefix}.gate.e_score_correction_bias": torch.ones(2),
+        f"{prefix}.shared_experts.gate_proj.weight": torch.ones(3, 4),
+        f"{prefix}.shared_experts.down_proj.weight": torch.ones(4, 3),
+        f"{prefix}.shared_experts.up_proj.weight": torch.ones(3, 4),
+    }
+    del state[f"{prefix}.experts.{missing_projection}.weight_scale_inv"]
+
+    with pytest.raises(ValueError, match="missing its scale"):
+        convert_hf_layer_to_prime(state, 3)
 
 
 def test_glm53_vllm_packer_fuses_kda_and_dense_mlp():

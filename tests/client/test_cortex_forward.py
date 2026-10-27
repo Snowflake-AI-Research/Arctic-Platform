@@ -37,8 +37,10 @@ result it decodes without a live GS.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+from copy import deepcopy
 from urllib.parse import unquote
 
 import pytest
@@ -47,6 +49,7 @@ import torch
 from arctic_platform import wire
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
+from arctic_platform.client.requests import bootstrap_router_replay_request
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.transport import Request
@@ -232,6 +235,173 @@ class TestForwardSubJobRouting:
         transport.call(fwd_bwd_request(transport.jobs, _batch()))
 
         assert "target_sub_job_id" not in send.urls[0]
+
+
+class TestRouterReplayWire:
+    @pytest.mark.parametrize("operation", ["forward-backward", "forward"])
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_replay_coordination_is_metadata_not_a_model_batch_field(self, monkeypatch, operation, chunked):
+        if chunked:
+            monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 16 * 1024)
+            monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 16 * 1024)
+        replay = {"sampling_job_id": "sampler-1", "identity_version": 1}
+        width = 20_000 if chunked else 3
+        batch = {
+            "args": (),
+            "kwargs": {
+                "input_ids": torch.arange(width).reshape(1, -1),
+                "rr_sample_ids": ["rr1:sample-1"],
+                "rr_replay_meta": [{"replay_id": "rr1:sample-1"}],
+                "rr_discard": True,
+            },
+            "context": {"temperature": 1.0},
+            "processing": {"loss_fn": "grpo"},
+        }
+        before = deepcopy(batch)
+        jobs = JobHandles(training=TRAINING)
+        if operation == "forward-backward":
+            request = fwd_bwd_request(jobs, batch, router_replay=replay)
+        else:
+            request = fwd_no_grad_request(jobs, {**batch, "router_replay": replay})
+        request_body = deepcopy(request.body)
+
+        _, sends = cortex_module._route(operation).prepare("http://gs.test", request)
+
+        frames = [
+            (
+                send["data"]
+                if operation == "forward-backward"
+                else base64.b64decode(send["json"]["payload"]["payload_b64"])
+            )
+            for send in sends
+        ]
+        if operation == "forward-backward":
+            frame = wire.decode_byte_chunks(frames, kind="request")
+        else:
+            frame = wire.decode_byte_chunks(frames, kind="request") if len(frames) > 1 else frames[0]
+        if chunked:
+            assert len(sends) > 1
+        assert wire.read_metadata(frame) == {**cortex_module._CHUNKED_RESULTS, "router_replay": replay}
+        payload = wire.loads(frame)
+        assert set(payload) == set(batch)
+        assert payload["kwargs"]["rr_sample_ids"] == ["rr1:sample-1"]
+        assert payload["kwargs"]["rr_replay_meta"] == [{"replay_id": "rr1:sample-1"}]
+        assert payload["kwargs"]["rr_discard"] is True
+        assert payload["context"] == batch["context"]
+        assert payload["processing"] == batch["processing"]
+        assert torch.equal(payload["kwargs"]["input_ids"], before["kwargs"]["input_ids"])
+        assert torch.equal(batch["kwargs"]["input_ids"], before["kwargs"]["input_ids"])
+        assert request.body["router_replay"] == request_body["router_replay"]
+        assert set(request.body) == set(request_body)
+
+    @pytest.mark.parametrize("operation", ["forward-backward", "forward"])
+    def test_absent_replay_keeps_the_ordinary_batch_and_response_metadata(self, operation):
+        jobs = JobHandles(training=TRAINING)
+        batch = _batch()
+        request = fwd_bwd_request(jobs, batch) if operation == "forward-backward" else fwd_no_grad_request(jobs, batch)
+        _, sends = cortex_module._route(operation).prepare("http://gs.test", request)
+        frame = (
+            wire.decode_byte_chunks([send["data"] for send in sends], kind="request")
+            if operation == "forward-backward"
+            else base64.b64decode(sends[0]["json"]["payload"]["payload_b64"])
+        )
+        assert wire.read_metadata(frame) == cortex_module._CHUNKED_RESULTS
+        payload = wire.loads(frame)
+        assert set(payload) == set(batch)
+        assert payload["batch"]["input_ids"].tolist() == BATCH_IDS
+
+
+class TestRouterReplayJobIdentity:
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("operation", ["forward-backward", "forward"])
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_bootstrap_sampler_identity_reaches_training_metadata(self, monkeypatch, asynchronous, operation, chunked):
+        if chunked:
+            monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 16 * 1024)
+            monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 16 * 1024)
+        transport, send = _transport()
+        sampling = f"{JOB}:sampling:0"
+        transport.jobs.sampling = sampling
+        bootstrap = {"status": "ok", "training_job_id": "internal-training", "sampling_job_id": "internal-sampling"}
+        bootstraps = []
+
+        async def reply(method, url, **kwargs):
+            body = kwargs.get("json") or {}
+            if body.get("operation_type") == "bootstrap-router-replay":
+                bootstraps.append(body)
+                return bootstrap
+            return await send(method, url, **kwargs)
+
+        transport._send = reply
+
+        def call(request):
+            return asyncio.run(transport.acall(request)) if asynchronous else transport.call(request)
+
+        assert call(bootstrap_router_replay_request(transport.jobs)) == bootstrap
+        assert bootstraps[0]["payload"]["source_sub_job_id"] == sampling
+        assert bootstraps[0]["payload"]["target_sub_job_id"] == TRAINING
+        replay = {"sampling_job_id": sampling, "identity_version": 1}
+        batch = {"batch": {"input_ids": torch.arange(20_000 if chunked else 3).reshape(1, -1)}}
+        request = (
+            fwd_bwd_request(transport.jobs, batch, router_replay=replay)
+            if operation == "forward-backward"
+            else fwd_no_grad_request(transport.jobs, {**batch, "router_replay": replay})
+        )
+        call(request)
+        frame = (
+            wire.decode_byte_chunks(send.frames, kind="request")
+            if operation == "forward-backward"
+            else send.operation_frame
+        )
+        assert wire.read_metadata(frame)["router_replay"] == {
+            "sampling_job_id": "internal-sampling",
+            "identity_version": 1,
+        }
+        assert len(send.posts) > 1 if chunked else len(send.posts) == 1
+        assert request.body["router_replay"] == replay
+        assert replay["sampling_job_id"] == sampling
+        assert transport.jobs.training == TRAINING
+        assert transport.jobs.sampling == sampling
+
+    @pytest.mark.parametrize("unmapped", ["different-training", "different-sampling", "already-internal"])
+    def test_bootstrap_translation_is_scoped_to_the_public_job_pair(self, unmapped):
+        transport, send = _transport()
+        sampling = f"{JOB}:sampling:0"
+        transport.jobs.sampling = sampling
+
+        async def reply(method, url, **kwargs):
+            if (kwargs.get("json") or {}).get("operation_type") == "bootstrap-router-replay":
+                return {"status": "ok", "sampling_job_id": "internal-sampling"}
+            return await send(method, url, **kwargs)
+
+        transport._send = reply
+        transport.call(bootstrap_router_replay_request(transport.jobs))
+        jobs = JobHandles(training="another:training:0" if unmapped == "different-training" else TRAINING)
+        sampler = {
+            "different-training": sampling,
+            "different-sampling": "another:sampling:0",
+            "already-internal": "internal-sampling",
+        }[unmapped]
+        transport.call(fwd_bwd_request(jobs, _batch(), router_replay={"sampling_job_id": sampler}))
+        frame = wire.decode_byte_chunks(send.frames, kind="request")
+        assert wire.read_metadata(frame)["router_replay"]["sampling_job_id"] == sampler
+
+    def test_failed_bootstrap_does_not_translate_later_requests(self):
+        transport, send = _transport()
+        transport.jobs.sampling = f"{JOB}:sampling:0"
+
+        async def reply(method, url, **kwargs):
+            if (kwargs.get("json") or {}).get("operation_type") == "bootstrap-router-replay":
+                raise RuntimeError("bootstrap failed")
+            return await send(method, url, **kwargs)
+
+        transport._send = reply
+        with pytest.raises(RuntimeError, match="bootstrap failed"):
+            transport.call(bootstrap_router_replay_request(transport.jobs))
+        replay = {"sampling_job_id": transport.jobs.sampling}
+        transport.call(fwd_bwd_request(transport.jobs, _batch(), router_replay=replay))
+        frame = wire.decode_byte_chunks(send.frames, kind="request")
+        assert wire.read_metadata(frame)["router_replay"] == replay
 
 
 class TestForwardResult:

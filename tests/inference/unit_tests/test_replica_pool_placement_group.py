@@ -106,11 +106,13 @@ def _config(
     ray_num_gpus=None,
     extra_env=None,
     engine_kwargs=None,
+    semi_p=False,
 ):
     return SimpleNamespace(
         tensor_parallel_size=tp,
         pipeline_parallel_size=pp,
         ray_num_gpus=ray_num_gpus,
+        semi_p=semi_p,
         extra_env=extra_env or {},
         clear_cache_on_weight_sync=True,
         to_engine_kwargs=lambda: {"model": "test-model", **(engine_kwargs or {})},
@@ -295,6 +297,81 @@ def test_single_node_initialization_reserves_tp_times_pp_gpus(monkeypatch):
     asyncio.run(run())
 
     assert killed == [0]
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "backend", "override", "semi_p", "expected_gpus"),
+    [
+        (1, 1, "ray", None, False, 0.0),
+        (2, 2, "ray", None, False, 0.0),
+        (2, 2, "mp", None, False, 4.0),
+        (2, 2, None, None, False, 4.0),
+        (1, 1, "ray", 0.5, False, 0.5),
+        (2, 2, "ray", 4.0, False, 4.0),
+        (2, 2, "mp", 0.0, False, 0.0),
+        (2, 2, "ray", None, True, 4.0),
+        (2, 2, "mp", None, True, 4.0),
+        (2, 2, "ray", 0.0, True, 0.0),
+    ],
+)
+def test_single_node_executor_gpu_reservation(
+    monkeypatch, tp, pp, backend, override, semi_p, expected_gpus
+):
+    worker_cls = _FakeWorkerClass()
+    killed = []
+    engine_kwargs = (
+        {} if backend is None else {"distributed_executor_backend": backend}
+    )
+    config = _config(
+        tp=tp,
+        pp=pp,
+        ray_num_gpus=override,
+        engine_kwargs=engine_kwargs,
+        semi_p=semi_p,
+    )
+
+    async def run():
+        pool = ReplicaPool(worker_cls=worker_cls)
+        pool._make_scheduler = lambda workers: _FakeScheduler()
+
+        assert await pool.initialize(config, num_replicas=1) == 1
+        assert worker_cls.options_calls[0]["num_gpus"] == expected_gpus
+        initialized_kwargs = worker_cls.actors[0].initialize_calls[0][0][0]
+        assert initialized_kwargs.get("distributed_executor_backend") == backend
+        await pool.shutdown()
+
+    monkeypatch.setattr(
+        replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index)
+    )
+    asyncio.run(run())
+    assert killed == [0]
+
+
+def test_single_node_ray_restart_keeps_zero_gpu_coordinator(monkeypatch):
+    worker_cls = _FakeWorkerClass()
+    old_worker = _FakeActor(index=99)
+    killed = []
+
+    async def run():
+        pool = ReplicaPool(worker_cls=worker_cls)
+        scheduler = _FakeScheduler()
+        pool._config = _config(
+            tp=1, pp=1, engine_kwargs={"distributed_executor_backend": "ray"}
+        )
+        pool._workers = [old_worker]
+        pool._scheduler = scheduler
+
+        await pool._restart_worker(0)
+
+        assert worker_cls.options_calls[0]["num_gpus"] == 0.0
+        assert pool._workers == [worker_cls.actors[0]]
+        assert scheduler.updated == [(0, worker_cls.actors[0])]
+
+    monkeypatch.setattr(
+        replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index)
+    )
+    asyncio.run(run())
+    assert killed == [99]
 
 
 def test_placement_group_rejects_replica_scaling():

@@ -32,10 +32,15 @@ lengths, and a microbatch count above one.
 
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
 from typing import List
 
 from ..harness.config import tolerance_text
 from ..harness.names import align
+from ..harness.participation import active_gradient_norms
+from ..harness.participation import compare_participation
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
@@ -58,9 +63,36 @@ def _run_arm(ctx, arm) -> TestResult:
     reference = ctx.reference_for(arm)
     target = ctx.target_for(arm)
 
+    target_norms, reference_norms = target.grad_norms, reference["grad_norms"]
+    inactive = 0
+    try:
+        if not all(math.isfinite(value) for value in (target.avg_loss, reference["loss"])):
+            raise ValueError("forward-backward loss is not finite")
+        for norms in (target_norms, reference_norms):
+            if any(
+                type(value) not in {int, float} or not math.isfinite(value) or value < 0 for value in norms.values()
+            ):
+                raise ValueError("gradient norms must be finite and nonnegative")
+        participation = getattr(target, "participation", None)
+        if participation is None and getattr(target, "optimizer_state_manifest", None):
+            participation = json.loads(Path(target.optimizer_state_manifest).read_text()).get("participation")
+        if reference.get("participation") is not None or participation is not None:
+            _, inactive = compare_participation(participation, reference.get("participation"))
+            target_norms = active_gradient_norms(participation, target_norms)
+            reference_norms = active_gradient_norms(reference["participation"], reference_norms)
+        pairs, only_dss, only_reference = align(target_norms, reference_norms)
+        if not pairs:
+            raise ValueError("gradient comparison has no active parameter coverage")
+    except ValueError as error:
+        return TestResult(
+            test_id="single-step-grads",
+            config_id=ctx.config_id,
+            arm=arm.name,
+            outcome=TestOutcome.FAIL,
+            summary="gradient participation or finite-value coverage failed",
+            reason=str(error),
+        )
     loss_delta = abs(target.avg_loss - reference["loss"])
-
-    pairs, only_dss, only_reference = align(target.grad_norms, reference["grad_norms"])
 
     # Every parameter pairs, or the comparison is not the one being claimed: an unmatched name is a tensor
     # nobody checked, and the tensors that did pair would report a pass for coverage the case never had.
@@ -129,6 +161,7 @@ def _run_arm(ctx, arm) -> TestResult:
             "median_ratio": median_ratio,
             "max_abs_diff": max(m.abs_diff for m in mismatches),
             "tensors_compared": float(len(pairs)),
+            "inactive_parameters_verified": float(inactive),
             "tensors_over_stated_criterion": float(len(over_stated)),
             "stated_criterion_abs": gate,
             "unmatched_dss": float(len(only_dss)),

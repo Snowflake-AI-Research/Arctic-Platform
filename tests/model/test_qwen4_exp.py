@@ -255,6 +255,223 @@ def test_qwen38_conversion_round_trip_and_ple_concatenation():
     )
 
 
+def _indexed_expert_weights(prefix, expert_ids):
+    shapes = {"gate_proj": (3, 4), "up_proj": (3, 4), "down_proj": (4, 3)}
+    return {
+        f"{prefix}.mlp.experts.{expert_idx}.{projection}.weight": (
+            torch.arange(shape[0] * shape[1], dtype=torch.bfloat16).reshape(shape) + expert_idx * 16 + projection_idx
+        )
+        for expert_idx in reversed(expert_ids)
+        for projection_idx, (projection, shape) in enumerate(shapes.items())
+    }
+
+
+def test_qwen38_conversion_stacks_indexed_experts_in_numeric_order():
+    prefix = "model.language_model.layers.0"
+    original = _indexed_expert_weights(prefix, range(12))
+    other_layer = _indexed_expert_weights("model.language_model.layers.1", range(2))
+    state = {**original, **other_layer}
+    state[f"{prefix}.mlp.gate.weight"] = torch.arange(48).reshape(12, 4)
+
+    from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_layer_to_prime
+
+    convert_hf_layer_to_prime(state, 0)
+    for prime_projection, hf_projection in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        expected = torch.stack(
+            [original[f"{prefix}.mlp.experts.{expert_idx}.{hf_projection}.weight"] for expert_idx in range(12)]
+        )
+        torch.testing.assert_close(state[f"{prefix}.mlp.experts.{prime_projection}"], expected, rtol=0, atol=0)
+    assert not set(original).intersection(state)
+    assert f"{prefix}.mlp.router.gate.weight" in state
+    for name, value in other_layer.items():
+        assert state[name] is value
+
+    convert_hf_to_prime(state)
+    assert "model.language_model.layers.1.mlp.experts.w1" in state
+    convert_prime_to_hf(state)
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.gate_up_proj"],
+        torch.cat(
+            [
+                torch.stack([original[f"{prefix}.mlp.experts.{idx}.gate_proj.weight"] for idx in range(12)]),
+                torch.stack([original[f"{prefix}.mlp.experts.{idx}.up_proj.weight"] for idx in range(12)]),
+            ],
+            dim=1,
+        ),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.down_proj"],
+        torch.stack([original[f"{prefix}.mlp.experts.{idx}.down_proj.weight"] for idx in range(12)]),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("expert_ids", [[1], [0, 2], [0, 1, 3]])
+def test_qwen38_conversion_rejects_noncontiguous_indexed_experts(expert_ids):
+    state = _indexed_expert_weights("model.language_model.layers.0", expert_ids)
+    original = state.copy()
+    with pytest.raises(KeyError, match="Non-contiguous Qwen3.8 experts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_qwen38_conversion_rejects_incomplete_indexed_experts(projection):
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    del state[f"{prefix}.mlp.experts.1.{projection}.weight"]
+    original = state.copy()
+    with pytest.raises(KeyError, match="Incomplete Qwen3.8 expert"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+def test_qwen38_conversion_validates_indexed_layers_before_mutating_checkpoint():
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    state.update(_indexed_expert_weights("model.language_model.layers.1", [0, 2]))
+    state[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_0.weight"] = torch.ones(2, 4)
+    state[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_1.weight"] = torch.ones(2, 4)
+    original = state.copy()
+    with pytest.raises(KeyError, match="Non-contiguous Qwen3.8 experts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("packed_projection", ["gate_up_proj", "down_proj", "w1", "w2", "w3"])
+def test_qwen38_conversion_rejects_mixed_expert_layouts(packed_projection):
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    state[f"{prefix}.mlp.experts.{packed_projection}"] = torch.ones(2, 3, 4)
+    original = state.copy()
+    with pytest.raises(ValueError, match="Mixed Qwen3.8 expert layouts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("include_skipped", [False, True])
+def test_qwen38_full_hf_export_restores_ple_shards(monkeypatch, include_skipped):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=2))
+    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    tensor = torch.arange(20).reshape(5, 4)
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            yield name, tensor
+            if include_skipped:
+                yield "mtp.fc_embedding.weight", torch.ones(2, 2)
+
+        return iterator
+
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights_with_mtp", ordinary_builder)
+    exported = dict(integration._build_iter_full_hf_weights(model)(include_skipped=include_skipped))
+    if not include_skipped:
+        assert set(exported) == {name}
+        assert exported[name] is tensor
+        return
+    assert set(exported) == {
+        name.replace(".weight", ".shard_0.weight"),
+        name.replace(".weight", ".shard_1.weight"),
+        "mtp.fc_embedding.weight",
+    }
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_0.weight")], tensor[:3], rtol=0, atol=0)
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_1.weight")], tensor[3:], rtol=0, atol=0)
+
+
+def test_qwen38_full_hf_export_uses_family_export_builder():
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    assert integration._adapter().hf_weight_export is integration._build_iter_full_hf_weights
+
+
+@pytest.mark.parametrize("parts", [0, -1, True, 1.5, "128"])
+def test_qwen38_full_hf_export_rejects_invalid_ple_part_count(monkeypatch, parts):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=parts))
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights_with_mtp", lambda model: None)
+    with pytest.raises(ValueError, match="split_ngram_parts must be a positive integer"):
+        integration._build_iter_full_hf_weights(model)
+
+
+def test_qwen38_preserves_original_mtp_payload(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    names = (
+        "fc_embedding.weight",
+        "fc_hidden.weight",
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
+        "hyper_connection_mixer.hc_norm.weight",
+        "hyper_connection_mixer.input_mix_weight_down.weight",
+        "hyper_connection_mixer.input_mix_weight_up.weight",
+    )
+    layer_names = (
+        "attn_hyper_connection.block_inject_weight.weight",
+        "attn_hyper_connection.hc_norm.weight",
+        "attn_hyper_connection.input_mix_weight_down.weight",
+        "attn_hyper_connection.input_mix_weight_up.weight",
+        "mlp_hyper_connection.block_inject_weight.weight",
+        "mlp_hyper_connection.hc_norm.weight",
+        "mlp_hyper_connection.input_mix_weight_down.weight",
+        "mlp_hyper_connection.input_mix_weight_up.weight",
+        "self_attn.indexer.index_qk_proj.weight",
+        "self_attn.indexer.k_layernorm.weight",
+        "self_attn.indexer.q_layernorm.weight",
+        "self_attn.k_norm.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.v_proj.weight",
+        "mlp.gate.weight",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+        "mlp.shared_expert_gate.weight",
+    )
+    payload = {
+        name: torch.full((2, 3), float(index), dtype=torch.bfloat16)
+        for index, name in enumerate(
+            [f"mtp.{name}" for name in names] + [f"mtp.layers.0.{name}" for name in layer_names]
+        )
+    }
+    save_file(payload, tmp_path / "model.safetensors")
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(model_type="qwen4_exp_text", mtp_num_hidden_layers=1))
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    exported = dict(mtp_weights.iter_preserved_mtp_weights(model))
+    assert len(exported) == 31
+    assert set(exported) == set(payload)
+    assert not list(model.parameters()) and not list(model.buffers())
+    for name, value in payload.items():
+        torch.testing.assert_close(exported[name], value, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DSS MoE kernels require CUDA",

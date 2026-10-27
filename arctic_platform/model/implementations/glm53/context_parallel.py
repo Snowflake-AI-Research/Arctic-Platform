@@ -28,6 +28,7 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.fp8 import compute_weight
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
     fused_sparse_mla_backward_available,
 )
@@ -618,7 +619,7 @@ def _sparse_attention_forward(
     else:
         topk_indices = prev_topk_indices
 
-    kv_b_weight = self.kv_b_proj.weight.view(
+    kv_b_weight = compute_weight(self.kv_b_proj).view(
         self.num_heads,
         self.qk_nope_head_dim + self.v_head_dim,
         self.kv_lora_rank,

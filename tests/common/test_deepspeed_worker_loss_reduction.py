@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from arctic_platform.common.utils import sequence_parallel as sp
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.rl.processors import BaseLoss
 from arctic_platform.rl.processors import prepare_request_loss
@@ -143,6 +144,140 @@ def _worker(engine):
     worker._device = torch.device("cpu")
     worker.cpu_device = torch.device("cpu")
     return worker
+
+
+class _SPAccumulationEngine(_Engine):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def set_gradient_accumulation_boundary(self, value):
+        self.events.append(("boundary", value))
+
+    def step(self):
+        self.events.append(("step",))
+        super().step()
+
+
+def _sp_execution_worker():
+    worker = _worker(_SPAccumulationEngine())
+    worker.world_size = 4
+    worker.sp_size = 2
+    worker.sp_group = object()
+    info = {"rank": 0, "world_size": 4, "sp_size": 2, "sp_rank": 0, "sp_ranks": [0, 2]}
+    worker.get_sequence_parallel_info = lambda: dict(info)
+    request = {
+        "batch": [
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 4]]),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "loss_mask": torch.tensor([[1, 0, 0, 0]]),
+                "advantages": torch.ones(1, 4),
+            },
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "loss_mask": torch.tensor([[1, 1, 1, 0]]),
+                "advantages": torch.ones(1, 4),
+            },
+        ],
+        "meta": {"dp_size": 2},
+        "processing": {"loss_fn": "grpo", "post": ["compute_logprobs"], "config": {"loss_agg_mode": "token-mean"}},
+    }
+    return worker, info, request
+
+
+@pytest.mark.parametrize("backward", [True, False])
+def test_sp_execution_worker_preserves_objective_gas_scales_boundaries_and_steps(monkeypatch, backward):
+    worker, info, request = _sp_execution_worker()
+    guards, calls = [], []
+    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", lambda engine, **kwargs: guards.append(kwargs))
+
+    def selected(engine, batch, meta, processing, device, **kwargs):
+        assert engine is worker.engine
+        assert meta["dp_size"] == 2
+        assert kwargs["sp_info"] == info
+        assert kwargs["sp_group"] is worker.sp_group
+        assert kwargs["backward"] is backward
+        assert kwargs["loss_object"] is not None
+        calls.append(kwargs)
+        engine.events.append(("model",))
+        return {
+            "avg_loss": float(2 * len(calls)),
+            "metrics": {"token_count": float(batch["loss_mask"].sum())},
+            "batch": {"logprobs": batch["input_ids"].float()},
+        }
+
+    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    result = worker._forward_maybe_backward(request, backward=backward)
+    assert [call["loss_scale"] for call in calls] == [0.25, 0.75]
+    assert calls[0]["loss_object"] is calls[1]["loss_object"]
+    assert result["avg_loss"] == 3.5
+    assert result["metrics"]["token_count"] == 4.0
+    assert result["batch"]["logprobs"].tolist() == [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
+    assert result["_sequence_parallel_info"] == info
+    if backward:
+        assert guards == [{"sp_info": info, "sp_group": worker.sp_group}] * 2
+        assert worker.engine.events == [
+            ("boundary", False),
+            ("model",),
+            ("step",),
+            ("boundary", True),
+            ("model",),
+        ]
+        assert worker.engine.steps == 1
+    else:
+        assert not guards
+        assert worker.engine.events == [("model",), ("model",)]
+        assert worker.engine.steps == 0
+
+
+def test_sp_execution_worker_rejects_unselected_reducer_before_model(monkeypatch):
+    worker, _, request = _sp_execution_worker()
+
+    def reject(*args, **kwargs):
+        raise ValueError("unselected reducer")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("SP adapter must not run after failed reduction admission")
+
+    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", reject)
+    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", unexpected)
+    with pytest.raises(ValueError, match="unselected reducer"):
+        worker.forward_backward(request)
+    assert not worker.engine.events
+
+
+def test_sp_execution_worker_rejects_membership_changed_during_execution(monkeypatch):
+    worker, info, request = _sp_execution_worker()
+    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", lambda *args, **kwargs: None)
+
+    def selected(*args, **kwargs):
+        info["world_size"] = 8
+        return {"avg_loss": 0.0, "batch": {}, "metrics": {}}
+
+    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    with pytest.raises(RuntimeError, match="membership changed"):
+        worker.forward_backward(request)
+
+
+def test_sp_execution_worker_rechecks_reducer_before_publishing_result(monkeypatch):
+    worker, _, request = _sp_execution_worker()
+    calls = []
+
+    def verify(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            raise ValueError("selected reducer changed")
+
+    def selected(*args, **kwargs):
+        return {"avg_loss": 0.0, "batch": {}, "metrics": {}}
+
+    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", verify)
+    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    with pytest.raises(ValueError, match="selected reducer changed"):
+        worker.forward_backward(request)
+    assert len(calls) == 2
 
 
 def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object():

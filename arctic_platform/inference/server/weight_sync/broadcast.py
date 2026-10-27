@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import torch
 
+from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_send_broadcast_weights
 from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
 
 
 class BroadcastNCCLEngine(NCCLEngine):
     """NCCLEngine variant for world_size > 2: send/recv primitives become broadcast(src=0)."""
+
+    def send_weights(self, weights):
+        return maybe_send_broadcast_weights(self, weights, super().send_weights)
 
     def _send_pair(self, idx: int, stream: torch.cuda.Stream) -> None:
         self.nccl.broadcast(self._meta_bufs[idx], src=0, stream=stream)

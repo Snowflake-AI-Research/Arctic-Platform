@@ -341,10 +341,10 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
                 gate_result = f"PASSED {tolerance_text(gate)} tolerance"
                 gate_count = f"{optimizer_compared}/{optimizer_compared}"
             lines.append("        " + gate_result.ljust(43) + gate_count)
-        worst = result.worst_name or "-"
-        lines.append(
-            "        " + "largest disagreement".ljust(43) + f"{m.get('max_optimizer_delta_norm', 0.0):.3e}  {worst}"
-        )
+        maximum = m.get("max_optimizer_norm_delta", m.get("max_optimizer_delta_norm"))
+        if maximum is not None:
+            worst = result.worst_name or "-"
+            lines.append("        " + "largest disagreement".ljust(43) + f"{maximum:.3e}  {worst}")
 
     if result.outcome is TestOutcome.PASS:
         lines.append("")
@@ -422,6 +422,17 @@ def _header(specs: Dict[str, TestSpec], execution: Dict[str, dict]) -> List[str]
             "",
             "Environment fields below describe the client process, not the remote worker image or GPUs.",
         ]
+    if any(spec.model.param_count is None for spec in specs.values()):
+        lines[2:5] = [
+            (
+                "Reference-free checks use the original model and their reviewed comparison criteria, without a"
+                " supervised Hugging Face reference. Original-model metadata is not a generated reference fixture"
+                " or evidence that the target loaded the model. Other checks retain their reviewed reference and"
+                " fixture contracts."
+            ),
+            "",
+            "Environment fields below describe the client process, not independently verified target workers.",
+        ]
     env = collect()
     labels = {
         "generated": "generated",
@@ -471,13 +482,18 @@ def to_markdown(
         bound_fixture = remote and metadata.get("fixture_sha256") is not None
         local_fixture = bound_fixture and metadata.get("fixture_distribution") == "local-gateway"
         published = bound_fixture and not local_fixture
+        inference_model = metadata.get("inference_model_name") if remote else None
         if metadata:
             lines.append(f"- execution backend: `{metadata.get('backend') or 'unknown'}`")
         if remote:
             label = "requested published reduced model" if published else "requested catalog model"
             if local_fixture:
                 label = "requested local reduced model"
+            if bound_fixture and inference_model is not None:
+                label += " (fixture-based checks only)"
             lines.append(f"- {label}: `{metadata['requested_model_name']}`")
+            if inference_model is not None:
+                lines.append(f"- `inference-checkpoint-loss` requested full model: `{inference_model}`")
             if bound_fixture:
                 lines.append(f"- local model/tokenizer SHA-256 binding: `{metadata['fixture_sha256']}`")
                 if local_fixture:
@@ -488,8 +504,14 @@ def to_markdown(
         model_label = "model"
         if remote and not bound_fixture:
             model_label = "reviewed reference fixture (not loaded on Cortex)"
+        elif bound_fixture and inference_model is not None:
+            model_label = "reviewed reference fixture (fixture-based checks only; not used by inference)"
+        parameter_count = f"{spec.model.param_count:,} parameters" if spec.model.param_count is not None else None
+        if parameter_count is None:
+            model_label = "original model metadata (not a generated reference fixture)"
+            parameter_count = "parameter count unknown"
         lines.append(
-            f"- {model_label}: {spec.model.param_count:,} parameters, {spec.model.num_hidden_layers} layers "
+            f"- {model_label}: {parameter_count}, {spec.model.num_hidden_layers} layers "
             f"of `{spec.model.source_checkpoint}`, hash `{spec.model.content_hash}`"
         )
         lines.append(f"- attention implementations: {', '.join(spec.attn_implementations)}")

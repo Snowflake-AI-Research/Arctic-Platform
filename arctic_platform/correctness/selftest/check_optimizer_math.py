@@ -15,13 +15,14 @@
 
 """Static correctness selftests: optimizer math."""
 
-
 from __future__ import annotations
 
 import copy
 import json
 import math
+import os
 import tempfile
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +41,168 @@ from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 from arctic_platform.correctness.reference import optimizer_step
 from arctic_platform.correctness.reference.optimizer_step import run_adamw_step
+
+# Adamw chunked.
+
+
+class _adamw_chunked_SmallModel(torch.nn.Module):
+
+    def __init__(self, dtype):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.linspace(-0.7, 0.9, 21, dtype=dtype).reshape(3, 7))
+        self.bias = torch.nn.Parameter(torch.linspace(-0.2, 0.4, 7, dtype=dtype))
+        self.norm = torch.nn.LayerNorm(7, dtype=dtype)
+        self.scalar = torch.nn.Parameter(torch.tensor(0.3, dtype=dtype))
+        self.dormant = torch.nn.Parameter(torch.ones(5, dtype=dtype))
+        self.frozen = torch.nn.Parameter(torch.ones(4, dtype=dtype), requires_grad=False)
+        self.to(os.environ.get("ADAMW_TEST_DEVICE", "cpu"))
+
+
+_adamw_chunked_OWNED_NAMES = ("weight", "bias", "scalar", "norm.weight", "norm.bias")
+
+_adamw_chunked_DECAY_NAMES = {"weight", "scalar"}
+
+_adamw_chunked_CONFIG = {"name": "AdamW", "weight_decay": 0.17, "betas": [0.73, 0.91], "eps": 0.003}
+
+_adamw_chunked_LEARNING_RATE = 0.007
+
+
+def _adamw_chunked_gradients_for(model, step):
+    gradients = {}
+    for index, (name, parameter) in enumerate(model.named_parameters()):
+        if name == "dormant":
+            continue
+        values = torch.arange(parameter.numel(), dtype=torch.float32, device=parameter.device).reshape(parameter.shape)
+        gradient = torch.sin(values + step * 0.7 + index) * (step + 1)
+        if step == 2:
+            gradient.zero_()
+        if gradient.ndim == 2:
+            gradient = gradient.T.contiguous().T
+        gradients[name] = gradient.requires_grad_()
+    return gradients
+
+
+class _adamw_chunked_OrdinaryAdamW:
+    """Independent whole-parameter oracle with explicitly declared decay membership."""
+
+    def __init__(self, model, master_type, clipping):
+        sources = dict(model.named_parameters())
+        self.masters = {
+            name: torch.nn.Parameter(sources[name].detach().to(master_type).clone())
+            for name in _adamw_chunked_OWNED_NAMES
+        }
+        self.optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": [
+                        self.masters[name] for name in _adamw_chunked_OWNED_NAMES if name in _adamw_chunked_DECAY_NAMES
+                    ],
+                    "weight_decay": _adamw_chunked_CONFIG["weight_decay"],
+                },
+                {
+                    "params": [
+                        self.masters[name]
+                        for name in _adamw_chunked_OWNED_NAMES
+                        if name not in _adamw_chunked_DECAY_NAMES
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=_adamw_chunked_LEARNING_RATE,
+            betas=tuple(_adamw_chunked_CONFIG["betas"]),
+            eps=_adamw_chunked_CONFIG["eps"],
+            foreach=False,
+            fused=False,
+        )
+        self.model = model
+        self.clipping = clipping
+
+    def step(self, gradients):
+        for name, master in self.masters.items():
+            master.grad = gradients[name].detach().to(master.dtype).clone()
+        norm = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(master.grad) for master in self.masters.values()])
+        )
+        if self.clipping is not None and self.clipping > 0:
+            torch.nn.utils.clip_grad_norm_(list(self.masters.values()), self.clipping)
+        self.optimizer.step()
+        with torch.no_grad():
+            for name, source in self.model.named_parameters():
+                if name in self.masters:
+                    source.copy_(self.masters[name].to(source.dtype))
+        for master in self.masters.values():
+            master.grad = None
+        return float(norm)
+
+
+def _adamw_chunked_make_trajectory(trajectory_class, model, *, chunk=4, clipping=None, master="float32"):
+    return trajectory_class(
+        model,
+        copy.deepcopy(_adamw_chunked_CONFIG),
+        learning_rate=_adamw_chunked_LEARNING_RATE,
+        gradient_clipping=clipping,
+        optimizer_dtype=master,
+        optimizer_chunk_elements=chunk,
+    )
+
+
+def _adamw_chunked_assert_same_tensor(actual, expected, *, context):
+    assert torch.equal(actual, expected), (
+        f"{context}: max absolute difference"
+        f" {float((actual.to(torch.float32) - expected.to(torch.float32)).abs().max())}"
+    )
+
+
+def _adamw_chunked_assert_oracle_state(trajectory, oracle, step):
+    assert trajectory.steps == step
+    assert tuple(trajectory.trainable_names) == _adamw_chunked_OWNED_NAMES
+    assert set(trajectory._masters) == set(_adamw_chunked_OWNED_NAMES)
+    assert len(trajectory._optimizer.state) == len(_adamw_chunked_OWNED_NAMES)
+    assert len(trajectory._optimizer.param_groups) == 2
+    assert trajectory._optimizer.defaults["foreach"] is False
+    assert trajectory._optimizer.defaults["fused"] is False
+    diagnostics = trajectory.state_norms()
+    assert set(diagnostics) == set(_adamw_chunked_OWNED_NAMES)
+    for name in _adamw_chunked_OWNED_NAMES:
+        master = trajectory._masters[name]
+        expected_master = oracle.masters[name]
+        _adamw_chunked_assert_same_tensor(master, expected_master, context=f"step {step} {name} master")
+        actual = trajectory._optimizer.state[master]
+        expected = oracle.optimizer.state[expected_master]
+        assert set(actual) == set(expected) == {"step", "exp_avg", "exp_avg_sq"}
+        for key in expected:
+            _adamw_chunked_assert_same_tensor(actual[key], expected[key], context=f"step {step} {name} {key}")
+        assert actual["step"].item() == step
+        assert actual["exp_avg"].shape == master.shape
+        assert actual["exp_avg_sq"].shape == master.shape
+        assert master.grad is None
+        diagnostic_moments = {
+            key: expected[key].contiguous() if actual[key].is_contiguous() else expected[key]
+            for key in ("exp_avg", "exp_avg_sq")
+        }
+        assert diagnostics[name] == {
+            "exp_avg": float(torch.linalg.vector_norm(diagnostic_moments["exp_avg"])),
+            "exp_avg_sq": float(torch.linalg.vector_norm(diagnostic_moments["exp_avg_sq"])),
+            "step": float(step),
+        }
+    for name, actual in trajectory._model.named_parameters():
+        _adamw_chunked_assert_same_tensor(
+            actual, dict(oracle.model.named_parameters())[name], context=f"step {step} {name} source"
+        )
+    for group in trajectory._optimizer.param_groups:
+        names = {name for name, master in trajectory._masters.items() if any((master is p for p in group["params"]))}
+        assert names == (
+            _adamw_chunked_DECAY_NAMES
+            if group["weight_decay"]
+            else set(_adamw_chunked_OWNED_NAMES) - _adamw_chunked_DECAY_NAMES
+        )
+        assert group["betas"] == tuple(_adamw_chunked_CONFIG["betas"])
+        assert group["eps"] == _adamw_chunked_CONFIG["eps"]
+        assert group["lr"] == _adamw_chunked_LEARNING_RATE
+
+
+# Optimizer norms.
+
 
 _optimizer_norms_KWARGS = {"optimizer_config": {}, "learning_rate": OPTIMIZER_LEARNING_RATE}
 
@@ -104,6 +267,113 @@ def _optimizer_norms_adam_states(gradient, backend):
         -(first / correction1 / denominator) * lr if backend == "dss" else -lr * (first / correction1) / denominator
     )
     return {"parameter_update": update, "exp_avg": first, "exp_avg_sq": second}
+
+
+def _optimizer_participation_manifest(root, *, include_inactive=True):
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+    from arctic_platform.correctness.harness.participation import weight_identity
+
+    states = {"layer.weight": _optimizer_norms_states(torch.zeros(2))}
+    if include_inactive:
+        states["visual.weight"] = _optimizer_norms_states(torch.zeros(2))
+    path = _optimizer_norms_manifest(root, states)
+    identity = weight_identity(torch.ones(2))
+    record = json.loads(path.read_text())
+    record.update(
+        participation={
+            "schema": PARTICIPATION_SCHEMA,
+            "parameters": {
+                "layer.weight": {"shape": [2], "state": "active", "evidence": None},
+                "visual.weight": {
+                    "shape": [2],
+                    "state": "inactive",
+                    "evidence": {
+                        "kind": "text-decoder-bypass",
+                        "module": "visual",
+                        "calls": 0,
+                        "outside_decoder_and_head": True,
+                        "forward_sha256": "a" * 64,
+                    },
+                },
+            },
+        },
+        inactive_weights={
+            "visual.weight": {
+                kind: {"before": copy.deepcopy(identity), "after": copy.deepcopy(identity)}
+                for kind in ("parameter", "master")
+            }
+        },
+    )
+    path.write_text(json.dumps(record))
+    return path
+
+
+@pytest.mark.parametrize("backend", ["reference", "dss"])
+@pytest.mark.parametrize("include_inactive", [True, False])
+def test_optimizer_participation_preserves_complete_inactive_witnesses(
+    _optimizer_norms_artifact_root, backend, include_inactive
+):
+    path = _optimizer_participation_manifest(
+        _optimizer_norms_artifact_root / "participation", include_inactive=include_inactive
+    )
+    summary = summarize_optimizer_artifacts(path, backend=backend, **_optimizer_norms_KWARGS)
+    assert set(summary["parameters"]) == {"layer.weight"}
+    assert summary["parameter_count"] == 1
+    assert summary["inactive_weights"] == json.loads(path.read_text())["inactive_weights"]
+    assert compare_optimizer_norms(summary, summary).worst_delta == 0.0
+
+
+@pytest.mark.parametrize("kind", ["parameter", "master"])
+def test_optimizer_participation_rejects_changed_inactive_weights(_optimizer_norms_artifact_root, kind):
+    path = _optimizer_participation_manifest(_optimizer_norms_artifact_root / "changed")
+    record = json.loads(path.read_text())
+    record["inactive_weights"]["visual.weight"][kind]["after"]["sha256"] = "b" * 64
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match=f"inactive {kind} weights changed"):
+        summarize_optimizer_artifacts(path, **_optimizer_norms_KWARGS)
+
+
+@pytest.mark.parametrize("state", STATE_KEYS)
+def test_optimizer_participation_rejects_nonzero_inactive_optimizer_artifacts(_optimizer_norms_artifact_root, state):
+    path = _optimizer_participation_manifest(_optimizer_norms_artifact_root / "state")
+    artifact = path.parent / "000001.pt"
+    values = torch.load(artifact, weights_only=True)
+    values[state].fill_(1)
+    torch.save(values, artifact)
+    with pytest.raises(ValueError, match="nonzero state or update"):
+        summarize_optimizer_artifacts(path, **_optimizer_norms_KWARGS)
+
+
+@pytest.mark.parametrize("damage", ["witness", "evidence", "active", "shape"])
+def test_optimizer_participation_rejects_incomplete_or_unexplained_inventory(_optimizer_norms_artifact_root, damage):
+    path = _optimizer_participation_manifest(_optimizer_norms_artifact_root / "missing")
+    record = json.loads(path.read_text())
+    if damage == "witness":
+        record["inactive_weights"].clear()
+    elif damage == "evidence":
+        record["participation"]["parameters"]["visual.weight"]["evidence"] = None
+    elif damage == "active":
+        record["parameters"] = record["parameters"][1:]
+    else:
+        record["participation"]["parameters"]["layer.weight"]["shape"] = [3]
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError):
+        summarize_optimizer_artifacts(path, **_optimizer_norms_KWARGS)
+
+
+def test_optimizer_participation_comparison_and_calibration_reject_disagreement(_optimizer_norms_artifact_root):
+    first = _optimizer_participation_manifest(_optimizer_norms_artifact_root / "first")
+    second = _optimizer_participation_manifest(_optimizer_norms_artifact_root / "second")
+    record = json.loads(second.read_text())
+    record["participation"]["parameters"]["visual.weight"].update(state="active", evidence=None)
+    record["inactive_weights"].clear()
+    second.write_text(json.dumps(record))
+    left = summarize_optimizer_artifacts(first, **_optimizer_norms_KWARGS)
+    right = summarize_optimizer_artifacts(second, **_optimizer_norms_KWARGS)
+    with pytest.raises(ValueError, match="participation or shape disagreement"):
+        compare_optimizer_norms(left, right)
+    with pytest.raises(ValueError, match="participation or shape disagreement"):
+        max_pairwise_optimizer_norm_delta([first, second], **_optimizer_norms_KWARGS)
 
 
 def test_optimizer_norms_summary_is_compact_serializable_float32_l2(_optimizer_norms_artifact_root):
@@ -574,6 +844,9 @@ def test_optimizer_norms_arm_requires_gate_and_target_capture():
         fwd_bwd_step._compare_arm(ctx, arm, reference, target)
 
 
+# Optimizer reference.
+
+
 @pytest.fixture
 def _optimizer_reference_fast_output():
     with tempfile.TemporaryDirectory(prefix="optimizer-reference-selftest-", dir="/data-fast/tmp") as directory:
@@ -744,3 +1017,524 @@ def test_optimizer_reference_adamw_reference_returns_canonical_fast_manifest(_op
     )
     assert artifact.manifest_path == actual / "optimizer/manifest.json"
     assert artifact.manifest_path.is_file()
+
+
+# Bounded single-step reference; these controls do not invoke a reference model.
+
+
+class _BoundedStepModel(torch.nn.Module):
+
+    def __init__(self, dtype):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.linspace(-0.9, 0.7, 15, dtype=dtype).reshape(3, 5).T)
+        self.bias = torch.nn.Parameter(torch.linspace(-0.4, 0.6, 3, dtype=dtype))
+        self.scalar = torch.nn.Parameter(torch.tensor(0.3, dtype=dtype))
+        self.norm = torch.nn.LayerNorm(3, dtype=dtype)
+        self.dormant = torch.nn.Parameter(torch.ones(2, dtype=dtype))
+        self.frozen = torch.nn.Parameter(torch.ones(4, dtype=dtype), requires_grad=False)
+        self.tied = self.weight
+
+
+_BOUNDED_STEP_CONFIG = {"name": "AdamW", "betas": [0.73, 0.91], "eps": 0.003, "weight_decay": 0.17}
+_BOUNDED_STEP_LR = 0.007
+
+
+def _bounded_step_gradients(model, *, zero=False):
+    result = {}
+    for index, (name, parameter) in enumerate(model.named_parameters()):
+        if name == "dormant":
+            continue
+        values = torch.arange(parameter.numel(), dtype=torch.float32).reshape(parameter.shape)
+        gradient = torch.sin(values + index + 0.7) * (index + 1)
+        if gradient.ndim == 2:
+            gradient = gradient.T.contiguous().T
+        if zero:
+            gradient.zero_()
+        result[name] = gradient.requires_grad_()
+    result["not_a_parameter"] = torch.ones(1)
+    return result
+
+
+def _bounded_step_whole_parameter_oracle(model, gradients, *, master_dtype, clipping):
+    """Keep the pre-streaming whole-parameter Torch computation independent of the implementation."""
+    selected = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name in gradients
+    ]
+    masters = {name: torch.nn.Parameter(parameter.detach().to(master_dtype).clone()) for name, parameter in selected}
+    initial_masters = {name: master.detach().float().clone() for name, master in masters.items()}
+    decay_names = {"weight", "scalar"}
+    groups = [
+        {"params": [master for name, master in masters.items() if name in decay_names], "weight_decay": 0.17},
+        {"params": [master for name, master in masters.items() if name not in decay_names], "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(
+        [group for group in groups if group["params"]],
+        lr=_BOUNDED_STEP_LR,
+        betas=(0.73, 0.91),
+        eps=0.003,
+        foreach=False,
+        fused=False,
+    )
+    for name, master in masters.items():
+        master.grad = gradients[name].detach().to(device=master.device, dtype=master_dtype).clone()
+    norm = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(master.grad) for master in masters.values()])
+    )
+    if clipping is not None and clipping > 0:
+        torch.nn.utils.clip_grad_norm_(list(masters.values()), clipping)
+    optimizer.step()
+    artifacts, entries = {}, []
+    for index, (name, parameter) in enumerate(selected):
+        master = masters[name]
+        state = optimizer.state[master]
+        assert state["step"].item() == 1
+        artifacts[name] = {
+            "parameter_update": master.detach().float().sub(initial_masters[name]).cpu(),
+            "exp_avg": state["exp_avg"].detach().cpu(),
+            "exp_avg_sq": state["exp_avg_sq"].detach().cpu(),
+        }
+        entries.append(
+            {
+                "name": name,
+                "file": f"{index:06d}.pt",
+                "shape": list(parameter.shape),
+                **{f"{key}_norm": float(torch.linalg.vector_norm(value)) for key, value in artifacts[name].items()},
+            }
+        )
+    return float(norm), {"step": 1, "parameters": entries}, artifacts
+
+
+def _bounded_step_run(model, gradients, output, *, master="float32", clipping=0.35):
+    return run_adamw_step(
+        model,
+        gradients,
+        copy.deepcopy(_BOUNDED_STEP_CONFIG),
+        learning_rate=_BOUNDED_STEP_LR,
+        gradient_clipping=clipping,
+        optimizer_dtype=master,
+        output_dir=output,
+    )
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("master", ["float32", "bfloat16"])
+def test_optimizer_update_excludes_initial_master_precision_conversion(
+    _optimizer_reference_fast_output, source_dtype, master
+):
+    model = torch.nn.Linear(4, 1, bias=False, dtype=source_dtype)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[0.12345, -0.32109, 0.54321, -0.98765]]))
+    initial = model.weight.detach().clone()
+    config = {"name": "AdamW", "weight_decay": 0.0, "betas": [0.9, 0.999], "eps": 1e-8}
+    artifact = run_adamw_step(
+        model,
+        {"weight": torch.zeros_like(model.weight)},
+        config,
+        learning_rate=0.01,
+        gradient_clipping=None,
+        optimizer_dtype=master,
+        output_dir=_optimizer_reference_fast_output,
+    )
+    tensors = torch.load(artifact.manifest_path.parent / "000000.pt", weights_only=True)
+    assert tensors["parameter_update"].dtype == torch.float32
+    for name, value in tensors.items():
+        assert torch.count_nonzero(value) == 0, name
+    summary = summarize_optimizer_artifacts(artifact.manifest_path, optimizer_config=config, learning_rate=0.01)
+    assert summary["parameters"]["weight"]["parameter_update_residual"] == 0.0
+    assert torch.equal(model.weight.detach(), initial)
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("master", ["float32", "bfloat16"])
+@pytest.mark.parametrize("clipping", [None, 0.35, 100.0])
+@pytest.mark.parametrize("zero", [False, True])
+def test_bounded_step_new_exact_whole_parameter_parity_and_unchanged_artifact_contract(
+    _optimizer_reference_fast_output, source_dtype, master, clipping, zero
+):
+    model = _BoundedStepModel(source_dtype)
+    gradients = _bounded_step_gradients(model, zero=zero)
+    sources_before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    inputs_before = {name: tensor.detach().clone() for name, tensor in gradients.items()}
+    expected_norm, expected_manifest, expected = _bounded_step_whole_parameter_oracle(
+        model, gradients, master_dtype=getattr(torch, master), clipping=clipping
+    )
+    artifact = _bounded_step_run(model, gradients, _optimizer_reference_fast_output, master=master, clipping=clipping)
+    manifest = json.loads(artifact.manifest_path.read_text())
+    assert artifact.gradient_norm_before_clip == expected_norm
+    assert manifest == expected_manifest
+    assert [entry["name"] for entry in manifest["parameters"]] == [
+        "weight",
+        "bias",
+        "scalar",
+        "norm.weight",
+        "norm.bias",
+    ]
+    for entry in manifest["parameters"]:
+        actual = torch.load(artifact.manifest_path.parent / entry["file"], weights_only=True)
+        assert set(actual) == set(expected[entry["name"]]) == {"parameter_update", "exp_avg", "exp_avg_sq"}
+        for key, value in actual.items():
+            target = expected[entry["name"]][key]
+            assert value.dtype == target.dtype
+            assert value.device.type == "cpu"
+            assert torch.equal(value, target), (entry["name"], key)
+    oracle_dir = _optimizer_reference_fast_output / "oracle"
+    oracle_dir.mkdir()
+    for entry in expected_manifest["parameters"]:
+        torch.save(expected[entry["name"]], oracle_dir / entry["file"])
+    oracle_manifest = oracle_dir / "manifest.json"
+    oracle_manifest.write_text(json.dumps(expected_manifest))
+    kwargs = {"optimizer_config": _BOUNDED_STEP_CONFIG, "learning_rate": _BOUNDED_STEP_LR}
+    assert summarize_optimizer_artifacts(artifact.manifest_path, **kwargs) == summarize_optimizer_artifacts(
+        oracle_manifest, **kwargs
+    )
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, sources_before[name])
+        assert parameter.grad is None
+    for name, tensor in gradients.items():
+        assert torch.equal(tensor, inputs_before[name])
+        assert tensor.grad is None
+
+
+@pytest.mark.parametrize("clipping", [0.0, -0.5, 1e-10])
+def test_bounded_step_new_disabled_and_tiny_global_clipping(_optimizer_reference_fast_output, clipping):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    expected_norm, expected_manifest, expected = _bounded_step_whole_parameter_oracle(
+        model, gradients, master_dtype=torch.float32, clipping=clipping
+    )
+    actual = _bounded_step_run(model, gradients, _optimizer_reference_fast_output, clipping=clipping)
+    assert actual.gradient_norm_before_clip == expected_norm
+    assert json.loads(actual.manifest_path.read_text()) == expected_manifest
+    for entry in expected_manifest["parameters"]:
+        tensors = torch.load(actual.manifest_path.parent / entry["file"], weights_only=True)
+        assert all(torch.equal(tensors[key], expected[entry["name"]][key]) for key in tensors)
+
+
+def test_bounded_step_new_one_owned_master_and_state_released_before_next_allocation(
+    monkeypatch, _optimizer_reference_fast_output
+):
+    original_build = optimizer_step.build_adamw
+    observed = []
+
+    def build(named_masters, config, *, learning_rate):
+        for previous, reference in observed:
+            assert previous.state == {}
+            assert previous.param_groups == []
+            assert reference() is None
+        assert len(named_masters) == 1
+        name, master = named_masters[0]
+        result = original_build(named_masters, config, learning_rate=learning_rate)
+        assert len(result.param_groups) == 1
+        group = result.param_groups[0]
+        assert group["weight_decay"] == (0.17 if name in {"weight", "scalar"} else 0.0)
+        assert group["betas"] == (0.73, 0.91)
+        assert group["eps"] == 0.003 and group["lr"] == _BOUNDED_STEP_LR
+        assert group["foreach"] is False and group["fused"] is False
+        observed.append((result, weakref.ref(master)))
+        return result
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    model = _BoundedStepModel(torch.bfloat16)
+    _bounded_step_run(model, _bounded_step_gradients(model), _optimizer_reference_fast_output)
+    assert len(observed) == 5
+    assert all(
+        not optimizer.state and not optimizer.param_groups and master() is None for optimizer, master in observed
+    )
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "shape", "sparse", "missing_all"])
+def test_bounded_step_new_invalid_gradient_rejected_before_any_optimizer_or_artifact(
+    monkeypatch, _optimizer_reference_fast_output, invalid
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    if invalid in {"nan", "inf"}:
+        gradients["norm.bias"] = torch.full_like(gradients["norm.bias"], float(invalid))
+    elif invalid == "shape":
+        gradients["norm.bias"] = torch.ones(2)
+    elif invalid == "sparse":
+        gradients["norm.bias"] = gradients["norm.bias"].to_sparse()
+    else:
+        gradients = {"frozen": gradients["frozen"], "not_a_parameter": torch.ones(1)}
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(True)
+        pytest.fail("invalid selected gradients must fail before allocation/publication")
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", forbidden)
+    monkeypatch.setattr(torch, "save", forbidden)
+    with pytest.raises(ValueError, match="finite|shape|dense|no trainable"):
+        _bounded_step_run(model, gradients, _optimizer_reference_fast_output)
+    assert not calls
+    assert not list(_optimizer_reference_fast_output.iterdir())
+
+
+def test_bounded_step_new_partial_missing_gradients_keep_original_selection(_optimizer_reference_fast_output):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    del gradients["bias"]
+    artifact = _bounded_step_run(model, gradients, _optimizer_reference_fast_output)
+    names = [entry["name"] for entry in json.loads(artifact.manifest_path.read_text())["parameters"]]
+    assert names == ["weight", "scalar", "norm.weight", "norm.bias"]
+
+
+@pytest.mark.parametrize("phase", ["norm", "build", "step", "save", "manifest"])
+def test_bounded_step_new_failure_releases_owned_containers_and_preserves_exception_without_success_manifest(
+    monkeypatch, _optimizer_reference_fast_output, phase
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    sources_before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    observed = []
+    original_build = optimizer_step.build_adamw
+    failure = RuntimeError(f"injected {phase} failure")
+
+    def build(named_masters, config, *, learning_rate):
+        if phase == "build":
+            raise failure
+        result = original_build(named_masters, config, learning_rate=learning_rate)
+        observed.append((result, named_masters[0][1]))
+        if phase == "step":
+            original_step = result.step
+
+            def fail_step():
+                original_step()
+                raise failure
+
+            result.step = fail_step
+        return result
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    if phase == "norm":
+        monkeypatch.setattr(torch.linalg, "vector_norm", fail)
+    elif phase == "save":
+        original_save = torch.save
+
+        def fail_save(tensors, path):
+            original_save(tensors, path)
+            raise failure
+
+        monkeypatch.setattr(torch, "save", fail_save)
+    elif phase == "manifest":
+        monkeypatch.setattr(Path, "write_text", fail)
+    with pytest.raises(RuntimeError) as caught:
+        _bounded_step_run(model, gradients, _optimizer_reference_fast_output)
+    assert caught.value is failure
+    assert not (_optimizer_reference_fast_output / "manifest.json").exists()
+    assert all(
+        not optimizer.state and not optimizer.param_groups and master.grad is None for optimizer, master in observed
+    )
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, sources_before[name])
+        assert parameter.grad is None
+
+
+def test_bounded_step_new_existing_output_is_preserved_before_streaming(monkeypatch, _optimizer_reference_fast_output):
+    previous = _optimizer_reference_fast_output / "manifest.json"
+    previous.write_text("held original bytes")
+
+    def forbidden():
+        pytest.fail("existing artifacts must not enter streaming")
+
+    with pytest.raises(ValueError, match="must be empty"):
+        _bounded_step_run(SimpleNamespace(named_parameters=forbidden), {}, _optimizer_reference_fast_output)
+    assert previous.read_text() == "held original bytes"
+
+
+@pytest.mark.parametrize("phase", ["partial_write", "replace"])
+def test_bounded_step_new_manifest_publication_is_atomic_on_failure(
+    monkeypatch, _optimizer_reference_fast_output, phase
+):
+    failure = OSError(f"injected {phase}")
+    original_write = Path.write_text
+
+    def partial_write(path, text, *args, **kwargs):
+        original_write(path, text[:20], *args, **kwargs)
+        raise failure
+
+    def fail_replace(*args, **kwargs):
+        raise failure
+
+    if phase == "partial_write":
+        monkeypatch.setattr(Path, "write_text", partial_write)
+    else:
+        monkeypatch.setattr(Path, "replace", fail_replace)
+    model = _BoundedStepModel(torch.bfloat16)
+    with pytest.raises(OSError) as caught:
+        _bounded_step_run(model, _bounded_step_gradients(model), _optimizer_reference_fast_output)
+    assert caught.value is failure
+    assert not (_optimizer_reference_fast_output / "manifest.json").exists()
+    assert (_optimizer_reference_fast_output / ".manifest.json.tmp").is_file()
+    assert len(list(_optimizer_reference_fast_output.glob("*.pt"))) == 5
+
+
+def test_bounded_step_new_counter_advances_once_and_manifest_is_published_last(
+    monkeypatch, _optimizer_reference_fast_output
+):
+    original_build = optimizer_step.build_adamw
+    steps = []
+
+    def build(named_masters, config, *, learning_rate):
+        optimizer = original_build(named_masters, config, learning_rate=learning_rate)
+        master = named_masters[0][1]
+        original_step = optimizer.step
+
+        def step():
+            assert not (_optimizer_reference_fast_output / "manifest.json").exists()
+            assert not optimizer.state
+            original_step()
+            steps.append(float(optimizer.state[master]["step"]))
+
+        optimizer.step = step
+        return optimizer
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    model = _BoundedStepModel(torch.bfloat16)
+    artifact = _bounded_step_run(model, _bounded_step_gradients(model), _optimizer_reference_fast_output)
+    assert steps == [1.0] * 5
+    assert json.loads(artifact.manifest_path.read_text())["step"] == 1
+    assert not (_optimizer_reference_fast_output / ".manifest.json.tmp").exists()
+
+
+# Consuming reference gradients after complete global clipping preflight.
+
+
+def _consuming_step_run(model, gradients, output, *, master="float32", clipping=0.35):
+    return run_adamw_step(
+        model,
+        gradients,
+        copy.deepcopy(_BOUNDED_STEP_CONFIG),
+        learning_rate=_BOUNDED_STEP_LR,
+        gradient_clipping=clipping,
+        optimizer_dtype=master,
+        output_dir=output,
+        consume_gradients=True,
+    )
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("master", ["float32", "bfloat16"])
+@pytest.mark.parametrize("clipping", [None, 0.35, 100.0])
+def test_consuming_step_exact_artifacts_and_global_clip(
+    _optimizer_reference_fast_output, source_dtype, master, clipping
+):
+    model = _BoundedStepModel(source_dtype)
+    gradients = _bounded_step_gradients(model)
+    sources = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    untouched = {name: gradients[name] for name in ("frozen", "not_a_parameter")}
+    norm, manifest, expected = _bounded_step_whole_parameter_oracle(
+        model, gradients, master_dtype=getattr(torch, master), clipping=clipping
+    )
+    artifact = _consuming_step_run(
+        model, gradients, _optimizer_reference_fast_output, master=master, clipping=clipping
+    )
+    assert artifact.gradient_norm_before_clip == norm
+    assert json.loads(artifact.manifest_path.read_text()) == manifest
+    assert gradients.keys() == untouched.keys()
+    assert all(gradients[name] is value for name, value in untouched.items())
+    for entry in manifest["parameters"]:
+        actual = torch.load(artifact.manifest_path.parent / entry["file"], weights_only=True)
+        assert actual.keys() == expected[entry["name"]].keys()
+        for key, tensor in actual.items():
+            oracle = expected[entry["name"]][key]
+            assert tensor.dtype == oracle.dtype
+            assert torch.equal(tensor, oracle)
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, sources[name])
+        assert parameter.grad is None
+
+
+@pytest.mark.parametrize("clipping", [None, 0.35])
+def test_consuming_step_releases_each_input_before_optimizer_and_artifact_allocation(
+    monkeypatch, _optimizer_reference_fast_output, clipping
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    names = [name for name, parameter in model.named_parameters() if parameter.requires_grad and name in gradients]
+    references = {name: weakref.ref(gradients[name]) for name in names}
+    original_build, original_save = optimizer_step.build_adamw, torch.save
+    seen = []
+    saved = []
+
+    def assert_lifetime():
+        assert all(references[name]() is None and name not in gradients for name in seen)
+        assert all(references[name]() is not None and name in gradients for name in names[len(seen) :])
+
+    def build(named_masters, config, *, learning_rate):
+        seen.append(named_masters[0][0])
+        assert_lifetime()
+        return original_build(named_masters, config, learning_rate=learning_rate)
+
+    def save(tensors, path):
+        assert_lifetime()
+        saved.append(path.name)
+        original_save(tensors, path)
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    monkeypatch.setattr(torch, "save", save)
+    _consuming_step_run(model, gradients, _optimizer_reference_fast_output, clipping=clipping)
+    assert seen == names
+    assert saved == [f"{index:06d}.pt" for index in range(len(names))]
+    assert all(reference() is None for reference in references.values())
+
+
+def test_consuming_step_default_keeps_caller_mapping_and_tensors(_optimizer_reference_fast_output):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    original = dict(gradients)
+    values = {name: tensor.detach().clone() for name, tensor in gradients.items()}
+    _bounded_step_run(model, gradients, _optimizer_reference_fast_output)
+    assert gradients.keys() == original.keys()
+    assert all(gradients[name] is tensor and torch.equal(tensor, values[name]) for name, tensor in original.items())
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "shape", "sparse"])
+def test_consuming_step_last_invalid_gradient_does_not_consume_or_write(
+    monkeypatch, _optimizer_reference_fast_output, invalid
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    if invalid in {"nan", "inf"}:
+        gradients["norm.bias"] = torch.full_like(gradients["norm.bias"], float(invalid))
+    elif invalid == "shape":
+        gradients["norm.bias"] = torch.ones(2)
+    else:
+        gradients["norm.bias"] = gradients["norm.bias"].to_sparse()
+    original = dict(gradients)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("complete preflight must precede consuming or writing")
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", forbidden)
+    monkeypatch.setattr(torch, "save", forbidden)
+    with pytest.raises(ValueError, match="finite|shape|dense"):
+        _consuming_step_run(model, gradients, _optimizer_reference_fast_output)
+    assert gradients.keys() == original.keys()
+    assert all(gradients[name] is tensor for name, tensor in original.items())
+    assert not list(_optimizer_reference_fast_output.iterdir())
+
+
+def test_consuming_step_write_failure_preserves_primary_and_unprocessed_gradients(
+    monkeypatch, _optimizer_reference_fast_output
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    original = dict(gradients)
+    failure = OSError("injected consuming artifact write failure")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(torch, "save", fail)
+    with pytest.raises(OSError) as caught:
+        _consuming_step_run(model, gradients, _optimizer_reference_fast_output)
+    assert caught.value is failure
+    assert gradients.keys() == original.keys() - {"weight"}
+    assert all(gradients[name] is original[name] for name in gradients)
+    assert not (_optimizer_reference_fast_output / "manifest.json").exists()

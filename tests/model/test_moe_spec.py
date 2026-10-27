@@ -41,6 +41,23 @@ def test_text_model_type_reads_a_nested_glm_config(tmp_path):
     assert is_glm_moe_model(checkpoint)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_glm53_uses_the_glm_moe_training_policy(tmp_path, nested):
+    payload = {"model_type": "glm5_next_text"}
+    if nested:
+        payload = {"model_type": "glm5_next", "text_config": payload}
+    checkpoint = _write_config(tmp_path / "glm53", payload)
+
+    assert hf_text_model_type(checkpoint) == "glm5_next_text"
+    assert is_glm_moe_model(checkpoint)
+
+
+def test_non_glm_moe_does_not_use_the_glm_training_policy(tmp_path):
+    checkpoint = _write_config(tmp_path / "qwen", {"model_type": "qwen3_5_moe"})
+
+    assert not is_glm_moe_model(checkpoint)
+
+
 def test_qwen_spec_lifts_dtype_attention_and_parallelism(tmp_path):
     checkpoint = _write_config(tmp_path / "qwen", {"model_type": "qwen3_5_moe"})
     spec = moe_model_spec(

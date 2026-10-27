@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
 from .config import DebugModelConfig, ModelConfig
+from .mtp_weights import iter_preserved_mtp_weights
 from .sequence_parallel import apply_sequence_parallelism
 from .model_builder import (
     DTYPE_MAP,
@@ -209,6 +210,26 @@ def _configure_family_backend(_config: ModelConfig) -> None:
     pass
 
 
+def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
+    ordinary = _build_iter_full_hf_weights(model)
+
+    def iterator(*, include_skipped: bool = False):
+        import torch.distributed as dist
+
+        names: set[str] = set()
+        for name, tensor in ordinary(include_skipped=include_skipped):
+            names.add(name)
+            yield name, tensor
+        # Finish all ordinary collectives before the serializer-only sidecar.
+        if include_skipped and dist.get_rank() == 0:
+            for name, tensor in iter_preserved_mtp_weights(model):
+                if name in names:
+                    raise RuntimeError(f"Original MTP tensor collides with live HF export: {name}")
+                yield name, tensor
+
+    return iterator
+
+
 def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
     if sp_size > 1:
         apply_sequence_parallelism(model, sp_size, sp_group)
@@ -261,6 +282,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
         vllm_weight_export=_build_iter_full_vllm_weights,
+        hf_weight_export=_build_iter_full_hf_weights_with_mtp,
     )
 
 
@@ -359,6 +381,7 @@ def _generic_adapter() -> MoEDeepSpeedAdapter:
         _adapter(),
         apply_sequence_parallelism=_apply_generic_sequence_parallelism,
         vllm_weight_export=build_iter_full_vllm_weights,
+        hf_weight_export=_build_iter_full_hf_weights,
     )
 
 

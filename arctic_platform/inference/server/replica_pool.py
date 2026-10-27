@@ -203,7 +203,7 @@ class ReplicaPool:
         # When set, this pool runs the multi-node path: a single 0-GPU
         # coordinator actor is scheduled into this PG (bundle 0) and vLLM's Ray
         # executor inherits it via capture_child_tasks. ``None`` means the
-        # single-node path (the pool reserves ``world_size`` GPUs on one actor).
+        # single-node path (mp reserves GPUs on the actor; Ray on its workers).
         # The pool does NOT create or remove this PG; lifetime is the caller's.
         self._engine_pg: Any | None = None
 
@@ -242,6 +242,13 @@ class ReplicaPool:
     def _ray_num_gpus(self) -> float:
         if self._config is not None and self._config.ray_num_gpus is not None:
             return self._config.ray_num_gpus
+        if (
+            not bool(getattr(self._config, "semi_p", False))
+            and self._engine_kwargs().get("distributed_executor_backend") == "ray"
+        ):
+            # vLLM's Ray workers reserve their own GPUs; reserving them on the
+            # coordinator as well leaves its placement group unschedulable.
+            return 0.0
         return float(self.world_size)
 
     # ------------------------------------------------------------------
@@ -324,8 +331,9 @@ class ReplicaPool:
     def _make_worker(self) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
 
-        Single-node: the actor reserves ``tp_size`` GPUs and runs an mp-backed
-        vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
+        Single-node: an mp-backed actor reserves ``world_size`` GPUs; an
+        explicitly Ray-backed actor reserves none, leaving GPUs for vLLM's
+        workers. Multi-node: the actor is a 0-GPU coordinator
         pinned into a cross-node PG; vLLM inherits that PG via
         ``get_current_placement_group()`` and schedules one rank per bundle.
 
@@ -720,8 +728,8 @@ class ReplicaPool:
                 pod-spanning path: one 0-GPU coordinator actor is scheduled
                 into the PG (bundle 0) and vLLM's Ray executor inherits it via
                 capture_child_tasks. The pool does not create or remove the PG.
-                ``None`` keeps the single-node path (the pool reserves
-                ``world_size`` GPUs on one actor).
+                ``None`` keeps the single-node path (mp reserves
+                ``world_size`` GPUs on one actor; Ray reserves them on workers).
 
         Returns the number of workers created.
         """

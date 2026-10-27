@@ -15,11 +15,11 @@
 
 """Static correctness selftests: catalog configuration."""
 
-
 from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +45,8 @@ from arctic_platform.correctness.harness.names import canonical_dss_tensor_group
 from arctic_platform.correctness.harness.runner import assert_applicable_tests_registered
 
 from .helpers import _config_factory_native_config
+
+# Applicable tests.
 
 
 def _cortex_recipe():
@@ -87,12 +89,15 @@ def _cortex_recipe():
     }
 
 
-def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_path):
+@pytest.mark.parametrize("hardware", [None, "H200", "B200", "B300"])
+def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_path, hardware):
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.correctness.harness.config import local_config_path
     from arctic_platform.correctness.harness.hosted import training_client_config
 
     raw = _cortex_recipe()
+    if hardware is not None:
+        raw["hardware"] = hardware
     source = tmp_path / "external" / "qwen38_flash_next.json"
     source.parent.mkdir()
     source.write_text(json.dumps(raw, indent=2) + "\n")
@@ -107,7 +112,10 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.attention_implementation == "qsa_flex"
     assert cfg.optimizer_dtype == "bfloat16"
     assert config_checksum(cfg) == config_checksum(load_config(source))
-    wire = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1")).to_cortex()[0]
+    client_config = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1"))
+    assert cfg.hardware == client_config.hardware == hardware
+    assert cfg.gpu_type == (hardware.lower() if hardware is not None else None)
+    wire = client_config.to_cortex()[0]
     assert wire["weight_format"] == "vllm"
     for key in ("sp_size", "ep_size", "ep_group_layout", "ac_config", "optimizer"):
         assert wire["training_config"][key] == cfg.training[key]
@@ -117,9 +125,85 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.training["mb_spec"]["max_tokens_per_mb"] == 262144
     wider = cfg.at_gpu_width(16)
     assert wider.n_gpus == 16 and wider.sp_size == 8
+    assert wider.hardware == hardware
+    assert wider.gpu_type == cfg.gpu_type
     assert wider.training["ds_config"]["train_batch_size"] == 2
     assert config_checksum(wider) != config_checksum(cfg)
     assert cfg.sub_jobs == raw["sub_job_configs"]
+
+
+@pytest.mark.parametrize("hardware", [None, True, 200, "", "h200", "H100", [], {}])
+def test_cortex_recipe_invalid_hardware_fails_before_import(tmp_path, hardware):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _cortex_recipe()
+    raw["hardware"] = hardware
+    source = tmp_path / "recipe.json"
+    source.write_text(json.dumps(raw))
+    destination = tmp_path / "configs"
+    with pytest.raises(ValueError, match="hardware must be one of H200, B200, B300"):
+        local_config_path(source, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("hardware", "attention"),
+    [("H200", "flash_attention_3"), ("B200", "flash_attention_4"), ("B300", "flash_attention_4")],
+)
+def test_cortex_recipe_explicit_hardware_controls_attention_and_host_admission(
+    tmp_path, monkeypatch, hardware, attention
+):
+    from arctic_platform.correctness.harness import config as config_module
+
+    raw = _cortex_recipe()
+    raw["hardware"] = hardware
+    sub_job = raw["sub_job_configs"][0]
+    sub_job["model_name"] = "Qwen/Qwen3-8B"
+    sub_job["training_config"].pop("attn_implementation")
+    other_gpu = "b200" if hardware == "H200" else "h200"
+    path = tmp_path / "configs" / "model" / other_gpu / "recipe.config"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(raw))
+    cfg = load_config(path)
+    assert cfg.gpu_type == hardware.lower()
+    assert cfg.attention_implementation == attention
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: other_gpu)
+    with pytest.raises(ValueError, match=f"config is for {hardware.lower()} but this host has {other_gpu}"):
+        validate_against_host(cfg, available_gpus=8)
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: hardware.lower())
+    validate_against_host(cfg, available_gpus=8)
+    sub_job["training_config"]["attn_implementation"] = (
+        "flash_attention_4" if hardware == "H200" else "flash_attention_3"
+    )
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="requires attn_implementation"):
+        _ = load_config(path).attention_implementation
+
+
+def test_cortex_recipe_checksum_binds_explicit_hardware_and_preserves_omitted_digest(tmp_path):
+    import hashlib
+
+    from arctic_platform.correctness.harness.config import normalize_ints
+
+    raw = _cortex_recipe()
+    normalized_sub_job = normalize_ints(raw["sub_job_configs"][0])
+    path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(raw))
+    legacy = hashlib.sha256(json.dumps(normalized_sub_job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert config_checksum(load_config(path)) == legacy
+    digests = {legacy}
+    for hardware in ("H200", "B200", "B300"):
+        raw["hardware"] = hardware
+        path.write_text(json.dumps(raw))
+        cfg = load_config(path)
+        expected = hashlib.sha256(
+            json.dumps(
+                {"hardware": hardware, "sub_job": normalized_sub_job}, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        assert config_checksum(cfg) == expected
+        digests.add(expected)
+    assert len(digests) == 4
 
 
 def test_cortex_recipe_sampling_preserves_rl_classification(tmp_path):
@@ -246,6 +330,9 @@ def test_applicable_tests_the_refusal_names_every_unregistered_id():
     assert "t02_delta_update" in str(failure.value)
 
 
+# Arms.
+
+
 def test_arms_eight_gpu_arms_cap_gas1_at_64k_total() -> None:
     arms = arms_for(max_row_tokens=262144, gpu_count=8)
     assert [(arm.name, arm.global_batch_size, arm.max_seq_len, arm.total_tokens) for arm in arms] == [
@@ -278,6 +365,9 @@ def test_arms_microbatch_count_uses_the_capped_correctness_budget() -> None:
 
 def test_arms_smaller_microbatch_budget_is_preserved() -> None:
     assert correctness_microbatch_tokens(10240) == 10240
+
+
+# Config gpu attention.
 
 
 def _config_gpu_attention_write_config(tmp_path: Path, gpu_type: str, attention: str | None, n_gpus: int = 8) -> Path:
@@ -418,6 +508,9 @@ def test_config_gpu_attention_flash_next_rejects_generic_h200_attention(tmp_path
         validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
 
 
+# Flash 256k source recipes.
+
+
 @pytest.mark.parametrize("model", ["zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"])
 def test_reference_attention_does_not_bypass_invalid_glm_target(tmp_path, model):
     path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
@@ -426,6 +519,217 @@ def test_reference_attention_does_not_bypass_invalid_glm_target(tmp_path, model)
     path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="requires attn_implementation='sparse_mla'"):
         _ = load_config(path).reference_attention_implementation
+
+
+def _flash_source_recipe(recipe: str) -> tuple[str, dict, dict | None]:
+    """Independent source semantics; selftests do not require the external clone."""
+    qwen = recipe.startswith("qwen38")
+    lora = "-lora-" in recipe
+    rl = "-rl-" in recipe
+    width = 8 if lora else 16
+    model = "Qwen/Qwen3.8-Flash-Next" if qwen else "zai-org/GLM-5.3-Flash" + ("" if lora else "-BF16")
+    optimizer = {
+        "name": "AdamW",
+        "lr": 0.0001 if lora else 2e-05,
+        "weight_decay": 0.0,
+        "betas": [0.9, 0.999],
+        "eps": 1e-08,
+    }
+    bf16 = {"enabled": True}
+    if not qwen:
+        bf16.update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    training = {
+        "n_gpus": width,
+        "max_seq_len": 262144,
+        "train_batch_size": 1,
+        "gradient_clipping": 1.0,
+        "model_provider": "prime_rl",
+        "attn_implementation": "qsa_flex" if qwen else "sparse_mla",
+        "cuda_allocator_conf": "expandable_segments:True",
+        "activation_checkpointing": True,
+        "sp_size": width,
+        "ep_size": 8 if qwen else width,
+        "ep_group_layout": "auto",
+        "mb_spec": {"max_tokens_per_mb": 262144},
+        "ac_config": {
+            "mode": "full",
+            "freq": 1,
+            "router_replay_recompute": True,
+            "offload_config": {
+                "enabled": not qwen,
+                "keep_last_n": 1,
+                "use_streams": True,
+                "pin_memory_enabled": True,
+                "pin_memory_max_size_gib": "auto",
+                "pin_memory_bucket_size_mib": 64,
+            },
+        },
+        "tiled_mlp_token_chunk_size": None if qwen else 1024,
+        "step_peak_memory_log": True,
+        "optimizer": optimizer,
+        "ds_config": {
+            "train_batch_size": 1,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": 1,
+            "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+            "bf16": bf16,
+        },
+    }
+    peft = None
+    if lora:
+        peft = {
+            "peft_type": "Lora",
+            "r": 32,
+            "lora_alpha": 32,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"],
+        }
+        training["peft_config"] = peft
+    if qwen:
+        training.update(deepep_token_chunk_size=8192, fp32_lm_head=False, training_memory_telemetry=False)
+    elif lora:
+        training["prime_rl"] = {
+            "ep_comm_backend": "deepep",
+            "deepep_token_chunk_size": 8192,
+            "fused_cross_entropy": False if rl else "liger",
+        }
+        training["model_options"] = {"lm_head": {"cross_entropy": False if rl else "liger"}}
+        if rl:
+            training["prime_rl"]["fused_lm_head_token_chunk_size"] = 4096
+            training["model_options"]["lm_head"]["token_chunk_size"] = 4096
+    else:
+        training["prime_rl"] = {
+            "ep_comm_backend": "uccl",
+            "fused_cross_entropy": False if rl else "liger",
+            "deepep_token_chunk_size": 1024 if rl else 3072,
+        }
+        training["model_options"] = {"moe": {"comm_token_chunk": 1024 if rl else 3072}}
+        if rl:
+            training["prime_rl"]["fused_lm_head_token_chunk_size"] = 1024
+            training["model_options"]["lm_head"] = {"token_chunk_size": 1024}
+        else:
+            training["model_options"]["lm_head"] = {"cross_entropy": "liger"}
+    sampling = None
+    if rl:
+        vllm = {"tensor_parallel_size": width, "trust_remote_code": True, "gpu_memory_utilization": 0.8}
+        if lora:
+            vllm["extra_engine_kwargs"] = {"attention_config": {"backend": "FLASHINFER_MLA_SPARSE_SM90"}}
+        sampling = {"n_gpus": width, "max_seq_len": 262144, "vllm_config": vllm}
+        if peft is not None:
+            sampling["peft_config"] = deepcopy(peft)
+    return model, training, sampling
+
+
+@pytest.mark.parametrize("location", ["client", "training", "sampling"])
+def test_flash_recipe_public_schema_rejects_unrepresentable_weight_format(location: str) -> None:
+    from pydantic import ValidationError
+
+    raw = {"model_name": "Qwen/Qwen3.8-Flash-Next"}
+    if location == "client":
+        raw["weight_format"] = "vllm"
+    else:
+        raw[location] = {"weight_format": "vllm"}
+    with pytest.raises(ValidationError) as failure:
+        ArcticClientConfig.model_validate(raw)
+    assert any(
+        error["loc"][-1] == "weight_format" and error["type"] == "extra_forbidden" for error in failure.value.errors()
+    )
+
+
+def test_flash_recipe_qwen_rl_sampling16_tp8_cannot_use_single_engine_override() -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    raw = {
+        "model_name": "Qwen/Qwen3.8-Flash-Next",
+        "max_seq_len": 262144,
+        "sampling_gpus": 16,
+        "sampling": {
+            "vllm": {"tensor_parallel_size": 8},
+            "arctic_inference_config": {"router_replay": {"enabled": True, "max_cache_bytes": 17179869184}},
+        },
+        "backend": {"type": "remote", "base_url": "http://127.0.0.1:8003"},
+    }
+    native = ArcticClientConfig.model_validate(raw)
+    assert native.sampling.vllm["tensor_parallel_size"] == 8
+    assert native.sampling.arctic_inference_config["router_replay"]["max_cache_bytes"] == 17179869184
+    with pytest.raises(ValueError, match="allocation must equal tensor times pipeline parallelism"):
+        CortexTrainingConfig.model_validate({**raw, "inference_tensor_parallel_size": 8})
+
+
+def _correctness_qwen_flash_source(recipe):
+    model, training, _ = _flash_source_recipe("qwen38-flash-next-sft-16gpus-256k")
+    for key in ("tiled_mlp_token_chunk_size", "deepep_token_chunk_size", "fp32_lm_head", "training_memory_telemetry"):
+        training.pop(key)
+    training["ac_config"]["offload_config"]["enabled"] = True
+    sampling = None
+    if recipe == "sft8":
+        training.update(n_gpus=8, sp_size=8)
+        training["ds_config"]["bf16"].update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    else:
+        training.pop("model_provider")
+        training.update(
+            router_replay={"enabled": True, "max_cache_bytes": 2147483648},
+            prime_rl={"fused_cross_entropy": False, "seq_len": 262144},
+            fused_lm_head_token_chunk_size=1024,
+            fused_lm_head_vocab_chunk_size=8192,
+        )
+        sampling = {
+            "n_gpus": 16,
+            "max_seq_len": 262144,
+            "num_replicas": 2,
+            "router_replay": {"enabled": True, "max_cache_bytes": 17179869184},
+            "vllm_config": {
+                "tensor_parallel_size": 8,
+                "trust_remote_code": True,
+                "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 16,
+                "distributed_executor_backend": "mp",
+                "enable_chunked_prefill": True,
+                "max_num_batched_tokens": 8192,
+                "enforce_eager": False,
+                "enable_return_routed_experts": True,
+                "enable_prefix_caching": True,
+                "gdn_prefill_backend": "triton",
+                "reasoning_parser": "qwen3",
+                "extra_engine_kwargs": {"disable_custom_all_reduce": True},
+            },
+        }
+    subjobs = [
+        {
+            "job_type": "training",
+            "model_name": model,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "weight_format": "vllm",
+            "training_config": training,
+        }
+    ]
+    if sampling is not None:
+        subjobs.append(
+            {
+                "job_type": "sampling",
+                "model_name": model,
+                "dtype": "bfloat16",
+                "seed": 42,
+                "weight_format": "vllm",
+                "inference_config": sampling,
+            }
+        )
+    return subjobs
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"])
+def test_flash_recipe_glm_rejects_generic_h200_attention(tmp_path: Path, model: str) -> None:
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="requires attn_implementation='sparse_mla'"):
+        validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
+
+
+# Config tolerance.
 
 
 def _config_tolerance_context(*, gate: float, dss_norm: float):
@@ -471,6 +775,113 @@ def test_config_tolerance_gradient_norm_verdict_uses_the_frozen_config_gate():
     assert _run_arm(failing_context, arm).outcome.value == "fail"
 
 
+def _participation_record(*, inactive=True):
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+
+    entries = {"weight": {"shape": [2, 3], "state": "active", "evidence": None}}
+    if inactive:
+        entries["visual.weight"] = {
+            "shape": [3, 3],
+            "state": "inactive",
+            "evidence": {
+                "kind": "text-decoder-bypass",
+                "module": "visual",
+                "calls": 0,
+                "outside_decoder_and_head": True,
+                "forward_sha256": "a" * 64,
+            },
+        }
+    return {"schema": PARTICIPATION_SCHEMA, "parameters": entries}
+
+
+def test_participation_requires_complete_matching_inventory_and_independent_inactivity():
+    from arctic_platform.correctness.harness.participation import compare_participation
+
+    record = _participation_record()
+    assert compare_participation(record, record) == (1, 1)
+    with pytest.raises(ValueError, match="incomplete trainable inventory"):
+        compare_participation(_participation_record(inactive=False), record)
+    unexplained = deepcopy(record)
+    unexplained["parameters"]["visual.weight"]["evidence"] = None
+    with pytest.raises(ValueError, match="no independent evidence"):
+        compare_participation(unexplained, record)
+    disagreement = deepcopy(record)
+    disagreement["parameters"]["visual.weight"].update(state="active", evidence=None)
+    with pytest.raises(ValueError, match="participation or shape disagreement"):
+        compare_participation(disagreement, record)
+
+
+@pytest.mark.parametrize("norm", [float("nan"), float("inf"), -1.0])
+def test_gradient_comparison_rejects_nonfinite_or_negative_norms(norm):
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=norm)
+    result = _run_arm(context, arm)
+    assert result.outcome.value == "fail"
+    assert "finite" in result.reason
+
+
+def test_gradient_comparison_rejects_empty_pairs_and_missing_target_participation():
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    reference, target = context.reference_for(arm), context.target_for(arm)
+    reference["grad_norms"].clear()
+    target.grad_norms.clear()
+    assert _run_arm(context, arm).outcome.value == "fail"
+    reference["grad_norms"]["weight"] = target.grad_norms.setdefault("weight", 1.0)
+    reference["participation"] = _participation_record()
+    assert _run_arm(context, arm).outcome.value == "fail"
+
+
+def test_gradient_comparison_accepts_only_witnessed_inactive_zero_buffers():
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    reference, target = context.reference_for(arm), context.target_for(arm)
+    reference["participation"] = _participation_record()
+    target.participation = deepcopy(reference["participation"])
+    target.grad_norms["visual.weight"] = 0.0
+    result = _run_arm(context, arm)
+    assert result.outcome.value == "pass"
+    assert result.metrics["inactive_parameters_verified"] == 1.0
+    target.grad_norms["visual.weight"] = 0.1
+    assert _run_arm(context, arm).outcome.value == "fail"
+    target.grad_norms.pop("visual.weight")
+    target.grad_norms.pop("weight")
+    assert _run_arm(context, arm).outcome.value == "fail"
+
+
+def test_participation_observes_autograd_and_integer_outputs_without_inventing_zero_gradients():
+    import torch
+
+    from arctic_platform.correctness.harness.participation import ParticipationCapture
+    from arctic_platform.correctness.harness.participation import validate_participation
+
+    class Glm5NextTextIndexer(torch.nn.Linear):
+        def forward(self, value):
+            return super().forward(value).argmax(dim=-1)
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.visual = torch.nn.Linear(3, 3, bias=False)
+    model.indexer = Glm5NextTextIndexer(3, 3, bias=False)
+    initial_hooks = {name: len(parameter._backward_hooks or {}) for name, parameter in model.named_parameters()}
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3, requires_grad=True)
+        model.indexer(value)
+        (model.head(model.decoder(value)) * 0).sum().backward()
+        entries = validate_participation(capture.result())
+    assert entries["decoder.weight"]["state"] == entries["head.weight"]["state"] == "active"
+    assert entries["visual.weight"]["state"] == entries["indexer.weight"]["state"] == "inactive"
+    assert model.visual.weight.grad is None and model.indexer.weight.grad is None
+    assert torch.count_nonzero(model.decoder.weight.grad) == 0
+    assert initial_hooks == {
+        name: len(parameter._backward_hooks or {}) for name, parameter in model.named_parameters()
+    }
+    model.register_parameter("unexpected", torch.nn.Parameter(torch.ones(2)))
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        model.indexer(value)
+        model.head(model.decoder(value)).sum().backward()
+        with pytest.raises(ValueError, match="unexpected missing gradient"):
+            validate_participation(capture.result())
+
+
 def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor():
     floor = Tolerance(absolute=0.001, computed_gate=0.0004)
     rounded = Tolerance(absolute=0.002, computed_gate=0.0012)
@@ -478,6 +889,9 @@ def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold
     assert rounded.absolute == 0.002
     with pytest.raises(ValueError, match="does not equal upward-rounded"):
         Tolerance(absolute=0.001, computed_gate=0.0012)
+
+
+# Names.
 
 
 def test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts() -> None:
@@ -530,12 +944,12 @@ def test_names_unequal_checkpoint_aliases_fail_coverage() -> None:
     assert only_dss == ["model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"]
 
 
-def test_names_unused_zero_vision_gradients_are_excluded() -> None:
+def test_names_unmatched_zero_vision_gradients_fail_coverage() -> None:
     dss = {"model.visual.blocks.0.attn.qkv.weight": 0.0, "model.layers.0.input_layernorm.weight": 2.0}
     reference = {"model.language_model.layers.0.input_layernorm.weight": 2.0}
     pairs, only_dss, only_reference = align(dss, reference)
     assert pairs == [("layers.0.input_layernorm.weight", 2.0, 2.0)]
-    assert not only_dss
+    assert only_dss == ["model.visual.blocks.0.attn.qkv.weight"]
     assert not only_reference
 
 
@@ -650,6 +1064,33 @@ def test_names_glm53_bare_shared_expert_does_not_match_singular_hf_container() -
     assert only_dss == [original]
     assert only_reference == [reference]
 
+
+# Original models.
+
+
+_original_models_QWEN8 = "Qwen/Qwen3-8B"
+
+_original_models_DENSE27 = "Qwen/Qwen3.8-27B"
+
+_original_models_FLASH = "Qwen/Qwen3.8-Flash-Next"
+
+_original_models_DENSE_CONFIG = "qwen3.8-27b-b200-train-sft-8gpus-2k"
+
+_original_models_FLASH_CONFIG = "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
+
+_original_models_FLASH_SOURCE = (
+    "/checkpoint/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540"
+)
+
+
+def _original_models_case(model, config_id, source):
+    return (
+        SimpleNamespace(model_name=model, config_id=config_id),
+        SimpleNamespace(model=SimpleNamespace(source_checkpoint=source)),
+    )
+
+
+# Placement widths.
 
 _placement_widths_CASES = [
     (8, 4, [4, 8]),
@@ -865,6 +1306,9 @@ def test_placement_widths_a_multiple_below_one_is_refused() -> None:
         scaled_for_placement(arms_for(8192, 4), 0)
 
 
+# Spec.
+
+
 def test_spec_model_hash_ignores_non_model_processor_sidecars(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("model")
     (tmp_path / "model.safetensors").write_bytes(b"weights")
@@ -879,3 +1323,14 @@ def test_spec_model_hash_keeps_tokenizer_metadata_in_identity(tmp_path: Path) ->
     expected = hash_directory(tmp_path)
     (tmp_path / "tokenizer_config.json").write_text("tokenizer")
     assert hash_directory(tmp_path) != expected
+
+
+# Reference-free RL onboarding.
+
+
+def _rl_bootstrap_validation(status="pass"):
+    return {
+        "status": status,
+        "log": "/synthetic-only/run.log",
+        "report": "/synthetic-only/report.json" if status == "pass" else None,
+    }

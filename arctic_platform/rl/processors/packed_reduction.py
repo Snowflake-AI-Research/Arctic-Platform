@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from arctic_platform.common.utils.batch import metric_is_summed
+from arctic_platform.debug.router_replay_trace import maybe_complete_router_replay_call
 
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss
@@ -184,6 +185,7 @@ def apply_packed_loss_reduction(
     scaled = loss_tensor * scale
     if backward is True:
         engine.backward(scaled, scale_wrt_gas=False)
+        maybe_complete_router_replay_call(engine)
         return None
     return scaled
 

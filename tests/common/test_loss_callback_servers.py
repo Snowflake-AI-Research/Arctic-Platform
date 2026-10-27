@@ -26,6 +26,24 @@ import torch
 from arctic_platform.rl.processors import BaseLoss
 
 
+def _awaitable(value):
+    """ObjectRef stand-in. The training gather rejects a bare return value."""
+
+    async def _done():
+        return value
+
+    return _done()
+
+
+def _training_server(ray_server):
+    """Server built without ``__init__``, with the training lock the gather requires."""
+    server = object.__new__(ray_server.ArcticRLRayServer)
+    server._training_op_lock = asyncio.Lock()
+    server._training_failed = False
+    server._training_failure = None
+    return server
+
+
 def _request() -> dict:
     return {
         "kwargs": {
@@ -61,6 +79,119 @@ class _RecordingLoss:
 
     def reporting_callback(self, worker_metrics, metrics, avg_loss):
         return self.loss.reporting_callback(worker_metrics, metrics, avg_loss)
+
+
+class _SPLogicalLoss(_RecordingLoss):
+    def metrics_callback(self, worker_metrics, metrics):
+        self.loss.metrics_callback(worker_metrics, metrics)
+        self.events.append(("metrics", len(worker_metrics)))
+
+    def reporting_callback(self, worker_metrics, metrics, avg_loss):
+        self.events.append(("reporting", len(worker_metrics)))
+        return self.loss.reporting_callback(worker_metrics, metrics, avg_loss)
+
+
+def _sp_execution_server(monkeypatch):
+    import arctic_platform.common.ray_server as ray_server
+    import arctic_platform.rl.processors.base_loss as base_loss_module
+
+    events = []
+    loss = _SPLogicalLoss(base_loss_module.resolve_loss("grpo"), events)
+    monkeypatch.setattr(base_loss_module, "resolve_loss", lambda name: loss)
+    groups = ((2, 0), (3, 1))
+    records = {
+        rank: {"rank": rank, "world_size": 4, "sp_size": 2, "sp_rank": local, "sp_ranks": list(group)}
+        for group in groups
+        for local, rank in enumerate(group)
+    }
+    server = _training_server(ray_server)
+    server.jobs = {1: {"job_type": "training", "sp_size": 2}}
+
+    class Membership:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def remote(self):
+            events.append(("membership", self.rank))
+            return dict(records[self.rank])
+
+    class Model:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def remote(self, shard):
+            events.append(("worker", self.rank))
+            assert sum(isinstance(event, tuple) and event[0] == "membership" for event in events) == 4
+            assert shard["meta"]["dp_size"] == 2
+            return _awaitable(
+                {
+                    "_sequence_parallel_info": dict(records[self.rank]),
+                    "avg_loss": 1.0 if self.rank in (3, 1) else 2.0,
+                    "metrics": {"token_count": float(shard["batch"]["input_ids"].shape[0])},
+                    "batch": {"output": shard["batch"]["input_ids"]},
+                }
+            )
+
+    server.training_workers = [
+        type(
+            "Worker",
+            (),
+            {
+                "get_sequence_parallel_info": Membership(rank),
+                "forward_backward": Model(rank),
+                "forward_no_grad": Model(rank),
+            },
+        )()
+        for rank in (1, 2, 3, 0)
+    ]
+    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
+    request = {
+        "batch": {
+            "input_ids": torch.arange(20).reshape(5, 4),
+            "attention_mask": torch.ones(5, 4, dtype=torch.long),
+            "loss_mask": torch.tensor([[1, 1, 1, 0]]).expand(5, -1).clone(),
+            "advantages": torch.ones(5, 4),
+        },
+        "meta": {"return_fwd_batch": True},
+        "processing": {"loss_fn": "grpo", "post": ["compute_logprobs"], "config": {"loss_agg_mode": "token-mean"}},
+    }
+    return server, records, request, events
+
+
+@pytest.mark.parametrize("backward", [True, False])
+def test_sp_execution_ray_collects_logical_callbacks_and_rows_once(monkeypatch, backward):
+    server, _, request, events = _sp_execution_server(monkeypatch)
+    method = server.forward_backward if backward else server.forward
+    result = asyncio.run(method(1, request))
+    assert result["avg_loss"] == 3.0
+    assert result["metrics"]["token_count"] == 5.0
+    assert torch.equal(result["batch"]["output"], request["batch"]["input_ids"])
+    assert events[-2:] == [("reporting", 2), ("metrics", 2)]
+    assert len([event for event in events if isinstance(event, tuple) and event[0] == "worker"]) == 4
+
+
+def test_sp_execution_ray_rejects_returned_membership_drift(monkeypatch):
+    server, _, request, events = _sp_execution_server(monkeypatch)
+    model = server.training_workers[0].forward_backward
+    original = model.remote
+
+    async def changed(shard):
+        result = await original(shard)
+        result["_sequence_parallel_info"]["rank"] = 3
+        return result
+
+    model.remote = changed
+    with pytest.raises(ValueError, match="dispatched worker"):
+        asyncio.run(server.forward_backward(1, request))
+    assert not any(isinstance(event, tuple) and event[0] == "metrics" for event in events)
+
+
+def test_sp_execution_ray_rejects_unsupported_route_before_membership_rpc(monkeypatch):
+    server, _, request, events = _sp_execution_server(monkeypatch)
+    request["processing"]["post"] = ["compute_entropy_and_logprobs"]
+    with pytest.raises(ValueError, match="selected compute_logprobs"):
+        asyncio.run(server.forward_backward(1, request))
+    assert not any(isinstance(event, tuple) for event in events)
 
 
 class _BatchingStateLoss(BaseLoss):
@@ -144,9 +275,9 @@ def test_ray_forward_backward_runs_loss_callbacks_around_real_split(monkeypatch)
             self.index = index
 
         def remote(self, shard):
-            return _assert_shard(shard, self.index, events)
+            return _awaitable(_assert_shard(shard, self.index, events))
 
-    server = object.__new__(ray_server.ArcticRLRayServer)
+    server = _training_server(ray_server)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
     server.training_workers = [type("Worker", (), {"forward_backward": Remote(index)})() for index in range(2)]
     monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
@@ -167,9 +298,9 @@ def test_ray_forward_runs_loss_callbacks_around_real_split(monkeypatch):
             self.index = index
 
         def remote(self, shard):
-            return _assert_shard(shard, self.index, events)
+            return _awaitable(_assert_shard(shard, self.index, events))
 
-    server = object.__new__(ray_server.ArcticRLRayServer)
+    server = _training_server(ray_server)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
     server.training_workers = [type("Worker", (), {"forward_no_grad": Remote(index)})() for index in range(2)]
     monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
@@ -304,9 +435,9 @@ def test_ray_preserves_batching_state_through_serialized_worker_execution(monkey
     class Remote:
         def remote(self, shard):
             worker_shard = pickle.loads(pickle.dumps(shard))
-            return worker.forward_backward(worker_shard)
+            return _awaitable(worker.forward_backward(worker_shard))
 
-    server = object.__new__(ray_server.ArcticRLRayServer)
+    server = _training_server(ray_server)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
     server.training_workers = [type("Worker", (), {"forward_backward": Remote()})()]
     monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
@@ -346,9 +477,9 @@ def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypa
 
         def remote(self, shard):
             received.append(shard)
-            return self.worker.forward_backward(shard)
+            return _awaitable(self.worker.forward_backward(shard))
 
-    server = object.__new__(ray_server.ArcticRLRayServer)
+    server = _training_server(ray_server)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
     server.training_workers = [type("Worker", (), {"forward_backward": Remote(worker)})() for worker in workers]
     monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
@@ -382,9 +513,9 @@ def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_s
             self.worker = worker
 
         def remote(self, shard):
-            return self.worker.forward_backward(shard)
+            return _awaitable(self.worker.forward_backward(shard))
 
-    server = object.__new__(ray_server.ArcticRLRayServer)
+    server = _training_server(ray_server)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
     server.training_workers = [type("Worker", (), {"forward_backward": Remote(worker)})() for worker in workers]
     monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)

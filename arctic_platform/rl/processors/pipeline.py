@@ -67,6 +67,8 @@ from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
 from arctic_platform.common.utils.batch import META_FWD_SCALAR_KEYS
 from arctic_platform.common.utils.batch import _reject_meta_fwd_scalars_on_batch
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
+from arctic_platform.debug.router_replay_trace import maybe_begin_router_replay_call
+from arctic_platform.debug.router_replay_trace import maybe_complete_router_replay_call
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
 from arctic_platform.rl.utils.debug import ProfilerContext
@@ -569,6 +571,7 @@ def run_pipeline(
             if validate_loss_callback:
                 loss_object.validation_callback(context, config)
             loss_object.model_forward_callback(fwd_kwargs, context, config, output_keys)
+        maybe_begin_router_replay_call(engine, fwd_kwargs, backward=backward)
         if backward is False:
             engine.eval()
             with torch.no_grad():
@@ -644,6 +647,7 @@ def run_pipeline(
                 # Pass `scale_wrt_gas=False` so DS leaves our pre-normalized
                 # loss alone.
                 engine.backward(loss, scale_wrt_gas=False)
+                maybe_complete_router_replay_call(engine)
 
             timers.stop_and_print_elapsed(tname)
             prof_bwd.report()

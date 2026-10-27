@@ -61,7 +61,7 @@ def assert_adamw_semantics(optimizer_config: dict) -> None:
 def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
     """One AdamW over the config's hyperparameters, with weight decay withheld from biases and norms.
 
-    Single-step references use independent PyTorch AdamW with fused and foreach
+    Single-step and trajectory references both use independent PyTorch AdamW with fused and foreach
     implementations disabled. Product optimizer rounding remains a measured difference.
     """
     import torch
@@ -84,6 +84,65 @@ def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
     return torch.optim.AdamW(groups, foreach=False, fused=False, **kwargs)
 
 
+def _write_adamw_parameter(
+    name,
+    source,
+    gradients,
+    optimizer_config,
+    *,
+    dtype,
+    learning_rate,
+    coefficient,
+    foreach_clip,
+    path,
+    consume_gradients,
+):
+    master = initial_master = optimizer = state = tensors = None
+    try:
+        master = torch.nn.Parameter(source.detach().to(dtype).clone(), requires_grad=True)
+        # Initialization precision conversion is not part of the optimizer update.
+        initial_master = master.detach().float().clone()
+        gradient = gradients.pop(name) if consume_gradients else gradients[name]
+        master.grad = gradient.detach().to(device=master.device, dtype=dtype).clone()
+        del gradient
+        if coefficient is not None:
+            if foreach_clip:
+                torch._foreach_mul_([master.grad], coefficient)
+            else:
+                master.grad.mul_(coefficient)
+        optimizer = build_adamw([(name, master)], optimizer_config, learning_rate=learning_rate)
+        optimizer.step()
+        master.grad = None
+        state = optimizer.state[master]
+        tensors = {
+            "parameter_update": master.detach().float().sub(initial_master).cpu(),
+            "exp_avg": state["exp_avg"].detach().cpu(),
+            "exp_avg_sq": state["exp_avg_sq"].detach().cpu(),
+        }
+        torch.save(tensors, path)
+        return {
+            "name": name,
+            "file": path.name,
+            "shape": list(master.shape),
+            "parameter_update_norm": float(torch.linalg.vector_norm(tensors["parameter_update"])),
+            "exp_avg_norm": float(torch.linalg.vector_norm(tensors["exp_avg"])),
+            "exp_avg_sq_norm": float(torch.linalg.vector_norm(tensors["exp_avg_sq"])),
+        }
+    finally:
+        if master is not None:
+            master.grad = None
+        if state is not None:
+            state.clear()
+        if optimizer is not None:
+            optimizer.state.clear()
+            for group in optimizer.param_groups:
+                group["params"].clear()
+            optimizer.param_groups.clear()
+        if tensors is not None:
+            tensors.clear()
+        master = initial_master = optimizer = state = tensors = None
+
+
 def run_adamw_step(
     model,
     gradients: Dict[str, "torch.Tensor"],
@@ -93,13 +152,32 @@ def run_adamw_step(
     gradient_clipping: float | None,
     optimizer_dtype: str,
     output_dir: Path,
+    consume_gradients: bool = False,
+    participation: dict | None = None,
 ) -> OptimizerStepArtifact:
-    """Apply one independent AdamW step and write each named state without an HTTP payload."""
+    """Apply one AdamW step, optionally consuming selected gradients after full clipping preflight."""
     output_dir = require_data_fast_path(output_dir, label="reference optimizer output")
     import torch
+    from torch.utils._foreach_utils import _has_foreach_support
 
     dtype = master_dtype(optimizer_dtype)
     assert_adamw_semantics(optimizer_config)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError("reference optimizer output directory must be empty")
+
+    inventory = None
+    if participation is not None:
+        from arctic_platform.correctness.harness.participation import validate_participation
+
+        inventory = validate_participation(participation)
+        actual = {
+            name: list(parameter.shape) for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        if actual != {name: entry["shape"] for name, entry in inventory.items()}:
+            raise ValueError("optimizer participation does not cover the actual trainable inventory")
+        active = {name for name, entry in inventory.items() if entry["state"] == "active"}
+        if set(gradients) != active:
+            raise ValueError("optimizer gradients do not match actual backward participation")
 
     named_parameters = [
         (name, parameter)
@@ -109,52 +187,82 @@ def run_adamw_step(
     if not named_parameters:
         raise ValueError("optimizer step found no trainable parameters with gradients")
 
-    masters = {
-        name: torch.nn.Parameter(parameter.detach().to(dtype).clone(), requires_grad=True)
-        for name, parameter in named_parameters
-    }
-    optimizer = build_adamw(
-        [(name, masters[name]) for name, _ in named_parameters], optimizer_config, learning_rate=learning_rate
-    )
-    for name, _ in named_parameters:
-        masters[name].grad = gradients[name].detach().to(device=masters[name].device, dtype=dtype).clone()
+    device = named_parameters[0][1].device
+    for name, parameter in named_parameters:
+        gradient = gradients[name]
+        if parameter.device != device or device.type == "meta":
+            raise ValueError("optimizer step requires parameters on one materialized device")
+        if type(gradient) is not torch.Tensor or gradient.layout != torch.strided:
+            raise ValueError(f"optimizer gradient {name!r} must be a dense Tensor")
+        if gradient.shape != parameter.shape:
+            raise ValueError(f"optimizer gradient {name!r} shape does not match its parameter")
 
-    gradient_norm = torch.linalg.vector_norm(
-        torch.stack([torch.linalg.vector_norm(masters[name].grad) for name, _ in named_parameters])
-    )
-    if gradient_clipping is not None and float(gradient_clipping) > 0:
-        torch.nn.utils.clip_grad_norm_(list(masters.values()), float(gradient_clipping))
-    optimizer.step()
+    clipping = gradient_clipping is not None and float(gradient_clipping) > 0
+    reported_norms, clipping_norms = [], []
+    foreach_clip = False
+    # Preserve both reductions: clip_grad_norm_'s default foreach norm need not equal the reported norm.
+    for name, parameter in named_parameters:
+        gradient = gradients[name].detach().to(device=device, dtype=dtype).clone()
+        try:
+            if not bool(torch.isfinite(gradient).all()):
+                raise ValueError(f"optimizer gradient {name!r} is not finite in {dtype}")
+            reported_norms.append(torch.linalg.vector_norm(gradient))
+            if clipping:
+                foreach_clip = _has_foreach_support([gradient], device)
+                clipping_norms.append(torch._foreach_norm([gradient], 2.0)[0] if foreach_clip else reported_norms[-1])
+        finally:
+            del gradient
+    gradient_norm = torch.linalg.vector_norm(torch.stack(reported_norms))
+    coefficient = None
+    if clipping:
+        clipping_norm = torch.linalg.vector_norm(torch.stack(clipping_norms))
+        coefficient = (float(gradient_clipping) / (clipping_norm + 1e-6)).clamp(max=1.0)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    entries = []
-    source_parameters = dict(named_parameters)
-    for index, (name, _) in enumerate(named_parameters):
-        master = masters[name]
-        state = optimizer.state[master]
-        source = source_parameters[name]
-        tensors = {
-            "parameter_update": master.detach().sub(source.detach().float()).cpu(),
-            "exp_avg": state["exp_avg"].detach().cpu(),
-            "exp_avg_sq": state["exp_avg_sq"].detach().cpu(),
-        }
-        filename = f"{index:06d}.pt"
-        torch.save(tensors, output_dir / filename)
-        entries.append(
-            {
-                "name": name,
-                "file": filename,
-                "shape": list(master.shape),
-                "parameter_update_norm": float(torch.linalg.vector_norm(tensors["parameter_update"])),
-                "exp_avg_norm": float(torch.linalg.vector_norm(tensors["exp_avg"])),
-                "exp_avg_sq_norm": float(torch.linalg.vector_norm(tensors["exp_avg_sq"])),
+    inactive_weights = {}
+    if inventory is not None:
+        from arctic_platform.correctness.harness.participation import validate_inactive_weights
+        from arctic_platform.correctness.harness.participation import weight_identity
+
+        for name, source in model.named_parameters():
+            if name not in inventory or inventory[name]["state"] != "inactive":
+                continue
+            master = torch.nn.Parameter(source.detach().to(dtype).clone(), requires_grad=True)
+            parameter_before, master_before = weight_identity(source), weight_identity(master)
+            optimizer = build_adamw([(name, master)], optimizer_config, learning_rate=learning_rate)
+            optimizer.step()
+            inactive_weights[name] = {
+                "parameter": {"before": parameter_before, "after": weight_identity(source)},
+                "master": {"before": master_before, "after": weight_identity(master)},
             }
+            if optimizer.state:
+                raise ValueError(f"inactive reference parameter {name} acquired Adam state")
+            del optimizer, master
+        validate_inactive_weights(participation, inactive_weights)
+    entries = []
+    for index, (name, source) in enumerate(named_parameters):
+        entries.append(
+            _write_adamw_parameter(
+                name,
+                source,
+                gradients,
+                optimizer_config,
+                dtype=dtype,
+                learning_rate=learning_rate,
+                coefficient=coefficient,
+                foreach_clip=foreach_clip,
+                path=output_dir / f"{index:06d}.pt",
+                consume_gradients=consume_gradients,
+            )
         )
-        state.clear()
-        master.grad = None
 
     manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps({"step": 1, "parameters": entries}, indent=2, sort_keys=True) + "\n")
+    temporary_manifest = output_dir / ".manifest.json.tmp"
+    manifest = {"step": 1, "parameters": entries}
+    if participation is not None:
+        manifest.update(participation=participation, inactive_weights=inactive_weights)
+    temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    temporary_manifest.replace(manifest_path)
     return OptimizerStepArtifact(
         manifest_path=manifest_path,
         gradient_norm_before_clip=float(gradient_norm.detach().cpu()),

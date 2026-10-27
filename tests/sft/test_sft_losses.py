@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import torch
 
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.sft.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.sft.processor import LOGIT_LOSS_FNS
 from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
 from arctic_platform.sft.processor import SFT_LOSS_FNS
@@ -33,6 +34,9 @@ from arctic_platform.sft.processor import run_sft_pipeline
 from arctic_platform.sft.processor import sft_ce_loss
 from arctic_platform.sft.processor import sft_loss
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
 
 
 class TestSFTRegistry(TestCasePlus):
@@ -69,6 +73,75 @@ class TestSFTLoss(TestCasePlus):
                 {},
                 "cpu",
             )
+
+
+class TestChunkedCausalLMLoss(TestCasePlus):
+    def _compare(self, *, dtype=torch.float32, num_items=None, shifted=False, noncontiguous=False):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        base = torch.randn(2, 11, 29, dtype=dtype)
+        if noncontiguous:
+            base = base.transpose(0, 1).contiguous().transpose(0, 1)
+        labels = torch.randint(0, 29, base.shape[:-1])
+        labels[..., 1::3] = -100
+        options = {"shift_labels": labels} if shifted else {}
+        original = base.detach().contiguous().clone().requires_grad_(True)
+        candidate = base.detach().clone().requires_grad_(True)
+        expected = ForCausalLMLoss(original, labels, 29, num_items_in_batch=num_items, **options)
+        actual = chunked_causal_lm_loss(candidate, labels, 29, num_items_in_batch=num_items, chunk_rows=3, **options)
+        (expected * 0.7).backward()
+        (actual * 0.7).backward()
+        torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
+
+    def test_masked_loss_and_backward(self):
+        self._compare()
+
+    def test_bfloat16_logits_and_gradient(self):
+        self._compare(dtype=torch.bfloat16)
+
+    def test_explicit_integer_denominator(self):
+        self._compare(num_items=43)
+
+    def test_explicit_tensor_denominator_and_shift(self):
+        self._compare(num_items=torch.tensor(43), shifted=True)
+
+    def test_fractional_denominator(self):
+        self._compare(num_items=0.5)
+
+    def test_double_precision_denominator(self):
+        self._compare(num_items=torch.tensor(43.0, dtype=torch.float64))
+
+    def test_zero_explicit_denominator_keeps_hf_behavior(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        original = torch.randn(2, 4, 13, requires_grad=True)
+        candidate = original.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, 13, (2, 4))
+        labels[:, 2] = -100
+        expected = ForCausalLMLoss(original, labels, 13, num_items_in_batch=0)
+        actual = chunked_causal_lm_loss(candidate, labels, 13, num_items_in_batch=0, chunk_rows=3)
+        expected.backward()
+        actual.backward()
+        torch_assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=0, equal_nan=True)
+
+    def test_noncontiguous_logits(self):
+        self._compare(noncontiguous=True)
+
+    def test_all_ignored_keeps_hf_nan_and_zero_gradient(self):
+        logits = torch.randn(2, 4, 13, requires_grad=True)
+        labels = torch.full((2, 4), -100)
+        loss = chunked_causal_lm_loss(logits, labels, 13, chunk_rows=3)
+        self.assertTrue(torch.isnan(loss))
+        loss.backward()
+        torch_assert_close(logits.grad, torch.zeros_like(logits), rtol=0, atol=0)
+
+    def test_invalid_chunk_size(self):
+        with self.assertRaisesRegex(ValueError, "chunk_rows"):
+            chunked_causal_lm_loss(torch.zeros(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), 3, chunk_rows=0)
 
 
 class TestSFTCELoss(TestCasePlus):
@@ -397,3 +470,93 @@ class TestSftCeSumFromHiddenErrors(TestCasePlus):
         )
         with self.assertRaises(ValueError):
             sft_ce_sum_from_hidden(model, torch.randn(1, 3, 4), torch.zeros(1, 3, dtype=torch.long), mode="none")
+
+
+class TestSftCeMemoryGradientReduction(TestCasePlus):
+    """CPU bookkeeping regression, not CUDA CE-kernel parity."""
+
+    device = "cpu"
+
+    class _TinyLm(torch.nn.Module):
+        def __init__(self, *, tied):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+            if tied:
+                self.lm_head.weight = self.embed_tokens.weight
+            self.config = SimpleNamespace(vocab_size=8)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+    def _check_gas4_reduction(self, *, tied, peak_mem_gib, tiles):
+        from arctic_platform.sft.processor import sft_ce_sum_from_hidden
+
+        set_seed(0)
+        model = self._TinyLm(tied=tied).to(self.device)
+        reference = self._TinyLm(tied=tied).to(self.device)
+        reference.load_state_dict(model.state_dict())
+        weight = model.lm_head.weight
+        weight.ds_grad_is_ready = True
+        readiness = []
+        reductions = []
+
+        def record_reduction(param):
+            ready = param.ds_grad_is_ready
+            readiness.append(ready)
+            if ready:
+                reductions.append(param.grad.detach().clone())
+
+        inputs = torch.tensor([[0, 1, 2, 3]], device=self.device)
+        labels = torch.tensor([[-100, 1, 2, 3]], device=self.device)
+        losses = []
+        reference_losses = []
+        hook = weight.register_post_accumulate_grad_hook(record_reduction)
+        try:
+            for _ in range(4):
+                ce_sum, n_valid = sft_ce_sum_from_hidden(
+                    model, model.embed_tokens(inputs), labels, mode="memory", peak_mem_gib=peak_mem_gib
+                )
+                reference_sum, reference_valid = sft_ce_sum_from_hidden(
+                    reference, reference.embed_tokens(inputs), labels, mode="compute"
+                )
+                self.assertEqual(n_valid, 3)
+                self.assertEqual(reference_valid, n_valid)
+                loss = ce_sum / (4 * n_valid)
+                reference_loss = reference_sum / (4 * reference_valid)
+                losses.append(loss.detach())
+                reference_losses.append(reference_loss.detach())
+                loss.backward()
+                reference_loss.backward()
+        finally:
+            hook.remove()
+
+        # Untied heads reduce only on the final tile. Tied heads additionally
+        # accumulate an input-embedding gradient in the outer backward.
+        per_microbatch = [False] * tiles + [True] if tied else [False] * (tiles - 1) + [True]
+        self.assertEqual(readiness, per_microbatch * 4)
+        self.assertEqual(len(reductions), 4)
+        self.assertTrue(weight.ds_grad_is_ready)
+        # fp32 summation order can differ between chunked and tiled replay.
+        torch_assert_close(torch.stack(losses), torch.stack(reference_losses), rtol=0, atol=1e-6)
+        for name, param in model.named_parameters():
+            reference_param = dict(reference.named_parameters())[name]
+            torch_assert_close(param.grad, reference_param.grad, rtol=0, atol=1e-6, msg=name)
+        torch_assert_close(reductions[-1], reference.lm_head.weight.grad, rtol=0, atol=1e-6)
+
+    def test_untied_lm_head_reduces_once_per_microbatch(self):
+        for peak_mem_gib, tiles in ((1.0, 1), (1e-12, 3)):
+            with self.subTest(tiles=tiles):
+                self._check_gas4_reduction(tied=False, peak_mem_gib=peak_mem_gib, tiles=tiles)
+
+    def test_tied_lm_head_reduces_after_outer_embedding_backward(self):
+        for peak_mem_gib, tiles in ((1.0, 1), (1e-12, 3)):
+            with self.subTest(tiles=tiles):
+                self._check_gas4_reduction(tied=True, peak_mem_gib=peak_mem_gib, tiles=tiles)
+
+
+@require_torch_gpu
+class TestSftCeMemoryGradientReductionGPU(TestSftCeMemoryGradientReduction):
+    """Repeat loss/gradient/reduction checks with the installed CUDA CE kernel."""
+
+    device = "cuda"

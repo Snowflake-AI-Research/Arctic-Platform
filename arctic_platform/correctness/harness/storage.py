@@ -154,17 +154,30 @@ def onboarding_node_prerequisites(request: dict) -> dict:
             if version is not None:
                 versions[name] = str(version)
         except Exception as exc:
-            installation = (
-                "Install the DSS checkout into this interpreter with python -m pip install -e "
-                "'/path/to/dss-platform' and complete its gateway/worker setup; "
-                "Arctic Platform's .[correctness] extra does not include DSS."
-                if name == "dss" or name.startswith("dss.")
-                else (
-                    "Install python -m pip install -e '.[correctness]' in this interpreter; "
-                    "sampling checks additionally require '.[rl]'."
+            if name == "dss" or name.startswith("dss."):
+                installation = (
+                    "Install the DSS checkout into this interpreter with python -m pip install -e "
+                    "'/path/to/dss-platform' and complete its gateway/worker setup; "
+                    "Arctic Platform's .[correctness] extra does not include DSS."
                 )
-            )
+            elif name == "arctic_platform.inference" or name.startswith("arctic_platform.inference."):
+                installation = "Install python -m pip install -e '.[inference]' for native sampling."
+            elif name == "arctic_inference" or name.startswith("arctic_inference."):
+                installation = "Install python -m pip install -e '.[rl]' for legacy OnPrem sampling."
+            elif name == "vllm" or name.startswith("vllm."):
+                installation = (
+                    "Install python -m pip install -e '.[inference]' for native sampling, "
+                    "or '.[rl]' for legacy OnPrem sampling."
+                )
+            else:
+                installation = "Install python -m pip install -e '.[correctness]' in this interpreter."
             errors.append(f"cannot import {name}: {type(exc).__name__}: {exc}. {installation}")
+    native_inference = modules.get("arctic_platform.inference.utils")
+    if native_inference is not None:
+        try:
+            native_inference.require_supported_vllm_version(feature="DSS correctness sampling")
+        except Exception as exc:
+            errors.append(f"native sampling runtime: {type(exc).__name__}: {exc}")
     torch = modules.get("torch")
     gpu_count = 0
     if torch is not None:

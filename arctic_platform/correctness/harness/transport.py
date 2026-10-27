@@ -14,11 +14,67 @@
 # limitations under the License.
 
 
-"Explicit supervised microbatch packing."
+"Training transport contracts and explicitly requested microbatch packing."
 
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
+from typing import ContextManager
+from typing import Optional
+from typing import Protocol
+
+
+class UnsafeCleanupError(RuntimeError):
+    """Owned resources may remain; do not start another correctness workload."""
+
+    def __init__(self, message, *, owned_parent=None, owned_children=None, shutdown_error=None):
+        super().__init__(message)
+        self.owned_parent = owned_parent
+        self.owned_children = dict(owned_children or {})
+        self.shutdown_error = shutdown_error
+        self.workload_error = None
+
+    def preserve_workload(self, error):
+        self.workload_error = error
+        self.args = (f"Original workload failed: {type(error).__name__}: {error}; {self}",)
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """A saved checkpoint and the job that wrote it, in whatever spelling the issuing transport uses."""
+
+    reference: str
+    source_job: str
+
+
+class TrainingJob(Protocol):
+    """A running training job, reduced to the two operations a loss trajectory needs."""
+
+    def fwd_bwd_step(self, body: bytes, *, learning_rate: float) -> float:
+        """Run one request's forward-backward and then one optimizer step, and return the request's loss.
+
+        ``body`` is a DSSST1 frame. The loss is the one the forward-backward reported, so it is measured
+        before the step that follows it changes any parameter.
+        """
+
+    def save_resumable(self) -> Checkpoint:
+        """Save model weights, optimizer moments and LR-scheduler position, and return what identifies them."""
+
+
+class Transport(Protocol):
+    """Somewhere jobs can be created, held open for as long as a check needs to create them."""
+
+    def __enter__(self) -> "Transport": ...
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None: ...
+
+    def job(self, *, resume_from: Optional[Checkpoint] = None) -> ContextManager[TrainingJob]:
+        """One job running the config this transport was built for, and destroyed when the block exits.
+
+        With ``resume_from`` the job initializes its weights, optimizer moments and scheduler position from
+        that checkpoint instead of from the base model.
+        """
 
 
 def pack_microbatches(

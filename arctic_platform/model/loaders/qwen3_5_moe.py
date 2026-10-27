@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.debug.reduced_fixture_mtp import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
@@ -35,12 +36,15 @@ from arctic_platform.model.loader import register_loader
 
 
 class DebugModelOptions(BaseModel):
+    """Loader debug options (provider ``DebugModelConfig`` fields only)."""
+
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     random_init: bool = False
     num_layers: int | None = Field(None, gt=0)
     gradient_sample_max_numel: int = Field(0, ge=0)
     full_determinism: bool = False
+    reduced_fixture_mtp: ReducedFixtureMTP | None = None
 
 
 class Qwen3_5MoeOptions(BaseModel):

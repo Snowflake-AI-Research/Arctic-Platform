@@ -65,11 +65,11 @@ def _file_hash(path: str, size: int, mtime_ns: int, ctime_ns: int, inode: int) -
     return digest.hexdigest()
 
 
-def file_identity(path: Path | str, *, use_cache: bool = True) -> dict:
+def file_identity(path: Path | str, *, refresh: bool = False) -> dict:
     path = Path(path)
     stat = path.stat()
-    hash_contents = _file_hash if use_cache else _file_hash.__wrapped__
-    sha = hash_contents(str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+    hash_file = _file_hash.__wrapped__ if refresh else _file_hash
+    sha = hash_file(str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
     current = path.stat()
     stable_fields = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
     if any(getattr(current, name) != getattr(stat, name) for name in stable_fields):
@@ -77,7 +77,7 @@ def file_identity(path: Path | str, *, use_cache: bool = True) -> dict:
     return {"sha256": sha, "size": stat.st_size}
 
 
-def model_identity(path: Path | str, *, use_cache: bool = True) -> dict:
+def model_identity(path: Path | str, *, refresh: bool = False) -> dict:
     """Hash asset contents, not machine-specific roots or file sizes alone."""
     from .config import NON_MODEL_PROCESSOR_SIDECARS
 
@@ -85,7 +85,7 @@ def model_identity(path: Path | str, *, use_cache: bool = True) -> dict:
     if not root.is_dir():
         raise ReferencePrerequisiteError(f"reference model assets unavailable: {root}")
     assets = {
-        str(item.relative_to(root)): file_identity(item, use_cache=use_cache)
+        str(item.relative_to(root)): file_identity(item, refresh=refresh)
         for item in sorted(root.rglob("*"))
         if item.is_file()
         and item.suffix in {".json", ".safetensors", ".bin", ".model", ".tiktoken", ".txt", ".py"}
@@ -134,7 +134,10 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         for path in [
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "batches.py",
+            root / "harness" / "sft.py",
             root / "harness" / "names.py",
+            root / "harness" / "participation.py",
+            root / "harness" / "optimizer_capture.py",
             *(
                 [root / "harness" / "shared_lora_adapter.py"]
                 if isinstance(recipe.get("initialization"), dict)
@@ -196,6 +199,10 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             )
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
+        if measurements.get("participation") is not None:
+            from .participation import active_gradient_norms
+
+            active_gradient_norms(measurements["participation"], norms)
         if check == "single-step-optimizer":
             summary = measurements.get("optimizer_norms", {})
             gate = measurements.get("optimizer_norm_gate", {})
@@ -214,8 +221,13 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if not summary.get("parameters"):
                 raise ReferencePrerequisiteError("optimizer reference has no parameter norms")
             from .names import validate_optimizer_norm_summary
+            from .participation import compare_participation
+            from .participation import validate_optimizer_participation
 
             validate_optimizer_norm_summary(summary)
+            validate_optimizer_participation(summary, backend="reference")
+            if measurements.get("participation") is not None or summary.get("participation") is not None:
+                compare_participation(measurements.get("participation"), summary.get("participation"))
 
 
 def _record_path(ctx, identity: dict) -> Path:

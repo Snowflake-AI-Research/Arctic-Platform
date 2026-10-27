@@ -43,6 +43,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
+from arctic_platform.correctness.harness.config import reference_calibration_worker_count
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
@@ -88,7 +89,11 @@ class _ConsoleLog:
 
 
 def _onboarding_failure(reason: str) -> None:
-    print(f"\n\n!!!!! ONBOARDING FAILED: {reason.upper()} !!!!!\n\n", file=sys.stderr, flush=True)
+    heading, separator, details = reason.partition("\n")
+    print(f"\n\n!!!!! ONBOARDING FAILED : {heading} !!!!!\n", file=sys.stderr, flush=True)
+    if separator:
+        print(details, file=sys.stderr, flush=True)
+    print(file=sys.stderr, flush=True)
 
 
 def logged_run(args: argparse.Namespace) -> int:
@@ -128,10 +133,7 @@ def logged_run(args: argparse.Namespace) -> int:
                         print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
                     finally:
-                        print(
-                            f"Total run time: {total_duration(time.monotonic() - started)}",
-                            flush=True,
-                        )
+                        print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)
             finally:
                 logger.handlers = previous_handlers
                 handler.close()
@@ -145,13 +147,7 @@ def logged_run(args: argparse.Namespace) -> int:
 def _stream_subprocess(command, *, cwd, env) -> int:
     """Stream child output through the console/log tee, including native-library output."""
     process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
     try:
         for line in process.stdout:
@@ -207,7 +203,7 @@ def _validation_gateway(args: argparse.Namespace):
     from arctic_platform.correctness.harness.dss_driver import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
-    with local_cortex_gateway(directory) as url:
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.correctness_participation") as url:
         yield url
 
 
@@ -245,16 +241,8 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                 if isinstance(function, ast.FunctionDef) and function.name == "logged_run":
                     for node in ast.walk(function):
                         for field, value in ast.iter_fields(node):
-                            if isinstance(value, list) and field in {
-                                "body",
-                                "orelse",
-                                "finalbody",
-                            }:
-                                setattr(
-                                    node,
-                                    field,
-                                    [item for item in value if ast.dump(item) not in footer_nodes],
-                                )
+                            if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                                setattr(node, field, [item for item in value if ast.dump(item) not in footer_nodes])
             tree.body = [
                 node
                 for node in tree.body
@@ -291,15 +279,9 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                     if len(node.items) == 1 and ast.dump(node.items[0]) == progress_context:
                         for child in ast.walk(node):
                             for field, value in ast.iter_fields(child):
-                                if isinstance(value, list) and field in {
-                                    "body",
-                                    "orelse",
-                                    "finalbody",
-                                }:
+                                if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
                                     setattr(
-                                        child,
-                                        field,
-                                        [item for item in value if ast.dump(item) != progress_update],
+                                        child, field, [item for item in value if ast.dump(item) != progress_update]
                                     )
                         return node.body
                     return node
@@ -325,16 +307,8 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
                 if isinstance(node, ast.If) and ast.dump(node.test) == reuse:
                     node.test = ast.Name(id="stepping", ctx=ast.Load())
                 for field, value in ast.iter_fields(node):
-                    if isinstance(value, list) and field in {
-                        "body",
-                        "orelse",
-                        "finalbody",
-                    }:
-                        setattr(
-                            node,
-                            field,
-                            [item for item in value if ast.dump(item) not in ignored],
-                        )
+                    if isinstance(value, list) and field in {"body", "orelse", "finalbody"}:
+                        setattr(node, field, [item for item in value if ast.dump(item) not in ignored])
         preparation["code"][relative] = {
             "schema": "onboarding-preparation-ast-v1",
             "sha256": hashlib.sha256(ast.dump(tree).encode()).hexdigest(),
@@ -366,16 +340,7 @@ def _resume_setup(args: argparse.Namespace) -> None:
     if not getattr(args, "_automatic_cortex_gateway", False):
         options["base_url"] = getattr(args, "base_url", None) or os.environ.get("ARCTIC_CORTEX_BASE_URL")
     versions = {}
-    for name in (
-        "torch",
-        "transformers",
-        "huggingface-hub",
-        "peft",
-        "deepspeed",
-        "ray",
-        "dss",
-        "dss-client",
-    ):
+    for name in ("torch", "transformers", "huggingface-hub", "peft", "deepspeed", "ray", "dss", "dss-client"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -386,7 +351,7 @@ def _resume_setup(args: argparse.Namespace) -> None:
         "options": options,
         "python": sys.executable,
         "dependencies": versions,
-        "source": model_identity(source, use_cache=False) if source.is_dir() else args.source_checkpoint,
+        "source": model_identity(source, refresh=True) if source.is_dir() else args.source_checkpoint,
         "code": {
             str(path.relative_to(root)): _checkpoint_file_identity(path)
             for folder in ("onboarding", "harness", "reference", "checks")
@@ -397,11 +362,7 @@ def _resume_setup(args: argparse.Namespace) -> None:
     args._resume_dir = args._resume_root / args.test_spec.stem / args.test_id / digest
     args._resume_dir.mkdir(parents=True, exist_ok=True)
     preparation = _resume_preparation_request(request, root)
-    manifest = {
-        "schema": "onboarding-resume-request-v1",
-        "request": request,
-        "preparation_request": preparation,
-    }
+    manifest = {"schema": "onboarding-resume-request-v1", "request": request, "preparation_request": preparation}
     manifest_path = args._resume_dir / "request.json"
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != manifest:
@@ -448,23 +409,16 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
                 _checkpoint_file_identity(path) == identity for path, identity in saved["files"].items()
             )
             valid = valid and all(
-                model_identity(path, use_cache=False) == identity for path, identity in saved["models"].items()
+                model_identity(path, refresh=True) == identity for path, identity in saved["models"].items()
             )
             if valid:
                 if saved["spec"] is not None:
                     args.test_spec.write_text(saved["spec"])
-                _stage(
-                    "Resume",
-                    phase.replace("-", " "),
-                    "Reusing the verified completed phase.",
-                )
+                _stage("Resume", phase.replace("-", " "), "Reusing the verified completed phase.")
                 return saved["result"]
         except (OSError, ValueError, KeyError):
             pass
-        print(
-            f"Retained {phase} work is missing or changed; rebuilding this phase.",
-            flush=True,
-        )
+        print(f"Retained {phase} work is missing or changed; rebuilding this phase.", flush=True)
     # A rebuilt phase invalidates downstream results even if it happens to reproduce identical bytes.
     args._resume_candidates = []
     phases = ("sizing", "fixture", "calibration", "references", "validation")
@@ -580,7 +534,31 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
     if getattr(args, "_automatic_cortex_gateway", False):
         target_modules.append("dss.ray_dss.gateway_server")
     if target_local and (config.is_rl or "inference-checkpoint-loss" in selection):
-        target_modules += ["arctic_inference", "vllm"]
+        if getattr(args, "_automatic_cortex_gateway", False):
+            target_modules += [
+                "arctic_platform.inference.server.multi_model",
+                "arctic_platform.inference.server.config",
+                "arctic_platform.inference.server.weight_sync.schedule",
+                "arctic_platform.inference.server.weight_sync.sender",
+                "arctic_platform.inference.server.weight_sync",
+                "arctic_platform.inference.utils",
+                "vllm",
+            ]
+            if config.is_rl:
+                sampling_settings = [
+                    sub.get("inference_config") or {}
+                    for sub in getattr(config, "sub_jobs", [])
+                    if sub.get("job_type") == "sampling"
+                ]
+                replay_enabled = bool((config.training.get("router_replay") or {}).get("enabled")) or any(
+                    (settings.get("router_replay") or {}).get("enabled")
+                    or (settings.get("vllm_config") or {}).get("enable_return_routed_experts")
+                    for settings in sampling_settings
+                )
+                if replay_enabled:
+                    target_modules.append("arctic_platform.inference.server.router_replay")
+        else:
+            target_modules += ["arctic_inference", "vllm"]
     attention = []
     if reference:
         attention.append(config.reference_attention_implementation)
@@ -602,7 +580,7 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         "modules": common + reference_modules + target_modules,
         "attention": sorted(set(attention)),
         "hf_attention": [config.reference_attention_implementation] if reference else [],
-        "min_gpus": max(1, getattr(args, "reference_calibration_workers", 1)) if reference else int(target_local),
+        "min_gpus": (getattr(args, "reference_calibration_workers", None) or 1) if reference else int(target_local),
         "gpu_type": config.gpu_type if target_local else None,
         "source": source if Path(source).is_absolute() else None,
         "model_id": source,
@@ -768,7 +746,7 @@ def _sizing_request(args: argparse.Namespace, layers: int) -> dict:
     sources = [
         *sorted((root / "reference").glob("*.py")),
         root / "onboarding" / "synth_model.py",
-        *(root / "harness" / name for name in ("config.py", "batches.py", "names.py")),
+        *(root / "harness" / name for name in ("config.py", "batches.py", "sft.py", "names.py")),
     ]
     return {
         "config_sha256": file_identity(args.config)["sha256"],
@@ -830,8 +808,7 @@ def _reuse_sizing(args: argparse.Namespace, layers: int) -> dict:
         raise ValueError("sizing reuse requires the retained model weights")
     if selected.get("model_hash") != hash_directory(model_path):
         raise ValueError("sizing reuse model identity mismatch")
-    # A rapid same-size rewrite can retain the cached filesystem timestamp key.
-    if receipt.get("model_identity") != model_identity(model_path, use_cache=False):
+    if receipt.get("model_identity") != model_identity(model_path, refresh=True):
         raise ValueError("sizing reuse model contents changed after admission")
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     text_config = getattr(model_config, "text_config", model_config)
@@ -943,45 +920,13 @@ def _probe_worker(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def build_spec(
-    cfg,
-    source_checkpoint: str,
-    cache_root: str,
-    arm_defs,
-    *,
-    attn_implementations=None,
-    num_layers: int | None = None,
-    workdir: Path | None = None,
-):
-    """Materialize the reduced reference model and freeze the generated cases."""
-    cache_root = require_data_fast_path(cache_root, label="onboarding model cache")
-    if workdir is not None:
-        workdir = require_data_fast_path(workdir, label="onboarding work directory")
-
-    from transformers import AutoConfig
-
+def _spec_arms(cfg, arm_defs, vocab_size: int):
+    """Describe the same generated comparison cases for reduced and full-source specifications."""
     from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import ArmSpec
-    from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
-    from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
-    from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
-    temporary.mkdir(parents=True, exist_ok=True)
-    if num_layers is None:
-        num_layers, _ = size_for_single_gpu(source_checkpoint)
-    destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
-    model = materialize_pretrained(source_checkpoint, destination, num_layers)
-    print(
-        f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}",
-        flush=True,
-    )
-
-    model_config = AutoConfig.from_pretrained(destination, trust_remote_code=True)
-    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
     arms = []
     for definition in arm_defs:
         batch = build_batch(
@@ -1005,13 +950,49 @@ def build_spec(
             )
         )
 
-    implementations = attn_implementations or [cfg.attention_implementation]
     notes = []
     if not any(arm.dss_microbatches > 1 for arm in arms):
         notes.append(
             "No arm splits into more than one microbatch, so gradient accumulation is untested; "
             "raise a global batch size or lower mb_spec.max_tokens_per_mb."
         )
+    return arms, notes
+
+
+def build_spec(
+    cfg,
+    source_checkpoint: str,
+    cache_root: str,
+    arm_defs,
+    *,
+    attn_implementations=None,
+    num_layers: int | None = None,
+    workdir: Path | None = None,
+):
+    """Materialize the reduced reference model and freeze the generated cases."""
+    cache_root = require_data_fast_path(cache_root, label="onboarding model cache")
+    if workdir is not None:
+        workdir = require_data_fast_path(workdir, label="onboarding work directory")
+
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
+    from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
+
+    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
+    temporary.mkdir(parents=True, exist_ok=True)
+    if num_layers is None:
+        num_layers, _ = size_for_single_gpu(source_checkpoint)
+    destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
+    model = materialize_pretrained(source_checkpoint, destination, num_layers)
+    print(f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}", flush=True)
+
+    model_config = AutoConfig.from_pretrained(destination, trust_remote_code=True)
+    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
+    arms, notes = _spec_arms(cfg, arm_defs, vocab_size)
+    implementations = attn_implementations or [cfg.attention_implementation]
     return TestSpec(
         config_id=cfg.config_id,
         config_path=str(cfg.path),
@@ -1071,9 +1052,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         key = str(model_path.resolve())
         if key not in generated:
             generated[key] = generate_adapter(
-                model_path,
-                config.training["peft_config"],
-                correctness_workdir("shared-peft-") / "adapter",
+                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
@@ -1115,6 +1094,7 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
         tokens=args.tokens,
         reference_token_budget=args.reference_token_budget,
         peft_adapter_path=peft_adapter_path,
+        reference_calibration_workers=getattr(args, "reference_calibration_workers", None),
     )
     calibration_script.write_text(render(render_args))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
@@ -1166,7 +1146,9 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         raise ValueError("optimizer calibration requires an explicit optimizer config")
     adapter_path = _shared_adapter(args, config, model_path)
 
-    lanes = max(1, min(CALIBRATION_RUNS, torch.cuda.device_count()))
+    lanes = reference_calibration_worker_count(
+        getattr(args, "reference_calibration_workers", None), runs=CALIBRATION_RUNS
+    )
     calibration_root = correctness_workdir("optimizer-calibration-")
     manifests: list[Path] = []
     worst_delta = 0.0
@@ -1206,18 +1188,18 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     try:
         completed: dict[int, tuple[float, dict]] = {}
         with tqdm(
-            total=CALIBRATION_RUNS,
-            desc="Finding optimizer tolerance",
-            unit="run",
-            dynamic_ncols=True,
+            total=CALIBRATION_RUNS, desc="Finding optimizer tolerance", unit="run", dynamic_ncols=True
         ) as progress:
-            with ThreadPoolExecutor(max_workers=lanes) as pool:
-                futures = [pool.submit(one_run, index) for index in range(CALIBRATION_RUNS)]
-                for future in as_completed(futures):
-                    index, elapsed, result = future.result()
-                    completed[index] = (elapsed, result)
-                    progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
-                    progress.update()
+            for start in range(0, CALIBRATION_RUNS, lanes):
+                with ThreadPoolExecutor(max_workers=lanes) as pool:
+                    futures = [
+                        pool.submit(one_run, index) for index in range(start, min(start + lanes, CALIBRATION_RUNS))
+                    ]
+                    for future in as_completed(futures):
+                        index, elapsed, result = future.result()
+                        completed[index] = (elapsed, result)
+                        progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
+                        progress.update()
         for index in range(CALIBRATION_RUNS):
             elapsed, result = completed[index]
             durations.append(elapsed)
@@ -1227,10 +1209,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         parameter_count = len(json.loads(manifests[0].read_text())["parameters"])
         pair_count = CALIBRATION_RUNS * (CALIBRATION_RUNS - 1) // 2
         with tqdm(
-            total=parameter_count,
-            desc=f"Comparing {pair_count} reference pairs",
-            unit="tensor",
-            dynamic_ncols=True,
+            total=parameter_count, desc=f"Comparing {pair_count} reference pairs", unit="tensor", dynamic_ncols=True
         ) as progress:
             worst = max_pairwise_optimizer_delta(
                 manifests,
@@ -1371,15 +1350,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
     ):
         raise ValueError("optimizer validation bootstrap requires only local Cortex Test 2 onboarding")
     admitted = {}
-    fields = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_nlink",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
-    )
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
     for role, value, digest in (
         ("bootstrap", values[0], values[1]),
         ("config", values[2], values[3]),
@@ -1409,11 +1380,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
             or hashlib.sha256(raw).hexdigest() != digest
         ):
             raise ValueError(f"optimizer validation {role} changed or SHA256 differs")
-        admitted[role] = {
-            "path": str(path),
-            "sha256": digest,
-            "file_identity": identity,
-        }
+        admitted[role] = {"path": str(path), "sha256": digest, "file_identity": identity}
     return admitted
 
 
@@ -1454,12 +1421,19 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
-    if getattr(args, "local_cortex_fixture", False):
-        command.append("--local-cortex-fixture")
     if getattr(args, "reference_records_dir", None) is not None:
         command += ["--reference-records-dir", str(args.reference_records_dir)]
+    if getattr(args, "local_cortex_fixture", False):
+        command.append("--local-cortex-fixture")
     if getattr(args, "peft_adapter", None) is not None:
         command += ["--peft-adapter", str(args.peft_adapter)]
+    if getattr(args, "dense_checkpoint_allocation", None) is not None:
+        command += [
+            "--dense-checkpoint-allocation",
+            str(args.dense_checkpoint_allocation),
+            "--dense-checkpoint-allocation-sha256",
+            str(args.dense_checkpoint_allocation_sha256),
+        ]
     if bootstrap is not None:
         command = [
             sys.executable,
@@ -1473,13 +1447,13 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--",
             *command[3:],
         ]
-    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     description = selected.get("model_description", f"frozen {layers}-layer regression")
     _stage(phase, "Target Validation", description)
     lines: list[str] = []
     with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
             command += ["--base-url", gateway_url]
+        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
         process = subprocess.Popen(
             command,
             cwd=args.checkout_root,
@@ -1575,11 +1549,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     test_id = "single-step-optimizer"
     criterion = CRITERIA[test_id]
     runs = args.reference_calibration_runs
-    workers = args.reference_calibration_workers
-    if runs != CALIBRATION_RUNS or not 1 <= workers <= 8:
-        raise ValueError(
-            f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm and 1 to 8 HF workers"
-        )
+    if runs != CALIBRATION_RUNS:
+        raise ValueError(f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm")
+    workers = reference_calibration_worker_count(args.reference_calibration_workers, runs=runs)
     records_root = require_git_records_dir(args.reference_records_dir)
     records_root.mkdir(parents=True, exist_ok=True)
     model_config = AutoConfig.from_pretrained(args.optimizer_model_path, trust_remote_code=True)
@@ -1784,11 +1756,7 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
     )
     try:
         calibration_json = Path(
-            _resume_phase(
-                args,
-                "calibration",
-                lambda: str(_run_local_optimizer_calibration(args, config, spec)),
-            )
+            _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
         )
         selected = {"layers": optimizer_layers}
         validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
@@ -2034,11 +2002,22 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--reference-calibration-runs", type=int, default=CALIBRATION_RUNS)
     parser.add_argument(
+        "--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON"
+    )
+    parser.add_argument(
+        "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+    )
+    parser.add_argument(
         "--peft-adapter",
         type=Path,
         help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
     )
-    parser.add_argument("--reference-calibration-workers", type=int, default=1)
+    parser.add_argument(
+        "--reference-calibration-workers",
+        type=int,
+        default=None,
+        help="concurrent HF reference workers (default: available GPUs on this node, capped at 8)",
+    )
     parser.add_argument(
         "--local-cortex-fixture",
         action="store_true",
@@ -2126,6 +2105,14 @@ def run(args: argparse.Namespace) -> int:
         _onboarding_kind(args.test_id)
     for test_id in getattr(args, "reference_tests", None) or []:
         _onboarding_kind(test_id)
+    from arctic_platform.correctness.harness.execution import _load_dense_checkpoint_allocation
+
+    if getattr(args, "dense_checkpoint_allocation", None) is not None:
+        args.dense_checkpoint_allocation = Path(args.dense_checkpoint_allocation).resolve()
+    _load_dense_checkpoint_allocation(
+        SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}),
+        allow_automatic_gateway=True,
+    )
     _optimizer_validation_bootstrap(args)
     if getattr(args, "local_cortex_fixture", False) and (
         getattr(args, "prepare_references", False) or args.probe_layers is not None
@@ -2201,7 +2188,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             (
                 0
                 if test_id == "single-step-grads"
-                else (1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2)
+                else 1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2
             ),
             test_id,
         )
@@ -2223,10 +2210,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         print("preparing the gradient fixture required by the selected check", flush=True)
     for index, test_id in enumerate(queue, start=1):
         if test_id != "single-step-grads" and not config.is_rl and not spec_path.exists():
-            results[test_id] = {
-                "status": "failed",
-                "reason": "gradient fixture onboarding failed",
-            }
+            results[test_id] = {"status": "failed", "reason": "gradient fixture onboarding failed"}
             continue
         child = argparse.Namespace(
             **{
@@ -2239,11 +2223,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         if hasattr(args, "_diagnostics_dir"):
             child._diagnostics_dir = args._diagnostics_dir / test_id
             child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        _stage(
-            f"Onboarding {index}/{len(queue)}",
-            test_id.replace("-", " "),
-            f"Config: {config.config_id}",
-        )
+        _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
         try:
             code = _parent(child)
             results[test_id] = {
@@ -2321,10 +2301,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         report_path.write_text("\n".join(lines), encoding="utf-8")
         print(f"Report: {report_path}", flush=True)
     print(f"onboarding summary: {destination}", flush=True)
-    print(
-        (f"spec: {spec_path}" if spec_path.exists() else "no specification was published"),
-        flush=True,
-    )
+    print(f"spec: {spec_path}" if spec_path.exists() else "no specification was published", flush=True)
     return int(preparation_error is not None or any(result["status"] == "failed" for result in results.values()))
 
 
