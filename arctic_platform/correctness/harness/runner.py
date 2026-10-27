@@ -42,6 +42,7 @@ from typing import Optional
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..models import validate_local_full_model
@@ -56,6 +57,7 @@ from .config import ArmSpec
 from .config import LoadedConfig
 from .config import TestSpec
 from .config import correctness_microbatch_tokens
+from .config import reference_calibration_worker_count
 from .dss_driver import UnsafeCleanupError
 from .dss_driver import build_payload
 from .dss_driver import copy_checkpoint_peft_adapter
@@ -89,6 +91,7 @@ class RunContext:
     client_backend: OnPremConfig | CortexConfig = field(default_factory=OnPremConfig)
     # Populated only from a fixture binding validated against the reviewed local weights.
     target_model_name: str | None = None
+    published_fixture: dict | None = None
     local_gateway_full_model: bool = False
     local_full_model_path: str | None = None
     inference_sampling_topology: tuple[int, int, int] | None = None
@@ -125,6 +128,10 @@ class RunContext:
                 self.client_backend,
                 self.cfg,
                 attn_implementation=self.attn_implementation,
+                **({"model_name": self.target_model_name} if self.target_model_name is not None else {}),
+                **({"preserve_native_topology": True} if getattr(self.cfg, "is_rl", False) else {}),
+                spec=self.spec,
+                published_fixture=self.published_fixture,
             )
         from .dss_driver import GatewayTransport
 
@@ -392,13 +399,30 @@ def _cortex_rejection(
     published_fixture: dict | None = None,
     *,
     local_gateway_full_model: bool = False,
+    local_cortex_fixture: bool = False,
+    native_adapter_initialization: bool = False,
+    local_weight_sync: bool = False,
+    local_router_replay: bool = False,
 ) -> TestResult | None:
     reason = (
         None
-        if local_gateway_full_model and test.test_id == "e2e-sft-train-validate"
+        if (local_gateway_full_model and test.test_id == "e2e-sft-train-validate")
+        or (local_weight_sync and test.test_id == "rl-weight-sync")
+        or (local_router_replay and test.test_id == "rl-router-replay")
         else cortex_unavailable_reason(test, published_fixture)
     )
-    if reason is None and test.compares_to_reference and cfg.training.get("peft_config"):
+    native_e2e_adapter = local_cortex_fixture and test.test_id == "e2e-sft-train-validate"
+    native_first_two_adapter = (
+        local_cortex_fixture
+        and native_adapter_initialization
+        and test.test_id in {"single-step-grads", "single-step-optimizer"}
+    )
+    if (
+        reason is None
+        and test.compares_to_reference
+        and cfg.training.get("peft_config")
+        and not (native_e2e_adapter or native_first_two_adapter)
+    ):
         reason = "Cortex reference comparisons cannot export the product-initialized LoRA adapter"
     if reason is None:
         return None
@@ -442,10 +466,11 @@ def execute(
     peft_adapter: Path | None = None,
     historical_gradient_references: dict | None = None,
     reference_calibration_runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS,
-    reference_calibration_workers: int = 1,
+    reference_calibration_workers: int | None = None,
     native_optimizer_scope=None,
     native_optimizer_scope_source: dict | None = None,
     native_optimizer_supplier_source: dict | None = None,
+    dense_checkpoint_allocation: dict | None = None,
 ) -> List[TestResult]:
     """Use the config's upstream reference attention unless explicitly overridden.
 
@@ -480,6 +505,13 @@ def execute(
     ):
         raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
+    native_first_two_adapter = bool(
+        local_cortex_fixture
+        and isinstance(client_backend, CortexConfig)
+        and not cfg.is_rl
+        and select
+        and set(select) <= {"single-step-grads", "single-step-optimizer"}
+    )
     if local_gateway_lora_save0:
         raise ValueError("deterministic LoRA SAVE0 execution is retired; use --peft-adapter on-prem")
     shared_adapter_identity = None
@@ -491,13 +523,51 @@ def execute(
             or not cfg.training.get("peft_config")
             or not select
             or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or (not prepare_references and not isinstance(client_backend, OnPremConfig))
+            or (
+                not prepare_references
+                and not isinstance(client_backend, OnPremConfig)
+                and not native_first_two_adapter
+            )
         ):
             raise ValueError(
-                "supplied PEFT adapter requires on-prem first-two SFT checks or their reference preparation"
+                "supplied PEFT adapter requires on-prem or explicit local Cortex first-two SFT checks "
+                "or their reference preparation"
             )
         peft_adapter = require_data_fast_path(peft_adapter, label="shared PEFT adapter").resolve(strict=True)
         shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
+    if dense_checkpoint_allocation is not None:
+        from .cortex_optimizer import validate_dense_checkpoint_allocation
+        from .hosted import require_local_cortex_gateway
+
+        ds_config = cfg.training.get("ds_config") or {}
+        expert = ds_config.get("expert_parallel") or {}
+        tensor = ds_config.get("tensor_parallel") or {}
+        if (
+            not local_cortex_fixture
+            or prepare_references
+            or cfg.is_rl
+            or cfg.training.get("peft_config")
+            or not isinstance(client_backend, CortexConfig)
+            or not select
+            or "single-step-optimizer" not in select
+            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
+            or cfg.sp_size != 1
+            or cfg.dp_size != cfg.n_gpus
+            or not isinstance(expert, dict)
+            or expert.get("enabled", False)
+            or expert.get("ep_size", 1) != 1
+            or expert.get("autoep_size", 1) != 1
+            or ds_config.get("moe")
+            or not isinstance(tensor, dict)
+            or tensor.get("tp_size", 1) != 1
+            or native_optimizer_scope is not None
+            or native_optimizer_scope_source is not None
+            or native_optimizer_supplier_source is not None
+        ):
+            raise ValueError("dense checkpoint allocation requires exclusive local Cortex SP1/EP1 optimizer capture")
+        require_local_cortex_gateway(client_backend)
+        dense_checkpoint_allocation = deepcopy(dense_checkpoint_allocation)
+        validate_dense_checkpoint_allocation(dense_checkpoint_allocation, expected_dp_world_size=cfg.dp_size)
     if (
         native_optimizer_scope is not None
         or native_optimizer_scope_source is not None
@@ -557,8 +627,11 @@ def execute(
 
         if not isinstance(client_backend, CortexConfig) or cortex_fixture is not None:
             raise ValueError("local Cortex fixture requires CortexConfig without a publication receipt")
-        if not select or not set(select) <= {"single-step-grads", "single-step-optimizer"}:
-            raise ValueError("local Cortex fixture supports only single-step-grads and single-step-optimizer")
+        if not select or not (
+            set(select) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+            or set(select) == {"checkpoint-resume-loss"}
+        ):
+            raise ValueError("local Cortex fixture supports only first-two, E2E or checkpoint checks")
         try:
             published_fixture = load_local_fixture(client_backend, spec)
         except ValueError as exc:
@@ -591,6 +664,8 @@ def execute(
                 cfg,
                 published_fixture,
                 local_gateway_full_model=local_gateway_full_model,
+                local_cortex_fixture=local_cortex_fixture,
+                native_adapter_initialization=native_first_two_adapter,
             )
             if rejection is not None:
                 results.append(rejection)
@@ -677,6 +752,7 @@ def execute(
         vocab_size=vocab_size,
         client_backend=client_backend,
         target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
+        published_fixture=deepcopy(published_fixture),
         local_gateway_full_model=local_gateway_full_model,
         local_full_model_path=local_full_model_path,
         inference_sampling_topology=inference_sampling_topology,
@@ -708,11 +784,23 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
+        maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
                 payload["hardware"] = cfg.gpu_type.upper()
         if context.reference_adapter_path is not None:
+            if native_first_two_adapter:
+                from .lora import bind_payload
+                from .shared_lora_adapter import adapter_identity
+
+                if adapter_identity(context.reference_adapter_path) != shared_adapter_identity:
+                    raise ValueError("shared adapter changed before native target binding")
+                return bind_payload(
+                    payload,
+                    context.reference_adapter_path,
+                    native_backend=client_backend,
+                )
             payload["training_config"]["debug"]["shared_peft_adapter"] = {
                 "path": str(context.reference_adapter_path),
                 "identity": deepcopy(shared_adapter_identity),
@@ -734,6 +822,11 @@ def execute(
                     expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
                     optimizer_config=optimizer_config,
                     **({"local_checkpoint": True} if local_cortex_fixture else {}),
+                    **(
+                        {"dense_checkpoint_allocation": deepcopy(dense_checkpoint_allocation)}
+                        if dense_checkpoint_allocation is not None
+                        else {}
+                    ),
                     **(
                         {
                             "native_layout_supplier": supplier,
@@ -787,7 +880,11 @@ def execute(
             from .shared_lora_adapter import adapter_identity
             from .shared_lora_adapter import generate_adapter
 
-            if not prepare_references and not isinstance(client_backend, OnPremConfig):
+            if (
+                not prepare_references
+                and not isinstance(client_backend, OnPremConfig)
+                and not native_first_two_adapter
+            ):
                 raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
             peft_adapter = generate_adapter(
                 reference_model_path, cfg.training["peft_config"], tmp / "initial-adapter", seed=SEED
@@ -797,8 +894,16 @@ def execute(
     else:
         reference_adapter_path = None
     context.reference_adapter_path = reference_adapter_path
-    if reference_adapter_path is not None and not prepare_references and not isinstance(client_backend, OnPremConfig):
+    if (
+        reference_adapter_path is not None
+        and not prepare_references
+        and not isinstance(client_backend, OnPremConfig)
+        and not native_first_two_adapter
+    ):
         raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
+    if reference_adapter_path is not None and native_first_two_adapter and not prepare_references and arm_specs:
+        # Reject an unsupported native pack before reading references or allocating target resources.
+        payload_for(arm_specs[0])
 
     from .batches import load as load_batch
 
@@ -954,8 +1059,9 @@ def execute(
                 from ..checks.optimizer_state import max_pairwise_optimizer_norm_delta
                 from ..checks.optimizer_state import summarize_optimizer_artifacts
 
-                if reference_calibration_runs < 2 or reference_calibration_workers < 1:
-                    raise ValueError("norm onboarding requires at least two calibration runs and one worker")
+                calibration_workers = reference_calibration_worker_count(
+                    reference_calibration_workers, runs=reference_calibration_runs
+                )
                 compact["optimizer_norms"] = summarize_optimizer_artifacts(
                     Path(reference["optimizer_state_manifest"]),
                     optimizer_config=optimizer_config,
@@ -963,7 +1069,7 @@ def execute(
                 )
                 print(
                     f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs, "
-                    f"{reference_calibration_workers} worker(s), arm={arm.name}",
+                    f"{calibration_workers} worker(s), arm={arm.name}",
                     flush=True,
                 )
                 manifests = []
@@ -976,15 +1082,15 @@ def execute(
                     mininterval=0,
                     miniters=1,
                 ) as progress:
-                    for start in range(0, reference_calibration_runs, reference_calibration_workers):
-                        indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
-                        with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
+                    for start in range(0, reference_calibration_runs, calibration_workers):
+                        indices = range(start, min(start + calibration_workers, reference_calibration_runs))
+                        with ThreadPoolExecutor(max_workers=calibration_workers) as pool:
                             futures = {
                                 pool.submit(
                                     measure_reference,
                                     arm,
                                     output_name=f"{arm.name}-calibration-{index}",
-                                    cuda_device=index % reference_calibration_workers,
+                                    cuda_device=index % calibration_workers,
                                     deterministic=False,
                                 ): index
                                 for index in indices
@@ -1176,8 +1282,11 @@ def execute_rl(
     vocab_size: int,
     attn: Optional[str] = None,
     select: Optional[List[str]] = None,
+    cases: Optional[List[str]] = None,
     workdir: Optional[Path] = None,
     client_backend: OnPremConfig | CortexConfig | None = None,
+    local_cortex_fixture: bool = False,
+    inference_sampling_topology: tuple[int, int, int] | None = None,
     inference_export_allocation: dict | None = None,
     inference_initial_model_dir: Path | None = None,
 ) -> List[TestResult]:
@@ -1186,11 +1295,20 @@ def execute_rl(
     Tests against the single-GPU reference are the caller's to report as inapplicable. Every other applicable
     test runs once, and both sub-jobs run at the widths the config declares. The RL checks build their own
     requests from the training and sampling sub-jobs; a check that trains on generated batches, such as
-    ``checkpoint-resume-loss``, runs one case per entry in the spec's ``arms``, as the hosted command does.
+    ``checkpoint-resume-loss``, runs the selected reviewed cases in the spec's order.
     """
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="RL correctness workdir")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
+    published_fixture = None
+    if local_cortex_fixture:
+        from .cortex import load_local_fixture
+        from .hosted import require_local_cortex_gateway
+
+        if select != ["checkpoint-resume-loss"] or not isinstance(client_backend, CortexConfig):
+            raise ValueError("RL local fixtures require only local Cortex checkpoint-resume-loss")
+        require_local_cortex_gateway(client_backend)
+        published_fixture = load_local_fixture(client_backend, spec)
     if inference_export_allocation is not None:
         from .hosted import require_local_cortex_gateway
         from .inference_export import validate_local_inference_allocation
@@ -1206,7 +1324,22 @@ def execute_rl(
         if inference_export_allocation is None:
             raise ValueError("inference initial model directory requires local inference export allocation")
         inference_initial_model_dir = validate_initial_training_model_dir(inference_initial_model_dir)
+    arms = list(spec.arms)
+    if cases:
+        wanted = set(cases)
+        names = [arm.name for arm in arms]
+        if len(wanted) != len(cases) or len(set(names)) != len(names):
+            raise ValueError("selected and reviewed case names must be unique")
+        if unknown := wanted - set(names):
+            raise ValueError(f"unreviewed case selection: {', '.join(sorted(unknown))}")
+        arms = [arm for arm in arms if arm.name in wanted]
     cfg = cfg.at_gpu_width(cfg.n_gpus)
+    if inference_sampling_topology is not None:
+        from ..checks.inference_checkpoint_loss import _sampling_topology
+
+        if select != ["inference-checkpoint-loss"]:
+            raise ValueError("explicit inference sampling topology requires only inference-checkpoint-loss")
+        _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=inference_sampling_topology))
     assert_applicable_tests_registered(spec, cfg.config_id)
     tmp = workdir if workdir is not None else correctness_workdir("dss-correctness-rl-")
     tmp.mkdir(parents=True, exist_ok=True)
@@ -1214,12 +1347,15 @@ def execute_rl(
         config_id=cfg.config_id,
         cfg=cfg,
         spec=spec,
-        arms=list(spec.arms),
+        arms=arms,
         attn_implementation=attn or cfg.attention_implementation,
         workdir=tmp,
         batch_paths={},
         vocab_size=vocab_size,
         client_backend=client_backend,
+        target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
+        published_fixture=deepcopy(published_fixture),
+        inference_sampling_topology=inference_sampling_topology,
         inference_export_allocation=deepcopy(inference_export_allocation),
         inference_initial_model_dir=inference_initial_model_dir,
     )
@@ -1239,7 +1375,18 @@ def execute_rl(
             )
             continue
         if isinstance(context.client_backend, CortexConfig):
-            rejection = _cortex_rejection(test, cfg)
+            from .hosted import is_local_cortex_gateway
+            from .hosted import require_local_cortex_gateway
+
+            local_weight_sync = test.test_id == "rl-weight-sync" and is_local_cortex_gateway(context.client_backend)
+            local_router_replay = test.test_id == "rl-router-replay" and is_local_cortex_gateway(
+                context.client_backend
+            )
+            if local_weight_sync or local_router_replay:
+                require_local_cortex_gateway(context.client_backend)
+            rejection = _cortex_rejection(
+                test, cfg, local_weight_sync=local_weight_sync, local_router_replay=local_router_replay
+            )
             if rejection is not None:
                 results.append(rejection)
                 continue

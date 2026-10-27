@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -55,21 +56,63 @@ def _concatenate_ple_shards(state_dict: dict[str, Tensor]) -> None:
         )
 
 
+def _indexed_expert_keys(state_dict: dict[str, Tensor], prefix: str) -> dict[int, dict[str, str]]:
+    pattern = re.compile(rf"^{re.escape(prefix)}\.mlp\.experts\.(\d+)\.(gate_proj|down_proj|up_proj)\.weight$")
+    experts: dict[int, dict[str, str]] = {}
+    for name in state_dict:
+        match = pattern.match(name)
+        if match is not None:
+            projections = experts.setdefault(int(match.group(1)), {})
+            projection = match.group(2)
+            if projection in projections:
+                raise ValueError(f"Duplicate Qwen3.8 expert projection for {prefix}: {name}")
+            projections[projection] = name
+    if not experts:
+        return experts
+    if any(
+        f"{prefix}.mlp.experts.{projection}" in state_dict
+        for projection in ("gate_up_proj", "down_proj", "w1", "w2", "w3")
+    ):
+        raise ValueError(f"Mixed Qwen3.8 expert layouts for {prefix}")
+    indices = sorted(experts)
+    if indices != list(range(len(indices))):
+        raise KeyError(f"Non-contiguous Qwen3.8 experts for {prefix}: {indices}")
+    for index, projections in experts.items():
+        missing = {"gate_proj", "down_proj", "up_proj"} - projections.keys()
+        if missing:
+            raise KeyError(f"Incomplete Qwen3.8 expert {prefix}.{index}: missing {sorted(missing)}")
+    return experts
+
+
 def convert_hf_layer_to_prime(
     state_dict: dict[str, Tensor],
     layer_idx: int,
 ) -> dict[str, Tensor]:
-    _concatenate_ple_shards(state_dict)
     if layer_idx < 0:
+        _concatenate_ple_shards(state_dict)
         return state_dict
 
     prefix = _layer_prefix(layer_idx)
+    experts = _indexed_expert_keys(state_dict, prefix)
     fp8_keys = [name for name in state_dict if name.startswith(f"{prefix}.") and "weight_scale_inv" in name]
     if fp8_keys:
         raise NotImplementedError(
             "Qwen3.8-Flash-Next native-FP8 training is not implemented; use Qwen/Qwen3.8-Flash-Next. Found "
             + ", ".join(fp8_keys[:3])
         )
+
+    if experts:
+        stacked = {
+            f"{prefix}.mlp.experts.{prime_name}": torch.stack(
+                [state_dict[experts[index][hf_name]] for index in range(len(experts))]
+            )
+            for hf_name, prime_name in (("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3"))
+        }
+        for projections in experts.values():
+            for name in projections.values():
+                state_dict.pop(name)
+        state_dict.update(stacked)
+    _concatenate_ple_shards(state_dict)
 
     gate_up_key = f"{prefix}.mlp.experts.gate_up_proj"
     down_key = f"{prefix}.mlp.experts.down_proj"
@@ -135,10 +178,44 @@ def convert_prime_layer_to_hf(
 
 
 def convert_hf_to_prime(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    layers = _layer_indices(state_dict)
+    for layer_idx in layers:
+        _indexed_expert_keys(state_dict, _layer_prefix(layer_idx))
     _concatenate_ple_shards(state_dict)
-    for layer_idx in _layer_indices(state_dict):
+    for layer_idx in layers:
         convert_hf_layer_to_prime(state_dict, layer_idx)
     return state_dict
+
+
+def _checkpoint_groups(names: tuple[str, ...]) -> list[list[str]]:
+    keys = dict.fromkeys(names)
+    for layer_idx in _layer_indices(keys):
+        _indexed_expert_keys(keys, _layer_prefix(layer_idx))
+    ple_groups: dict[str, list[int]] = {}
+    groups: dict[tuple[str, str], list[str]] = {}
+    for name in names:
+        layer = _LAYER_RE.match(name)
+        ple = _PLE_SHARD_RE.match(name)
+        if ple is not None:
+            ple_groups.setdefault(ple.group(1), []).append(int(ple.group(2)))
+        if layer is not None:
+            group = ("layer", layer.group(1))
+        elif ple is not None:
+            group = ("ple", ple.group(1))
+        else:
+            group = ("tensor", name)
+        groups.setdefault(group, []).append(name)
+    for base, indices in ple_groups.items():
+        indices.sort()
+        if indices != list(range(len(indices))):
+            raise KeyError(f"Non-contiguous Qwen3.8 PLE shards for {base}: {indices}")
+    return list(groups.values())
+
+
+def convert_hf_checkpoint_to_prime(source_dir: Path, save_dir: Path) -> None:
+    from ..moe.weights import convert_safetensor_checkpoint
+
+    convert_safetensor_checkpoint(source_dir, save_dir, convert_hf_to_prime, _checkpoint_groups)
 
 
 def convert_prime_to_hf(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:

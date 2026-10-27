@@ -35,12 +35,14 @@ parameter is written by no tensor.
 
 from __future__ import annotations
 
-import os
 import traceback
 from pathlib import Path
 from typing import Dict
 from typing import List
 from typing import Tuple
+
+from arctic_platform.debug.broadcast_weight_sync_evidence import TRAINING_OPTION
+from arctic_platform.debug.broadcast_weight_sync_evidence import weight_sync_verification_environment
 
 from ..harness import sft as gsm8k
 from ..harness.batches import SEED
@@ -107,13 +109,20 @@ def _run(ctx) -> TestResult:
 
     training = build_payload(cfg.training, model_path, SEED, attn_implementation=ctx.attn_implementation)
     training["training_config"]["debug"]["weight_sync_manifest"] = True
+    training["training_config"].setdefault("ds_config", {})[TRAINING_OPTION] = True
     gateway_dir = Path(ctx.workdir) / TEST_ID / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
-    os.environ[VERIFY_ENV] = "1"
-
-    with running_rl_client(
-        cfg, training, model_path, gateway_dir, backend=getattr(ctx, "client_backend", None)
-    ) as client:
+    with (
+        weight_sync_verification_environment(),
+        running_rl_client(
+            cfg,
+            training,
+            model_path,
+            gateway_dir,
+            backend=getattr(ctx, "client_backend", None),
+            weight_sync_verification=True,
+        ) as client,
+    ):
         loss = float(rl_fwd_bwd(client, batch)["avg_loss"])
         step(client, learning_rate)
         sync = sync_weights(client)

@@ -68,6 +68,7 @@ class ReferenceResult:
     optimizer_state_manifest: Optional[str] = None
     optimizer_gradient_norm: Optional[float] = None
     reference_execution: Optional[dict] = None
+    participation: Optional[dict] = None
 
 
 @dataclass
@@ -79,6 +80,7 @@ class ForwardBackwardResult:
     active_tokens: int
     microbatches: int
     skipped_no_grad: List[str] = field(default_factory=list)
+    participation: Optional[dict] = None
 
 
 def _build_liger_fused_cross_entropy(*, fp32_lm_head: bool):
@@ -320,7 +322,7 @@ def reference_row_groups(
     return row_groups(lengths, row_length, token_budget)
 
 
-def forward_backward(
+def _forward_backward(
     engine: ReferenceEngine,
     batch,
     *,
@@ -468,6 +470,15 @@ def forward_backward(
     )
 
 
+def forward_backward(engine: ReferenceEngine, batch, **options) -> ForwardBackwardResult:
+    from arctic_platform.correctness.harness.participation import ParticipationCapture
+
+    with ParticipationCapture(engine.model, decoder=engine.decoder, head=engine.head) as capture:
+        result = _forward_backward(engine, batch, **options)
+        result.participation = capture.result()
+    return result
+
+
 def gradient_norms(gradients: Dict[str, "torch.Tensor"], device: str) -> Dict[str, float]:
     """One L2 norm per accumulated gradient.
 
@@ -542,6 +553,9 @@ def run(
     accumulator = forward.gradients
     skipped = forward.skipped_no_grad
     grad_norms = gradient_norms(accumulator, device)
+    from arctic_platform.correctness.harness.participation import active_gradient_norms
+
+    active_gradient_norms(forward.participation, grad_norms)
     optimizer_state_manifest = None
     optimizer_gradient_norm = None
     if optimizer_config is not None:
@@ -557,6 +571,8 @@ def run(
             gradient_clipping=gradient_clipping,
             optimizer_dtype=optimizer_dtype,
             output_dir=Path(optimizer_output_dir),
+            consume_gradients=True,
+            participation=forward.participation,
         )
         optimizer_state_manifest = str(optimizer_artifact.manifest_path)
         optimizer_gradient_norm = optimizer_artifact.gradient_norm_before_clip
@@ -576,4 +592,5 @@ def run(
         optimizer_state_manifest=optimizer_state_manifest,
         optimizer_gradient_norm=optimizer_gradient_norm,
         reference_execution=reference_execution,
+        participation=forward.participation,
     )

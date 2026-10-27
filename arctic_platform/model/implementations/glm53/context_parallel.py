@@ -28,6 +28,7 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.fp8 import compute_weight
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
     fused_sparse_mla_backward_available,
 )
@@ -559,6 +560,24 @@ def _pad_sparse_indices(indices: torch.Tensor, multiple: int = 128) -> torch.Ten
     return F.pad(indices, (0, padded_width - width), value=-1)
 
 
+def _sparse_indexer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    q_resid: torch.Tensor,
+    attention_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+):
+    return _select_sparse_indices(
+        self,
+        hidden_states,
+        q_resid,
+        attention_mask,
+        cu_seqlens,
+        cp_group=self._cp_group,
+        cp_rank=self._cp_rank,
+    )
+
+
 def _sparse_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -604,21 +623,18 @@ def _sparse_attention_forward(
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-        topk_indices = _select_sparse_indices(
-            self.indexer,
+        topk_indices = self.indexer(
             hidden_states,
             q_resid,
             attention_mask,
             global_cu_seqlens,
-            cp_group=self._cp_group,
-            cp_rank=self._cp_rank,
         )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
         topk_indices = prev_topk_indices
 
-    kv_b_weight = self.kv_b_proj.weight.view(
+    kv_b_weight = compute_weight(self.kv_b_proj).view(
         self.num_heads,
         self.qk_nope_head_dim + self.v_head_dim,
         self.kv_lora_rank,
@@ -970,6 +986,10 @@ def apply_context_parallelism(
         attention._cp_world_size = cp_world_size
         if layer.block_type == "deepseek_sparse_attention":
             attention._ap_sparse_mla_backend = attn_implementation
+            if attention.indexer is not None:
+                attention.indexer._cp_group = cp_group
+                attention.indexer._cp_rank = cp_rank
+                attention.indexer.forward = types.MethodType(_sparse_indexer_forward, attention.indexer)
             attention.forward = types.MethodType(
                 _sparse_attention_forward,
                 attention,

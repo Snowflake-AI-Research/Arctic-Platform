@@ -101,11 +101,6 @@ def _canonical_dss(values: Dict[str, float]) -> Dict[str, _Entry]:
     routed: Dict[str, Dict[str, _Entry]] = {}
 
     for key, entry in source.items():
-        # Text-only correctness batches never execute the VLM vision tower. DeepSpeed materializes zero
-        # gradients for those unused trainable parameters, while plain PyTorch leaves ``grad`` absent.
-        # Exclude only a proven zero; a nonzero vision gradient remains unmatched and fails coverage.
-        if key.startswith("visual.") and entry.value == 0.0:
-            continue
         match = _ROUTED_EXPERT.match(key)
         if match:
             weight = match.group("weight")

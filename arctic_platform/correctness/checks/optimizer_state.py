@@ -34,6 +34,10 @@ from ..harness.names import CanonicalTensorGroup
 from ..harness.names import canonical_dss_tensor_groups
 from ..harness.names import normalize
 from ..harness.names import validate_optimizer_norm_summary as _validate_optimizer_norm_summary
+from ..harness.participation import canonical_participation
+from ..harness.participation import compare_participation
+from ..harness.participation import validate_inactive_weights
+from ..harness.participation import validate_optimizer_participation
 
 
 @dataclass(frozen=True)
@@ -129,15 +133,6 @@ def _comparison_tensors(
     }
 
 
-def _is_unused_zero_group(entries: Dict[str, Path], group: CanonicalTensorGroup) -> bool:
-    import torch
-
-    if not all(name.startswith("visual.") for name in group.originals):
-        return False
-    tensors = _load_tensor_group(entries, group, torch.device("cpu"))
-    return all(not bool(torch.count_nonzero(value)) for value in tensors.values())
-
-
 def compare_optimizer_artifacts(
     dss_manifest: Path, reference_manifest: Path, *, optimizer_config: dict, learning_rate: float
 ) -> OptimizerComparison:
@@ -153,7 +148,6 @@ def compare_optimizer_artifacts(
 
     dss_groups = canonical_dss_tensor_groups(dss)
     only_dss_keys = set(dss_groups) - set(reference)
-    only_dss_keys = {key for key in only_dss_keys if not _is_unused_zero_group(dss, dss_groups[key])}
     shared = sorted(set(dss_groups) & set(reference))
     deltas = []
     comparison_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -309,9 +303,26 @@ def summarize_optimizer_artifacts(
         raise ValueError("optimizer norm artifacts have a canonical parameter name collision")
 
     parameters = {}
+    participation = raw_manifest.get("participation")
+    inventory = None
+    if participation is not None:
+        validate_inactive_weights(participation, raw_manifest.get("inactive_weights"))
+        inventory = canonical_participation(participation, backend=backend)
+        if set(groups) - set(inventory):
+            raise ValueError("optimizer artifacts contain parameters outside the trainable inventory")
+        if {name for name, entry in inventory.items() if entry["state"] == "active"} - set(groups):
+            raise ValueError("optimizer artifacts have incomplete active parameter coverage")
+    elif "inactive_weights" in raw_manifest:
+        raise ValueError("inactive optimizer weights require participation evidence")
     for name, group in sorted(groups.items()):
         tensors = _load_norm_group(entries, group)
         shape = list(tensors["parameter_update"].shape)
+        if inventory is not None and inventory[name]["shape"] != shape:
+            raise ValueError(f"optimizer participation shape mismatch for {name}")
+        if inventory is not None and inventory[name]["state"] == "inactive":
+            if any(bool(torch.count_nonzero(value)) for value in tensors.values()):
+                raise ValueError(f"inactive optimizer parameter {name} has nonzero state or update")
+            continue
         values = _comparison_tensors(
             tensors, step=step, optimizer_config=optimizer_config, learning_rate=learning_rate, backend=backend
         )
@@ -325,7 +336,7 @@ def summarize_optimizer_artifacts(
             norms[state] = norm
         parameters[name] = {"shape": shape, **norms}
         del tensors, values
-    return {
+    summary = {
         "criterion": OPTIMIZER_NORM_CRITERION,
         "step": 1,
         "state_keys": list(COMPARISON_STATE_KEYS),
@@ -333,6 +344,10 @@ def summarize_optimizer_artifacts(
         "optimizer_values_count": len(parameters) * len(COMPARISON_STATE_KEYS),
         "parameters": parameters,
     }
+    if participation is not None:
+        summary.update(participation=participation, inactive_weights=raw_manifest["inactive_weights"])
+        validate_optimizer_participation(summary, backend=backend)
+    return summary
 
 
 def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> OptimizerComparison:
@@ -343,6 +358,10 @@ def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> Optim
     """
     dss = _validate_optimizer_norm_summary(dss_summary)
     reference = _validate_optimizer_norm_summary(reference_summary)
+    validate_optimizer_participation(dss_summary, backend="dss")
+    validate_optimizer_participation(reference_summary, backend="reference")
+    if dss_summary.get("participation") is not None or reference_summary.get("participation") is not None:
+        compare_participation(dss_summary.get("participation"), reference_summary.get("participation"))
     deltas = []
     for name in sorted(set(dss) & set(reference)):
         if dss[name]["shape"] != reference[name]["shape"]:
@@ -368,6 +387,10 @@ def max_pairwise_optimizer_norm_delta(
     if not summaries:
         return None
     parameters = [_validate_optimizer_norm_summary(summary) for summary in summaries]
+    for summary in summaries:
+        validate_optimizer_participation(summary, backend="reference")
+        if summary.get("participation") is not None or summaries[0].get("participation") is not None:
+            compare_participation(summary.get("participation"), summaries[0].get("participation"))
     names = set(parameters[0])
     if any(set(values) != names for values in parameters[1:]):
         raise ValueError("optimizer norm calibration runs returned different parameter sets")

@@ -383,6 +383,109 @@ def test_cortex_fixture_published_fixture_enables_only_supported_reference_check
     assert runner.cortex_unavailable_reason(inference) is None
 
 
+def _reduced_fixture_mtp_producer_case(tmp_path, *, model_type="qwen3_5_moe_text"):
+    from arctic_platform.correctness.harness.dss_driver import build_payload
+
+    spec = _applicable_tests_spec(["single-step-grads"])
+    root = tmp_path / f"reviewed-{model_type}"
+    root.mkdir()
+    config = {
+        "model_type": "qwen3_5_moe" if model_type == "qwen3_5_moe_text" else model_type,
+        "text_config": {
+            "model_type": model_type,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
+        },
+        "vision_config": {"depth": 2},
+    }
+    if model_type == "glm5_next_text":
+        config["text_config"].pop("mtp_num_hidden_layers")
+        config["text_config"]["num_nextn_predict_layers"] = 1
+    (root / "config.json").write_text(json.dumps(config))
+    save_file({"model.weight": torch.ones(2, 2)}, root / "model.safetensors")
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.weight": "model.safetensors"}})
+    )
+    (root / "tokenizer_config.json").write_text("{}")
+    spec.model.source_checkpoint = "Qwen/Qwen3.5-Source"
+    spec.model.num_hidden_layers = 2
+    spec.model.vision_depth = 2
+    spec.model.seed = 0
+    spec.model.cache_path = str(root.resolve())
+    spec.model.content_hash = hash_directory(root)
+    binding = cortex_fixture.describe_fixture(spec, root)
+    payload = build_payload(
+        {
+            "model_provider": "prime_rl",
+            "ep_size": 2,
+            "prime_rl": {"debug": {"existing_debug": "preserved"}},
+        },
+        binding["model_name"],
+        42,
+        attn_implementation="sdpa",
+    )
+    return spec, binding, payload
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"])
+def test_reduced_fixture_mtp_producer_binds_validated_publication_without_overwriting_debug(tmp_path, model_type):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+
+    spec, binding, payload = _reduced_fixture_mtp_producer_case(tmp_path, model_type=model_type)
+
+    maybe_bind_reduced_fixture_mtp(payload, spec, binding)
+
+    debug = payload["training_config"]["prime_rl"]["debug"]
+    assert debug["existing_debug"] == "preserved"
+    assert debug["reduced_fixture_mtp"] == {
+        "schema_version": 1,
+        "config_id": spec.config_id,
+        "fixture_locator": binding["model_name"],
+        "reference_path": spec.model.cache_path,
+        "reviewed_hash": spec.model.content_hash,
+        "fixture_sha256": binding["fixture_sha256"],
+        "files": binding["files"],
+        "source_checkpoint": spec.model.source_checkpoint,
+        "num_hidden_layers": 2,
+        "vision_depth": 2,
+        "materialization": "pretrained-prefix-reduction",
+    }
+
+
+def test_reduced_fixture_mtp_producer_rejects_preexisting_descriptor(tmp_path):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+
+    spec, binding, payload = _reduced_fixture_mtp_producer_case(tmp_path)
+    original = {"caller_supplied": True}
+    payload["training_config"]["prime_rl"]["debug"]["reduced_fixture_mtp"] = original
+
+    with pytest.raises(ValueError, match="must not be supplied or overwritten"):
+        maybe_bind_reduced_fixture_mtp(payload, spec, binding)
+    assert payload["training_config"]["prime_rl"]["debug"]["reduced_fixture_mtp"] is original
+
+
+def test_reduced_fixture_mtp_producer_is_noop_during_reference_preparation_without_publication(tmp_path):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+
+    spec, _, payload = _reduced_fixture_mtp_producer_case(tmp_path)
+    before = json.loads(json.dumps(payload))
+
+    maybe_bind_reduced_fixture_mtp(payload, spec, None)
+
+    assert payload == before
+
+
+def test_reduced_fixture_mtp_producer_is_noop_for_non_qwen_fixture(tmp_path):
+    from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+
+    spec, binding, payload = _reduced_fixture_mtp_producer_case(tmp_path, model_type="llama")
+    before = json.loads(json.dumps(payload))
+
+    maybe_bind_reduced_fixture_mtp(payload, spec, binding)
+
+    assert payload == before
+
+
 def _cortex_fixture_receipt(tmp_path):
     module = _cortex_fixture_module()
     spec, _ = _cortex_fixture_fixture(tmp_path)
@@ -601,7 +704,11 @@ def _local_cortex_full_27b_full_model(tmp_path, monkeypatch):
 
     def cached_file(model, filename, **kwargs):
         assert model == cfg.model_name and filename == "config.json"
-        assert kwargs == {"local_files_only": True}
+        assert kwargs == {
+            "cache_dir": str(cache),
+            "revision": _local_cortex_full_27b_REVISION,
+            "local_files_only": True,
+        }
         return str(root / filename)
 
     def safe_open(path, **kwargs):
@@ -897,11 +1004,22 @@ def _local_cortex_full_flashnext_validate(case):
     )
 
 
+@pytest.mark.parametrize("placement", [8, 16])
 @pytest.mark.parametrize("source", ["model-id", "pinned-snapshot"])
 def test_local_cortex_full_flashnext_original_flashnext_is_admitted_header_only(
-    _local_cortex_full_flashnext_full_model, source
+    _local_cortex_full_flashnext_full_model, source, placement
 ):
-    original = (_local_cortex_full_flashnext_CONFIG.read_bytes(), _local_cortex_full_flashnext_SPEC.read_bytes())
+    config = (
+        _local_cortex_full_flashnext_BASE
+        / f"configs/qwen3.8-flash-next/h200/train-sft-full-{placement}gpus-sp{placement}-256k.config"
+    )
+    spec = (
+        _local_cortex_full_flashnext_BASE
+        / f"specs/qwen3.8-flash-next-h200-train-sft-full-{placement}gpus-sp{placement}-256k.json"
+    )
+    original = (config.read_bytes(), spec.read_bytes())
+    _local_cortex_full_flashnext_full_model.cfg = load_config(config)
+    _local_cortex_full_flashnext_full_model.spec = Spec.read(spec)
     if source == "model-id":
         _local_cortex_full_flashnext_full_model.spec.model.source_checkpoint = (
             _local_cortex_full_flashnext_full_model.cfg.model_name
@@ -911,10 +1029,30 @@ def test_local_cortex_full_flashnext_original_flashnext_is_admitted_header_only(
         == _local_cortex_full_flashnext_full_model.root
     )
     assert len(_local_cortex_full_flashnext_full_model.calls) == 131
-    assert (
-        _local_cortex_full_flashnext_CONFIG.read_bytes(),
-        _local_cortex_full_flashnext_SPEC.read_bytes(),
-    ) == original
+    assert (config.read_bytes(), spec.read_bytes()) == original
+
+
+@pytest.mark.parametrize("legacy_cache", ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"])
+def test_local_cortex_full_flashnext_explicit_cache_and_revision_override_legacy_defaults(
+    _local_cortex_full_flashnext_full_model, tmp_path, monkeypatch, legacy_cache
+):
+    case = _local_cortex_full_flashnext_full_model
+    monkeypatch.setenv(legacy_cache, str(tmp_path / "unrelated-cache"))
+    observed = []
+
+    def cached_file(model, filename, **kwargs):
+        observed.append(kwargs)
+        return hub.cached_files(model, [filename], **kwargs)[0]
+
+    monkeypatch.setattr(hub, "cached_file", cached_file)
+    assert _local_cortex_full_flashnext_validate(case) == case.root
+    assert observed == [
+        {
+            "cache_dir": str(case.root.parents[2]),
+            "revision": _local_cortex_full_flashnext_REVISION,
+            "local_files_only": True,
+        }
+    ]
 
 
 @pytest.mark.parametrize("buffer", sorted(_local_cortex_full_flashnext_BUFFERS))
@@ -936,6 +1074,7 @@ def test_local_cortex_full_flashnext_every_original_integer_buffer_is_pinned(
         _local_cortex_full_flashnext_validate(_local_cortex_full_flashnext_full_model)
 
 
+@pytest.mark.parametrize("placement", [8, 16])
 @pytest.mark.parametrize(
     "failure",
     [
@@ -955,9 +1094,17 @@ def test_local_cortex_full_flashnext_every_original_integer_buffer_is_pinned(
     ],
 )
 def test_local_cortex_full_flashnext_original_flashnext_rejects_drift(
-    _local_cortex_full_flashnext_full_model, failure
+    _local_cortex_full_flashnext_full_model, failure, placement
 ):
     case = _local_cortex_full_flashnext_full_model
+    case.cfg = load_config(
+        _local_cortex_full_flashnext_BASE
+        / f"configs/qwen3.8-flash-next/h200/train-sft-full-{placement}gpus-sp{placement}-256k.config"
+    )
+    case.spec = Spec.read(
+        _local_cortex_full_flashnext_BASE
+        / f"specs/qwen3.8-flash-next-h200-train-sft-full-{placement}gpus-sp{placement}-256k.json"
+    )
     if failure == "source":
         case.spec.model.source_checkpoint = "/data-fast/base-models/synthetic/FlashNext-4L"
     elif failure == "config-id":
@@ -1571,3 +1718,744 @@ def test_local_cortex_fixture_execution_transport_stays_on_unauthenticated_loopb
         transport.shutdown()
     assert session.closed
     assert transport._session is None
+
+
+# Reference-free original-source metadata.
+
+
+@pytest.fixture
+def _reference_free_metadata_workspace():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="reference-free-metadata-", dir="/data-fast/tmp") as directory:
+        yield Path(directory).resolve()
+
+
+def _reference_free_metadata_source(workspace, *, indexed=True, vision="depth"):
+    from arctic_platform.correctness.harness.inference_export import schema_bytes
+
+    root = workspace / "original"
+    root.mkdir()
+    config = {
+        "model_type": "glm5_next",
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "text_config": {
+            "model_type": "glm5_next_text",
+            "num_hidden_layers": 45,
+            "vocab_size": 128,
+            "dtype": "bfloat16",
+        },
+    }
+    if vision is not None:
+        config["vision_config"] = {"model_type": "vision_fixture", vision: 24}
+    (root / "config.json").write_text(json.dumps(config))
+    tensors = {
+        "model.embed_tokens.weight": torch.zeros((4, 3), dtype=torch.bfloat16),
+        "model.layers.44.norm.weight": torch.ones(3, dtype=torch.float32),
+        "model.layer_multipliers": torch.tensor(1, dtype=torch.int64),
+    }
+    schema = {
+        "model.embed_tokens.weight": ["BF16", [4, 3]],
+        "model.layers.44.norm.weight": ["F32", [3]],
+        "model.layer_multipliers": ["I64", []],
+    }
+    if indexed:
+        shards = {
+            "model-00001-of-00002.safetensors": {"model.embed_tokens.weight": tensors["model.embed_tokens.weight"]},
+            "model-00002-of-00002.safetensors": {
+                name: tensor for name, tensor in tensors.items() if name != "model.embed_tokens.weight"
+            },
+        }
+        for name, values in shards.items():
+            save_file(values, str(root / name))
+        index = {
+            "metadata": {"total_size": schema_bytes(schema)},
+            "weight_map": {tensor: shard for shard, values in shards.items() for tensor in values},
+        }
+        (root / "model.safetensors.index.json").write_text(json.dumps(index))
+    else:
+        save_file(tensors, str(root / "model.safetensors"))
+        index = None
+    return SimpleNamespace(root=root, config=config, schema=schema, index=index)
+
+
+def _reference_free_metadata_unchanged(root):
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_dev,
+            path.stat().st_ino,
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(root.iterdir())
+    }
+
+
+@pytest.fixture
+def _reference_free_metadata_no_model(monkeypatch):
+    import huggingface_hub
+    import transformers
+    from safetensors import torch as safetensors_torch
+
+    from arctic_platform.correctness.onboarding import onboard
+    from arctic_platform.correctness.onboarding import synth_model
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("reference-free metadata reached model construction, sizing, payloads or HF references")
+
+    for name in ("_model_shape", "build_spec", "_prepare_references", "_render_and_run_calibration"):
+        monkeypatch.setattr(onboard, name, forbidden)
+    for name in ("reduce_config", "count_parameters", "size_for_single_gpu", "materialize_pretrained"):
+        monkeypatch.setattr(synth_model, name, forbidden)
+    for name in ("AutoConfig", "AutoModel", "AutoModelForCausalLM"):
+        cls = getattr(transformers, name)
+        monkeypatch.setattr(cls, "from_pretrained", forbidden)
+        if hasattr(cls, "from_config"):
+            monkeypatch.setattr(cls, "from_config", forbidden)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", forbidden)
+    monkeypatch.setattr(torch, "load", forbidden)
+    monkeypatch.setattr(safetensors_torch, "load_file", forbidden)
+    actual_safe_open = safetensors.safe_open
+    header_files = []
+
+    @contextmanager
+    def headers_only(path, **kwargs):
+        header_files.append(Path(path).name)
+        with actual_safe_open(path, **kwargs) as stream:
+            yield SimpleNamespace(keys=stream.keys, get_slice=stream.get_slice, get_tensor=forbidden)
+
+    monkeypatch.setattr(safetensors, "safe_open", headers_only)
+    actual_open = Path.open
+    actual_read_bytes = Path.read_bytes
+
+    def metadata_open(path, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path.suffix == ".safetensors" and ("r" in mode or "+" in mode):
+            forbidden()
+        return actual_open(path, *args, **kwargs)
+
+    def metadata_read_bytes(path):
+        if path.suffix == ".safetensors":
+            forbidden()
+        return actual_read_bytes(path)
+
+    monkeypatch.setattr(Path, "open", metadata_open)
+    monkeypatch.setattr(Path, "read_bytes", metadata_read_bytes)
+    return header_files
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "unsharded"])
+@pytest.mark.parametrize(
+    "vision", ["depth", "num_hidden_layers", None], ids=["vision-depth", "vision-layers", "text-only"]
+)
+def test_reference_free_metadata_original_schema_no_constructor_or_source_rewrite(
+    _reference_free_metadata_workspace, monkeypatch, indexed, vision
+):
+    from arctic_platform.correctness.harness.inference_export import schema_bytes
+    from arctic_platform.correctness.harness.inference_export import schema_sha
+    from arctic_platform.correctness.onboarding import synth_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace, indexed=indexed, vision=vision)
+    before = _reference_free_metadata_unchanged(case.root)
+    # Activate the same no-construction/payload sentinels after hashing the tiny test fixtures.
+    with monkeypatch.context() as guard:
+        headers = _reference_free_metadata_no_model.__wrapped__(guard)
+        model, vocab_size, evidence = synth_model.describe_source_model(str(case.root))
+    assert _reference_free_metadata_unchanged(case.root) == before
+    assert vocab_size == 128
+    assert model.num_hidden_layers == 45
+    assert model.vision_depth == (24 if vision is not None else None)
+    assert model.cache_path == str(case.root)
+    assert model.source_checkpoint == str(case.root)
+    assert model.content_hash == hash_directory(case.root)
+    assert model.seed is model.param_count is model.sized_against_gib is None
+    assert model.measured_reference_peak_gib is None
+    assert evidence == {
+        "config_sha256": before["config.json"][-1],
+        "index_sha256": before["model.safetensors.index.json"][-1] if indexed else None,
+        "tensor_schema_sha256": schema_sha(case.schema),
+        "tensor_count": 3,
+        "stored_tensor_elements": 16,
+        "tensor_payload_bytes": schema_bytes(case.schema),
+        "tensor_payloads_read": False,
+    }
+    assert set(headers) == {path.name for path in case.root.glob("*.safetensors")}
+    assert (case.root / "model.safetensors.index.json").exists() is indexed
+
+
+@pytest.mark.parametrize(
+    "location,field,value",
+    [
+        ("root", "text_config", None),
+        ("root", "text_config", []),
+        ("root", "text_config", "not-an-object"),
+        ("text", "num_hidden_layers", None),
+        ("text", "num_hidden_layers", 0),
+        ("text", "num_hidden_layers", -1),
+        ("text", "num_hidden_layers", True),
+        ("text", "num_hidden_layers", 45.0),
+        ("text", "vocab_size", None),
+        ("text", "vocab_size", 0),
+        ("text", "vocab_size", False),
+        ("text", "vocab_size", "128"),
+        ("root", "vision_config", []),
+        ("root", "vision_config", {}),
+        ("vision", "depth", 0),
+        ("vision", "depth", True),
+        ("vision", "depth", 24.0),
+    ],
+)
+def test_reference_free_metadata_rejects_invalid_original_config(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, location, field, value
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
+    holder = {"root": case.config, "text": case.config["text_config"], "vision": case.config["vision_config"]}[
+        location
+    ]
+    holder[field] = value
+    (case.root / "config.json").write_text(json.dumps(case.config))
+    with pytest.raises(ValueError, match="original .*required"):
+        describe_source_model(str(case.root))
+
+
+def _reference_free_metadata_fp8_source(workspace, *, indexed):
+    case = _reference_free_metadata_source(workspace, indexed=False)
+    case.config["quantization_config"] = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    (case.root / "config.json").write_text(json.dumps(case.config))
+    weight = "model.layers.44.mlp.down_proj.weight"
+    scale = "model.layers.44.mlp.down_proj.weight_scale_inv"
+    tensors = {
+        "model.embed_tokens.weight": torch.zeros((4, 3), dtype=torch.bfloat16),
+        "model.layers.44.norm.weight": torch.ones(3, dtype=torch.float32),
+        "model.layer_multipliers": torch.tensor(1, dtype=torch.int64),
+        weight: torch.ones((129, 257), dtype=torch.bfloat16).to(torch.float8_e4m3fn),
+        scale: torch.ones((2, 3), dtype=torch.float32),
+    }
+    save_file(tensors, str(case.root / "model.safetensors"))
+    case.schema.update({weight: ["F8_E4M3", [129, 257]], scale: ["F32", [2, 3]]})
+    case.payload_bytes = 24 + 12 + 8 + 129 * 257 + 2 * 3 * 4
+    if indexed:
+        case.index = {
+            "metadata": {"total_size": case.payload_bytes},
+            "weight_map": {name: "model.safetensors" for name in tensors},
+        }
+        (case.root / "model.safetensors.index.json").write_text(json.dumps(case.index))
+    return case
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "unsharded"])
+def test_reference_free_metadata_declared_block_fp8_source_preserves_strict_exports(
+    _reference_free_metadata_workspace, monkeypatch, indexed
+):
+    from arctic_platform.correctness.harness import inference_export
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=indexed)
+    before = _reference_free_metadata_unchanged(case.root)
+    with monkeypatch.context() as guard:
+        _reference_free_metadata_no_model.__wrapped__(guard)
+        model, vocab, evidence = describe_source_model(str(case.root))
+        with pytest.raises(ValueError, match="invalid tensor dtype"):
+            inference_export.schema_bytes(case.schema)
+        if indexed:
+            with pytest.raises(ValueError, match="invalid tensor dtype"):
+                inference_export.read_inventory(case.root, case.index)
+    assert _reference_free_metadata_unchanged(case.root) == before
+    assert model.seed is model.param_count is model.sized_against_gib is None
+    assert vocab == 128
+    assert evidence["tensor_count"] == 5
+    assert evidence["tensor_payload_bytes"] == case.payload_bytes
+    assert evidence["tensor_schema_sha256"] == inference_export.schema_sha(case.schema)
+    assert evidence["original_quantization_config"] == case.config["quantization_config"]
+    assert evidence["tensor_payloads_read"] is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("quant_method", "int8"),
+        ("fmt", "e5m2"),
+        ("activation_scheme", "static"),
+        ("weight_block_size", [64, 128]),
+        ("weight_block_size", [128.0, 128]),
+        ("weight_block_size", [128, 128.0]),
+        ("weight_block_size", [True, 128]),
+        ("weight_block_size", None),
+        ("weight_block_size", "128,128"),
+    ],
+)
+def test_reference_free_metadata_rejects_unsupported_fp8_declaration(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, field, value
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=True)
+    case.config["quantization_config"][field] = value
+    (case.root / "config.json").write_text(json.dumps(case.config))
+    with pytest.raises(ValueError, match="supported dynamic block-FP8"):
+        describe_source_model(str(case.root))
+
+
+@pytest.mark.parametrize("corruption", ["missing-declaration", "missing-scale", "scale-shape", "scale-dtype", "size"])
+def test_reference_free_metadata_rejects_fp8_inventory_corruption(_reference_free_metadata_workspace, corruption):
+    from arctic_platform.correctness.harness.inference_export import original_schema_bytes
+    from arctic_platform.correctness.harness.inference_export import read_inventory
+
+    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=True)
+    quantization = case.config["quantization_config"]
+    scale = "model.layers.44.mlp.down_proj.weight_scale_inv"
+    if corruption == "missing-declaration":
+        quantization = None
+    elif corruption == "missing-scale":
+        case.schema.pop(scale)
+    elif corruption == "scale-shape":
+        case.schema[scale] = ["F32", [1, 3]]
+    elif corruption == "scale-dtype":
+        case.schema[scale] = ["BF16", [2, 3]]
+    else:
+        case.index["metadata"]["total_size"] += 1
+        with pytest.raises(ValueError, match="byte inventory disagrees"):
+            read_inventory(case.root, case.index, original_quantization_config=quantization)
+        return
+    with pytest.raises(ValueError, match="invalid tensor dtype|matching FP32 inverse block scales"):
+        original_schema_bytes(case.schema, quantization)
+
+
+@pytest.mark.parametrize(
+    "bad_json",
+    [
+        "[]",
+        '{"text_config": {}, "text_config": {"num_hidden_layers": 45, "vocab_size": 128}}',
+        '{"text_config":',
+    ],
+    ids=["nonobject", "duplicate-key", "malformed"],
+)
+def test_reference_free_metadata_rejects_noncanonical_json(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, bad_json
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
+    (case.root / "config.json").write_text(bad_json)
+    with pytest.raises(ValueError):
+        describe_source_model(str(case.root))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-config",
+        "missing-shard",
+        "extra-shard",
+        "missing-index-and-single",
+        "empty-map",
+        "wrong-byte-count",
+        "wrong-header-name",
+        "wrong-shard",
+        "traversal",
+        "nonobject-index",
+        "duplicate-index-key",
+        "bad-header",
+    ],
+)
+def test_reference_free_metadata_rejects_inventory_or_metadata_mismatch(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, mutation
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
+    index_path = case.root / "model.safetensors.index.json"
+    shard = case.root / "model-00001-of-00002.safetensors"
+    if mutation == "missing-config":
+        (case.root / "config.json").unlink()
+    elif mutation == "missing-shard":
+        shard.unlink()
+    elif mutation == "extra-shard":
+        save_file({"extra": torch.zeros(1, dtype=torch.bfloat16)}, str(case.root / "extra.safetensors"))
+    elif mutation == "missing-index-and-single":
+        index_path.unlink()
+    elif mutation == "empty-map":
+        case.index["weight_map"] = {}
+    elif mutation == "wrong-byte-count":
+        case.index["metadata"]["total_size"] += 2
+    elif mutation == "wrong-header-name":
+        case.index["weight_map"]["wrong.tensor"] = case.index["weight_map"].pop("model.embed_tokens.weight")
+    elif mutation == "wrong-shard":
+        case.index["weight_map"]["model.embed_tokens.weight"] = "model-00002-of-00002.safetensors"
+    elif mutation == "traversal":
+        case.index["weight_map"]["model.embed_tokens.weight"] = "../outside.safetensors"
+    elif mutation == "bad-header":
+        shard.write_bytes(b"invalid-safetensors-header")
+    if mutation == "nonobject-index":
+        index_path.write_text("[]")
+    elif mutation == "duplicate-index-key":
+        index_path.write_text('{"weight_map": {}, "weight_map": {}}')
+    elif index_path.exists():
+        index_path.write_text(json.dumps(case.index))
+    with pytest.raises((ValueError, OSError, safetensors.SafetensorError)):
+        describe_source_model(str(case.root))
+
+
+@pytest.mark.parametrize(
+    "tensors,total",
+    [
+        ({"weight": torch.zeros(1, dtype=torch.float16)}, 2),
+        ({"unknown_buffer": torch.zeros(1, dtype=torch.int64)}, 8),
+        ({"weight": torch.empty((0, 3), dtype=torch.bfloat16)}, 0),
+    ],
+    ids=["unreviewed-f16", "unreviewed-i64", "zero-dimension"],
+)
+@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "unsharded"])
+def test_reference_free_metadata_rejects_unreviewed_header_schema(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, tensors, total, indexed
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace, indexed=False)
+    save_file(tensors, str(case.root / "model.safetensors"))
+    if indexed:
+        (case.root / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {"metadata": {"total_size": total}, "weight_map": {name: "model.safetensors" for name in tensors}}
+            )
+        )
+    with pytest.raises(ValueError, match="invalid tensor dtype or shape"):
+        describe_source_model(str(case.root))
+
+
+@pytest.mark.parametrize("target", ["root", "ancestor", "config.json", "model.safetensors.index.json", "shard"])
+def test_reference_free_metadata_rejects_symlinks(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, target
+):
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    workspace = _reference_free_metadata_workspace
+    case = _reference_free_metadata_source(workspace)
+    source = case.root
+    if target == "root":
+        source = workspace / "alias"
+        source.symlink_to(case.root, target_is_directory=True)
+    elif target == "ancestor":
+        alias = workspace / "parent-alias"
+        alias.symlink_to(workspace, target_is_directory=True)
+        source = alias / "original"
+    else:
+        name = "model-00001-of-00002.safetensors" if target == "shard" else target
+        path = case.root / name
+        moved = workspace / name
+        path.rename(moved)
+        path.symlink_to(moved)
+    with pytest.raises(ValueError, match="canonical regular|regular original"):
+        describe_source_model(str(source))
+
+
+@pytest.mark.parametrize("target", ["config.json", "model.safetensors.index.json", "shard", "membership", "inode"])
+def test_reference_free_metadata_rejects_source_drift_during_header_admission(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch, target
+):
+    from arctic_platform.correctness.harness import inference_export
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
+    actual_inventory = inference_export.read_inventory
+
+    def drifting_inventory(root, index, *, original_quantization_config=None):
+        result = actual_inventory(root, index, original_quantization_config=original_quantization_config)
+        if target == "membership":
+            save_file({"extra": torch.zeros(1, dtype=torch.bfloat16)}, str(case.root / "new.safetensors"))
+        else:
+            name = "model-00001-of-00002.safetensors" if target in ("shard", "inode") else target
+            path = case.root / name
+            if target == "inode":
+                path.rename(case.root / "replaced.safetensors")
+                save_file({"model.embed_tokens.weight": torch.zeros((4, 3), dtype=torch.bfloat16)}, str(path))
+            else:
+                with path.open("ab") if path.suffix != ".safetensors" else open(path, "ab") as stream:
+                    stream.write(b" ")
+        return result
+
+    monkeypatch.setattr(inference_export, "read_inventory", drifting_inventory)
+    with pytest.raises(ValueError, match="changed during preparation"):
+        describe_source_model(str(case.root))
+
+
+def _reference_free_metadata_rl_args(workspace, monkeypatch):
+    from arctic_platform.correctness.harness.config import LoadedConfig
+    from arctic_platform.correctness.onboarding import onboard
+
+    case = _reference_free_metadata_source(workspace)
+    training = {
+        "job_type": "training",
+        "model_name": "zai-org/GLM-5.3-Flash-BF16",
+        "dtype": "bfloat16",
+        "training_config": {
+            "n_gpus": 2,
+            "sp_size": 2,
+            "max_seq_len": 128,
+            "mb_spec": {"max_tokens_per_mb": 128},
+            "attn_implementation": "sparse_mla",
+        },
+    }
+    cfg = LoadedConfig(
+        config_id="metadata-fixture-rl",
+        path=workspace / "rl.config",
+        sub_job=training,
+        sub_jobs=[training, {"job_type": "sampling"}],
+    )
+    # Relocate only the canonical publication root; never write the maintained specs directory.
+    monkeypatch.setattr(onboard, "__file__", str(workspace / "overlay" / "onboarding" / "onboard.py"))
+    args = SimpleNamespace(
+        test_id="inference-checkpoint-loss",
+        source_checkpoint=str(case.root),
+        test_spec=workspace / "overlay" / "specs" / f"{cfg.config_id}.json",
+        tokens=128,
+        config=cfg.path,
+        output_dir=workspace / "output",
+    )
+    args.output_dir.mkdir()
+    return args, cfg, case
+
+
+def test_reference_free_metadata_null_roundtrip_preserves_full_depth_and_evidence(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    spec = onboard._build_reference_free_rl_spec(args, cfg)
+    spec.write(args.test_spec)
+    raw = json.loads(args.test_spec.read_text())
+    assert {field: raw["model"][field] for field in ("seed", "param_count", "sized_against_gib")} == {
+        "seed": None,
+        "param_count": None,
+        "sized_against_gib": None,
+    }
+    assert raw["model"]["vision_depth"] == 24
+    restored = Spec.read(args.test_spec)
+    assert restored == spec
+    assert restored.test_settings[args.test_id]["source_metadata"]["tensor_payloads_read"] is False
+
+
+def test_reference_free_metadata_generated_arms_checksum_and_only_selected_rl_check(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch
+):
+    from arctic_platform.correctness.harness.batches import SEED
+    from arctic_platform.correctness.harness.batches import build_batch
+    from arctic_platform.correctness.harness.config import arms_for
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
+    from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
+    from arctic_platform.correctness.harness.registry import registered_tests
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    expected_checksum = config_checksum(cfg)
+    spec = onboard._build_reference_free_rl_spec(args, cfg)
+    assert spec.config_id == cfg.config_id
+    assert spec.config_path == str(cfg.path)
+    assert spec.config_checksum == expected_checksum == config_checksum(cfg)
+    assert spec.attn_implementations == [cfg.attention_implementation]
+    assert spec.applicable_tests == [args.test_id]
+    assert spec.test_tolerances == {}
+    assert spec.inapplicable == {
+        test_id: RL_INAPPLICABLE_REASON for test_id, entry in registered_tests().items() if entry.compares_to_reference
+    }
+    assert list(spec.test_settings) == [args.test_id]
+    definitions = arms_for(cfg.max_seq_len, cfg.n_gpus)
+    assert len(spec.arms) == len(definitions) == 2
+    for arm, definition in zip(spec.arms, definitions):
+        batch = build_batch(definition.name, definition.global_batch_size, definition.max_seq_len, 128, seed=SEED)
+        assert vars(arm) == {
+            "name": definition.name,
+            "global_batch_size": definition.global_batch_size,
+            "max_seq_len": definition.max_seq_len,
+            "total_tokens": batch.total_tokens,
+            "active_tokens": batch.active_tokens,
+            "dss_microbatches": definition.microbatches(
+                correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
+            ),
+            "pad_fraction": batch.pad_fraction,
+        }
+    assert not args.test_spec.exists()
+    assert "not an architecture parameter count" in " ".join(spec.notes)
+
+
+@pytest.mark.parametrize("invalid", ["custom-destination", "smaller-tokens", "sft", "reference-check", "hosted-check"])
+def test_reference_free_metadata_bootstrap_prerequisites_fail_before_source_admission(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch, invalid
+):
+    from arctic_platform.correctness.onboarding import onboard
+    from arctic_platform.correctness.onboarding import synth_model
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    if invalid == "custom-destination":
+        args.test_spec = args.output_dir / "custom.json"
+    elif invalid == "smaller-tokens":
+        args.tokens -= 1
+    elif invalid == "sft":
+        cfg.sub_jobs = [cfg.sub_job]
+    elif invalid == "reference-check":
+        args.test_id = "single-step-grads"
+    else:
+        from arctic_platform.correctness.harness.registry import registered_tests
+
+        # No current check requires hosted execution; exercise the existing admission flag directly.
+        monkeypatch.setattr(registered_tests()[args.test_id], "requires_hosted_control_plane", True)
+    monkeypatch.setattr(
+        synth_model, "describe_source_model", lambda *args: pytest.fail("invalid bootstrap reached metadata admission")
+    )
+    with pytest.raises(ValueError, match="initial RL onboarding"):
+        onboard._build_reference_free_rl_spec(args, cfg)
+    assert not args.test_spec.exists()
+
+
+@pytest.mark.parametrize("result", ["pass", "fail", "exception"])
+def test_reference_free_metadata_publication_requires_final_regression_and_rolls_back(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch, result
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    calls = []
+
+    def final_regression(actual_args, selected, *, phase):
+        assert actual_args is args
+        candidate = Spec.read(args.test_spec)
+        assert candidate.model.num_hidden_layers == 45
+        assert candidate.model.param_count is candidate.model.seed is candidate.model.sized_against_gib is None
+        assert candidate.test_tolerances == {}
+        assert candidate.applicable_tests == [args.test_id]
+        assert candidate.test_settings[args.test_id]["source_metadata"]["tensor_payloads_read"] is False
+        assert selected == {"layers": 45, "model_description": f"configured full model {cfg.model_name}"}
+        assert phase == "phase 1/1"
+        calls.append(candidate)
+        if result == "exception":
+            raise RuntimeError("final regression sentinel")
+        return {"status": result, "report": str(args.output_dir / "report.json"), "log": "retained-final.log"}
+
+    monkeypatch.setattr(onboard, "_run_final_regression", final_regression)
+    manifest = args.output_dir / f"onboarding-{args.test_id}.json"
+    if result == "pass":
+        assert onboard._onboard_fixed_tolerance_test(args, cfg) == 0
+        assert Spec.read(args.test_spec) == calls[0]
+        record = json.loads(manifest.read_text())
+        assert record["bootstrapped_reference_free_rl"] is True
+        assert record["validated_model_scope"] == "configured-full-model"
+        assert record["num_hidden_layers"] == 45
+        assert record["frozen_reference_num_hidden_layers"] is None
+        assert "not calibrated" in record["tolerance"]
+        assert not list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+    else:
+        with pytest.raises(RuntimeError, match="final regression sentinel|inference-checkpoint-loss fail"):
+            onboard._onboard_fixed_tolerance_test(args, cfg)
+        assert not args.test_spec.exists()
+        assert not manifest.exists()
+        quarantined = list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+        assert len(quarantined) == 1
+        assert Spec.read(quarantined[0]) == calls[0]
+    assert len(calls) == 1
+
+
+def test_reference_free_metadata_existing_spec_checksum_drift_does_not_regress_or_restamp(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    spec = onboard._build_reference_free_rl_spec(args, cfg)
+    spec.write(args.test_spec)
+    before = args.test_spec.read_bytes()
+    cfg.training["max_seq_len"] += 1
+    monkeypatch.setattr(
+        onboard, "_run_final_regression", lambda *args, **kwargs: pytest.fail("checksum drift regressed")
+    )
+    with pytest.raises(ValueError, match="reviewed spec records training config checksum"):
+        onboard._onboard_fixed_tolerance_test(args, cfg)
+    assert args.test_spec.read_bytes() == before
+
+
+def test_reference_free_metadata_existing_reviewed_spec_restored_after_final_failure(
+    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args, cfg, _ = _reference_free_metadata_rl_args(_reference_free_metadata_workspace, monkeypatch)
+    spec = onboard._build_reference_free_rl_spec(args, cfg)
+    spec.applicable_tests = []
+    spec.notes.append("retained reviewed sentinel")
+    spec.write(args.test_spec)
+    before = args.test_spec.read_bytes()
+
+    def final_regression(*args, **kwargs):
+        raise RuntimeError("existing final regression sentinel")
+
+    monkeypatch.setattr(onboard, "_run_final_regression", final_regression)
+    with pytest.raises(RuntimeError, match="existing final regression sentinel"):
+        onboard._onboard_fixed_tolerance_test(args, cfg)
+    assert args.test_spec.read_bytes() == before
+    assert not list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+
+
+def test_reference_free_metadata_supervised_build_spec_retains_reduced_numeric_recipe(
+    _reference_free_metadata_workspace, monkeypatch
+):
+    import transformers
+
+    from arctic_platform.correctness.harness.batches import SEED
+    from arctic_platform.correctness.harness.config import ModelSpec
+    from arctic_platform.correctness.harness.config import arms_for
+    from arctic_platform.correctness.onboarding import onboard
+    from arctic_platform.correctness.onboarding import synth_model
+
+    workspace = _reference_free_metadata_workspace
+    args, cfg, _ = _reference_free_metadata_rl_args(workspace, monkeypatch)
+    cfg.sub_jobs = [cfg.sub_job]
+    observed = []
+    model = ModelSpec(
+        source_checkpoint=args.source_checkpoint,
+        num_hidden_layers=2,
+        vision_depth=2,
+        seed=SEED,
+        param_count=456,
+        cache_path=str(workspace / "reduced"),
+        content_hash="numeric-reduced-fixture",
+        sized_against_gib=100.0,
+    )
+
+    def materialize(source, destination, layers):
+        observed.append((source, destination, layers))
+        return model
+
+    monkeypatch.setattr(synth_model, "materialize_pretrained", materialize)
+    monkeypatch.setattr(synth_model, "size_for_single_gpu", lambda source: (2, 456))
+    monkeypatch.setattr(
+        synth_model,
+        "describe_source_model",
+        lambda *args: pytest.fail("supervised sizing used RL metadata descriptor"),
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(vocab_size=128)
+    )
+    spec = onboard.build_spec(
+        cfg,
+        args.source_checkpoint,
+        str(workspace / "cache"),
+        arms_for(cfg.max_seq_len, cfg.n_gpus),
+        workdir=workspace / "work",
+    )
+    assert observed == [(args.source_checkpoint, str(workspace / "cache" / "original-2L"), 2)]
+    assert spec.model is model
+    assert spec.model.param_count == 456
+    assert spec.model.seed == SEED
+    assert spec.model.sized_against_gib == 100.0
+    assert spec.applicable_tests == ["single-step-grads"]
+    assert spec.inapplicable == spec.test_settings == {}

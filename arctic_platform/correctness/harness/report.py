@@ -422,6 +422,17 @@ def _header(specs: Dict[str, TestSpec], execution: Dict[str, dict]) -> List[str]
             "",
             "Environment fields below describe the client process, not the remote worker image or GPUs.",
         ]
+    if any(spec.model.param_count is None for spec in specs.values()):
+        lines[2:5] = [
+            (
+                "Reference-free checks use the original model and their reviewed comparison criteria, without a"
+                " supervised Hugging Face reference. Original-model metadata is not a generated reference fixture"
+                " or evidence that the target loaded the model. Other checks retain their reviewed reference and"
+                " fixture contracts."
+            ),
+            "",
+            "Environment fields below describe the client process, not independently verified target workers.",
+        ]
     env = collect()
     labels = {
         "generated": "generated",
@@ -495,8 +506,12 @@ def to_markdown(
             model_label = "reviewed reference fixture (not loaded on Cortex)"
         elif bound_fixture and inference_model is not None:
             model_label = "reviewed reference fixture (fixture-based checks only; not used by inference)"
+        parameter_count = f"{spec.model.param_count:,} parameters" if spec.model.param_count is not None else None
+        if parameter_count is None:
+            model_label = "original model metadata (not a generated reference fixture)"
+            parameter_count = "parameter count unknown"
         lines.append(
-            f"- {model_label}: {spec.model.param_count:,} parameters, {spec.model.num_hidden_layers} layers "
+            f"- {model_label}: {parameter_count}, {spec.model.num_hidden_layers} layers "
             f"of `{spec.model.source_checkpoint}`, hash `{spec.model.content_hash}`"
         )
         lines.append(f"- attention implementations: {', '.join(spec.attn_implementations)}")

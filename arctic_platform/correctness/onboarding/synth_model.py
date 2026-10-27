@@ -29,8 +29,11 @@ tensors on the same side, and the checkpoint's weights bring that to -2.01e-04 w
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
+import math
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 from typing import Tuple
@@ -50,6 +53,111 @@ SINGLE_GPU_BUDGET_GIB = 100.0
 # sizing on weights and accumulator alone understates the requirement by a quarter and selects a layer
 # count that does not fit.
 BYTES_PER_PARAM = 8
+
+
+def describe_source_model(source: str) -> tuple[ModelSpec, int, dict]:
+    """Read original config and tensor headers for reference-free checks, without constructing a model.
+
+    Header element counts include buffers and do not establish architecture parameter counts. Neither a
+    reference sizing measurement nor an initialization seed exists for this original pretrained model.
+    """
+    from arctic_platform.correctness.harness.inference_export import original_schema_bytes
+    from arctic_platform.correctness.harness.inference_export import read_export_json
+    from arctic_platform.correctness.harness.inference_export import read_inventory
+    from arctic_platform.correctness.harness.inference_export import schema_sha
+
+    root = Path(source)
+    if not root.is_dir():
+        from huggingface_hub import snapshot_download
+
+        root = Path(snapshot_download(source, local_files_only=True))
+    canonical = require_data_fast_path(root, label="reference-free original model")
+    if root.is_symlink() or root.absolute() != canonical or not root.is_dir():
+        raise ValueError("reference-free metadata requires a canonical regular original model directory")
+    root = canonical
+
+    def fingerprint(path: Path) -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    index_path = root / "model.safetensors.index.json"
+
+    def metadata_paths() -> list[Path]:
+        result = [root, root / "config.json", *sorted(root.glob("*.safetensors"))]
+        if index_path.exists() or index_path.is_symlink():
+            result.append(index_path)
+        return result
+
+    paths = metadata_paths()
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("reference-free metadata requires regular original config and weight files")
+    before = {path: fingerprint(path) for path in paths}
+    config = read_export_json(root / "config.json")
+    text = config.get("text_config", config)
+    if not isinstance(text, dict):
+        raise ValueError("original text configuration object required")
+    for name in ("num_hidden_layers", "vocab_size"):
+        if type(text.get(name)) is not int or text[name] <= 0:
+            raise ValueError(f"original positive integer {name} required")
+    quantization_config = config.get("quantization_config", text.get("quantization_config"))
+    vision = config.get("vision_config")
+    vision_depth = None
+    if vision is not None:
+        if not isinstance(vision, dict):
+            raise ValueError("original vision configuration object required")
+        vision_depth = vision.get("depth", vision.get("num_hidden_layers"))
+        if type(vision_depth) is not int or vision_depth <= 0:
+            raise ValueError("original positive integer vision depth required")
+
+    if index_path in before:
+        index = read_export_json(index_path)
+        index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    else:
+        from safetensors import safe_open
+
+        weights = root / "model.safetensors"
+        if weights not in before:
+            raise ValueError("original safetensors index or single model.safetensors required")
+        with safe_open(str(weights), framework="pt", device="cpu") as stream:
+            schema = {
+                name: [stream.get_slice(name).get_dtype(), stream.get_slice(name).get_shape()]
+                for name in stream.keys()
+            }
+        index = {
+            "metadata": {"total_size": original_schema_bytes(schema, quantization_config)},
+            "weight_map": {name: weights.name for name in schema},
+        }
+        index_sha = None
+    schema = read_inventory(root, index, original_quantization_config=quantization_config)
+    evidence = {
+        "config_sha256": hashlib.sha256((root / "config.json").read_bytes()).hexdigest(),
+        "index_sha256": index_sha,
+        "tensor_schema_sha256": schema_sha(schema),
+        "tensor_count": len(schema),
+        "stored_tensor_elements": sum(math.prod(shape) for _, shape in schema.values()),
+        "tensor_payload_bytes": original_schema_bytes(schema, quantization_config),
+        "tensor_payloads_read": False,
+    }
+    if quantization_config is not None:
+        evidence["original_quantization_config"] = quantization_config
+    model = ModelSpec(
+        source_checkpoint=source,
+        num_hidden_layers=text["num_hidden_layers"],
+        vision_depth=vision_depth,
+        seed=None,
+        param_count=None,
+        cache_path=str(root),
+        content_hash=hash_directory(root),
+        sized_against_gib=None,
+    )
+    after_paths = metadata_paths()
+    if (
+        paths != after_paths
+        or any(path.is_symlink() for path in after_paths)
+        or before != {path: fingerprint(path) for path in after_paths}
+    ):
+        raise ValueError("original source metadata or weights changed during preparation")
+    return model, text["vocab_size"], evidence
 
 
 def detect_block_period(layer_types: List[str]) -> int:
@@ -98,24 +206,85 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     return cfg, original, period
 
 
-def count_parameters(cfg) -> int:
-    """Exact parameter count with no memory cost and no weight loading, for any architecture."""
+def _meta_model(cfg):
     import torch
     import transformers
 
     cls = getattr(transformers, cfg.architectures[0])
     with torch.device("meta"):
-        model = cls(cfg)
-    return sum(p.numel() for p in model.parameters())
+        return cls(cfg)
+
+
+def count_parameters(cfg) -> int:
+    """Exact full parameter count with no tensor payload allocation or weight loading."""
+    return sum(p.numel() for p in _meta_model(cfg).parameters())
+
+
+@dataclass(frozen=True)
+class ReferenceParameterResidency:
+    total_parameter_elements: int
+    cpu_frozen_parameter_elements: int
+    accelerator_frozen_parameter_elements: int
+    accelerator_trainable_parameter_elements: int
+    cpu_frozen_weight_bytes: int
+    accelerator_weight_bytes: int
+    accelerator_live_gradient_bytes: int
+    cpu_gradient_accumulator_bytes: int
+    accelerator_buffer_bytes: int
+    conservative_accelerator_parameter_charge_bytes: int
+    sizing_scope: str = "bf16-forward-backward-parameters-only-not-peak-runtime-or-optimizer-admission"
+
+
+def reference_parameter_residency(cfg, bytes_per_param: int = BYTES_PER_PARAM) -> ReferenceParameterResidency:
+    """Count unique architecture parameters by the maintained BF16 reference's placement policy.
+
+    CPU bytes are obligations, not available-memory claims. The Qwen4 charge retains the conservative
+    trainable rate (eight bytes by default) and charges accelerator-frozen weights at two bytes each.
+    Buffers are reported separately; activations, workspace and optimizer state are outside this estimate.
+    Other families retain the original all-parameter charge, regardless of their trainability.
+    """
+    model = _meta_model(cfg)
+    qwen4 = getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+    cpu_ids = frozenset()
+    frozen_ids = frozenset()
+    if qwen4:
+        from ..reference.qwen4_reference import qwen4_parameter_policy
+
+        policy = qwen4_parameter_policy(model)
+        cpu_ids = policy.cpu_parameter_ids
+        frozen_ids = policy.frozen_parameter_ids
+    cpu_frozen = accelerator_frozen = accelerator_trainable = 0
+    for parameter in model.parameters():
+        if id(parameter) in cpu_ids:
+            cpu_frozen += parameter.numel()
+        elif id(parameter) in frozen_ids or not parameter.requires_grad:
+            accelerator_frozen += parameter.numel()
+        else:
+            accelerator_trainable += parameter.numel()
+    total = cpu_frozen + accelerator_frozen + accelerator_trainable
+    charge = accelerator_trainable * bytes_per_param + accelerator_frozen * 2 if qwen4 else total * bytes_per_param
+    return ReferenceParameterResidency(
+        total_parameter_elements=total,
+        cpu_frozen_parameter_elements=cpu_frozen,
+        accelerator_frozen_parameter_elements=accelerator_frozen,
+        accelerator_trainable_parameter_elements=accelerator_trainable,
+        cpu_frozen_weight_bytes=cpu_frozen * 2,
+        accelerator_weight_bytes=(accelerator_frozen + accelerator_trainable) * 2,
+        accelerator_live_gradient_bytes=accelerator_trainable * 2,
+        cpu_gradient_accumulator_bytes=accelerator_trainable * 4,
+        accelerator_buffer_bytes=sum(buffer.numel() * buffer.element_size() for buffer in model.buffers()),
+        conservative_accelerator_parameter_charge_bytes=charge,
+    )
 
 
 def size_for_single_gpu(
     source: str, budget_gib: float = SINGLE_GPU_BUDGET_GIB, bytes_per_param: int = BYTES_PER_PARAM
 ) -> Tuple[int, int]:
-    """Largest whole-block layer count whose parameter-resident memory fits the budget.
+    """Largest whole-block layer count whose reference parameter residency fits the budget.
 
     Activations and the cross-entropy workspace are not counted here; they are bounded separately by the
-    reference's own microbatch token budget, and the margin in ``budget_gib`` covers them.
+    reference's own microbatch token budget, and the margin in ``budget_gib`` covers them. CPU table and
+    accumulator capacity, buffer residency and optimizer peak memory are not admitted by this selection.
     """
     from transformers import AutoConfig
 
@@ -126,8 +295,14 @@ def size_for_single_gpu(
 
     for n in range(full - (full % period), 0, -period):
         cfg, _, _ = reduce_config(source, n)
-        params = count_parameters(cfg)
-        if params * bytes_per_param / 1024**3 <= budget_gib:
+        if getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
+            residency = reference_parameter_residency(cfg, bytes_per_param=bytes_per_param)
+            params = residency.total_parameter_elements
+            charge = residency.conservative_accelerator_parameter_charge_bytes
+        else:
+            params = count_parameters(cfg)
+            charge = params * bytes_per_param
+        if charge / 1024**3 <= budget_gib:
             return n, params
     raise RuntimeError(f"no layer count fits {budget_gib} GiB; the embedding pair alone may exceed it")
 
@@ -328,7 +503,11 @@ def materialize(
     import torch
     import transformers
 
-    cfg, original, period = reduce_config(source, num_layers, vision_depth)
+    cfg, _, _ = reduce_config(source, num_layers, vision_depth)
+    # These weights are initialized in BF16, not loaded from the source's quantized tensors.
+    for config in (cfg, getattr(cfg, "text_config", cfg)):
+        if hasattr(config, "quantization_config"):
+            delattr(config, "quantization_config")
 
     if force or not (dest_path / "config.json").exists():
         dest_path.mkdir(parents=True, exist_ok=True)
@@ -339,6 +518,10 @@ def materialize(
         for extra in glob.glob(f"{source}/*token*") + glob.glob(f"{source}/*.txt"):
             shutil.copy2(extra, dest_path)
         del model
+    else:
+        cached = json.loads((dest_path / "config.json").read_text())
+        if any(config.get("quantization_config") is not None for config in (cached, cached.get("text_config", {}))):
+            raise ValueError("the cached reduced fixture is quantized; rebuild it with force=True")
 
     params = count_parameters(cfg)
     return ModelSpec(

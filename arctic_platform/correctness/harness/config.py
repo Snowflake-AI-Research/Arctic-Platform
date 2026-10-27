@@ -42,7 +42,26 @@ from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
 
-DEFAULT_REFERENCE_CALIBRATION_RUNS = 5
+DEFAULT_REFERENCE_CALIBRATION_RUNS = 8
+MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS = 8
+
+
+def reference_calibration_worker_count(
+    workers: int | None = None, *, runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS
+) -> int:
+    """Select independent HF workers on the current node, not the target GPU group."""
+    if runs < 2:
+        raise ValueError("norm onboarding requires at least two calibration runs")
+    if workers is not None:
+        if not 1 <= workers <= MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS:
+            raise ValueError("reference calibration requires 1 to 8 HF workers on one node")
+        return min(workers, runs)
+
+    import torch
+
+    # TODO: Use all available GPUs within one allocation, including multi-node
+    # launches, node-local model/input staging, unique devices and result/failure collection.
+    return max(1, min(runs, MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS, torch.cuda.device_count()))
 
 
 class ReviewedTrainingConfig(TrainingConfig):
@@ -109,16 +128,20 @@ class ArmSpec:
 
 @dataclass
 class ModelSpec:
-    """The synthetic model recipe. Regenerable from the seed, so the path is a cache and not an input."""
+    """A prepared reference recipe or metadata describing an original pretrained source.
+
+    Reference-free checks retain the original source directory as an input, not a regenerable fixture.
+    Unknown or unmeasured seed, parameter count and reference sizing remain None.
+    """
 
     source_checkpoint: str
     num_hidden_layers: int
-    vision_depth: int
-    seed: int
-    param_count: int
+    vision_depth: Optional[int]
+    seed: Optional[int]
+    param_count: Optional[int]
     cache_path: str
     content_hash: str
-    sized_against_gib: float
+    sized_against_gib: Optional[float]
     measured_reference_peak_gib: Optional[float] = None
 
 
@@ -263,6 +286,7 @@ class LoadedConfig:
     # alone, but the surrounding job shape is what says whether that training step is part of an RL loop.
     sub_jobs: List[Dict[str, Any]] = field(default_factory=list)
     native: ArcticClientConfig | None = None
+    hardware: Literal["H200", "B200", "B300"] | None = None
 
     @property
     def training(self) -> Dict[str, Any]:
@@ -406,10 +430,12 @@ class LoadedConfig:
 
     @property
     def gpu_type(self) -> str | None:
-        """The GPU type this config was written for, read from its directory: ``h200``, ``b200``, ``b300``.
+        """The explicit service hardware, otherwise the accelerator named by the config directory.
 
-        ``None`` for a config outside the ``configs/`` tree, where the layout carries no such claim.
+        A recipe imported outside the original catalog layout retains its explicit hardware identity.
         """
+        if self.hardware is not None:
+            return self.hardware.lower()
         parts = list(self.path.resolve().with_suffix("").parts)
         if CONFIG_ROOT not in parts:
             return None
@@ -512,7 +538,7 @@ def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
     if source.is_relative_to(root):
         return source
     load_config(source)
-    identifier = config_id(source)
+    identifier = source.stem
     matches = [
         candidate
         for candidate in root.rglob("*")
@@ -523,7 +549,11 @@ def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
     ]
     if len(matches) > 1:
         raise ValueError(f"duplicate configuration ID: {identifier}")
-    destination = matches[0] if matches else root / f"{identifier}{source.suffix}"
+    destination = root / source.name
+    if matches and matches[0] != destination:
+        raise ValueError(
+            f"configuration ID {identifier!r} already exists at {matches[0]}; use a distinct configuration filename"
+        )
     contents = source.read_bytes()
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -612,9 +642,12 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
 
 def _load_cortex_recipe(path: Path, raw: dict) -> LoadedConfig:
     """Read the service recipe without losing engine fields in a client-schema conversion."""
-    unsupported = set(raw) - {"sub_job_configs"}
+    unsupported = set(raw) - {"sub_job_configs", "hardware"}
     if unsupported:
         raise ValueError(f"{path}: unsupported Cortex recipe fields: {sorted(unsupported)}")
+    hardware = raw.get("hardware")
+    if "hardware" in raw and (not isinstance(hardware, str) or hardware not in {"H200", "B200", "B300"}):
+        raise ValueError(f"{path}: hardware must be one of H200, B200, B300")
     sub_jobs = raw["sub_job_configs"]
     if not isinstance(sub_jobs, list) or not sub_jobs:
         raise ValueError(f"{path}: sub_job_configs must be a non-empty list")
@@ -651,7 +684,7 @@ def _load_cortex_recipe(path: Path, raw: dict) -> LoadedConfig:
     if "training" not in roles:
         raise ValueError(f"{path}: correctness requires exactly one training sub-job")
     training = next(sub for sub in sub_jobs if sub["job_type"] == "training")
-    return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs)
+    return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs, hardware=hardware)
 
 
 def load_config(path: str | Path) -> LoadedConfig:
@@ -673,7 +706,10 @@ def load_config(path: str | Path) -> LoadedConfig:
 def config_checksum(config: LoadedConfig) -> str:
     """Hash the normalized native fields that define the training job."""
     if config.native is None:
-        canonical = json.dumps(config.sub_job, sort_keys=True, separators=(",", ":"))
+        projection = config.sub_job
+        if config.hardware is not None:
+            projection = {"hardware": config.hardware, "sub_job": config.sub_job}
+        canonical = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     else:
         raw = config.native.model_dump(mode="json", exclude_none=False)
         projection = {

@@ -176,7 +176,7 @@ class ShadowVerifier:
         ):
             raise RuntimeError("weight loader changed the registered parameter identities or storage")
 
-    def load(self, name, value):
+    def load(self, name, value, *, loader=None):
         import torch
         from torch.utils._python_dispatch import TorchDispatchMode
         from torch.utils._pytree import tree_flatten
@@ -185,6 +185,13 @@ class ShadowVerifier:
         if not isinstance(name, str) or not name or name in self.received:
             raise ValueError("received tensor names must be nonempty and unique")
         self._check_inventory()
+        if loader is None:
+
+            def loader(source_name, tensor):
+                return self.model.load_weights([(source_name, tensor)])
+
+        verify_sources(self.sources)
+        self.sources.update(source_files(loader))
         verify_sources(self.sources)
         entry = tensor_manifest(value)
         verifier = self
@@ -244,10 +251,10 @@ class ShadowVerifier:
                 return result
 
         with torch.no_grad(), Observe(False) as live:
-            self.model.load_weights([(name, value)])
+            result = loader(name, value)
         # Each replay receives private input too; loaders must not mutate the wire tensor.
         with torch.no_grad(), Observe(True) as replay:
-            self.model.load_weights([(name, value.detach().clone())])
+            loader(name, value.detach().clone())
         self._check_inventory()
         verify_sources(self.sources)
         if live.written != replay.written or tensor_manifest(value) != entry:
@@ -255,6 +262,7 @@ class ShadowVerifier:
         entry["destinations"] = sorted(live.written)
         self.received[name] = entry
         self.touched.update(live.written)
+        return result
 
     def finish(self):
         import torch

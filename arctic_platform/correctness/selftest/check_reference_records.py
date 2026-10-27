@@ -549,16 +549,70 @@ def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_refer
     output = capsys.readouterr().out
     for arm in control.arms:
         assert f"Optimizer calibration {arm.name}" in output
-        for completed in range(1, 6):
-            assert f"{completed}/5" in output
+        for completed in range(1, 9):
+            assert f"{completed}/8" in output
         assert output.index(f"Optimizer calibration {arm.name}") < output.index(
             f"*** Optimizer Norm Summary: {arm.name} ***"
         )
         assert calls.count((f"batch-{arm.name}.pt", True)) == 1
-        assert calls.count((f"batch-{arm.name}.pt", False)) == 5
+        assert calls.count((f"batch-{arm.name}.pt", False)) == 8
     assert len(control.published) == 2
     assert all(
-        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 5
+        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 8
+        for identity, measurements in control.published
+    )
+    assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
+
+
+@pytest.mark.parametrize("available", [8, 16])
+def test_optimizer_calibration_defaults_to_one_eight_gpu_wave_per_arm(
+    _prepared_reference_runner_prepared_runner, monkeypatch, available
+):
+    from threading import Barrier
+    from threading import Lock
+
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.update(("single-step-optimizer", arm.name) for arm in control.arms)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
+    barrier = Barrier(8, timeout=10)
+    lock = Lock()
+    active = set()
+    completed = {}
+    baseline = []
+
+    def reference(model, batch, output, **kwargs):
+        arm = batch.stem.removeprefix("batch-")
+        if kwargs["deterministic"]:
+            assert kwargs["cuda_device"] is None
+            baseline.append(arm)
+        else:
+            index = int(output.stem.rsplit("-", 1)[-1])
+            device = kwargs["cuda_device"]
+            with lock:
+                assert device == index % 8
+                assert device not in active
+                assert 0 <= index < 8
+                active.add(device)
+            try:
+                barrier.wait()
+            finally:
+                with lock:
+                    active.remove(device)
+                    completed.setdefault(arm, set()).add(index)
+        return {
+            "loss": 3.0,
+            "grad_norms": {"layer.weight": 3.0},
+            "optimizer_state_manifest": str(control.target_manifest),
+        }
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert control.execute(prepare_references=True) == []
+    assert not active
+    assert baseline == [arm.name for arm in control.arms]
+    assert completed == {arm.name: set(range(8)) for arm in control.arms}
+    assert len(control.published) == len(control.arms)
+    assert all(
+        measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 8
         for identity, measurements in control.published
     )
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
@@ -591,8 +645,8 @@ def test_optimizer_calibration_failed_run_leaves_partial_progress_without_public
             reference_calibration_workers=1,
         )
     output = capsys.readouterr().out
-    assert "Optimizer calibration gas1" in output and "1/5" in output
-    assert "5/5" not in output and "Optimizer Norm Summary" not in output
+    assert "Optimizer calibration gas1" in output and "1/8" in output
+    assert "8/8" not in output and "Optimizer Norm Summary" not in output
     assert control.published == []
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
 
@@ -2238,6 +2292,8 @@ def test_reference_execution_witness_rejects_unrecordable_runtime(_reference_exe
 def test_reference_execution_witness_survives_run_and_rejects_execution_changes(
     _reference_execution_engine, monkeypatch, tmp_path, change
 ):
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+
     engine = _reference_execution_engine
     if change == "source":
         source = tmp_path / "changing-forward.py"
@@ -2260,7 +2316,28 @@ def test_reference_execution_witness_survives_run_and_rejects_execution_changes(
         elif change == "source":
             source.write_bytes(source.read_bytes() + b"\n# changed after reference start\n")
         return hf_single_gpu.ForwardBackwardResult(
-            loss=1.25, gradients={}, active_tokens=8, microbatches=1, skipped_no_grad=["indexer.weight"]
+            loss=1.25,
+            gradients={},
+            active_tokens=8,
+            microbatches=1,
+            skipped_no_grad=["indexer.weight"],
+            participation={
+                "schema": PARTICIPATION_SCHEMA,
+                "parameters": {
+                    "indexer.weight": {
+                        "shape": [1],
+                        "state": "inactive",
+                        "evidence": {
+                            "kind": "integer-selector",
+                            "module": "indexer",
+                            "module_class": "Glm5NextTextIndexer",
+                            "calls": 1,
+                            "integer_outputs_only": True,
+                            "forward_sha256": "0" * 64,
+                        },
+                    }
+                },
+            },
         )
 
     monkeypatch.setattr(hf_single_gpu, "forward_backward", forward)

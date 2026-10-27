@@ -95,12 +95,15 @@ def _cortex_recipe():
     }
 
 
-def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_path):
+@pytest.mark.parametrize("hardware", [None, "H200", "B200", "B300"])
+def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_path, hardware):
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.correctness.harness.config import local_config_path
     from arctic_platform.correctness.harness.hosted import training_client_config
 
     raw = _cortex_recipe()
+    if hardware is not None:
+        raw["hardware"] = hardware
     source = tmp_path / "external" / "qwen38_flash_next.json"
     source.parent.mkdir()
     source.write_text(json.dumps(raw, indent=2) + "\n")
@@ -115,7 +118,10 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.attention_implementation == "qsa_flex"
     assert cfg.optimizer_dtype == "bfloat16"
     assert config_checksum(cfg) == config_checksum(load_config(source))
-    wire = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1")).to_cortex()[0]
+    client_config = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1"))
+    assert cfg.hardware == client_config.hardware == hardware
+    assert cfg.gpu_type == (hardware.lower() if hardware is not None else None)
+    wire = client_config.to_cortex()[0]
     assert wire["weight_format"] == "vllm"
     for key in ("sp_size", "ep_size", "ep_group_layout", "ac_config", "optimizer"):
         assert wire["training_config"][key] == cfg.training[key]
@@ -125,9 +131,85 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.training["mb_spec"]["max_tokens_per_mb"] == 262144
     wider = cfg.at_gpu_width(16)
     assert wider.n_gpus == 16 and wider.sp_size == 8
+    assert wider.hardware == hardware
+    assert wider.gpu_type == cfg.gpu_type
     assert wider.training["ds_config"]["train_batch_size"] == 2
     assert config_checksum(wider) != config_checksum(cfg)
     assert cfg.sub_jobs == raw["sub_job_configs"]
+
+
+@pytest.mark.parametrize("hardware", [None, True, 200, "", "h200", "H100", [], {}])
+def test_cortex_recipe_invalid_hardware_fails_before_import(tmp_path, hardware):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _cortex_recipe()
+    raw["hardware"] = hardware
+    source = tmp_path / "recipe.json"
+    source.write_text(json.dumps(raw))
+    destination = tmp_path / "configs"
+    with pytest.raises(ValueError, match="hardware must be one of H200, B200, B300"):
+        local_config_path(source, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("hardware", "attention"),
+    [("H200", "flash_attention_3"), ("B200", "flash_attention_4"), ("B300", "flash_attention_4")],
+)
+def test_cortex_recipe_explicit_hardware_controls_attention_and_host_admission(
+    tmp_path, monkeypatch, hardware, attention
+):
+    from arctic_platform.correctness.harness import config as config_module
+
+    raw = _cortex_recipe()
+    raw["hardware"] = hardware
+    sub_job = raw["sub_job_configs"][0]
+    sub_job["model_name"] = "Qwen/Qwen3-8B"
+    sub_job["training_config"].pop("attn_implementation")
+    other_gpu = "b200" if hardware == "H200" else "h200"
+    path = tmp_path / "configs" / "model" / other_gpu / "recipe.config"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(raw))
+    cfg = load_config(path)
+    assert cfg.gpu_type == hardware.lower()
+    assert cfg.attention_implementation == attention
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: other_gpu)
+    with pytest.raises(ValueError, match=f"config is for {hardware.lower()} but this host has {other_gpu}"):
+        validate_against_host(cfg, available_gpus=8)
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: hardware.lower())
+    validate_against_host(cfg, available_gpus=8)
+    sub_job["training_config"]["attn_implementation"] = (
+        "flash_attention_4" if hardware == "H200" else "flash_attention_3"
+    )
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="requires attn_implementation"):
+        _ = load_config(path).attention_implementation
+
+
+def test_cortex_recipe_checksum_binds_explicit_hardware_and_preserves_omitted_digest(tmp_path):
+    import hashlib
+
+    from arctic_platform.correctness.harness.config import normalize_ints
+
+    raw = _cortex_recipe()
+    normalized_sub_job = normalize_ints(raw["sub_job_configs"][0])
+    path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(raw))
+    legacy = hashlib.sha256(json.dumps(normalized_sub_job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert config_checksum(load_config(path)) == legacy
+    digests = {legacy}
+    for hardware in ("H200", "B200", "B300"):
+        raw["hardware"] = hardware
+        path.write_text(json.dumps(raw))
+        cfg = load_config(path)
+        expected = hashlib.sha256(
+            json.dumps(
+                {"hardware": hardware, "sub_job": normalized_sub_job}, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        assert config_checksum(cfg) == expected
+        digests.add(expected)
+    assert len(digests) == 4
 
 
 def test_cortex_recipe_sampling_preserves_rl_classification(tmp_path):
@@ -734,7 +816,6 @@ def _correctness_qwen_flash_source(recipe):
         training.update(n_gpus=8, sp_size=8)
         training["ds_config"]["bf16"].update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
     else:
-        training.pop("model_provider")
         training.update(
             router_replay={"enabled": True, "max_cache_bytes": 2147483648},
             prime_rl={"fused_cross_entropy": False, "seq_len": 262144},
@@ -832,6 +913,22 @@ def test_correctness_sampling_replicas_wire(recipe):
     assert actual == expected
     assert config.native.model_dump(mode="json") == before
     assert config_checksum(config) == config_checksum(load_config(config.path))
+
+
+def test_correctness_flash_next_rl_expert_parallel_provider():
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    config = _correctness_qwen_flash_config("rl32")
+    assert config.training["ep_size"] == 8
+    assert config.training["sp_size"] == config.n_gpus == 16
+    assert config.training["model_provider"] == "prime_rl"
+    wire = next(
+        sub["training_config"]
+        for sub in CortexTrainingConfig.from_reviewed(config.native).to_cortex()
+        if sub["job_type"] == "training"
+    )
+    assert wire["model_provider"] == config.training["model_provider"]
+    assert wire["ep_size"] == config.training["ep_size"]
 
 
 @pytest.mark.parametrize(
@@ -1018,6 +1115,113 @@ def test_config_tolerance_gradient_norm_verdict_uses_the_frozen_config_gate():
     assert _run_arm(failing_context, arm).outcome.value == "fail"
 
 
+def _participation_record(*, inactive=True):
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+
+    entries = {"weight": {"shape": [2, 3], "state": "active", "evidence": None}}
+    if inactive:
+        entries["visual.weight"] = {
+            "shape": [3, 3],
+            "state": "inactive",
+            "evidence": {
+                "kind": "text-decoder-bypass",
+                "module": "visual",
+                "calls": 0,
+                "outside_decoder_and_head": True,
+                "forward_sha256": "a" * 64,
+            },
+        }
+    return {"schema": PARTICIPATION_SCHEMA, "parameters": entries}
+
+
+def test_participation_requires_complete_matching_inventory_and_independent_inactivity():
+    from arctic_platform.correctness.harness.participation import compare_participation
+
+    record = _participation_record()
+    assert compare_participation(record, record) == (1, 1)
+    with pytest.raises(ValueError, match="incomplete trainable inventory"):
+        compare_participation(_participation_record(inactive=False), record)
+    unexplained = deepcopy(record)
+    unexplained["parameters"]["visual.weight"]["evidence"] = None
+    with pytest.raises(ValueError, match="no independent evidence"):
+        compare_participation(unexplained, record)
+    disagreement = deepcopy(record)
+    disagreement["parameters"]["visual.weight"].update(state="active", evidence=None)
+    with pytest.raises(ValueError, match="participation or shape disagreement"):
+        compare_participation(disagreement, record)
+
+
+@pytest.mark.parametrize("norm", [float("nan"), float("inf"), -1.0])
+def test_gradient_comparison_rejects_nonfinite_or_negative_norms(norm):
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=norm)
+    result = _run_arm(context, arm)
+    assert result.outcome.value == "fail"
+    assert "finite" in result.reason
+
+
+def test_gradient_comparison_rejects_empty_pairs_and_missing_target_participation():
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    reference, target = context.reference_for(arm), context.target_for(arm)
+    reference["grad_norms"].clear()
+    target.grad_norms.clear()
+    assert _run_arm(context, arm).outcome.value == "fail"
+    reference["grad_norms"]["weight"] = target.grad_norms.setdefault("weight", 1.0)
+    reference["participation"] = _participation_record()
+    assert _run_arm(context, arm).outcome.value == "fail"
+
+
+def test_gradient_comparison_accepts_only_witnessed_inactive_zero_buffers():
+    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    reference, target = context.reference_for(arm), context.target_for(arm)
+    reference["participation"] = _participation_record()
+    target.participation = deepcopy(reference["participation"])
+    target.grad_norms["visual.weight"] = 0.0
+    result = _run_arm(context, arm)
+    assert result.outcome.value == "pass"
+    assert result.metrics["inactive_parameters_verified"] == 1.0
+    target.grad_norms["visual.weight"] = 0.1
+    assert _run_arm(context, arm).outcome.value == "fail"
+    target.grad_norms.pop("visual.weight")
+    target.grad_norms.pop("weight")
+    assert _run_arm(context, arm).outcome.value == "fail"
+
+
+def test_participation_observes_autograd_and_integer_outputs_without_inventing_zero_gradients():
+    import torch
+
+    from arctic_platform.correctness.harness.participation import ParticipationCapture
+    from arctic_platform.correctness.harness.participation import validate_participation
+
+    class Glm5NextTextIndexer(torch.nn.Linear):
+        def forward(self, value):
+            return super().forward(value).argmax(dim=-1)
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.visual = torch.nn.Linear(3, 3, bias=False)
+    model.indexer = Glm5NextTextIndexer(3, 3, bias=False)
+    initial_hooks = {name: len(parameter._backward_hooks or {}) for name, parameter in model.named_parameters()}
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3, requires_grad=True)
+        model.indexer(value)
+        (model.head(model.decoder(value)) * 0).sum().backward()
+        entries = validate_participation(capture.result())
+    assert entries["decoder.weight"]["state"] == entries["head.weight"]["state"] == "active"
+    assert entries["visual.weight"]["state"] == entries["indexer.weight"]["state"] == "inactive"
+    assert model.visual.weight.grad is None and model.indexer.weight.grad is None
+    assert torch.count_nonzero(model.decoder.weight.grad) == 0
+    assert initial_hooks == {
+        name: len(parameter._backward_hooks or {}) for name, parameter in model.named_parameters()
+    }
+    model.register_parameter("unexpected", torch.nn.Parameter(torch.ones(2)))
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        model.indexer(value)
+        model.head(model.decoder(value)).sum().backward()
+        with pytest.raises(ValueError, match="unexpected missing gradient"):
+            validate_participation(capture.result())
+
+
 def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor():
     floor = Tolerance(absolute=0.001, computed_gate=0.0004)
     rounded = Tolerance(absolute=0.002, computed_gate=0.0012)
@@ -1080,12 +1284,12 @@ def test_names_unequal_checkpoint_aliases_fail_coverage() -> None:
     assert only_dss == ["model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"]
 
 
-def test_names_unused_zero_vision_gradients_are_excluded() -> None:
+def test_names_unmatched_zero_vision_gradients_fail_coverage() -> None:
     dss = {"model.visual.blocks.0.attn.qkv.weight": 0.0, "model.layers.0.input_layernorm.weight": 2.0}
     reference = {"model.language_model.layers.0.input_layernorm.weight": 2.0}
     pairs, only_dss, only_reference = align(dss, reference)
     assert pairs == [("layers.0.input_layernorm.weight", 2.0, 2.0)]
-    assert not only_dss
+    assert only_dss == ["model.visual.blocks.0.attn.qkv.weight"]
     assert not only_reference
 
 

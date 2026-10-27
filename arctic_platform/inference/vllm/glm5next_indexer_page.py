@@ -26,8 +26,10 @@ same way 160 does. The legal kernel page is ``index_kpool * 64`` tokens (256
 for GLM-5.3-Flash). Advertising only that page makes vLLM's aligner round the
 640-token block up to 768, which splits into three 256-token pages of 64 states.
 
-Remove this once the pinned vLLM contains
-https://github.com/vllm-project/vllm/pull/57169.
+Newer vLLM separates shared token blocks from compressed storage pages. When
+the cache returns legal storage pages, keep its stock backend and metadata
+builder; forcing 256 shared tokens conflicts with the sparse MLA backend.
+The legacy override remains for cache specs without legal storage pages.
 """
 
 from dataclasses import replace
@@ -79,9 +81,30 @@ def metadata_block_size(
     return kernel_block_size
 
 
+def has_legal_storage_page(spec, page_states: tuple[int, ...]) -> bool:
+    """Whether the returned cache spec already describes a legal compressed page."""
+    block_size = getattr(spec, "block_size", None)
+    storage_block_size = getattr(spec, "storage_block_size", None)
+    tokens_per_state = getattr(spec, "tokens_per_state", 1)
+    if (
+        type(block_size) is not int
+        or type(storage_block_size) is not int
+        or type(tokens_per_state) is not int
+        or block_size <= 0
+        or storage_block_size <= 0
+        or tokens_per_state <= 1
+        or block_size % storage_block_size != 0
+        or storage_block_size % tokens_per_state != 0
+    ):
+        return False
+    return storage_block_size // tokens_per_state in page_states
+
+
 def build_with_deepgemm_page(builder, original_build, page_states, args, kwargs):
     """Run ``original_build`` against a legal DeepGEMM page, then restore."""
     spec = builder.kv_cache_spec
+    if has_legal_storage_page(spec, page_states):
+        return original_build(builder, *args, **kwargs)
     block_size = metadata_block_size(
         spec.block_size,
         getattr(builder, "kernel_block_size", None),
@@ -135,15 +158,22 @@ def apply_glm5next_indexer_page_fix() -> None:
 
     page_states = paged_mqa_page_sizes(_is_sm120(current_platform))
     original_backend = Glm5NextIndexerCache.get_attn_backend
+    original_spec = Glm5NextIndexerCache.get_kv_cache_spec
     original_build = DeepseekV32IndexerMetadataBuilder.build
 
     class Glm5NextIndexerCachePatch(ArcticPatch[Glm5NextIndexerCache]):
+        def get_kv_cache_spec(self, vllm_config):
+            # vLLM obtains the cache spec before choosing each layer's backend.
+            spec = original_spec(self, vllm_config)
+            self._arctic_indexer_cache_spec = spec
+            return spec
+
         def get_attn_backend(self):
             kpool = int(getattr(self, "_index_kpool", 1) or 1)
             # DeepSeek-V3.2 packs one token per state and keeps its own
             # 64-token kernel page. GLM is the cache that packs several
             # tokens into each state.
-            if kpool <= 1:
+            if kpool <= 1 or has_legal_storage_page(getattr(self, "_arctic_indexer_cache_spec", None), page_states):
                 return original_backend(self)
             return _indexer_backend(kpool, page_states)
 

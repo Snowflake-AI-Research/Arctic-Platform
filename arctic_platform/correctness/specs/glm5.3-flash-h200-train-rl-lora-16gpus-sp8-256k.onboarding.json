@@ -1,0 +1,12 @@
+{
+  "combined_reference_error": null,
+  "config": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/configs/glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
+  "config_id": "glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k",
+  "results": {
+    "inference-checkpoint-loss": {
+      "reason": "inference-checkpoint-loss failed for glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k\ninference-checkpoint-loss / -: validation cross entropy over answer tokens: training zone 0.457702, sampling zone 0.542128, absolute difference 84.426e-03 against a 1.000e-03 gate\nReport: /code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/work/reports/glm-rl16-inference-onboarding-t6QJTaPq/onboarding-svxi0bq6/inference-checkpoint-loss/validation/45-layers/report.json\nComplete log: /code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/work/reports/glm-rl16-inference-onboarding-t6QJTaPq/onboarding-svxi0bq6/inference-checkpoint-loss/validation/45-layers/run.log",
+      "status": "failed"
+    }
+  },
+  "test_spec": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/specs/glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k.json"
+}

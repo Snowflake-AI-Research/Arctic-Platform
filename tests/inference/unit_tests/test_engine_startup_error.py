@@ -1,9 +1,12 @@
+import hashlib
 import json
 import logging
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from arctic_platform.debug import inference_startup_error as durable_startup_error
 from arctic_platform.inference.vllm import startup_error
 
 
@@ -199,3 +202,289 @@ def test_engine_startup_root_reaches_the_raised_error():
     assert message.startswith("Engine core initialization failed.")
     assert "\nRoot cause in EngineCore: ValueError: " in message
     assert "gpu_memory_utilization" in message
+
+
+def _durable_startup_error_new_directory_identity(path):
+    metadata = path.stat()
+    return [
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+    ]
+
+
+@pytest.fixture
+def durable_startup_error_new_case(tmp_path, monkeypatch):
+    durable_startup_error._reset_inference_startup_error_for_tests()
+    monkeypatch.delenv(durable_startup_error.REQUEST_ENV, raising=False)
+    monkeypatch.delenv(durable_startup_error.ATTEMPT_ENV, raising=False)
+    root = tmp_path / "durable-startup-errors"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    request = {
+        "schema": "inference-startup-error-v1",
+        "request_id": "future-e03-attempt",
+        "config_id": "qwen35-e03",
+        "check_id": "inference-checkpoint-loss",
+        "generation": "generation-1",
+        "root": {
+            "path": str(root),
+            "identity": _durable_startup_error_new_directory_identity(root),
+            "parent_identity": _durable_startup_error_new_directory_identity(
+                root.parent
+            ),
+        },
+        "sources": {
+            label: hashlib.sha256(path.read_bytes()).hexdigest()
+            for label, path in durable_startup_error._SOURCE_PATHS.items()
+        },
+    }
+    case = SimpleNamespace(root=root, request=request)
+    try:
+        yield case
+    finally:
+        durable_startup_error._reset_inference_startup_error_for_tests()
+
+
+def _durable_startup_error_new_enable(monkeypatch, request):
+    monkeypatch.setenv(
+        durable_startup_error.REQUEST_ENV,
+        json.dumps(request, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _durable_startup_error_new_records(root):
+    return [
+        json.loads(path.read_bytes())
+        for path in sorted(root.iterdir())
+        if path.suffix == ".json"
+    ]
+
+
+def test_durable_startup_error_new_disabled_paths_are_exact_noops(
+    monkeypatch,
+    vllm_logger,
+):
+    durable_startup_error._reset_inference_startup_error_for_tests()
+    monkeypatch.delenv(durable_startup_error.REQUEST_ENV, raising=False)
+    before = list(vllm_logger.handlers)
+
+    assert (
+        durable_startup_error.maybe_install_inference_startup_error_producer()
+        is None
+    )
+    assert (
+        durable_startup_error.maybe_begin_inference_startup_attempt(1) is None
+    )
+    assert (
+        durable_startup_error.maybe_finish_inference_startup_attempt(
+            None,
+            "ready",
+            None,
+        )
+        is None
+    )
+    assert vllm_logger.handlers == before
+    assert durable_startup_error._ACTIVE is None
+
+
+def test_durable_startup_error_new_records_full_nonoverwriting_tracebacks(
+    durable_startup_error_new_case,
+    monkeypatch,
+    vllm_logger,
+):
+    case = durable_startup_error_new_case
+    _durable_startup_error_new_enable(monkeypatch, case.request)
+    durable_startup_error.maybe_install_inference_startup_error_producer()
+    durable_startup_error.maybe_install_inference_startup_error_producer()
+    handlers = [
+        handler
+        for handler in vllm_logger.handlers
+        if isinstance(
+            handler,
+            durable_startup_error.DurableStartupErrorHandler,
+        )
+    ]
+    assert len(handlers) == 1
+
+    marker_one = "complete-trace-one"
+    marker_two = "complete-trace-two"
+    engine_logger = logging.getLogger("vllm.v1.engine.core")
+    try:
+        raise ValueError(marker_one)
+    except ValueError:
+        engine_logger.exception(
+            "WorkerProc failed to start.",
+            extra={"vllm_process_name": "Worker_TP0"},
+        )
+    try:
+        raise RuntimeError(marker_two)
+    except RuntimeError:
+        engine_logger.exception("EngineCore failed to start.")
+
+    records = _durable_startup_error_new_records(case.root)
+    assert [record["sequence"] for record in records] == [0, 1]
+    assert [record["phase"] for record in records] == [
+        "startup_error",
+        "startup_error",
+    ]
+    assert records[0]["process_name"] == "Worker_TP0"
+    assert records[0]["exception_message"] == marker_one
+    assert records[1]["exception_message"] == marker_two
+    assert marker_one in records[0]["traceback"]
+    assert marker_two in records[1]["traceback"]
+    assert all(record["traceback_complete"] for record in records)
+    assert all(record["rank_state"] == "unknown" for record in records)
+    before = {path.name: path.read_bytes() for path in case.root.iterdir()}
+    durable_startup_error._reset_inference_startup_error_for_tests()
+    assert {path.name: path.read_bytes() for path in case.root.iterdir()} == before
+
+
+def test_durable_startup_error_new_create_only_collision_preserves_foreign_record(
+    durable_startup_error_new_case,
+    monkeypatch,
+):
+    case = durable_startup_error_new_case
+    _durable_startup_error_new_enable(monkeypatch, case.request)
+    producer = durable_startup_error._active_producer()
+    name = (
+        f"{producer.host_id}-{producer.pid}-{producer.start_ticks}-"
+        "00000000.json"
+    )
+    path = case.root / name
+    path.write_bytes(b"foreign")
+
+    with pytest.raises(FileExistsError):
+        producer.write("attempt_begin", {"coordinator": True})
+
+    assert path.read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize("damage", ["digest", "root-link", "root-generation"])
+def test_durable_startup_error_new_rejects_unauthenticated_sources_and_roots(
+    durable_startup_error_new_case,
+    monkeypatch,
+    tmp_path,
+    damage,
+):
+    case = durable_startup_error_new_case
+    request = json.loads(json.dumps(case.request))
+    if damage == "digest":
+        request["sources"]["producer"] = "0" * 64
+    elif damage == "root-link":
+        alias = tmp_path / "root-alias"
+        alias.symlink_to(case.root, target_is_directory=True)
+        request["root"]["path"] = str(alias)
+    else:
+        request["root"]["identity"][-1] += 1
+    _durable_startup_error_new_enable(monkeypatch, request)
+
+    with pytest.raises((RuntimeError, ValueError)):
+        durable_startup_error.maybe_install_inference_startup_error_producer()
+
+    assert durable_startup_error._ACTIVE is None
+    assert list(case.root.iterdir()) == []
+
+
+def test_durable_startup_error_new_rank_identity_changes_only_after_init(
+    monkeypatch,
+):
+    distributed = pytest.importorskip("torch.distributed")
+    monkeypatch.setattr(distributed, "is_available", lambda: True)
+    monkeypatch.setattr(distributed, "is_initialized", lambda: False)
+    assert durable_startup_error._rank_identity() == {
+        "rank_state": "unknown",
+        "global_rank": None,
+        "local_rank": None,
+        "world_size": None,
+    }
+
+    monkeypatch.setattr(distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(distributed, "get_rank", lambda: 7)
+    monkeypatch.setattr(distributed, "get_world_size", lambda: 16)
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    assert durable_startup_error._rank_identity() == {
+        "rank_state": "initialized",
+        "global_rank": 7,
+        "local_rank": 3,
+        "world_size": 16,
+    }
+
+
+def test_durable_startup_error_new_attempt_restores_env_and_preserves_exception(
+    durable_startup_error_new_case,
+    monkeypatch,
+):
+    case = durable_startup_error_new_case
+    _durable_startup_error_new_enable(monkeypatch, case.request)
+    attempt = durable_startup_error.maybe_begin_inference_startup_attempt(3)
+    attempt_value = json.loads(
+        os.environ[durable_startup_error.ATTEMPT_ENV]
+    )
+    assert attempt_value["attempt_ordinal"] == 3
+    assert attempt_value["attempt_id"] == attempt.attempt_id
+    original = KeyboardInterrupt("engine interrupted")
+    monkeypatch.setattr(
+        attempt.producer,
+        "write",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("diagnostic write failed")
+        ),
+    )
+
+    durable_startup_error.maybe_finish_inference_startup_attempt(
+        attempt,
+        "error",
+        original,
+    )
+
+    assert durable_startup_error.ATTEMPT_ENV not in os.environ
+    assert str(original) == "engine interrupted"
+    assert any(
+        "diagnostic write failed" in note
+        for note in getattr(original, "__notes__", [])
+    )
+
+
+def test_durable_startup_error_new_constructor_failure_closes_all_held_state(
+    durable_startup_error_new_case,
+    monkeypatch,
+):
+    case = durable_startup_error_new_case
+    closed = []
+
+    class Held:
+        def __init__(self, label):
+            self.label = label
+
+        def close(self):
+            closed.append(self.label)
+
+    monkeypatch.setattr(
+        durable_startup_error._HeldRoot,
+        "open",
+        lambda descriptor: Held("root"),
+    )
+    monkeypatch.setattr(
+        durable_startup_error._HeldSource,
+        "open",
+        lambda label, path, digest: Held(label),
+    )
+    monkeypatch.setattr(
+        durable_startup_error,
+        "_process_identity",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("process identity unavailable")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="process identity unavailable"):
+        durable_startup_error._Producer(case.request)
+
+    assert closed == [
+        *reversed(list(durable_startup_error._SOURCE_PATHS)),
+        "root",
+    ]

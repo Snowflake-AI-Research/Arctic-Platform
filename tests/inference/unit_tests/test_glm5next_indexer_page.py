@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
 
+import pytest
+
+from arctic_platform.inference.vllm import glm5next_indexer_page
 from arctic_platform.inference.vllm.glm5next_indexer_page import build_with_deepgemm_page
+from arctic_platform.inference.vllm.glm5next_indexer_page import has_legal_storage_page
 from arctic_platform.inference.vllm.glm5next_indexer_page import indexer_kernel_block_sizes
 from arctic_platform.inference.vllm.glm5next_indexer_page import metadata_block_size
 from arctic_platform.inference.vllm.glm5next_indexer_page import paged_mqa_page_sizes
@@ -17,6 +22,7 @@ _PAGES = paged_mqa_page_sizes(sm120=False)
 class _Spec:
     block_size: int
     tokens_per_state: int
+    storage_block_size: int | None = None
 
 
 def test_hopper_kernel_page_is_64_states():
@@ -103,3 +109,100 @@ def test_build_restores_the_spec_when_metadata_build_fails():
         raise AssertionError("expected the metadata build to fail")
 
     assert builder.kv_cache_spec is spec
+
+
+@pytest.mark.parametrize("block_size", [256, 512, 768])
+def test_storage_page_is_64_compressed_states(block_size):
+    assert has_legal_storage_page(_Spec(block_size, _KPOOL, 256), _PAGES)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        SimpleNamespace(block_size=512, tokens_per_state=4),
+        _Spec(512, 4),
+        _Spec(512, 4, 128),
+        _Spec(512, 4, 64),
+        _Spec(512, 4, 0),
+        _Spec(512, 4, -256),
+        _Spec(640, 4, 256),
+        _Spec(512, 1, 64),
+        _Spec(512, 0, 256),
+        _Spec(512, 4, 256.0),
+        _Spec(512, True, 64),
+    ],
+)
+def test_missing_or_invalid_storage_page_keeps_legacy_behavior(spec):
+    assert not has_legal_storage_page(spec, _PAGES)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_storage_aware_build_preserves_spec_and_arguments(fails):
+    spec = _Spec(256, _KPOOL, 256)
+    builder = SimpleNamespace(kv_cache_spec=spec, kernel_block_size=64)
+    arguments = (object(),)
+    keyword_arguments = {"marker": object()}
+
+    def original_build(bound, *args, **kwargs):
+        assert bound.kv_cache_spec is spec
+        assert args == arguments
+        assert kwargs == keyword_arguments
+        if fails:
+            raise RuntimeError("upstream build failed")
+        return "upstream metadata"
+
+    if fails:
+        with pytest.raises(RuntimeError, match="upstream build failed"):
+            build_with_deepgemm_page(builder, original_build, _PAGES, arguments, keyword_arguments)
+    else:
+        assert (
+            build_with_deepgemm_page(builder, original_build, _PAGES, arguments, keyword_arguments)
+            == "upstream metadata"
+        )
+    assert builder.kv_cache_spec is spec
+
+
+def test_backend_uses_actual_returned_spec_and_keeps_instances_separate(monkeypatch):
+    from vllm.models.glm5next.common import attention
+    from vllm.v1.attention.backends.mla import indexer
+
+    stock_backend = object()
+    legacy_backend = object()
+
+    class Cache:
+        _index_kpool = _KPOOL
+
+        def __init__(self, spec):
+            self.spec = spec
+
+        def get_kv_cache_spec(self, vllm_config):
+            assert vllm_config == "config"
+            return self.spec
+
+        def get_attn_backend(self):
+            return stock_backend
+
+    class Builder:
+        def build(self):
+            return "metadata"
+
+    monkeypatch.setattr(attention, "Glm5NextIndexerCache", Cache)
+    monkeypatch.setattr(indexer, "DeepseekV32IndexerMetadataBuilder", Builder)
+    monkeypatch.setattr(glm5next_indexer_page, "_PATCHED", False)
+    monkeypatch.setattr(glm5next_indexer_page, "_indexer_backend", lambda *args: legacy_backend)
+    glm5next_indexer_page.apply_glm5next_indexer_page_fix()
+    glm5next_indexer_page.apply_glm5next_indexer_page_fix()
+
+    modern = Cache(_Spec(512, _KPOOL, 256))
+    legacy = Cache(_Spec(768, _KPOOL))
+    assert modern.get_attn_backend() is legacy_backend
+    assert modern.get_kv_cache_spec("config") is modern.spec
+    assert modern.get_attn_backend() is stock_backend
+    assert legacy.get_kv_cache_spec("config") is legacy.spec
+    assert legacy.get_attn_backend() is legacy_backend
+    assert modern.get_attn_backend() is stock_backend
+
+    modern.spec = _Spec(640, _KPOOL, 128)
+    modern.get_kv_cache_spec("config")
+    assert modern.get_attn_backend() is legacy_backend

@@ -27,9 +27,11 @@ from typing import Iterator
 from urllib.parse import urlsplit
 
 from arctic_platform.client import CortexConfig
+from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
 
 from .batches import SEED
 from .config import LoadedConfig
+from .config import TestSpec
 from .cortex import CorrectnessClient as ArcticClient
 from .dss_driver import GatewaySession
 from .dss_driver import _training_client_config
@@ -41,7 +43,7 @@ from .transport import Checkpoint
 
 _STAGE_CHECKPOINT_ID = re.compile(r"/checkpoints/(cp_[0-9a-fA-F-]+)/")
 _LOCAL_CHECKPOINT_TAG = re.compile(r"global_step(0|[1-9][0-9]*)")
-_LOCAL_CHECKPOINT_ID = re.compile(r"cp_[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+_LOCAL_CHECKPOINT_ID = re.compile(r"cp_(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})")
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class LocalCortexCheckpoint(Checkpoint):
     checkpoint_tag: str
     version: int
     stage_info: dict | None = field(default=None, repr=False)
+    native_store: bool = False
 
 
 def require_local_checkpoint_id(value: str) -> str:
@@ -65,7 +68,17 @@ def _local_stage_info(value: dict | None, checkpoint_id: str) -> dict | None:
         not isinstance(value, dict)
         or value.get("location_type") not in ("S3", "AZURE", "GCS")
         or any(not isinstance(value.get(key), str) or not value[key] for key in ("bucket", "prefix"))
-        or set(value) - {"location_type", "bucket", "prefix", "region", "cred_expiry_time_ms", "aws", "azure", "gcp"}
+        or set(value)
+        - {
+            "location_type",
+            "bucket",
+            "prefix",
+            "region",
+            "cred_expiry_time_ms",
+            "aws",
+            "azure",
+            "gcp",
+        }
     ):
         raise ValueError("local checkpoint load requires explicit cloud stage_info, not a filesystem restore address")
     if (
@@ -111,7 +124,13 @@ class HostedConnection:
 
     def backend(self) -> CortexConfig:
         options = {} if self.endpoint is None else {"endpoint": self.endpoint}
-        return CortexConfig(host=self.host, database=self.database, schema=self.schema, pat=self.pat, **options)
+        return CortexConfig(
+            host=self.host,
+            database=self.database,
+            schema=self.schema,
+            pat=self.pat,
+            **options,
+        )
 
 
 def training_client_config(
@@ -120,24 +139,46 @@ def training_client_config(
     *,
     source_checkpoint_info: dict | None = None,
     attn_implementation: str | None = None,
+    model_name: str | None = None,
+    determinism: str = "best-effort",
+    preserve_native_topology: bool = False,
+    spec: TestSpec | None = None,
+    published_fixture: dict | None = None,
 ):
-    """Build a training-only unified config without rewriting the reviewed input."""
+    """Build reviewed training, optionally retaining the native RL sampling placement."""
+    if preserve_native_topology and (not cfg.is_rl or cfg.native is None):
+        raise ValueError("native checkpoint topology requires a reviewed RL configuration")
     payload = build_payload(
         cfg.training,
-        cfg.model_name,
+        cfg.model_name if model_name is None else model_name,
         cfg.sub_job.get("seed") if cfg.sub_job.get("seed") is not None else SEED,
         attn_implementation=attn_implementation,
         gradient_norms_per_param=False,
+        determinism=determinism,
     )
     # DSS schedules request-wide accumulation from mb_spec, not the engine GAS.
     payload["dtype"] = cfg.sub_job.get("dtype") or payload["dtype"]
     payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
     if "weight_format" in cfg.sub_job:
         payload["weight_format"] = cfg.sub_job["weight_format"]
+    maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
     client_config = _training_client_config(GatewaySession(Path("."), cfg.n_gpus, backend), payload)
+    if preserve_native_topology:
+        from .cortex import CortexTrainingConfig
+
+        client_config = CortexTrainingConfig.from_reviewed(
+            cfg.native,
+            model_name=client_config.model_name,
+            training=client_config.training,
+            backend=client_config.backend,
+            hardware=client_config.hardware,
+        )
     if source_checkpoint_info is not None:
         client_config = type(client_config).model_validate(
-            {**client_config.model_dump(), "source_checkpoint_info": source_checkpoint_info}
+            {
+                **client_config.model_dump(),
+                "source_checkpoint_info": source_checkpoint_info,
+            }
         )
     return client_config
 
@@ -164,7 +205,11 @@ def save_and_resolve_checkpoint_id(client: ArcticClient, job_id: str, checkpoint
 def is_local_cortex_gateway(backend: CortexConfig) -> bool:
     """Select only the explicitly configured, plain-HTTP loopback DSS gateway."""
     parsed = urlsplit(backend.base_url or "")
-    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    return parsed.scheme == "http" and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
 
 
 def require_local_cortex_gateway(backend: CortexConfig) -> None:
@@ -234,6 +279,11 @@ class HostedTrainingJob:
                     "catalog, so cross-job resume is unavailable (saved files retained)"
                 )
             require_local_checkpoint_id(checkpoint_id)
+            from .gateway import NATIVE_STORE_SCHEMA
+
+            native_store = result.get("correctness_native_store") == NATIVE_STORE_SCHEMA
+            if native_store and not getattr(self.client.transport, "_native_checkpoint_bridge", False):
+                raise RuntimeError("local resumable save returned an unrequested native checkpoint store")
             return LocalCortexCheckpoint(
                 reference=checkpoint_id,
                 source_job=self.job_id,
@@ -241,6 +291,7 @@ class HostedTrainingJob:
                 checkpoint_tag=result["checkpoint_tag"],
                 version=result["version"],
                 stage_info=_local_stage_info(result.get("stage_info"), checkpoint_id),
+                native_store=native_store,
             )
         return Checkpoint(
             reference=save_and_resolve_checkpoint_id(self.client, self.job_id, "resumable"),
@@ -257,10 +308,20 @@ class HostedTransport:
         cfg: LoadedConfig,
         *,
         attn_implementation: str | None = None,
+        model_name: str | None = None,
+        determinism: str = "best-effort",
+        preserve_native_topology: bool = False,
+        spec: TestSpec | None = None,
+        published_fixture: dict | None = None,
     ) -> None:
         self.backend = connection.backend() if isinstance(connection, HostedConnection) else connection
         self.cfg = cfg
         self.attn_implementation = attn_implementation
+        self.model_name = model_name
+        self.determinism = determinism
+        self.preserve_native_topology = preserve_native_topology
+        self.spec = spec
+        self.published_fixture = published_fixture
         self._entered = False
 
     def __enter__(self) -> "HostedTransport":
@@ -287,7 +348,10 @@ class HostedTransport:
                         " FAST paths and source_job_id cannot be loaded by this gateway"
                     )
                 require_local_checkpoint_id(resume_from.reference)
-                if _local_stage_info(resume_from.stage_info, resume_from.reference) is None:
+                if (
+                    _local_stage_info(resume_from.stage_info, resume_from.reference) is None
+                    and not resume_from.native_store
+                ):
                     raise RuntimeError(
                         "local cross-job resume requires explicit stage_info; this gateway cannot resolve "
                         "another parent's checkpoint store"
@@ -302,20 +366,33 @@ class HostedTransport:
                 )
                 local_checkpoint = resume_from
             else:
-                source = {"checkpoint_id": resume_from.reference, "source_job_id": resume_from.source_job}
+                source = {
+                    "checkpoint_id": resume_from.reference,
+                    "source_job_id": resume_from.source_job,
+                }
         config = training_client_config(
             self.cfg,
             self.backend,
             source_checkpoint_info=source,
             attn_implementation=self.attn_implementation,
+            model_name=self.model_name,
+            determinism=self.determinism,
+            **({"preserve_native_topology": True} if self.preserve_native_topology else {}),
+            spec=self.spec,
+            published_fixture=self.published_fixture,
         )
         with ArcticClient(config) as client:
             if local_checkpoint is not None:
+                if local_checkpoint.native_store and not getattr(client.transport, "_native_checkpoint_bridge", False):
+                    raise RuntimeError("native checkpoint resume requires the owned correctness gateway bridge")
                 result = client.transport.load_checkpoint(
                     local_checkpoint.reference,
                     stage_info=local_checkpoint.stage_info,
                 )
-                if result["checkpoint_tag"] != local_checkpoint.checkpoint_tag:
+                if (
+                    result["checkpoint_tag"] != local_checkpoint.checkpoint_tag
+                    or result["version"] != local_checkpoint.version
+                ):
                     raise RuntimeError("local checkpoint load restored a different global step")
             job_id = str(client.jobs.require("training")).split(":", 1)[0]
             print(f"  Cortex job {job_id} ready for {self.cfg.config_id}", flush=True)

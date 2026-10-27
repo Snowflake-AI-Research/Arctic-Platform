@@ -35,10 +35,12 @@ import torch
 from pydantic import ValidationError
 
 from arctic_platform import wire
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.client import TrainingConfig
+from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.transport import JobHandles
+from arctic_platform.client.transports import cortex as cortex_transport
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
@@ -130,7 +132,9 @@ def _client_backends_session_with_close_spy(transport, monkeypatch, closed):
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex(monkeypatch):
+def test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex(
+    monkeypatch,
+):
     selected = []
     monkeypatch.setattr(cli, "cmd_run", lambda args: selected.append(args.backend) or 0)
     assert cli.main(["run", "--all-configs"]) == 0
@@ -164,7 +168,12 @@ def test_client_backends_cortex_connection_uses_environment_or_pat_file(tmp_path
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize(
     "base_url",
-    ["http://127.0.0.1:7001", "http://localhost:7001", "http://[::1]:7001", "http://remote.test:7001"],
+    [
+        "http://127.0.0.1:7001",
+        "http://localhost:7001",
+        "http://[::1]:7001",
+        "http://remote.test:7001",
+    ],
 )
 @pytest.mark.parametrize("from_environment", [False, True])
 @pytest.mark.parametrize("settings", ["missing", "explicit", "environment", "empty"])
@@ -201,7 +210,13 @@ def test_client_backends_local_cortex_route_segments(monkeypatch, base_url, from
 
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize(
-    "base_url", ["http://127.0.0.1:7001", "http://localhost:7001", "http://[::1]:7001", "http://127.0.0.1:7001/"]
+    "base_url",
+    [
+        "http://127.0.0.1:7001",
+        "http://localhost:7001",
+        "http://[::1]:7001",
+        "http://127.0.0.1:7001/",
+    ],
 )
 @pytest.mark.parametrize("from_environment", [False, True])
 def test_client_backends_local_cortex_uses_direct_url_without_hosted_auth(monkeypatch, base_url, from_environment):
@@ -282,7 +297,14 @@ def test_client_backends_remote_run_never_probes_local_allocation(tmp_path, monk
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, *args, **kwargs: seen.append(cfg.config_id))
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
     args = cli.parse_args(
-        ["run", "--all-configs", "--config-dir", str(config_dir), "--base-url", _client_backends_remote().base_url]
+        [
+            "run",
+            "--all-configs",
+            "--config-dir",
+            str(config_dir),
+            "--base-url",
+            _client_backends_remote().base_url,
+        ]
     )
     assert cli._run_configs(args) == 0
     assert len(seen) == 2
@@ -307,7 +329,10 @@ def test_client_backends_remote_job_skips_ray_and_preserves_backend(tmp_path, mo
 
     monkeypatch.setattr(dss_driver, "_gateway_runtime", forbidden)
     monkeypatch.setattr(dss_driver, "ArcticClient", Client)
-    payload = {"model_name": "model", "training_config": {"n_gpus": 8, "max_seq_len": 8}}
+    payload = {
+        "model_name": "model",
+        "training_config": {"n_gpus": 8, "max_seq_len": 8},
+    }
     with dss_driver.gateway(tmp_path, 8, backend=backend) as session:
         with dss_driver.running_job(session, payload) as job:
             assert job.job_id == "parent:training:0"
@@ -319,12 +344,22 @@ def test_client_backends_remote_job_skips_ray_and_preserves_backend(tmp_path, mo
 @pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_cortex_batch_preserves_microbatch_order_labels_and_context():
     chunks = [
-        {"input_ids": torch.tensor([[index, index + 1]]), "labels": torch.tensor([[index + 1, -100]])}
+        {
+            "input_ids": torch.tensor([[index, index + 1]]),
+            "labels": torch.tensor([[index + 1, -100]]),
+        }
         for index in range(4)
     ]
-    body = {"batch": chunks, "meta": {"labels_are_shifted": True}, "processing": {"loss_fn": "sft"}}
+    body = {
+        "batch": chunks,
+        "meta": {"labels_are_shifted": True},
+        "processing": {"loss_fn": "sft"},
+    }
     lowered = dss_driver.cortex_training_body(body)
-    torch_assert_equal(lowered["kwargs"]["input_ids"], torch.cat([chunk["input_ids"] for chunk in chunks]))
+    torch_assert_equal(
+        lowered["kwargs"]["input_ids"],
+        torch.cat([chunk["input_ids"] for chunk in chunks]),
+    )
     torch_assert_equal(lowered["kwargs"]["labels"], torch.cat([chunk["labels"] for chunk in chunks]))
     assert lowered["context"] == body["meta"]
     assert "processing" not in lowered
@@ -360,36 +395,89 @@ def test_client_backends_cortex_config_forwards_worker_settings_without_mutation
         model_name="model",
         training_gpus=8,
         backend=_client_backends_remote(),
-        training=TrainingConfig(ds_worker_config=worker, full_determinism=True),
+        training={"ds_worker_config": worker, "full_determinism": True},
         source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "parent"},
     )
     wire = config.to_cortex()[0]
     assert wire["source_checkpoint_info"] == config.source_checkpoint_info
     assert wire["training_config"]["sp_size"] == 8
     assert wire["training_config"]["prime_rl"] == worker["prime_rl"]
-    assert wire["training_config"]["debug"] == {"full_determinism": True, "full_determinism_must_comply": False}
+    assert wire["training_config"]["debug"] == {
+        "full_determinism": True,
+        "full_determinism_must_comply": False,
+    }
     assert wire["training_config"]["activation_checkpointing"] is True
     assert "enable_gradient_checkpointing" not in wire["training_config"]
     assert "full_determinism" not in worker["debug"]
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-@pytest.mark.parametrize("source", [{}, {"checkpoint_id": "cp_saved"}, {"checkpoint_id": "", "source_job_id": "p"}])
+def test_client_backends_cortex_model_options_preserve_internal_debug_without_a_bridge():
+    worker = {
+        "ep_size": 8,
+        "sp_size": 8,
+        "model_options": {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {
+                "token_chunk_size": 1024,
+                "fp32": False,
+                "cross_entropy": False,
+            },
+            "attention": {"backend": "qsa_flex"},
+        },
+        "prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}},
+    }
+    native = ArcticClientConfig(
+        model_name="model",
+        max_seq_len=262144,
+        training_gpus=8,
+        backend=_client_backends_remote(),
+        training={"ds_worker_config": worker},
+    )
+    native_before = native.model_dump()
+    config = CortexTrainingConfig.from_reviewed(native)
+    before = config.model_dump()
+    training = config.to_cortex()[0]["training_config"]
+    assert training["model_options"] == worker["model_options"]
+    assert training["prime_rl"] == worker["prime_rl"]
+    assert training["max_seq_len"] == 262144
+    assert training["sp_size"] == 8
+    assert "deepep_token_chunk_size" not in training
+    assert "fused_lm_head_token_chunk_size" not in training
+    assert config.model_dump() == before
+    training["model_options"]["lm_head"]["token_chunk_size"] = 2048
+    training["prime_rl"]["debug"]["gpu_mem_preallocate_gib"] = 0
+    assert config.model_dump() == before
+    assert native.model_dump() == native_before
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+@pytest.mark.parametrize(
+    "source",
+    [{}, {"checkpoint_id": "cp_saved"}, {"checkpoint_id": "", "source_job_id": "p"}],
+)
 def test_client_backends_cortex_resume_requires_complete_source_identity(source):
     with pytest.raises(ValidationError, match="checkpoint_id and source_job_id"):
-        CortexTrainingConfig(model_name="model", backend=_client_backends_remote(), source_checkpoint_info=source)
+        CortexTrainingConfig(
+            model_name="model",
+            backend=_client_backends_remote(),
+            source_checkpoint_info=source,
+        )
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_onprem_refuses_cortex_checkpoint_identity():
     with pytest.raises(ValidationError, match="requires CortexConfig"):
         CortexTrainingConfig(
-            model_name="model", source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "p"}
+            model_name="model",
+            source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "p"},
         )
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints(monkeypatch):
+def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints(
+    monkeypatch,
+):
     transport = CorrectnessCortexTransport(CortexConfig(base_url="http://cortex.test"))
     calls = []
 
@@ -407,7 +495,10 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
     config = CortexTrainingConfig(model_name="model", training_gpus=8, backend=transport.config, hardware="H200")
     try:
         transport.initialize(client_config=config)
-        assert calls[0][2]["json"] == {"sub_job_configs": config.to_cortex(), "hardware": "H200"}
+        assert calls[0][2]["json"] == {
+            "sub_job_configs": config.to_cortex(),
+            "hardware": "H200",
+        }
         assert transport.list_checkpoints() == [{"checkpoint_id": "cp_saved"}]
         assert calls[1][:2] == ("GET", f"{transport._prefix}/parent/checkpoints")
     finally:
@@ -418,6 +509,7 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 def test_client_backends_cortex_shutdown_closes_session_when_cancel_fails(monkeypatch):
     transport = CorrectnessCortexTransport(_client_backends_remote())
     transport.job_id = "parent"
+    transport._owns_job = True
     closed = []
     session = _client_backends_session_with_close_spy(transport, monkeypatch, closed)
     attempts = []
@@ -459,7 +551,11 @@ def test_client_backends_inapplicable_check_is_not_also_a_cortex_failure(tmp_pat
 def test_client_backends_cortex_unsupported_checks_fail_before_batch_or_reference(tmp_path, monkeypatch):
     cfg = SimpleNamespace(config_id="unit", n_gpus=8, training={}, at_gpu_width=lambda width: cfg)
     spec = _applicable_tests_spec(["single-step-optimizer"])
-    monkeypatch.setattr(runner, "build_batch", lambda *args, **kwargs: pytest.fail("must reject before batches"))
+    monkeypatch.setattr(
+        runner,
+        "build_batch",
+        lambda *args, **kwargs: pytest.fail("must reject before batches"),
+    )
     results = runner.execute(
         cfg,
         spec,
@@ -479,8 +575,16 @@ def test_client_backends_cortex_unsupported_checks_fail_before_batch_or_referenc
 @pytest.mark.parametrize("check", ["single-step-grads", "e2e-sft-train-validate"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(config_id="unit", n_gpus=8, training={}, at_gpu_width=lambda width: cfg)
-    monkeypatch.setattr(runner, "build_batch", lambda *args, **kwargs: pytest.fail("must reject before batches"))
-    monkeypatch.setattr(runner, "run_reference", lambda *args, **kwargs: pytest.fail("must reject before reference"))
+    monkeypatch.setattr(
+        runner,
+        "build_batch",
+        lambda *args, **kwargs: pytest.fail("must reject before batches"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_reference",
+        lambda *args, **kwargs: pytest.fail("must reject before reference"),
+    )
     results = runner.execute(
         cfg,
         _applicable_tests_spec([check]),
@@ -505,11 +609,19 @@ def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tm
 @pytest.mark.parametrize("check", ["rl-weight-sync", "rl-router-replay"])
 def test_client_backends_cortex_rl_refuses_local_instrumentation_before_check(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(
-        config_id="unit", n_gpus=8, training={}, attention_implementation="sdpa", at_gpu_width=lambda width: cfg
+        config_id="unit",
+        n_gpus=8,
+        training={},
+        attention_implementation="sdpa",
+        at_gpu_width=lambda width: cfg,
     )
     monkeypatch.setattr(runner, "rl_gpu_count", lambda cfg: 16)
     tests = runner.registered_tests()
-    monkeypatch.setattr(tests[check], "fn", lambda ctx: pytest.fail("must reject before tokenizer or client"))
+    monkeypatch.setattr(
+        tests[check],
+        "fn",
+        lambda ctx: pytest.fail("must reject before tokenizer or client"),
+    )
     results = runner.execute_rl(
         cfg,
         _applicable_tests_spec([check]),
@@ -565,7 +677,7 @@ def test_client_backends_cortex_cli_inference_runs_full_model_without_reduced_me
     import transformers
 
     path = _cli_config_selection_write_config(tmp_path / "configs", "h200")
-    cfg = load_config(path)
+    cfg = load_config(cli.local_config_path(path))
     test_id = "inference-checkpoint-loss"
     spec = _applicable_tests_spec([test_id])
     spec.model.cache_path = "/data-fast/unused-reduced-reference"
@@ -593,7 +705,13 @@ def test_client_backends_cortex_cli_inference_runs_full_model_without_reduced_me
         yield Result(test_id=test_id, config_id=ctx.config_id, outcome=Outcome.PASS)
 
     def execute(run_cfg, run_spec, arms, **kwargs):
-        return runner.execute(run_cfg, run_spec, arms, workdir=tmp_path / f"width-{run_cfg.n_gpus}", **kwargs)
+        return runner.execute(
+            run_cfg,
+            run_spec,
+            arms,
+            workdir=tmp_path / f"width-{run_cfg.n_gpus}",
+            **kwargs,
+        )
 
     def finish(results, *args, **kwargs):
         finished.extend(results)
@@ -639,7 +757,8 @@ def test_client_backends_cortex_cli_inference_runs_full_model_without_reduced_me
     }
     if with_fixture:
         expected.update(
-            fixture_sha256=fixture["fixture_sha256"], fixture_stage_path=fixture["publication"]["stage_path"]
+            fixture_sha256=fixture["fixture_sha256"],
+            fixture_stage_path=fixture["publication"]["stage_path"],
         )
     assert metadata == {cfg.config_id: expected}
 
@@ -650,7 +769,7 @@ def test_client_backends_cortex_cli_fixture_provenance_keeps_e2e_and_full_infere
     tmp_path, monkeypatch, include_inference
 ):
     path = _cli_config_selection_write_config(tmp_path / "configs", "h200")
-    cfg = load_config(path)
+    cfg = load_config(cli.local_config_path(path))
     selected = ["e2e-sft-train-validate"]
     if include_inference:
         selected.append("inference-checkpoint-loss")
@@ -672,7 +791,11 @@ def test_client_backends_cortex_cli_fixture_provenance_keeps_e2e_and_full_infere
         return [Result(test_id, cfg.config_id, Outcome.PASS) for test_id in kwargs["select"]]
 
     monkeypatch.setattr(cli, "execute", execute)
-    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0)
+    monkeypatch.setattr(
+        cli,
+        "_finish",
+        lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0,
+    )
     args = [
         "run",
         "--config",
@@ -742,7 +865,11 @@ def test_client_backends_cortex_e2e_only_keeps_reduced_model_vocabulary(tmp_path
         return SimpleNamespace(vocab_size=64)
 
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", reduced_config)
-    monkeypatch.setattr(cli, "_catalog_vocab_size", lambda *args: pytest.fail("E2E must keep reduced vocabulary"))
+    monkeypatch.setattr(
+        cli,
+        "_catalog_vocab_size",
+        lambda *args: pytest.fail("E2E must keep reduced vocabulary"),
+    )
     assert (
         cli._run_vocab_size(
             cfg,
@@ -761,7 +888,10 @@ def test_client_backends_cortex_sft_body_does_not_select_the_rl_processor():
     from arctic_platform import wire
 
     body = {
-        "batch": {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+        "batch": {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[1, 2, -100]]),
+        },
         "processing": {"loss_fn": "sft"},
     }
     lowered = dss_driver.cortex_training_body(body)
@@ -778,7 +908,9 @@ def test_client_backends_cortex_sft_body_does_not_select_the_rl_processor():
         {"loss_fn": "sft", "config": {"unknown": True}},
     ],
 )
-def test_client_backends_cortex_does_not_silently_drop_sft_processing_options(processing):
+def test_client_backends_cortex_does_not_silently_drop_sft_processing_options(
+    processing,
+):
     with pytest.raises(ValueError, match="use --backend onprem"):
         dss_driver.cortex_training_body({"batch": {"input_ids": torch.ones(1, 2)}, "processing": processing})
 
@@ -797,7 +929,11 @@ def test_client_backends_remote_cli_checkpoint_uses_catalog_and_explicit_placeme
         return [Result("checkpoint-resume-loss", cfg.config_id, Outcome.PASS, gpus=cfg.n_gpus)]
 
     monkeypatch.setattr(cli, "execute", execute)
-    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0)
+    monkeypatch.setattr(
+        cli,
+        "_finish",
+        lambda *args, **kwargs: metadata.update(kwargs["execution"]) or 0,
+    )
     assert (
         cli.main(
             [
@@ -817,7 +953,10 @@ def test_client_backends_remote_cli_checkpoint_uses_catalog_and_explicit_placeme
     assert [cfg.n_gpus for cfg, _ in measured] == [8, 16]
     assert all((isinstance(options["client_backend"], CortexConfig) for _, options in measured))
     assert all((options["vocab_size"] == 128 for _, options in measured))
-    assert metadata["model-h200-train"] == {"backend": "cortex", "requested_model_name": measured[0][0].model_name}
+    assert metadata["model-h200-train"] == {
+        "backend": "cortex",
+        "requested_model_name": measured[0][0].model_name,
+    }
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
@@ -848,6 +987,47 @@ def test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_me
     assert payload["specs"]["unit"]["model"]["content_hash"] == spec.model.content_hash
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_original_metadata_report_preserves_unknown_counts_without_reference_claims(tmp_path, monkeypatch, remote):
+    from arctic_platform.correctness.harness import report
+
+    monkeypatch.setattr(report, "collect", lambda: {"host": "client-host"})
+    spec = _applicable_tests_spec(["inference-checkpoint-loss"])
+    spec.model.param_count = None
+    spec.model.seed = None
+    spec.model.sized_against_gib = None
+    spec.model.vision_depth = None
+    execution = {"unit": {"backend": "cortex", "requested_model_name": "original-model"}} if remote else {}
+
+    report.write([], {"unit": spec}, tmp_path, execution=execution)
+    markdown = (tmp_path / "report.md").read_text()
+    assert "original model metadata (not a generated reference fixture): parameter count unknown" in markdown
+    assert "without a supervised Hugging Face reference" in markdown
+    assert "reviewed reference fixture (not loaded on Cortex)" not in markdown
+    assert "holding identical weights and data" not in markdown
+    assert "HF reference runs outside Cortex" not in markdown
+    model = json.loads((tmp_path / "report.json").read_text())["specs"]["unit"]["model"]
+    assert all(model[field] is None for field in ("param_count", "seed", "sized_against_gib", "vision_depth"))
+    assert model["content_hash"] == spec.model.content_hash
+
+
+def test_original_metadata_report_keeps_known_supervised_counts_in_mixed_report(
+    monkeypatch,
+):
+    from arctic_platform.correctness.harness import report
+
+    monkeypatch.setattr(report, "collect", lambda: {"host": "client-host"})
+    reference_free = _applicable_tests_spec(["inference-checkpoint-loss"])
+    reference_free.model.param_count = None
+    supervised = _applicable_tests_spec(["single-step-grads"])
+    count = supervised.model.param_count
+
+    markdown = report.to_markdown([], {"reference-free": reference_free, "supervised": supervised})
+    assert markdown.count("parameter count unknown") == 1
+    assert f"- model: {count:,} parameters" in markdown
+    assert "Other checks retain their reviewed reference and fixture contracts" in markdown
+
+
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("case,microbatches", [("gas1", 1), ("gas4", 4)])
 def test_client_backends_checkpoint_check_uses_three_real_cortex_clients(tmp_path, monkeypatch, case, microbatches):
@@ -870,7 +1050,10 @@ def test_client_backends_checkpoint_check_uses_three_real_cortex_clients(tmp_pat
             job_id = f"job-{len(jobs) + 1}"
             source = config.get("source_checkpoint_info")
             if source:
-                assert source == {"checkpoint_id": checkpoint_id, "source_job_id": "job-2"}
+                assert source == {
+                    "checkpoint_id": checkpoint_id,
+                    "source_job_id": "job-2",
+                }
                 assert ("cancel", "job-2") in events
             jobs[job_id] = {
                 "config": config,
@@ -888,7 +1071,10 @@ def test_client_backends_checkpoint_check_uses_three_real_cortex_clients(tmp_pat
                 return {"checkpoints": job["checkpoints"]}
             if url == f"{transport._prefix}/{transport.job_id}":
                 return {"status": "RUNNING"}
-            return {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
+            return {
+                "status": "REQUEST_STATE_DONE",
+                "result": replies[url.rsplit("/", 1)[-1]],
+            }
         if url.endswith(":cancel"):
             events.append(("cancel", transport.job_id))
             return {}
@@ -918,7 +1104,12 @@ def test_client_backends_checkpoint_check_uses_three_real_cortex_clients(tmp_pat
     monkeypatch.setattr(base, "require_any_dep_group", lambda *args: None)
     monkeypatch.setattr(CortexTransport, "_send", send)
     cfg = load_config(_cli_config_selection_write_config(tmp_path / "configs", "h200")).at_gpu_width(16)
-    arm = SimpleNamespace(name=case, global_batch_size=16 * microbatches, max_seq_len=8, dss_microbatches=microbatches)
+    arm = SimpleNamespace(
+        name=case,
+        global_batch_size=16 * microbatches,
+        max_seq_len=8,
+        dss_microbatches=microbatches,
+    )
     ctx = runner.RunContext(
         config_id="unit",
         cfg=cfg,
@@ -980,7 +1171,11 @@ def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_pat
 
     session = _client_backends_session_with_close_spy(transport, monkeypatch, events)
     monkeypatch.setattr(transport, "_send", send)
-    monkeypatch.setattr(cortex_transport, "CorrectnessCortexTransport", lambda *args, **kwargs: transport)
+    monkeypatch.setattr(
+        cortex_transport,
+        "CorrectnessCortexTransport",
+        lambda *args, **kwargs: transport,
+    )
     with pytest.raises(RuntimeError, match="no capacity"):
         if path == "hosted":
             cfg = load_config(_cli_config_selection_write_config(tmp_path / "configs", "h200"))
@@ -998,6 +1193,259 @@ def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_pat
 
 
 # Cortex e2e.
+
+
+def _e2e_reduced_fixture_context(tmp_path, *, family="qwen3_5_moe_text", published=True):
+    import hashlib
+
+    from arctic_platform.correctness.harness.config import hash_directory
+
+    ctx = _cortex_e2e_context(tmp_path)
+    root = tmp_path / "reviewed-fixture"
+    root.mkdir()
+    config = {
+        "model_type": "qwen3_5_moe" if family == "qwen3_5_moe_text" else family,
+        "text_config": {"model_type": family, "num_hidden_layers": 2},
+        "vision_config": {"depth": 2},
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+    ctx.spec.model.cache_path = str(root.resolve())
+    ctx.spec.model.source_checkpoint = "Qwen/Qwen3.5-Source"
+    ctx.spec.model.num_hidden_layers = 2
+    ctx.spec.model.vision_depth = 2
+    ctx.spec.model.seed = 0
+    ctx.spec.model.content_hash = hash_directory(root)
+    ctx.cfg.training["model_provider"] = "prime_rl"
+    ctx.cfg.training["prime_rl"] = {"debug": {"existing_debug": "preserved"}}
+    files = [
+        {
+            "path": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in sorted(root.iterdir())
+    ]
+    ctx.published_fixture = (
+        {
+            "config_id": ctx.spec.config_id,
+            "reference_path": ctx.spec.model.cache_path,
+            "reviewed_hash": ctx.spec.model.content_hash,
+            "model_name": ctx.target_model_name,
+            "files": files,
+            "fixture_sha256": (
+                hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            ),
+        }
+        if published
+        else None
+    )
+    return ctx
+
+
+def _e2e_reduced_fixture_capture(monkeypatch):
+    captured = []
+
+    @contextmanager
+    def gateway(*args, **kwargs):
+        yield "session"
+
+    @contextmanager
+    def running_job(session, payload):
+        captured.append(deepcopy(payload))
+        yield "job"
+
+    monkeypatch.setattr(
+        check,
+        "request_bodies",
+        lambda *args, **kwargs: (
+            [{"train": 1}],
+            {"processing": {"return_logprobs": True}},
+        ),
+    )
+    monkeypatch.setattr(check, "gateway", gateway)
+    monkeypatch.setattr(check, "running_job", running_job)
+    monkeypatch.setattr(check, "fwd_bwd_step", lambda *args, **kwargs: SimpleNamespace(avg_loss=2.0))
+    monkeypatch.setattr(check, "forward_logprobs", lambda *args, **kwargs: torch.tensor([[-1.0]]))
+    return captured
+
+
+@pytest.mark.parametrize("native_topology", [False, True])
+def test_checkpoint_reduced_fixture_mtp_reaches_hosted_training_wire(tmp_path, monkeypatch, native_topology):
+    ctx = _e2e_reduced_fixture_context(tmp_path)
+    cfg = _hosted_config()
+    cfg.training["model_provider"] = "prime_rl"
+    cfg.training["prime_rl"] = deepcopy(ctx.cfg.training["prime_rl"])
+    if native_topology:
+        from .helpers import _config_factory_native_config
+
+        path = tmp_path / "rl.config"
+        path.write_text(
+            json.dumps(
+                _config_factory_native_config(
+                    {"n_gpus": 8, "max_seq_len": 64, "ep_size": 4},
+                    sampling={"n_gpus": 8, "vllm_config": {"tensor_parallel_size": 8}},
+                )
+            )
+        )
+        cfg = load_config(path)
+        cfg.training["model_provider"] = "prime_rl"
+        cfg.training["prime_rl"] = deepcopy(ctx.cfg.training["prime_rl"])
+    before = deepcopy(cfg.training)
+    captured = []
+
+    @contextmanager
+    def client(config):
+        captured.append(next(sub for sub in config.to_cortex() if sub["job_type"] == "training"))
+        yield SimpleNamespace(jobs=SimpleNamespace(require=lambda kind: "p1:training:0"))
+
+    monkeypatch.setattr(hosted, "ArcticClient", client)
+    context = runner.RunContext(
+        config_id=cfg.config_id,
+        cfg=cfg,
+        spec=ctx.spec,
+        arms=[],
+        attn_implementation="sdpa",
+        workdir=tmp_path,
+        batch_paths={},
+        vocab_size=128,
+        client_backend=ctx.client_backend,
+        target_model_name=ctx.target_model_name,
+        published_fixture=ctx.published_fixture,
+    )
+    with context.transport_for(tmp_path) as transport:
+        with transport.job():
+            pass
+        with transport.job():
+            pass
+    assert len(captured) == 2
+    for payload in captured:
+        descriptor = payload["training_config"]["prime_rl"]["debug"]["reduced_fixture_mtp"]
+        assert descriptor["fixture_locator"] == ctx.target_model_name
+        assert descriptor["fixture_sha256"] == ctx.published_fixture["fixture_sha256"]
+        assert descriptor["files"] == ctx.published_fixture["files"]
+        assert descriptor["reviewed_hash"] == ctx.spec.model.content_hash
+        assert payload["model_name"] == ctx.target_model_name
+    assert cfg.training == before
+
+
+def test_e2e_reduced_fixture_mtp_binds_before_native_adapter_without_mutating_inputs(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import lora
+
+    ctx = _e2e_reduced_fixture_context(tmp_path)
+    before_training = deepcopy(ctx.cfg.training)
+    before_fixture = deepcopy(ctx.published_fixture)
+    captured = _e2e_reduced_fixture_capture(monkeypatch)
+    adapter = tmp_path / "adapter"
+    binding_order = []
+
+    def bind_adapter(payload, path, *, native_backend):
+        binding_order.append(payload["training_config"]["prime_rl"]["debug"]["reduced_fixture_mtp"])
+        assert path == adapter and native_backend is ctx.client_backend
+        return deepcopy(payload)
+
+    monkeypatch.setattr(lora, "bind_payload", bind_adapter)
+    losses, _ = check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target", adapter)
+    assert losses == [2.0] and len(captured) == 1
+    debug = captured[0]["training_config"]["prime_rl"]["debug"]
+    assert debug["existing_debug"] == "preserved"
+    assert debug["reduced_fixture_mtp"] == {
+        "schema_version": 1,
+        "config_id": ctx.spec.config_id,
+        "fixture_locator": ctx.target_model_name,
+        "reference_path": ctx.spec.model.cache_path,
+        "reviewed_hash": ctx.spec.model.content_hash,
+        "fixture_sha256": ctx.published_fixture["fixture_sha256"],
+        "files": ctx.published_fixture["files"],
+        "source_checkpoint": ctx.spec.model.source_checkpoint,
+        "num_hidden_layers": 2,
+        "vision_depth": 2,
+        "materialization": "pretrained-prefix-reduction",
+    }
+    assert binding_order == [debug["reduced_fixture_mtp"]]
+    assert ctx.cfg.training == before_training and ctx.published_fixture == before_fixture
+    assert check.TRAIN_STEPS == 100 and check.TOLERANCE == 0.03
+
+
+@pytest.mark.parametrize("failure", ["locator", "config_id", "config_bytes", "descriptor"])
+def test_e2e_reduced_fixture_mtp_rejects_bad_binding_before_job_creation(tmp_path, monkeypatch, failure):
+    ctx = _e2e_reduced_fixture_context(tmp_path)
+    if failure == "locator":
+        ctx.published_fixture["model_name"] = "unreviewed"
+    elif failure == "config_id":
+        ctx.published_fixture["config_id"] = "another-config"
+    elif failure == "config_bytes":
+        (Path(ctx.spec.model.cache_path) / "config.json").write_text("{}")
+    else:
+        ctx.cfg.training["prime_rl"]["debug"]["reduced_fixture_mtp"] = {}
+    _e2e_reduced_fixture_capture(monkeypatch)
+    monkeypatch.setattr(
+        check,
+        "gateway",
+        lambda *args, **kwargs: pytest.fail("must reject before job creation"),
+    )
+    with pytest.raises(ValueError):
+        check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
+
+
+@pytest.mark.parametrize("mode", ["unpublished", "non_qwen", "full_model", "on_prem"])
+def test_e2e_reduced_fixture_mtp_does_not_change_unrequested_payloads(tmp_path, monkeypatch, mode):
+    ctx = _e2e_reduced_fixture_context(
+        tmp_path,
+        family="llama" if mode == "non_qwen" else "qwen3_5_moe_text",
+        published=mode in {"non_qwen"},
+    )
+    if mode == "full_model":
+        ctx.client_backend = CortexConfig(base_url="http://127.0.0.1:8003")
+        ctx.local_gateway_full_model = True
+        ctx.local_full_model_path = _cortex_e2e_FULL_SNAPSHOT
+    elif mode == "on_prem":
+        ctx.client_backend = OnPremConfig()
+    captured = _e2e_reduced_fixture_capture(monkeypatch)
+    check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
+    assert captured[0]["training_config"]["prime_rl"]["debug"] == {"existing_debug": "preserved"}
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_e2e_reduced_fixture_mtp_run_context_keeps_validated_binding(tmp_path, monkeypatch, published):
+    from dataclasses import fields
+
+    from arctic_platform.correctness.harness.registry import TestSpecEntry
+
+    assert "published_fixture" in {field.name for field in fields(runner.RunContext)}
+    ctx = _e2e_reduced_fixture_context(tmp_path, published=published)
+    ctx.spec.applicable_tests = [check.TEST_ID]
+    contexts = []
+
+    def whole_run(context):
+        contexts.append(context)
+        assert context.published_fixture == ctx.published_fixture
+        if published:
+            assert context.published_fixture is not ctx.published_fixture
+            context.published_fixture["files"].append({"context_only": True})
+            assert {"context_only": True} not in ctx.published_fixture["files"]
+        yield Result(check.TEST_ID, context.config_id, Outcome.PASS, summary="context handoff")
+
+    test = TestSpecEntry(
+        test_id=check.TEST_ID,
+        title="Context handoff",
+        criterion="fixture binding",
+        fn=whole_run,
+    )
+    monkeypatch.setattr(runner, "registered_tests", lambda: {check.TEST_ID: test})
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: ctx.published_fixture)
+    monkeypatch.setattr(runner, "run_reference", lambda *args, **kwargs: pytest.fail("must not run HF"))
+    results = runner.execute(
+        ctx.cfg,
+        ctx.spec,
+        [],
+        vocab_size=128,
+        select=[check.TEST_ID],
+        client_backend=ctx.client_backend if published else OnPremConfig(),
+        local_cortex_fixture=published,
+        workdir=tmp_path / "run",
+    )
+    assert len(contexts) == 1 and results[0].outcome == Outcome.PASS
 
 
 _cortex_e2e_ROOT = Path(__file__).resolve().parents[1]
@@ -1047,7 +1495,11 @@ def _cortex_e2e_context(tmp_path, width=4):
 def _cortex_e2e_replay(tmp_path):
     rows = [
         gsm8k.Example(
-            question=f"row-{index}", prompt="q:", completion=" a", input_ids=(10 + index, 30, 40), n_prompt=1
+            question=f"row-{index}",
+            prompt="q:",
+            completion=" a",
+            input_ids=(10 + index, 30, 40),
+            n_prompt=1,
         )
         for index in range(6)
     ]
@@ -1085,9 +1537,15 @@ def test_cortex_e2e_e2e_replay_uses_validated_fixture_and_cleans_up(
             cancels.append(transport.job_id)
             return {}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
-            return {"status": "RUNNING", "sub_jobs": [{"job_type": "training", "sub_job_id": "trainer"}]}
+            return {
+                "status": "RUNNING",
+                "sub_jobs": [{"job_type": "training", "sub_job_id": "trainer"}],
+            }
         if method == "GET":
-            return {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
+            return {
+                "status": "REQUEST_STATE_DONE",
+                "result": replies[url.rsplit("/", 1)[-1]],
+            }
         if url.endswith("/forward-backward"):
             body = wire.loads(wire.decode_byte_chunks([kwargs["data"]], kind="request"))
             assert "processing" not in body
@@ -1128,7 +1586,10 @@ def test_cortex_e2e_e2e_replay_uses_validated_fixture_and_cleans_up(
             for key in ("input_ids", "labels", "position_ids"):
                 torch.testing.assert_close(actual["kwargs"][key], expected["batch"][key], rtol=0, atol=0)
         torch.testing.assert_close(
-            forward[0]["kwargs"]["labels"], expected_validation["batch"]["labels"], rtol=0, atol=0
+            forward[0]["kwargs"]["labels"],
+            expected_validation["batch"]["labels"],
+            rtol=0,
+            atol=0,
         )
     assert cancels == ["e2e-job"]
     assert _cortex_e2e_no_network and all((transport.job_id is None for transport in _cortex_e2e_no_network))
@@ -1145,7 +1606,11 @@ def test_cortex_e2e_e2e_replay_uses_validated_fixture_and_cleans_up(
 def test_cortex_e2e_e2e_rejects_missing_fixture_before_allocation(tmp_path, monkeypatch, name):
     ctx = _cortex_e2e_context(tmp_path)
     ctx.target_model_name = name
-    monkeypatch.setattr(check, "gateway", lambda *args, **kwargs: pytest.fail("must reject before allocation"))
+    monkeypatch.setattr(
+        check,
+        "gateway",
+        lambda *args, **kwargs: pytest.fail("must reject before allocation"),
+    )
     with pytest.raises(ValueError, match="validated published Cortex fixture"):
         check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
@@ -1279,7 +1744,11 @@ def test_cortex_e2e_full_e2e_requests_original_model_and_preserves_cleanup(tmp_p
 def test_cortex_e2e_full_e2e_rejects_missing_or_nonfast_snapshot_before_allocation(tmp_path, monkeypatch, path):
     ctx = _cortex_e2e_full_context(tmp_path)
     ctx.local_full_model_path = path
-    monkeypatch.setattr(check, "gateway", lambda *args, **kwargs: pytest.fail("must reject before allocation"))
+    monkeypatch.setattr(
+        check,
+        "gateway",
+        lambda *args, **kwargs: pytest.fail("must reject before allocation"),
+    )
     with pytest.raises(ValueError, match="validated local full-model snapshot|/data-fast"):
         check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
@@ -1297,7 +1766,11 @@ def test_cortex_e2e_full_e2e_rejects_missing_or_nonfast_snapshot_before_allocati
 def test_cortex_e2e_full_e2e_never_bypasses_hosted_or_non_gateway_guards(tmp_path, monkeypatch, backend):
     ctx = _cortex_e2e_full_context(tmp_path)
     ctx.client_backend = backend
-    monkeypatch.setattr(check, "gateway", lambda *args, **kwargs: pytest.fail("must reject before allocation"))
+    monkeypatch.setattr(
+        check,
+        "gateway",
+        lambda *args, **kwargs: pytest.fail("must reject before allocation"),
+    )
     with pytest.raises(ValueError, match="local Cortex gateway|HTTP loopback"):
         check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
@@ -1327,7 +1800,9 @@ def test_cortex_model_identity_validated_fixture_reaches_e2e_context_without_cha
 
     monkeypatch.setattr(entry, "fn", measure)
     monkeypatch.setattr(
-        cortex_fixture, "load_fixture", lambda *args: {"model_name": "published-exact-reviewed-weights"}
+        cortex_fixture,
+        "load_fixture",
+        lambda *args: {"model_name": "published-exact-reviewed-weights"},
     )
     results = runner.execute(
         cfg,
@@ -1410,7 +1885,9 @@ def test_cortex_model_identity_mixed_cortex_run_keeps_e2e_fixture_but_inference_
     for test_id in test_ids:
         monkeypatch.setattr(runner.registered_tests()[test_id], "fn", measure(test_id))
     monkeypatch.setattr(
-        cortex_fixture, "load_fixture", lambda *args: {"model_name": "published-exact-reviewed-weights"}
+        cortex_fixture,
+        "load_fixture",
+        lambda *args: {"model_name": "published-exact-reviewed-weights"},
     )
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", forbidden)
     monkeypatch.setattr(runner, "build_batch", forbidden)
@@ -1431,7 +1908,9 @@ def test_cortex_model_identity_mixed_cortex_run_keeps_e2e_fixture_but_inference_
 
 
 @pytest.mark.parametrize("target_model_name", [None, "published-exact-reviewed-weights"])
-def test_cortex_model_identity_cortex_sampling_checkpoint_identity_uses_full_model_not_e2e_fixture(target_model_name):
+def test_cortex_model_identity_cortex_sampling_checkpoint_identity_uses_full_model_not_e2e_fixture(
+    target_model_name,
+):
     cfg = load_config(_cortex_model_identity_CONFIG)
     backend = CortexConfig(base_url="http://unused")
     ctx = SimpleNamespace(
@@ -1513,7 +1992,11 @@ def test_cortex_model_identity_cortex_e2e_without_published_identity_never_creat
         client_backend=CortexConfig(base_url="http://unused"),
         target_model_name=None,
     )
-    monkeypatch.setattr(e2e, "gateway", lambda *args, **kwargs: pytest.fail("must reject before allocation"))
+    monkeypatch.setattr(
+        e2e,
+        "gateway",
+        lambda *args, **kwargs: pytest.fail("must reject before allocation"),
+    )
     monkeypatch.setattr(e2e, "request_bodies", lambda *args, **kwargs: ([], {}))
     with pytest.raises(ValueError, match="published Cortex fixture"):
         e2e.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path)
@@ -1526,7 +2009,9 @@ _driver_reviewed_rl_config = _driver_reviewed_root / "configs/qwen3.8-flash-next
 
 
 @pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
-def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(weight_format):
+def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(
+    weight_format,
+):
     cfg = load_config(_driver_reviewed_root / "configs/qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config")
     before = deepcopy(cfg.training)
     payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed, weight_format=weight_format)
@@ -1537,7 +2022,9 @@ def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(weight
 
 
 @pytest.mark.parametrize("weight_format", ["vllm", "hf", "lora"])
-def test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload(weight_format):
+def test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload(
+    weight_format,
+):
     cfg = load_config(_driver_reviewed_rl_config)
     payload = deepcopy(cfg.sub_job)
     payload["weight_format"] = weight_format
@@ -1550,7 +2037,9 @@ def test_driver_reviewed_training_preserves_explicit_format_without_mutating_pay
 
 
 @pytest.mark.parametrize("job_type", ["sampling", "log_prob"])
-def test_driver_reviewed_inference_preserves_format_topology_and_independent_replay_cache(job_type):
+def test_driver_reviewed_inference_preserves_format_topology_and_independent_replay_cache(
+    job_type,
+):
     cfg = load_config(_driver_reviewed_rl_config)
     payload = dss_driver.rl_sampling_payload(cfg, "/data-fast/models/reviewed")
     payload["job_type"] = job_type
@@ -1608,7 +2097,11 @@ def test_driver_reviewed_rl_bootstraps_before_yield_and_always_shuts_down(monkey
 
     def run():
         with dss_driver.running_rl_client(
-            cfg, payload, "/data-fast/models/reviewed", tmp_path, backend=CortexConfig(base_url="http://unused")
+            cfg,
+            payload,
+            "/data-fast/models/reviewed",
+            tmp_path,
+            backend=CortexConfig(base_url="http://unused"),
         ):
             events.append("body")
             if failure == "body":
@@ -1619,7 +2112,12 @@ def test_driver_reviewed_rl_bootstraps_before_yield_and_always_shuts_down(monkey
     else:
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
             run()
-    assert events == ["create", "bootstrap", *(["body"] if failure != "bootstrap" else []), "shutdown"]
+    assert events == [
+        "create",
+        "bootstrap",
+        *(["body"] if failure != "bootstrap" else []),
+        "shutdown",
+    ]
     assert cfg.native.model_dump() == original
     assert payload == before
 
@@ -1646,33 +2144,135 @@ def test_driver_reviewed_rl_does_not_bootstrap_when_either_side_is_disabled(monk
 
     monkeypatch.setattr(dss_driver, "RLClient", Client)
     with dss_driver.running_rl_client(
-        cfg, payload, cfg.model_name, tmp_path, backend=CortexConfig(base_url="http://unused")
+        cfg,
+        payload,
+        cfg.model_name,
+        tmp_path,
+        backend=CortexConfig(base_url="http://unused"),
     ):
         events.append("body")
     assert events == ["create", "body", "shutdown"]
+
+
+@pytest.mark.parametrize("sampling_replay", [None, {"enabled": False, "max_cache_bytes": 17179869184}])
+def test_driver_replay_verification_enables_unconfigured_sampler_without_mutating_config(
+    monkeypatch, tmp_path, sampling_replay
+):
+    cfg = load_config(_driver_reviewed_rl_config)
+    inference = cfg.native.sampling.arctic_inference_config
+    if sampling_replay is None:
+        inference.pop("router_replay")
+    else:
+        inference["router_replay"] = deepcopy(sampling_replay)
+    original = cfg.native.model_dump()
+    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
+    before = deepcopy(payload)
+    events = []
+
+    class Client:
+        def __init__(self, native):
+            assert native.sampling.arctic_inference_config == {
+                **inference,
+                "router_replay": {**(sampling_replay or {}), "enabled": True},
+            }
+            sampling = next(sub for sub in native.to_cortex() if sub["job_type"] == "sampling")
+            assert sampling["inference_config"]["router_replay"]["enabled"] is True
+            events.append("create")
+
+        def bootstrap_router_replay(self, *, max_cache_bytes):
+            assert max_cache_bytes == 2147483648
+            events.append("bootstrap")
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    monkeypatch.setattr(dss_driver, "RLClient", Client)
+    with dss_driver.running_rl_client(
+        cfg,
+        payload,
+        cfg.model_name,
+        tmp_path,
+        backend=CortexConfig(base_url="http://unused"),
+        router_replay_verification=True,
+    ):
+        events.append("body")
+    assert events == ["create", "bootstrap", "body", "shutdown"]
+    assert cfg.native.model_dump() == original
+    assert payload == before
+
+
+def test_driver_reviewed_rl_fwd_bwd_preserves_replay_identity_in_zone_metadata():
+    batch = dss_driver.rl_batch([[1, 2, 3]], [2], pad_id=0)
+    batch["kwargs"].update(
+        rr_sample_ids=["rr1:row-0"],
+        rr_replay_meta=[{"replay_id": "rr1:row-0"}],
+        rr_discard=True,
+    )
+    response = {"avg_loss": 1.0}
+
+    class Client:
+        jobs = JobHandles(training="trainer", sampling="sampler")
+
+        def fwd_bwd(self, batch, *, router_replay):
+            request = fwd_bwd_request(self.jobs, batch, router_replay=router_replay)
+            _, sends = cortex_transport._route(request.op).prepare("http://unused", request)
+            frame = wire.decode_byte_chunks([send["data"] for send in sends], kind="request")
+            assert wire.read_metadata(frame)["router_replay"] == {
+                "sampling_job_id": "sampler",
+                "identity_version": 1,
+            }
+            payload = wire.loads(frame)
+            assert set(payload) == {"args", "kwargs", "context", "processing"}
+            assert payload["kwargs"]["rr_sample_ids"] == ["rr1:row-0"]
+            assert payload["kwargs"]["rr_replay_meta"] == [{"replay_id": "rr1:row-0"}]
+            assert payload["kwargs"]["rr_discard"] is True
+            torch_assert_equal(payload["kwargs"]["input_ids"], batch["kwargs"]["input_ids"])
+            return response
+
+    assert dss_driver.rl_fwd_bwd(Client(), batch, replay_sampling=True) is response
+    assert "router_replay" not in batch
 
 
 def test_driver_reviewed_rl_revalidates_incompatible_formats_before_client_creation(monkeypatch, tmp_path):
     cfg = load_config(_driver_reviewed_rl_config)
     payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     payload["weight_format"] = "hf"
-    monkeypatch.setattr(dss_driver, "RLClient", lambda config: pytest.fail("invalid config must not create jobs"))
+    monkeypatch.setattr(
+        dss_driver,
+        "RLClient",
+        lambda config: pytest.fail("invalid config must not create jobs"),
+    )
     with pytest.raises(ValueError, match="weight formats must agree"):
         with dss_driver.running_rl_client(
-            cfg, payload, cfg.model_name, tmp_path, backend=CortexConfig(base_url="http://unused")
+            cfg,
+            payload,
+            cfg.model_name,
+            tmp_path,
+            backend=CortexConfig(base_url="http://unused"),
         ):
             pytest.fail("invalid config must not yield")
 
 
-def test_driver_reviewed_rl_rejects_unsupported_onprem_fields_before_transport(monkeypatch):
+@pytest.mark.parametrize("unsupported", ["training-format", "sampling-format", "replicas"])
+def test_driver_reviewed_rl_rejects_unsupported_onprem_fields_before_transport(monkeypatch, unsupported):
     cfg = load_config(_driver_reviewed_rl_config)
+    cfg.native.training.weight_format = "vllm" if unsupported == "training-format" else None
+    cfg.native.sampling.weight_format = "vllm" if unsupported == "sampling-format" else None
+    if unsupported != "replicas":
+        cfg.native.sampling.arctic_inference_config.pop("num_replicas")
     payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     monkeypatch.setattr(
-        cortex_fixture, "initialize_or_cleanup", lambda *args, **kwargs: pytest.fail("must not create jobs")
+        dss_driver,
+        "RLClient",
+        lambda *args, **kwargs: pytest.fail("must not create jobs"),
     )
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
         with dss_driver.running_rl_client(
-            cfg, payload, cfg.model_name, Path("/data-fast/tmp/reviewed-rl-cpu-control"), backend=OnPremConfig()
+            cfg,
+            payload,
+            cfg.model_name,
+            Path("/data-fast/tmp/reviewed-rl-cpu-control"),
+            backend=OnPremConfig(),
         ):
             pytest.fail("unsupported fields must not yield")
 
@@ -1687,9 +2287,15 @@ def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monke
     )
     session = GatewaySession(Path("/data-fast/tmp/reviewed-prestart-control"), 32, OnPremConfig())
     monkeypatch.setattr(
-        dss_driver, "_gateway_runtime", lambda *args: pytest.fail("invalid recipe must not touch the runtime")
+        dss_driver,
+        "_gateway_runtime",
+        lambda *args: pytest.fail("invalid recipe must not touch the runtime"),
     )
-    monkeypatch.setattr(dss_driver, "ArcticClient", lambda *args: pytest.fail("invalid recipe must not create jobs"))
+    monkeypatch.setattr(
+        dss_driver,
+        "ArcticClient",
+        lambda *args: pytest.fail("invalid recipe must not create jobs"),
+    )
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
         with dss_driver.running_job(session, payload):
             pytest.fail("unsupported fields must not yield")
@@ -1703,10 +2309,14 @@ _cortex_port_CONFIG = _cortex_port_ROOT / "configs/qwen3-8b/h200/train-sft-full-
 @pytest.fixture(autouse=False)
 def _cortex_port_no_network(monkeypatch):
     monkeypatch.setattr(
-        aiohttp.ClientSession, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
+        aiohttp.ClientSession,
+        "request",
+        lambda *args, **kwargs: pytest.fail("unit tests must not access the network"),
     )
     monkeypatch.setattr(
-        requests.Session, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
+        requests.Session,
+        "request",
+        lambda *args, **kwargs: pytest.fail("unit tests must not access the network"),
     )
 
 
@@ -1747,7 +2357,14 @@ def test_cortex_port_cortex_training_preserves_dss_extra_fields_and_determinism(
     session = GatewaySession(Path("."), 8, CortexConfig(base_url="http://unused"))
     cfg = _training_client_config(session, payload)
     wire = cfg.to_cortex()[0]
-    for key in ("sp_size", "prime_rl", "custom_worker_option", "activation_checkpointing", "mb_spec", "debug"):
+    for key in (
+        "sp_size",
+        "prime_rl",
+        "custom_worker_option",
+        "activation_checkpointing",
+        "mb_spec",
+        "debug",
+    ):
         assert wire["training_config"][key] == payload["training_config"][key]
     assert wire["training_config"]["debug"]["gradient_norms_per_param"] is True
     assert wire["training_config"]["debug"]["full_determinism"] is True
@@ -1784,7 +2401,12 @@ def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workar
         assert identity["check_id"] == "single-step-grads"
         name = identity["recipe"]["synthetic_inputs"]["batch"]["name"]
         references.append(load_batch(ctx.batch_paths[name]))
-        return {"loss": 2.0, "grad_norms": {"weight": 1.0}, "microbatches": 1, "active_tokens": 1}
+        return {
+            "loss": 2.0,
+            "grad_norms": {"weight": 1.0},
+            "microbatches": 1,
+            "active_tokens": 1,
+        }
 
     async def send(transport, method, url, **kwargs):
         if method == "POST" and url == transport._prefix:
@@ -1792,10 +2414,16 @@ def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workar
             return {"job_id": f"job-{len(creates)}"}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
             if startup_error:
-                return {"status": "failed", "reason": "unsupported native worker options: ['mb_spec']"}
+                return {
+                    "status": "failed",
+                    "reason": "unsupported native worker options: ['mb_spec']",
+                }
             return {"status": "RUNNING"}
         if method == "GET":
-            return {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
+            return {
+                "status": "REQUEST_STATE_DONE",
+                "result": replies[url.rsplit("/", 1)[-1]],
+            }
         if url.endswith(":cancel"):
             cancels.append(transport.job_id)
             return {}
@@ -1813,8 +2441,16 @@ def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workar
         replies[request_id] = result
         return {"request_id": request_id}
 
-    monkeypatch.setattr(cortex_fixture, "load_fixture", lambda *args: {"model_name": "published-reviewed-fixture"})
-    monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
+    monkeypatch.setattr(
+        cortex_fixture,
+        "load_fixture",
+        lambda *args: {"model_name": "published-reviewed-fixture"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_reference",
+        lambda *a, **k: pytest.fail("regression must not run HF"),
+    )
     monkeypatch.setattr(reference_records, "model_identity", lambda *a: {"sha256": "unit-model"})
     monkeypatch.setattr(reference_records, "load_record", reference)
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
@@ -1890,7 +2526,11 @@ def _cortex_port_mock_inference_inputs(monkeypatch, cfg):
 
     monkeypatch.setattr(gsm8k, "load_tokenizer", load_tokenizer)
     monkeypatch.setattr(gsm8k, "read_rows", read_rows)
-    monkeypatch.setattr(gsm8k, "tokenize_examples", lambda actual, rows: rows if actual is tokenizer else None)
+    monkeypatch.setattr(
+        gsm8k,
+        "tokenize_examples",
+        lambda actual, rows: rows if actual is tokenizer else None,
+    )
     return (training, validation, tokenizer_paths)
 
 
@@ -1958,9 +2598,15 @@ def test_cortex_port_managed_inference_uses_public_transport_and_cleans_up(tmp_p
             if mode == "sampling_start_error" and transport.job_id == "job-2":
                 return {"status": "FAILED", "reason": "mock sampling startup failed"}
             role = creates[int(transport.job_id.rsplit("-", 1)[1]) - 1]["sub_job_configs"][0]["job_type"]
-            return {"status": "RUNNING", "sub_jobs": [{"job_type": role, "sub_job_id": f"opaque-{role}-id"}]}
+            return {
+                "status": "RUNNING",
+                "sub_jobs": [{"job_type": role, "sub_job_id": f"opaque-{role}-id"}],
+            }
         if method == "GET":
-            return {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
+            return {
+                "status": "REQUEST_STATE_DONE",
+                "result": replies[url.rsplit("/", 1)[-1]],
+            }
         if path.endswith("/forward-backward"):
             body = wire.loads(wire.decode_byte_chunks([kwargs["data"]], kind="request"))
             assert "processing" not in body
@@ -2041,17 +2687,32 @@ def test_cortex_port_managed_inference_uses_public_transport_and_cleans_up(tmp_p
     if expected_jobs == 2:
         sampling = creates[1]["sub_job_configs"][0]
         assert sampling["job_type"] == "sampling"
-        assert sampling["source_checkpoint_info"] == {"checkpoint_id": checkpoint_id, "source_job_id": "job-1"}
+        assert sampling["source_checkpoint_info"] == {
+            "checkpoint_id": checkpoint_id,
+            "source_job_id": "job-1",
+        }
         assert sampling["inference_config"]["n_gpus"] == 1
         assert sampling["inference_config"]["max_seq_len"] == cfg.max_tokens_per_mb + 1
     expected_validation = inference.pack_logit_aligned(gsm8k.build_batch("validation", validation, 0))
-    torch.testing.assert_close(forwards[0]["kwargs"]["labels"], expected_validation["batch"]["labels"], rtol=0, atol=0)
-    for body, batch in zip(backward, inference.training_batches(training, cfg.training["train_batch_size"], 0)):
+    torch.testing.assert_close(
+        forwards[0]["kwargs"]["labels"],
+        expected_validation["batch"]["labels"],
+        rtol=0,
+        atol=0,
+    )
+    for body, batch in zip(
+        backward,
+        inference.training_batches(training, cfg.training["train_batch_size"], 0),
+    ):
         torch.testing.assert_close(body["kwargs"]["input_ids"], batch.input_ids, rtol=0, atol=0)
         torch.testing.assert_close(body["kwargs"]["labels"], batch.labels, rtol=0, atol=0)
     if generates:
         assert generates[0]["prompts"] == [example.prompt + example.completion for example in validation]
-        assert generates[0]["sampling_params"] == {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": 0}
+        assert generates[0]["sampling_params"] == {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "prompt_logprobs": 0,
+        }
     if mode == "success":
         assert result.outcome.value == "pass"
         assert result.metrics["reference_cross_entropy"] == result.metrics["target_cross_entropy"] == 1.25
@@ -2076,7 +2737,10 @@ def test_cortex_port_sampling_config_forwards_checkpoint_identity_without_mutati
     sub = config.to_cortex()[0]
     assert sub["model_name"] == cfg.model_name
     assert sub["job_type"] == "sampling"
-    assert sub["source_checkpoint_info"] == {"checkpoint_id": "cp_saved", "source_job_id": "source-parent"}
+    assert sub["source_checkpoint_info"] == {
+        "checkpoint_id": "cp_saved",
+        "source_job_id": "source-parent",
+    }
     assert sub["inference_config"]["vllm_config"]["enforce_eager"] is True
     assert json.dumps(cfg.training, sort_keys=True) == before
 
@@ -2106,7 +2770,10 @@ def test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic
         def __init__(self, config):
             self.config = config
             self.shutdown_called = False
-            self.jobs = JobHandles(training="training" if config.training_gpus else None, log_prob="log_prob")
+            self.jobs = JobHandles(
+                training="training" if config.training_gpus else None,
+                log_prob="log_prob",
+            )
             clients.append(self)
 
         def shutdown(self):
@@ -2118,7 +2785,12 @@ def test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic
                 inference.training_batches(training, cfg.training["train_batch_size"], 0)[index],
                 model_provider=cfg.training["model_provider"],
             )
-            torch.testing.assert_close(body["batch"]["input_ids"], expected["batch"]["input_ids"], rtol=0, atol=0)
+            torch.testing.assert_close(
+                body["batch"]["input_ids"],
+                expected["batch"]["input_ids"],
+                rtol=0,
+                atol=0,
+            )
             torch.testing.assert_close(body["batch"]["labels"], expected["batch"]["labels"], rtol=0, atol=0)
             return {"avg_loss": 2.0}
 
@@ -2144,7 +2816,10 @@ def test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic
             assert request.body["top_k"] == 0
             return {
                 "results": [
-                    {"token_ids": list(example.input_ids[1:]), "logprobs": [-1.25] * (example.length - 1)}
+                    {
+                        "token_ids": list(example.input_ids[1:]),
+                        "logprobs": [-1.25] * (example.length - 1),
+                    }
                     for example in validation
                 ]
             }
@@ -2154,12 +2829,18 @@ def test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic
     monkeypatch.setattr(inference, "CorrectnessClient", forbidden)
     monkeypatch.setattr(inference, "save_and_resolve_checkpoint_id", forbidden)
     monkeypatch.setattr(
-        inference, "materialize_checkpoint_tokenizer", lambda tokenizer, path: tokenizer_saves.append(path)
+        inference,
+        "materialize_checkpoint_tokenizer",
+        lambda tokenizer, path: tokenizer_saves.append(path),
     )
     result = inference._run(ctx)
     assert result.outcome.value == "pass"
     assert len(clients) == 3
-    assert [client.config.model_name for client in clients] == [cfg.model_name, str(weights_dir), str(weights_dir)]
+    assert [client.config.model_name for client in clients] == [
+        cfg.model_name,
+        str(weights_dir),
+        str(weights_dir),
+    ]
     assert all((client.shutdown_called and isinstance(client.config.backend, OnPremConfig) for client in clients))
     assert steps == [cfg.training["optimizer"]["lr"]] * 10
     assert tokenizer_paths == [cfg.model_name]
@@ -2230,7 +2911,11 @@ class _hosted_Client:
 
     def load_checkpoint(self, *, path):
         self.calls.append(("load", path))
-        return {"checkpoint_path": path, "checkpoint_tag": "global_step10", "version": 10}
+        return {
+            "checkpoint_path": path,
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        }
 
     def list_checkpoints(self):
         return [dict(entry) for entry in self.catalog]
@@ -2277,7 +2962,10 @@ def test_hosted_an_ordinary_sub_job_carries_no_source_checkpoint() -> None:
 
 
 def test_hosted_a_resumed_sub_job_names_the_checkpoint_and_the_job_that_saved_it() -> None:
-    wire = _hosted_wire(_hosted_config(), source_checkpoint_info={"checkpoint_id": "cp_1", "source_job_id": "job-a"})
+    wire = _hosted_wire(
+        _hosted_config(),
+        source_checkpoint_info={"checkpoint_id": "cp_1", "source_job_id": "job-a"},
+    )
     source = wire["source_checkpoint_info"]
     assert source["checkpoint_id"] == "cp_1"
     assert source["source_job_id"] == "job-a"
@@ -2353,14 +3041,19 @@ def test_hosted_a_job_releases_its_gpus_when_the_block_raises(monkeypatch) -> No
     assert client.cancelled == ["job-1"]
 
 
-def test_hosted_a_resumed_job_is_created_from_the_checkpoint_it_was_given(monkeypatch) -> None:
+def test_hosted_a_resumed_job_is_created_from_the_checkpoint_it_was_given(
+    monkeypatch,
+) -> None:
     client = _hosted_Client()
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
     with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
         with transport.job(resume_from=Checkpoint(reference="cp_1", source_job="job-a")):
             pass
     body, hardware = client.created[0]
-    assert body["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
+    assert body["source_checkpoint_info"] == {
+        "checkpoint_id": "cp_1",
+        "source_job_id": "job-a",
+    }
     assert hardware == "H200"
 
 
@@ -2449,7 +3142,12 @@ class _hosted_LocalClient(_hosted_Client):
     def load_checkpoint(self, checkpoint_id, *, stage_info=None):
         self.calls.append(("load", checkpoint_id, deepcopy(stage_info)))
         return hosted._local_load_metadata(
-            {"checkpoint_id": checkpoint_id, "checkpoint_tag": "global_step10", "version": 10}, checkpoint_id
+            {
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_tag": "global_step10",
+                "version": 10,
+            },
+            checkpoint_id,
         )
 
 
@@ -2472,7 +3170,11 @@ def test_hosted_local_save_uses_a_fresh_fast_path_without_catalog(monkeypatch, t
     marker.write_text("preserve", encoding="ascii")
     monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
     client = _hosted_LocalClient(
-        save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10}
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        }
     )
     saved_root, result = hosted._save_local_checkpoint(client, checkpoint_type)
     assert saved_root == root.resolve()
@@ -2496,7 +3198,12 @@ def test_hosted_local_resumable_checkpoint_keeps_the_saving_job_identity(monkeyp
     )
     checkpoint = HostedTrainingJob(client, "owned-parent", local_gateway=True).save_resumable()
     assert checkpoint == hosted.LocalCortexCheckpoint(
-        _hosted_LOCAL_CHECKPOINT_ID, "owned-parent", str(root), "global_step10", 10, stage_info=_hosted_LOCAL_STAGE
+        _hosted_LOCAL_CHECKPOINT_ID,
+        "owned-parent",
+        str(root),
+        "global_step10",
+        10,
+        stage_info=_hosted_LOCAL_STAGE,
     )
     assert checkpoint.stage_info is not client.save_result["stage_info"]
     assert client.calls == [("save", "resumable", str(root))]
@@ -2511,7 +3218,11 @@ def test_hosted_local_resumable_save_without_durable_identity_retains_output_and
     marker.write_text("preserve", encoding="ascii")
     monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
     client = _hosted_LocalClient(
-        save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10}
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        }
     )
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
     with pytest.raises(RuntimeError, match="only a FAST path/tag"):
@@ -2549,7 +3260,12 @@ def test_hosted_local_save_rejects_inconsistent_metadata_and_retains_output(monk
     marker = root / "retained-evidence"
     marker.write_text("preserve", encoding="ascii")
     monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
-    result = {"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10, **changes}
+    result = {
+        "checkpoint_path": str(root),
+        "checkpoint_tag": "global_step10",
+        "version": 10,
+        **changes,
+    }
     with pytest.raises((ValueError, RuntimeError)):
         hosted._save_local_checkpoint(_hosted_LocalClient(save_result=result), "resumable")
     assert marker.read_text(encoding="ascii") == "preserve"
@@ -2564,7 +3280,9 @@ def test_hosted_local_save_rejects_nonmapping_response(monkeypatch, tmp_path, re
         hosted._save_local_checkpoint(client, "resumable")
 
 
-def test_hosted_local_save_rejects_invalid_checkpoint_type_before_creating_storage(monkeypatch) -> None:
+def test_hosted_local_save_rejects_invalid_checkpoint_type_before_creating_storage(
+    monkeypatch,
+) -> None:
 
     def unexpected(*args, **kwargs):
         raise AssertionError("invalid type must not allocate storage")
@@ -2598,7 +3316,11 @@ def test_hosted_local_resume_creates_a_fresh_full_model_job_then_loads_before_tr
         assert client.cancelled == ["job-1"]
         with transport.job(resume_from=checkpoint) as resumed:
             assert resumed.job_id == "job-2"
-            assert client.calls[-1] == ("load", _hosted_LOCAL_CHECKPOINT_ID, _hosted_LOCAL_STAGE)
+            assert client.calls[-1] == (
+                "load",
+                _hosted_LOCAL_CHECKPOINT_ID,
+                _hosted_LOCAL_STAGE,
+            )
             assert resumed.fwd_bwd_step({"args": (), "kwargs": {}}, learning_rate=0.001) == 2.5
     assert client.cancelled == ["job-1", "job-2"]
     assert client.calls == [
@@ -2673,7 +3395,10 @@ def test_hosted_local_resume_rejects_unconfirmed_or_wrong_step_and_releases_fres
     assert client.closed
 
 
-@pytest.mark.parametrize("marker", [None, b"", b"cp_123", b"global_step-1", b"\xff", b"global_step10" + b" " * 129])
+@pytest.mark.parametrize(
+    "marker",
+    [None, b"", b"cp_123", b"global_step-1", b"\xff", b"global_step10" + b" " * 129],
+)
 def test_hosted_local_resume_rejects_path_with_missing_or_invalid_marker_before_allocating_job(
     monkeypatch, tmp_path, marker
 ) -> None:
@@ -2770,7 +3495,10 @@ def test_hosted_determinism_training_client_config_pins_determinism() -> None:
                 "max_seq_len": 8,
                 "train_batch_size": 1,
                 "n_gpus": 1,
-                "debug": {"full_determinism": False, "full_determinism_must_comply": True},
+                "debug": {
+                    "full_determinism": False,
+                    "full_determinism_must_comply": True,
+                },
             },
             "global_batch_size": 1,
             "dtype": "bfloat16",

@@ -278,6 +278,19 @@ class LoraInitializationPrerequisiteError(RuntimeError):
     """The selected target cannot consume and prove the declared LoRA initialization."""
 
 
+def _canonicalize_adapter_config(path: Path) -> None:
+    config = json.loads(path.read_text())
+    modules = config["target_modules"]
+    if isinstance(modules, list):
+        if any(not isinstance(name, str) or not name for name in modules):
+            raise ValueError("PEFT target_modules must contain only non-empty strings")
+        # PEFT stores module names as a set; process hash seeds must not affect pack identity.
+        config["target_modules"] = sorted(modules)
+    elif not isinstance(modules, str) or not modules:
+        raise ValueError("PEFT target_modules must be a string or list of strings")
+    path.write_text(json.dumps(config, indent=2, sort_keys=True, allow_nan=False) + "\n")
+
+
 def materialize_adapter(cfg, model_path: str | Path, workdir: str | Path) -> Path | None:
     """Build shape metadata offline, then write an owned temporary PEFT pack under /data-fast."""
     peft_config = cfg.training.get("peft_config")
@@ -341,6 +354,7 @@ def materialize_adapter(cfg, model_path: str | Path, workdir: str | Path) -> Pat
         tempfile.mkdtemp(prefix="deterministic-lora-", dir=root), label="deterministic LoRA temporary adapter"
     )
     model.peft_config["default"].save_pretrained(output)
+    _canonicalize_adapter_config(output / "adapter_config.json")
     save_file(adapter_state, str(output / "adapter_model.safetensors"), metadata={"format": "pt"})
     metadata = {
         "schema_version": 1,
@@ -382,12 +396,20 @@ def identity_metadata(adapter_path: str | Path) -> dict:
 adapter_identity = identity_metadata
 
 
-def bind_payload(payload: dict, adapter_path: str | Path | None) -> dict:
-    """Leave non-LoRA requests untouched; never invent an unsupported target init field."""
+def bind_payload(payload: dict, adapter_path: str | Path | None, *, native_backend=None) -> dict:
+    """Admit the owned native adapter route explicitly; unsupported callers remain rejected."""
     if adapter_path is None:
         if (payload.get("training_config") or {}).get("peft_config") is not None:
             raise LoraInitializationPrerequisiteError("LoRA target requires a deterministic adapter initialization")
         return payload
+    if native_backend is not None:
+        from .native_lora import bind_original_adapter
+        from .native_lora import bind_shared_adapter
+
+        root = Path(adapter_path)
+        if (root / "initialization.json").exists():
+            return bind_original_adapter(payload, root, native_backend)
+        return bind_shared_adapter(payload, root, native_backend)
     raise LoraInitializationPrerequisiteError(
         "deterministic LoRA target initialization is unavailable through the supplied DSS gateway: "
         "no supported public training adapter-load/init route; checkpoint save and zone resumable load "

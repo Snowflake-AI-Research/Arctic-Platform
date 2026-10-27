@@ -88,6 +88,7 @@ def _write_conversion_cache(
     *,
     rank: int,
     local_rank: int,
+    convert_checkpoint_fn: Callable | None = None,
 ) -> None:
     tmp_path = snapshot_path.with_name(f"{snapshot_path.name}.tmp-rank{rank}-pid{os.getpid()}")
     if tmp_path.exists():
@@ -107,13 +108,19 @@ def _write_conversion_cache(
     committed = False
     t0 = time.perf_counter()
     try:
-        snapshot_state_dict = load_state_dict_fn(source_path)
-        t_load = time.perf_counter()
-        convert_fn(snapshot_state_dict)
-        t_convert = time.perf_counter()
-        save_state_dict_fn(snapshot_state_dict, tmp_path)
-        t_save = time.perf_counter()
-        del snapshot_state_dict
+        if convert_checkpoint_fn is None:
+            snapshot_state_dict = load_state_dict_fn(source_path)
+            t_load = time.perf_counter()
+            convert_fn(snapshot_state_dict)
+            t_convert = time.perf_counter()
+            save_state_dict_fn(snapshot_state_dict, tmp_path)
+            t_save = time.perf_counter()
+            del snapshot_state_dict
+        else:
+            convert_checkpoint_fn(source_path, tmp_path)
+            t_load = t_convert = t_save = time.perf_counter()
+        if not conversion_cache_ready(tmp_path):
+            raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
         os.replace(tmp_path, snapshot_path)
         committed = True
     finally:
@@ -147,6 +154,7 @@ def ensure_node_local_conversion_cache(
     *,
     rank: int,
     local_rank: int,
+    convert_checkpoint_fn: Callable | None = None,
 ) -> None:
     if conversion_cache_ready(snapshot_path):
         if local_rank == 0:
@@ -175,6 +183,7 @@ def ensure_node_local_conversion_cache(
                     save_state_dict_fn,
                     rank=rank,
                     local_rank=local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                 )
             elif local_rank == 0:
                 logger.info(

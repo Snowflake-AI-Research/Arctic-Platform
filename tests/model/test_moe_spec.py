@@ -41,6 +41,58 @@ def test_text_model_type_reads_a_nested_glm_config(tmp_path):
     assert is_glm_moe_model(checkpoint)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_glm53_uses_the_glm_moe_training_policy(tmp_path, nested):
+    payload = {"model_type": "glm5_next_text"}
+    if nested:
+        payload = {"model_type": "glm5_next", "text_config": payload}
+    checkpoint = _write_config(tmp_path / "glm53", payload)
+
+    assert hf_text_model_type(checkpoint) == "glm5_next_text"
+    assert is_glm_moe_model(checkpoint)
+
+
+def test_non_glm_moe_does_not_use_the_glm_training_policy(tmp_path):
+    checkpoint = _write_config(tmp_path / "qwen", {"model_type": "qwen3_5_moe"})
+
+    assert not is_glm_moe_model(checkpoint)
+
+
+@pytest.mark.parametrize("family,attention", [("glm5_next", "sparse_mla"), ("qwen4_exp", "qsa_flex")])
+@pytest.mark.parametrize("nested", [False, True])
+def test_flash_moe_text_config_preserves_training_options(tmp_path, family, attention, nested):
+    payload = {"model_type": f"{family}_text"}
+    if nested:
+        payload = {"model_type": family, "text_config": payload}
+    checkpoint = _write_config(tmp_path / family, payload)
+    spec = moe_model_spec(
+        model_name=checkpoint,
+        ep_size=8,
+        sp_size=8,
+        loader_options={
+            "attn": attention,
+            "ac_config": {"mode": "full"},
+            "seq_len": 1024,
+            "ep_comm_backend": "uccl",
+            "fused_cross_entropy": "liger",
+            "deepep_token_chunk_size": 1024,
+            "debug": {"full_determinism": True},
+        },
+        tiled_mlp_token_chunk_size=1024,
+    )
+
+    assert spec.loader == family
+    assert spec.attn_implementation == attention
+    assert spec.parallelism.expert_parallel == spec.parallelism.sequence_parallel == 8
+    assert spec.loader_options["ac_config"]["mode"] == "full"
+    assert spec.loader_options["seq_len"] == 1024
+    assert spec.loader_options["ep_comm_backend"] == "uccl"
+    assert spec.loader_options["fused_cross_entropy"] == "liger"
+    assert spec.loader_options["deepep_token_chunk_size"] == 1024
+    assert spec.loader_options["tiled_mlp_token_chunk_size"] == 1024
+    assert spec.loader_options["debug"]["full_determinism"] is True
+
+
 def test_qwen_spec_lifts_dtype_attention_and_parallelism(tmp_path):
     checkpoint = _write_config(tmp_path / "qwen", {"model_type": "qwen3_5_moe"})
     spec = moe_model_spec(

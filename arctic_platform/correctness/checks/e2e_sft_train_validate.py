@@ -60,6 +60,7 @@ from typing import Tuple
 import torch
 
 from arctic_platform.client import CortexConfig
+from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..harness import reference_records
@@ -396,10 +397,15 @@ def run_dss_trajectory(
         attn_implementation=ctx.attn_implementation,
         weight_format=ctx.cfg.sub_job.get("weight_format"),
     )
+    maybe_bind_reduced_fixture_mtp(payload, ctx.spec, getattr(ctx, "published_fixture", None))
     if peft_adapter_path is not None:
         from ..harness.lora import bind_payload
 
-        payload = bind_payload(payload, peft_adapter_path)
+        payload = bind_payload(
+            payload,
+            peft_adapter_path,
+            native_backend=backend if isinstance(backend, CortexConfig) else None,
+        )
     if isinstance(backend, CortexConfig) and ctx.cfg.gpu_type is not None:
         payload["hardware"] = ctx.cfg.gpu_type.upper()
     # ``serve_gateway`` writes its hostfile into the directory it is handed and does not create it.
@@ -611,7 +617,12 @@ def _prepare_adapter(ctx, model_path: str, workdir: Path) -> Tuple[Path | None, 
             attn_implementation=ctx.attn_implementation,
             weight_format=ctx.cfg.sub_job.get("weight_format"),
         )
-        deterministic_lora.bind_payload(payload, adapter)
+        backend = getattr(ctx, "client_backend", None)
+        deterministic_lora.bind_payload(
+            payload,
+            adapter,
+            native_backend=backend if isinstance(backend, CortexConfig) else None,
+        )
     return adapter, {
         "kind": "deterministic-lora",
         "metadata": deterministic_lora.identity_metadata(adapter),

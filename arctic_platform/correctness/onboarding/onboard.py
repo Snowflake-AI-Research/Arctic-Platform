@@ -43,6 +43,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
+from arctic_platform.correctness.harness.config import reference_calibration_worker_count
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
@@ -88,7 +89,22 @@ class _ConsoleLog:
 
 
 def _onboarding_failure(reason: str) -> None:
-    print(f"\n\n!!!!! ONBOARDING FAILED: {reason.upper()} !!!!!\n\n", file=sys.stderr, flush=True)
+    heading, separator, details = reason.partition("\n")
+    print(f"\n\n!!!!! ONBOARDING FAILED : {heading} !!!!!\n", file=sys.stderr, flush=True)
+    if separator:
+        print(details, file=sys.stderr, flush=True)
+    print(file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started
 
 
 def logged_run(args: argparse.Namespace) -> int:
@@ -98,6 +114,7 @@ def logged_run(args: argparse.Namespace) -> int:
     if getattr(args, "probe_layers", None) is not None:
         return run(args)
     started = time.monotonic()
+    args._onboarding_times = {}
     previous_root = os.environ.get(CORRECTNESS_LOGDIR_ENV)
     args._resume_root = Path(previous_root or Path.cwd() / "work" / "logs") / "onboarding-state"
     args._diagnostics_dir = correctness_logdir("onboarding-")
@@ -119,15 +136,22 @@ def logged_run(args: argparse.Namespace) -> int:
                     except Exception as exc:
                         reason = f"{type(exc).__name__}: {exc}"
                         traceback.print_exc()
+                        timings = "".join(
+                            f"\nOnboarding time ({test_id}): {total_duration(elapsed)}\n"
+                            for test_id, elapsed in args._onboarding_times.items()
+                        )
                         (args._diagnostics_dir / "report.md").write_text(
                             f"# Onboarding Failed\n\nConfig: `{args.config}`\n\n"
-                            f"## Reason\n\n{reason}\n\nComplete traceback: [onboarding.log](onboarding.log)\n",
+                            f"## Reason\n\n{reason}\n{timings}\n"
+                            "Complete traceback: [onboarding.log](onboarding.log)\n",
                             encoding="utf-8",
                         )
                         _onboarding_failure(reason)
                         print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
                     finally:
+                        for test_id, elapsed in args._onboarding_times.items():
+                            print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)
                         print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)
             finally:
                 logger.handlers = previous_handlers
@@ -163,8 +187,8 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
         getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
         or getattr(args, "backend", "onprem") not in {"cortex", "cortex-training"}
-        or config.is_rl
-        or not set(selection).intersection(CALIBRATED_TEST_IDS)
+        or (config.is_rl and getattr(args, "test_id", None) != "checkpoint-resume-loss")
+        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"))
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
@@ -185,8 +209,30 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
             "Remove hosted ARCTIC_CORTEX_HOST/PAT settings to use the automatically managed local gateway, "
             "or pass --base-url for an existing local gateway. Hosted reduced-model onboarding is unsupported."
         ) from exc
-    if args.test_id in CALIBRATED_TEST_IDS:
+    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"):
         args.local_cortex_fixture = True
+    if args.test_id == "checkpoint-resume-loss":
+        args._automatic_checkpoint_bridge = True
+
+
+def _checkpoint_placement(args: argparse.Namespace, config):
+    """Use the regression's explicit placement without mutating the reviewed config."""
+    width = getattr(args, "checkpoint_training_gpus", None)
+    if width is None:
+        return config
+    if type(width) is not int or width < 1:
+        raise ValueError("--checkpoint-training-gpus must be a positive integer")
+    if (
+        args.test_id != "checkpoint-resume-loss"
+        or config.is_rl
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        raise ValueError("--checkpoint-training-gpus requires supervised checkpoint-resume-loss onboarding")
+    pool = getattr(args, "gpu_pool", None) or width
+    if width > pool:
+        raise ValueError(f"requested checkpoint training width {width} exceeds GPU pool {pool}")
+    return config.at_gpu_width(width)
 
 
 @contextmanager
@@ -198,7 +244,13 @@ def _validation_gateway(args: argparse.Namespace):
     from arctic_platform.correctness.harness.dss_driver import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
-    with local_cortex_gateway(directory) as url:
+    if getattr(args, "_automatic_checkpoint_bridge", False):
+        from arctic_platform.correctness.harness.execution import _regression_gateway
+
+        with _regression_gateway(SimpleNamespace(**{**vars(args), "out": directory})) as url:
+            yield url
+        return
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.correctness_participation") as url:
         yield url
 
 
@@ -208,6 +260,126 @@ def _checkpoint_file_identity(path: Path | str) -> dict:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
         size = os.fstat(stream.fileno()).st_size
     return {"sha256": digest, "size": size}
+
+
+def _resume_onboarding_timing(tree: ast.Module) -> ast.Module:
+    """Normalize only the exact reviewed per-test timing additions."""
+    removed = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            """@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started""",
+            "args._onboarding_times = {}",
+            """if not hasattr(args, "_onboarding_times"):
+    args._onboarding_times = {}""",
+            """timings = "".join(
+    f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"
+    for test_id, elapsed in args._onboarding_times.items()
+)""",
+            """for test_id, elapsed in args._onboarding_times.items():
+    print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)""",
+            'results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]',
+            """if "combined reference preparation" in args._onboarding_times:
+    lines.extend([
+        "Combined reference preparation time: "
+        f"{total_duration(args._onboarding_times['combined reference preparation'])}",
+        "",
+    ])""",
+        )
+    }
+    selection_nodes = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            "selection = args.reference_tests or [args.test_id]",
+            'label = selection[0] if len(selection) == 1 else "combined reference preparation"',
+        )
+    }
+    contexts = {
+        ast.dump(ast.parse(f"with {source}:\n    pass").body[0].items[0])
+        for source in (
+            "_onboarding_test_time(args, label)",
+            "_onboarding_test_time(args, args.test_id)",
+            "_onboarding_test_time(child, test_id)",
+            '_onboarding_test_time(args, "combined reference preparation")',
+        )
+    }
+    report_import = ast.dump(
+        ast.parse("from arctic_platform.correctness.harness.report import total_duration").body[0]
+    )
+    failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n{timings}\\n"'
+        '"Complete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    previous_failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    failure_report_node = ast.dump(ast.parse(failure_report, mode="eval").body)
+    timing_line = ast.dump(
+        ast.parse(
+            """(f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+if "elapsed_seconds" in result else "Onboarding time: not run")""",
+            mode="eval",
+        ).body
+    )
+    combined_time = ast.dump(
+        ast.parse('args._onboarding_times.get("combined reference preparation")', mode="eval").body
+    )
+
+    class TimingDisplay(ast.NodeTransformer):
+        function = None
+
+        def visit(self, node):
+            identity = ast.dump(node)
+            if identity in removed or self.function == "run" and identity in selection_nodes:
+                return None
+            if self.function == "_onboard_configuration" and identity == report_import:
+                return None
+            if identity == failure_report_node:
+                return ast.parse(previous_failure_report, mode="eval").body
+            return super().visit(node)
+
+        def visit_FunctionDef(self, node):
+            previous = self.function
+            self.function = node.name
+            node = self.generic_visit(node)
+            self.function = previous
+            return node
+
+        def visit_With(self, node):
+            node = self.generic_visit(node)
+            if len(node.items) == 1 and ast.dump(node.items[0]) in contexts:
+                return node.body
+            return node
+
+        def visit_Dict(self, node):
+            for index in range(len(node.keys) - 1, -1, -1):
+                if (
+                    isinstance(node.keys[index], ast.Constant)
+                    and node.keys[index].value == "combined_reference_elapsed_seconds"
+                    and ast.dump(node.values[index]) == combined_time
+                ):
+                    del node.keys[index]
+                    del node.values[index]
+            return self.generic_visit(node)
+
+        def visit_List(self, node):
+            for index in range(len(node.elts) - 2, -1, -1):
+                if ast.dump(node.elts[index]) == timing_line and ast.dump(node.elts[index + 1]) == ast.dump(
+                    ast.Constant(value="")
+                ):
+                    del node.elts[index : index + 2]
+            return self.generic_visit(node)
+
+    return TimingDisplay().visit(tree)
 
 
 def _resume_preparation_request(request: dict, root: Path) -> dict:
@@ -222,6 +394,7 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
             raise ValueError(f"Onboarding source changed while recording retry state: {path}")
         tree = ast.parse(path.read_text())
         if relative == "onboarding/onboard.py":
+            tree = _resume_onboarding_timing(tree)
             footer_nodes = {
                 ast.dump(ast.parse(source).body[0])
                 for source in (
@@ -529,7 +702,31 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
     if getattr(args, "_automatic_cortex_gateway", False):
         target_modules.append("dss.ray_dss.gateway_server")
     if target_local and (config.is_rl or "inference-checkpoint-loss" in selection):
-        target_modules += ["arctic_inference", "vllm"]
+        if getattr(args, "_automatic_cortex_gateway", False):
+            target_modules += [
+                "arctic_platform.inference.server.multi_model",
+                "arctic_platform.inference.server.config",
+                "arctic_platform.inference.server.weight_sync.schedule",
+                "arctic_platform.inference.server.weight_sync.sender",
+                "arctic_platform.inference.server.weight_sync",
+                "arctic_platform.inference.utils",
+                "vllm",
+            ]
+            if config.is_rl:
+                sampling_settings = [
+                    sub.get("inference_config") or {}
+                    for sub in getattr(config, "sub_jobs", [])
+                    if sub.get("job_type") == "sampling"
+                ]
+                replay_enabled = bool((config.training.get("router_replay") or {}).get("enabled")) or any(
+                    (settings.get("router_replay") or {}).get("enabled")
+                    or (settings.get("vllm_config") or {}).get("enable_return_routed_experts")
+                    for settings in sampling_settings
+                )
+                if replay_enabled:
+                    target_modules.append("arctic_platform.inference.server.router_replay")
+        else:
+            target_modules += ["arctic_inference", "vllm"]
     attention = []
     if reference:
         attention.append(config.reference_attention_implementation)
@@ -551,7 +748,7 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         "modules": common + reference_modules + target_modules,
         "attention": sorted(set(attention)),
         "hf_attention": [config.reference_attention_implementation] if reference else [],
-        "min_gpus": max(1, getattr(args, "reference_calibration_workers", 1)) if reference else int(target_local),
+        "min_gpus": (getattr(args, "reference_calibration_workers", None) or 1) if reference else int(target_local),
         "gpu_type": config.gpu_type if target_local else None,
         "source": source if Path(source).is_absolute() else None,
         "model_id": source,
@@ -891,42 +1088,13 @@ def _probe_worker(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def build_spec(
-    cfg,
-    source_checkpoint: str,
-    cache_root: str,
-    arm_defs,
-    *,
-    attn_implementations=None,
-    num_layers: int | None = None,
-    workdir: Path | None = None,
-):
-    """Materialize the reduced reference model and freeze the generated cases."""
-    cache_root = require_data_fast_path(cache_root, label="onboarding model cache")
-    if workdir is not None:
-        workdir = require_data_fast_path(workdir, label="onboarding work directory")
-
-    from transformers import AutoConfig
-
+def _spec_arms(cfg, arm_defs, vocab_size: int):
+    """Describe the same generated comparison cases for reduced and full-source specifications."""
     from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import ArmSpec
-    from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
-    from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
-    from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
-    temporary.mkdir(parents=True, exist_ok=True)
-    if num_layers is None:
-        num_layers, _ = size_for_single_gpu(source_checkpoint)
-    destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
-    model = materialize_pretrained(source_checkpoint, destination, num_layers)
-    print(f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}", flush=True)
-
-    model_config = AutoConfig.from_pretrained(destination, trust_remote_code=True)
-    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
     arms = []
     for definition in arm_defs:
         batch = build_batch(
@@ -950,13 +1118,49 @@ def build_spec(
             )
         )
 
-    implementations = attn_implementations or [cfg.attention_implementation]
     notes = []
     if not any(arm.dss_microbatches > 1 for arm in arms):
         notes.append(
             "No arm splits into more than one microbatch, so gradient accumulation is untested; "
             "raise a global batch size or lower mb_spec.max_tokens_per_mb."
         )
+    return arms, notes
+
+
+def build_spec(
+    cfg,
+    source_checkpoint: str,
+    cache_root: str,
+    arm_defs,
+    *,
+    attn_implementations=None,
+    num_layers: int | None = None,
+    workdir: Path | None = None,
+):
+    """Materialize the reduced reference model and freeze the generated cases."""
+    cache_root = require_data_fast_path(cache_root, label="onboarding model cache")
+    if workdir is not None:
+        workdir = require_data_fast_path(workdir, label="onboarding work directory")
+
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
+    from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
+
+    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
+    temporary.mkdir(parents=True, exist_ok=True)
+    if num_layers is None:
+        num_layers, _ = size_for_single_gpu(source_checkpoint)
+    destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
+    model = materialize_pretrained(source_checkpoint, destination, num_layers)
+    print(f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}", flush=True)
+
+    model_config = AutoConfig.from_pretrained(destination, trust_remote_code=True)
+    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
+    arms, notes = _spec_arms(cfg, arm_defs, vocab_size)
+    implementations = attn_implementations or [cfg.attention_implementation]
     return TestSpec(
         config_id=cfg.config_id,
         config_path=str(cfg.path),
@@ -1058,6 +1262,7 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
         tokens=args.tokens,
         reference_token_budget=args.reference_token_budget,
         peft_adapter_path=peft_adapter_path,
+        reference_calibration_workers=getattr(args, "reference_calibration_workers", None),
     )
     calibration_script.write_text(render(render_args))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
@@ -1109,7 +1314,9 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         raise ValueError("optimizer calibration requires an explicit optimizer config")
     adapter_path = _shared_adapter(args, config, model_path)
 
-    lanes = max(1, min(CALIBRATION_RUNS, torch.cuda.device_count()))
+    lanes = reference_calibration_worker_count(
+        getattr(args, "reference_calibration_workers", None), runs=CALIBRATION_RUNS
+    )
     calibration_root = correctness_workdir("optimizer-calibration-")
     manifests: list[Path] = []
     worst_delta = 0.0
@@ -1151,13 +1358,16 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         with tqdm(
             total=CALIBRATION_RUNS, desc="Finding optimizer tolerance", unit="run", dynamic_ncols=True
         ) as progress:
-            with ThreadPoolExecutor(max_workers=lanes) as pool:
-                futures = [pool.submit(one_run, index) for index in range(CALIBRATION_RUNS)]
-                for future in as_completed(futures):
-                    index, elapsed, result = future.result()
-                    completed[index] = (elapsed, result)
-                    progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
-                    progress.update()
+            for start in range(0, CALIBRATION_RUNS, lanes):
+                with ThreadPoolExecutor(max_workers=lanes) as pool:
+                    futures = [
+                        pool.submit(one_run, index) for index in range(start, min(start + lanes, CALIBRATION_RUNS))
+                    ]
+                    for future in as_completed(futures):
+                        index, elapsed, result = future.result()
+                        completed[index] = (elapsed, result)
+                        progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
+                        progress.update()
         for index in range(CALIBRATION_RUNS):
             elapsed, result = completed[index]
             durations.append(elapsed)
@@ -1368,7 +1578,16 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     ]
     if getattr(args, "test_spec", None) is not None:
         command += ["--test-spec", str(args.test_spec)]
-    for name in ("host", "database", "schema", "endpoint", "base_url", "pat_file", "gpu_pool"):
+    for name in (
+        "host",
+        "database",
+        "schema",
+        "endpoint",
+        "base_url",
+        "pat_file",
+        "gpu_pool",
+        "checkpoint_training_gpus",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
@@ -1389,6 +1608,13 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--inference-export-allocation-sha256",
             str(args.inference_export_allocation_sha256),
         ]
+    if getattr(args, "dense_checkpoint_allocation", None) is not None:
+        command += [
+            "--dense-checkpoint-allocation",
+            str(args.dense_checkpoint_allocation),
+            "--dense-checkpoint-allocation-sha256",
+            str(args.dense_checkpoint_allocation_sha256),
+        ]
     if getattr(args, "inference_initial_model_dir", None) is not None:
         command += ["--inference-initial-model-dir", str(args.inference_initial_model_dir)]
     if bootstrap is not None:
@@ -1404,13 +1630,13 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--",
             *command[3:],
         ]
-    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     description = selected.get("model_description", f"frozen {layers}-layer regression")
     _stage(phase, "Target Validation", description)
     lines: list[str] = []
     with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
             command += ["--base-url", gateway_url]
+        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
         process = subprocess.Popen(
             command,
             cwd=args.checkout_root,
@@ -1504,8 +1730,8 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
     from arctic_platform.correctness.checks.checkpoint_resume import loss_range_gate
     from arctic_platform.correctness.checks.checkpoint_resume import measure_undeterministic_loss_range
     from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import arms_for
     from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import scaled_for_placement
 
     test_id = args.test_id
     if test_id != TEST_ID:
@@ -1529,19 +1755,42 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
             "neither re-stamps the checksum nor runs a check against a configuration nobody reviewed; "
             f"onboard single-step-grads again for {args.config} first"
         )
-    arms = list(spec.arms) if config.is_rl else arms_for(config.max_seq_len, config.n_gpus)
+    placed = _checkpoint_placement(args, config)
+    arms = scaled_for_placement(list(spec.arms), placed.n_gpus // config.n_gpus)
     model_cfg = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
     vocab_size = int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
     print("phase 1/2: three 10-step runs with determinism off, per case", flush=True)
-    raw_range, where = measure_undeterministic_loss_range(
-        config.training,
-        spec.model.cache_path,
-        slots=config.n_gpus,
-        vocab_size=vocab_size,
-        arms=arms,
-        workdir=args.output_dir / "checkpoint-resume-calibration",
-        attn_implementation=config.attention_implementation,
-    )
+    with _validation_gateway(args) as gateway_url:
+        transport_options = {}
+        if getattr(args, "backend", "onprem") == "cortex":
+            from arctic_platform.correctness.harness.cortex import load_local_fixture
+            from arctic_platform.correctness.harness.execution import _client_backend
+            from arctic_platform.correctness.harness.hosted import HostedTransport
+
+            backend = _client_backend(args)
+            if gateway_url is not None:
+                backend = backend.model_copy(update={"base_url": gateway_url})
+            fixture = load_local_fixture(backend, spec)
+            transport_options["transport_factory"] = lambda directory: HostedTransport(
+                backend,
+                placed,
+                model_name=fixture["model_name"],
+                spec=spec,
+                published_fixture=fixture,
+                attn_implementation=config.attention_implementation,
+                determinism="off",
+                **({"preserve_native_topology": True} if config.is_rl else {}),
+            )
+        raw_range, where = measure_undeterministic_loss_range(
+            placed.training,
+            spec.model.cache_path,
+            slots=placed.n_gpus,
+            vocab_size=vocab_size,
+            arms=arms,
+            workdir=args.output_dir / "checkpoint-resume-calibration",
+            attn_implementation=config.attention_implementation,
+            **transport_options,
+        )
     gate = loss_range_gate(raw_range, where)
     print(
         f"phase 1/2 complete: raw_range={raw_range} worst={where} "
@@ -1562,6 +1811,7 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
         "config_id": config.config_id,
         "config_path": str(args.config),
         "test_id": test_id,
+        "training_gpus": placed.n_gpus,
         "raw_loss_range": raw_range,
         "worst": where,
         "multiplier": gate.multiplier,
@@ -1588,9 +1838,12 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
 
 def _build_reference_free_rl_spec(args: argparse.Namespace, config):
     """Create an RL candidate without a supervised reference run or calibrated gate."""
+    from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import arms_for
+    from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
     from arctic_platform.correctness.harness.registry import registered_tests
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
 
     entry = registered_tests()[args.test_id]
     if not config.is_rl or entry.compares_to_reference or entry.requires_hosted_control_plane:
@@ -1607,24 +1860,33 @@ def _build_reference_free_rl_spec(args: argparse.Namespace, config):
             f"initial RL onboarding requires the config-derived {arm_defs[0].max_seq_len}-token "
             "case width; a smaller --tokens value would not match the regression cases"
         )
-    full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
-    spec = build_spec(
-        config,
-        str(args.source_checkpoint),
-        str(args.cache_root),
-        arm_defs,
-        num_layers=representative_layers,
-        workdir=args.output_dir / "onboard",
+    model, vocab_size, evidence = describe_source_model(str(args.source_checkpoint))
+    arms, notes = _spec_arms(config, arm_defs, vocab_size)
+    spec = TestSpec(
+        config_id=config.config_id,
+        config_path=str(config.path),
+        model=model,
+        arms=arms,
+        attn_implementations=[config.attention_implementation],
+        applicable_tests=[args.test_id],
+        config_checksum=config_checksum(config),
+        test_settings={args.test_id: {"source_metadata": evidence}},
+        inapplicable={
+            test_id: RL_INAPPLICABLE_REASON
+            for test_id, test in registered_tests().items()
+            if test.compares_to_reference
+        },
+        notes=notes,
     )
-    spec.applicable_tests = [args.test_id]
-    spec.inapplicable = {
-        test_id: RL_INAPPLICABLE_REASON for test_id, test in registered_tests().items() if test.compares_to_reference
-    }
     spec.notes.append(
-        f"Reference-free RL bootstrap materialized {representative_layers} of {full_layers} source "
-        f"layers (attention period {period}) and generated the cases without HF training, "
-        "single-GPU sizing or tolerance calibration. RL checks use the configured full model; "
-        "this reduced fixture supplies the spec metadata, not a supervised rollout baseline."
+        f"Reference-free RL bootstrap retained all {model.num_hidden_layers} original text layers and "
+        "the original vision configuration, and generated the cases from config and safetensors "
+        "headers without constructing an HF model, reading tensor payloads, sizing a reference or "
+        "calibrating a tolerance. RL checks use the configured full model. Parameter count, "
+        "initialization seed and reference sizing are unknown/not measured; stored tensor elements "
+        "include buffers and are not an architecture parameter count. The legacy model content_hash "
+        "binds filenames and sizes only; source_metadata separately binds config/index bytes and "
+        "tensor header schema, not weight payloads."
     )
     return spec
 
@@ -1632,9 +1894,9 @@ def _build_reference_free_rl_spec(args: argparse.Namespace, config):
 def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
     """Validate a fixed-gate check, bootstrapping an RL spec when none exists.
 
-    An existing reviewed model and its settings remain frozen. Initial RL onboarding materializes an
-    explicit representative prefix and cases, with no reference sizing or calibration. Both paths use
-    the check's own fixed criterion and publish applicability only after the ordinary regression passes.
+    An existing reviewed model and its settings remain frozen. Initial RL onboarding describes the
+    original config and tensor headers and generates cases, with no reference sizing or calibration.
+    Both paths use the check's own fixed criterion and publish applicability only after the ordinary regression passes.
     """
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
@@ -1718,7 +1980,7 @@ def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
         "num_hidden_layers": layers,
         "validated_model_scope": "configured-full-model" if full_model else "frozen-reference",
         "validated_model_name": config.model_name if full_model else spec.model.cache_path,
-        "frozen_reference_num_hidden_layers": layers,
+        "frozen_reference_num_hidden_layers": None if config.is_rl else layers,
         "applicable_tests": spec.applicable_tests,
         "already_listed_before_this_run": already_listed,
         "bootstrapped_reference_free_rl": bootstrap,
@@ -1763,11 +2025,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     test_id = "single-step-optimizer"
     criterion = CRITERIA[test_id]
     runs = args.reference_calibration_runs
-    workers = args.reference_calibration_workers
-    if runs != CALIBRATION_RUNS or not 1 <= workers <= 8:
-        raise ValueError(
-            f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm and 1 to 8 HF workers"
-        )
+    if runs != CALIBRATION_RUNS:
+        raise ValueError(f"local optimizer norm onboarding requires {CALIBRATION_RUNS} repeats per arm")
+    workers = reference_calibration_worker_count(args.reference_calibration_workers, runs=runs)
     records_root = require_git_records_dir(args.reference_records_dir)
     records_root.mkdir(parents=True, exist_ok=True)
     model_config = AutoConfig.from_pretrained(args.optimizer_model_path, trust_remote_code=True)
@@ -2021,6 +2281,7 @@ def _parent(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
 
     config = load_config(args.config)
+    placed = _checkpoint_placement(args, config)
     _configure_fixture_target(args, config, [args.test_id])
     if config.is_rl:
         from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
@@ -2038,38 +2299,44 @@ def _parent(args: argparse.Namespace) -> int:
     local_fixture = getattr(args, "local_cortex_fixture", False)
     if local_fixture and (
         getattr(args, "backend", "onprem") != "cortex"
-        or config.is_rl
+        or (config.is_rl and args.test_id != "checkpoint-resume-loss")
         or getattr(args, "local_gateway_full_model", False)
-        or args.test_id not in CALIBRATED_TEST_IDS
+        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss")
     ):
-        raise ValueError("local Cortex fixture onboarding requires supervised Cortex gradients or optimizer")
+        raise ValueError(
+            "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
+        )
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.dss_driver import rl_gpu_count
         from arctic_platform.correctness.harness.execution import _client_backend
         from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
 
         full_model = getattr(args, "local_gateway_full_model", False)
-        rl_inference = config.is_rl and args.test_id == "inference-checkpoint-loss" and not full_model
+        rl_fixed_check = (
+            config.is_rl
+            and args.test_id in {"inference-checkpoint-loss", "rl-weight-sync", "rl-router-replay"}
+            and not full_model
+        )
         supervised_full_model = (
             not config.is_rl and full_model and args.test_id in {"inference-checkpoint-loss", "e2e-sft-train-validate"}
         )
-        if not (rl_inference or supervised_full_model or local_fixture):
+        if not (rl_fixed_check or supervised_full_model or local_fixture):
             raise ValueError(
-                "Cortex onboarding requires local reference-free RL inference or "
+                "Cortex onboarding requires a local reference-free RL fixed-gate check or "
                 "a local full-model supervised inference/e2e check or an explicit local Cortex fixture"
             )
         require_local_cortex_gateway(_client_backend(args))
-        required_gpus = rl_gpu_count(config) if config.is_rl else config.n_gpus
+        required_gpus = rl_gpu_count(config) if config.is_rl else placed.n_gpus
         pool = getattr(args, "gpu_pool", None) or required_gpus
         if pool < required_gpus:
             raise ValueError(f"GPU pool is smaller than the required {required_gpus} GPUs")
     else:
-        _onboarding_preflight(args, config)
+        _onboarding_preflight(args, placed)
         validate_against_host(
-            config, args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()
+            placed, args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()
         )
         ensure_no_interrupted_builds()
-    _onboarding_preflight(args, config)
+    _onboarding_preflight(args, placed)
     from arctic_platform.correctness.harness.config import GAS1_TOKEN_CAP
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
     from arctic_platform.correctness.harness.config import max_sequence_tokens
@@ -2193,6 +2460,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-root", type=Path, default=Path("/data-fast/base-models/synthetic"))
     parser.add_argument("--test-spec", type=Path)
     parser.add_argument(
+        "--checkpoint-training-gpus",
+        type=int,
+        help=(
+            "explicit supervised checkpoint calibration and validation placement; reviewed config and arms stay fixed"
+        ),
+    )
+    parser.add_argument(
         "--inference-sampling-topology",
         type=int,
         nargs=3,
@@ -2201,6 +2475,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--inference-export-allocation", type=Path, help="same-job local inference allocation JSON")
     parser.add_argument("--inference-export-allocation-sha256", help="full SHA256 of the allocation JSON bytes")
+    parser.add_argument(
+        "--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON"
+    )
+    parser.add_argument(
+        "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+    )
     parser.add_argument(
         "--inference-initial-model-dir",
         type=Path,
@@ -2244,7 +2524,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
     )
-    parser.add_argument("--reference-calibration-workers", type=int, default=1)
+    parser.add_argument(
+        "--reference-calibration-workers",
+        type=int,
+        default=None,
+        help="concurrent HF reference workers (default: available GPUs on this node, capped at 8)",
+    )
     parser.add_argument(
         "--local-gateway-full-model",
         action="store_true",
@@ -2324,6 +2609,7 @@ def _prepare_references(args: argparse.Namespace) -> int:
 def run(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_id
     from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.execution import _load_dense_checkpoint_allocation
     from arctic_platform.correctness.harness.execution import _load_inference_export_allocation
     from arctic_platform.correctness.harness.execution import _load_inference_initial_model_dir
 
@@ -2333,6 +2619,12 @@ def run(args: argparse.Namespace) -> int:
         _onboarding_kind(args.test_id)
     if getattr(args, "inference_export_allocation", None) is not None:
         args.inference_export_allocation = Path(args.inference_export_allocation).resolve()
+    if getattr(args, "dense_checkpoint_allocation", None) is not None:
+        args.dense_checkpoint_allocation = Path(args.dense_checkpoint_allocation).resolve()
+    _load_dense_checkpoint_allocation(
+        SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}),
+        allow_automatic_gateway=True,
+    )
     _load_inference_export_allocation(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
     _load_inference_initial_model_dir(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
     _optimizer_validation_bootstrap(args)
@@ -2378,7 +2670,10 @@ def run(args: argparse.Namespace) -> int:
     if getattr(args, "prepare_references", False):
         if args.probe_layers is not None:
             raise ValueError("reference preparation cannot be combined with model sizing")
-        return _prepare_references(args)
+        selection = args.reference_tests or [args.test_id]
+        label = selection[0] if len(selection) == 1 else "combined reference preparation"
+        with _onboarding_test_time(args, label):
+            return _prepare_references(args)
     if getattr(args, "reference_tests", None):
         raise ValueError("--reference-tests requires --prepare-references")
     if args.probe_layers is not None:
@@ -2395,7 +2690,8 @@ def run(args: argparse.Namespace) -> int:
         ).exists()
     ):
         return _onboard_configuration(args)
-    return _parent(args)
+    with _onboarding_test_time(args, args.test_id):
+        return _parent(args)
 
 
 def _onboard_configuration(args: argparse.Namespace) -> int:
@@ -2405,7 +2701,10 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.reference_records import CRITERIA
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
+    from arctic_platform.correctness.harness.report import total_duration
 
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
     config = load_config(args.config)
     tests = registered_tests()
     requested = list(tests) if args.test_id == "all" else [args.test_id]
@@ -2459,19 +2758,21 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             child._diagnostics_dir = args._diagnostics_dir / test_id
             child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
         _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
-        try:
-            code = _parent(child)
-            results[test_id] = {
-                "status": "onboarded" if code == 0 else "failed",
-                "exit_code": code,
-                "output_dir": str(child.output_dir),
-            }
-        except UnsafeCleanupError:
-            raise
-        except Exception as exc:
-            results[test_id] = {"status": "failed", "reason": str(exc)}
-            traceback.print_exc()
-            _onboarding_failure(f"{test_id}: {exc}")
+        with _onboarding_test_time(child, test_id):
+            try:
+                code = _parent(child)
+                results[test_id] = {
+                    "status": "onboarded" if code == 0 else "failed",
+                    "exit_code": code,
+                    "output_dir": str(child.output_dir),
+                }
+            except UnsafeCleanupError:
+                raise
+            except Exception as exc:
+                results[test_id] = {"status": "failed", "reason": str(exc)}
+                traceback.print_exc()
+                _onboarding_failure(f"{test_id}: {exc}")
+        results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]
     references = [test_id for test_id in selected if test_id in CRITERIA and results[test_id]["status"] == "onboarded"]
     preparation_error = None
     if len(references) > 1:
@@ -2484,20 +2785,22 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / "combined-references",
             }
         )
-        try:
-            _prepare_references(preparation)
-        except UnsafeCleanupError:
-            raise
-        except Exception as exc:
-            preparation_error = str(exc)
-            traceback.print_exc()
-            _onboarding_failure(f"combined reference preparation: {exc}")
+        with _onboarding_test_time(args, "combined reference preparation"):
+            try:
+                _prepare_references(preparation)
+            except UnsafeCleanupError:
+                raise
+            except Exception as exc:
+                preparation_error = str(exc)
+                traceback.print_exc()
+                _onboarding_failure(f"combined reference preparation: {exc}")
     summary = {
         "config_id": config.config_id,
         "config": str(args.config),
         "test_spec": str(spec_path),
         "results": results,
         "combined_reference_error": preparation_error,
+        "combined_reference_elapsed_seconds": args._onboarding_times.get("combined reference preparation"),
     }
     destination = spec_path.with_name(f"{spec_path.stem}.onboarding.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2512,12 +2815,28 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                     "",
                     f"Status: {result['status']}",
                     "",
+                    (
+                        f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+                        if "elapsed_seconds" in result
+                        else "Onboarding time: not run"
+                    ),
+                    "",
                     result.get("reason", f"Exit code: {result.get('exit_code', 'not run')}"),
                     "",
                 ]
             )
         if preparation_error:
             lines.extend(["## Combined Reference Failure", "", preparation_error, ""])
+        if "combined reference preparation" in args._onboarding_times:
+            lines.extend(
+                [
+                    (
+                        "Combined reference preparation time: "
+                        f"{total_duration(args._onboarding_times['combined reference preparation'])}"
+                    ),
+                    "",
+                ]
+            )
         lines.extend(
             [
                 "## Retry",

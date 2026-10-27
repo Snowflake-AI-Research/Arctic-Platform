@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import traceback
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ from arctic_platform.correctness.harness.cortex import CorrectnessCortexTranspor
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.correctness.harness.transport import Checkpoint
+from arctic_platform.correctness.harness.transport import UnsafeCleanupError
 
 # Local cortex checkpoint load.
 
@@ -64,7 +66,11 @@ _local_cortex_checkpoint_load_STAGE = {
     "location_type": "S3",
     "bucket": "synthetic-control-bucket",
     "prefix": f"jobs/saving-parent/checkpoints/{_local_cortex_checkpoint_load_CHECKPOINT_ID}/",
-    "aws": {"aws_key_id": "control-key", "aws_secret_key": "control-secret", "aws_token": "control-token"},
+    "aws": {
+        "aws_key_id": "control-key",
+        "aws_secret_key": "control-secret",
+        "aws_token": "control-token",
+    },
 }
 
 _local_cortex_checkpoint_load_CONFIG = (
@@ -92,6 +98,7 @@ def _local_cortex_checkpoint_load_response(payload):
 @pytest.fixture
 def _local_cortex_checkpoint_load_gateway(monkeypatch):
     monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    monkeypatch.delenv(cortex_transport.LOCAL_CHECKPOINT_BRIDGE_ENV, raising=False)
     state = SimpleNamespace(
         calls=[],
         exchanges=[],
@@ -136,7 +143,12 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
                 {
                     "paths": {
                         path: {"post": {"parameters": [{"name": "job_id", "in": "query", "required": True}]}}
-                        for path in ("/forward", "/log-probs")
+                        for path in (
+                            "/forward",
+                            "/log-probs",
+                            "/correctness/save-checkpoint",
+                            "/correctness/load-checkpoint",
+                        )
                     }
                 }
             )
@@ -157,14 +169,23 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
                 return _local_cortex_checkpoint_load_response(
                     {
                         "status": "REQUEST_STATE_DONE",
-                        "events": [{"type": "result_chunk", "payload_b64": base64.b64encode(frame).decode()}],
+                        "events": [
+                            {
+                                "type": "result_chunk",
+                                "payload_b64": base64.b64encode(frame).decode(),
+                            }
+                        ],
                     }
                 )
             return _local_cortex_checkpoint_load_response({"status": "REQUEST_STATE_DONE", "result": state.result})
         if method == "GET":
             parent = url.rsplit("/", 1)[-1]
             roles = state.roles[parent]
-            segments = {"training": "training", "sampling": "sampling", "log_probability": "log_prob"}
+            segments = {
+                "training": "training",
+                "sampling": "sampling",
+                "log_probability": "log_prob",
+            }
             cancelled = parent in state.cancelled
             return _local_cortex_checkpoint_load_response(
                 {
@@ -180,13 +201,15 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
                     ],
                 }
             )
+        if method == "POST" and "/correctness/load-checkpoint?job_id=" in url:
+            return _local_cortex_checkpoint_load_response(state.result)
         if method == "POST" and url.endswith("/load"):
             if state.failure is not None:
                 raise state.failure
             return _local_cortex_checkpoint_load_response(state.result if state.reply == "inline" else state.submitted)
         if method == "POST" and (url.endswith("/save") or "/save-checkpoint?job_id=" in url):
             body = kwargs["json"]
-            assert body["checkpoint_type"] == "resumable"
+            assert body["checkpoint_type"] in {"resumable", "weights-only"}
             root = require_data_fast_path(body["path"], label="save control basetemp")
             root.mkdir()
             (root / "latest").write_text("global_step10\n", encoding="ascii")
@@ -214,8 +237,9 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
 
     monkeypatch.setattr(aiohttp.ClientSession, "close", close)
 
-    def create(*, native=False, training_gpus=8):
+    def create(*, native=False, bridge=False, training_gpus=8):
         monkeypatch.setenv(LOCAL_NATIVE_FORWARD_ENV, "1" if native else "0")
+        monkeypatch.setenv(cortex_transport.LOCAL_CHECKPOINT_BRIDGE_ENV, "1" if bridge else "0")
         client = CorrectnessClient(
             CortexTrainingConfig(
                 model_name="Qwen/Qwen3.6-35B-A3B",
@@ -224,7 +248,10 @@ def _local_cortex_checkpoint_load_gateway(monkeypatch):
                 log_prob_gpus=1,
                 hardware="H200",
                 backend=CortexConfig(
-                    base_url="http://127.0.0.1:8003", max_retries=4, request_timeout=1.0, poll_timeout=1.0
+                    base_url="http://127.0.0.1:8003",
+                    max_retries=4,
+                    request_timeout=1.0,
+                    poll_timeout=1.0,
                 ),
             )
         )
@@ -248,11 +275,241 @@ def _local_cortex_checkpoint_load_load(client, *, stage=None, asynchronous=False
                 Request(
                     "load-checkpoint",
                     client.jobs.training,
-                    {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "stage_info": stage},
+                    {
+                        "checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID,
+                        "stage_info": stage,
+                    },
                 )
             )
         )
     return client.transport.load_checkpoint(_local_cortex_checkpoint_load_CHECKPOINT_ID, stage_info=stage)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_checkpoint_transport_owned_load_uses_catalog_bridge(
+    _local_cortex_checkpoint_load_gateway, asynchronous
+):
+    from arctic_platform.correctness.harness.gateway import NATIVE_STORE_SCHEMA
+
+    state, create = _local_cortex_checkpoint_load_gateway
+    client = create(bridge=True)
+    state.result = {**state.result, "correctness_native_store": NATIVE_STORE_SCHEMA}
+    with client:
+        result = _local_cortex_checkpoint_load_load(client, asynchronous=asynchronous)
+        assert result == state.result
+        sends = list(state.calls)
+        child = client.transport._native_bindings[str(client.jobs.training)][1]
+        assert sends[0][1].endswith(f"/correctness/load-checkpoint?job_id={child}")
+        assert sends[0][2]["json"] == {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID}
+        assert len(sends) == 1
+
+
+def test_native_checkpoint_transport_bridge_preserves_explicit_stage_load(
+    _local_cortex_checkpoint_load_gateway,
+):
+    state, create = _local_cortex_checkpoint_load_gateway
+    client = create(bridge=True)
+    with client:
+        _local_cortex_checkpoint_load_load(client, stage=_local_cortex_checkpoint_load_STAGE)
+        assert state.calls[0][1].endswith(f"/{client.transport.job_id}/load")
+
+
+@pytest.mark.parametrize("kind", ["resumable", "weights-only"])
+def test_native_checkpoint_transport_only_resumable_saves_use_bridge(
+    _local_cortex_checkpoint_load_gateway, kind, tmp_path
+):
+    state, create = _local_cortex_checkpoint_load_gateway
+    client = create(bridge=True)
+    with client:
+        client.save_checkpoint(path=str(tmp_path / "save-control"), checkpoint_type=kind)
+        route = "/correctness/save-checkpoint?" if kind == "resumable" else "/save-checkpoint?"
+        assert route in state.calls[0][1]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"correctness_native_store": "untrusted"},
+        {"checkpoint_id": _local_cortex_checkpoint_load_OTHER_ID},
+        {"checkpoint_tag": "global_step9"},
+        {"version": True},
+    ],
+)
+def test_native_checkpoint_transport_rejects_unbound_response(_local_cortex_checkpoint_load_gateway, change):
+    from arctic_platform.correctness.harness.gateway import NATIVE_STORE_SCHEMA
+
+    state, create = _local_cortex_checkpoint_load_gateway
+    client = create(bridge=True)
+    state.result = {
+        **state.result,
+        "correctness_native_store": NATIVE_STORE_SCHEMA,
+        **change,
+    }
+    with client:
+        with pytest.raises(RuntimeError):
+            _local_cortex_checkpoint_load_load(client)
+
+
+@pytest.mark.parametrize("value", ["cp_" + "a" * 32, _local_cortex_checkpoint_load_CHECKPOINT_ID])
+def test_native_checkpoint_transport_accepts_current_checkpoint_uuid_spellings(value):
+    assert hosted.require_local_checkpoint_id(value) == value
+
+
+def test_native_checkpoint_transport_model_override_preserves_reviewed_configuration():
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG)
+    before = deepcopy(cfg.sub_job)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    original = hosted.training_client_config(cfg, backend)
+    reduced = hosted.training_client_config(cfg, backend, model_name="/data-fast/control-reviewed-fixture")
+    assert original.model_name == cfg.model_name
+    assert reduced.model_name == "/data-fast/control-reviewed-fixture"
+    original_dump = original.model_dump()
+    reduced_dump = reduced.model_dump()
+    original_dump.pop("model_name")
+    reduced_dump.pop("model_name")
+    assert original_dump == reduced_dump
+    assert cfg.sub_job == before
+
+
+@pytest.mark.parametrize("mode", ["best-effort", "off"])
+def test_native_checkpoint_transport_preserves_rl_sampling_placement(mode):
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG.parent / "train-rl-16gpus-64k.config")
+    before = deepcopy(cfg.native.model_dump())
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    training_only = hosted.training_client_config(cfg, backend, determinism=mode)
+    native = hosted.training_client_config(
+        cfg,
+        backend,
+        determinism=mode,
+        model_name="/data-fast/control-reviewed-fixture",
+        preserve_native_topology=True,
+    )
+    assert training_only.training_gpus == 8 and training_only.sampling_gpus == 0
+    assert native.training_gpus == native.sampling_gpus == 8
+    assert native.log_prob_gpus == 0
+    assert native.sampling.model_dump() == before["sampling"]
+    assert native.training.model_dump() == training_only.training.model_dump()
+    assert native.model_name == "/data-fast/control-reviewed-fixture"
+    assert native.backend == backend
+    assert native.inference_tensor_parallel_size == 8
+    subs = native.to_cortex()
+    assert {sub["job_type"] for sub in subs} == {"training", "sampling"}
+    sampling = next(sub for sub in subs if sub["job_type"] == "sampling")
+    assert sampling["model_name"] == native.model_name
+    assert sampling["inference_config"]["n_gpus"] == 8
+    assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 8
+    assert cfg.native.model_dump() == before
+
+
+def test_native_checkpoint_transport_rejects_supervised_native_rl_topology(monkeypatch):
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG)
+    monkeypatch.setattr(hosted, "_training_client_config", lambda *a: pytest.fail("invalid topology built a client"))
+    with pytest.raises(ValueError, match="reviewed RL"):
+        hosted.training_client_config(
+            cfg, CortexConfig(base_url="http://127.0.0.1:8003"), preserve_native_topology=True
+        )
+
+
+def test_native_checkpoint_transport_preserves_upstream_route_policy(monkeypatch):
+    transport = object.__new__(CorrectnessCortexTransport)
+    request = Request("get-job", "owned-parent")
+    route = object()
+    expected = object()
+    calls = []
+
+    def submit(client, request_arg, route_arg=None):
+        calls.append((client, request_arg, route_arg))
+        return expected
+
+    monkeypatch.setattr(CortexTransport, "_submit", submit)
+    assert transport._submit(request, route) is expected
+    assert calls == [(transport, request, route)]
+
+
+@pytest.mark.parametrize("mode, enabled", [("best-effort", True), ("off", False)])
+def test_hosted_checkpoint_calibration_determinism_preserves_reviewed_input(mode, enabled):
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG)
+    before = deepcopy(cfg.sub_job)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    default = hosted.training_client_config(cfg, backend, model_name="/data-fast/control-reviewed-fixture")
+    selected = hosted.training_client_config(
+        cfg, backend, model_name="/data-fast/control-reviewed-fixture", determinism=mode
+    )
+    assert default.training.full_determinism is True
+    assert selected.training.full_determinism is enabled
+    default_dump, selected_dump = default.model_dump(), selected.model_dump()
+    for value in (default_dump, selected_dump):
+        value["training"].pop("full_determinism")
+        debug = value["training"]["ds_worker_config"]["debug"]
+        debug.pop("full_determinism")
+        debug.pop("full_determinism_must_comply")
+    assert default_dump == selected_dump
+    assert cfg.sub_job == before
+
+
+def test_hosted_checkpoint_calibration_invalid_determinism_rejects_before_client(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        hosted,
+        "ArcticClient",
+        lambda config: pytest.fail("invalid mode created a client"),
+    )
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG)
+    with hosted.HostedTransport(
+        CortexConfig(base_url="http://127.0.0.1:8003"), cfg, determinism="unknown"
+    ) as transport:
+        with pytest.raises(ValueError, match="determinism"):
+            with transport.job():
+                pytest.fail("invalid mode yielded a training job")
+
+
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        ({}, "best-effort"),
+        ({"determinism": "off"}, "off"),
+        ({"preserve_native_topology": True}, "best-effort"),
+    ],
+)
+def test_hosted_checkpoint_calibration_transport_forwards_determinism(monkeypatch, options, expected):
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    configs = []
+    config = object()
+
+    def build(cfg_arg, backend_arg, **kwargs):
+        assert cfg_arg is cfg and backend_arg is backend
+        configs.append(kwargs)
+        return config
+
+    class Client:
+        def __init__(self, config_arg):
+            assert config_arg is config
+            self.jobs = SimpleNamespace(require=lambda role: "owned-child:training")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(hosted, "training_client_config", build)
+    monkeypatch.setattr(hosted, "ArcticClient", Client)
+    with hosted.HostedTransport(
+        backend, cfg, model_name="/data-fast/control-reviewed-fixture", **options
+    ) as transport:
+        with transport.job() as job:
+            assert job.job_id == "owned-child"
+    assert configs == [
+        {
+            "source_checkpoint_info": None,
+            "attn_implementation": None,
+            "model_name": "/data-fast/control-reviewed-fixture",
+            "determinism": expected,
+            **({"preserve_native_topology": True} if options.get("preserve_native_topology") else {}),
+        }
+    ]
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -311,7 +568,11 @@ def test_local_cortex_checkpoint_load_load_rejects_nonowned_or_nontraining_token
     }
     with pytest.raises(ValueError, match="newly owned training"):
         client.transport.call(
-            Request("load-checkpoint", tokens[role], {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID})
+            Request(
+                "load-checkpoint",
+                tokens[role],
+                {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID},
+            )
         )
     assert state.calls == []
 
@@ -324,8 +585,14 @@ def test_local_cortex_checkpoint_load_load_rejects_nonowned_or_nontraining_token
         {"path": _local_cortex_checkpoint_load_CHECKPOINT_ID},
         {"checkpoint_path": "/data-fast/tmp/retained"},
         {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "step": 10},
-        {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "source_job_id": "saving-parent"},
-        {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "source_job_id": None},
+        {
+            "checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID,
+            "source_job_id": "saving-parent",
+        },
+        {
+            "checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID,
+            "source_job_id": None,
+        },
         {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "path": None},
         {"checkpoint_id": "global_step10"},
         {"checkpoint_id": "/data-fast/tmp/retained"},
@@ -360,7 +627,10 @@ def test_local_cortex_checkpoint_load_load_body_never_translates_paths_tags_step
             **_local_cortex_checkpoint_load_STAGE,
             "prefix": f"../checkpoints/{_local_cortex_checkpoint_load_CHECKPOINT_ID}/",
         },
-        {**_local_cortex_checkpoint_load_STAGE, "checkpoint_path": "/data-fast/tmp/checkpoint"},
+        {
+            **_local_cortex_checkpoint_load_STAGE,
+            "checkpoint_path": "/data-fast/tmp/checkpoint",
+        },
         {**_local_cortex_checkpoint_load_STAGE, "aws": object()},
     ],
 )
@@ -379,7 +649,11 @@ def test_local_cortex_checkpoint_load_invalid_or_misbound_stage_fails_before_htt
     "result",
     [
         {},
-        {"checkpoint_id": _local_cortex_checkpoint_load_OTHER_ID, "checkpoint_tag": "global_step10", "version": 10},
+        {
+            "checkpoint_id": _local_cortex_checkpoint_load_OTHER_ID,
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        },
         {**_local_cortex_checkpoint_load_RESULT, "checkpoint_tag": "../global_step10"},
         {**_local_cortex_checkpoint_load_RESULT, "checkpoint_tag": "global_step010"},
         {**_local_cortex_checkpoint_load_RESULT, "version": 11},
@@ -431,7 +705,9 @@ def test_local_cortex_checkpoint_load_load_rejects_invalid_async_submission_with
     assert len(state.calls) == 1
 
 
-def test_local_cortex_checkpoint_load_load_rejects_binary_request_before_http(_local_cortex_checkpoint_load_gateway):
+def test_local_cortex_checkpoint_load_load_rejects_binary_request_before_http(
+    _local_cortex_checkpoint_load_gateway,
+):
     state, create = _local_cortex_checkpoint_load_gateway
     client = create()
     with pytest.raises(ValueError, match="checkpoint_id/stage_info only"):
@@ -527,7 +803,9 @@ def test_local_cortex_checkpoint_load_uninitialized_transport_cannot_open_a_load
     with pytest.raises(ValueError, match="newly owned training"):
         transport.call(
             Request(
-                "load-checkpoint", "unowned:training:0", {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID}
+                "load-checkpoint",
+                "unowned:training:0",
+                {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID},
             )
         )
     assert state.calls == [] and transport._session is None
@@ -539,7 +817,10 @@ def test_local_cortex_checkpoint_load_production_cortex_load_route_posts_and_pol
     request = Request(
         "load-checkpoint",
         "production-parent:training:0",
-        {"checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID, "stage_info": None},
+        {
+            "checkpoint_id": _local_cortex_checkpoint_load_CHECKPOINT_ID,
+            "stage_info": None,
+        },
     )
     assert route.prepare("https://account.example/cortex-training", request) == (
         "https://account.example/cortex-training/production-parent/load",
@@ -625,7 +906,8 @@ def test_local_cortex_checkpoint_load_hosted_explicit_stage_resume_uses_real_cli
         stage_info=deepcopy(_local_cortex_checkpoint_load_STAGE),
     )
     with hosted.HostedTransport(
-        CortexConfig(base_url="http://127.0.0.1:8003"), load_config(_local_cortex_checkpoint_load_CONFIG)
+        CortexConfig(base_url="http://127.0.0.1:8003"),
+        load_config(_local_cortex_checkpoint_load_CONFIG),
     ) as transport:
         with transport.job(resume_from=identity) as job:
             assert isinstance(job.client, CorrectnessClient)
@@ -653,7 +935,11 @@ def test_local_cortex_checkpoint_load_hosted_wrong_saved_step_releases_owned_chi
     _local_cortex_checkpoint_load_gateway,
 ):
     state, _ = _local_cortex_checkpoint_load_gateway
-    state.result = {**_local_cortex_checkpoint_load_RESULT, "checkpoint_tag": "global_step11", "version": 11}
+    state.result = {
+        **_local_cortex_checkpoint_load_RESULT,
+        "checkpoint_tag": "global_step11",
+        "version": 11,
+    }
     identity = hosted.LocalCortexCheckpoint(
         _local_cortex_checkpoint_load_CHECKPOINT_ID,
         "saving-parent",
@@ -663,7 +949,8 @@ def test_local_cortex_checkpoint_load_hosted_wrong_saved_step_releases_owned_chi
         stage_info=deepcopy(_local_cortex_checkpoint_load_STAGE),
     )
     with hosted.HostedTransport(
-        CortexConfig(base_url="http://127.0.0.1:8003"), load_config(_local_cortex_checkpoint_load_CONFIG)
+        CortexConfig(base_url="http://127.0.0.1:8003"),
+        load_config(_local_cortex_checkpoint_load_CONFIG),
     ) as transport:
         with pytest.raises(RuntimeError, match="different global step"):
             with transport.job(resume_from=identity):
@@ -769,11 +1056,18 @@ def _local_cortex_checkpoint_resume_gateway(monkeypatch):
                 return _local_cortex_checkpoint_resume_response(
                     {
                         "status": "REQUEST_STATE_DONE",
-                        "result": {"checkpoint_id": _local_cortex_checkpoint_resume_CHECKPOINT_ID, "version": 1},
+                        "result": {
+                            "checkpoint_id": _local_cortex_checkpoint_resume_CHECKPOINT_ID,
+                            "version": 1,
+                        },
                     }
                 )
         if method == "GET" and url.endswith("/owned-resume-parent"):
-            segments = {"training": "training", "sampling": "sampling", "log_probability": "log_prob"}
+            segments = {
+                "training": "training",
+                "sampling": "sampling",
+                "log_probability": "log_prob",
+            }
             return _local_cortex_checkpoint_resume_response(
                 {
                     "job_id": "owned-resume-parent",
@@ -811,7 +1105,10 @@ def _local_cortex_checkpoint_resume_gateway(monkeypatch):
             log_prob_gpus=1,
             hardware="H200",
             backend=CortexConfig(
-                base_url="http://127.0.0.1:8003", max_retries=4, poll_timeout=1.0, request_timeout=1.0
+                base_url="http://127.0.0.1:8003",
+                max_retries=4,
+                poll_timeout=1.0,
+                request_timeout=1.0,
             ),
         )
         client = CorrectnessClient(config)
@@ -833,7 +1130,10 @@ def _local_cortex_checkpoint_resume_gateway(monkeypatch):
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_local_cortex_checkpoint_resume_owned_fast_restore_is_unsupported_before_http_and_still_shuts_down(
-    _local_cortex_checkpoint_resume_gateway, _local_cortex_checkpoint_resume_checkpoint, native, asynchronous
+    _local_cortex_checkpoint_resume_gateway,
+    _local_cortex_checkpoint_resume_checkpoint,
+    native,
+    asynchronous,
 ):
     state, create = _local_cortex_checkpoint_resume_gateway
     client = create(native=native)
@@ -844,7 +1144,10 @@ def test_local_cortex_checkpoint_resume_owned_fast_restore_is_unsupported_before
             if asynchronous:
                 asyncio.run(
                     transport.acall(
-                        load_checkpoint_request(client.jobs, path=str(_local_cortex_checkpoint_resume_checkpoint))
+                        load_checkpoint_request(
+                            client.jobs,
+                            path=str(_local_cortex_checkpoint_resume_checkpoint),
+                        )
                     )
                 )
             else:
@@ -876,12 +1179,16 @@ def test_local_cortex_checkpoint_resume_owned_fast_restore_is_unsupported_before
     ],
 )
 def test_local_cortex_checkpoint_resume_wrong_or_nontraining_token_cannot_dispatch_unsupported_restore(
-    _local_cortex_checkpoint_resume_gateway, _local_cortex_checkpoint_resume_checkpoint, token
+    _local_cortex_checkpoint_resume_gateway,
+    _local_cortex_checkpoint_resume_checkpoint,
+    token,
 ):
     state, create = _local_cortex_checkpoint_resume_gateway
     client = create()
     request = Request(
-        "load-checkpoint", token, {"path": str(_local_cortex_checkpoint_resume_checkpoint), "step": None}
+        "load-checkpoint",
+        token,
+        {"path": str(_local_cortex_checkpoint_resume_checkpoint), "step": None},
     )
     with pytest.raises(ValueError, match=_local_cortex_checkpoint_resume_LOAD_OWNER_ERROR):
         client.transport.call(request)
@@ -894,17 +1201,29 @@ def test_local_cortex_checkpoint_resume_wrong_or_nontraining_token_cannot_dispat
         ({}, _local_cortex_checkpoint_resume_LOAD_ID_ERROR),
         ({"path": None, "step": None}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
         ({"path": ""}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
-        ({"path": "relative/checkpoint"}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
+        (
+            {"path": "relative/checkpoint"},
+            _local_cortex_checkpoint_resume_LOAD_BODY_ERROR,
+        ),
         ({"path": "/tmp/checkpoint"}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
         ({"path": "/data-fast"}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
         ({"path": 123}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
-        ({"checkpoint_path": "/data-fast/tmp/checkpoint"}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
-        ({"checkpoint_id": "global_step1"}, _local_cortex_checkpoint_resume_LOAD_ID_ERROR),
+        (
+            {"checkpoint_path": "/data-fast/tmp/checkpoint"},
+            _local_cortex_checkpoint_resume_LOAD_BODY_ERROR,
+        ),
+        (
+            {"checkpoint_id": "global_step1"},
+            _local_cortex_checkpoint_resume_LOAD_ID_ERROR,
+        ),
         (
             {"source_job_id": "foreign-parent", "path": "/data-fast/tmp/checkpoint"},
             _local_cortex_checkpoint_resume_LOAD_BODY_ERROR,
         ),
-        ({"source_job_id": "", "path": "/data-fast/tmp/checkpoint"}, _local_cortex_checkpoint_resume_LOAD_BODY_ERROR),
+        (
+            {"source_job_id": "", "path": "/data-fast/tmp/checkpoint"},
+            _local_cortex_checkpoint_resume_LOAD_BODY_ERROR,
+        ),
     ],
 )
 def test_local_cortex_checkpoint_resume_alternate_restore_bodies_never_become_zone_load_requests(
@@ -919,7 +1238,9 @@ def test_local_cortex_checkpoint_resume_alternate_restore_bodies_never_become_zo
 
 @pytest.mark.parametrize("step", [0, 1, -1, True, "1"])
 def test_local_cortex_checkpoint_resume_explicit_step_does_not_enable_a_local_restore_fallback(
-    _local_cortex_checkpoint_resume_gateway, _local_cortex_checkpoint_resume_checkpoint, step
+    _local_cortex_checkpoint_resume_gateway,
+    _local_cortex_checkpoint_resume_checkpoint,
+    step,
 ):
     state, create = _local_cortex_checkpoint_resume_gateway
     client = create()
@@ -940,7 +1261,9 @@ def test_local_cortex_checkpoint_resume_explicit_step_does_not_enable_a_local_re
     ],
 )
 def test_local_cortex_checkpoint_resume_authenticated_or_decorated_loopback_cannot_enable_restore(
-    _local_cortex_checkpoint_resume_gateway, _local_cortex_checkpoint_resume_checkpoint, backend
+    _local_cortex_checkpoint_resume_gateway,
+    _local_cortex_checkpoint_resume_checkpoint,
+    backend,
 ):
     state, create = _local_cortex_checkpoint_resume_gateway
     client = create()
@@ -951,7 +1274,9 @@ def test_local_cortex_checkpoint_resume_authenticated_or_decorated_loopback_cann
 
 
 def test_local_cortex_checkpoint_resume_unsupported_restore_never_enters_http_or_polling_even_with_retries(
-    _local_cortex_checkpoint_resume_gateway, _local_cortex_checkpoint_resume_checkpoint, monkeypatch
+    _local_cortex_checkpoint_resume_gateway,
+    _local_cortex_checkpoint_resume_checkpoint,
+    monkeypatch,
 ):
     state, create = _local_cortex_checkpoint_resume_gateway
     client = create()
@@ -980,7 +1305,8 @@ def test_local_cortex_checkpoint_resume_nonlocal_resume_uses_production_checkpoi
     client.transport.config = client.transport.config.model_copy(update={"base_url": base_url})
     assert not client.transport._is_local_gateway()
     assert client.load_checkpoint(
-        checkpoint_id=_local_cortex_checkpoint_resume_CHECKPOINT_ID, source_job_id="saving-parent"
+        checkpoint_id=_local_cortex_checkpoint_resume_CHECKPOINT_ID,
+        source_job_id="saving-parent",
     ) == {"checkpoint_id": _local_cortex_checkpoint_resume_CHECKPOINT_ID, "version": 1}
     prefix = client.transport._prefix
     assert [(method, url) for method, url, _ in state.calls] == [
@@ -1008,7 +1334,14 @@ def test_local_cortex_checkpoint_resume_production_cortex_resume_route_preserves
     )
     assert route.prepare("https://account.example/cortex-training", request) == (
         "https://account.example/cortex-training/restoring-parent/load",
-        [{"json": {"checkpoint_id": _local_cortex_checkpoint_resume_CHECKPOINT_ID, "source_job_id": "saving-parent"}}],
+        [
+            {
+                "json": {
+                    "checkpoint_id": _local_cortex_checkpoint_resume_CHECKPOINT_ID,
+                    "source_job_id": "saving-parent",
+                }
+            }
+        ],
     )
     assert route.submitted(request, {"request_id": "production-load-request"}) == "production-load-request"
 
@@ -1156,7 +1489,9 @@ def _local_cortex_forward_created(calls):
     )
 
 
-def test_local_cortex_forward_native_binding_uses_only_fresh_public_config_ids(_local_cortex_forward_gateway):
+def test_local_cortex_forward_native_binding_uses_only_fresh_public_config_ids(
+    _local_cortex_forward_gateway,
+):
     calls, _ = _local_cortex_forward_gateway
     config = _local_cortex_forward_client_config(sampling_gpus=1, log_prob_gpus=1)
     original = config.to_cortex()
@@ -1206,7 +1541,9 @@ def test_local_cortex_forward_native_opt_in_rejects_hosted_or_decorated_gateway_
     assert transport._native_bindings == {}
 
 
-def test_local_cortex_forward_native_reconnect_is_rejected_without_discovery(_local_cortex_forward_gateway):
+def test_local_cortex_forward_native_reconnect_is_rejected_without_discovery(
+    _local_cortex_forward_gateway,
+):
     calls, _ = _local_cortex_forward_gateway
     config = _local_cortex_forward_client_config(training_job_id="other-parent:training:0")
     transport = CorrectnessCortexTransport(config.backend)
@@ -1247,7 +1584,10 @@ def test_local_cortex_forward_log_probability_route_checked_for_declared_log_pro
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("op,role", [("forward", "training"), ("log-probs", "log_prob"), ("log-probs", "sampling")])
+@pytest.mark.parametrize(
+    "op,role",
+    [("forward", "training"), ("log-probs", "log_prob"), ("log-probs", "sampling")],
+)
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_local_cortex_forward_native_wire_request_uses_owned_uuid_not_synthetic_token(
     _local_cortex_forward_gateway, monkeypatch, op, role, asynchronous
@@ -1258,7 +1598,11 @@ def test_local_cortex_forward_native_wire_request_uses_owned_uuid_not_synthetic_
     jobs = transport.initialize(config)
     token = getattr(jobs, role)
     child = transport._native_bindings[str(token)][1]
-    body = {"batch": {"input_ids": torch.tensor([[2, 3]])}, "processing": {"temperature": 1.0}, "optional": None}
+    body = {
+        "batch": {"input_ids": torch.tensor([[2, 3]])},
+        "processing": {"temperature": 1.0},
+        "optional": None,
+    }
     expected = {"logprobs": torch.tensor([[-1.2, -2.3]], dtype=torch.float32)}
     captured = []
 
@@ -1332,7 +1676,10 @@ def test_local_cortex_forward_native_error_preserves_server_reason_and_cleanup(
         monkeypatch,
         lambda *args, **kwargs: _local_cortex_forward_response({"detail": "actual gateway error"}, status=status),
     )
-    with pytest.raises((aiohttp.ClientResponseError, RuntimeError), match="actual gateway error|without redirects"):
+    with pytest.raises(
+        (aiohttp.ClientResponseError, RuntimeError),
+        match="actual gateway error|without redirects",
+    ):
         request = Request("forward", jobs.training, {})
         if asynchronous:
             asyncio.run(transport.acall(request))
@@ -1350,7 +1697,9 @@ def test_local_cortex_forward_native_creation_failure_cleans_parent_and_binding(
     config = _local_cortex_forward_client_config()
     transport = CorrectnessCortexTransport(config.backend)
     monkeypatch.setattr(
-        transport, "_wait_running", lambda: (_ for _ in ()).throw(RuntimeError("actual startup error"))
+        transport,
+        "_wait_running",
+        lambda: (_ for _ in ()).throw(RuntimeError("actual startup error")),
     )
     with pytest.raises(RuntimeError, match="actual startup error"):
         initialize_or_cleanup(transport, config)
@@ -1373,7 +1722,8 @@ def test_local_cortex_forward_native_malformed_or_wrong_identity_response_reject
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
     _local_cortex_forward_native_reply(
-        monkeypatch, lambda *args, **kwargs: _local_cortex_forward_response(data=payload)
+        monkeypatch,
+        lambda *args, **kwargs: _local_cortex_forward_response(data=payload),
     )
     with pytest.raises(ValueError):
         request = Request("forward", jobs.training, {})
@@ -1430,7 +1780,12 @@ def test_local_cortex_save_automatically_uses_explicit_path_and_owned_native_chi
     assert not any(url.endswith("/openapi.json") for _, url, _ in calls)
     child = transport._native_bindings[str(jobs.training)][1]
     root = "/data-fast/tmp/correctness-owned-save-control"
-    expected = {"job_id": child, "checkpoint_path": root, "checkpoint_tag": "global_step0", "version": 0}
+    expected = {
+        "job_id": child,
+        "checkpoint_path": root,
+        "checkpoint_tag": "global_step0",
+        "version": 0,
+    }
     captured = []
 
     def post(session, url, **kwargs):
@@ -1438,7 +1793,11 @@ def test_local_cortex_save_automatically_uses_explicit_path_and_owned_native_chi
         return _local_cortex_forward_response(expected)
 
     _local_cortex_forward_native_reply(monkeypatch, post)
-    request = Request("save", jobs.training, {"path": root, "checkpoint_type": "resumable", "export_hf": False})
+    request = Request(
+        "save",
+        jobs.training,
+        {"path": root, "checkpoint_type": "resumable", "export_hf": False},
+    )
     result = asyncio.run(transport.acall(request)) if asynchronous else transport.call(request)
     assert result == expected
     url, kwargs = captured[0]
@@ -1471,7 +1830,11 @@ def test_local_cortex_save_rejects_unsupported_native_options_before_request(
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
     before = len(calls)
-    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable", **change}
+    body = {
+        "path": "/data-fast/tmp/correctness-owned-save-control",
+        "checkpoint_type": "resumable",
+        **change,
+    }
     with pytest.raises(ValueError):
         transport.call(Request("save", jobs.training, body))
     assert len(calls) == before
@@ -1486,7 +1849,10 @@ def test_local_cortex_save_never_reroutes_foreign_or_wrong_role(_local_cortex_fo
     transport = CorrectnessCortexTransport(config.backend)
     transport.initialize(config)
     before = len(calls)
-    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    body = {
+        "path": "/data-fast/tmp/correctness-owned-save-control",
+        "checkpoint_type": "resumable",
+    }
     with pytest.raises(ValueError, match="owned child|cannot target"):
         transport.call(Request("save", token, body))
     assert len(calls) == before
@@ -1504,9 +1870,13 @@ def test_local_cortex_save_rejects_malformed_or_wrong_child_response(
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
     _local_cortex_forward_native_reply(
-        monkeypatch, lambda *args, **kwargs: _local_cortex_forward_response(data=payload)
+        monkeypatch,
+        lambda *args, **kwargs: _local_cortex_forward_response(data=payload),
     )
-    body = {"path": "/data-fast/tmp/correctness-owned-save-control", "checkpoint_type": "resumable"}
+    body = {
+        "path": "/data-fast/tmp/correctness-owned-save-control",
+        "checkpoint_type": "resumable",
+    }
     with pytest.raises(ValueError):
         transport.call(Request("save", jobs.training, body))
     transport.shutdown()
@@ -1521,7 +1891,11 @@ def test_local_cortex_save_managed_and_hosted_saves_preserve_public_route(
     transport = CorrectnessCortexTransport(config.backend)
     body = {"path": None if base_url.startswith("http://127.") else "/data-fast/tmp/control"}
     request = Request("save", "managed-job", body)
-    monkeypatch.setattr(CortexTransport, "call", lambda actual, supplied: {"public": supplied is request})
+    monkeypatch.setattr(
+        CortexTransport,
+        "call",
+        lambda actual, supplied: {"public": supplied is request},
+    )
     assert transport.call(request) == {"public": True}
 
 
@@ -1583,7 +1957,11 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
     )
     examples = [
         gsm8k.Example(
-            question=f"row-{index}", prompt="q:", completion=" a", input_ids=(10 + index, 30, 40), n_prompt=1
+            question=f"row-{index}",
+            prompt="q:",
+            completion=" a",
+            input_ids=(10 + index, 30, 40),
+            n_prompt=1,
         )
         for index in range(6)
     ]
@@ -1602,7 +1980,10 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
     def send(session, method, url, **kwargs):
         if method == "GET" and "/requests/" in url:
             return _local_cortex_forward_response(
-                {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
+                {
+                    "status": "REQUEST_STATE_DONE",
+                    "result": replies[url.rsplit("/", 1)[-1]],
+                }
             )
         if method == "POST" and url.endswith("/forward-backward"):
             backward.append(wire.loads(wire.decode_byte_chunks([kwargs["data"]], kind="request")))
@@ -1622,7 +2003,11 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
         return _local_cortex_forward_response({"request_id": identifier})
 
     monkeypatch.setattr(aiohttp.ClientSession, "request", send)
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", lambda *args, **kwargs: pytest.fail("no new gateway"))
+    monkeypatch.setattr(
+        dss_driver,
+        "_gateway_runtime",
+        lambda *args, **kwargs: pytest.fail("no new gateway"),
+    )
     if failure:
         with pytest.raises(aiohttp.ClientResponseError, match="native forward failed"):
             check.run_dss_trajectory(ctx, replay, tmp_path / "target")
@@ -1670,20 +2055,38 @@ def _local_cortex_shutdown_gateway(monkeypatch):
         state.slept.append(seconds)
         state.elapsed += seconds
 
-    monkeypatch.setattr(cortex_transport, "time", SimpleNamespace(monotonic=lambda: state.elapsed, sleep=sleep))
+    monkeypatch.setattr(
+        cortex_transport,
+        "time",
+        SimpleNamespace(monotonic=lambda: state.elapsed, sleep=sleep),
+    )
 
     def job(status="cancelled", child_status="cancelled"):
-        segments = {"training": "training", "sampling": "sampling", "log_probability": "log_prob"}
+        segments = {
+            "training": "training",
+            "sampling": "sampling",
+            "log_probability": "log_prob",
+        }
         return {
             "job_id": "owned-parent",
             "status": status,
             "sub_jobs": [
-                {"job_type": role, "sub_job_id": f"owned-parent:{segments[role]}:0", "status": child_status}
+                {
+                    "job_type": role,
+                    "sub_job_id": f"owned-parent:{segments[role]}:0",
+                    "status": child_status,
+                }
                 for role in state.roles
             ],
         }
 
-    def create(*, base_url="http://127.0.0.1:8003", native=False, reconnect=False, roles=("training",)):
+    def create(
+        *,
+        base_url="http://127.0.0.1:8003",
+        native=False,
+        reconnect=False,
+        roles=("training",),
+    ):
         if native:
             monkeypatch.setenv(LOCAL_NATIVE_FORWARD_ENV, "1")
         config = CortexTrainingConfig(
@@ -1848,18 +2251,21 @@ def test_local_cortex_shutdown_invalid_or_failed_owned_cancellation_fails_closed
     else:
         payload["sub_jobs"] = {}
     state.polls = [payload]
-    with pytest.raises(RuntimeError, match="local gateway"):
+    with pytest.raises(UnsafeCleanupError, match="local gateway"):
         transport.shutdown()
     assert state.closed and transport.job_id is None and (transport.config is original)
     assert state.slept == []
 
 
-def test_local_cortex_shutdown_pending_child_reaches_configured_monotonic_deadline(_local_cortex_shutdown_gateway):
+def test_local_cortex_shutdown_pending_child_reaches_configured_monotonic_deadline(
+    _local_cortex_shutdown_gateway,
+):
     state, job, create = _local_cortex_shutdown_gateway
     transport, original = create()
     state.polls = [job(child_status="pending")] * 3
-    with pytest.raises(TimeoutError, match="cancellation deadline"):
+    with pytest.raises(UnsafeCleanupError, match="cancellation deadline") as caught:
         transport.shutdown()
+    assert isinstance(caught.value.__cause__, TimeoutError)
     assert state.elapsed == original.poll_timeout
     assert len(state.calls) == 4
     assert state.closed and transport.config is original
@@ -1876,22 +2282,28 @@ def test_local_cortex_shutdown_nonfinite_or_nonpositive_timing_is_rejected_witho
         transport.poll_interval = value
     else:
         transport.config = transport.config.model_copy(update={field: value})
-    with pytest.raises(ValueError, match="finite and positive"):
+    with pytest.raises(UnsafeCleanupError, match="finite and positive") as caught:
         transport.shutdown()
+    assert isinstance(caught.value.__cause__, ValueError)
     assert state.calls == [] and state.closed
 
 
-def test_local_cortex_shutdown_cancel_network_failure_is_not_suppressed_or_retried(_local_cortex_shutdown_gateway):
+def test_local_cortex_shutdown_cancel_network_failure_is_not_suppressed_or_retried(
+    _local_cortex_shutdown_gateway,
+):
     state, _, create = _local_cortex_shutdown_gateway
     transport, original = create()
     state.error = aiohttp.ClientConnectionError("actual cancellation request failed")
-    with pytest.raises(aiohttp.ClientConnectionError, match="actual cancellation request failed"):
+    with pytest.raises(UnsafeCleanupError, match="actual cancellation request failed") as caught:
         transport.shutdown()
+    assert caught.value.__cause__ is state.error
     assert len(state.calls) == 1 and state.closed
     assert transport.config is original
 
 
-def test_local_cortex_shutdown_poll_network_failure_restores_config_and_closes(_local_cortex_shutdown_gateway):
+def test_local_cortex_shutdown_poll_network_failure_restores_config_and_closes(
+    _local_cortex_shutdown_gateway,
+):
     state, _, create = _local_cortex_shutdown_gateway
     transport, original = create()
 
@@ -1899,8 +2311,9 @@ def test_local_cortex_shutdown_poll_network_failure_restores_config_and_closes(_
         raise aiohttp.ClientConnectionError("actual cancellation poll failed")
 
     state.polls = [failure]
-    with pytest.raises(aiohttp.ClientConnectionError, match="actual cancellation poll failed"):
+    with pytest.raises(UnsafeCleanupError, match="actual cancellation poll failed") as caught:
         transport.shutdown()
+    assert isinstance(caught.value.__cause__, aiohttp.ClientConnectionError)
     assert len(state.calls) == 2 and state.closed
     assert transport.config is original
 
@@ -1920,15 +2333,15 @@ def test_local_cortex_shutdown_close_failure_preserves_cancellation_error_and_ow
 
     with monkeypatch.context() as patch:
         patch.setattr(transport, "_close_session", failing_close)
-        with pytest.raises(aiohttp.ClientConnectionError) as caught:
+        with pytest.raises(UnsafeCleanupError) as caught:
             transport.shutdown()
 
-    assert caught.value is primary
+    assert caught.value.__cause__ is caught.value.shutdown_error is primary
     assert len(state.calls) == 1 and state.closed
     assert transport.config is original and transport.job_id is None
     assert transport._native_bindings == transport._native_children == {}
     assert transport._local_shutdown_parent is None and transport._local_shutdown_children == {}
-    notes = "\n".join(primary.__notes__)
+    notes = str(caught.value) + "\n" + "\n".join(caught.value.__notes__)
     assert "cancellation was not verified" in notes and "owned-parent" in notes
     for role in ("training", "sampling", "log_prob"):
         assert f"owned-parent:{role}:0" in notes
@@ -1987,7 +2400,9 @@ def test_local_cortex_shutdown_interruption_preserves_ownership_when_session_clo
     assert "HTTP session closure also failed" in notes
 
 
-def test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadline(_local_cortex_shutdown_gateway):
+def test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadline(
+    _local_cortex_shutdown_gateway,
+):
     state, job, create = _local_cortex_shutdown_gateway
     transport, original = create()
 
@@ -1996,23 +2411,30 @@ def test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadlin
         return job()
 
     state.polls = [late]
-    with pytest.raises(TimeoutError, match="cancellation deadline"):
+    with pytest.raises(UnsafeCleanupError, match="cancellation deadline") as caught:
         transport.shutdown()
+    assert isinstance(caught.value.__cause__, TimeoutError)
     assert state.closed and transport.config is original
 
 
-def test_local_cortex_shutdown_changed_parent_identity_never_cancels_another_parent(_local_cortex_shutdown_gateway):
+def test_local_cortex_shutdown_changed_parent_identity_never_cancels_another_parent(
+    _local_cortex_shutdown_gateway,
+):
     state, _, create = _local_cortex_shutdown_gateway
     transport, _ = create()
     transport.job_id = "foreign-parent"
-    with pytest.raises(RuntimeError, match="inconsistent owned parent"):
+    with pytest.raises(UnsafeCleanupError, match="inconsistent owned parent"):
         transport.shutdown()
     assert state.calls == [] and state.closed
 
 
 @pytest.mark.parametrize(
     "base_url,reconnect",
-    [("http://remote.example", False), ("https://127.0.0.1:8003", False), ("http://127.0.0.1:8003", True)],
+    [
+        ("http://remote.example", False),
+        ("https://127.0.0.1:8003", False),
+        ("http://127.0.0.1:8003", True),
+    ],
 )
 def test_local_cortex_shutdown_hosted_and_reconnected_shutdown_keep_ack_only_behavior(
     _local_cortex_shutdown_gateway, base_url, reconnect
@@ -2034,10 +2456,195 @@ def test_local_cortex_shutdown_startup_failure_still_cancels_owned_parent_with_c
     state.closed = False
     state.polls = [job()]
     monkeypatch.setattr(
-        transport, "_wait_running", lambda: (_ for _ in ()).throw(RuntimeError("actual startup failure"))
+        transport,
+        "_wait_running",
+        lambda: (_ for _ in ()).throw(RuntimeError("actual startup failure")),
     )
     config = CortexTrainingConfig(model_name="Qwen/Qwen3-8B", training_gpus=4, backend=transport.config)
     with pytest.raises(RuntimeError, match="actual startup failure"):
         initialize_or_cleanup(transport, config)
     assert [method for method, _, _ in state.calls] == ["POST", "POST", "GET"]
     assert state.closed and transport.job_id is None
+
+
+@pytest.mark.parametrize("workload_fails", [False, True])
+def test_correctness_client_unsafe_shutdown_preserves_failures_and_owned_ids(
+    _local_cortex_shutdown_gateway, workload_fails
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    cancellation = aiohttp.ClientConnectionError("owned cancellation failed")
+    workload = RuntimeError("checkpoint create failed: rc=0, receipts={}")
+    state.error = cancellation
+    with pytest.raises(UnsafeCleanupError) as caught:
+        with client:
+            if workload_fails:
+                raise workload
+    error = caught.value
+    assert error.__cause__ is error.shutdown_error is cancellation
+    assert error.workload_error is (workload if workload_fails else None)
+    assert error.owned_parent == "owned-parent"
+    assert error.owned_children == {"training": "owned-parent:training:0"}
+    rendered = "".join(traceback.format_exception(error))
+    assert "owned cancellation failed" in rendered and "owned-parent:training:0" in str(error)
+    if workload_fails:
+        assert "checkpoint create failed: rc=0, receipts={}" in str(error)
+        assert "Original workload traceback" in rendered
+    assert len(state.calls) == 1 and state.closed
+
+
+@pytest.mark.parametrize("workload_fails", [False, True])
+def test_correctness_client_verified_shutdown_preserves_workload_behavior(
+    _local_cortex_shutdown_gateway, workload_fails
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    workload = RuntimeError("original workload failure")
+
+    def run():
+        with client:
+            if workload_fails:
+                raise workload
+
+    if workload_fails:
+        with pytest.raises(RuntimeError) as caught:
+            run()
+        assert caught.value is workload
+        assert not getattr(workload, "__notes__", [])
+    else:
+        run()
+    assert [method for method, _, _ in state.calls] == ["POST", "GET"] and state.closed
+
+
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit])
+def test_correctness_client_workload_interrupt_remains_primary_after_unsafe_shutdown(
+    _local_cortex_shutdown_gateway, exception
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    state.error = aiohttp.ClientConnectionError("owned cancellation failed")
+    interruption = exception("original workload interrupted")
+    with pytest.raises(exception) as caught:
+        with client:
+            raise interruption
+    assert caught.value is interruption
+    unsafe = interruption.__cause__
+    assert isinstance(unsafe, UnsafeCleanupError) and unsafe.__cause__ is state.error
+    assert "owned-parent:training:0" in "\n".join(interruption.__notes__)
+    assert state.closed
+
+
+def test_correctness_client_shutdown_interrupt_retains_original_workload(_local_cortex_shutdown_gateway, monkeypatch):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    interruption = KeyboardInterrupt("shutdown interrupted")
+    workload = RuntimeError("original checkpoint failure")
+
+    def cancel(parent):
+        raise interruption
+
+    monkeypatch.setattr(transport, "_wait_local_cancelled", cancel)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with client:
+            raise workload
+    assert caught.value is interruption
+    rendered = "".join(traceback.format_exception(interruption))
+    assert "original checkpoint failure" in rendered and "owned-parent:training:0" in rendered
+    assert state.closed
+
+
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_correctness_client_startup_failure_does_not_suppress_unsafe_shutdown(
+    _local_cortex_shutdown_gateway, monkeypatch, cancel_fails
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, _ = create()
+    startup = RuntimeError("original startup failure")
+
+    def initialize(config):
+        raise startup
+
+    monkeypatch.setattr(transport, "initialize", initialize)
+    monkeypatch.setattr(cortex_transport, "CorrectnessCortexTransport", lambda backend: transport)
+    config = CortexTrainingConfig(model_name="Qwen/Qwen3-8B", training_gpus=4, backend=transport.config)
+    if cancel_fails:
+        state.error = aiohttp.ClientConnectionError("owned cancellation failed")
+        with pytest.raises(UnsafeCleanupError) as caught:
+            CorrectnessClient(config)
+        assert caught.value.workload_error is startup and caught.value.shutdown_error is state.error
+        assert "original startup failure" in str(caught.value)
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            CorrectnessClient(config)
+        assert caught.value is startup
+    assert state.closed
+
+
+@pytest.mark.parametrize("base_url,reconnect", [("http://remote.example", False), ("http://127.0.0.1:8003", True)])
+def test_correctness_client_hosted_or_reconnected_shutdown_preserves_existing_behavior(
+    _local_cortex_shutdown_gateway, base_url, reconnect
+):
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, original = create(base_url=base_url, reconnect=reconnect)
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    state.error = aiohttp.ClientConnectionError("ACK-only cancellation failed")
+    workload = RuntimeError("original hosted workload failure")
+    with pytest.raises(RuntimeError) as caught:
+        with client:
+            raise workload
+    assert caught.value is workload and not getattr(workload, "__notes__", [])
+    assert len(state.calls) == (0 if reconnect else original.max_retries + 1) and state.closed
+
+
+def test_correctness_cleanup_contract_reexport_is_the_same_class():
+    from arctic_platform.correctness.harness.dss_driver import UnsafeCleanupError as DriverError
+
+    assert DriverError is cortex_transport.UnsafeCleanupError is UnsafeCleanupError
+
+
+def test_checkpoint_resume_owned_cancellation_failure_stops_before_next_arm(
+    _local_cortex_shutdown_gateway, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.checks import checkpoint_resume
+
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, original = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    client.jobs = transport.jobs
+    config = load_config(_local_cortex_checkpoint_load_CONFIG)
+    workload = RuntimeError("checkpoint create failed: rc=0, receipts={}")
+    state.error = aiohttp.ClientConnectionError("owned cancellation failed")
+    admissions = []
+    monkeypatch.setattr(hosted, "ArcticClient", lambda cfg: client)
+
+    def transport_for(workdir):
+        admissions.append(workdir.name)
+        return hosted.HostedTransport(original, config)
+
+    def run_arm(ctx, actual_transport, arm):
+        with actual_transport.job():
+            raise workload
+
+    monkeypatch.setattr(checkpoint_resume, "_run_arm", run_arm)
+    context = SimpleNamespace(
+        config_id=config.config_id,
+        workdir=tmp_path,
+        arms=[SimpleNamespace(name="gas1"), SimpleNamespace(name="gas4")],
+        transport_for=transport_for,
+    )
+    with pytest.raises(UnsafeCleanupError) as caught:
+        checkpoint_resume.run(context)
+    assert admissions == ["gas1"]
+    assert caught.value.workload_error is workload and caught.value.shutdown_error is state.error
+    assert "checkpoint create failed" in str(caught.value) and "owned-parent:training:0" in str(caught.value)
+    assert len(state.calls) == 1 and state.closed

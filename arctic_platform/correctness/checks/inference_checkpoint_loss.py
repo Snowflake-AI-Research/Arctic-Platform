@@ -44,10 +44,15 @@ it was applied:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import shutil
+import stat
 import traceback
+from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict
 from typing import List
@@ -55,6 +60,8 @@ from typing import Sequence
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.debug.inference_startup_error import maybe_bind_inference_startup_error
+from arctic_platform.debug.inference_warmup_observer import maybe_bind_inference_warmup_observer
 
 from ..harness import sft as gsm8k
 from ..harness.batches import SEED
@@ -98,6 +105,8 @@ TRAIN_STEPS = 10
 
 _EXPORT_JSON_LIMIT_BYTES = 16 * 1024 * 1024
 _TOKENIZER_JSON_LIMIT_BYTES = 32 * 1024 * 1024
+_PROCESSOR_JSON_LIMIT_BYTES = 16 * 1024 * 1024
+_PROCESSOR_METADATA_NAMES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
 # Fixed, and deliberately not calibrated. The two sides are one set of weights read by two engines, so
 # there is no engine-to-engine spread for a calibration to size: a checkpoint that carries the model
@@ -111,7 +120,7 @@ B200_TOLERANCE = 3e-3
 # gateway's own default is 1 (arctic_platform/client/requests.py:181) while the zone body's is 0.
 LOG_PROB_TOP_K = 0
 
-# Default sampling uses one GPU and a bounded prefill batch. Explicit Flash-Next topology is opt-in;
+# Default sampling uses one GPU and a bounded prefill batch. Explicit sampling topology is opt-in;
 # neither placement may substitute reduced weights after a memory failure.
 SAMPLING_GPUS = 1
 _FLASHNEXT_CONFIG_ID = "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
@@ -130,13 +139,21 @@ def _sampling_topology(ctx) -> tuple[int, int, int]:
         or topology[0] != topology[1] * topology[2]
     ):
         raise ValueError("inference sampling topology requires positive integer allocation, TP and PP with GPUs=TP*PP")
-    if (
-        ctx.cfg.config_id != _FLASHNEXT_CONFIG_ID
-        or ctx.cfg.model_name != "Qwen/Qwen3.8-Flash-Next"
-        or ctx.cfg.n_gpus != 16
-        or topology not in ((8, 8, 1), (16, 8, 2))
-    ):
-        raise ValueError("explicit inference sampling topology is restricted to the original 16-GPU Flash-Next config")
+    for sub in ctx.cfg.sub_jobs:
+        if sub.get("job_type") != "sampling":
+            continue
+        inference = sub["inference_config"]
+        allocation = inference["n_gpus"]
+        engine = inference.get("vllm_config", {})
+        reviewed = (
+            allocation,
+            engine.get("tensor_parallel_size", allocation),
+            engine.get("pipeline_parallel_size", 1),
+        )
+        if any(type(size) is not int or size <= 0 for size in reviewed) or topology != reviewed:
+            raise ValueError(
+                "explicit inference sampling topology differs from the configured sampling allocation/TP/PP"
+            )
     return topology
 
 
@@ -153,6 +170,8 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
         n_gpus=allocation,
         max_seq_len=token_budget + 1,
     )
+    if ctx.cfg.training.get("peft_config"):
+        payload["inference_config"]["peft_config"] = deepcopy(ctx.cfg.training["peft_config"])
     if getattr(ctx, "inference_sampling_topology", None) is not None:
         payload["inference_config"]["vllm_config"].update(
             tensor_parallel_size=tensor,
@@ -165,14 +184,17 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
                 "decode_context_parallel_size": 1,
                 "enable_eplb": False,
                 "enable_elastic_ep": False,
-                "engram_config": {
-                    "cpu_offload": False,
-                    "embedding_across_dp": False,
-                    "dp_shared_memory": False,
-                    "use_thp": False,
-                },
             },
         )
+        if ctx.cfg.model_name == "Qwen/Qwen3.8-Flash-Next":
+            payload["inference_config"]["vllm_config"]["extra_engine_kwargs"]["engram_config"] = {
+                "cpu_offload": False,
+                "embedding_across_dp": False,
+                "dp_shared_memory": False,
+                "use_thp": False,
+            }
+    maybe_bind_inference_warmup_observer(payload, ctx)
+    maybe_bind_inference_startup_error(payload, ctx)
     return payload
 
 
@@ -411,6 +433,271 @@ def materialize_checkpoint_tokenizer(tokenizer, checkpoint_path: str | Path) -> 
     tokenizer.save_pretrained(checkpoint_path)
 
 
+def _processor_metadata_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _require_processor_metadata_directory(path: Path, fd: int, label: str):
+    try:
+        held = os.fstat(fd)
+        slot = os.stat(path, follow_symlinks=False)
+    except OSError:
+        raise RuntimeError(f"processor metadata {label} changed") from None
+    if not stat.S_ISDIR(held.st_mode) or _processor_metadata_identity(slot) != _processor_metadata_identity(held):
+        raise RuntimeError(f"processor metadata {label} changed")
+    return held
+
+
+def _read_processor_metadata(fd: int, name: str) -> bytes:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"processor metadata snapshot requires a regular file: {name}")
+    if metadata.st_size > _PROCESSOR_JSON_LIMIT_BYTES:
+        raise RuntimeError(f"processor metadata exceeds its bound: {name}")
+    os.lseek(fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        raw = stream.read(_PROCESSOR_JSON_LIMIT_BYTES + 1)
+    if len(raw) > _PROCESSOR_JSON_LIMIT_BYTES:
+        raise RuntimeError(f"processor metadata exceeds its bound: {name}")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate processor metadata JSON key: {key}")
+            value[key] = item
+        return value
+
+    def invalid_constant(value):
+        raise ValueError(f"processor metadata JSON contains a nonfinite value: {value}")
+
+    value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"processor metadata JSON must be an object: {name}")
+    return raw
+
+
+def _open_processor_metadata_file(parent_fd: int, name: str, *, required: bool) -> int | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise RuntimeError(f"processor metadata snapshot requires a regular file: {name}") from None
+    except OSError:
+        raise RuntimeError(f"processor metadata snapshot requires a regular file: {name}") from None
+    try:
+        metadata = os.fstat(descriptor)
+        slot = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or _processor_metadata_identity(slot) != _processor_metadata_identity(
+            metadata
+        ):
+            raise RuntimeError(f"processor metadata snapshot requires a regular file: {name}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _copy_processor_metadata_file(
+    source_fd: int, destination_parent_fd: int, name: str
+) -> tuple[int, os.stat_result, bytes, bool]:
+    raw = _read_processor_metadata(source_fd, name)
+    destination_created = False
+    try:
+        destination_fd = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=destination_parent_fd,
+        )
+    except FileExistsError:
+        try:
+            destination_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=destination_parent_fd,
+            )
+        except OSError:
+            raise RuntimeError(
+                f"processor metadata destination already exists but is not a stable regular file: {name}"
+            ) from None
+    else:
+        destination_created = True
+    try:
+        if destination_created:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(destination_fd, raw[offset:])
+                if written <= 0:
+                    raise RuntimeError(f"processor metadata destination write stopped: {name}")
+                offset += written
+            os.fsync(destination_fd)
+        destination = os.fstat(destination_fd)
+        slot = os.stat(name, dir_fd=destination_parent_fd, follow_symlinks=False)
+        copied = _read_processor_metadata(destination_fd, name)
+        if (
+            not stat.S_ISREG(destination.st_mode)
+            or (destination_created and stat.S_IMODE(destination.st_mode) != 0o600)
+            or _processor_metadata_identity(slot) != _processor_metadata_identity(destination)
+            or copied != raw
+            or hashlib.sha256(copied).digest() != hashlib.sha256(raw).digest()
+        ):
+            raise RuntimeError(f"processor metadata destination already exists with different bytes: {name}")
+        return destination_fd, destination, raw, destination_created
+    except BaseException:
+        try:
+            if destination_created:
+                destination = os.fstat(destination_fd)
+                slot = os.stat(name, dir_fd=destination_parent_fd, follow_symlinks=False)
+                if _processor_metadata_identity(slot) == _processor_metadata_identity(destination):
+                    os.unlink(name, dir_fd=destination_parent_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(destination_fd)
+        raise
+
+
+def materialize_checkpoint_processor_metadata(ctx, checkpoint_path: str | Path) -> None:
+    """Preserve exact offline Qwen3.5 processor JSON before publishing a local export."""
+    source_path = getattr(ctx, "inference_initial_model_dir", None)
+    if source_path is None:
+        return
+
+    from ..harness.inference_export import validate_initial_training_model_dir
+
+    source_path = validate_initial_training_model_dir(source_path)
+    checkpoint_path = Path(checkpoint_path)
+    source_parent_fd = os.open(source_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        destination_parent_fd = os.open(checkpoint_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except BaseException:
+        os.close(source_parent_fd)
+        raise
+    destinations = []
+    try:
+        source_parent = os.fstat(source_parent_fd)
+        if _processor_metadata_identity(os.stat(source_path, follow_symlinks=False)) != _processor_metadata_identity(
+            source_parent
+        ):
+            raise RuntimeError("processor metadata source snapshot changed")
+        destination_parent = _require_processor_metadata_directory(
+            checkpoint_path, destination_parent_fd, "destination"
+        )
+        if (source_parent.st_dev, source_parent.st_ino) == (
+            destination_parent.st_dev,
+            destination_parent.st_ino,
+        ):
+            raise RuntimeError("processor metadata source and destination must differ")
+
+        with ExitStack() as held:
+            sources = []
+            config_fd = _open_processor_metadata_file(source_parent_fd, "config.json", required=True)
+            held.callback(os.close, config_fd)
+            config_raw = _read_processor_metadata(config_fd, "config.json")
+            config = json.loads(config_raw)
+            config_metadata = os.fstat(config_fd)
+            sources.append(("config.json", config_fd, config_metadata, config_raw))
+            if config.get("model_type") != "qwen3_5_moe":
+                if (
+                    _processor_metadata_identity(os.stat(source_path, follow_symlinks=False))
+                    != _processor_metadata_identity(source_parent)
+                    or _processor_metadata_identity(os.fstat(config_fd))
+                    != _processor_metadata_identity(config_metadata)
+                    or _processor_metadata_identity(
+                        os.stat("config.json", dir_fd=source_parent_fd, follow_symlinks=False)
+                    )
+                    != _processor_metadata_identity(config_metadata)
+                    or _read_processor_metadata(config_fd, "config.json") != config_raw
+                ):
+                    raise RuntimeError("processor metadata source changed: config.json")
+                return
+
+            index_fd = _open_processor_metadata_file(source_parent_fd, "model.safetensors.index.json", required=True)
+            held.callback(os.close, index_fd)
+            index_raw = _read_processor_metadata(index_fd, "model.safetensors.index.json")
+            sources.append(("model.safetensors.index.json", index_fd, os.fstat(index_fd), index_raw))
+            processor_sources = []
+            for position, name in enumerate(_PROCESSOR_METADATA_NAMES):
+                descriptor = _open_processor_metadata_file(source_parent_fd, name, required=position == 0)
+                if descriptor is not None:
+                    held.callback(os.close, descriptor)
+                    raw = _read_processor_metadata(descriptor, name)
+                    sources.append((name, descriptor, os.fstat(descriptor), raw))
+                    processor_sources.append((name, descriptor))
+
+            for name, source_fd in processor_sources:
+                destination_fd, destination_metadata, raw, destination_created = _copy_processor_metadata_file(
+                    source_fd, destination_parent_fd, name
+                )
+                destinations.append((name, destination_fd, destination_metadata, raw, destination_created))
+
+            if _processor_metadata_identity(
+                os.stat(source_path, follow_symlinks=False)
+            ) != _processor_metadata_identity(source_parent):
+                raise RuntimeError("processor metadata source snapshot changed")
+            for name, source_fd, source_metadata, raw in sources:
+                if (
+                    _processor_metadata_identity(os.fstat(source_fd)) != _processor_metadata_identity(source_metadata)
+                    or _processor_metadata_identity(os.stat(name, dir_fd=source_parent_fd, follow_symlinks=False))
+                    != _processor_metadata_identity(source_metadata)
+                    or _read_processor_metadata(source_fd, name) != raw
+                ):
+                    raise RuntimeError(f"processor metadata source changed: {name}")
+            for name, destination_fd, destination_metadata, raw, _ in destinations:
+                try:
+                    destination = os.fstat(destination_fd)
+                    slot = os.stat(name, dir_fd=destination_parent_fd, follow_symlinks=False)
+                    copied = _read_processor_metadata(destination_fd, name)
+                except (OSError, RuntimeError, ValueError):
+                    raise RuntimeError(f"processor metadata destination changed: {name}") from None
+                if (
+                    _processor_metadata_identity(destination) != _processor_metadata_identity(destination_metadata)
+                    or _processor_metadata_identity(slot) != _processor_metadata_identity(destination_metadata)
+                    or copied != raw
+                    or hashlib.sha256(copied).digest() != hashlib.sha256(raw).digest()
+                ):
+                    raise RuntimeError(f"processor metadata destination changed: {name}")
+            _require_processor_metadata_directory(checkpoint_path, destination_parent_fd, "destination")
+    except BaseException:
+        for name, destination_fd, _, _, destination_created in reversed(destinations):
+            if not destination_created:
+                continue
+            try:
+                destination = os.fstat(destination_fd)
+                slot = os.stat(name, dir_fd=destination_parent_fd, follow_symlinks=False)
+                if _processor_metadata_identity(slot) == _processor_metadata_identity(destination):
+                    os.unlink(name, dir_fd=destination_parent_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        for _, destination_fd, _, _, _ in destinations:
+            try:
+                os.close(destination_fd)
+            except OSError:
+                pass
+        try:
+            os.close(destination_parent_fd)
+        finally:
+            os.close(source_parent_fd)
+
+
 def _export_json(path: Path) -> dict:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"local HF export requires a regular file: {path.name}")
@@ -434,23 +721,29 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
     from ..harness.inference_export import FAMILIES
     from ..harness.inference_export import read_export_json
     from ..harness.inference_export import read_inventory
-    from ..harness.inference_export import validate_qwen4_full_config
-    from ..harness.inference_export import validate_qwen4_full_schema
+    from ..harness.inference_export import validate_glm53_full_config
+    from ..harness.inference_export import validate_glm53_full_schema
+    from ..harness.inference_export import validate_initial_training_model_dir
+    from ..harness.inference_export import validate_qwen4_local_export
     from ..harness.inference_export import validate_text_projection
 
     canonical = require_data_fast_path(weights_dir, label="local inference HF export")
     if weights_dir != canonical or weights_dir.is_symlink() or not weights_dir.is_dir():
         raise RuntimeError("local inference requires a regular exported directory")
     weights_dir = canonical
-    source = AutoConfig.from_pretrained(_full_model_name(ctx), local_files_only=True)
+    source_model = _full_model_name(ctx)
+    initial_model_dir = getattr(ctx, "inference_initial_model_dir", None)
+    if initial_model_dir is not None:
+        source_model = str(validate_initial_training_model_dir(initial_model_dir))
+    source = AutoConfig.from_pretrained(source_model, local_files_only=True)
     exported = _export_json(weights_dir / "config.json")
     if source.model_type in FAMILIES and exported.get("model_type") != source.model_type:
         source_config = require_data_fast_path(
-            Path(cached_file(_full_model_name(ctx), "config.json", local_files_only=True)),
+            Path(cached_file(source_model, "config.json", local_files_only=True)),
             label="local full-model config",
         )
         source_index = require_data_fast_path(
-            Path(cached_file(_full_model_name(ctx), "model.safetensors.index.json", local_files_only=True)),
+            Path(cached_file(source_model, "model.safetensors.index.json", local_files_only=True)),
             label="local full-model index",
         )
         if source_config.parent != source_index.parent:
@@ -465,6 +758,32 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
         )
         if receipt is None:
             raise RuntimeError("local text-export configuration identity changed")
+        return weights_dir
+    if source.model_type == "glm5_next":
+        source_config = require_data_fast_path(
+            Path(cached_file(source_model, "config.json", local_files_only=True)),
+            label="local full-model config",
+        )
+        source_index = require_data_fast_path(
+            Path(cached_file(source_model, "model.safetensors.index.json", local_files_only=True)),
+            label="local full-model index",
+        )
+        if source_config.parent != source_index.parent:
+            raise RuntimeError("local full-model config and tensor index must belong to one snapshot")
+        original_config = read_export_json(source_config)
+        validate_glm53_full_config(original_config, read_export_json(weights_dir / "config.json"))
+        quantization = original_config.get("quantization_config")
+        original_schema = read_inventory(
+            source_index.parent,
+            read_export_json(source_index),
+            original_quantization_config=quantization,
+        )
+        exported_schema = read_inventory(
+            weights_dir,
+            read_export_json(weights_dir / "model.safetensors.index.json"),
+            original_quantization_config=quantization,
+        )
+        validate_glm53_full_schema(original_config, original_schema, exported_schema)
         return weights_dir
     for field in (
         "model_type",
@@ -481,34 +800,32 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
             raise RuntimeError(f"local HF export differs from the full configured model: {field}")
     if exported.get("auto_map"):
         raise RuntimeError("local HF export must not require remote code")
-    source_index = cached_file(_full_model_name(ctx), "model.safetensors.index.json", local_files_only=True)
+    source_index = cached_file(source_model, "model.safetensors.index.json", local_files_only=True)
     if source.model_type == "qwen4_exp":
         source_index = require_data_fast_path(Path(source_index), label="local full-model index")
         source_config = require_data_fast_path(
-            Path(cached_file(_full_model_name(ctx), "config.json", local_files_only=True)),
+            Path(cached_file(source_model, "config.json", local_files_only=True)),
             label="local full-model config",
         )
         if source_config.parent != source_index.parent:
             raise RuntimeError("local full-model config and tensor index must belong to one snapshot")
-        original_config = read_export_json(source_config)
-        if original_config.get("model_type") != source.model_type:
-            raise RuntimeError("local full-model configuration identity changed")
-        validate_qwen4_full_config(original_config, exported)
-        original_schema = read_inventory(source_index.parent, read_export_json(source_index))
-        exported_schema = read_inventory(weights_dir, read_export_json(weights_dir / "model.safetensors.index.json"))
-        validate_qwen4_full_schema(original_schema, exported_schema)
+        validate_qwen4_local_export(source_config, source_index, weights_dir)
         return weights_dir
     expected = _export_json(require_data_fast_path(Path(source_index), label="local full-model index"))
     index = _export_json(weights_dir / "model.safetensors.index.json")
     mapping = index.get("weight_map")
     expected_mapping = expected.get("weight_map")
-    if (
-        not isinstance(mapping, dict)
-        or not mapping
-        or not isinstance(expected_mapping, dict)
-        or set(mapping) != set(expected_mapping)
-    ):
-        raise RuntimeError("local HF export does not contain the full configured tensor inventory")
+    if not isinstance(mapping, dict) or not mapping or not isinstance(expected_mapping, dict) or not expected_mapping:
+        raise RuntimeError(
+            "local HF export does not contain the full configured tensor inventory: invalid or empty weight_map"
+        )
+    missing = sorted(set(expected_mapping) - set(mapping))
+    unexpected = sorted(set(mapping) - set(expected_mapping))
+    if missing or unexpected:
+        raise RuntimeError(
+            "local HF export does not contain the full configured tensor inventory: "
+            f"missing={len(missing)} {missing[:8]!r}; unexpected={len(unexpected)} {unexpected[:8]!r}"
+        )
     if any(
         not isinstance(name, str) or Path(name).name != name or not name.endswith(".safetensors")
         for name in mapping.values()
@@ -530,11 +847,17 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
                 if view.get_dtype() != "BF16":
                     raise RuntimeError("local full-model HF export requires BF16 weights")
                 total_bytes += math.prod(view.get_shape()) * 2
-    expected_bytes = (expected.get("metadata") or {}).get("total_size")
+    original_metadata = expected.get("metadata")
+    exported_metadata = index.get("metadata")
+    expected_bytes = original_metadata.get("total_size") if isinstance(original_metadata, dict) else None
+    exported_bytes = exported_metadata.get("total_size") if isinstance(exported_metadata, dict) else None
+    # Original HF indexes can encode an exact integral byte count as a JSON float.
     if (
-        type(expected_bytes) is not int
-        or expected_bytes <= 0
-        or (total_bytes != expected_bytes or (index.get("metadata") or {}).get("total_size") != total_bytes)
+        total_bytes <= 0
+        or type(expected_bytes) not in (int, float)
+        or type(exported_bytes) not in (int, float)
+        or expected_bytes != total_bytes
+        or exported_bytes != total_bytes
     ):
         raise RuntimeError("local HF export tensor byte inventory differs from the full configured model")
     return weights_dir
@@ -559,6 +882,7 @@ def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenize
     restored = gsm8k.load_tokenizer(str(weights_dir))
     if restored.get_vocab() != tokenizer.get_vocab() or restored.special_tokens_map != tokenizer.special_tokens_map:
         raise RuntimeError("local inference export tokenizer differs from the configured tokenizer")
+    materialize_checkpoint_processor_metadata(ctx, weights_dir)
     ctx._inference_export_locality = distribute_local_inference_export(
         weights_dir, getattr(ctx, "inference_export_allocation", None)
     )
@@ -603,12 +927,19 @@ def _run(ctx) -> TestResult:
             raise ValueError("initial training model directory requires local Cortex inference")
         initial_model_dir = validate_initial_training_model_dir(initial_model_dir)
     model_path = _full_model_name(ctx)
+    input_model_path = model_path
+    if initial_model_dir is not None:
+        input_model_path = str(initial_model_dir)
+    elif local and getattr(ctx, "local_gateway_full_model", False):
+        from ..harness.inference_export import validate_initial_training_model_dir
+
+        input_model_path = str(validate_initial_training_model_dir(getattr(ctx, "local_full_model_path", None)))
     gateway_slots = (
         max(ctx.cfg.n_gpus, sampling_gpus)
         if getattr(ctx, "inference_sampling_topology", None) is not None
         else ctx.cfg.n_gpus + sampling_gpus
     )
-    tokenizer = gsm8k.load_tokenizer(model_path)
+    tokenizer = gsm8k.load_tokenizer(input_model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     learning_rate = configured_learning_rate(ctx.cfg)
     rows_per_step = configured_rows_per_step(ctx.cfg)
@@ -624,7 +955,7 @@ def _run(ctx) -> TestResult:
 
     validation_batch = gsm8k.build_batch("validation", validation_examples, pad_id)
     train_batches = training_batches(training_examples, rows_per_step, pad_id)
-    minimum_row_tokens = _minimum_context_parallel_row_tokens(ctx, model_path)
+    minimum_row_tokens = _minimum_context_parallel_row_tokens(ctx, input_model_path)
     validation_batch = _extend_short_causal_rows(validation_batch, minimum_row_tokens, pad_id)
     train_batches = [_extend_short_causal_rows(batch, minimum_row_tokens, pad_id) for batch in train_batches]
     if minimum_row_tokens and validation_batch.total_tokens > token_budget:

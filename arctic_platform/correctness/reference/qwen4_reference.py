@@ -17,6 +17,49 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Qwen4ParameterPolicy:
+    cpu_parameter_ids: frozenset[int]
+    frozen_parameter_ids: frozenset[int]
+
+
+def qwen4_parameter_policy(model) -> Qwen4ParameterPolicy:
+    """Discover the reference's structural placement/freezing policy without changing the model."""
+    from torch import nn
+
+    registered = {id(parameter) for parameter in model.parameters()}
+    tables = set()
+    indexers = set()
+    try:
+        layers = model.get_decoder().layers
+        for layer in layers:
+            ple = getattr(layer, "ple", None)
+            if ple is not None:
+                table = ple.ple_embedding.ngram_embedding.weight
+                if not isinstance(table, nn.Parameter):
+                    raise ValueError("qwen4_exp PLE table must be a registered Parameter")
+                tables.add(id(table))
+            attention = getattr(layer, "self_attn", None)
+            if attention is not None:
+                indexer = attention.indexer
+                if not isinstance(indexer, nn.Module):
+                    raise ValueError("qwen4_exp QSA indexer must be a registered module")
+                parameters = tuple(indexer.parameters())
+                if not parameters:
+                    raise ValueError("qwen4_exp QSA indexer must contain registered parameters")
+                indexers.update(id(parameter) for parameter in parameters)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("qwen4_exp reference requires a complete PLE/QSA layer period") from exc
+    if not tables or not indexers:
+        raise ValueError("qwen4_exp reference requires a complete PLE/QSA layer period")
+    frozen = tables | indexers
+    if not frozen <= registered:
+        raise ValueError("qwen4_exp policy parameters must be registered on the model")
+    return Qwen4ParameterPolicy(frozenset(tables), frozenset(frozen))
+
 
 def load_qwen4_reference(model_class, model_path, *, dtype, attn_implementation, device):
     """Keep only the frozen n-gram table on CPU, without accelerator reload hooks."""
@@ -38,23 +81,11 @@ def load_qwen4_reference(model_class, model_path, *, dtype, attn_implementation,
     if any(parameter.device.type != "cpu" for parameter in model.parameters()):
         raise ValueError("qwen4_exp reference must load on CPU before selective placement")
 
-    tables = []
-    indexers = []
-    for layer in model.get_decoder().layers:
-        ple = getattr(layer, "ple", None)
-        if ple is not None:
-            tables.append(ple.ple_embedding.ngram_embedding.weight)
-        attention = getattr(layer, "self_attn", None)
-        if attention is not None:
-            indexers.append(attention.indexer)
-    if not tables or not indexers:
-        raise ValueError("qwen4_exp reference requires a complete PLE/QSA layer period")
-    for table in tables:
-        table.requires_grad_(False)
-    for indexer in indexers:
-        indexer.requires_grad_(False)
+    policy = qwen4_parameter_policy(model)
+    for parameter in model.parameters():
+        if id(parameter) in policy.frozen_parameter_ids:
+            parameter.requires_grad_(False)
 
-    table_ids = {id(table) for table in tables}
     # Module.to uses _apply too, but would also allocate the 95 GiB frozen table on CUDA.
-    model._apply(lambda tensor: tensor if id(tensor) in table_ids else tensor.to(device=device))
+    model._apply(lambda tensor: tensor if id(tensor) in policy.cpu_parameter_ids else tensor.to(device=device))
     return model

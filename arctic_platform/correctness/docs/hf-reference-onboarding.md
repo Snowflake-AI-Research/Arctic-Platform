@@ -50,8 +50,7 @@ python -m arctic_platform.correctness onboard \
 
 python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
-  --prepare-references --test-id single-step-optimizer \
-  --reference-calibration-runs 5 --reference-calibration-workers 5
+  --prepare-references --test-id single-step-optimizer
 
 python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
@@ -65,8 +64,7 @@ python -m arctic_platform.correctness onboard \
 python -m arctic_platform.correctness onboard \
   --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
   --prepare-references \
-  --reference-tests single-step-grads single-step-optimizer \
-  --reference-calibration-runs 5 --reference-calibration-workers 5
+  --reference-tests single-step-grads single-step-optimizer
 ```
 
 **Advanced full-model mode is separate from config-only reduced-fixture onboarding.** [The original-model validator](../models/original.py) defines the accepted model/config pairs, source revisions, configuration hashes and indexed tensor layouts. It currently lists Qwen3-8B, the B200 Qwen3.8-27B config and the reviewed Flash-Next config; metadata inclusion does not establish a compatible sampling runtime or numerical pass. This mode requires `HF_HUB_OFFLINE=1`, `DSS_ALLOW_REMOTE_MODELS=1` and `HF_HUB_CACHE` pointing to the populated cache under `/data-fast`. Indexed models must match complete tensor-name/dtype/shape headers. Header validation does not read or hash tensor payloads.
@@ -81,9 +79,13 @@ python -m arctic_platform.correctness onboard \
 
 **Equal norms can hide sign, permutation, or directional errors.** `abs(||target||2 - ||reference||2)` is weaker than the full-tensor difference `||target - reference||2`; a norm pass does not establish elementwise optimizer-state equivalence.
 
-**A new optimizer norm record needs fresh, criterion-specific onboarding calibration.** Config-only onboarding uses five nondeterministic single-GPU HF repeats per arm, in addition to the deterministic baseline capture, for tiny and real models alike. The CLI defaults to one worker; the examples above explicitly use five workers and require five available GPUs. The [runner](../harness/runner.py) measures the largest absolute scalar-norm difference over all repeat pairs, multiplies that spread by 4, rounds upward to a `1e-3` increment, and applies a minimum absolute gate of `1e-3`. The record retains the gate and actual calibration run count. Existing records retain their original provenance, including historical 16-run measurements. No legacy full-tensor tolerance is inherited, and regression neither recalibrates nor widens this gate.
+**A new optimizer norm record needs fresh, criterion-specific onboarding calibration.** Config-only onboarding uses eight nondeterministic single-GPU HF repeats per arm, in addition to the deterministic baseline capture, for tiny and real models alike. The [runner](../harness/runner.py) measures the largest absolute scalar-norm difference over all repeat pairs, multiplies that spread by 4, rounds upward to a `1e-3` increment, and applies a minimum absolute gate of `1e-3`. The record retains the gate and actual calibration run count. Existing records retain their original provenance and reviewed gates. No legacy full-tensor tolerance is inherited, and regression neither recalibrates nor widens this gate.
 
-**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Five repeats plus a deterministic baseline for each of GAS1 and GAS4 means twelve processes with the default one worker, not five processes for the entire optimizer check. The progress bar measures complete reference runs, including this overhead; its ETA appears after a completion.
+**Calibration automatically uses the visible GPUs on one node, capped at eight workers.** Each worker runs an independent single-GPU HF process. Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, including when sixteen GPUs are visible. Fewer local GPUs require more waves. `--reference-calibration-workers` preserves an explicit override from one to eight; the operator must make those GPUs available. Gradient and optimizer calibration use this policy independently of the target's GPU count.
+
+**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Eight repeats plus a deterministic baseline for each of GAS1 and GAS4 means eighteen processes for the optimizer check; concurrent workers overlap repeats, not the two GAS arms or their baselines. The progress bar measures complete reference runs, including this overhead; its ETA appears after a completion.
+
+**TODO: Use every available GPU within one allocation for calibration.** Multi-node support must handle remote worker launches, node-local model and input staging, unique GPU assignments, and result and failure collection before removing the one-node limit.
 
 ## Run Regression
 

@@ -51,6 +51,8 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 **Classify results from actual evidence.** A numerical pass requires completed comparisons. A numerical failure means a measured mismatch; an execution error precedes comparison. `B` is reserved for a verified missing production API, not missing test code, references, integration or capacity. `H` denotes harness/setup work and `?` denotes pending work in progress tables.
 
+**Count distinct blockages, not affected configurations or test arms.** A verified shared cause affecting three configurations is one issue with three affected configurations. Keep issue totals separate from configuration/check/placement coverage, start human-facing issue IDs at 1, and do not infer a shared cause from matching error text alone. Unknown distinct-cause totals stay `UNKNOWN`; harness defects do not enter core `B`/`E` counts.
+
 **Owned gateway shutdown and complete worker cleanup are separate claims.** A direct child being reaped does not prove detached Ray workers are gone. Treat unsafe cleanup as a reason to stop subsequent workloads; preserve the primary failure and retained cleanup diagnostics.
 
 ## Changes And Verification
@@ -61,4 +63,4 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 **Document the actual operator experience.** Keep setup, onboarding and Running instructions in lifecycle order, including exact report/log locations, external-service behavior and failure handling. Preserve operator-authored PR text when updating instructions.
 
-**Use root `correctness-progress.md` for local fleet outcomes when that file exists.** Static guides and this skill contain reusable instructions, not live status. Do not duplicate counts or promote numerical, runtime, maintenance or cleanup claims without their corresponding evidence. Fleet authorization and personal reporting rules come from the active operator instructions, not this skill.
+**Keep root `correctness-progress.md` as a concise, human-facing results page.** Put the AP outcome-by-config/check tables first; update actual result cells and only necessary scope notes. Keep operational logs, cadence reports, reviews, source bindings and detailed history in `correctness-progress-notes.md`, not the results page. Static guides and this skill contain reusable instructions, not live status. Do not promote numerical, runtime, maintenance or cleanup claims without their corresponding evidence. Fleet authorization and personal reporting rules come from the active operator instructions, not this skill.

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import hashlib
@@ -45,6 +46,361 @@ from arctic_platform.correctness.harness.config import TestTolerance as Toleranc
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 from arctic_platform.correctness.harness.transport import Checkpoint
+
+# Allocation-local native checkpoint bridge. No DSS process, API or GPU is started.
+
+
+@pytest.fixture
+def _native_checkpoint_bridge(monkeypatch):
+    from fastapi import FastAPI
+
+    from arctic_platform.correctness.harness import gateway
+
+    parents = {}
+    snowapi = SimpleNamespace(_parents=parents)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss", SimpleNamespace(gateway_snowapi=snowapi))
+    state = SimpleNamespace(
+        calls=[], verified=[], roots=[], counter=0, response={}, create_error=None, closed=False, created=[]
+    )
+    zone = SimpleNamespace(num_gpus=4, nodes=[SimpleNamespace(model_dump=lambda **kw: {"host": "node-a", "gpus": 4})])
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            state.closed = True
+
+    gw = SimpleNamespace(app=FastAPI(lifespan=lifespan), _jobs={})
+
+    async def create(config):
+        if state.create_error:
+            raise state.create_error
+        state.created.append(config.model_dump(mode="json", by_alias=True))
+        state.counter += 1
+        child = f"child-{state.counter}"
+        gw._jobs[child] = zone
+        parents[child] = SimpleNamespace(
+            state="running",
+            cancel_requested=False,
+            children={"training": SimpleNamespace(job_id=child, status="ready")},
+        )
+        return child
+
+    async def request(zone_arg, method, path, **kwargs):
+        assert zone_arg is zone
+        state.calls.append((method, path, copy.deepcopy(kwargs)))
+        child = path.split("/")[-2]
+        body = kwargs["json_body"]
+        return {
+            "job_id": child,
+            "checkpoint_path": body.get("path", "/tmp/dss.ray_dss/ds/job-owned-store"),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": body.get("checkpoint_id"),
+            "stage_path": "",
+            **state.response,
+        }
+
+    def retain(root):
+        state.roots.append(str(root))
+        return {
+            "path": str(root),
+            "source_job_id": "owned-store",
+            "native_path": "/tmp/dss.ray_dss/ds/job-owned-store",
+        }
+
+    gw._create_child_job = create
+    gw._zone_for_job = lambda child: gw._jobs[child]
+    gw._zone_request_and_wait = request
+    store = SimpleNamespace(create=retain, verify=lambda binding: state.verified.append(copy.deepcopy(binding)))
+    gateway.install_checkpoint_routes(gw, store)
+    state.gw, state.parents, state.zone, state.store = gw, parents, zone, store
+    state.config = {
+        "job_type": "training",
+        "job_id": "generated",
+        "model_name": "control-model",
+        "training_config": {"load_optimizer_states": True, "optimizer": {"lr": 1e-5}},
+    }
+
+    async def child(config=None):
+        class Config:
+            def __init__(self, raw):
+                self.raw = copy.deepcopy(raw)
+                self.job_id = self.raw["job_id"]
+
+            def model_dump(self, **kwargs):
+                return copy.deepcopy(self.raw)
+
+            @classmethod
+            def model_validate(cls, raw):
+                return cls(raw)
+
+        raw = copy.deepcopy(state.config if config is None else config)
+        return await gw._create_child_job(Config(raw))
+
+    async def invoke(route, child_id, **body):
+        endpoint = next(route_obj.endpoint for route_obj in gw.app.routes if route_obj.path == route)
+        return await endpoint(job_id=child_id, body=endpoint.__annotations__["body"](**body))
+
+    state.child, state.invoke = child, invoke
+    return state
+
+
+@pytest.mark.parametrize("node_local", [None, False, True])
+def test_native_checkpoint_bridge_sets_node_local_save_without_changing_other_overrides(
+    _native_checkpoint_bridge, node_local
+):
+    state = _native_checkpoint_bridge
+    raw = copy.deepcopy(state.config)
+    checkpoint = {"tag_validation": "Fail"}
+    if node_local is not None:
+        checkpoint["use_node_local_storage"] = node_local
+    raw["training_config"]["ds_config"] = {
+        "checkpoint": checkpoint,
+        "zero_optimization": {"stage": 2, "elastic_checkpoint": False},
+    }
+    original = copy.deepcopy(raw)
+
+    asyncio.run(state.child(raw))
+
+    expected = copy.deepcopy(original)
+    expected["training_config"]["ds_config"]["checkpoint"]["use_node_local_storage"] = True
+    assert state.created == [expected]
+    assert raw == original
+
+
+@pytest.mark.parametrize("fused", [None, False, True])
+def test_native_checkpoint_bridge_training_config_round_trips_optional_optimizer_defaults(fused):
+    from dss.ray_dss.models import JobConfig
+
+    from arctic_platform.correctness.harness.gateway import _training_config
+
+    optimizer = {"lr": 1e-5}
+    if fused is not None:
+        optimizer["fused"] = fused
+    config = JobConfig.model_validate(
+        {
+            "job_id": "generated",
+            "model_name": "control-model",
+            "model_post_init": ["control-hook"],
+            "training_config": {
+                "optimizer": optimizer,
+                "ds_config": {"checkpoint": {"tag_validation": "Fail"}},
+            },
+        }
+    )
+    original = config.model_dump(mode="json", by_alias=True)
+
+    raw = _training_config(config)
+    assert "job_id" not in raw
+    assert raw["model_post_init"] == ["control-hook"]
+    assert raw["training_config"]["ds_config"] == {"checkpoint": {"tag_validation": "Fail"}}
+    if fused is None:
+        assert "fused" not in raw["training_config"]["optimizer"]
+    else:
+        assert raw["training_config"]["optimizer"]["fused"] is fused
+    restored = JobConfig.model_validate({**raw, "job_id": config.job_id})
+    assert restored.model_dump(mode="json", by_alias=True) == original
+    assert config.model_dump(mode="json", by_alias=True) == original
+
+
+def test_native_checkpoint_bridge_leaves_weights_only_and_sampling_configs_unchanged(_native_checkpoint_bridge):
+    state = _native_checkpoint_bridge
+    weights_only = copy.deepcopy(state.config)
+    weights_only["training_config"]["load_optimizer_states"] = False
+    sampling = {**state.config, "job_type": "inference", "training_config": None}
+    for raw in (weights_only, sampling):
+        asyncio.run(state.child(raw))
+    assert state.created == [weights_only, sampling]
+
+
+def test_native_checkpoint_bridge_exact_store_survives_fresh_child_resume(_native_checkpoint_bridge):
+    state = _native_checkpoint_bridge
+
+    async def scenario():
+        source = await state.child()
+        assert state.created[0]["training_config"]["ds_config"] == {"checkpoint": {"use_node_local_storage": True}}
+        saved = await state.invoke(
+            "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+        )
+        assert saved["checkpoint_id"].startswith("cp_") and len(saved["checkpoint_id"]) == 35
+        del state.gw._jobs[source]
+        state.parents.clear()
+        target = await state.child({**state.config, "job_id": "different-generated"})
+        loaded = await state.invoke("/correctness/load-checkpoint", target, checkpoint_id=saved["checkpoint_id"])
+        assert loaded["checkpoint_id"] == saved["checkpoint_id"]
+        assert loaded["version"] == 10 and loaded["checkpoint_tag"] == "global_step10"
+        assert state.calls == [
+            (
+                "POST",
+                f"/api/v0/jobs/{source}/save",
+                {
+                    "json_body": {"path": "/data-fast/control-resume", "checkpoint_type": "resumable"},
+                    "no_keepalive": True,
+                },
+            ),
+            (
+                "POST",
+                f"/api/v0/jobs/{target}/load",
+                {
+                    "json_body": {"checkpoint_id": "global_step10", "source_job_id": "owned-store"},
+                    "no_keepalive": True,
+                },
+            ),
+        ]
+        assert len(state.verified) == 4
+        paths = state.gw.app.openapi()["paths"]
+        for route in ("/correctness/save-checkpoint", "/correctness/load-checkpoint"):
+            assert {
+                "name": "job_id",
+                "in": "query",
+                "required": True,
+                "schema": {"type": "string", "title": "Job Id"},
+            } in paths[route]["post"]["parameters"]
+        async with state.gw.app.router.lifespan_context(state.gw.app):
+            pass
+        assert state.closed and state.roots == ["/data-fast/control-resume"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "change", ["model", "optimizer", "layout", "module-only", "live-source", "same-child", "unknown"]
+)
+def test_native_checkpoint_bridge_rejects_incompatible_resume_before_load(_native_checkpoint_bridge, change):
+    from fastapi import HTTPException
+
+    state = _native_checkpoint_bridge
+
+    async def scenario():
+        source = await state.child()
+        saved = await state.invoke(
+            "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+        )
+        if change != "live-source":
+            del state.gw._jobs[source]
+        config = copy.deepcopy(state.config)
+        if change == "model":
+            config["model_name"] = "different-model"
+        elif change == "optimizer":
+            config["training_config"]["optimizer"]["lr"] = 1e-4
+        elif change == "module-only":
+            config["training_config"]["load_optimizer_states"] = False
+        if change == "same-child":
+            state.gw._jobs[source] = state.zone
+            target = source
+        else:
+            target = await state.child(config)
+        if change == "layout":
+            state.zone.num_gpus = 8
+        identity = "cp_unknown" if change == "unknown" else saved["checkpoint_id"]
+        with pytest.raises(HTTPException) as error:
+            await state.invoke("/correctness/load-checkpoint", target, checkpoint_id=identity)
+        assert error.value.status_code in {404, 409}
+        assert len(state.calls) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"job_id": "other-child"},
+        {"checkpoint_path": "/data-fast/not-owned"},
+        {"checkpoint_tag": "global_step010"},
+        {"version": True},
+        {"version": 9},
+        {"stage_path": "s3://unexpected-stage"},
+    ],
+)
+def test_native_checkpoint_bridge_rejects_invalid_native_save_metadata(_native_checkpoint_bridge, response):
+    state = _native_checkpoint_bridge
+
+    async def scenario():
+        source = await state.child()
+        state.response = response
+        with pytest.raises(RuntimeError, match="native checkpoint response"):
+            await state.invoke(
+                "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+            )
+        assert state.roots == ["/data-fast/control-resume"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"job_id": "other-child"},
+        {"checkpoint_path": "/data-fast/control-resume"},
+        {"checkpoint_tag": "global_step9", "version": 9},
+        {"checkpoint_id": "global_step9"},
+    ],
+)
+def test_native_checkpoint_bridge_rejects_wrong_restored_state(_native_checkpoint_bridge, response):
+    state = _native_checkpoint_bridge
+
+    async def scenario():
+        source = await state.child()
+        saved = await state.invoke(
+            "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+        )
+        del state.gw._jobs[source]
+        target = await state.child()
+        state.response = response
+        with pytest.raises(RuntimeError):
+            await state.invoke("/correctness/load-checkpoint", target, checkpoint_id=saved["checkpoint_id"])
+
+    asyncio.run(scenario())
+
+
+def test_native_checkpoint_bridge_cancelled_operation_retains_store(_native_checkpoint_bridge):
+    state = _native_checkpoint_bridge
+
+    async def interrupted(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    async def scenario():
+        source = await state.child()
+        state.gw._zone_request_and_wait = interrupted
+        with pytest.raises(asyncio.CancelledError):
+            await state.invoke(
+                "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+            )
+        assert state.roots == ["/data-fast/control-resume"]
+        async with state.gw.app.router.lifespan_context(state.gw.app):
+            pass
+        assert state.closed
+
+    asyncio.run(scenario())
+
+
+def test_native_checkpoint_bridge_failed_create_has_no_eligible_binding(_native_checkpoint_bridge):
+    from fastapi import HTTPException
+
+    state = _native_checkpoint_bridge
+    state.create_error = RuntimeError("original creation failure")
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="original creation failure"):
+            await state.child()
+        state.parents["unbound"] = SimpleNamespace(
+            state="running",
+            cancel_requested=False,
+            children={"training": SimpleNamespace(job_id="unbound", status="ready")},
+        )
+        with pytest.raises(HTTPException):
+            await state.invoke(
+                "/correctness/save-checkpoint",
+                "unbound",
+                path="/data-fast/control-resume",
+                checkpoint_type="resumable",
+            )
+        assert not state.roots and not state.calls
+
+    asyncio.run(scenario())
+
 
 # Checkpoint resume.
 
@@ -1451,3 +1807,561 @@ def test_optimizer_state_check_unexplained_update_corruption_remains_in_residual
     assert by_state["parameter_update_residual"] == pytest.approx(0.005)
     assert by_state["exp_avg"] < 0.001
     assert by_state["exp_avg_sq"] < 0.001
+
+
+# Native retained checkpoint store.
+
+
+@pytest.fixture
+def _native_checkpoint_fresh_child(tmp_path, monkeypatch):
+    import base64
+    import os
+    import shlex
+
+    from arctic_platform.correctness.harness import checkpoint_store as module
+
+    overlay = tmp_path / "private-overlay"
+    package = overlay / "arctic_platform" / "correctness" / "harness"
+    package.mkdir(parents=True)
+    for directory in (package, package.parent, package.parent.parent):
+        (directory / "__init__.py").write_text("")
+    source = package / "checkpoint_store.py"
+    source.write_text(
+        "def _node_receipt(request):\n"
+        "    binding = dict(request['binding'], native_path='/synthetic/native')\n"
+        "    identity = {key: [1, 2, 3, 4] for key in ('root', 'marker', 'link', 'lock')}\n"
+        "    if request['operation'] == 'close':\n"
+        "        identity = {'closed': True, 'lock': [1, 2, 3, 4]}\n"
+        "    return dict(host='synthetic-node', token=request['token'], operation=request['operation'],\n"
+        "                binding=binding, ok=True, identity=identity, error=None)\n"
+    )
+    child_cwd = tmp_path / "login-cwd"
+    child_cwd.mkdir()
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("node-0 slots=1\n")
+    original_run = module.subprocess.run
+    children = []
+    before_child = []
+
+    def run(command, **kwargs):
+        assert command[1:3] == ["-f", str(hostfile)]
+        tokens = shlex.split(command[-1])
+        assert tokens[0] == "echo"
+        script = base64.b64decode(tokens[1], validate=True).decode()
+        for hook in before_child:
+            hook()
+        child_env = dict(os.environ)
+        child_env.pop("PYTHONPATH", None)
+        done = original_run(
+            [sys.executable, "-B", "-"],
+            input=script,
+            cwd=child_cwd,
+            env=child_env,
+            **kwargs,
+        )
+        children.append(done)
+        # Model ds_ssh reporting rc=0 even when its remote child fails.
+        return SimpleNamespace(
+            returncode=0,
+            stdout="".join(f"node-0: {line}\n" for line in done.stdout.splitlines()),
+            stderr=done.stderr,
+        )
+
+    monkeypatch.setattr(module, "__file__", str(source))
+    monkeypatch.setattr(sys, "path", [str(overlay), *sys.path])
+    monkeypatch.setattr(module.subprocess, "run", run)
+    return SimpleNamespace(
+        module=module,
+        source=source,
+        overlay=overlay,
+        children=children,
+        before_child=before_child,
+        store=module.NativeCheckpointStore(hostfile),
+    )
+
+
+def test_native_checkpoint_fanout_fresh_child_uses_private_overlay(_native_checkpoint_fresh_child):
+    env = _native_checkpoint_fresh_child
+    binding = {"source_job_id": "synthetic-source", "path": "/synthetic/retained"}
+    receipts = env.store._fanout("create", binding, {})
+    assert receipts["node-0"]["host"] == "synthetic-node"
+    env.store._fanout("verify", binding, receipts)
+    closed = env.store._fanout("close", binding, receipts)
+    assert closed["node-0"]["identity"]["closed"] is True
+    assert len(env.children) == 3
+    assert all(child.returncode == 0 and child.stderr == "" for child in env.children)
+
+
+@pytest.mark.parametrize("import_root", ["absolute", "relative", "cwd", "non-string"])
+def test_native_checkpoint_fanout_fresh_child_keeps_gateway_dependency_roots(
+    _native_checkpoint_fresh_child, monkeypatch, import_root
+):
+    env = _native_checkpoint_fresh_child
+    dependency = env.overlay.parent / "native-dependency"
+    dependency.mkdir()
+    (dependency / "synthetic_native_dependency.py").write_text("NATIVE_PATH = '/synthetic/native'\n")
+    env.source.write_text(
+        "from synthetic_native_dependency import NATIVE_PATH\n"
+        + env.source.read_text().replace("native_path='/synthetic/native'", "native_path=NATIVE_PATH")
+    )
+    if import_root == "cwd":
+        monkeypatch.chdir(dependency)
+        root = ""
+    else:
+        monkeypatch.chdir(dependency.parent)
+        root = str(dependency) if import_root in {"absolute", "non-string"} else dependency.name
+    paths = [root, *sys.path]
+    if import_root == "non-string":
+        paths.insert(0, None)
+    monkeypatch.setattr(sys, "path", paths)
+    receipts = env.store._fanout("create", {"path": "/synthetic/retained"}, {})
+    assert receipts["node-0"]["binding"]["native_path"] == "/synthetic/native"
+    assert env.children[0].returncode == 0
+
+
+@pytest.mark.parametrize("source_change", ["changed", "missing", "shadowed"])
+def test_native_checkpoint_fanout_fresh_child_rejects_wrong_source(_native_checkpoint_fresh_child, source_change):
+    env = _native_checkpoint_fresh_child
+    if source_change == "changed":
+        env.before_child.append(
+            lambda: env.source.write_text("raise AssertionError('must not execute changed source')\n")
+        )
+        expected_error = "checkpoint store source SHA256 differs"
+    elif source_change == "missing":
+        env.before_child.append(env.source.unlink)
+        expected_error = "FileNotFoundError"
+    else:
+        shadow = env.overlay.parent / "foreign-harness"
+        shadow.mkdir()
+        (shadow / "checkpoint_store.py").write_text(
+            "def _node_receipt(request):\n    raise AssertionError('must not call foreign receipt')\n"
+        )
+        env.source.parent.joinpath("__init__.py").write_text(f"__path__ = [{str(shadow)!r}]\n")
+        expected_error = "checkpoint store imported source path differs"
+    with pytest.raises(env.module.CheckpointStoreError, match="missing hosts=.*node-0") as error:
+        env.store._fanout("create", {"path": "/synthetic/retained"}, {})
+    assert len(env.children) == 1 and env.children[0].returncode != 0
+    assert error.value.receipts == {}
+    assert error.value.transport_stderr == env.children[0].stderr
+    assert expected_error in error.value.transport_stderr
+    assert "must not" not in error.value.transport_stderr
+    assert expected_error in "".join(traceback.format_exception(error.value))
+
+
+def test_native_checkpoint_fanout_missing_gateway_source_is_structured(_native_checkpoint_fresh_child):
+    env = _native_checkpoint_fresh_child
+    env.source.unlink()
+    with pytest.raises(env.module.CheckpointStoreError) as error:
+        env.store._fanout("create", {"path": "/synthetic/retained"}, {})
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+    assert env.children == []
+    assert error.value.receipts == {}
+    assert error.value.transport_stdout == error.value.transport_stderr == ""
+
+
+@pytest.fixture
+def _native_checkpoint_store_env(tmp_path, monkeypatch):
+    import base64
+    import io
+    import shlex
+
+    from arctic_platform.correctness.harness import checkpoint_store as module
+
+    fast = tmp_path / "fast"
+    native = tmp_path / "native"
+    fast.mkdir()
+    native.mkdir()
+    root = fast / "retained"
+    root.mkdir()
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("node-0 slots=1\n")
+    monkeypatch.setattr(module, "_FAST_ROOT", fast)
+    monkeypatch.setattr(module, "_native_path", lambda source: native / f"job-{source}")
+    monkeypatch.setattr(module.socket, "gethostname", lambda: "node-0")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert command[1:3] == ["-f", str(hostfile)]
+        assert kwargs["timeout"] == 120
+        tokens = shlex.split(command[-1])
+        if tokens[0] == "echo":
+            assert tokens[2:7] == ["|", "base64", "-d", "|", sys.executable]
+            assert tokens[7:] == ["-"]
+            script = base64.b64decode(tokens[1], validate=True).decode()
+        else:
+            script = tokens[-1]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exec(script, {})
+        return SimpleNamespace(returncode=0, stdout=f"node-0: {output.getvalue()}", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    return SimpleNamespace(
+        module=module,
+        root=root,
+        fast=fast,
+        native=native,
+        hostfile=hostfile,
+        run=run,
+        calls=calls,
+        store=module.NativeCheckpointStore(hostfile),
+    )
+
+
+def test_native_checkpoint_store_survives_ds_ssh_unquoted_argument_flattening(
+    _native_checkpoint_store_env, monkeypatch
+):
+    env = _native_checkpoint_store_env
+
+    def flattened(command, **kwargs):
+        remote = " ".join(command[-1].split())
+        return env.run([*command[:-1], remote], **kwargs)
+
+    monkeypatch.setattr(env.module.subprocess, "run", flattened)
+    binding = env.store.create(env.root)
+    env.store.verify(binding)
+    env.store.close()
+    assert len(env.calls) == 3
+    assert not env.root.exists()
+
+
+def test_native_checkpoint_store_missing_peer_names_the_absent_host(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    env.hostfile.write_text("node-0 slots=1\nnode-1 slots=1\n")
+    store = env.module.NativeCheckpointStore(env.hostfile)
+    with pytest.raises(env.module.CheckpointStoreError, match="missing hosts=.*node-1"):
+        store.create(env.root)
+
+
+def test_native_checkpoint_store_preserves_launcher_output(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    output = SimpleNamespace(
+        returncode=0,
+        stdout="hostfile=/job/hostfile\nnode-0: diagnostic-only output\n",
+        stderr="node-0: ModuleNotFoundError: No module named 'arctic_platform'\n",
+    )
+    monkeypatch.setattr(env.module.subprocess, "run", lambda *args, **kwargs: output)
+    with pytest.raises(env.module.CheckpointStoreError, match="missing hosts=.*node-0") as error:
+        env.store.create(env.root)
+    assert error.value.transport_stdout == output.stdout
+    assert error.value.transport_stderr == output.stderr
+    rendered = "".join(traceback.format_exception(error.value))
+    assert output.stdout.strip() in rendered
+    assert output.stderr.strip() in rendered
+    assert error.value.receipts == {}
+    assert env.root.exists()
+
+
+def test_native_checkpoint_store_preserves_timeout_output(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+
+    def timeout(command, **kwargs):
+        raise env.module.subprocess.TimeoutExpired(
+            command, kwargs["timeout"], output=b"node-0: started\n", stderr=b"node-0: waiting\n"
+        )
+
+    monkeypatch.setattr(env.module.subprocess, "run", timeout)
+    with pytest.raises(env.module.CheckpointStoreError) as error:
+        env.store.create(env.root)
+    assert error.value.transport_stdout == "node-0: started\n"
+    assert error.value.transport_stderr == "node-0: waiting\n"
+    assert isinstance(error.value.__cause__, env.module.subprocess.TimeoutExpired)
+    assert error.value.receipts == {}
+    assert env.root.exists()
+
+
+def test_native_checkpoint_store_create_verify_and_explicit_close(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    native = Path(binding["native_path"])
+    lock = Path(f"{native}.lock")
+    lock_inode = lock.stat().st_ino
+    assert set(binding) == {"source_job_id", "path", "native_path"}
+    assert native.is_symlink() and native.readlink() == env.root
+    (env.root / "global_step1").mkdir()
+    (env.root / "global_step1/model.pt").write_bytes(b"synthetic checkpoint")
+    env.store.verify(binding)
+    assert env.store.bindings == (binding,)
+    env.store.bindings[0]["path"] = "not the store's binding"
+    assert env.store.bindings[0] == binding
+    env.store.close()
+    assert not native.exists() and not native.is_symlink() and not env.root.exists()
+    assert lock.stat().st_ino == lock_inode
+    assert env.store.bindings == ()
+    assert len(env.calls) == 3
+    env.store.close()
+
+
+def test_native_checkpoint_store_root_is_retained_without_close(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    assert env.root.exists() and Path(binding["native_path"]).is_symlink()
+    assert len(env.calls) == 1
+
+
+@pytest.mark.parametrize("condition", ["nonempty", "symlink", "outside"])
+def test_native_checkpoint_store_rejects_unsafe_roots(_native_checkpoint_store_env, condition):
+    env = _native_checkpoint_store_env
+    root = env.root
+    if condition == "nonempty":
+        (root / "foreign").write_bytes(b"preserve")
+    elif condition == "symlink":
+        root = env.fast / "alias"
+        root.symlink_to(env.root, target_is_directory=True)
+    else:
+        root = env.native
+    with pytest.raises((ValueError, env.module.CheckpointStoreError)):
+        env.store.create(root)
+    assert env.root.exists()
+    assert all(
+        path.name.endswith(".lock") and path.is_file() and not path.is_symlink()
+        for path in env.native.glob("job-correctness-*")
+    )
+    if condition == "nonempty":
+        assert (root / "foreign").read_bytes() == b"preserve"
+
+
+def test_native_checkpoint_store_never_overwrites_existing_native_namespace(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    native = env.native / "existing"
+    native.write_bytes(b"foreign")
+    monkeypatch.setattr(env.module, "_native_path", lambda source: native)
+    with pytest.raises(env.module.CheckpointStoreError, match="already exists"):
+        env.store.create(env.root)
+    assert native.read_bytes() == b"foreign"
+    assert list(env.root.iterdir()) == []
+    assert env.store.bindings[0]["path"] == str(env.root)
+
+
+@pytest.mark.parametrize("changed", ["link", "root", "marker", "lock"])
+def test_native_checkpoint_store_preserves_replaced_owned_objects(_native_checkpoint_store_env, changed):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    native = Path(binding["native_path"])
+    if changed == "link":
+        foreign = env.fast / "foreign"
+        foreign.mkdir()
+        native.unlink()
+        native.symlink_to(foreign)
+    elif changed == "root":
+        env.root.rename(env.fast / "original")
+        env.root.mkdir()
+        marker = env.fast / "original" / env.module._MARKER
+        (env.root / env.module._MARKER).write_bytes(marker.read_bytes())
+    else:
+        target = env.root / env.module._MARKER if changed == "marker" else Path(f"{native}.lock")
+        replacement = target.with_name("replacement")
+        replacement.write_bytes(target.read_bytes())
+        replacement.replace(target)
+    with pytest.raises(env.module.CheckpointStoreError, match="changed|differs"):
+        env.store.verify(binding)
+    with pytest.raises(env.module.CheckpointStoreError):
+        env.store.close()
+    assert env.root.exists() and native.is_symlink()
+    assert env.store.bindings
+
+
+def test_native_checkpoint_store_rejects_payload_symlinks(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    (env.root / "payload-link").symlink_to(env.hostfile)
+    with pytest.raises(env.module.CheckpointStoreError, match="payload"):
+        env.store.verify(binding)
+    with pytest.raises(env.module.CheckpointStoreError, match="payload"):
+        env.store.close()
+    assert env.hostfile.exists() and Path(binding["native_path"]).is_symlink()
+
+
+def test_native_checkpoint_store_exclusive_close_refuses_active_native_reader(_native_checkpoint_store_env):
+    import fcntl
+
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    native = Path(binding["native_path"])
+    with Path(f"{native}.lock").open("r+") as reader:
+        fcntl.flock(reader, fcntl.LOCK_SH)
+        with pytest.raises(env.module.CheckpointStoreError, match="BlockingIOError"):
+            env.store.close()
+        assert native.is_symlink() and env.root.exists()
+        env.store.verify(binding)
+        fcntl.flock(reader, fcntl.LOCK_UN)
+    env.store.close()
+    assert not env.root.exists()
+
+
+def test_native_checkpoint_store_cleanup_failure_is_retained_and_can_be_retried(
+    _native_checkpoint_store_env, monkeypatch
+):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    remove = env.module.shutil.rmtree
+
+    def fail(path):
+        raise PermissionError("synthetic tree cleanup failed")
+
+    fail.avoids_symlink_attacks = True
+    monkeypatch.setattr(env.module.shutil, "rmtree", fail)
+    with pytest.raises(env.module.CheckpointStoreError, match="synthetic tree cleanup failed"):
+        env.store.close()
+    assert env.root.exists() and not Path(binding["native_path"]).is_symlink()
+    assert env.store.bindings == (binding,)
+    monkeypatch.setattr(env.module.shutil, "rmtree", remove)
+    env.store.close()
+    assert not env.root.exists()
+
+
+def test_native_checkpoint_store_hostfile_drift_rejects_before_fanout(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    expected = env.store._host_identity
+    env.hostfile.write_text("node-1 slots=1\n")
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed") as error:
+        env.store.create(env.root)
+    assert env.calls == []
+    message = str(error.value)
+    assert f"path={env.hostfile}" in message
+    changes = json.loads(message.split("differences=", 1)[1])
+    observed = env.store._hostfile_identity()
+    assert expected["sha256"] != observed["sha256"]
+    assert changes == {
+        key: {"expected": expected[key], "observed": observed[key]}
+        for key in expected
+        if expected[key] != observed[key]
+    }
+
+
+def test_native_checkpoint_store_same_content_replacement_reports_identity_drift(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    replacement = env.hostfile.with_name("replacement-hostfile")
+    replacement.write_bytes(env.hostfile.read_bytes())
+    replacement.replace(env.hostfile)
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed") as error:
+        env.store.create(env.root)
+    changes = json.loads(str(error.value).split("differences=", 1)[1])
+    assert "sha256" not in changes
+    assert changes["path_identity"]["expected"] != changes["path_identity"]["observed"]
+    assert changes["target_identity"]["expected"] != changes["target_identity"]["observed"]
+    assert env.calls == []
+
+
+def test_native_checkpoint_store_hostfile_drift_after_fanout_retains_partial_root(
+    _native_checkpoint_store_env, monkeypatch
+):
+    env = _native_checkpoint_store_env
+
+    def changed(command, **kwargs):
+        result = env.run(command, **kwargs)
+        env.hostfile.write_text("node-0 slots=2\n")
+        return result
+
+    monkeypatch.setattr(env.module.subprocess, "run", changed)
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed"):
+        env.store.create(env.root)
+    assert env.store.bindings and (env.root / env.module._MARKER).exists()
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed"):
+        env.store.close()
+    assert env.root.exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "foreign", "token", "identity", "nonzero"])
+def test_native_checkpoint_store_requires_exact_structured_node_receipts(
+    _native_checkpoint_store_env, monkeypatch, corruption
+):
+    env = _native_checkpoint_store_env
+
+    def corrupted(command, **kwargs):
+        result = env.run(command, **kwargs)
+        prefix, _, raw = result.stdout.partition(env.module._RECEIPT)
+        receipt = json.loads(raw)
+        if corruption == "missing":
+            result.stdout = ""
+        elif corruption == "duplicate":
+            result.stdout *= 2
+        elif corruption == "foreign":
+            result.stdout = f"foreign: {env.module._RECEIPT}{raw}"
+        elif corruption == "nonzero":
+            result.returncode = 1
+        else:
+            receipt[corruption] = None
+            result.stdout = prefix + env.module._RECEIPT + json.dumps(receipt)
+        return result
+
+    monkeypatch.setattr(env.module.subprocess, "run", corrupted)
+    with pytest.raises(env.module.CheckpointStoreError):
+        env.store.create(env.root)
+    assert len(env.calls) == 1
+    assert env.root.exists()
+    assert env.store.bindings[0]["path"] == str(env.root)
+
+
+def test_native_checkpoint_store_rejects_missing_peer_without_local_fallback(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    env.hostfile.write_text("node-0 slots=1\nnode-1 slots=1\n")
+    store = env.module.NativeCheckpointStore(env.hostfile)
+    with pytest.raises(env.module.CheckpointStoreError):
+        store.create(env.root)
+    assert len(env.calls) == 1
+
+
+def test_native_checkpoint_store_rejects_same_executing_node_twice(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    env.hostfile.write_text("node-0 slots=1\nnode-1 slots=1\n")
+    store = env.module.NativeCheckpointStore(env.hostfile)
+
+    def duplicate_node(command, **kwargs):
+        result = env.run(command, **kwargs)
+        result.stdout += result.stdout.replace("node-0:", "node-1:")
+        return result
+
+    monkeypatch.setattr(env.module.subprocess, "run", duplicate_node)
+    with pytest.raises(env.module.CheckpointStoreError, match="duplicate executing"):
+        store.create(env.root)
+
+
+def test_native_checkpoint_store_verify_rejects_changed_executing_host(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+
+    def changed_host(command, **kwargs):
+        result = env.run(command, **kwargs)
+        prefix, _, raw = result.stdout.partition(env.module._RECEIPT)
+        receipt = json.loads(raw)
+        receipt["host"] = "replacement-node"
+        result.stdout = prefix + env.module._RECEIPT + json.dumps(receipt)
+        return result
+
+    monkeypatch.setattr(env.module.subprocess, "run", changed_host)
+    with pytest.raises(env.module.CheckpointStoreError, match="node identity changed"):
+        env.store.verify(binding)
+
+
+def test_native_checkpoint_store_rejects_foreign_binding_and_closed_create(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    with pytest.raises(env.module.CheckpointStoreError, match="not owned"):
+        env.store.verify({**binding, "path": str(env.fast / "foreign")})
+    env.store.close()
+    with pytest.raises(env.module.CheckpointStoreError, match="closed"):
+        env.store.create(env.root)
+
+
+def test_native_checkpoint_store_close_attempts_all_owned_bindings(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    first = env.store.create(env.root)
+    second_root = env.fast / "second"
+    second_root.mkdir()
+    second = env.store.create(second_root)
+    marker = env.root / env.module._MARKER
+    marker.write_text("{}")
+    with pytest.raises(env.module.CheckpointStoreError):
+        env.store.close()
+    assert Path(first["native_path"]).is_symlink() and env.root.exists()
+    assert not Path(second["native_path"]).is_symlink() and not second_root.exists()
+    assert env.store.bindings == (first,)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, float("nan"), float("inf")])
+def test_native_checkpoint_store_requires_bounded_timeout(_native_checkpoint_store_env, timeout):
+    env = _native_checkpoint_store_env
+    with pytest.raises(ValueError, match="finite and positive"):
+        env.module.NativeCheckpointStore(env.hostfile, timeout=timeout)

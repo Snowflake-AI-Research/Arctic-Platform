@@ -133,6 +133,7 @@ def main() -> None:
                 "optimizer_state_manifest": result.optimizer_state_manifest,
                 "optimizer_gradient_norm": result.optimizer_gradient_norm,
                 "reference_execution": result.reference_execution,
+                "participation": result.participation,
             }
         )
     )

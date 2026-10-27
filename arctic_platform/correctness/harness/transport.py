@@ -25,6 +25,21 @@ from typing import Optional
 from typing import Protocol
 
 
+class UnsafeCleanupError(RuntimeError):
+    """Owned resources may remain; do not start another correctness workload."""
+
+    def __init__(self, message, *, owned_parent=None, owned_children=None, shutdown_error=None):
+        super().__init__(message)
+        self.owned_parent = owned_parent
+        self.owned_children = dict(owned_children or {})
+        self.shutdown_error = shutdown_error
+        self.workload_error = None
+
+    def preserve_workload(self, error):
+        self.workload_error = error
+        self.args = (f"Original workload failed: {type(error).__name__}: {error}; {self}",)
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """A saved checkpoint and the job that wrote it, in whatever spelling the issuing transport uses."""

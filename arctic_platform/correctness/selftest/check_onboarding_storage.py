@@ -646,11 +646,19 @@ def test_inference_forwarding_onboarding_local_route_never_admits_gpu_pool_from_
         ("inference-checkpoint-loss", False, 32, "http://127.0.0.1:8003", None),
         ("inference-checkpoint-loss", False, None, "http://127.0.0.1:8003", None),
         ("inference-checkpoint-loss", False, 16, "http://127.0.0.1:8003", "required 32 GPUs"),
-        ("inference-checkpoint-loss", True, 32, "http://127.0.0.1:8003", "reference-free RL inference"),
+        ("inference-checkpoint-loss", True, 32, "http://127.0.0.1:8003", "reference-free RL fixed-gate"),
         ("inference-checkpoint-loss", False, 32, "https://example.com", "local"),
-        ("rl-weight-sync", False, 32, "http://127.0.0.1:8003", "reference-free RL inference"),
-        ("rl-router-replay", False, 32, "http://127.0.0.1:8003", "reference-free RL inference"),
-        ("checkpoint-resume-loss", False, 32, "http://127.0.0.1:8003", "reference-free RL inference"),
+        ("rl-weight-sync", False, 32, "http://127.0.0.1:8003", None),
+        ("rl-weight-sync", False, None, "http://127.0.0.1:8003", None),
+        ("rl-weight-sync", False, 16, "http://127.0.0.1:8003", "required 32 GPUs"),
+        ("rl-weight-sync", True, 32, "http://127.0.0.1:8003", "reference-free RL fixed-gate"),
+        ("rl-weight-sync", False, 32, "https://example.com", "local"),
+        ("rl-router-replay", False, 32, "http://127.0.0.1:8003", None),
+        ("rl-router-replay", False, None, "http://127.0.0.1:8003", None),
+        ("rl-router-replay", False, 16, "http://127.0.0.1:8003", "required 32 GPUs"),
+        ("rl-router-replay", True, 32, "http://127.0.0.1:8003", "reference-free RL fixed-gate"),
+        ("rl-router-replay", False, 32, "https://example.com", "local"),
+        ("checkpoint-resume-loss", False, 32, "http://127.0.0.1:8003", "existing reviewed spec"),
     ],
 )
 def test_rl_local_onboarding_admission_preserves_checks_and_combined_gpu_width(
@@ -1099,8 +1107,8 @@ def test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_
     assert keywords["prepare_references"] is True
     assert keywords["select"] == [test_id]
     assert keywords["vocab_size"] == 128
-    assert keywords["reference_calibration_runs"] == 5
-    assert keywords["reference_calibration_workers"] == 1
+    assert keywords["reference_calibration_runs"] == 8
+    assert keywords["reference_calibration_workers"] is None
     assert keywords["client_backend"].base_url == "http://127.0.0.1:1"
     assert keywords["reference_records_dir"] == reference_records.DEFAULT_RECORDS_DIR
 
@@ -1476,7 +1484,7 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
 
     calls = _rendered_calibration_workers
-    assert len(calls) == 10
+    assert len(calls) == 16
     batch_paths = {batch_path for batch_path, output in calls}
     assert len(batch_paths) == 2
     for batch_path in batch_paths:
@@ -1491,10 +1499,10 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     )
     assert not list(diagnostics.rglob("*.pt"))
     payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["configuration"]["runs"] == 5
+    assert payload["configuration"]["runs"] == 8
     assert payload["tolerance"]["selected_gate"] == 0.001
     spec = json.loads(namespace["SPEC_PATH"].read_text())
-    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 5
+    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 8
     assert spec["test_tolerances"]["single-step-grads"]["worst_tensor"] == "model.weight"
     assert payload["tolerance"]["raw_max_same_tensor_range"] == 0.0
 
@@ -1511,8 +1519,9 @@ def test_onboarding_renderer_rejects_diagnostic_directory_for_tensor_scratch(
     assert not list(tmp_path.rglob("*.pt"))
 
 
+@pytest.mark.parametrize("workers", [None, 1, 4, 8])
 def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diagnostics(
-    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, monkeypatch
+    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, monkeypatch, workers
 ):
     _onboarding_render_config(tmp_path, None)
     args = argparse.Namespace(
@@ -1526,12 +1535,15 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
         tokens=2048,
         reference_token_budget=65536,
         checkout_root=tmp_path,
+        reference_calibration_workers=workers,
     )
     args.output_dir.mkdir()
 
     def execute(command, *, cwd, env):
         namespace = {"__name__": "synthetic_calibration"}
-        exec(compile(Path(command[1]).read_text(), command[1], "exec"), namespace)
+        rendered = Path(command[1]).read_text()
+        assert f"reference_calibration_worker_count({workers!r}, runs=RUNS)" in rendered
+        exec(compile(rendered, command[1], "exec"), namespace)
         assert Path(namespace["WORK_DIR"]) == args.output_dir / "calibration-runs"
         return namespace["main"]()
 
@@ -1541,7 +1553,7 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
     assert result.is_file()
     assert (args.output_dir / "calibration-runs" / "batch-gas1.pt").is_file()
     assert (args.output_dir / "calibration-runs" / "batch-gas4.pt").is_file()
-    assert len(_rendered_calibration_workers) == 10
+    assert len(_rendered_calibration_workers) == 16
     assert not list(args._diagnostics_dir.rglob("*.pt"))
 
 
@@ -1577,7 +1589,7 @@ def test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing(_calibrat
             arm["name"], arm["global_batch_size"], arm["max_seq_len"], 128, seed=batches.SEED
         )
         actual = [batch for batch in measured if batch.name == arm["name"]]
-        assert len(actual) == 5
+        assert len(actual) == 8
         for batch in actual:
             for tensor in ("input_ids", "position_ids", "labels"):
                 assert torch.equal(getattr(batch, tensor), getattr(expected, tensor))
@@ -1586,7 +1598,7 @@ def test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing(_calibrat
         assert evidence["max_seq_len"] == expected.seq_len
         assert evidence["active_tokens"] == expected.active_tokens
         assert evidence["batch_hash"] == namespace["_batch_hash"](expected)
-        assert evidence["microbatches"] == [1] * 5
+        assert evidence["microbatches"] == [1] * 8
         assert evidence["skipped_no_grad"] == ["model.visual.weight"]
 
 
@@ -1607,9 +1619,9 @@ def test_gradient_calibration_measures_spread_only_within_each_arm(_calibration_
     namespace["run_reference"] = vary
     assert namespace["main"]() == 0
     payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["tolerance"]["raw_max_same_tensor_range"] == pytest.approx(0.008)
+    assert payload["tolerance"]["raw_max_same_tensor_range"] == pytest.approx(0.014)
     assert payload["tolerance"]["worst_arm"] == "gas4"
-    assert payload["tolerance"]["selected_gate"] == 0.032
+    assert payload["tolerance"]["selected_gate"] == 0.056
     assert payload["loss_range"] == 0
     assert {row["arm"] for row in payload["gradient_ranges"]} == {"gas1", "gas4"}
     assert len(payload["gradient_ranges"]) == 2
@@ -1705,8 +1717,48 @@ def test_gradient_calibration_never_overlaps_workers_on_the_same_gpu(_calibratio
     namespace["run_reference"] = observe
     assert namespace["main"]() == 0
     assert not active
-    assert devices.count(0) == 6
-    assert devices.count(1) == 4
+    assert devices.count(0) == 8
+    assert devices.count(1) == 8
+
+
+@pytest.mark.parametrize("available", [8, 16])
+def test_gradient_calibration_defaults_to_one_eight_gpu_wave_per_arm(_calibration_driver, monkeypatch, available):
+    import threading
+
+    namespace = _calibration_driver
+    assert namespace["RUNS"] == 8
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
+    reference = namespace["run_reference"]
+    barrier = threading.Barrier(8, timeout=10)
+    lock = threading.Lock()
+    active = set()
+    completed = {}
+    devices = {}
+
+    def observe(model, batch_path, output, **kwargs):
+        arm = output.parent.name
+        index = int(output.stem.split("-")[-1])
+        device = kwargs["cuda_device"]
+        with lock:
+            assert device == index % 8
+            assert device not in active
+            active.add(device)
+            devices.setdefault(arm, []).append(device)
+        try:
+            barrier.wait()
+            return reference(model, batch_path, output, **kwargs)
+        finally:
+            with lock:
+                active.remove(device)
+                completed.setdefault(arm, set()).add(index)
+
+    namespace["run_reference"] = observe
+    assert namespace["main"]() == 0
+    assert not active
+    assert set(devices) == {"gas1", "gas4"}
+    for arm in devices:
+        assert sorted(devices[arm]) == list(range(8))
+        assert completed[arm] == set(range(8))
 
 
 @pytest.mark.parametrize("arms", [[], [{"name": "gas1"}, {"name": "gas1"}]])
@@ -2546,6 +2598,110 @@ def test_onboarding_pretrained_materialization_rejects_other_quantizers_before_l
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"quant_method": "gptq"}])
+def test_onboarding_synthetic_materialization_saves_unquantized_bf16(
+    _onboarding_storage_fast_root, tmp_path, quantization
+) -> None:
+    source = tmp_path / "synthetic-source"
+    source.mkdir()
+    config = transformers.Qwen3Config(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    config.architectures = ["Qwen3ForCausalLM"]
+    if quantization is not None:
+        config.quantization_config = quantization
+    config.save_pretrained(source)
+    (source / "tokenizer_config.json").write_text("{}")
+    source_config = (source / "config.json").read_bytes()
+    destination = _onboarding_storage_fast_root / "synthetic-reduced"
+
+    result = synth_model.materialize(str(source), str(destination), 1, seed=0)
+
+    saved_config = json.loads((destination / "config.json").read_text())
+    assert "quantization_config" not in saved_config
+    assert saved_config["num_hidden_layers"] == 1
+    assert (source / "config.json").read_bytes() == source_config
+    assert result.source_checkpoint == str(source)
+    assert result.seed == 0
+    reopened = transformers.Qwen3ForCausalLM.from_pretrained(destination, dtype=torch.bfloat16)
+    assert not getattr(reopened, "is_quantized", False)
+    saved = load_file(destination / "model.safetensors")
+    assert all(tensor.dtype == torch.bfloat16 for tensor in saved.values())
+    assert not any(name.endswith("weight_scale_inv") for name in saved)
+    for name, tensor in reopened.state_dict().items():
+        torch.testing.assert_close(tensor, saved[name], atol=0, rtol=0, msg=name)
+    cached = synth_model.materialize(str(source), str(destination), 1, seed=0)
+    assert cached == result
+
+
+@pytest.mark.parametrize("scope", ["root", "text", "both"])
+@pytest.mark.parametrize("force", [False, True])
+def test_onboarding_synthetic_materialization_clears_nested_quantization_before_construction(
+    _onboarding_storage_fast_root, tmp_path, monkeypatch, scope, force
+) -> None:
+    import transformers as runtime_transformers
+
+    source = tmp_path / "synthetic-source"
+    source.mkdir()
+    (source / "tokenizer_config.json").write_text("{}")
+    config = SimpleNamespace(architectures=["SyntheticMaterializationModel"], text_config=SimpleNamespace())
+    if scope in {"root", "both"}:
+        config.quantization_config = {"quant_method": "fp8"}
+    if scope in {"text", "both"}:
+        config.text_config.quantization_config = {"quant_method": "fp8"}
+
+    class FakeModel:
+        def __init__(self, cfg):
+            assert not hasattr(cfg, "quantization_config")
+            assert not hasattr(cfg.text_config, "quantization_config")
+
+        def to(self, dtype):
+            assert dtype == torch.bfloat16
+            return self
+
+        def save_pretrained(self, path, **kwargs):
+            (path / "config.json").write_text("{}")
+
+    monkeypatch.setattr(runtime_transformers, "SyntheticMaterializationModel", FakeModel, raising=False)
+    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 2, 1))
+    monkeypatch.setattr(synth_model, "count_parameters", lambda cfg: 1)
+    destination = _onboarding_storage_fast_root / "synthetic-reduced"
+    if force:
+        destination.mkdir()
+        cached = {"quantization_config": {"quant_method": "fp8"}}
+        (destination / "config.json").write_text(json.dumps(cached))
+
+    synth_model.materialize(str(source), str(destination), 1, force=force)
+    assert json.loads((destination / "config.json").read_text()) == {}
+
+
+@pytest.mark.parametrize("scope", ["root", "text", "both"])
+def test_onboarding_synthetic_materialization_rejects_quantized_cache(
+    _onboarding_storage_fast_root, monkeypatch, scope
+) -> None:
+    config = SimpleNamespace(architectures=["UnusedModel"])
+    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 2, 1))
+    monkeypatch.setattr(synth_model, "count_parameters", _onboarding_storage_unexpected)
+    destination = _onboarding_storage_fast_root / "synthetic-reduced"
+    destination.mkdir()
+    cached = {"text_config": {}}
+    if scope in {"root", "both"}:
+        cached["quantization_config"] = {"quant_method": "fp8"}
+    if scope in {"text", "both"}:
+        cached["text_config"]["quantization_config"] = {"quant_method": "fp8"}
+    config_bytes = json.dumps(cached)
+    (destination / "config.json").write_text(config_bytes)
+    with pytest.raises(ValueError, match="cached reduced fixture is quantized"):
+        synth_model.materialize("unused", str(destination), 1)
+    assert (destination / "config.json").read_text() == config_bytes
+
+
 def test_onboarding_pretrained_materialization_rejects_quantized_cache(
     _onboarding_storage_fast_root, monkeypatch
 ) -> None:
@@ -2654,9 +2810,16 @@ def test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_
 
 
 @pytest.mark.parametrize("fail_reference", [False, True])
+@pytest.mark.parametrize(
+    ("available", "workers", "runs", "lanes"),
+    [(1, None, 2, 1), (8, None, 8, 8), (16, None, 8, 8), (8, None, 16, 8), (16, None, 16, 8), (16, 4, 7, 4)],
+)
 def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_cleans_only_owned_tree(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch, fail_reference
+    _onboarding_storage_fast_root, tmp_path, monkeypatch, fail_reference, available, workers, runs, lanes
 ):
+    from threading import Barrier
+    from threading import Lock
+
     import torch
     import transformers
 
@@ -2679,6 +2842,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
         test_spec=tmp_path / "checkout" / "spec.json",
         optimizer_layers=4,
         reference_token_budget=8,
+        reference_calibration_workers=workers,
     )
     config = SimpleNamespace(
         config_id="test",
@@ -2716,12 +2880,16 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
         return None
 
     monkeypatch.setattr(runner, "materialize_dss_peft_adapter", adapter)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(onboard, "CALIBRATION_RUNS", 2)
+    monkeypatch.setattr(onboard, "CALIBRATION_RUNS", runs)
     monkeypatch.setattr(optimizer_state, "max_pairwise_optimizer_delta", lambda *args, **kwargs: None)
     created = []
     deleted = []
+    active = set()
+    completed = set()
+    lock = Lock()
+    barriers = {start: Barrier(min(lanes, runs - start), timeout=10) for start in range(0, runs, lanes)}
     real_rmtree = onboard.shutil.rmtree
 
     def allocate(prefix):
@@ -2739,15 +2907,30 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
         assert destination.parent.parent in created
         if fail_reference:
             raise RuntimeError("reference failed")
-        destination.mkdir()
-        manifest = destination / "manifest.json"
-        manifest.write_text('{"parameters": [{"name": "mock"}]}')
-        return {"optimizer_state_manifest": str(manifest), "loss": 1.0, "peak_gib": 0.0}
+        index = int(destination.parent.name.removeprefix("run-")) - 1
+        device = kwargs["cuda_device"]
+        start = index // lanes * lanes
+        with lock:
+            assert device == index % lanes
+            assert device not in active
+            assert completed >= set(range(start))
+            active.add(device)
+        try:
+            barriers[start].wait()
+            destination.mkdir()
+            manifest = destination / "manifest.json"
+            manifest.write_text('{"parameters": [{"name": "mock"}]}')
+            return {"optimizer_state_manifest": str(manifest), "loss": 1.0, "peak_gib": 0.0}
+        finally:
+            with lock:
+                active.remove(device)
+                completed.add(index)
 
     monkeypatch.setattr(onboard, "correctness_workdir", allocate)
     monkeypatch.setattr(onboard.shutil, "rmtree", cleanup)
     monkeypatch.setattr(runner, "run_reference", reference)
     for _ in range(2):
+        completed.clear()
         if fail_reference:
             with pytest.raises(RuntimeError, match="reference failed"):
                 onboard._run_optimizer_calibration(args)
@@ -2755,6 +2938,8 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
             report = onboard._run_optimizer_calibration(args)
             assert report == output / "optimizer-reference-repeatability.json"
             assert args.test_spec.exists()
+            assert completed == set(range(runs))
+        assert not active
     assert len(created) == 2 and created[0] != created[1]
     assert deleted == created
     assert all((path.parent == _onboarding_storage_fast_root / "tmp" and (not path.exists()) for path in created))
@@ -2929,6 +3114,503 @@ def test_checkpoint_onboarding_calibration_failure_does_not_modify_reviewed_spec
     with pytest.raises(RuntimeError, match="calibration failed"):
         onboard._onboard_checkpoint_resume(args, config)
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_cortex_checkpoint_calibration_recipe_preserves_three_ten_step_runs_per_gas(tmp_path, monkeypatch, injected):
+    training = {"model_provider": "huggingface", "optimizer": {"lr": 2e-05}, "peft_config": {"r": 8}}
+    original = json.loads(json.dumps(training))
+    events = []
+    transports = []
+    packed = []
+
+    class Transport:
+        def __init__(self, directory):
+            self.directory = directory
+            self.runs = []
+            transports.append(self)
+
+        def __enter__(self):
+            events.append(("enter", self.directory))
+            return self
+
+        def __exit__(self, *args):
+            events.append(("exit", self.directory))
+
+        @contextlib.contextmanager
+        def job(self):
+            requests = []
+            run_index = len(self.runs)
+            self.runs.append(requests)
+            events.append(("job", self.directory, run_index))
+
+            def step(body, *, learning_rate):
+                requests.append((body, learning_rate))
+                return float(body["seed"]) + run_index * (0.125 if self.directory.name == "gas4" else 0.0625)
+
+            try:
+                yield SimpleNamespace(fwd_bwd_step=step)
+            finally:
+                events.append(("close", self.directory, run_index))
+
+    def gateway(directory, config, model, seed, **kwargs):
+        assert config is training and model == "reviewed-model" and seed == batches.SEED
+        assert kwargs == {"slots": 4, "attn_implementation": "flash_attention_3", "determinism": "off"}
+        return Transport(directory)
+
+    def pack(batch, **kwargs):
+        assert kwargs == {"model_provider": "huggingface"}
+        packed.append(batch)
+        return batch
+
+    monkeypatch.setattr(
+        checkpoint_resume, "GatewayTransport", gateway if not injected else _onboarding_storage_unexpected
+    )
+    monkeypatch.setattr(
+        checkpoint_resume,
+        "build_batch",
+        lambda name, size, tokens, vocab, *, seed: {
+            "arm": name,
+            "size": size,
+            "tokens": tokens,
+            "vocab": vocab,
+            "seed": seed,
+        },
+    )
+    monkeypatch.setattr(checkpoint_resume, "pack", pack)
+    arms = [
+        SimpleNamespace(name="gas1", global_batch_size=1, max_seq_len=128),
+        SimpleNamespace(name="gas4", global_batch_size=4, max_seq_len=128),
+    ]
+    options = {"transport_factory": Transport} if injected else {}
+    raw, worst = checkpoint_resume.measure_undeterministic_loss_range(
+        training,
+        "reviewed-model",
+        slots=4,
+        vocab_size=256,
+        arms=arms,
+        workdir=tmp_path,
+        attn_implementation="flash_attention_3",
+        **options,
+    )
+    assert training == original
+    assert len(packed) == 20
+    assert raw == 0.25 and worst == "gas4 loss at iteration 1"
+    gate = checkpoint_resume.loss_range_gate(raw, worst)
+    assert gate.multiplier == 2 and gate.absolute == 0.5 and gate.calibration_runs == 3
+    for transport in transports:
+        assert len(transport.runs) == 3
+        assert all(len(requests) == 10 for requests in transport.runs)
+        for requests in transport.runs:
+            assert [body["seed"] for body, _ in requests] == list(range(batches.SEED + 1, batches.SEED + 11))
+            assert all(rate == 1e-3 for _, rate in requests)
+        assert all(
+            transport.runs[0][index][0] is requests[index][0] for requests in transport.runs[1:] for index in range(10)
+        )
+    assert [event[0] for event in events] == ["enter", "job", "close", "job", "close", "job", "close", "exit"] * 2
+
+
+@pytest.mark.parametrize("failure", ["calibration", "validation", None])
+def test_cortex_checkpoint_calibration_uses_reviewed_fixture_off_and_owned_gateway(
+    _checkpoint_onboarding_calibration, monkeypatch, failure
+):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import hosted
+
+    args, config, path, original, calls = _checkpoint_onboarding_calibration
+    args.backend = "cortex"
+    args.base_url = "http://127.0.0.1:1"
+    native_before = config.native.model_dump()
+    config_before = args.config.read_bytes()
+    active = []
+    created = []
+    reviewed = []
+    published = []
+
+    @contextlib.contextmanager
+    def gateway(args):
+        active.append(True)
+        try:
+            yield "http://127.0.0.1:8123"
+        finally:
+            active.pop()
+            calls.append(("gateway-closed", None))
+
+    def fixture(backend, spec):
+        assert active == [True] and backend.base_url == "http://127.0.0.1:8123"
+        assert spec.model.cache_path == json.loads(original)["model"]["cache_path"]
+        reviewed.append(spec)
+        published.append({"model_name": spec.model.cache_path})
+        return published[-1]
+
+    def transport(backend, cfg, **kwargs):
+        assert active == [True] and cfg is config
+        assert backend.base_url == "http://127.0.0.1:8123"
+        assert kwargs == {
+            "model_name": json.loads(original)["model"]["cache_path"],
+            "attn_implementation": config.attention_implementation,
+            "determinism": "off",
+            "spec": reviewed[0],
+            "published_fixture": published[0],
+        }
+        assert kwargs["spec"] is reviewed[0] and kwargs["published_fixture"] is published[0]
+        created.append(kwargs)
+        return SimpleNamespace()
+
+    def measure(training, model, **kwargs):
+        assert active == [True] and path.read_bytes() == original
+        assert training is config.training
+        assert model == json.loads(original)["model"]["cache_path"] != config.model_name
+        assert kwargs["slots"] == config.n_gpus and kwargs["vocab_size"] == 256
+        kwargs["transport_factory"](args.output_dir / "gas1")
+        kwargs["transport_factory"](args.output_dir / "gas4")
+        if failure == "calibration":
+            raise RuntimeError("synthetic calibration failure")
+        return 0.1001, "gas4 loss at iteration 10"
+
+    def validation(args, selected, **kwargs):
+        assert active == [] and len(created) == 2
+        assert selected == {"layers": json.loads(original)["model"]["num_hidden_layers"]}
+        assert kwargs == {"phase": "phase 2/2"}
+        if failure == "validation":
+            raise RuntimeError("synthetic validation failure")
+        return _fixed_tolerance_onboarding_regression("pass")(args, selected)
+
+    monkeypatch.setattr(onboard, "_validation_gateway", gateway)
+    monkeypatch.setattr(cortex, "load_local_fixture", fixture)
+    monkeypatch.setattr(hosted, "HostedTransport", transport)
+    monkeypatch.setattr(checkpoint_resume, "GatewayTransport", _onboarding_storage_unexpected)
+    monkeypatch.setattr(checkpoint_resume, "measure_undeterministic_loss_range", measure)
+    monkeypatch.setattr(onboard, "_run_final_regression", validation)
+    if failure:
+        with pytest.raises(RuntimeError, match=f"synthetic {failure} failure"):
+            onboard._onboard_checkpoint_resume(args, config)
+        assert path.read_bytes() == original
+    else:
+        assert onboard._onboard_checkpoint_resume(args, config) == 0
+        updated = json.loads(path.read_text())
+        before = json.loads(original)
+        assert updated["test_tolerances"]["checkpoint-resume-loss"]["absolute"] == 0.201
+        assert {k: v for k, v in updated.items() if k not in {"applicable_tests", "test_tolerances"}} == {
+            k: v for k, v in before.items() if k not in {"applicable_tests", "test_tolerances"}
+        }
+        assert {k: v for k, v in updated["test_tolerances"].items() if k != "checkpoint-resume-loss"} == before[
+            "test_tolerances"
+        ]
+    assert active == [] and ("gateway-closed", None) in calls
+    assert args.base_url == "http://127.0.0.1:1"
+    assert args.config.read_bytes() == config_before and config.native.model_dump() == native_before
+
+
+@pytest.mark.parametrize(
+    ("backend", "url", "pool", "full_model", "error"),
+    [
+        ("cortex", None, 4, False, None),
+        ("cortex-training", "http://127.0.0.1:8123", 4, False, None),
+        ("cortex", None, 3, False, "required 4 GPUs"),
+        ("cortex", "https://example.com", 4, False, "loopback"),
+        ("cortex", None, 4, True, "supervised Cortex"),
+        ("onprem", None, 4, False, "supervised Cortex"),
+    ],
+)
+def test_cortex_checkpoint_calibration_parent_admission_and_local_guards(
+    tmp_path, monkeypatch, backend, url, pool, full_model, error
+):
+    args, config, path = _fixed_tolerance_onboarding_prepared(tmp_path, "checkpoint-resume-loss")
+    args.backend = backend
+    args.base_url = url
+    args.gpu_pool = pool
+    args.local_cortex_fixture = True
+    args.local_gateway_full_model = full_model
+    args.source_checkpoint = config.model_name
+    args.tokens = None
+    args.reference_token_budget = None
+    before = path.read_bytes()
+    native_before = config.native.model_dump()
+    for name in ("BASE_URL", "HOST", "PAT"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
+    monkeypatch.setattr(onboard, "_resume_setup", lambda *a: None)
+    monkeypatch.setattr(dss_driver, "available_gpus", _onboarding_storage_unexpected)
+    monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", _onboarding_storage_unexpected)
+    reached = []
+    monkeypatch.setattr(onboard, "_onboard_checkpoint_resume", lambda *a: reached.append(True) or 0)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            onboard._parent(args)
+        assert reached == []
+    else:
+        assert onboard._parent(args) == 0 and reached == [True]
+        assert args.local_cortex_fixture and args._automatic_checkpoint_bridge
+        assert args.backend == "cortex"
+        assert getattr(args, "_automatic_cortex_gateway", False) is (url is None)
+    assert path.read_bytes() == before and config.native.model_dump() == native_before
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_cortex_checkpoint_calibration_bridge_environment_and_owned_close(tmp_path, monkeypatch, failure):
+    import os
+
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import execution
+
+    names = (cortex.LOCAL_NATIVE_FORWARD_ENV, cortex.LOCAL_CHECKPOINT_BRIDGE_ENV)
+    monkeypatch.setenv(names[0], "previous")
+    monkeypatch.delenv(names[1], raising=False)
+    events = []
+
+    @contextlib.contextmanager
+    def gateway(directory, **kwargs):
+        assert directory == tmp_path
+        assert kwargs == {"gateway_module": "arctic_platform.correctness.harness.gateway"}
+        assert [os.environ.get(name) for name in names] == ["1", "1"]
+        events.append("start")
+        try:
+            yield "http://127.0.0.1:8123"
+        finally:
+            events.append("close")
+
+    monkeypatch.setattr(execution, "local_cortex_gateway", gateway)
+    args = SimpleNamespace(_automatic_cortex_gateway=True, _automatic_checkpoint_bridge=True, output_dir=tmp_path)
+    try:
+        with onboard._validation_gateway(args) as url:
+            assert url == "http://127.0.0.1:8123"
+            if failure:
+                raise RuntimeError("synthetic gateway body")
+    except RuntimeError:
+        assert failure
+    assert events == ["start", "close"]
+    assert [os.environ.get(name) for name in names] == ["previous", None]
+
+
+@pytest.mark.parametrize("width", [None, 8])
+def test_cortex_checkpoint_calibration_final_command_uses_bridge_and_frozen_spec(tmp_path, monkeypatch, width):
+    from arctic_platform.correctness.harness.execution import parse_args
+
+    args = parse_args(
+        [
+            "onboard",
+            "--config",
+            str(tmp_path / "input.config"),
+            "--test-id",
+            "checkpoint-resume-loss",
+            "--test-spec",
+            str(tmp_path / "reviewed.json"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--backend",
+            "cortex",
+        ]
+    )
+    args.checkpoint_training_gpus = width
+    args.checkout_root = tmp_path
+    for name in ("BASE_URL", "HOST", "PAT"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    onboard._configure_fixture_target(args, SimpleNamespace(is_rl=False), [args.test_id])
+    captured = []
+
+    @contextlib.contextmanager
+    def gateway(args):
+        assert args._automatic_checkpoint_bridge and args.local_cortex_fixture
+        yield "http://127.0.0.1:8123"
+
+    def process(command, **kwargs):
+        captured.append(command)
+        output = Path(command[command.index("--out") + 1])
+        (output / "report.json").write_text(json.dumps({"totals": {"pass": 2, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO(), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard, "_validation_gateway", gateway)
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    parsed = parse_args(captured[0][3:])
+    assert parsed.backend == "cortex" and parsed.base_url == "http://127.0.0.1:8123"
+    assert parsed.test == ["checkpoint-resume-loss"]
+    assert parsed.test_spec == args.test_spec and parsed.local_cortex_fixture
+    assert not parsed.local_gateway_full_model
+    assert parsed.checkpoint_training_gpus == width
+
+
+@pytest.mark.parametrize("width", [None, 4, 8])
+def test_cortex_checkpoint_calibration_preserves_nondefault_reviewed_arms(tmp_path, monkeypatch, width):
+    args, config, path = _fixed_tolerance_onboarding_prepared(tmp_path, "checkpoint-resume-loss")
+    args.checkpoint_training_gpus = width
+    args.gpu_pool = 8
+    raw = json.loads(path.read_text())
+    raw["arms"] = [
+        {
+            "name": name,
+            "global_batch_size": rows,
+            "max_seq_len": 512,
+            "total_tokens": rows * 512,
+            "active_tokens": rows * 512,
+            "dss_microbatches": count,
+            "pad_fraction": 0.0,
+        }
+        for name, rows, count in (("gas1", 1, 1), ("gas4", 16, 4))
+    ]
+    path.write_text(json.dumps(raw))
+    original = path.read_bytes()
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoConfig=SimpleNamespace(from_pretrained=lambda *a, **kw: SimpleNamespace(vocab_size=256))),
+    )
+    captured = []
+
+    def measure(training, model, **kwargs):
+        assert path.read_bytes() == original
+        assert kwargs["slots"] == (width or config.n_gpus)
+        assert training["n_gpus"] == (width or config.n_gpus)
+        captured.extend((arm.name, arm.global_batch_size, arm.max_seq_len) for arm in kwargs["arms"])
+        return 0.01, "gas4 loss at iteration 1"
+
+    monkeypatch.setattr(checkpoint_resume, "measure_undeterministic_loss_range", measure)
+    monkeypatch.setattr(onboard, "_run_final_regression", _fixed_tolerance_onboarding_regression("pass"))
+    assert onboard._onboard_checkpoint_resume(args, config) == 0
+    multiple = (width or config.n_gpus) // config.n_gpus
+    assert captured == [("gas1", multiple, 512), ("gas4", 16 * multiple, 512)]
+    assert json.loads(path.read_text())["arms"] == raw["arms"]
+
+
+@pytest.mark.parametrize(
+    "width,pool,test_id,is_rl,error",
+    [
+        (0, 8, "checkpoint-resume-loss", False, "positive integer"),
+        (True, 8, "checkpoint-resume-loss", False, "positive integer"),
+        (6, 8, "checkpoint-resume-loss", False, "whole multiple"),
+        (8, 4, "checkpoint-resume-loss", False, "exceeds GPU pool"),
+        (8, 8, "single-step-grads", False, "supervised checkpoint"),
+        (8, 8, "checkpoint-resume-loss", True, "supervised checkpoint"),
+    ],
+)
+def test_checkpoint_onboarding_placement_rejects_invalid_requests(tmp_path, width, pool, test_id, is_rl, error):
+    args, config, path = _fixed_tolerance_onboarding_prepared(tmp_path, "checkpoint-resume-loss")
+    args.checkpoint_training_gpus = width
+    args.gpu_pool = pool
+    args.test_id = test_id
+    if is_rl:
+        config = SimpleNamespace(is_rl=True)
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match=error):
+        onboard._checkpoint_placement(args, config)
+    assert path.read_bytes() == original
+
+
+def test_cortex_checkpoint_calibration_does_not_expand_rl_fixture_admission(monkeypatch):
+    args = SimpleNamespace(backend="cortex", test_id="single-step-grads")
+    onboard._configure_fixture_target(args, SimpleNamespace(is_rl=True), [args.test_id])
+    assert vars(args) == {"backend": "cortex", "test_id": "single-step-grads"}
+
+
+@pytest.fixture
+def _cortex_checkpoint_rl_config(tmp_path):
+    args, _, path = _fixed_tolerance_onboarding_prepared(tmp_path, "checkpoint-resume-loss")
+    raw = json.loads(args.config.read_text())
+    raw["sampling_gpus"] = 4
+    raw["sampling"] = {"vllm": {"tensor_parallel_size": 2}, "arctic_inference_config": None}
+    args.config.write_text(json.dumps(raw))
+    _fixed_tolerance_onboarding_write_spec(args.config, path)
+    config = load_config(args.config)
+    assert config.is_rl and config.native.training_gpus == 4 and config.native.sampling_gpus == 4
+    args.backend = "cortex"
+    args.base_url = "http://127.0.0.1:8123"
+    return args, config, path
+
+
+def test_cortex_checkpoint_rl_calibration_preserves_native_sampling_and_off(_cortex_checkpoint_rl_config, monkeypatch):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import hosted
+
+    args, config, path = _cortex_checkpoint_rl_config
+    previous = path.read_bytes()
+    native_before = config.native.model_dump()
+    seen = []
+    reviewed = []
+    published = []
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoConfig=SimpleNamespace(from_pretrained=lambda *a, **kw: SimpleNamespace(vocab_size=256))),
+    )
+
+    def fixture(backend, spec):
+        assert backend.base_url == args.base_url
+        reviewed.append(spec)
+        published.append({"model_name": spec.model.cache_path})
+        return published[-1]
+
+    def transport(backend, cfg, **kwargs):
+        assert cfg is config
+        assert kwargs == {
+            "model_name": json.loads(previous)["model"]["cache_path"],
+            "attn_implementation": config.attention_implementation,
+            "determinism": "off",
+            "preserve_native_topology": True,
+            "spec": reviewed[0],
+            "published_fixture": published[0],
+        }
+        assert kwargs["spec"] is reviewed[0] and kwargs["published_fixture"] is published[0]
+        assert cfg.native.sampling.model_dump() == native_before["sampling"]
+        seen.append(kwargs)
+        return SimpleNamespace()
+
+    def measure(training, model, **kwargs):
+        assert training is config.training and path.read_bytes() == previous
+        assert [(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in kwargs["arms"]] == [
+            (arm["name"], arm["global_batch_size"], arm["max_seq_len"]) for arm in json.loads(previous)["arms"]
+        ]
+        kwargs["transport_factory"](args.output_dir / "gas1")
+        return 0.1001, "gas1 loss at iteration 1"
+
+    monkeypatch.setattr(cortex, "load_local_fixture", fixture)
+    monkeypatch.setattr(hosted, "HostedTransport", transport)
+    monkeypatch.setattr(checkpoint_resume, "measure_undeterministic_loss_range", measure)
+    monkeypatch.setattr(onboard, "_run_final_regression", _fixed_tolerance_onboarding_regression("pass"))
+    assert onboard._onboard_checkpoint_resume(args, config) == 0
+    assert len(seen) == 1 and config.native.model_dump() == native_before
+    assert json.loads(path.read_text())["test_tolerances"]["checkpoint-resume-loss"]["absolute"] == 0.201
+
+
+@pytest.mark.parametrize(
+    ("pool", "url", "full_model", "error"),
+    [
+        (8, None, False, None),
+        (7, None, False, "required 8 GPUs"),
+        (8, "https://example.com", False, "loopback"),
+        (8, None, True, "checkpoint-resume"),
+    ],
+)
+def test_cortex_checkpoint_rl_calibration_parent_preserves_whole_allocation_guards(
+    _cortex_checkpoint_rl_config, monkeypatch, tmp_path, pool, url, full_model, error
+):
+    args, config, path = _cortex_checkpoint_rl_config
+    args.base_url = url
+    args.gpu_pool = pool
+    args.local_gateway_full_model = full_model
+    args.source_checkpoint = config.model_name
+    args.tokens = None
+    args.reference_token_budget = None
+    before = path.read_bytes()
+    native_before = config.native.model_dump()
+    for name in ("BASE_URL", "HOST", "PAT"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
+    monkeypatch.setattr(onboard, "_resume_setup", lambda *a: None)
+    monkeypatch.setattr(dss_driver, "available_gpus", _onboarding_storage_unexpected)
+    monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", _onboarding_storage_unexpected)
+    reached = []
+    monkeypatch.setattr(onboard, "_onboard_checkpoint_resume", lambda *a: reached.append(True) or 0)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            onboard._parent(args)
+        assert reached == []
+    else:
+        assert onboard._parent(args) == 0 and reached == [True]
+        assert args.local_cortex_fixture and args._automatic_cortex_gateway and args._automatic_checkpoint_bridge
+    assert path.read_bytes() == before and config.native.model_dump() == native_before
 
 
 # Local Cortex compact reference publication.
@@ -3260,8 +3942,10 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
         assert args.test_spec.read_bytes() == state.previous
         assert kwargs["select"] == ["single-step-optimizer"]
         assert kwargs["prepare_references"] is True
-        assert kwargs["reference_calibration_runs"] == 5
-        assert kwargs["reference_calibration_workers"] == args.reference_calibration_workers
+        assert kwargs["reference_calibration_runs"] == 8
+        assert kwargs[
+            "reference_calibration_workers"
+        ] == _fixed_tolerance_onboarding_SPEC.reference_calibration_worker_count(args.reference_calibration_workers)
         assert kwargs["reference_token_budget"] == 64
         assert isinstance(kwargs["client_backend"], CortexConfig)
         staging = kwargs["reference_records_dir"]
@@ -3324,7 +4008,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                 "status": "reviewed",
                 "provenance": {
                     "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
-                    "calibration_runs": 5,
+                    "calibration_runs": 8,
                     "maximum_pairwise_norm_delta": spread,
                     "worst_quantity": "layer.weight::exp_avg",
                     "multiplier": 4,
@@ -3334,7 +4018,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
             if state.failure == "legacy-provenance":
                 gate["provenance"] = "retained full-tensor gate"
             if state.failure == "wrong-runs":
-                gate["provenance"]["calibration_runs"] = 8
+                gate["provenance"]["calibration_runs"] = 16
             if state.failure == "wrong-gate":
                 gate["absolute"] = 0.002
             if state.failure == "negative-spread":
@@ -3395,7 +4079,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
     return state
 
 
-@pytest.mark.parametrize("workers", [1, 8])
+@pytest.mark.parametrize("workers", [None, 1, 8])
 def test_local_cortex_optimizer_scalar_norm_publication_preserves_test1_and_per_arm_gates(
     _local_cortex_optimizer_onboarding, workers
 ):
@@ -3422,7 +4106,7 @@ def test_local_cortex_optimizer_scalar_norm_publication_preserves_test1_and_per_
         assert record["identity"] == receipt["identity"]
         assert record["measurements"]["optimizer_norm_gate"] == receipt["gate"]
         assert receipt["gate"]["absolute"] == (0.001 if name == "gas1" else 0.004)
-        assert receipt["gate"]["provenance"]["calibration_runs"] == 5
+        assert receipt["gate"]["provenance"]["calibration_runs"] == 8
     assert list(state.args.reference_records_dir.glob(".optimizer-onboarding-*")) == []
 
 
@@ -3487,14 +4171,14 @@ def test_local_cortex_optimizer_scalar_norm_rejects_unreviewed_fixture_before_ca
     assert not (state.args.output_dir / "onboarding-t02.json").exists()
 
 
-@pytest.mark.parametrize(("runs", "workers"), [(16, 1), (8, 8), (0, 8), (5, 0), (5, 9)])
+@pytest.mark.parametrize(("runs", "workers"), [(5, 1), (16, 8), (0, 8), (8, 0), (8, 9)])
 def test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before_reference(
     _local_cortex_optimizer_onboarding, runs, workers
 ):
     state = _local_cortex_optimizer_onboarding
     state.args.reference_calibration_runs = runs
     state.args.reference_calibration_workers = workers
-    with pytest.raises(ValueError, match="5 repeats"):
+    with pytest.raises(ValueError, match="8 repeats|1 to 8 HF workers"):
         onboard._parent(state.args)
     assert state.events == []
     assert state.args.test_spec.read_bytes() == state.previous
@@ -3817,3 +4501,195 @@ def test_onboarding_pretrained_omitted_layers_do_not_warn(
         )
         assert type(direct) is transformers.Qwen3ForCausalLM
         assert any(name.startswith("model.layers.1.") for name in info["unexpected_keys"])
+
+
+# Shared Qwen4 reference residency sizing (new controls only).
+
+
+@pytest.fixture
+def _qwen4_residency_new_architecture(monkeypatch):
+    import transformers as runtime_transformers
+
+    from .check_lora_training import _qwen4_reference_TinyQwen4
+
+    observed = []
+
+    def construct(cfg):
+        model = _qwen4_reference_TinyQwen4()
+        observed.append(model)
+        assert all(parameter.device.type == "meta" for parameter in model.parameters())
+        if hasattr(cfg, "table_shape"):
+            model.layers[0].ple.ple_embedding.ngram_embedding = torch.nn.Embedding(*cfg.table_shape)
+        if getattr(cfg, "tie", False):
+            model.lm_head.weight = model.layers[0].ple.ple_embedding.ngram_embedding.weight
+        if getattr(cfg, "prefrozen", False):
+            model.layers[0].ple.key_proj.weight.requires_grad_(False)
+        if getattr(cfg, "large_trainable", False):
+            model.routed_experts = torch.nn.Parameter(torch.empty(cfg.num_hidden_layers * 2**30))
+        if getattr(cfg, "malformed", False):
+            del model.layers[0].ple
+        return model
+
+    monkeypatch.setattr(runtime_transformers, "Qwen4ResidencyTiny", construct, raising=False)
+    return observed
+
+
+def _qwen4_residency_new_config(model_type="qwen4_exp", **kwargs):
+    return SimpleNamespace(model_type=model_type, architectures=["Qwen4ResidencyTiny"], **kwargs)
+
+
+@pytest.mark.parametrize("family", ["qwen4_exp", "qwen4_exp_text"])
+def test_qwen4_residency_new_meta_pool_bytes_match_runtime_policy(_qwen4_residency_new_architecture, family):
+    from dataclasses import FrozenInstanceError
+    from dataclasses import asdict
+
+    from arctic_platform.correctness.reference.qwen4_reference import qwen4_parameter_policy
+
+    cfg = _qwen4_residency_new_config(family)
+    before = vars(cfg).copy()
+    result = synth_model.reference_parameter_residency(cfg)
+    model = _qwen4_residency_new_architecture[0]
+    policy = qwen4_parameter_policy(model)
+    assert result.total_parameter_elements == 32
+    assert result.cpu_frozen_parameter_elements == 10
+    assert result.accelerator_frozen_parameter_elements == 4
+    assert result.accelerator_trainable_parameter_elements == 18
+    assert result.total_parameter_elements == sum(
+        (
+            result.cpu_frozen_parameter_elements,
+            result.accelerator_frozen_parameter_elements,
+            result.accelerator_trainable_parameter_elements,
+        )
+    )
+    assert result.cpu_frozen_weight_bytes == 20
+    assert result.accelerator_weight_bytes == 44
+    assert result.accelerator_live_gradient_bytes == 36
+    assert result.cpu_gradient_accumulator_bytes == 72
+    assert result.accelerator_buffer_bytes == 16
+    assert result.conservative_accelerator_parameter_charge_bytes == 152
+    assert all(parameter.dtype == torch.float32 and parameter.requires_grad for parameter in model.parameters())
+    assert (
+        sum(parameter.numel() for parameter in model.parameters() if id(parameter) in policy.cpu_parameter_ids) == 10
+    )
+    assert vars(cfg) == before
+    assert synth_model.count_parameters(cfg) == 32
+    assert "not-peak-runtime-or-optimizer-admission" in result.sizing_scope
+    assert json.loads(json.dumps(asdict(result)))["total_parameter_elements"] == 32
+    with pytest.raises(FrozenInstanceError):
+        result.total_parameter_elements = 0
+
+
+@pytest.mark.parametrize("change", ["tied", "prefrozen"])
+def test_qwen4_residency_new_partition_handles_ties_and_existing_freeze(_qwen4_residency_new_architecture, change):
+    cfg = _qwen4_residency_new_config(tie=change == "tied", prefrozen=change == "prefrozen")
+    result = synth_model.reference_parameter_residency(cfg)
+    assert result.cpu_frozen_parameter_elements == 10
+    if change == "tied":
+        assert result.total_parameter_elements == 22
+        assert result.accelerator_frozen_parameter_elements == 4
+        assert result.accelerator_trainable_parameter_elements == 8
+        assert result.conservative_accelerator_parameter_charge_bytes == 72
+    else:
+        assert result.total_parameter_elements == 32
+        assert result.accelerator_frozen_parameter_elements == 8
+        assert result.accelerator_trainable_parameter_elements == 14
+        assert result.conservative_accelerator_parameter_charge_bytes == 128
+    assert synth_model.count_parameters(cfg) == result.total_parameter_elements
+
+
+def test_qwen4_residency_new_full_table_shape_counts_without_payload(_qwen4_residency_new_architecture):
+    cfg = _qwen4_residency_new_config(table_shape=(320001536, 160))
+    result = synth_model.reference_parameter_residency(cfg)
+    assert result.cpu_frozen_parameter_elements == 51200245760
+    assert result.cpu_frozen_weight_bytes == 102400491520
+    assert result.total_parameter_elements == 51200245760 + 22
+    assert result.conservative_accelerator_parameter_charge_bytes == 152
+    table = _qwen4_residency_new_architecture[0].layers[0].ple.ple_embedding.ngram_embedding.weight
+    assert table.device.type == "meta" and table.shape == (320001536, 160)
+
+
+@pytest.mark.parametrize("rate", [8, 12])
+def test_qwen4_residency_new_generic_family_retains_all_parameter_charge(
+    _qwen4_residency_new_architecture, monkeypatch, rate
+):
+    from arctic_platform.correctness.reference import qwen4_reference
+
+    monkeypatch.setattr(qwen4_reference, "qwen4_parameter_policy", lambda *args: pytest.fail("Qwen4 policy used"))
+    result = synth_model.reference_parameter_residency(
+        _qwen4_residency_new_config("unrelated", prefrozen=True), bytes_per_param=rate
+    )
+    assert result.total_parameter_elements == 32
+    assert result.cpu_frozen_parameter_elements == 0
+    assert result.accelerator_frozen_parameter_elements == 4
+    assert result.accelerator_trainable_parameter_elements == 28
+    assert result.conservative_accelerator_parameter_charge_bytes == 32 * rate
+
+
+def test_qwen4_residency_new_missing_policy_cannot_fall_back_to_generic(_qwen4_residency_new_architecture):
+    cfg = _qwen4_residency_new_config(malformed=True)
+    with pytest.raises(ValueError, match="complete PLE/QSA"):
+        synth_model.reference_parameter_residency(cfg)
+
+
+def test_qwen4_residency_new_whole_blocks_use_residency_and_keep_full_identity(
+    _qwen4_residency_new_architecture, monkeypatch
+):
+    import copy
+
+    cfg = _qwen4_residency_new_config(
+        num_hidden_layers=16,
+        layer_types=["linear", "linear", "linear", "full"] * 4,
+        ple_layer_ids=[2],
+        hidden_size=2560,
+        table_shape=(320001536, 160),
+        large_trainable=True,
+    )
+    original = copy.deepcopy(vars(cfg))
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: copy.deepcopy(cfg))
+    original_reduce = synth_model.reduce_config
+    candidates = []
+
+    def reduce(source, n):
+        reduced, full, period = original_reduce(source, n)
+        candidates.append(reduced)
+        assert full == 16 and period == 4
+        assert len(reduced.layer_types) == n and reduced.ple_layer_ids == [2]
+        assert reduced.hidden_size == 2560 and reduced.table_shape == (320001536, 160)
+        return reduced, full, period
+
+    monkeypatch.setattr(synth_model, "reduce_config", reduce)
+    layers, parameters = synth_model.size_for_single_gpu("unloaded-source")
+    assert layers == 12
+    assert [candidate.num_hidden_layers for candidate in candidates] == [16, 12]
+    assert parameters == 51200245760 + 22 + 12 * 2**30
+    assert parameters == synth_model.count_parameters(candidates[-1])
+    assert parameters * synth_model.BYTES_PER_PARAM > synth_model.SINGLE_GPU_BUDGET_GIB * 1024**3
+    assert synth_model.SINGLE_GPU_BUDGET_GIB == 100.0
+    assert vars(cfg) == original
+
+
+def test_qwen4_residency_new_generic_sizing_preserves_count_api(monkeypatch):
+    cfg = _qwen4_residency_new_config("unrelated", num_hidden_layers=8, layer_types=["a", "b"] * 4)
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(
+        synth_model,
+        "reduce_config",
+        lambda source, n: (_qwen4_residency_new_config("unrelated", num_hidden_layers=n), 8, 2),
+    )
+    monkeypatch.setattr(synth_model, "count_parameters", lambda reduced: reduced.num_hidden_layers * 2**30)
+    monkeypatch.setattr(
+        synth_model, "reference_parameter_residency", lambda *args, **kwargs: pytest.fail("policy used")
+    )
+    assert synth_model.size_for_single_gpu("unloaded-source", budget_gib=32) == (4, 4 * 2**30)
+
+
+def test_qwen4_residency_new_no_fitting_whole_period_still_rejects(_qwen4_residency_new_architecture, monkeypatch):
+    cfg = _qwen4_residency_new_config(
+        num_hidden_layers=4,
+        layer_types=["a", "a", "a", "b"],
+        large_trainable=True,
+    )
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (cfg, 4, 4))
+    with pytest.raises(RuntimeError, match="no layer count fits"):
+        synth_model.size_for_single_gpu("unloaded-source", budget_gib=1)

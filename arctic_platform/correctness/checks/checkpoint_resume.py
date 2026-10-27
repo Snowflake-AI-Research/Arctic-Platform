@@ -239,11 +239,20 @@ def loss_range_gate(raw_range: float, worst: str) -> TestTolerance:
 
 
 def measure_undeterministic_loss_range(
-    training_config: dict, model_path: str, *, slots: int, vocab_size: int, arms, workdir, attn_implementation: str
+    training_config: dict,
+    model_path: str,
+    *,
+    slots: int,
+    vocab_size: int,
+    arms,
+    workdir,
+    attn_implementation: str,
+    transport_factory=None,
 ):
     """Three 10-step runs per case, determinism off. Returns the widest per-iteration loss range.
 
-    Every run consumes identical plain supervised requests, as the regression does.
+    Every run consumes identical plain supervised requests, as the regression does. An injected factory
+    receives the arm work directory and must supply a transport with determinism off.
     The regression keeps best-effort determinism and reads the gate this range selects.
     """
     provider = str(training_config.get("model_provider", "huggingface"))
@@ -251,15 +260,20 @@ def measure_undeterministic_loss_range(
     where = ""
     workdir.mkdir(parents=True, exist_ok=True)
     for arm in arms:
-        with GatewayTransport(
-            workdir / arm.name,
-            training_config,
-            model_path,
-            SEED,
-            slots=slots,
-            attn_implementation=attn_implementation,
-            determinism="off",
-        ) as transport:
+        transport = (
+            transport_factory(workdir / arm.name)
+            if transport_factory is not None
+            else GatewayTransport(
+                workdir / arm.name,
+                training_config,
+                model_path,
+                SEED,
+                slots=slots,
+                attn_implementation=attn_implementation,
+                determinism="off",
+            )
+        )
+        with transport:
             batches = [
                 build_batch(arm.name, arm.global_batch_size, arm.max_seq_len, vocab_size, seed=SEED + iteration)
                 for iteration in range(1, CALIBRATION_STEPS + 1)

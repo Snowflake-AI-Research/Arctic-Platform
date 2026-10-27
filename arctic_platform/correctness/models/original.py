@@ -48,6 +48,7 @@ class OriginalModelMetadata:
     vocabulary_shape: tuple[int, ...] | None
     schema_sha256: str | None
     dtype_bytes: Mapping[str, int]
+    additional_config_ids: tuple[str, ...] = ()
 
 
 ORIGINAL_MODELS: Mapping[str, OriginalModelMetadata] = MappingProxyType(
@@ -102,6 +103,7 @@ ORIGINAL_MODELS: Mapping[str, OriginalModelMetadata] = MappingProxyType(
             vocabulary_shape=(248320, 2560),
             schema_sha256="1d55a6d3f64b1b2b004302864c0e74e11871ddf9f3481b10fc21fc8b0ec53d26",
             dtype_bytes=MappingProxyType({"BF16": 2, "I64": 8}),
+            additional_config_ids=("qwen3.8-flash-next-h200-train-sft-full-8gpus-sp8-256k",),
         ),
     }
 )
@@ -111,7 +113,10 @@ def _original_model(cfg: LoadedConfig, spec: TestSpec) -> OriginalModelMetadata:
     metadata = ORIGINAL_MODELS.get(cfg.model_name)
     if (
         metadata is None
-        or (metadata.config_id is not None and metadata.config_id != cfg.config_id)
+        or (
+            metadata.config_id is not None
+            and cfg.config_id not in (metadata.config_id, *metadata.additional_config_ids)
+        )
         or spec.model.source_checkpoint not in metadata.source_checkpoints
     ):
         raise ValueError("local full model mode requires a supported pinned original source")
@@ -138,7 +143,9 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
     schema_sha256 = metadata.schema_sha256
     dtype_bytes = metadata.dtype_bytes
     cache = require_data_fast_path(os.environ.get("HF_HUB_CACHE", ""), label="offline full model cache")
-    config_file = cached_file(cfg.model_name, "config.json", local_files_only=True)
+    config_file = cached_file(
+        cfg.model_name, "config.json", cache_dir=str(cache), revision=revision, local_files_only=True
+    )
     if not isinstance(config_file, str):
         raise ValueError("original full model config is not present in the offline cache")
     root = require_data_fast_path(Path(config_file).parent, label="offline full model snapshot")

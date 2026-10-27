@@ -21,11 +21,15 @@ import ast
 import asyncio
 import contextlib
 import hashlib
+import inspect
+import io
 import json
 import math
 import os
 import shutil
 import sys
+import threading
+import time
 import types
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -88,6 +92,404 @@ _cortex_optimizer_capture_CONFIG = (
 _cortex_optimizer_capture_SPEC = _cortex_optimizer_capture_ROOT / "specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json"
 
 _cortex_optimizer_capture_OPTIMIZER = {"name": "AdamW", "betas": [0.9, 0.999], "eps": 1e-08, "weight_decay": 0.0}
+
+
+def _callback_source_descriptor(callback):
+    path = Path(inspect.getsourcefile(inspect.unwrap(callback))).resolve()
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+@pytest.mark.parametrize("name", ["is_initialized", "get", "put"])
+def test_native_callback_accepts_installed_ray_wrappers_without_initializing_ray(name):
+    ray = pytest.importorskip("ray")
+    callback = getattr(ray, name)
+    capture.verify_native_callback(callback, _callback_source_descriptor(callback))
+
+
+def test_native_callback_keeps_contextmanager_support():
+    @contextmanager
+    def scope():
+        yield None
+
+    capture.verify_native_callback(scope, _callback_source_descriptor(scope))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_native_callback_accepts_installed_ray_actor_tracing(asynchronous, inherited):
+    ray = pytest.importorskip("ray")
+
+    class Coordinator:
+        if asynchronous:
+
+            async def save(self):
+                return "saved"
+
+        else:
+
+            def save(self):
+                return "saved"
+
+    actor = ray.remote(num_cpus=1, num_gpus=0)(Coordinator)
+    if inherited:
+        actor = ray.remote(num_cpus=1, num_gpus=0)(
+            type("InheritedCoordinator", (actor.__ray_metadata__.modified_class,), {})
+        )
+    callback = actor.__ray_metadata__.modified_class.save
+    original_signature = callback.__wrapped__.__signature__
+    capture.verify_native_callback(callback, _callback_source_descriptor(callback))
+    assert callback.__wrapped__.__signature__ is original_signature
+    assert not ray.is_initialized()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("class_roundtrip", [False, True])
+def test_native_callback_accepts_serialized_ray_actor_tracing(asynchronous, class_roundtrip):
+    ray = pytest.importorskip("ray")
+    cloudpickle = pytest.importorskip("ray.cloudpickle")
+
+    class Coordinator:
+        if asynchronous:
+
+            async def save(self):
+                return "saved"
+
+        else:
+
+            def save(self):
+                return "saved"
+
+    actor_class = ray.remote(num_cpus=1, num_gpus=0)(Coordinator).__ray_metadata__.modified_class
+    descriptor = _callback_source_descriptor(actor_class.save)
+    original = actor_class if class_roundtrip else actor_class.save
+    restored = cloudpickle.loads(cloudpickle.dumps(original))
+    callback = restored.save if class_roundtrip else restored
+    capture.verify_native_callback(callback, descriptor)
+    assert not ray.is_initialized()
+
+
+@pytest.fixture
+def native_scope_training_actor():
+    ray = pytest.importorskip("ray")
+
+    def build(*, asynchronous=False, inherited=False, serialized=False):
+        class Coordinator:
+            if asynchronous:
+
+                async def save(self):
+                    return "saved"
+
+            else:
+
+                def save(self):
+                    return "saved"
+
+        actor_class = ray.remote(num_cpus=1, num_gpus=0)(Coordinator).__ray_metadata__.modified_class
+        if inherited:
+            actor_class = ray.remote(num_cpus=1, num_gpus=0)(
+                type("SharedAdapterCoordinator", (actor_class,), {})
+            ).__ray_metadata__.modified_class
+        if serialized:
+            cloudpickle = pytest.importorskip("ray.cloudpickle")
+            actor_class = cloudpickle.loads(cloudpickle.dumps(actor_class))
+        owner = actor_class.__new__(actor_class)
+        owner._info = SimpleNamespace(
+            job_id="training-child",
+            layout=[SimpleNamespace(host="head", gpu_ids=[0, 1])],
+        )
+        owner._rank_hosts = ["head", "head"]
+        owner._workers = [
+            SimpleNamespace(_actor_id=SimpleNamespace(hex=lambda rank=rank: f"worker-{rank}")) for rank in range(2)
+        ]
+        return owner, _callback_source_descriptor(type(owner).save)
+
+    return build
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_native_scope_actor_workers_accepts_exact_native_save(
+    native_scope_training_actor, asynchronous, inherited, serialized
+):
+    owner, descriptor = native_scope_training_actor(
+        asynchronous=asynchronous, inherited=inherited, serialized=serialized
+    )
+    selected = capture._native_scope_actor_workers(owner, "training-child", descriptor)
+    assert selected == {
+        "workers": owner._workers,
+        "rank_hosts": ["head", "head"],
+        "actor_ids": ["worker-0", "worker-1"],
+    }
+    assert not sys.modules["ray"].is_initialized()
+
+
+@pytest.fixture
+def native_runtime_worker(native_scope_training_actor):
+    def build(*, asynchronous=False, inherited=False, serialized=False):
+        worker, training_source = native_scope_training_actor(
+            asynchronous=asynchronous, inherited=inherited, serialized=serialized
+        )
+
+        class Checkpointer:
+            def save_resumable(self):
+                return None
+
+            def save_adapters(self):
+                return None
+
+        class Optimizer:
+            def state_dict(self):
+                return {}
+
+            def backward(self):
+                return None
+
+        class Engine:
+            def save_checkpoint(self):
+                return None
+
+        worker._checkpointer = Checkpointer()
+        worker._engine = Engine()
+        worker._engine.optimizer = Optimizer()
+        sources = {
+            "training": training_source,
+            "expert_checkpointer": _callback_source_descriptor(Checkpointer.save_resumable),
+            "base_checkpointer": _callback_source_descriptor(Checkpointer.save_adapters),
+            "engine": _callback_source_descriptor(Engine.save_checkpoint),
+            "zero": _callback_source_descriptor(Optimizer.state_dict),
+            "zero_base": _callback_source_descriptor(Optimizer.backward),
+        }
+        return worker, sources
+
+    return build
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_native_runtime_sources_accepts_verified_ray_save(native_runtime_worker, asynchronous, inherited, serialized):
+    worker, sources = native_runtime_worker(asynchronous=asynchronous, inherited=inherited, serialized=serialized)
+    assert inspect.getsourcefile(type(worker).save) != sources["training"]["path"]
+    capture._native_runtime_sources(worker, sources)
+    assert not sys.modules["ray"].is_initialized()
+
+
+@pytest.mark.parametrize(
+    "role,owner,method",
+    [
+        ("training", "worker", "save"),
+        ("expert_checkpointer", "checkpointer", "save_resumable"),
+        ("base_checkpointer", "checkpointer", "save_adapters"),
+        ("engine", "engine", "save_checkpoint"),
+        ("zero", "optimizer", "state_dict"),
+        ("zero_base", "optimizer", "backward"),
+    ],
+)
+def test_native_runtime_sources_rejects_unrecognized_wrapper(native_runtime_worker, monkeypatch, role, owner, method):
+    worker, sources = native_runtime_worker(inherited=True, serialized=True)
+    selected = {
+        "worker": worker,
+        "checkpointer": worker._checkpointer,
+        "engine": worker._engine,
+        "optimizer": worker._engine.optimizer,
+    }[owner]
+    original = getattr(type(selected), method)
+
+    def replacement(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    replacement.__wrapped__ = original
+    monkeypatch.setattr(type(selected), method, replacement)
+    with pytest.raises(ValueError, match=f"native selected source origin mismatch: {role}"):
+        capture._native_runtime_sources(worker, sources)
+
+
+def test_native_runtime_sources_rejects_producer_hash_drift(native_runtime_worker):
+    worker, sources = native_runtime_worker(inherited=True, serialized=True)
+    sources["training"] = {**sources["training"], "sha256": "0" * 64}
+    with pytest.raises(ValueError, match="native producer source drift"):
+        capture._native_runtime_sources(worker, sources)
+
+
+@pytest.mark.parametrize("damage", ["child", "source", "instance-save", "rank-hosts", "duplicate-worker"])
+def test_native_scope_actor_workers_rejects_changed_selection(native_scope_training_actor, damage):
+    owner, descriptor = native_scope_training_actor()
+    child_id = "training-child"
+    if damage == "child":
+        child_id = "different-child"
+    elif damage == "source":
+        descriptor["sha256"] = "0" * 64
+    elif damage == "instance-save":
+
+        def substituted_save(self):
+            return "saved"
+
+        owner.save = types.MethodType(substituted_save, owner)
+    elif damage == "rank-hosts":
+        owner._rank_hosts = ["peer", "peer"]
+    else:
+        owner._workers[1]._actor_id = owner._workers[0]._actor_id
+    with pytest.raises(ValueError, match="selection|source|layout|distinct"):
+        capture._native_scope_actor_workers(owner, child_id, descriptor)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "dependency",
+        "builtin-shadow",
+        "builtins",
+        "extra-global",
+        "code",
+        "code-filename",
+        "closure",
+        "defaults",
+        "kwdefaults",
+        "metadata",
+        "hash",
+        "origin",
+    ],
+)
+def test_native_callback_rejects_altered_serialized_ray_actor_tracing(damage):
+    ray = pytest.importorskip("ray")
+    cloudpickle = pytest.importorskip("ray.cloudpickle")
+
+    @ray.remote(num_cpus=1, num_gpus=0)
+    class Coordinator:
+        def save(self):
+            return "saved"
+
+    callback = cloudpickle.loads(cloudpickle.dumps(Coordinator.__ray_metadata__.modified_class.save))
+    descriptor = _callback_source_descriptor(callback)
+    if damage == "hash":
+        descriptor["sha256"] = "0" * 64
+    elif damage == "origin":
+        descriptor = _callback_source_descriptor(capture.verify_native_callback)
+    else:
+        code, globals_dict, cells = callback.__code__, dict(callback.__globals__), callback.__closure__
+        defaults, kwdefaults = callback.__defaults__, callback.__kwdefaults__
+        if damage == "dependency":
+            globals_dict["_is_tracing_enabled"] = lambda: False
+        elif damage == "builtin-shadow":
+            globals_dict["getattr"] = lambda *args: None
+        elif damage == "builtins":
+            globals_dict["__builtins__"] = dict(callback.__builtins__)
+        elif damage == "extra-global":
+            globals_dict["unrelated"] = object()
+        elif damage == "code":
+            code = code.replace(co_consts=(*code.co_consts, "changed"))
+        elif damage == "code-filename":
+            code = code.replace(co_filename="/tmp/not-the-installed-ray-wrapper.py")
+        elif damage == "closure":
+            cells = tuple((lambda value: lambda: value)(object()).__closure__[0] for cell in cells)
+        elif damage == "defaults":
+            defaults = (object(),)
+        elif damage == "kwdefaults":
+            kwdefaults = {"_ray_trace_ctx": object()}
+        altered = types.FunctionType(code, globals_dict, callback.__name__, defaults, cells)
+        altered.__dict__.update(callback.__dict__)
+        altered.__kwdefaults__ = kwdefaults
+        altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
+        if damage == "metadata":
+            altered.__wrapped__ = lambda: "saved"
+        callback = altered
+    with pytest.raises(ValueError, match="wrapper|source"):
+        capture.verify_native_callback(callback, descriptor)
+
+
+@pytest.mark.parametrize("damage", ["metadata", "closure", "globals", "code", "hash", "origin"])
+def test_native_callback_rejects_altered_ray_actor_tracing(damage):
+    ray = pytest.importorskip("ray")
+
+    @ray.remote(num_cpus=1, num_gpus=0)
+    class Coordinator:
+        def save(self):
+            return "saved"
+
+    callback = Coordinator.__ray_metadata__.modified_class.save
+    descriptor = _callback_source_descriptor(callback)
+    if damage == "hash":
+        descriptor["sha256"] = "0" * 64
+    elif damage == "origin":
+        descriptor = _callback_source_descriptor(capture.verify_native_callback)
+    else:
+        code, globals_dict, cells = callback.__code__, callback.__globals__, callback.__closure__
+        if damage == "closure":
+            cells = tuple((lambda value: lambda: value)(object()).__closure__[0] for cell in cells)
+        elif damage == "globals":
+            globals_dict = dict(globals_dict)
+        elif damage == "code":
+
+            def unrelated_wrapper(method):
+                def wrapper(*args, **kwargs):
+                    return method(*args, **kwargs)
+
+                return wrapper
+
+            code = unrelated_wrapper(None).__code__
+        altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
+        altered.__dict__.update(callback.__dict__)
+        altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
+        if damage == "metadata":
+            altered.__wrapped__ = lambda: "saved"
+        callback = altered
+    with pytest.raises(ValueError, match="wrapper|source"):
+        capture.verify_native_callback(callback, descriptor)
+
+
+@pytest.mark.parametrize("damage", ["metadata", "closure", "globals", "code", "stale-public", "hash", "origin"])
+def test_native_callback_rejects_altered_ray_wrappers(monkeypatch, damage):
+    ray = pytest.importorskip("ray")
+    callback = ray.is_initialized
+    descriptor = _callback_source_descriptor(callback)
+    if damage == "hash":
+        descriptor["sha256"] = "0" * 64
+    elif damage == "origin":
+        descriptor = _callback_source_descriptor(test_native_callback_keeps_contextmanager_support)
+    elif damage == "stale-public":
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    else:
+        cells = callback.__closure__
+        globals_dict = callback.__globals__
+        code = callback.__code__
+        if damage == "closure":
+            cells = tuple(
+                (lambda value: lambda: value)(object()).__closure__[0] if name == "ray" else cell
+                for name, cell in zip(code.co_freevars, cells, strict=True)
+            )
+        elif damage == "globals":
+            globals_dict = dict(globals_dict)
+        elif damage == "code":
+
+            def unrelated_wrapper(func, ray):
+                def wrapper(*args, **kwargs):
+                    return ray if args else func(*args, **kwargs)
+
+                return wrapper
+
+            code = unrelated_wrapper(None, None).__code__
+        altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
+        altered.__dict__.update(callback.__dict__)
+        altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
+        if damage == "metadata":
+            altered.__wrapped__ = lambda: False
+        monkeypatch.setattr(ray, "is_initialized", altered)
+        callback = altered
+    with pytest.raises(ValueError, match="wrapper|Ray|source"):
+        capture.verify_native_callback(callback, descriptor)
+
+
+def test_native_callback_rejects_cyclic_contextmanager():
+    @contextmanager
+    def scope():
+        yield None
+
+    descriptor = _callback_source_descriptor(scope)
+    scope.__wrapped__ = scope
+    scope.__closure__[0].cell_contents = scope
+    with pytest.raises(ValueError, match="unsupported wrapper"):
+        capture.verify_native_callback(scope, descriptor)
 
 
 @pytest.fixture(autouse=False)
@@ -439,7 +841,7 @@ def test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_bud
             cancels.append(transport.job_id)
             return {}
         if url.endswith("/save"):
-            assert kwargs["json"] == {"checkpoint_type": "resumable", "export_hf": False}
+            assert kwargs["json"] == {"checkpoint_type": "resumable"}
             step = counts[transport.job_id]
             record(transport.job_id, f"save-{step}")
             result = {"stage_path": f"@stage/checkpoints/cp_{transport.job_id.rsplit('-', 1)[-1]}-{step}/"}
@@ -1517,7 +1919,12 @@ def test_dss_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_co
 def test_dss_driver_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypatch) -> None:
     from arctic_platform.correctness.harness import runner
 
-    cfg = SimpleNamespace(training={"peft_config": {"peft_type": "LORA"}}, n_gpus=1)
+    cfg = SimpleNamespace(
+        model_name="Qwen/Qwen3-8B",
+        training={"peft_config": {"peft_type": "LORA"}},
+        sub_job={},
+        n_gpus=1,
+    )
     cfg.at_gpu_width = lambda width: cfg
     source = tmp_path / "checkpoint" / "hf"
     source.mkdir(parents=True)
@@ -1614,7 +2021,6 @@ def _dss_driver_optimizer_capture_initializer(monkeypatch):
     from arctic_platform.correctness.harness import optimizer_capture
 
     class Worker:
-
         def initialize(self, master_addr, job_config):
             self.production_initialization = (master_addr, job_config)
             return True
@@ -1827,7 +2233,7 @@ def test_dss_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pi
 
 @pytest.mark.parametrize("auth_mode", [None, "disabled", "token", "legacy-mode"])
 @pytest.mark.parametrize("slots", [8, 16])
-def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch, auth_mode, slots) -> None:
+def test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(monkeypatch, auth_mode, slots) -> None:
     import torch
 
     from arctic_platform.correctness.harness import dss_driver
@@ -1838,7 +2244,7 @@ def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkey
         monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
     else:
         monkeypatch.setenv("RAY_AUTH_MODE", auth_mode)
-    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", lambda: events.append("clean"))
+    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: events.append("verify"))
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
     class RayCluster:
@@ -1870,12 +2276,12 @@ def test_dss_driver_gateway_runtime_cleans_before_and_after_standard_port(monkey
         assert RayCluster._HOSTFILE == selected_hostfile
         events.append(("body", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
     assert events == [
+        "verify",
         ("load", "29500", auth_mode),
-        "clean",
         ("start", False, selected_hostfile, "29500", auth_mode),
         ("body", "29500", auth_mode),
         ("shutdown", selected_hostfile),
-        "clean",
+        "verify",
     ]
     assert os.environ["MASTER_PORT"] == "12345"
     assert os.environ.get("RAY_AUTH_MODE") == auth_mode
@@ -1902,7 +2308,7 @@ def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch,
     ray._shutdown = lambda: shutdown_hostfiles.append(ray._HOSTFILE)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
     monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
-    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", lambda: None)
+    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: None)
     monkeypatch.delenv("MASTER_PORT", raising=False)
     with pytest.raises(RuntimeError) as caught:
         with _gateway_runtime(8):
@@ -1911,6 +2317,50 @@ def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch,
     assert shutdown_hostfiles == [os.devnull]
     assert ray._HOSTFILE == "/job/hostfile"
     assert "MASTER_PORT" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "environment,existing,expected",
+    [
+        (
+            {"DSS_GATEWAY_HOSTFILE": "/selected/dss", "ARCTIC_HOSTFILE": "/selected/arctic"},
+            {"/selected/dss", "/selected/arctic", "/data-fast/hostfile", "/job/hostfile"},
+            "/selected/dss",
+        ),
+        (
+            {"ARCTIC_HOSTFILE": "/selected/arctic"},
+            {"/selected/arctic", "/data-fast/hostfile", "/job/hostfile"},
+            "/selected/arctic",
+        ),
+        ({}, {"/data-fast/hostfile", "/job/hostfile"}, "/data-fast/hostfile"),
+        ({}, {"/job/hostfile"}, "/job/hostfile"),
+        ({}, set(), None),
+        ({"DSS_GATEWAY_HOSTFILE": "/missing"}, {"/job/hostfile"}, "/job/hostfile"),
+    ],
+    ids=["dss-precedence", "arctic", "fast-precedence", "job-fallback", "local-only", "missing-env"],
+)
+def test_dss_driver_selected_hostfile_is_shared_by_gateway_and_allocation(
+    monkeypatch, environment, existing, expected
+) -> None:
+    from arctic_platform.correctness.harness import dss_driver
+
+    monkeypatch.delenv("DSS_GATEWAY_HOSTFILE", raising=False)
+    monkeypatch.delenv("ARCTIC_HOSTFILE", raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) in existing)
+    selected = dss_driver._allocation_hostfile()
+    assert selected == (Path(expected) if expected else None)
+    commands = []
+
+    def command(arguments, **kwargs):
+        commands.append(arguments)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(dss_driver.subprocess, "run", command)
+    dss_driver._run_on_allocation("readonly-selection-check")
+    arguments = commands[0]
+    assert arguments[1:3] == (["-f", expected] if expected else ["-lc", "readonly-selection-check"])
 
 
 def test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:
@@ -1927,49 +2377,104 @@ def test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch,
 
     monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
     monkeypatch.setattr(dss_driver.subprocess, "run", run)
-    dss_driver._run_on_allocation("ray stop --force")
+    dss_driver._run_on_allocation("readonly-check")
     assert captured["command"][1:3] == ["-f", str(hostfile)]
     assert captured["command"][0].endswith("/ds_ssh")
-    assert captured["command"][3] == "ray stop --force"
+    assert captured["command"][3] == "readonly-check"
     assert captured["kwargs"] == {"capture_output": True, "text": True, "timeout": 180}
 
 
-def test_dss_driver_runtime_cleanup_stops_ray_then_checks_processes_and_port(monkeypatch) -> None:
+def test_dss_driver_runtime_idle_check_only_checks_processes_and_port(monkeypatch) -> None:
     from arctic_platform.correctness.harness import dss_driver
 
     scripts = []
     monkeypatch.setattr(dss_driver, "_run_on_allocation", lambda script: scripts.append(script))
-    dss_driver._stop_and_verify_gateway_runtime()
-    assert len(scripts) == 2
-    assert scripts[0].endswith("/ray stop --force")
-    assert "pgrep -af" in scripts[1]
-    assert "29500" in scripts[1]
+    dss_driver._verify_gateway_runtime_idle()
+    assert len(scripts) == 1
+    assert "pgrep -af" in scripts[0]
+    assert "29500" in scripts[0]
+    assert all(command not in scripts[0] for command in ("stop", "kill", "pkill"))
+    assert "ray::" not in dss_driver._RAY_PROCESS_PATTERN
 
 
-def test_dss_driver_gateway_runtime_restores_port_when_preflight_fails(monkeypatch) -> None:
+@pytest.mark.parametrize("failure", [RuntimeError("port is still bound"), KeyboardInterrupt("preflight interrupted")])
+def test_dss_driver_gateway_runtime_refuses_preflight_without_foreign_teardown(monkeypatch, failure) -> None:
     from arctic_platform.correctness.harness import dss_driver
 
-    calls = 0
+    calls = []
 
-    def cleanup():
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("port is still bound")
+    def verify():
+        calls.append("verify")
+        raise failure
 
     monkeypatch.setenv("MASTER_PORT", "12345")
-    ray = SimpleNamespace(_HOSTFILE="/job/hostfile", init_ray_cluster=lambda **kwargs: None, _shutdown=lambda: None)
+    ray = SimpleNamespace(
+        _HOSTFILE="/job/hostfile",
+        init_ray_cluster=lambda **kwargs: calls.append("start"),
+        _shutdown=lambda: calls.append("foreign-shutdown"),
+    )
+
+    def load():
+        calls.append("load")
+        return ray
+
     monkeypatch.setattr(
         dss_driver,
         "_load_gateway_ray_cluster",
-        lambda: ray,
+        load,
     )
-    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
-    with pytest.raises(RuntimeError, match="port is still bound"):
+    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", verify)
+    with pytest.raises(type(failure)) as caught:
         with _gateway_runtime(1):
             pytest.fail("preflight must fail before launch")
+    assert caught.value is failure
+    assert calls == ["verify"]
     assert os.environ["MASTER_PORT"] == "12345"
     assert ray._HOSTFILE == "/job/hostfile"
+
+
+@pytest.mark.parametrize("probe_status", [0, 1, 2], ids=["occupied", "idle", "probe-error"])
+def test_dss_driver_runtime_idle_check_requires_successful_process_inventory(monkeypatch, tmp_path, probe_status):
+    import subprocess
+
+    from arctic_platform.correctness.harness import dss_driver
+
+    interpreter = tmp_path / "port-probe"
+    interpreter.write_text("#!/bin/sh\nprintf 'PORT_CHECK\\n'\n")
+    interpreter.chmod(0o700)
+    monkeypatch.setattr(dss_driver, "sys", SimpleNamespace(executable=str(interpreter)))
+    scripts = []
+    monkeypatch.setattr(dss_driver, "_run_on_allocation", lambda script: scripts.append(script))
+    dss_driver._verify_gateway_runtime_idle()
+    result = subprocess.run(
+        ["bash", "-c", f"pgrep() {{ return {probe_status}; }}\n" + scripts[0]],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == (0 if probe_status == 1 else 1)
+    assert ("PORT_CHECK" in result.stdout) is (probe_status == 1)
+
+
+def test_dss_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(monkeypatch):
+    from arctic_platform.correctness.harness import dss_driver
+
+    calls = []
+    failure = RuntimeError("cluster import failed")
+
+    def load():
+        calls.append("load")
+        raise failure
+
+    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: calls.append("verify"))
+    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    with pytest.raises(RuntimeError) as caught:
+        with _gateway_runtime(1):
+            pytest.fail("cluster import must fail before launch")
+    assert caught.value is failure
+    assert calls == ["verify", "load"]
+    assert "MASTER_PORT" not in os.environ
 
 
 def test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path) -> None:
@@ -2007,7 +2512,8 @@ def test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatc
 
 
 @pytest.mark.parametrize("stage", ["shutdown", "verify"])
-def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(monkeypatch, stage):
+@pytest.mark.parametrize("primary", [None, RuntimeError("target failed")], ids=["success", "target-error"])
+def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(monkeypatch, stage, primary):
     from arctic_platform.correctness.harness import dss_driver
 
     failure = RuntimeError("owned runtime not clean")
@@ -2024,12 +2530,15 @@ def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(
 
     ray = SimpleNamespace(_HOSTFILE="/job/hostfile", init_ray_cluster=lambda **kwargs: None, _shutdown=shutdown)
     monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
-    monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", cleanup)
+    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", cleanup)
     monkeypatch.setenv("MASTER_PORT", "12345")
     with pytest.raises(dss_driver.UnsafeCleanupError) as caught:
         with dss_driver._gateway_runtime(1):
-            pass
+            if primary is not None:
+                raise primary
     assert caught.value.__cause__ is failure
+    if primary is not None:
+        assert failure.__context__ is primary
     assert os.environ["MASTER_PORT"] == "12345"
     assert calls == ["verify", "verify"]
     assert ray._HOSTFILE == "/job/hostfile"
@@ -2065,6 +2574,368 @@ def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path
 
 
 @pytest.fixture
+def _native_participation_worker(tmp_path, monkeypatch):
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(2, 2, bias=False)
+    model.head = torch.nn.Linear(2, 2, bias=False)
+    model.visual = torch.nn.Linear(2, 2, bias=False)
+    model.get_decoder = lambda: model.decoder
+    model.get_output_embeddings = lambda: model.head
+    engine = SimpleNamespace(module=model, global_steps=0)
+    pair = _native_ep_bf16_pair(tmp_path)
+
+    def save(engine, root, tag):
+        target = Path(root) / tag
+        target.mkdir(parents=True, exist_ok=True)
+        source = pair.before if engine.global_steps == 0 else pair.after
+        for path in (source / tag).glob("*.pt"):
+            shutil.copyfile(path, target / path.name)
+        return "saved"
+
+    checkpointer = SimpleNamespace(save_resumable=save)
+    worker = SimpleNamespace(job_id="child", _engine=engine, _checkpointer=checkpointer)
+    monkeypatch.setattr(decoder, "_native_runtime_sources", lambda *args: None)
+    monkeypatch.setattr(
+        decoder,
+        "_native_worker_layout",
+        lambda worker, root, tag, sources: _maintained_native_save_rows(pair, root, engine.global_steps)[0]["layout"],
+    )
+    return SimpleNamespace(worker=worker, model=model, pair=pair, root=tmp_path / "captured", save=save)
+
+
+def test_native_participation_collector_observes_backward_and_restores_all_hooks(_native_participation_worker):
+    case = _native_participation_worker
+    nonce = decoder.arm_native_optimizer_collector(
+        case.worker, parent_job_id="parent", training_child_id="child", source_files={}
+    )
+    case.worker._checkpointer.save_resumable(case.worker._engine, case.root, "global_step0")
+    (case.model.head(case.model.decoder(torch.ones(1, 2))) * 0).sum().backward()
+    case.worker._engine.global_steps = 1
+    case.worker._checkpointer.save_resumable(case.worker._engine, case.root, "global_step1")
+    after = json.loads((case.root / "global_step1/native_optimizer_layout/rank00000.json").read_text())
+    assert after["participation"]["parameters"]["decoder.weight"]["state"] == "active"
+    assert after["participation"]["parameters"]["visual.weight"]["state"] == "inactive"
+    assert after["candidate_weights"]["visual.weight"]["sha256"]
+    decoder.finish_native_optimizer_collector(case.worker, nonce)
+    assert case.worker._checkpointer.save_resumable is case.save
+    assert all(not parameter._backward_hooks for parameter in case.model.parameters())
+    assert not case.model.visual._forward_hooks
+
+
+def test_native_participation_collector_rejects_early_source_drift_and_still_closes(
+    _native_participation_worker, tmp_path, monkeypatch
+):
+    case = _native_participation_worker
+    source = tmp_path / "capture_source.py"
+    source.write_text("# initial source\n")
+    original = decoder.inspect.getsourcefile
+    monkeypatch.setattr(
+        decoder.inspect,
+        "getsourcefile",
+        lambda value: str(source) if value is decoder.tensor_digest else original(value),
+    )
+    nonce = decoder.arm_native_optimizer_collector(
+        case.worker, parent_job_id="parent", training_child_id="child", source_files={}
+    )
+    source.write_text("# changed source\n")
+    with pytest.raises(ValueError, match="participation source drift"):
+        case.worker._checkpointer.save_resumable(case.worker._engine, case.root, "global_step0")
+    assert not list(case.root.glob("*/native_optimizer_layout/*.json"))
+    decoder.finish_native_optimizer_collector(case.worker, nonce)
+    assert all(not parameter._backward_hooks for parameter in case.model.parameters())
+
+
+@pytest.mark.parametrize("damage", ["late", "constructor"])
+def test_native_participation_collector_arm_failure_does_not_leak_hooks(
+    _native_participation_worker, monkeypatch, damage
+):
+    case = _native_participation_worker
+    if damage == "late":
+        case.worker._engine.global_steps = 1
+    else:
+
+        def fail(*args):
+            raise RuntimeError("hook registration failed")
+
+        monkeypatch.setattr(case.model.visual, "register_forward_hook", fail)
+    with pytest.raises((ValueError, RuntimeError)):
+        decoder.arm_native_optimizer_collector(
+            case.worker, parent_job_id="parent", training_child_id="child", source_files={}
+        )
+    assert all(not parameter._backward_hooks for parameter in case.model.parameters())
+    assert decoder._COLLECTOR_STATE not in vars(case.worker)
+
+
+def test_automatic_participation_observes_zero_backward_and_accumulation(_native_participation_worker):
+    from arctic_platform.debug.correctness_participation import WorkerParticipation
+    from arctic_platform.debug.correctness_participation import merge_worker_receipts
+
+    case = _native_participation_worker
+    case.worker.rank = 0
+    capture = WorkerParticipation(case.worker)
+    try:
+        assert capture.before["participation"]["parameters"]["decoder.weight"]["state"] == "missing"
+        for _ in range(4):
+            (case.model.head(case.model.decoder(torch.ones(1, 2))) * 0).sum().backward()
+        case.worker._engine.global_steps = 1
+        receipt = capture.finish()
+        result = merge_worker_receipts([receipt], job_id="child", world_size=1)
+        assert result["training_child_id"] == "child"
+        assert result["parameters"]["decoder.weight"]["state"] == "active"
+        assert result["parameters"]["head.weight"]["state"] == "active"
+        assert result["parameters"]["visual.weight"]["state"] == "inactive"
+        assert result["rank_receipts"] == [receipt]
+    finally:
+        capture.close()
+    assert all(not parameter._backward_hooks for parameter in case.model.parameters())
+    assert not case.model.visual._forward_hooks
+
+
+@pytest.mark.parametrize("damage", ["no-backward", "source", "engine", "step", "inventory"])
+def test_automatic_participation_rejects_unobserved_or_changed_capture(_native_participation_worker, tmp_path, damage):
+    from arctic_platform.debug.correctness_participation import WorkerParticipation
+    from arctic_platform.debug.correctness_participation import merge_worker_receipts
+
+    case = _native_participation_worker
+    case.worker.rank = 0
+    capture = WorkerParticipation(case.worker)
+    try:
+        if damage != "no-backward":
+            case.model.head(case.model.decoder(torch.ones(1, 2))).sum().backward()
+        case.worker._engine.global_steps = 1
+        if damage == "source":
+            source = tmp_path / "drift.py"
+            source.write_text("# changed source\n")
+            capture.sources = {str(source): "0" * 64}
+        elif damage == "engine":
+            case.worker._engine = SimpleNamespace(module=case.model, global_steps=1)
+        elif damage == "step":
+            case.worker._engine.global_steps = 2
+        elif damage == "inventory":
+            case.model.register_parameter("new_weight", torch.nn.Parameter(torch.ones(2)))
+        with pytest.raises(ValueError):
+            merge_worker_receipts([capture.finish()], job_id="child", world_size=1)
+    finally:
+        capture.close()
+    assert all(not parameter._backward_hooks for parameter in case.model.parameters())
+
+
+def _automatic_participation_receipts(tmp_path, shapes, world_size):
+    from copy import deepcopy
+
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+
+    source = tmp_path / "capture.py"
+    source.write_text("# capture source\n")
+    sources = {str(source): hashlib.sha256(source.read_bytes()).hexdigest()}
+    before = {
+        "participation": {
+            "schema": PARTICIPATION_SCHEMA,
+            "parameters": {name: {"shape": list(shape), "state": "missing"} for name, shape in shapes.items()},
+        },
+        "candidate_weights": {},
+        "participation_sources": sources,
+    }
+    after = deepcopy(before)
+    for entry in after["participation"]["parameters"].values():
+        entry["state"] = "active"
+    return [
+        {"rank": rank, "job_id": "child", "before": deepcopy(before), "after": deepcopy(after)}
+        for rank in range(world_size)
+    ]
+
+
+@pytest.mark.parametrize(
+    "damage", ["empty", "rank", "bool-rank", "child", "before", "after", "sources", "inventory", "shape", "missing"]
+)
+def test_automatic_participation_rejects_incomplete_or_unbound_receipts(tmp_path, damage):
+    from arctic_platform.debug.correctness_participation import merge_worker_receipts
+
+    receipts = _automatic_participation_receipts(tmp_path, {"weight": [2]}, 2)
+    if damage == "empty":
+        receipts = []
+    elif damage == "rank":
+        receipts[1]["rank"] = 0
+    elif damage == "bool-rank":
+        receipts[1]["rank"] = True
+    elif damage == "child":
+        receipts[1]["job_id"] = "different-child"
+    elif damage in {"before", "after"}:
+        receipts[1][damage] = None
+    elif damage == "sources":
+        receipts[1]["after"]["participation_sources"] = {}
+    elif damage == "inventory":
+        receipts[1]["after"]["participation"]["parameters"] = {}
+    elif damage == "shape":
+        receipts[1]["after"]["participation"]["parameters"]["weight"]["shape"] = [3]
+    else:
+        for receipt in receipts:
+            receipt["after"]["participation"]["parameters"]["weight"]["state"] = "missing"
+    with pytest.raises(ValueError):
+        merge_worker_receipts(receipts, job_id="child", world_size=2)
+
+
+@pytest.mark.parametrize("damage", [None, "child", "source", "rank"])
+def test_automatic_participation_dense_decode_requires_actual_child_and_all_ranks(tmp_path, damage):
+    pair = _cortex_optimizer_decode_pair(tmp_path, world_size=2)
+    receipts = _automatic_participation_receipts(
+        tmp_path, {name: entry["exp_avg"].shape for name, entry in pair.expected.items()}, 2
+    )
+    if damage == "source":
+        Path(next(iter(receipts[0]["after"]["participation_sources"]))).write_text("# source drift\n")
+    elif damage == "rank":
+        receipts.pop()
+    options = {
+        "participation_receipts": receipts,
+        "expected_participation_job_id": "wrong" if damage == "child" else "child",
+    }
+    if damage:
+        with pytest.raises(ValueError):
+            decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out", **options)
+        assert not (tmp_path / "out").exists()
+    else:
+        manifest = decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out", **options)
+        metadata = json.loads(manifest.read_text())
+        assert set(metadata["participation"]["parameters"]) == set(pair.expected)
+        assert metadata["inactive_weights"] == {}
+
+
+def test_automatic_participation_disabled_preserves_original_spawn(monkeypatch):
+    from arctic_platform.debug.correctness_participation import CAPTURE_ENV
+    from arctic_platform.debug.correctness_participation import maybe_spawn_participation_coordinator
+
+    monkeypatch.delenv(CAPTURE_ENV, raising=False)
+    info = object()
+    calls = []
+    actor = object()
+    manager = SimpleNamespace(_ACTOR_CLS={"training": actor})
+    result = maybe_spawn_participation_coordinator(
+        manager, "training", actor, lambda value: calls.append(value) or "native", None, info
+    )
+    assert result == "native"
+    assert calls == [info]
+    assert manager._ACTOR_CLS["training"] is actor
+
+
+@pytest.mark.parametrize("failure", ["backward", "step", "destroy", None])
+def test_automatic_participation_worker_closes_hooks_on_failure_or_destroy(monkeypatch, failure):
+    from arctic_platform.correctness.harness import native_lora
+    from arctic_platform.debug import correctness_participation as debug
+
+    workers = []
+
+    class Worker:
+        def fwd_bwd(self, batch):
+            if failure == "backward":
+                raise RuntimeError("backward failed")
+            self._engine.module(batch).sum().backward()
+
+        def step(self, learning_rate=None):
+            if failure == "step":
+                raise RuntimeError("step failed")
+            self._engine.global_steps = 1
+            return {"global_steps": 1}
+
+        def destroy(self, remove_checkpoint_scratch=False):
+            return "destroyed", remove_checkpoint_scratch
+
+    class Coordinator:
+        async def _spawn_workers(self, *args):
+            workers.append(globals()["_DeepSpeedWorker"]())
+
+    training = SimpleNamespace(
+        _DeepSpeedWorker=Worker,
+        GPUTrainingJob=SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=Coordinator)),
+    )
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=lambda **kw: lambda cls: cls))
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", SimpleNamespace(training=training))
+    monkeypatch.setattr(native_lora, "_source", lambda *args: {})
+    monkeypatch.setitem(globals(), "_DeepSpeedWorker", Worker)
+    monkeypatch.setattr(native_lora, "_spawn_worker_binding", lambda *args: (globals(), Worker))
+    coordinator = debug.participation_coordinator_class(training)()
+    asyncio.run(coordinator._spawn_workers({}, [], None, None, None))
+    assert globals()["_DeepSpeedWorker"] is Worker
+    worker = workers[0]
+    worker._engine = SimpleNamespace(module=torch.nn.Linear(2, 2, bias=False), global_steps=0)
+    worker.job_id, worker.rank = "child", 0
+    if failure == "backward":
+        with pytest.raises(RuntimeError, match="backward failed"):
+            worker.fwd_bwd(torch.ones(1, 2))
+    else:
+        worker.fwd_bwd(torch.ones(1, 2))
+        if failure == "destroy":
+            assert worker.destroy(remove_checkpoint_scratch=True) == ("destroyed", True)
+        elif failure == "step":
+            with pytest.raises(RuntimeError, match="step failed"):
+                worker.step()
+        else:
+            assert worker.step() == {"global_steps": 1}
+            assert worker.correctness_participation_receipt()["job_id"] == "child"
+    assert all(not parameter._backward_hooks for parameter in worker._engine.module.parameters())
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [None, "inventory", "missing", "replica", "shape"],
+    ids=["rank-union", "missing-name", "missing-backward", "replica-drift", "shape-drift"],
+)
+def test_native_participation_rank_merge_globalizes_experts_and_requires_complete_evidence(damage):
+    from copy import deepcopy
+
+    from arctic_platform.correctness.harness.participation import PARTICIPATION_SCHEMA
+    from arctic_platform.correctness.harness.participation import merge_rank_participation
+    from arctic_platform.correctness.harness.participation import weight_identity
+
+    names = {"dense.weight": [2, 2], "expert.weight": [1, 2], "visual.weight": [2, 2]}
+    evidence = {
+        "kind": "text-decoder-bypass",
+        "module": "visual",
+        "calls": 0,
+        "outside_decoder_and_head": True,
+        "forward_sha256": "a" * 64,
+    }
+    initial = {
+        "participation": {
+            "schema": PARTICIPATION_SCHEMA,
+            "parameters": {
+                name: {
+                    "shape": shape,
+                    "state": "inactive" if name == "visual.weight" else "missing",
+                    "evidence": evidence if name == "visual.weight" else None,
+                }
+                for name, shape in names.items()
+            },
+        },
+        "candidate_weights": {"visual.weight": weight_identity(torch.ones(2, 2))},
+    }
+    before, after = [deepcopy(initial) for _ in range(8)], [deepcopy(initial) for _ in range(8)]
+    # Genuine activity on one rank covers DP-local missing gradients, not absent global backward.
+    for name in ("dense.weight", "expert.weight"):
+        after[3]["participation"]["parameters"][name]["state"] = "active"
+    if damage == "inventory":
+        del after[7]["participation"]["parameters"]["dense.weight"]
+    elif damage == "missing":
+        after[3]["participation"]["parameters"]["dense.weight"]["state"] = "missing"
+    elif damage == "replica":
+        after[4]["candidate_weights"]["visual.weight"] = weight_identity(torch.zeros(2, 2))
+    elif damage == "shape":
+        after[7]["participation"]["parameters"]["dense.weight"]["shape"] = [4]
+    routes = {
+        "dense.weight": [list(range(8))],
+        "expert.weight": [[rank] for rank in range(8)],
+        "visual.weight": [list(range(8))],
+    }
+    if damage is not None:
+        with pytest.raises(ValueError):
+            merge_rank_participation(before, after, names, routes)
+        return
+    record, witnesses = merge_rank_participation(before, after, names, routes)
+    assert record["parameters"]["expert.weight"]["shape"] == [8, 2]
+    assert record["parameters"]["dense.weight"]["state"] == "active"
+    assert set(witnesses) == {"visual.weight"}
+
+
+@pytest.fixture
 def _optimizer_capture_capture_worker(monkeypatch, tmp_path):
     import arctic_platform.common as common_package
 
@@ -2074,6 +2945,18 @@ def _optimizer_capture_capture_worker(monkeypatch, tmp_path):
     events = []
 
     class Worker:
+
+        def forward_backward(self, batch):
+            if batch.get("failure"):
+                raise RuntimeError("backward failed")
+            model(batch["input"]).sum().backward()
+            return {}
+
+        def step(self):
+            if getattr(self, "step_failure", False):
+                raise RuntimeError("step failed")
+            self.engine.global_steps += 1
+            return {}
 
         def _bf16_accumulated_gradients(self):
             events.append("accumulated")
@@ -2098,6 +2981,8 @@ def _optimizer_capture_capture_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
     monkeypatch.setattr(optimizer_capture, "_OPTIMIZER_CAPTURE_WORKER", None)
     monkeypatch.setattr(optimizer_capture.dist, "barrier", lambda: None)
+    monkeypatch.setattr(optimizer_capture.dist, "get_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", lambda rows, value: rows.__setitem__(0, value))
     actor = optimizer_capture._optimizer_capture_worker_class()()
     actor._optimizer_state_output_dir = str(tmp_path / "capture")
     actor.rank = 0
@@ -2105,6 +2990,9 @@ def _optimizer_capture_capture_worker(monkeypatch, tmp_path):
         module=model, optimizer=SimpleNamespace(state={}), global_steps=0, get_lr=lambda: [0.0001]
     )
     actor._full_adam_moments = lambda parameter: (None, None)
+    actor._arm_optimizer_participation()
+    model(torch.ones(1, 2, dtype=torch.bfloat16)).sum().backward()
+    model.weight.grad = torch.full_like(model.weight, 2.0)
     return SimpleNamespace(
         actor=actor,
         model=model,
@@ -2163,10 +3051,10 @@ def test_optimizer_capture_inactive_bf16_parameter_records_absent_gradient_witho
     state.accumulated.clear()
     state.actor.engine.optimizer.bf16_groups = [[parameter]]
     state.actor.engine.optimizer.fp32_groups_has_gradients = [[False]]
-    state.actor._snapshot_optimizer_state_parameters()
-    saved = torch.load(state.artifact, weights_only=True)
-    assert saved["gradient"] is None
-    assert torch.equal(saved["fp32_master"], parameter.detach().float())
+    state.actor._optimizer_participation_capture.active.clear()
+    with pytest.raises(ValueError, match="unexpected missing gradient"):
+        state.actor._snapshot_optimizer_state_parameters()
+    assert not state.artifact.exists()
     assert state.events == ["accumulated"]
 
 
@@ -2174,21 +3062,217 @@ def test_optimizer_capture_inactive_gradient_does_not_hide_post_step_optimizer_s
     _optimizer_capture_capture_worker,
 ):
     state = _optimizer_capture_capture_worker
-    parameter = state.model.weight
-    parameter.grad = None
-    state.accumulated.clear()
-    state.actor.engine.optimizer.bf16_groups = [[parameter]]
-    state.actor.engine.optimizer.fp32_groups_has_gradients = [[False]]
+    _optimizer_capture_add_inactive_visual(state)
     state.actor._snapshot_optimizer_state_parameters()
-    moments = (torch.full_like(parameter, 0.5, dtype=torch.float32), torch.ones_like(parameter, dtype=torch.float32))
+    moments = (
+        torch.full_like(state.model.weight, 0.5, dtype=torch.float32),
+        torch.ones_like(state.model.weight, dtype=torch.float32),
+    )
     state.actor._full_adam_moments = lambda parameter: moments
     state.actor.engine.global_steps = 1
+    with pytest.raises(ValueError, match="inactive optimizer parameter visual.weight"):
+        state.actor._optimizer_state_artifact_metrics()
+
+
+def _optimizer_capture_add_inactive_visual(state):
+    state.actor._close_optimizer_participation()
+    state.model.visual = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    # The decoder must not own the bypassed vision parameters.
+    state.model.get_decoder = lambda: SimpleNamespace(parameters=lambda: [state.model.weight])
+    state.model.get_output_embeddings = lambda: SimpleNamespace(parameters=lambda: [])
+    state.actor._arm_optimizer_participation()
+    state.model(torch.ones(1, 2, dtype=torch.bfloat16)).sum().backward()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [None, "parameter", "master", "gradient"],
+    ids=["exact", "parameter-change", "master-change", "nonzero-gradient"],
+)
+def test_optimizer_capture_preserves_inactive_weights_without_adam_moments(
+    _optimizer_capture_capture_worker, monkeypatch, damage
+):
+    state = _optimizer_capture_capture_worker
+    _optimizer_capture_add_inactive_visual(state)
+    if damage == "gradient":
+        state.accumulated[id(state.model.visual.weight)] = torch.ones_like(state.model.visual.weight)
+        with pytest.raises(ValueError, match="inactive parameter visual.weight"):
+            state.actor._snapshot_optimizer_state_parameters()
+        return
+    state.actor._snapshot_optimizer_state_parameters()
+    state.actor.engine.global_steps = 1
+    state.actor._full_adam_moments = lambda parameter: (
+        (None, None)
+        if parameter is state.model.visual.weight
+        else (torch.zeros_like(parameter), torch.zeros_like(parameter))
+    )
+    if damage == "parameter":
+        with torch.no_grad():
+            state.model.visual.weight.add_(1)
+    elif damage == "master":
+        utils = sys.modules["deepspeed.utils"]
+        monkeypatch.setattr(
+            utils,
+            "safe_get_full_fp32_param",
+            lambda parameter: parameter.detach().float() + (1 if parameter is state.model.visual.weight else 0),
+        )
+    if damage is not None:
+        with pytest.raises(ValueError, match="weights changed"):
+            state.actor._optimizer_state_artifact_metrics()
+        return
     metrics = state.actor._optimizer_state_artifact_metrics()
-    manifest = Path(metrics["optimizer_state_manifest"])
-    saved = torch.load(manifest.parent / "000000.pt", weights_only=True)
-    assert saved["gradient"] is None
-    assert torch.equal(saved["exp_avg"], moments[0])
-    assert torch.equal(saved["exp_avg_sq"], moments[1])
+    manifest = json.loads(Path(metrics["optimizer_state_manifest"]).read_text())
+    assert [entry["name"] for entry in manifest["parameters"]] == ["weight"]
+    witness = manifest["inactive_weights"]["visual.weight"]
+    assert witness["master"]["before"] == witness["master"]["after"]
+    assert witness["parameter"]["before"] == witness["parameter"]["after"]
+    assert state.model.visual.weight.grad is None
+
+
+@pytest.mark.parametrize("failure", ["backward", "step"])
+def test_optimizer_capture_failure_restores_backward_hooks(_optimizer_capture_capture_worker, failure):
+    state = _optimizer_capture_capture_worker
+    if failure == "backward":
+        with pytest.raises(RuntimeError, match="backward failed"):
+            state.actor.forward_backward({"failure": True})
+    else:
+        state.actor.step_failure = True
+        with pytest.raises(RuntimeError, match="step failed"):
+            state.actor.step()
+    assert not state.model.weight._backward_hooks
+    assert state.actor._optimizer_participation_capture is None
+
+
+def test_optimizer_capture_participation_survives_all_accumulated_microbatches(_optimizer_capture_capture_worker):
+    state = _optimizer_capture_capture_worker
+    state.actor._close_optimizer_participation()
+    capture = None
+    for microbatch in range(4):
+        state.actor.forward_backward({"input": torch.full((1, 2), microbatch + 1, dtype=torch.bfloat16)})
+        if capture is None:
+            capture = state.actor._optimizer_participation_capture
+        assert state.actor._optimizer_participation_capture is capture
+        assert capture.result()["parameters"]["weight"]["state"] == "active"
+        assert len(state.model.weight._backward_hooks) == 1
+    state.actor._close_optimizer_participation()
+    assert not state.model.weight._backward_hooks
+
+
+@pytest.mark.parametrize("rank", [0, 1], ids=["origin", "peer"])
+def test_optimizer_capture_shares_rank_zero_validation_errors_before_another_collective(
+    _optimizer_capture_capture_worker, monkeypatch, rank
+):
+    state = _optimizer_capture_capture_worker
+    state.actor.rank = rank
+    monkeypatch.setattr(optimizer_capture.dist, "get_world_size", lambda: 2)
+    messages = []
+
+    def gather(rows, message):
+        messages.append(message)
+        rows[:] = ["ValueError: invalid inactive witness", None]
+
+    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
+    monkeypatch.setattr(optimizer_capture.dist, "barrier", lambda: pytest.fail("error must precede barrier"))
+    calls = []
+
+    def validate():
+        calls.append("validate")
+        raise ValueError("invalid inactive witness")
+
+    expected = ValueError if rank == 0 else RuntimeError
+    with pytest.raises(expected, match="invalid inactive witness"):
+        state.actor._optimizer_collective_check(validate, rank_zero=True)
+    assert calls == (["validate"] if rank == 0 else [])
+    assert messages == (["ValueError: invalid inactive witness"] if rank == 0 else [None])
+
+
+def test_optimizer_capture_shares_local_participation_errors_before_gathering_evidence(
+    _optimizer_capture_capture_worker, monkeypatch
+):
+    state = _optimizer_capture_capture_worker
+    state.actor._close_optimizer_participation()
+    messages = []
+
+    def gather(rows, message):
+        messages.append(message)
+        rows[0] = message
+
+    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="genuine pre-backward participation"):
+        state.actor._optimizer_participation()
+    assert messages == ["ValueError: optimizer capture requires genuine pre-backward participation"]
+
+
+@pytest.mark.parametrize("damage", ["master", "gradient", "moments", "accumulation", "relink"])
+def test_optimizer_capture_shares_snapshot_validation_before_next_tensor_collective(
+    _optimizer_capture_capture_worker, monkeypatch, damage
+):
+    state = _optimizer_capture_capture_worker
+    messages, tensors = [], []
+    utils = sys.modules["deepspeed.utils"]
+    if damage == "master":
+        monkeypatch.setattr(utils, "safe_get_full_fp32_param", lambda parameter: None)
+    elif damage == "gradient":
+        state.accumulated.clear()
+    elif damage == "moments":
+        state.actor._full_adam_moments = lambda parameter: (torch.zeros_like(parameter), None)
+    else:
+
+        def fail():
+            raise ValueError(f"invalid {damage}")
+
+        if damage == "accumulation":
+            state.actor._bf16_accumulated_gradients = fail
+        else:
+            state.actor.engine.optimizer._lazy_init_hp_params_optimizer_state = fail
+
+    def gather(rows, message):
+        if isinstance(message, str):
+            messages.append(message)
+        rows[0] = message
+
+    def globalize(parameter, tensor):
+        tensors.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
+    state.actor._globalize_expert_optimizer_tensor = globalize
+    with pytest.raises((ValueError, RuntimeError)):
+        state.actor._snapshot_optimizer_state_parameters()
+    assert len(messages) == 1
+    assert len(tensors) == {"master": 0, "gradient": 1, "moments": 2, "accumulation": 0, "relink": 0}[damage]
+    assert not state.artifact.exists()
+
+
+@pytest.mark.parametrize("damage", ["master", "moments", "participation"])
+def test_optimizer_capture_shares_post_step_validation_before_next_tensor_collective(
+    _optimizer_capture_capture_worker, monkeypatch, damage
+):
+    state = _optimizer_capture_capture_worker
+    state.actor._snapshot_optimizer_state_parameters()
+    state.actor.engine.global_steps = 1
+    messages, tensors = [], []
+    if damage == "master":
+        monkeypatch.setattr(sys.modules["deepspeed.utils"], "safe_get_full_fp32_param", lambda parameter: None)
+    elif damage == "participation":
+        state.actor._optimizer_step_participation = {}
+
+    def gather(rows, message):
+        if isinstance(message, str):
+            messages.append(message)
+        rows[0] = message
+
+    def globalize(parameter, tensor):
+        tensors.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
+    state.actor._globalize_expert_optimizer_tensor = globalize
+    with pytest.raises((ValueError, RuntimeError)):
+        state.actor._optimizer_state_artifact_metrics()
+    assert len(messages) == 1
+    assert not tensors
+    assert state.artifact.exists()
 
 
 def test_optimizer_capture_missing_participating_bf16_buffer_with_no_local_grad_still_errors(
@@ -2946,8 +4030,19 @@ def test_local_cortex_optimizer_local_fixture_optimizer_runner_uses_same_model_a
 
 
 @pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize("tests", [["single-step-optimizer"], ["single-step-grads", "single-step-optimizer"]])
-def test_local_cortex_optimizer_cli_local_fixture_accepts_optimizer_selection_before_dispatch(monkeypatch, tests):
+@pytest.mark.parametrize(
+    "tests",
+    [
+        ["single-step-optimizer"],
+        ["single-step-grads", "single-step-optimizer"],
+        ["e2e-sft-train-validate"],
+        ["single-step-optimizer", "e2e-sft-train-validate"],
+        ["checkpoint-resume-loss"],
+    ],
+)
+def test_local_cortex_optimizer_cli_local_fixture_accepts_explicit_supported_selection_before_dispatch(
+    monkeypatch, tests
+):
     args = SimpleNamespace(
         local_cortex_fixture=True,
         cortex_fixture=None,
@@ -2967,7 +4062,14 @@ def test_local_cortex_optimizer_cli_local_fixture_accepts_optimizer_selection_be
 
 @pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
 @pytest.mark.parametrize(
-    "selected", [None, ["e2e-sft-train-validate"], ["single-step-optimizer", "inference-checkpoint-loss"]]
+    "selected",
+    [
+        None,
+        ["inference-checkpoint-loss"],
+        ["single-step-optimizer", "inference-checkpoint-loss"],
+        ["single-step-optimizer", "checkpoint-resume-loss"],
+        ["unknown-check"],
+    ],
 )
 def test_local_cortex_optimizer_cli_local_fixture_does_not_implicitly_enable_other_checks(monkeypatch, selected):
     args = SimpleNamespace(
@@ -2979,7 +4081,7 @@ def test_local_cortex_optimizer_cli_local_fixture_does_not_implicitly_enable_oth
     )
     monkeypatch.setattr(cli, "_client_backend", lambda args: CortexConfig(base_url="http://127.0.0.1:8003"))
     monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: pytest.fail("invalid selection dispatched"))
-    with pytest.raises(SystemExit, match="single-step"):
+    with pytest.raises(SystemExit, match="only first-two, E2E or checkpoint checks"):
         cli.cmd_run(args)
 
 
@@ -3012,6 +4114,7 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     args = SimpleNamespace(
         local_cortex_fixture=True,
         cortex_fixture=None,
+        base_url="http://127.0.0.1:8003",
         config=str(_cortex_optimizer_capture_CONFIG),
         all_configs=False,
         test=["single-step-optimizer"],
@@ -3025,6 +4128,9 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     widths = []
     monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
+    monkeypatch.setattr(
+        cli, "local_cortex_gateway", lambda *args, **kwargs: pytest.fail("explicit endpoint must remain external")
+    )
     monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: [_cortex_optimizer_capture_CONFIG])
     monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
     monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 128)
@@ -3335,10 +4441,15 @@ def _maintained_native_run(case, **options):
     )
 
 
-def _maintained_native_unpublished(case):
+def _maintained_native_unpublished(case, *, supplier_failed=False):
     assert not (case.output / "states").exists()
-    assert not list(case.output.glob("snapshots-*"))
-    assert all(not root.exists() for root in case.saved)
+    if supplier_failed:
+        scratch = list(case.output.glob("snapshots-*"))
+        assert len(scratch) == 1
+        assert all(root.is_dir() and root.parent == scratch[0] for root in case.saved)
+    else:
+        assert not list(case.output.glob("snapshots-*"))
+        assert all(not root.exists() for root in case.saved)
     assert case.pair.before.is_dir() and case.pair.after.is_dir()
 
 
@@ -3372,6 +4483,61 @@ def test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_ac
         torch.testing.assert_close(value["parameter_update"], case.pair.expected[entry["name"]], rtol=0, atol=0)
     assert not list(case.output.glob("snapshots-*"))
     assert all(not root.exists() for root in case.saved)
+
+
+@pytest.mark.parametrize("timed_out_step", [0, 1])
+@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionError, KeyboardInterrupt])
+def test_maintained_native_optimizer_supplier_timeout_keeps_inputs_for_pending_owner(
+    _maintained_native_capture, timed_out_step, error_type
+):
+    case = _maintained_native_capture
+    original_supplier = case.supplier
+    started, resume = threading.Event(), threading.Event()
+    observed, errors = [], []
+    worker = None
+
+    def supplier(root, *, step):
+        nonlocal worker
+        if step != timed_out_step:
+            return original_supplier(root, step=step)
+        checkpoint = root / f"global_step{step}" / "mp_rank_00_model_states.pt"
+
+        def owner_collect():
+            try:
+                observed.append(checkpoint.read_bytes())
+                started.set()
+                if not resume.wait(10):
+                    raise TimeoutError("test did not resume pending owner")
+                observed.append(checkpoint.read_bytes())
+            except BaseException as error:
+                errors.append(error)
+                started.set()
+
+        worker = threading.Thread(target=owner_collect)
+        worker.start()
+        assert started.wait(10), "owner did not begin reading its checkpoint"
+        raise error_type("caller response deadline; owner collection is still running")
+
+    case.supplier = supplier
+    try:
+        with pytest.raises(error_type, match="caller response deadline") as raised:
+            _maintained_native_run(case)
+        assert worker is not None and worker.is_alive()
+        _maintained_native_unpublished(case, supplier_failed=True)
+        assert any(
+            f"step {timed_out_step}" in note
+            and f"checkpoint inputs retained at {case.saved[-1].parent}" in note
+            and "no optimizer states published" in note
+            for note in raised.value.__notes__
+        )
+    finally:
+        resume.set()
+        if worker is not None:
+            worker.join(10)
+    assert worker is not None and not worker.is_alive()
+    assert errors == []
+    assert len(observed) == 2 and observed[0] == observed[1]
+    assert "step" in case.events if timed_out_step else "fwd_bwd" not in case.events
 
 
 @pytest.mark.parametrize("failure", ["save-0", "save-metadata", "fwd_bwd", "step", "save-1", "source-after-supply"])
@@ -3431,7 +4597,7 @@ def test_maintained_native_optimizer_rejects_completed_save_receipt_binding_dama
     with pytest.raises(ValueError):
         _maintained_native_run(case)
     assert "fwd_bwd" not in case.events
-    _maintained_native_unpublished(case)
+    _maintained_native_unpublished(case, supplier_failed=damage != "nonce")
 
 
 def test_maintained_native_optimizer_rejects_nonce_change_between_completed_saves(_maintained_native_capture):
@@ -3538,7 +4704,7 @@ def test_maintained_native_optimizer_supplier_authority_drift_blocks_next_operat
     _maintained_native_unpublished(case)
 
 
-def _maintained_native_scope(case, monkeypatch, *, split):
+def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
     descriptor = case.descriptor
     helper_source = {
         "path": decoder.__file__,
@@ -3568,7 +4734,7 @@ def _maintained_native_scope(case, monkeypatch, *, split):
                 return SimpleNamespace(value=None, error=exc)
 
     def get(reference, *, timeout):
-        assert timeout == 30
+        assert timeout == rpc_timeout
         if reference.error is not None:
             raise reference.error
         return reference.value
@@ -3639,6 +4805,7 @@ def _maintained_native_scope(case, monkeypatch, *, split):
             "restore": lambda: vars(checkpointer).pop("save_resumable"),
             "roots": {},
             "checkpoint_lease": lease,
+            "participation": SimpleNamespace(close=lambda: None),
         }
         return nonce
 
@@ -3673,7 +4840,7 @@ def _maintained_native_scope(case, monkeypatch, *, split):
         "allocation_hosts": ["head", "peer"],
         "checkpoint_parent": str(case.output.parent),
         "reserve_bytes": 0,
-        "rpc_timeout_seconds": 30,
+        "rpc_timeout_seconds": rpc_timeout,
     }
     if split:
         request["schema"] = "native-optimizer-owner-split-request-v1"
@@ -3699,6 +4866,28 @@ def _maintained_native_scope(case, monkeypatch, *, split):
         )
         scope = factory(case.session, case.job)
     return SimpleNamespace(scope=scope, workers=workers, child=child, helper_source=helper_source)
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
+@pytest.mark.parametrize("rpc_timeout", [0.5, 300, 382.133, 900])
+def test_maintained_native_optimizer_scope_admits_bounded_collection_budget(
+    _maintained_native_capture, monkeypatch, split, rpc_timeout
+):
+    fixture = _maintained_native_scope(_maintained_native_capture, monkeypatch, split=split, rpc_timeout=rpc_timeout)
+    with fixture.scope:
+        assert all(decoder._COLLECTOR_STATE in vars(worker) for worker in fixture.workers)
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
+@pytest.mark.parametrize("rpc_timeout", [0, -1, True, float("nan"), float("inf"), 900.001])
+def test_maintained_native_optimizer_scope_rejects_invalid_collection_budget(
+    _maintained_native_capture, monkeypatch, split, rpc_timeout
+):
+    message = "bounded explicit budgets" if math.isfinite(rpc_timeout) else "Out of range float values"
+    with pytest.raises(ValueError, match=message):
+        _maintained_native_scope(_maintained_native_capture, monkeypatch, split=split, rpc_timeout=rpc_timeout)
+    assert "save-0" not in _maintained_native_capture.events
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
@@ -3777,6 +4966,165 @@ def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records
     manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
     assert [entry["name"] for entry in manifest["parameters"]] == ["dense.weight"]
     assert manifest["frozen_expert_parameters"] == [pair.expert_name]
+
+
+def _native_checkpoint_wrapper_names(pair, wrapper_name="_checkpoint_wrapped_module"):
+    original = pair.expert_name
+    wrapped = original.replace(".mlp.", f".{wrapper_name}.mlp.")
+    for root, step in ((pair.before, 0), (pair.after, 1)):
+        tag = root / f"global_step{step}"
+        model = tag / "mp_rank_00_model_states.pt"
+
+        def edit_shapes(state):
+            for group in state["param_shapes"]:
+                if original in group:
+                    group[wrapped] = group.pop(original)
+
+        _cortex_optimizer_decode_rewrite(model, edit_shapes)
+        for path in tag.glob("experts_ep_rank_*.pt"):
+            _cortex_optimizer_decode_rewrite(path, lambda state: state.__setitem__(wrapped, state.pop(original)))
+        for path in tag.glob("*optim_states.pt"):
+
+            def edit_mappings(state):
+                for group in state["optimizer_state_dict"]["param_slice_mappings"]:
+                    if original in group:
+                        group[wrapped] = group.pop(original)
+
+            _cortex_optimizer_decode_rewrite(path, edit_mappings)
+    pair.expert_name = wrapped
+    if original in pair.expected:
+        pair.expected[wrapped] = pair.expected.pop(original)
+    return original
+
+
+@pytest.mark.parametrize("train_experts", [False, True])
+@pytest.mark.parametrize(
+    "wrapper_name", ["_checkpoint_wrapped_module", "_checkpoint_wrapped_module._checkpoint_wrapped_module"]
+)
+def test_native_ep_bf16_optimizer_checkpoint_wrapper_names_match_state_dict(tmp_path, train_experts, wrapper_name):
+    pair = _native_ep_bf16_pair(tmp_path, train_experts=train_experts)
+    original = _native_checkpoint_wrapper_names(pair, wrapper_name)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    if train_experts:
+        entry = next(row for row in manifest["parameters"] if row["name"] == pair.expert_name)
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        assert torch.equal(tensors["parameter_update"], pair.expected[pair.expert_name])
+    else:
+        assert manifest["frozen_expert_parameters"] == [pair.expert_name]
+    assert original != pair.expert_name
+    assert manifest["expert_sidefiles_are_master_sources"] is False
+
+
+@pytest.mark.parametrize("wrapper_name", ["_checkpoint_wrapped_module_suffix", "prefix_checkpoint_wrapped_module"])
+def test_native_ep_bf16_optimizer_checkpoint_wrapper_names_strip_only_exact_components(tmp_path, wrapper_name):
+    pair = _native_ep_bf16_pair(tmp_path)
+    _native_checkpoint_wrapper_names(pair, wrapper_name)
+    with pytest.raises(ValueError, match="module value is NoneType"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("damage", ["module_collision", "expert_collision", "module_shape", "module_dtype", "value"])
+def test_native_ep_bf16_optimizer_checkpoint_wrapper_aliases_remain_strict(tmp_path, damage):
+    pair = _native_ep_bf16_pair(tmp_path)
+    original = _native_checkpoint_wrapper_names(pair)
+    model = pair.before / "global_step0" / "mp_rank_00_model_states.pt"
+    if damage == "expert_collision":
+        for path in model.parent.glob("experts_ep_rank_*.pt"):
+            _cortex_optimizer_decode_rewrite(
+                path, lambda state: state.__setitem__(original, state[pair.expert_name].clone())
+            )
+    else:
+
+        def edit(state):
+            module = state["module"]
+            if damage == "module_collision":
+                module[pair.expert_name] = module[original].clone()
+            elif damage == "module_shape":
+                module[original] = module[original].reshape(5)
+            elif damage == "module_dtype":
+                module[original] = module[original].float()
+            else:
+                module[original] = module[original] + 1
+
+        _cortex_optimizer_decode_rewrite(model, edit)
+    with pytest.raises(ValueError):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("step", [0, 1])
+@pytest.mark.parametrize(
+    "damage,reason",
+    [
+        ("name", "parameter name is not a string"),
+        ("value", "sidefile value is int, not a tensor"),
+        ("dtype", "sidefile dtype is torch.float32"),
+        ("layout", "sidefile layout is torch.sparse_coo"),
+        ("scalar", "sidefile tensor is scalar"),
+        ("empty", "sidefile tensor is empty"),
+        ("module_missing", "module value is NoneType, not a tensor"),
+        ("module_value", "module value is int, not a tensor"),
+        ("shape", "sidefile shape (5,) differs from module shape (1, 5)"),
+        ("module_dtype", "module dtype torch.float32 differs from sidefile dtype torch.bfloat16"),
+        ("nonfinite", "sidefile tensor contains nonfinite values"),
+    ],
+)
+def test_native_ep_bf16_optimizer_invalid_sidefile_identifies_file_parameter_and_reason(
+    tmp_path, step, damage, reason
+):
+    pair = _native_ep_bf16_pair(tmp_path)
+    root = pair.before if step == 0 else pair.after
+    path = root / f"global_step{step}" / "experts_ep_rank_003.pt"
+    record = torch.load(path, weights_only=False)
+    value = record[pair.expert_name]
+    name = pair.expert_name
+    if damage == "name":
+        name = 3
+        for sidefile in path.parent.glob("experts_ep_rank_*.pt"):
+            _cortex_optimizer_decode_rewrite(
+                sidefile, lambda state: state.__setitem__(name, state.pop(pair.expert_name))
+            )
+        path = path.with_name("experts_ep_rank_000.pt")
+    elif damage in {"module_missing", "module_value", "module_dtype"}:
+        module_path = path.with_name("mp_rank_00_model_states.pt")
+
+        def edit_module(state):
+            module = state["module"]
+            if damage == "module_missing":
+                module.pop(name)
+            elif damage == "module_value":
+                module[name] = 3
+            else:
+                module[name] = module[name].float()
+
+        _cortex_optimizer_decode_rewrite(module_path, edit_module)
+        path = path.with_name("experts_ep_rank_000.pt")
+    else:
+        if damage == "value":
+            value = 3
+        elif damage == "dtype":
+            value = value.float()
+        elif damage == "layout":
+            value = value.to_sparse()
+        elif damage == "scalar":
+            value = value[0, 0]
+        elif damage == "empty":
+            value = value[:, :0]
+        elif damage == "shape":
+            value = value.reshape(5)
+        elif damage == "nonfinite":
+            value[0, 0] = float("nan")
+        record[name] = value
+        torch.save(record, path)
+    with pytest.raises(ValueError) as caught:
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    message = str(caught.value)
+    assert "invalid expert sidefile tensor or module shape" in message
+    assert path.name in message
+    assert f"parameter {name!r}" in message
+    assert reason in message
+    assert not (tmp_path / "out").exists()
 
 
 @pytest.mark.parametrize("field", ["master", "exp_avg", "exp_avg_sq"])
@@ -3959,3 +5307,1548 @@ def test_native_ep_bf16_optimizer_new_layout_negatives_cannot_guess_ownership(tm
     with pytest.raises(ValueError, match="cover every rank|actual ordered DP route|MP filename|slice mapping"):
         _native_ep_bf16_decode(pair, tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+@pytest.fixture
+def _dense_collection_case(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    nodes = [
+        {"host": "head", "hostname": "head", "slots": 8},
+        {"host": "peer", "hostname": "peer", "slots": 8},
+    ]
+    admission = {"allocation_id": "same-job", "nodes": nodes, "timeout_s": 30, "reserve_bytes": 0}
+    state = SimpleNamespace(
+        admission=admission,
+        roots={},
+        calls=[],
+        failure=None,
+        payloads=None,
+        client=SimpleNamespace(),
+        output=tmp_path / "snapshots",
+    )
+    monkeypatch.setattr(capture, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(transfer, "validate_local_inference_allocation", lambda value: value["nodes"])
+
+    def validate(value, deadline, identity=None):
+        assert value == admission
+        if identity is not None:
+            if identity:
+                assert identity == {"same-hostfile": True}
+            identity.update({"same-hostfile": True})
+        return value["nodes"]
+
+    monkeypatch.setattr(transfer, "_validate_local_allocation", validate)
+    monkeypatch.setattr(capture, "_dense_node_admission", lambda request, deadline: {"host": request["node"]["host"]})
+
+    def node_root(request):
+        root = Path(request["binding"]["root"])
+        return root if request["node"] == nodes[0] else root.parent / ("peer-" + root.name)
+
+    def call(value, node, role, request, deadline):
+        assert value == admission and node == request["node"]
+        state.calls.append((node["host"], role))
+        root = node_root(request)
+        state.roots[(request["binding"]["root"], node["host"])] = root
+        with monkeypatch.context() as scoped:
+            scoped.setattr(capture, "_dense_root", lambda request: root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                capture._dense_worker(role, request)
+            result = json.loads(output.getvalue())
+        if role == "prepare" and node == nodes[1] and state.failure == "lost-prepare":
+            raise RuntimeError("lost prepare acknowledgement")
+        return result
+
+    monkeypatch.setattr(capture, "_dense_call", call)
+
+    def copy(value, node, request, head_request, deadline):
+        source = node_root(request) / request["binding"]["tag"]
+        manifest = request["manifest"]
+        raw = json.dumps(manifest).encode() + b"\n"
+        raw += b"".join((source / row["path"]).read_bytes() for row in manifest["files"])
+        with monkeypatch.context() as scoped:
+            scoped.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(raw)))
+            capture._dense_receive({**head_request, "manifest": manifest}, deadline)
+        if state.failure == "head-drift":
+            (
+                Path(head_request["binding"]["root"]) / request["binding"]["tag"] / manifest["files"][0]["path"]
+            ).write_bytes(b"drift")
+
+    monkeypatch.setattr(capture, "_dense_copy_peer", copy)
+
+    def save_checkpoint(*, path, checkpoint_type, export_hf):
+        assert checkpoint_type == "resumable" and export_hf is False
+        step = 1 if Path(path).name == "after" else 0
+        tag = f"global_step{step}"
+        if state.failure == "save":
+            raise RuntimeError("native save failed")
+        for number, node in enumerate(nodes):
+            root = state.roots[(path, node["host"])]
+            (root / tag).mkdir()
+            if state.payloads is None:
+                names = {
+                    f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt": f"actual-shard-{rank}".encode()
+                    for rank in range(number * node["slots"], (number + 1) * node["slots"])
+                }
+                if number == 0:
+                    names["mp_rank_00_model_states.pt"] = b"actual-model"
+            else:
+                names = state.payloads(step, number)
+            if number == 1 and state.failure == "missing":
+                names.pop(next(iter(names)))
+            if number == 1 and state.failure == "duplicate":
+                name = next(iter(names))
+                names["bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt"] = names.pop(name)
+            for name, raw in names.items():
+                (root / tag / name).write_bytes(raw)
+        return {
+            "job_id": "parent:training:0" if state.failure != "child" else "other-child",
+            "checkpoint_path": path,
+            "checkpoint_tag": tag,
+            "version": step,
+            "stage_path": "",
+        }
+
+    state.client.save_checkpoint = save_checkpoint
+
+    def save():
+        return capture._save_local_snapshot(
+            state.client,
+            state.output,
+            step=0,
+            expected_dp_world_size=16,
+            dense_checkpoint_allocation=admission,
+            parent_job_id="parent",
+            training_child_id="parent:training:0",
+        )
+
+    state.save = save
+    return state
+
+
+def test_dense_collection_new_full16_head8_peer8_retains_hashes_and_cleanup(_dense_collection_case):
+    state = _dense_collection_case
+    root = state.save()
+    model, shards = capture._checkpoint_files(root)
+    assert len(shards) == 16 and model.read_bytes() == b"actual-model"
+    assert state.calls == [
+        ("head", "prepare"),
+        ("peer", "prepare"),
+        ("head", "manifest"),
+        ("peer", "manifest"),
+        ("peer", "close"),
+    ]
+    assert not state.roots[(str(root), "peer")].exists()
+    receipt = json.loads((root / capture._DENSE_RECEIPT).read_text())
+    assert receipt["binding"]["training_child_id"] == "parent:training:0"
+    assert receipt["peer_cleanup"] == [{"node": state.admission["nodes"][1], "owned_root_absent": True}]
+    assert [len(row["files"]) for row in receipt["node_manifests"]] == [9, 8]
+    for manifest in receipt["node_manifests"]:
+        for row in manifest["files"]:
+            assert hashlib.sha256((root / "global_step0" / row["path"]).read_bytes()).hexdigest() == row["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("missing", "node shard count"),
+        ("duplicate", "duplicate"),
+        ("child", "different training child"),
+        ("save", "native save failed"),
+        ("lost-prepare", "lost prepare"),
+        ("head-drift", "consolidated file drift"),
+    ],
+)
+def test_dense_collection_new_failure_never_relaxes16_and_closes_owned_peer(_dense_collection_case, failure, message):
+    state = _dense_collection_case
+    state.failure = failure
+    with pytest.raises((ValueError, RuntimeError), match=message):
+        state.save()
+    assert state.calls[-1] == ("peer", "close")
+    assert not state.roots[(str(state.output), "peer")].exists()
+    assert not (state.output / capture._DENSE_RECEIPT).exists()
+
+
+def test_dense_collection_new_disk_shortfall_closes_peer_without_copy(_dense_collection_case, monkeypatch):
+    state = _dense_collection_case
+    monkeypatch.setattr(capture.shutil, "disk_usage", lambda root: SimpleNamespace(free=0))
+    with pytest.raises(ValueError, match="insufficient fresh disk"):
+        state.save()
+    assert not state.roots[(str(state.output), "peer")].exists()
+    assert len(list((state.output / "global_step0").glob("*optim_states.pt"))) == 8
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing-node", "boot", "child", "duplicate-model", "alias-rank", "unexpected-file"]
+)
+def test_dense_collection_new_manifest_negatives_bind_nodes_child_and_fullranks(_dense_collection_case, mutation):
+    state = _dense_collection_case
+    state.save()
+    proof = json.loads((state.output / capture._DENSE_RECEIPT).read_text())
+    manifests = proof["node_manifests"]
+    if mutation == "missing-node":
+        manifests.pop()
+    elif mutation == "boot":
+        manifests[1]["node"]["boot_id"] = "wrong-boot"
+    elif mutation == "child":
+        manifests[1]["binding"] = {**manifests[1]["binding"], "training_child_id": "other-child"}
+    elif mutation == "duplicate-model":
+        manifests[1]["files"].append(dict(manifests[0]["files"][-1], path="mp_rank_00_model_states.pt"))
+    elif mutation == "alias-rank":
+        manifests[1]["files"][0]["path"] = "fp16_zero_pp_rank_0_mp_rank_00_optim_states.pt"
+    else:
+        manifests[1]["files"][0]["path"] = "../foreign.pt"
+    with pytest.raises(ValueError, match="every allocation|binding drift|duplicate|unsupported"):
+        capture._dense_validate_manifests(proof["binding"], state.admission["nodes"], manifests, 16)
+
+
+@pytest.mark.parametrize("mutation", ["truncated", "hash", "extra", "header"])
+def test_dense_collection_new_stream_refuses_partial_corrupt_or_unbound_bytes(tmp_path, monkeypatch, mutation):
+    root = tmp_path / "owned"
+    root.mkdir()
+    binding = {"root": str(root), "tag": "global_step0", "nonce": "own"}
+    (root / capture._DENSE_OWNER).write_text(json.dumps(binding))
+    monkeypatch.setattr(capture, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    raw = b"actual-peer-shard"
+    manifest = {
+        "files": [
+            {
+                "path": "bf16_zero_pp_rank_8_mp_rank_00_optim_states.pt",
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    }
+    header = json.dumps(manifest).encode()
+    payload = raw
+    if mutation == "truncated":
+        payload = raw[:-1]
+    elif mutation == "hash":
+        payload = b"x" * len(raw)
+    elif mutation == "extra":
+        payload = raw + b"extra"
+    else:
+        header = b'{"files":[]}'
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(header + b"\n" + payload)))
+    with pytest.raises(ValueError, match="truncated|hash mismatch|extra bytes|manifest mismatch"):
+        capture._dense_receive({"binding": binding, "manifest": manifest}, time.monotonic() + 30)
+
+
+def test_dense_collection_new_ownership_drift_preserves_foreign_peer(_dense_collection_case, monkeypatch):
+    state = _dense_collection_case
+    original = capture._dense_call
+
+    def drift(admission, node, role, request, deadline):
+        if role == "manifest" and node["host"] == "peer":
+            root = state.roots[(request["binding"]["root"], "peer")]
+            (root / capture._DENSE_OWNER).write_text('{"foreign":true}')
+        return original(admission, node, role, request, deadline)
+
+    monkeypatch.setattr(capture, "_dense_call", drift)
+    with pytest.raises(capture.UnsafeCleanupError, match="peer cleanup incomplete") as rejected:
+        state.save()
+    assert isinstance(rejected.value.shutdown_error, BaseExceptionGroup)
+    assert isinstance(rejected.value.workload_error, ValueError)
+    assert state.roots[(str(state.output), "peer")].exists()
+    assert not (state.output / capture._DENSE_RECEIPT).exists()
+
+
+def test_dense_collection_new_source_drift_rejected_before_worker_launch(monkeypatch):
+    sources = capture._dense_sources()
+    request = {"source_files": sources}
+    request["source_files"]["collector"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="source drift"):
+        capture._dense_worker_argv(sys.executable, "manifest", request)
+
+
+def test_dense_collection_new_allocation_width_cannot_substitute_sp_or_partial_dp(monkeypatch):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    admission = {"nodes": [{"slots": 8}, {"slots": 8}]}
+    monkeypatch.setattr(transfer, "validate_local_inference_allocation", lambda value: value["nodes"])
+    with pytest.raises(ValueError, match="complete DP world"):
+        capture.validate_dense_checkpoint_allocation(admission, expected_dp_world_size=8)
+
+
+def test_dense_collection_new_two_save_real_dense_decoder_retains_collection_evidence(
+    _dense_collection_case, tmp_path
+):
+    state = _dense_collection_case
+    pair = _cortex_optimizer_decode_pair(tmp_path / "real-source", world_size=16)
+
+    def payloads(step, number):
+        source = pair.before if step == 0 else pair.after
+        names = {
+            path.name: path.read_bytes()
+            for path in source.rglob("*optim_states.pt")
+            if number * 8 <= int(capture._OPTIM_FILE.fullmatch(path.name).group(1)) < (number + 1) * 8
+        }
+        if number == 0:
+            names["mp_rank_00_model_states.pt"] = next(source.rglob("*model_states.pt")).read_bytes()
+        return names
+
+    state.payloads = payloads
+    before = state.save()
+    after = capture._save_local_snapshot(
+        state.client,
+        tmp_path / "after",
+        step=1,
+        expected_dp_world_size=16,
+        dense_checkpoint_allocation=state.admission,
+        parent_job_id="parent",
+        training_child_id="parent:training:0",
+    )
+    manifest = capture.decode_optimizer_capture(
+        before,
+        after,
+        tmp_path / "decoded",
+        expected_optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
+        expected_learning_rate=0.01,
+    )
+    assert json.loads(Path(manifest).read_text())["step"] == 1
+    for root in (before, after):
+        assert len(capture._checkpoint_files(root)[1]) == 16
+        assert not state.roots[(str(root), "peer")].exists()
+        assert json.loads((root / capture._DENSE_RECEIPT).read_text())["peer_cleanup"]
+
+
+@pytest.fixture
+def _dense_collection_capture_case(_dense_collection_case, tmp_path, monkeypatch):
+    state = _dense_collection_case
+    pair = _cortex_optimizer_decode_pair(tmp_path / "capture-source", world_size=16)
+
+    def payloads(step, number):
+        source = pair.before if step == 0 else pair.after
+        names = {
+            path.name: path.read_bytes()
+            for path in source.rglob("*optim_states.pt")
+            if number * 8 <= int(capture._OPTIM_FILE.fullmatch(path.name).group(1)) < (number + 1) * 8
+        }
+        if number == 0:
+            names["mp_rank_00_model_states.pt"] = next(source.rglob("*model_states.pt")).read_bytes()
+        return names
+
+    state.payloads = payloads
+    state.target_calls = 0
+    state.mutation = None
+    backend = CortexConfig(base_url="http://127.0.0.1:8080")
+    state.client.config = SimpleNamespace(backend=backend)
+    state.client.transport = object.__new__(cortex_fixture.CorrectnessCortexTransport)
+    state.client.transport.job_id = "parent"
+    state.client.transport._native_bindings = {"parent:training:0": ("training", "parent:training:0")}
+    state.client.transport._native_children = {"training": "parent:training:0"}
+    state.client.jobs = SimpleNamespace(training="parent:training:0")
+    state.job = ArcticJob(state.client, "training")
+    state.session = GatewaySession(tmp_path, 16, backend)
+
+    def step(session, job, body, *, learning_rate):
+        assert session is state.session and job is state.job and body == {"same": "batch"}
+        assert learning_rate == 0.01
+        state.target_calls += 1
+        if state.mutation == "parent":
+            state.client.transport.job_id = "other-parent"
+        elif state.mutation == "child":
+            state.client.jobs.training = "other-child"
+        return StepResult(avg_loss=2.0, grad_norms={"layer.weight": 1.0}, model_calls=1)
+
+    monkeypatch.setattr(capture, "fwd_bwd_step", step)
+
+    def run():
+        return capture.capture_optimizer_step(
+            state.session,
+            state.job,
+            {"same": "batch"},
+            learning_rate=0.01,
+            output_dir=tmp_path / "capture-output",
+            expected_dp_world_size=16,
+            optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
+            local_checkpoint=True,
+            dense_checkpoint_allocation=state.admission,
+        )
+
+    state.run = run
+    return state
+
+
+@pytest.fixture
+def _dense_native_child_identity_case(_dense_collection_capture_case):
+    state = _dense_collection_capture_case
+    state.selector = state.client.jobs.training
+    state.native_child = "c6b00582-865b-43c7-90fa-5ea36247b8df"
+    state.client.transport._native_bindings = {state.selector: ("training", state.native_child)}
+    state.client.transport._native_children = {"training": state.native_child}
+    save = state.client.save_checkpoint
+
+    def native_save(**kwargs):
+        result = save(**kwargs)
+        result["job_id"] = state.native_child
+        return result
+
+    state.client.save_checkpoint = native_save
+    return state
+
+
+def test_dense_native_child_identity_new_both_receipts_use_actual_child(_dense_native_child_identity_case):
+    state = _dense_native_child_identity_case
+    result = state.run()
+    record = json.loads(Path(result.optimizer_state_manifest).read_text())
+    assert state.target_calls == 1 and state.native_child != state.selector
+    for receipt in record["dense_save_receipts"].values():
+        assert receipt["binding"]["training_child_id"] == state.native_child
+        assert receipt["binding"]["parent_job_id"] == "parent"
+        assert len(receipt["node_manifests"]) == 2
+    assert state.calls.count(("peer", "close")) == 2
+
+
+@pytest.mark.parametrize("damage", ["missing", "role", "child", "children", "binding-type", "selector", "transport"])
+def test_dense_native_child_identity_new_invalid_binding_stops_before_save(_dense_native_child_identity_case, damage):
+    state = _dense_native_child_identity_case
+    transport = state.client.transport
+    if damage == "missing":
+        transport._native_bindings = {}
+    elif damage == "role":
+        transport._native_bindings[state.selector] = ("sampling", state.native_child)
+    elif damage == "child":
+        transport._native_bindings[state.selector] = ("training", "")
+    elif damage == "children":
+        transport._native_children["training"] = "unrelated-child"
+    elif damage == "binding-type":
+        transport._native_bindings[state.selector] = ["training", state.native_child]
+    elif damage == "selector":
+        state.client.jobs.training = None
+    else:
+        state.client.transport = SimpleNamespace(
+            job_id="parent", _native_bindings=transport._native_bindings, _native_children=transport._native_children
+        )
+    with pytest.raises(ValueError, match="owned native training child binding"):
+        state.run()
+    assert not state.calls and state.target_calls == 0
+
+
+@pytest.mark.parametrize("damage", ["binding", "children", "transport"])
+def test_dense_native_child_identity_new_midstep_drift_stops_before_second_save(
+    _dense_native_child_identity_case, monkeypatch, damage
+):
+    state = _dense_native_child_identity_case
+    step = capture.fwd_bwd_step
+
+    def drift(*args, **kwargs):
+        result = step(*args, **kwargs)
+        if damage == "binding":
+            state.client.transport._native_bindings[state.selector] = ("training", "other-child")
+            state.client.transport._native_children["training"] = "other-child"
+        elif damage == "children":
+            state.client.transport._native_children["training"] = "other-child"
+        else:
+            state.client.transport = SimpleNamespace(job_id="parent")
+        return result
+
+    monkeypatch.setattr(capture, "fwd_bwd_step", drift)
+    with pytest.raises(ValueError, match="parent/training child changed|owned native training child binding"):
+        state.run()
+    assert state.target_calls == 1 and state.calls.count(("head", "prepare")) == 1
+    assert state.calls.count(("peer", "close")) == 1
+
+
+def test_dense_native_child_identity_new_response_cannot_substitute_selector(_dense_native_child_identity_case):
+    state = _dense_native_child_identity_case
+    state.native_child = state.selector
+    with pytest.raises(ValueError, match="different training child"):
+        state.run()
+    assert state.target_calls == 0 and state.calls.count(("peer", "close")) == 1
+
+
+def test_dense_native_child_identity_new_postdecode_binding_drift_blocks_publication(
+    _dense_native_child_identity_case, monkeypatch
+):
+    state = _dense_native_child_identity_case
+    decode = capture.decode_optimizer_capture
+
+    def drift(*args, **kwargs):
+        result = decode(*args, **kwargs)
+        state.client.transport._native_bindings[state.selector] = ("training", "other-child")
+        state.client.transport._native_children["training"] = "other-child"
+        return result
+
+    monkeypatch.setattr(capture, "decode_optimizer_capture", drift)
+    with pytest.raises(ValueError, match="parent/training child changed"):
+        state.run()
+    assert state.target_calls == 1 and state.calls.count(("peer", "close")) == 2
+
+
+def test_dense_collection_new_capture_retains_both_full16_receipts_and_exact_step(_dense_collection_capture_case):
+    state = _dense_collection_capture_case
+    result = state.run()
+    record = json.loads(Path(result.optimizer_state_manifest).read_text())
+    assert record["step"] == 1 and result.avg_loss == 2.0 and state.target_calls == 1
+    assert set(record["dense_save_receipts"]) == {"before", "after"}
+    for label, step in (("before", 0), ("after", 1)):
+        receipt = record["dense_save_receipts"][label]
+        assert receipt["binding"]["tag"] == f"global_step{step}"
+        assert receipt["binding"]["parent_job_id"] == "parent"
+        assert receipt["binding"]["training_child_id"] == "parent:training:0"
+        assert [row["node"] for row in receipt["node_preparations"]] == state.admission["nodes"]
+        assert receipt["peer_cleanup"] == [{"node": state.admission["nodes"][1], "owned_root_absent": True}]
+        assert sum(len(row["files"]) for row in receipt["node_manifests"]) == 17
+    assert state.calls.count(("peer", "close")) == 2
+    assert all(not path.exists() for (root, host), path in state.roots.items() if host == "peer")
+
+
+@pytest.mark.parametrize("mutation", ["parent", "child"])
+def test_dense_collection_new_capture_binding_drift_stops_before_second_save(_dense_collection_capture_case, mutation):
+    state = _dense_collection_capture_case
+    state.mutation = mutation
+    with pytest.raises(ValueError, match="parent/training child changed"):
+        state.run()
+    assert state.target_calls == 1 and state.calls.count(("head", "prepare")) == 1
+    assert state.calls.count(("peer", "close")) == 1
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "receipt", "tag", "cleanup", "source"])
+def test_dense_collection_new_capture_rejects_drift_during_decode(
+    _dense_collection_capture_case, monkeypatch, mutation
+):
+    state = _dense_collection_capture_case
+    original = capture.decode_optimizer_capture
+
+    def drift(before, after, output, **kwargs):
+        manifest = original(before, after, output, **kwargs)
+        if mutation == "bytes":
+            next(before.rglob("*optim_states.pt")).write_bytes(b"changed")
+        elif mutation == "source":
+            monkeypatch.setattr(capture, "_dense_sources", lambda: {})
+        else:
+            path = before / capture._DENSE_RECEIPT
+            receipt = json.loads(path.read_text())
+            if mutation == "tag":
+                receipt["binding"]["tag"] = "global_step1"
+            elif mutation == "cleanup":
+                receipt["peer_cleanup"] = []
+            else:
+                receipt["extra"] = "changed"
+            path.write_text(json.dumps(receipt))
+        return manifest
+
+    monkeypatch.setattr(capture, "decode_optimizer_capture", drift)
+    with pytest.raises(ValueError, match="byte drift|receipts changed|binding drift|cleanup drift|source drift"):
+        state.run()
+    assert state.target_calls == 1 and state.calls.count(("peer", "close")) == 2
+    assert not (state.session.workdir / "capture-output" / "states").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "child", "save"])
+def test_dense_collection_new_capture_failed_first_save_never_reaches_target(_dense_collection_capture_case, failure):
+    state = _dense_collection_capture_case
+    state.failure = failure
+    with pytest.raises(
+        (ValueError, RuntimeError), match="node shard count|different training child|native save failed"
+    ):
+        state.run()
+    assert state.target_calls == 0 and state.calls.count(("peer", "close")) == 1
+
+
+@pytest.mark.parametrize("mutation", ["hardlink", "symlink"])
+def test_dense_collection_new_manifest_refuses_foreign_file_alias(_dense_collection_case, monkeypatch, mutation):
+    state = _dense_collection_case
+    original = capture._dense_call
+
+    def alias(admission, node, role, request, deadline):
+        if role == "manifest" and node["host"] == "head":
+            root = Path(request["binding"]["root"])
+            file = next(root.rglob("*optim_states.pt"))
+            foreign = root.parent / "foreign.pt"
+            if mutation == "hardlink":
+                os.link(file, foreign)
+            else:
+                file.rename(foreign)
+                file.symlink_to(foreign)
+            state.foreign = foreign
+        return original(admission, node, role, request, deadline)
+
+    monkeypatch.setattr(capture, "_dense_call", alias)
+    with pytest.raises(ValueError, match="exclusively owned|unsupported entries"):
+        state.save()
+    assert state.foreign.is_file()
+    assert not state.roots[(str(state.output), "peer")].exists()
+
+
+@pytest.mark.parametrize("operation", ["prepare", "manifest", "send", "close"])
+def test_dense_collection_new_peer_argv_binds_strict_transport_and_bounded_supervisor(tmp_path, operation):
+    known = tmp_path / "known_hosts"
+    known.write_text("synthetic pinned host key")
+    nodes = [{"host": "head", "python": sys.executable}, {"host": "peer", "python": sys.executable}]
+    admission = {
+        "nodes": nodes,
+        "ssh": {
+            "port": 7878,
+            "known_hosts": str(known),
+            "known_hosts_sha256": hashlib.sha256(known.read_bytes()).hexdigest(),
+        },
+    }
+    request = {"source_files": capture._dense_sources(), "node": nodes[1]}
+    with capture._dense_argv(admission, nodes[1], operation, request, time.monotonic() + 30) as argv:
+        assert argv[:4] == ["ssh", "-T", "-p", "7878"]
+        assert "StrictHostKeyChecking=yes" in argv and "BatchMode=yes" in argv
+        held_path = next(value.split("=", 1)[1] for value in argv if value.startswith("UserKnownHostsFile="))
+        assert Path(held_path).read_bytes() == known.read_bytes() and argv[-2] == "peer"
+        assert "supervise" in argv[-1] and operation in argv[-1]
+    with capture._dense_argv(admission, nodes[0], operation, request, time.monotonic() + 30) as argv:
+        assert argv[0] == sys.executable
+
+
+@pytest.mark.parametrize("outcome", ["success", "exit", "timeout"])
+def test_dense_collection_new_supervisor_reaps_own_actual_cpu_child(tmp_path, monkeypatch, outcome):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    request = {
+        "timeout_s": 0.5,
+        "deadline_epoch": time.time() + 0.5,
+        "source_files": capture._dense_sources(),
+        "operation": "send",
+        "binding": {"root": str(tmp_path / "owned")},
+    }
+    monkeypatch.setattr(capture, "_dense_node_admission", lambda *args: {})
+    monkeypatch.setattr(capture, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    code = (
+        "pass"
+        if outcome == "success"
+        else "raise SystemExit(7)" if outcome == "exit" else "import time;time.sleep(60)"
+    )
+    monkeypatch.setattr(capture, "_dense_worker_argv", lambda *args: [sys.executable, "-B", "-c", code])
+    closed = []
+    stop = transfer._stop_local_children
+
+    def record(children):
+        closed.extend(children)
+        stop(children)
+
+    monkeypatch.setattr(transfer, "_stop_local_children", record)
+    if outcome == "success":
+        capture._dense_worker("supervise", request)
+    else:
+        with pytest.raises((RuntimeError, capture.subprocess.TimeoutExpired), match="worker failed|timed out"):
+            capture._dense_worker("supervise", request)
+    assert len(closed) == 1 and closed[0].poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(closed[0].pid, 0)
+
+
+@pytest.mark.parametrize("outcome", ["success", "truncated", "sender-exit", "timeout"])
+def test_dense_collection_new_boundary_real_pipe_reaps_both_owned_children(tmp_path, monkeypatch, outcome):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    root = tmp_path / "owned"
+    root.mkdir()
+    binding = {"root": str(root), "tag": "global_step0", "nonce": "own"}
+    (root / capture._DENSE_OWNER).write_text(json.dumps(binding))
+    raw = b"actual-bound-peer-bytes"
+    manifest = {
+        "files": [
+            {
+                "path": "bf16_zero_pp_rank_8_mp_rank_00_optim_states.pt",
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    }
+    stream = json.dumps(manifest).encode() + b"\n" + (raw[:-1] if outcome == "truncated" else raw)
+    sender_code = f"import sys;sys.stdout.buffer.write({stream!r});sys.stdout.buffer.flush()"
+    if outcome == "timeout":
+        sender_code = "import time;time.sleep(60)"
+    elif outcome == "sender-exit":
+        sender_code += ";raise SystemExit(7)"
+    monkeypatch.setattr(
+        capture, "_dense_argv", lambda *args: contextlib.nullcontext([sys.executable, "-B", "-c", sender_code])
+    )
+    receiver_request = {"binding": binding, "manifest": manifest}
+    receiver_code = (
+        "import json,time\nfrom arctic_platform.correctness.harness import cortex_optimizer as m\n"
+        f"print(json.dumps(m._dense_receive({receiver_request!r},time.monotonic()+30)))"
+    )
+    monkeypatch.setattr(capture, "_dense_worker_argv", lambda *args: [sys.executable, "-B", "-c", receiver_code])
+    closed = []
+    original = transfer._stop_local_children
+
+    def stop(children):
+        closed.extend(children)
+        original(children)
+
+    monkeypatch.setattr(transfer, "_stop_local_children", stop)
+    deadline = time.monotonic() + (0.5 if outcome == "timeout" else 30)
+    if outcome == "success":
+        capture._dense_copy_peer({}, {}, {"manifest": manifest}, receiver_request, deadline)
+        assert (root / "global_step0" / manifest["files"][0]["path"]).read_bytes() == raw
+    else:
+        with pytest.raises((RuntimeError, capture.subprocess.TimeoutExpired), match="transfer failed|timed out"):
+            capture._dense_copy_peer({}, {}, {"manifest": manifest}, receiver_request, deadline)
+    assert len(closed) == 2 and all(child.poll() is not None for child in closed)
+    for child in closed:
+        with pytest.raises(ProcessLookupError):
+            os.killpg(child.pid, 0)
+
+
+@pytest.mark.parametrize("mutation", ["valid", "boot", "width", "order", "hash", "content", "duplicate"])
+def test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_and_complete16(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    hostfile = tmp_path / "hostfile"
+    content = "head slots=8\npeer slots=8\n"
+    hostfile.write_text(content)
+    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", hostfile)
+    monkeypatch.setattr(transfer, "_validate_local_node", lambda node, deadline: None)
+    nodes = [
+        {
+            "host": name,
+            "hostname": name,
+            "slots": 8,
+            "boot_id": "1" * 36,
+            "python": sys.executable,
+            "python_sha256": "2" * 64,
+        }
+        for name in ("head", "peer")
+    ]
+    admission = {
+        "allocation_id": "same-job",
+        "nodes": nodes,
+        "hostfile_content": content,
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+    }
+    if mutation == "boot":
+        del nodes[1]["boot_id"]
+    elif mutation == "width":
+        nodes[1]["slots"] = 4
+    elif mutation == "order":
+        nodes.reverse()
+    elif mutation == "hash":
+        admission["hostfile_sha256"] = "0" * 64
+    elif mutation == "content":
+        admission["hostfile_content"] = "different"
+    elif mutation == "duplicate":
+        nodes[1]["hostname"] = nodes[0]["hostname"]
+    if mutation == "valid":
+        assert capture.validate_dense_checkpoint_allocation(admission, expected_dp_world_size=16) == nodes
+    else:
+        with pytest.raises(
+            ValueError, match="pins required|hosts and slots differ|hash differs|content differs|unique"
+        ):
+            capture.validate_dense_checkpoint_allocation(admission, expected_dp_world_size=16)
+
+
+@pytest.mark.parametrize("mutation", ["inode", "content"])
+def test_dense_collection_new_boundary_node_hostfile_cannot_drift_after_prepare(tmp_path, monkeypatch, mutation):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    hostfile = tmp_path / "hostfile"
+    content = "head slots=8\npeer slots=8\n"
+    hostfile.write_text(content)
+    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", hostfile)
+    monkeypatch.setattr(transfer, "_validate_local_node", lambda *args: None)
+    nodes = [{"host": name, "hostname": name, "slots": 8} for name in ("head", "peer")]
+    request = {
+        "node": nodes[1],
+        "allocation": {
+            "nodes": nodes,
+            "hostfile_content": content,
+            "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        },
+        "hostfile_identity": transfer._local_hostfile_identity(),
+    }
+    if mutation == "inode":
+        hostfile.rename(tmp_path / "old-hostfile")
+        hostfile.write_text(content)
+    else:
+        hostfile.write_text("different")
+    with pytest.raises(ValueError, match="node hostfile drift"):
+        capture._dense_node_admission(request, time.monotonic() + 30)
+
+
+@pytest.fixture
+def _dense_head_snapshot_case(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    hostfile = tmp_path / "hostfile"
+    content = "head slots=8\npeer slots=8\n"
+    nodes = [
+        {
+            "host": name,
+            "hostname": name,
+            "slots": 8,
+            "boot_id": "1" * 36,
+            "python": sys.executable,
+            "python_sha256": "2" * 64,
+        }
+        for name in ("head", "peer")
+    ]
+    request = {
+        "node": nodes[1],
+        "allocation": {
+            "nodes": nodes,
+            "hostfile_content": content,
+            "hostfile_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        },
+    }
+    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", hostfile)
+    validated = []
+    monkeypatch.setattr(transfer, "_validate_local_node", lambda node, deadline: validated.append(node))
+    return SimpleNamespace(request=request, hostfile=hostfile, content=content, validated=validated, transfer=transfer)
+
+
+def test_dense_head_snapshot_new_absent_peer_authenticates_without_creating_scheduler_file(_dense_head_snapshot_case):
+    state = _dense_head_snapshot_case
+    identity = capture._dense_node_admission(state.request, time.monotonic() + 30)
+    assert identity == {
+        "path": str(state.hostfile),
+        "absent": True,
+        "hostfile_sha256": state.request["allocation"]["hostfile_sha256"],
+    }
+    state.request["hostfile_identity"] = identity
+    assert capture._dense_node_admission(state.request, time.monotonic() + 30) == identity
+    assert state.validated == [state.request["node"]] * 2
+    assert not state.hostfile.exists()
+
+
+def test_dense_head_snapshot_new_missing_head_remains_rejected(_dense_head_snapshot_case):
+    state = _dense_head_snapshot_case
+    state.request["node"] = state.request["allocation"]["nodes"][0]
+    with pytest.raises(ValueError, match="head hostfile is required"):
+        capture._dense_node_admission(state.request, time.monotonic() + 30)
+
+
+@pytest.mark.parametrize("mutation", ["hash", "content", "oversized", "order", "slots", "duplicate", "foreign"])
+def test_dense_head_snapshot_new_corrupt_or_foreign_members_rejected(_dense_head_snapshot_case, mutation):
+    state = _dense_head_snapshot_case
+    admission = state.request["allocation"]
+    if mutation == "hash":
+        admission["hostfile_sha256"] = "0" * 64
+    elif mutation == "content":
+        admission["hostfile_content"] = "other slots=8\npeer slots=8\n"
+    elif mutation == "oversized":
+        admission["hostfile_content"] += "#" * 65536
+    elif mutation == "order":
+        admission["nodes"].reverse()
+    elif mutation == "slots":
+        admission["nodes"][1]["slots"] = 4
+    elif mutation == "duplicate":
+        admission["nodes"][1]["hostname"] = "head"
+    else:
+        state.request["node"] = {**state.request["node"], "boot_id": "3" * 36}
+    with pytest.raises(ValueError, match="snapshot"):
+        capture._dense_node_admission(state.request, time.monotonic() + 30)
+    assert not state.validated and not state.hostfile.exists()
+
+
+@pytest.mark.parametrize("field", ["boot_id", "python_sha256"])
+def test_dense_head_snapshot_new_actual_node_identity_guard_still_runs(_dense_head_snapshot_case, monkeypatch, field):
+    state = _dense_head_snapshot_case
+
+    def validate(node, deadline):
+        assert node[field] == state.request["node"][field]
+        raise ValueError("actual node identity drift")
+
+    monkeypatch.setattr(state.transfer, "_validate_local_node", validate)
+    with pytest.raises(ValueError, match="actual node identity drift"):
+        capture._dense_node_admission(state.request, time.monotonic() + 30)
+    assert not state.hostfile.exists()
+
+
+@pytest.mark.parametrize("mutation", ["appeared", "disappeared", "inode", "content", "dangling"])
+def test_dense_head_snapshot_new_existing_or_absent_hostfile_cannot_change(_dense_head_snapshot_case, mutation):
+    state = _dense_head_snapshot_case
+    if mutation != "appeared":
+        state.hostfile.write_text(state.content)
+    state.request["hostfile_identity"] = capture._dense_node_admission(state.request, time.monotonic() + 30)
+    if mutation == "appeared":
+        state.hostfile.write_text(state.content)
+    elif mutation == "disappeared":
+        state.hostfile.rename(state.hostfile.with_name("retained"))
+    elif mutation == "inode":
+        state.hostfile.rename(state.hostfile.with_name("retained"))
+        state.hostfile.write_text(state.content)
+    elif mutation == "content":
+        state.hostfile.write_text("different")
+    else:
+        state.hostfile.rename(state.hostfile.with_name("retained"))
+        state.hostfile.symlink_to(state.hostfile.with_name("missing"))
+    with pytest.raises((ValueError, FileNotFoundError), match="hostfile drift|symlink|No such file"):
+        capture._dense_node_admission(state.request, time.monotonic() + 30)
+
+
+def test_dense_collection_new_boundary_source_pin_survives_optimized_python_before_import(tmp_path, monkeypatch):
+    source = tmp_path / "source.py"
+    source.write_text("original")
+    sources = {"collector": {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}}
+    monkeypatch.setattr(capture, "_dense_sources", lambda: sources)
+    argv = capture._dense_worker_argv(sys.executable, "manifest", {"source_files": sources})
+    source.write_text("changed")
+    result = capture.subprocess.run([argv[0], "-O", *argv[1:]], capture_output=True, timeout=10)
+    assert result.returncode != 0 and b"source drift before import" in result.stderr
+    assert b"ModuleNotFoundError" not in result.stderr
+
+
+@pytest.mark.parametrize("outcome", ["success", "exit", "json", "timeout"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_dense_collection_new_cleanup_call_classifies_only_owned_group_failure(monkeypatch, outcome, cleanup_failure):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    code = {
+        "success": "print('{\"actual\":true}')",
+        "exit": "import sys;print('actual worker failure',file=sys.stderr);raise SystemExit(7)",
+        "json": "print('invalid json')",
+        "timeout": "import time;time.sleep(60)",
+    }[outcome]
+    monkeypatch.setattr(
+        capture, "_dense_argv", lambda *args: contextlib.nullcontext([sys.executable, "-B", "-c", code])
+    )
+    closed = []
+    original = transfer._stop_local_children
+
+    def close(children):
+        closed.extend(children)
+        original(children)
+        if cleanup_failure:
+            raise RuntimeError("synthetic owned group absence acknowledgement failure")
+
+    monkeypatch.setattr(transfer, "_stop_local_children", close)
+    deadline = time.monotonic() + (0.5 if outcome == "timeout" else 10)
+    if cleanup_failure:
+        with pytest.raises(capture.UnsafeCleanupError, match="owned process cleanup incomplete") as rejected:
+            capture._dense_call({}, {}, "manifest", {}, deadline)
+        assert isinstance(rejected.value.shutdown_error, RuntimeError)
+        assert bool(rejected.value.workload_error) == (outcome != "success")
+        assert set(rejected.value.owned_children) == {str(closed[0].pid)}
+    elif outcome == "success":
+        assert capture._dense_call({}, {}, "manifest", {}, deadline) == {"actual": True}
+    else:
+        expected = {
+            "exit": RuntimeError,
+            "json": json.JSONDecodeError,
+            "timeout": capture.subprocess.TimeoutExpired,
+        }[outcome]
+        with pytest.raises(expected):
+            capture._dense_call({}, {}, "manifest", {}, deadline)
+    assert len(closed) == 1 and closed[0].poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(closed[0].pid, 0)
+
+
+def test_dense_collection_new_cleanup_copy_preserves_worker_error_and_group_failure(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    command = [sys.executable, "-B", "-c", "raise SystemExit(7)"]
+    monkeypatch.setattr(capture, "_dense_argv", lambda *args: contextlib.nullcontext(command))
+    monkeypatch.setattr(capture, "_dense_worker_argv", lambda *args: command)
+    closed = []
+    original = transfer._stop_local_children
+
+    def close(children):
+        closed.extend(children)
+        original(children)
+        raise RuntimeError("synthetic transfer group absence acknowledgement failure")
+
+    monkeypatch.setattr(transfer, "_stop_local_children", close)
+    with pytest.raises(capture.UnsafeCleanupError, match="owned process cleanup incomplete") as rejected:
+        capture._dense_copy_peer({}, {}, {"manifest": {"files": []}}, {}, time.monotonic() + 10)
+    assert isinstance(rejected.value.workload_error, RuntimeError)
+    assert "transfer failed" in str(rejected.value.workload_error)
+    assert len(closed) == 2 and all(child.poll() is not None for child in closed)
+    assert set(rejected.value.owned_children) == {str(child.pid) for child in closed}
+
+
+def test_dense_collection_new_cleanup_supervisor_preserves_primary_and_owned_child(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    request = {
+        "timeout_s": 10,
+        "deadline_epoch": time.time() + 10,
+        "source_files": capture._dense_sources(),
+        "operation": "send",
+        "binding": {"root": str(tmp_path / "owned")},
+    }
+    monkeypatch.setattr(capture, "_dense_node_admission", lambda *args: {})
+    monkeypatch.setattr(capture, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(
+        capture, "_dense_worker_argv", lambda *args: [sys.executable, "-B", "-c", "raise SystemExit(7)"]
+    )
+    closed = []
+    original = transfer._stop_local_children
+
+    def close(children):
+        closed.extend(children)
+        original(children)
+        raise RuntimeError("synthetic supervised group absence acknowledgement failure")
+
+    monkeypatch.setattr(transfer, "_stop_local_children", close)
+    with pytest.raises(capture.UnsafeCleanupError, match="owned process cleanup incomplete") as rejected:
+        capture._dense_worker("supervise", request)
+    assert isinstance(rejected.value.workload_error, RuntimeError)
+    assert "supervised worker failed" in str(rejected.value.workload_error)
+    assert len(closed) == 1 and closed[0].poll() is not None
+
+
+# Dense-only runner and maintained API forwarding; no model or remote calls.
+
+
+@pytest.fixture
+def dense_allocation_runner_case(tmp_path, monkeypatch, request):
+    from copy import deepcopy
+
+    from arctic_platform.correctness.harness import storage
+
+    width = getattr(request, "param", 4)
+    cfg = load_config(_cortex_optimizer_capture_CONFIG).at_gpu_width(width)
+    spec = Spec.read(_cortex_optimizer_capture_SPEC)
+    spec.model.cache_path = str(tmp_path / "reviewed-model")
+    spec.test_settings["single-step-optimizer"]["model_cache_path"] = spec.model.cache_path
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    references = _cortex_optimizer_capture_prepared_references(monkeypatch, spec, cfg, tmp_path)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    admission = {"nodes": [{"host": "head", "slots": width // 2}, {"host": "peer", "slots": width // 2}]}
+    allocation_validator = capture.validate_dense_checkpoint_allocation
+    events, admitted, captures, payloads = [], [], [], []
+    original_files = (_cortex_optimizer_capture_CONFIG.read_bytes(), _cortex_optimizer_capture_SPEC.read_bytes())
+
+    def validate(value, *, expected_dp_world_size):
+        assert expected_dp_world_size == width
+        assert value == admission and value is not admission
+        admitted.append(deepcopy(value))
+        events.append("allocation")
+        return value["nodes"]
+
+    @contextmanager
+    def gateway(*args, **kwargs):
+        assert kwargs["backend"] is backend
+        events.append("gateway-enter")
+        yield "mock-session"
+        events.append("gateway-exit")
+
+    @contextmanager
+    def running_job(session, payload):
+        assert session == "mock-session"
+        payloads.append(deepcopy(payload))
+        events.append("job-enter")
+        yield "mock-job"
+        events.append("job-exit")
+
+    def step(session, job, body, **kwargs):
+        assert session == "mock-session" and job == "mock-job"
+        assert kwargs["local_checkpoint"] is True
+        assert kwargs["expected_dp_world_size"] == width
+        assert kwargs["learning_rate"] == 0.01
+        assert kwargs["optimizer_config"] == cfg.training["optimizer"]
+        assert kwargs["dense_checkpoint_allocation"] == admission
+        assert "native_layout_supplier" not in kwargs
+        captures.append(deepcopy(kwargs["dense_checkpoint_allocation"]))
+        kwargs["dense_checkpoint_allocation"]["nodes"][0]["slots"] = 99
+        events.append("capture")
+        manifest = _cortex_optimizer_capture_manifest(kwargs["output_dir"] / "states")
+        return StepResult(2.0, {"weight": 1.0}, optimizer_state_manifest=str(manifest))
+
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", validate)
+    monkeypatch.setattr(capture, "capture_optimizer_step", step)
+    monkeypatch.setattr(runner, "gateway", gateway)
+    monkeypatch.setattr(runner, "running_job", running_job)
+    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: {"model_name": spec.model.cache_path})
+    monkeypatch.setattr(
+        requests.Session, "request", lambda *args, **kwargs: pytest.fail("dense runner controls must not use network")
+    )
+
+    def execute(**options):
+        return runner.execute(
+            cfg,
+            spec,
+            [ArmDefinition("gas1", width, 32), ArmDefinition("gas4", 4 * width, 32)],
+            vocab_size=128,
+            workdir=tmp_path / "work",
+            **{
+                "select": ["single-step-optimizer"],
+                "client_backend": backend,
+                "local_cortex_fixture": True,
+                "dense_checkpoint_allocation": admission,
+                **options,
+            },
+        )
+
+    return SimpleNamespace(
+        cfg=cfg,
+        spec=spec,
+        backend=backend,
+        admission=admission,
+        references=references,
+        events=events,
+        admitted=admitted,
+        captures=captures,
+        payloads=payloads,
+        original_files=original_files,
+        allocation_validator=allocation_validator,
+        execute=execute,
+    )
+
+
+@pytest.mark.parametrize("order", ["batched", "interleaved"])
+@pytest.mark.parametrize("combined", [False, True])
+def test_dense_allocation_runner_new_forwards_original_dense_dp_and_isolates_each_arm(
+    dense_allocation_runner_case, order, combined
+):
+    case = dense_allocation_runner_case
+    selected = ["single-step-grads", "single-step-optimizer"] if combined else ["single-step-optimizer"]
+    original = json.loads(json.dumps(case.cfg.training))
+    results = case.execute(select=selected, order=order)
+    assert len(results) == 2 * len(selected) and all(result.outcome is Outcome.PASS for result in results)
+    assert case.admitted == [case.admission] and case.captures == [case.admission, case.admission]
+    assert case.admission["nodes"][0]["slots"] == 2
+    assert case.events[0] == "allocation" and case.events[-1] == "gateway-exit"
+    assert case.events.count("job-enter") == case.events.count("job-exit") == 2
+    assert all(row.metrics["stated_criterion_abs"] == 0.001 for row in results if row.test_id.endswith("optimizer"))
+    assert case.references == [(check, arm) for arm in ("gas1", "gas4") for check in selected]
+    assert case.cfg.training == original
+    assert (_cortex_optimizer_capture_CONFIG.read_bytes(), _cortex_optimizer_capture_SPEC.read_bytes()) == (
+        case.original_files
+    )
+
+
+@pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
+@pytest.mark.parametrize("order", ["batched", "interleaved"])
+def test_dense_allocation_runner_explicit16_preserves_placement_for_both_arms(dense_allocation_runner_case, order):
+    case = dense_allocation_runner_case
+    results = case.execute(order=order)
+    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
+    assert case.cfg.n_gpus == case.cfg.dp_size == 16 and case.cfg.sp_size == 1
+    assert case.cfg.training["ds_config"]["train_batch_size"] == 16
+    assert case.references == [("single-step-optimizer", arm) for arm in ("gas1", "gas4")]
+    assert len(case.captures) == len(case.payloads) == 2
+    assert all(sum(node["slots"] for node in admission["nodes"]) == 16 for admission in case.captures)
+    assert all(payload["training_config"]["n_gpus"] == 16 for payload in case.payloads)
+    assert all(result.metrics["stated_criterion_abs"] == 0.001 for result in results)
+    assert case.events.count("job-enter") == case.events.count("job-exit") == 2
+    assert case.events[-1] == "gateway-exit"
+
+
+@pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
+def test_dense_allocation_runner_explicit16_rejects_partial8_before_preparation(
+    dense_allocation_runner_case, monkeypatch
+):
+    from arctic_platform.correctness.harness import inference_export
+
+    case = dense_allocation_runner_case
+    for node in case.admission["nodes"]:
+        node["slots"] = 4
+    monkeypatch.setattr(inference_export, "validate_local_inference_allocation", lambda admission: admission["nodes"])
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", case.allocation_validator)
+    with pytest.raises(ValueError, match="complete DP world"):
+        case.execute()
+    assert case.cfg.n_gpus == case.cfg.dp_size == 16
+    assert not case.events and not case.references and not case.captures
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "no-local-fixture",
+        "preparation",
+        "rl",
+        "lora",
+        "onprem",
+        "remote",
+        "no-selection",
+        "gradients-only",
+        "mixed-selection",
+        "sp",
+        "ep",
+        "moe",
+        "tp",
+        "native-scope",
+        "native-source",
+        "native-supplier-source",
+    ],
+)
+def test_dense_allocation_runner_new_rejects_incompatible_route_before_references_or_resources(
+    dense_allocation_runner_case, bad
+):
+    case = dense_allocation_runner_case
+    options = {}
+    if bad == "no-local-fixture":
+        options["local_cortex_fixture"] = False
+    elif bad == "preparation":
+        options["prepare_references"] = True
+    elif bad == "rl":
+        case.cfg.native = case.cfg.native.model_copy(update={"sampling_gpus": 4})
+    elif bad == "lora":
+        case.cfg.training["peft_config"] = {"r": 32}
+    elif bad == "onprem":
+        options["client_backend"] = OnPremConfig()
+    elif bad == "remote":
+        options["client_backend"] = CortexConfig(base_url="http://not-local.example:8003")
+    elif bad == "no-selection":
+        options["select"] = None
+    elif bad == "gradients-only":
+        options["select"] = ["single-step-grads"]
+    elif bad == "mixed-selection":
+        options["select"] = ["single-step-optimizer", "inference-checkpoint-loss"]
+    elif bad == "sp":
+        case.cfg.training["sp_size"] = 2
+    elif bad == "ep":
+        case.cfg.training["ds_config"]["expert_parallel"] = {"enabled": True, "autoep_size": 2}
+    elif bad == "moe":
+        case.cfg.training["ds_config"]["moe"] = {"enabled": True}
+    elif bad == "tp":
+        case.cfg.training["ds_config"]["tensor_parallel"] = {"tp_size": 2}
+    elif bad == "native-scope":
+        options["native_optimizer_scope"] = lambda *args: pytest.fail("native scope must not run")
+    elif bad == "native-source":
+        options["native_optimizer_scope_source"] = {"path": "unread", "sha256": "0" * 64}
+    else:
+        options["native_optimizer_supplier_source"] = {"path": "unread", "sha256": "0" * 64}
+    with pytest.raises(ValueError, match="exclusive local Cortex SP1/EP1|loopback"):
+        case.execute(**options)
+    assert not case.events and not case.admitted and not case.captures and not case.references
+
+
+def test_dense_allocation_runner_new_allocation_rejection_precedes_reference_identity_and_resources(
+    dense_allocation_runner_case, monkeypatch
+):
+    case = dense_allocation_runner_case
+
+    def reject(*args, **kwargs):
+        raise ValueError("actual allocation identity differs")
+
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", reject)
+    monkeypatch.setattr(
+        reference_records, "model_identity", lambda *args: pytest.fail("read reference before admission")
+    )
+    with pytest.raises(ValueError, match="actual allocation identity"):
+        case.execute()
+    assert not case.events and not case.references
+
+
+def _dense_allocation_runner_args(tmp_path, *, raw=b'{"nodes":[{"host":"head","slots":4}]}'):
+    from arctic_platform.correctness import api
+
+    path = tmp_path / "allocation.json"
+    path.write_bytes(raw)
+    options = api.RunOptions(
+        backend="cortex-training",
+        base_url="http://127.0.0.1:8003",
+        local_cortex_fixture=True,
+        dense_checkpoint_allocation=path,
+        dense_checkpoint_allocation_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    request = api.RunRequest(config=str(_cortex_optimizer_capture_CONFIG), tests=("single-step-optimizer",))
+    return api._namespace(request, options), request, options
+
+
+@pytest.mark.parametrize("combined", [False, True])
+def test_dense_allocation_runner_new_maintained_parser_and_loader_have_distinct_optimizer_scope(tmp_path, combined):
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    selected = ["single-step-grads", "single-step-optimizer"] if combined else ["single-step-optimizer"]
+    argv = [
+        "--config",
+        request.config,
+        "--base-url",
+        options.base_url,
+        "--local-cortex-fixture",
+        "--dense-checkpoint-allocation",
+        str(options.dense_checkpoint_allocation),
+        "--dense-checkpoint-allocation-sha256",
+        options.dense_checkpoint_allocation_sha256,
+    ]
+    for test in selected:
+        argv.extend(["--test", test])
+    actual_request, actual_options = api.parse_run_args(argv)
+    assert actual_request.tests == tuple(selected)
+    assert actual_options.dense_checkpoint_allocation == options.dense_checkpoint_allocation
+    assert actual_options.dense_checkpoint_allocation_sha256 == options.dense_checkpoint_allocation_sha256
+    parsed = api._namespace(actual_request, actual_options)
+    assert cli._load_dense_checkpoint_allocation(parsed) == {"nodes": [{"host": "head", "slots": 4}]}
+    assert cli._load_inference_export_allocation(parsed) is None
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"test": None},
+        {"test": ["single-step-grads"]},
+        {"test": ["single-step-optimizer", "inference-checkpoint-loss"]},
+        {"all_configs": True},
+        {"config": None},
+        {"backend": "onprem"},
+        {"prepare_references": True},
+        {"local_cortex_fixture": False},
+        {"cortex_fixture": Path("unread-publication.json")},
+        {"probe_layers": 1},
+        {"local_gateway_full_model": True},
+        {"peft_adapter": Path("unread-adapter")},
+        {"base_url": "http://remote.example"},
+    ],
+)
+def test_dense_allocation_runner_new_loader_rejects_scope_before_descriptor_read(tmp_path, monkeypatch, changed):
+    args, _, _ = _dense_allocation_runner_args(tmp_path)
+    vars(args).update(changed)
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: pytest.fail("unsafe scope reached descriptor read"))
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"nodes":[],"nodes":[]}',
+        b'{"nodes":[{"slots":1,"slots":2}]}',
+        b'{"nodes":[],"timeout_s":NaN}',
+        b'{"nodes":[],"timeout_s":Infinity}',
+        b"[]",
+        b"x" * (1024 * 1024 + 1),
+    ],
+)
+def test_dense_allocation_runner_new_loader_rejects_duplicate_nonfinite_nonobject_and_oversize(tmp_path, raw):
+    args, _, _ = _dense_allocation_runner_args(tmp_path, raw=raw)
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize("bad", ["missing-path", "missing-pin", "wrong-pin", "uppercase-pin", "short-pin"])
+def test_dense_allocation_runner_new_loader_requires_exact_paired_fullpin(tmp_path, bad):
+    args, _, _ = _dense_allocation_runner_args(tmp_path)
+    if bad == "missing-path":
+        args.dense_checkpoint_allocation = None
+    elif bad == "missing-pin":
+        args.dense_checkpoint_allocation_sha256 = None
+    else:
+        args.dense_checkpoint_allocation_sha256 = {
+            "wrong-pin": "0" * 64,
+            "uppercase-pin": "A" * 64,
+            "short-pin": "a" * 63,
+        }[bad]
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize("boundary", ["api", "batch"])
+def test_dense_allocation_runner_new_original_mixed_selection_rejected_before_grouping(
+    tmp_path, monkeypatch, boundary
+):
+    from dataclasses import replace
+
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    request = replace(request, tests=("single-step-optimizer", "inference-checkpoint-loss"))
+    args.test = list(request.tests)
+    monkeypatch.setattr(api, "select", lambda *args: pytest.fail("invalid original selection was grouped"))
+    monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("invalid selection created batch output"))
+    with pytest.raises(ValueError):
+        if boundary == "api":
+            api.run(request, options)
+        else:
+            cli.run_batch(args, selected=[])
+
+
+def test_dense_allocation_runner_new_maintained_cli_forwards_authenticated_descriptor_to_executor(
+    tmp_path, monkeypatch
+):
+    args, _, options = _dense_allocation_runner_args(tmp_path)
+    parsed = cli.parse_args(
+        [
+            "run",
+            "--config",
+            str(_cortex_optimizer_capture_CONFIG),
+            "--base-url",
+            options.base_url,
+            "--local-cortex-fixture",
+            "--test",
+            "single-step-optimizer",
+            "--dense-checkpoint-allocation",
+            str(options.dense_checkpoint_allocation),
+            "--dense-checkpoint-allocation-sha256",
+            options.dense_checkpoint_allocation_sha256,
+            "--out",
+            str(tmp_path / "report"),
+        ]
+    )
+    cfg = load_config(_cortex_optimizer_capture_CONFIG)
+    spec = Spec.read(_cortex_optimizer_capture_SPEC)
+    backend = CortexConfig(base_url=options.base_url)
+    forwarded = []
+    monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
+    monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: [_cortex_optimizer_capture_CONFIG])
+    monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
+    monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 128)
+    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        cortex_fixture,
+        "load_local_fixture",
+        lambda *args: {
+            "model_name": spec.model.cache_path,
+            "fixture_sha256": "mock-fixture",
+            "distribution": "local-gateway",
+        },
+    )
+    monkeypatch.setattr(
+        requests.Session, "request", lambda *args, **kwargs: pytest.fail("CLI forwarding must not use network")
+    )
+
+    def execute(run_cfg, run_spec, arms, **kwargs):
+        assert run_cfg.n_gpus == cfg.n_gpus == 4 and run_cfg.dp_size == 4
+        assert run_spec is spec and arms[0].global_batch_size == 4
+        assert kwargs["select"] == ["single-step-optimizer"] and kwargs["local_cortex_fixture"] is True
+        assert kwargs["dense_checkpoint_allocation"] == cli._load_dense_checkpoint_allocation(args)
+        forwarded.append(kwargs)
+        return []
+
+    assert cli._run_configs(parsed, executor=execute) == 0
+    assert len(forwarded) == 1
+    assert hashlib.sha256(options.dense_checkpoint_allocation.read_bytes()).hexdigest() == (
+        options.dense_checkpoint_allocation_sha256
+    )
+
+
+def test_dense_allocation_runner_new_library_keeps_pinned_metadata_in_original_request_before_batch(
+    tmp_path, monkeypatch
+):
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    selected = [api.SelectedCase("mock-dense", _cortex_optimizer_capture_CONFIG, "single-step-optimizer")]
+    reached = []
+    monkeypatch.setattr(
+        api, "select", lambda actual: selected if actual is request else pytest.fail("request replaced")
+    )
+    result = object()
+
+    def batch(actual, **kwargs):
+        assert actual.test == ["single-step-optimizer"]
+        assert actual.dense_checkpoint_allocation == args.dense_checkpoint_allocation
+        assert actual.dense_checkpoint_allocation_sha256 == args.dense_checkpoint_allocation_sha256
+        assert kwargs["selected"] is selected
+        reached.append(actual)
+        return result
+
+    monkeypatch.setattr(cli, "run_batch", batch)
+    assert api.run(request, options) is result
+    assert len(reached) == 1
+
+
+@pytest.fixture
+def _strict_ssh_consumer_new_dense_case(tmp_path):
+    trust = tmp_path / "trust"
+    trust.write_bytes(b"[peer]:7878 ssh-ed25519 ORIGINAL\n")
+    trust.chmod(0o400)
+    nodes = [{"host": "head", "python": sys.executable}, {"host": "peer", "python": sys.executable}]
+    admission = {
+        "nodes": nodes,
+        "ssh": {
+            "port": 7878,
+            "known_hosts": str(trust),
+            "known_hosts_sha256": hashlib.sha256(trust.read_bytes()).hexdigest(),
+        },
+    }
+    return admission, nodes, trust
+
+
+@pytest.mark.parametrize("operation", ["prepare", "manifest", "send", "close"])
+def test_strict_ssh_consumer_new_dense_peer_context_holds_exact_generation(
+    _strict_ssh_consumer_new_dense_case,
+    operation,
+):
+    admission, nodes, trust = _strict_ssh_consumer_new_dense_case
+    request = {"source_files": capture._dense_sources(), "node": nodes[1]}
+    with capture._dense_argv(admission, nodes[1], operation, request, time.monotonic() + 15) as argv:
+        path = next(value.split("=", 1)[1] for value in argv if value.startswith("UserKnownHostsFile="))
+        assert Path(path).read_bytes() == trust.read_bytes()
+        assert argv[:6] == ["ssh", "-T", "-p", "7878", "-F", "/dev/null"]
+        assert "HostName=peer" in argv
+        assert "supervise" in argv[-1] and operation in argv[-1]
+    assert not Path(path).exists()
+
+
+def test_strict_ssh_consumer_new_dense_call_holds_trust_through_owned_cleanup(
+    _strict_ssh_consumer_new_dense_case,
+    monkeypatch,
+):
+    admission, nodes, trust = _strict_ssh_consumer_new_dense_case
+    request = {"source_files": capture._dense_sources(), "node": nodes[1]}
+    paths = []
+
+    @contextlib.contextmanager
+    def owned():
+        yield []
+        assert Path(paths[0]).read_bytes() == trust.read_bytes()
+
+    class Child:
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            path = next(value.split("=", 1)[1] for value in argv if value.startswith("UserKnownHostsFile="))
+            paths.append(path)
+            assert Path(path).read_bytes() == trust.read_bytes()
+
+        def communicate(self, timeout):
+            assert Path(paths[0]).read_bytes() == trust.read_bytes()
+            return b'{"semantic_exit":0}', b""
+
+    monkeypatch.setattr(capture, "_dense_owned_processes", owned)
+    monkeypatch.setattr(capture.subprocess, "Popen", Child)
+    assert capture._dense_call(admission, nodes[1], "manifest", request, time.monotonic() + 15) == {
+        "semantic_exit": 0,
+    }
+    assert not Path(paths[0]).exists()
+
+
+@pytest.mark.parametrize("failure", ["none", "worker", "cleanup"])
+def test_strict_ssh_lifetime_new_dense_pipe_retains_generation_until_both_children_closed(
+    _strict_ssh_consumer_new_dense_case,
+    monkeypatch,
+    failure,
+):
+    from arctic_platform.correctness.harness import inference_export as transfer
+
+    admission, nodes, trust = _strict_ssh_consumer_new_dense_case
+    manifest = {"files": []}
+    paths, closed = [], []
+
+    @contextlib.contextmanager
+    def owned():
+        children = []
+        try:
+            yield children
+        finally:
+            assert len(children) == 2
+            assert Path(paths[0]).read_bytes() == trust.read_bytes()
+            closed.extend(children)
+            if failure == "cleanup":
+                raise RuntimeError("new exact-owned cleanup failure")
+
+    class Child:
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            self.stdout = io.BytesIO()
+            if argv[0] == "ssh":
+                paths.append(next(v.split("=", 1)[1] for v in argv if v.startswith("UserKnownHostsFile=")))
+            assert Path(paths[0]).read_bytes() == trust.read_bytes()
+
+        def communicate(self, timeout):
+            if failure == "worker":
+                raise RuntimeError("new initiating worker failure")
+            return json.dumps({"manifest_sha256": transfer.schema_sha(manifest), "files_verified": 0}).encode(), None
+
+        def wait(self, timeout):
+            assert Path(paths[0]).exists()
+
+    monkeypatch.setattr(capture, "_dense_owned_processes", owned)
+    monkeypatch.setattr(capture.subprocess, "Popen", Child)
+    request = {"manifest": manifest, "source_files": capture._dense_sources()}
+    head_request = {"source_files": request["source_files"]}
+    if failure == "none":
+        capture._dense_copy_peer(admission, nodes[1], request, head_request, time.monotonic() + 15)
+    else:
+        with pytest.raises(RuntimeError, match="new"):
+            capture._dense_copy_peer(admission, nodes[1], request, head_request, time.monotonic() + 15)
+    assert len(closed) == 2 and not Path(paths[0]).exists()

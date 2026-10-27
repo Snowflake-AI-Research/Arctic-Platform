@@ -137,6 +137,8 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
             root / "harness" / "batches.py",
             root / "harness" / "sft.py",
             root / "harness" / "names.py",
+            root / "harness" / "participation.py",
+            root / "harness" / "optimizer_capture.py",
             *(
                 [root / "harness" / "shared_lora_adapter.py"]
                 if isinstance(recipe.get("initialization"), dict)
@@ -200,6 +202,10 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             )
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
+        if measurements.get("participation") is not None:
+            from .participation import active_gradient_norms
+
+            active_gradient_norms(measurements["participation"], norms)
         if check == "single-step-optimizer":
             summary = measurements.get("optimizer_norms", {})
             gate = measurements.get("optimizer_norm_gate", {})
@@ -218,8 +224,13 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if not summary.get("parameters"):
                 raise ReferencePrerequisiteError("optimizer reference has no parameter norms")
             from .names import validate_optimizer_norm_summary
+            from .participation import compare_participation
+            from .participation import validate_optimizer_participation
 
             validate_optimizer_norm_summary(summary)
+            validate_optimizer_participation(summary, backend="reference")
+            if measurements.get("participation") is not None or summary.get("participation") is not None:
+                compare_participation(measurements.get("participation"), summary.get("participation"))
     elif check == "e2e-sft-train-validate":
         for key in ("train_losses", "train_gradient_norms"):
             values = measurements.get(key)

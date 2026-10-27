@@ -42,5 +42,5 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-PyYAML, pydantic]
-        args: [--ignore-missing-imports]
+        args: [--ignore-missing-imports, --follow-imports=silent]
         files: ^arctic_platform/(model/|common/(deepspeed_engine\.py|option_registry\.py|model_options\.py|profiles/))

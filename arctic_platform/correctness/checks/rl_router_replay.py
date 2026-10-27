@@ -49,6 +49,8 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
+from arctic_platform.debug.router_replay_trace import TRAINING_OPTION
+
 from ..harness import sft as gsm8k
 from ..harness.batches import SEED
 from ..harness.dss_driver import UnsafeCleanupError
@@ -61,6 +63,7 @@ from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
+from ..harness.router_replay_trace import collect_traces
 from ..harness.sft import TRAIN_SPLIT
 from ..harness.sft import configured_rows_per_step
 
@@ -132,11 +135,21 @@ def _run(ctx) -> TestResult:
     ]
 
     training = build_payload(cfg.training, model_path, SEED, attn_implementation=ctx.attn_implementation)
-    training["training_config"]["debug"]["router_replay_trace"] = True
+    training["training_config"].setdefault("router_replay", {})["enabled"] = True
+    option = {
+        "request_id": uuid.uuid4().hex,
+        "output_dir": str(Path(ctx.workdir) / TEST_ID / "traces"),
+    }
+    training["training_config"].setdefault("ds_config", {})[TRAINING_OPTION] = option
     gateway_dir = Path(ctx.workdir) / TEST_ID / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
     with running_rl_client(
-        cfg, training, model_path, gateway_dir, backend=getattr(ctx, "client_backend", None)
+        cfg,
+        training,
+        model_path,
+        gateway_dir,
+        backend=getattr(ctx, "client_backend", None),
+        router_replay_verification=True,
     ) as client:
         results = generate(client, prompts, params)
         samples = [sample_from_result(prompt, result) for prompt, result in zip(prompts, results)]
@@ -147,12 +160,7 @@ def _run(ctx) -> TestResult:
         batch["kwargs"]["rr_replay_meta"] = [{k: s["marker"].get(k) for k in _MARKER_IDENTITY_FIELDS} for s in samples]
         batch["kwargs"]["rr_discard"] = True
         response = rl_fwd_bwd(client, batch, replay_sampling=True)
-
-    traces = response.get("router_replay_trace")
-    if not traces:
-        raise RuntimeError(
-            "fwd-bwd returned no router_replay_trace although the payload set debug.router_replay_trace"
-        )
+        traces = collect_traces(option, response, ranks=cfg.native.training_gpus)
     failed, metrics = judge(samples, traces, full_recompute=expects_full_recompute(cfg.training))
     metrics["train_loss"] = float(response.get("avg_loss", float("nan")))
     return verdict(ctx, failed, metrics)
@@ -167,7 +175,12 @@ def sample_from_result(prompt: Sequence[int], result: dict) -> dict:
     tokens = list(prompt) + [int(t) for t in result["token_ids"]]
     if int(marker["prompt_len"]) != len(prompt):
         raise RuntimeError(f"sampler prompt_len {marker['prompt_len']} for a prompt of {len(prompt)} tokens")
-    return {"tokens": tokens, "prompt_len": len(prompt), "marker": marker, "routing": marker["routed_experts"]}
+    return {
+        "tokens": tokens,
+        "prompt_len": len(prompt),
+        "marker": marker,
+        "routing": marker["routed_experts"],
+    }
 
 
 def _segments(positions: Sequence[int]) -> List[Tuple[int, int]]:
@@ -179,7 +192,11 @@ def _segments(positions: Sequence[int]) -> List[Tuple[int, int]]:
 
 
 def _attribute(
-    tokens: Sequence[int], positions: Sequence[int], start: int, end: int, samples: Sequence[dict]
+    tokens: Sequence[int],
+    positions: Sequence[int],
+    start: int,
+    end: int,
+    samples: Sequence[dict],
 ) -> Optional[int]:
     """The one sample whose row holds this span's tokens at this span's positions."""
     first = positions[start]
@@ -216,16 +233,30 @@ def judge(
         for replay_id, routing in (trace.get("received") or {}).items():
             index = by_replay_id.get(replay_id)
             if index is None:
-                failed.append(Mismatch(f"rank {rank}: received routing for unknown id {replay_id}", 1.0, 0.0))
+                failed.append(
+                    Mismatch(
+                        f"rank {rank}: received routing for unknown id {replay_id}",
+                        1.0,
+                        0.0,
+                    )
+                )
                 continue
             received_by[index] = received_by.get(index, 0) + 1
             if routing != samples[index]["routing"]:
                 failed.append(
-                    Mismatch(f"rank {rank}: sample {index} routing received differs from generate", 1.0, 0.0)
+                    Mismatch(
+                        f"rank {rank}: sample {index} routing received differs from generate",
+                        1.0,
+                        0.0,
+                    )
                 )
         for entry in trace.get("unattributed_router_calls") or []:
             failed.append(
-                Mismatch(f"rank {rank}: router layer {entry.get('layer')} ran outside a traced call", 1.0, 0.0)
+                Mismatch(
+                    f"rank {rank}: router layer {entry.get('layer')} ran outside a traced call",
+                    1.0,
+                    0.0,
+                )
             )
         for call_index, call in enumerate(trace.get("calls") or []):
             counts["calls"] += 1
@@ -270,7 +301,13 @@ def judge(
                     continue
                 seen[phase].add(layer)
                 if not invocation.get("replayed"):
-                    failed.append(Mismatch(f"{label}: layer {layer} {phase} computed its own routing", 1.0, 0.0))
+                    failed.append(
+                        Mismatch(
+                            f"{label}: layer {layer} {phase} computed its own routing",
+                            1.0,
+                            0.0,
+                        )
+                    )
                     continue
                 expected = [row[layer] for row in routed]
                 used = invocation.get("indices")
@@ -287,7 +324,13 @@ def judge(
             for phase, required in (("forward", True), ("recompute", full_recompute)):
                 if required:
                     for layer in sorted(set(range(layers)) - seen[phase]):
-                        failed.append(Mismatch(f"{label}: layer {layer} has no {phase} router invocation", 1.0, 0.0))
+                        failed.append(
+                            Mismatch(
+                                f"{label}: layer {layer} has no {phase} router invocation",
+                                1.0,
+                                0.0,
+                            )
+                        )
 
     for index, sample in enumerate(samples):
         if index not in received_by:

@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlencode
@@ -46,7 +47,6 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
-from arctic_platform.client.transport import initialize_or_cleanup
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _raise_for_status
 from arctic_platform.client.transports.cortex import _Route
@@ -56,6 +56,7 @@ from .config import ReviewedClientConfig
 from .config import TestSpec
 from .config import hash_directory
 from .storage import require_data_fast_path
+from .transport import UnsafeCleanupError
 
 
 class CortexTrainingConfig(ReviewedClientConfig):
@@ -204,7 +205,27 @@ class CorrectnessClient(ArcticClient):
 
         self.config = config
         self.transport = CorrectnessCortexTransport(config.backend)
-        self.jobs = initialize_or_cleanup(self.transport, client_config=config)
+        try:
+            self.jobs = self.transport.initialize(config)
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
+
+    def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
+        try:
+            self.shutdown()
+        except BaseException as error:
+            if exc_value is not None:
+                error.add_note(
+                    "Original workload traceback:\n"
+                    + "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+                )
+                if not isinstance(exc_value, Exception) and isinstance(error, Exception):
+                    exc_value.add_note(f"Shutdown also failed: {type(error).__name__}: {error}")
+                    raise exc_value.with_traceback(exc_traceback) from error
+                if isinstance(error, UnsafeCleanupError):
+                    error.preserve_workload(exc_value)
+            raise
 
 
 MANIFEST = "_neutrino_manifest.json"
@@ -343,6 +364,7 @@ def _load_local_fixture(backend: CortexConfig, spec: TestSpec) -> dict:
 
 
 LOCAL_NATIVE_FORWARD_ENV = "ARCTIC_CORRECTNESS_LOCAL_NATIVE_FORWARD"
+LOCAL_CHECKPOINT_BRIDGE_ENV = "ARCTIC_CORRECTNESS_LOCAL_CHECKPOINT_BRIDGE"
 _NATIVE_ROLES = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
 
 
@@ -369,11 +391,12 @@ class CorrectnessCortexTransport(CortexTransport):
     def initialize(self, client_config: CortexTrainingConfig) -> JobHandles:
         self.hardware = client_config.hardware
         self._native_gateway = os.environ.get(LOCAL_NATIVE_FORWARD_ENV) == "1"
+        self._native_checkpoint_bridge = os.environ.get(LOCAL_CHECKPOINT_BRIDGE_ENV) == "1"
         self._native_children = {}
         self._native_bindings = {}
         self._local_shutdown_parent = None
         self._local_shutdown_children = {}
-        if self._native_gateway:
+        if self._native_gateway or self._native_checkpoint_bridge:
             from .hosted import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
@@ -426,6 +449,8 @@ class CorrectnessCortexTransport(CortexTransport):
             required.append("/forward")
         if client_config.gpus_for("log_prob") > 0:
             required.append("/log-probs")
+        if self._native_checkpoint_bridge:
+            required.extend(("/correctness/save-checkpoint", "/correctness/load-checkpoint"))
         for path in required:
             path_config = paths.get(path) if isinstance(paths, dict) else None
             operation = path_config.get("post") if isinstance(path_config, dict) else None
@@ -480,7 +505,7 @@ class CorrectnessCortexTransport(CortexTransport):
         return result
 
     def _native_request(self, request):
-        if request.op == "save":
+        if request.op in {"save", "load-checkpoint"}:
             from .hosted import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
@@ -488,7 +513,7 @@ class CorrectnessCortexTransport(CortexTransport):
         if self.job_id is None or binding is None:
             raise ValueError("local native request must target this client's owned child job")
         role, child = binding
-        allowed = {"training"} if request.op in {"forward", "save"} else {"log_prob", "sampling"}
+        allowed = {"training"} if request.op in {"forward", "save", "load-checkpoint"} else {"log_prob", "sampling"}
         if role not in allowed:
             raise ValueError(f"local native {request.op} cannot target a {role} child job")
         if request.op == "save":
@@ -504,8 +529,21 @@ class CorrectnessCortexTransport(CortexTransport):
                 or body.get("save_total_limit") is not None
             ):
                 raise ValueError("local checkpoint save requires a canonical path and native save options")
-            url = f"{self.config.base_url.rstrip('/')}/save-checkpoint?{urlencode({'job_id': child})}"
+            bridge = self._native_checkpoint_bridge and body["checkpoint_type"] == "resumable"
+            route = "correctness/save-checkpoint" if bridge else "save-checkpoint"
+            url = f"{self.config.base_url.rstrip('/')}/{route}?{urlencode({'job_id': child})}"
             return url, {"json": {"path": str(root), "checkpoint_type": body["checkpoint_type"]}}
+        if request.op == "load-checkpoint":
+            from .hosted import require_local_checkpoint_id
+
+            body = request.body
+            if request.binary or not isinstance(body, dict) or set(body) - {"checkpoint_id", "stage_info"}:
+                raise ValueError("native checkpoint load accepts checkpoint_id only, never paths or source jobs")
+            if body.get("stage_info") is not None:
+                raise ValueError("native checkpoint load must resolve this owned gateway's retained store")
+            checkpoint_id = require_local_checkpoint_id(body.get("checkpoint_id"))
+            url = f"{self.config.base_url.rstrip('/')}/correctness/load-checkpoint?{urlencode({'job_id': child})}"
+            return url, {"json": {"checkpoint_id": checkpoint_id}}
         url = f"{self.config.base_url.rstrip('/')}/{request.op}?{urlencode({'job_id': child})}"
         body = {key: value for key, value in request.body.items() if value is not None}
         if request.op == "forward":
@@ -513,15 +551,30 @@ class CorrectnessCortexTransport(CortexTransport):
         return url, {"json": body}
 
     def _native_result(self, request, payload):
-        result = json.loads(payload) if request.op == "save" else wire.loads(payload)
+        result = json.loads(payload) if request.op in {"save", "load-checkpoint"} else wire.loads(payload)
         if not isinstance(result, dict):
             raise ValueError("local native gateway response must be an object")
         child = self._native_bindings[str(request.job_id)][1]
         if "job_id" in result and result["job_id"] != child:
             raise ValueError("local native gateway response names a different child job")
+        if request.op == "load-checkpoint":
+            from .gateway import NATIVE_STORE_SCHEMA
+            from .hosted import _local_load_metadata
+
+            if result.get("correctness_native_store") != NATIVE_STORE_SCHEMA:
+                raise RuntimeError("native checkpoint load returned no owned store identity")
+            return _local_load_metadata(result, request.body["checkpoint_id"])
         return result
 
     def _uses_native_route(self, request) -> bool:
+        if (
+            request.op == "load-checkpoint"
+            and getattr(self, "_native_checkpoint_bridge", False)
+            and self._is_local_gateway()
+            and isinstance(request.body, dict)
+            and request.body.get("stage_info") is None
+        ):
+            return True
         # SnowAPI saves choose their own directory; only the native route accepts a local path.
         if request.op == "save" and request.body.get("path") is not None and self._is_local_gateway():
             return True
@@ -555,9 +608,9 @@ class CorrectnessCortexTransport(CortexTransport):
             )
         )
 
-    def _submit(self, request):
+    def _submit(self, request, route=None):
         if request.op != "load-checkpoint" or not self._is_local_gateway():
-            return super()._submit(request)
+            return super()._submit(request, route)
         from .hosted import _local_load_metadata
         from .hosted import _local_stage_info
         from .hosted import require_local_checkpoint_id
@@ -668,10 +721,19 @@ class CorrectnessCortexTransport(CortexTransport):
         except BaseException as error:
             primary = error
             if parent is not None:
-                error.add_note(
+                ownership = (
                     f"Local gateway cancellation was not verified for owned parent {parent!r}; "
                     f"owned children: {self._local_shutdown_children!r}"
                 )
+                error.add_note(ownership)
+                if isinstance(error, Exception) and self._is_local_gateway():
+                    primary = UnsafeCleanupError(
+                        f"{ownership}; cancellation failed: {type(error).__name__}: {error}",
+                        owned_parent=parent,
+                        owned_children=self._local_shutdown_children,
+                        shutdown_error=error,
+                    )
+                    raise primary from error
             raise
         finally:
             self.job_id = None

@@ -82,7 +82,8 @@ def render(args: argparse.Namespace) -> str:
         ' uses_mixer_packing(MODEL_PATH)\n    print(f"determinism: off, {RUNS} independent processes per arm",'
         ' flush=True)\n    tensor_dir = (\n        require_data_fast_path(WORK_DIR, label="gradient calibration'
         ' tensors")\n        if WORK_DIR is not None else correctness_workdir("reference-calibration-")\n    )\n   '
-        " lanes = max(1, min(RUNS, torch.cuda.device_count()))\n\n    def one_run(index: int, batch_path: Path,"
+        " from arctic_platform.correctness.harness.config import reference_calibration_worker_count\n    lanes ="
+        " reference_calibration_worker_count(__WORKERS__, runs=RUNS)\n\n    def one_run(index: int, batch_path: Path,"
         " run_dir: Path) -> tuple[int, float, dict]:\n        started = time.monotonic()\n        result ="
         " run_reference(\n            MODEL_PATH,\n            batch_path,\n            run_dir /"
         ' f"run-{index:02d}.json",\n            token_budget=REFERENCE_TOKEN_BUDGET,\n            ce_chunk=2048,\n    '
@@ -166,6 +167,7 @@ def render(args: argparse.Namespace) -> str:
         "__TEST_ID__": repr(args.test_id),
         "__CONFIG_CHECKSUM__": repr(frozen_config_checksum),
         "__RUNS__": str(DEFAULT_REFERENCE_CALIBRATION_RUNS),
+        "__WORKERS__": repr(getattr(args, "reference_calibration_workers", None)),
         "__TOKENS__": str(tokens),
         "__REFERENCE_TOKEN_BUDGET__": str(args.reference_token_budget),
         "__ATTENTION__": repr(attention),

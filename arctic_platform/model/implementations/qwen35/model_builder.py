@@ -37,6 +37,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
 from arctic_platform.debug.lora_sync_hooks import maybe_observe_checkpoint_reader
+from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
@@ -500,6 +501,8 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    model.__dict__.pop("_ap_preserved_mtp_weights", None)
+    model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
@@ -522,13 +525,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         return
 
     if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
+        # DCP needs tensor shards and their index, not uncached Hub documentation.
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=config.name,
+                repo_type="model",
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
     else:
         logger.info(
             f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
             f"please remove the directory {config.name} and run again"
         )
         snapshot_path = Path(config.name)
+
+    maybe_capture_reduced_fixture_mtp(model, snapshot_path, config)
 
     # Dynamically convert between different weight formats if needed.
     conversion = None
@@ -544,6 +556,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."
@@ -562,6 +575,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -574,6 +588,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                 )
 
     # All ranks wait for master rank to finish conversion
