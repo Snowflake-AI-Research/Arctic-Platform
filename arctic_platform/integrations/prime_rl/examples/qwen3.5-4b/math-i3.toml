@@ -1,0 +1,67 @@
+# Qwen3.5-4B math RL on the i3_math taskset (INTELLECT-3-RL math subset): single-turn competition math,
+# scored deterministically by math-verify on the model's \boxed{} answer in the rollout runtime — no judge
+# (Cortex-safe, no PRIME_API_KEY) and no sandbox. The taskset's difficulty filter keeps a learnable mid-band
+# (drop the ~impossible and the ~trivial on the 4B-instruct solve-rate column) so GRPO groups carry reward
+# variance and the curve climbs. The fixed `standard` sampler cycles that band so improvement shows up as a
+# rising reward. Qwen3.5-4B is a VLM, so `language_model_only` selects its language tower. One 8-GPU training
+# sub-job + one 8-GPU sampling sub-job.
+#
+#   python -m arctic_platform.integrations.prime_rl.rl \
+#     @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/math-i3.toml --env-package i3-math
+
+seq_len = 49152
+max_steps = 400
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 32   # 32 question-groups x group_size 8 = 256 rollouts/step
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 256
+
+[orchestrator.train.sampling]
+max_completion_tokens = 40960   # room for the competition-math chain of thought; a tighter cap truncates it
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.taskset.filter.min = 0.3   # learnable mid-band on avg@8_qwen3_4b_instruct_2507: drop ~impossible
+env.taskset.filter.max = 0.8   # ... and ~trivial, keeping a frontier with GRPO variance
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+curriculum.sampler = { type = "standard" }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true
