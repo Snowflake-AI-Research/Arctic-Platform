@@ -17,11 +17,14 @@ asyncio or extra threads.
 Attach allocates CPU memory sized to model.named_parameters().  Stage
 snapshots the post-processed GPU parameters into that buffer.
 plan_restore_weights walks the param index once and caches a chunk plan
-(chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.
+(chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.  If the host
+buffer is pageable it also forms a small pinned double buffer (buffer_bytes
+split into two halves) that restore_weights stages through.
 restore_weights then loops over the cached plan: per chunk, copy a
-slice of host memory into a single reused GPU staging buffer and
-scatter into model parameters by name.  If no plan is cached,
-restore_weights falls back to a single-chunk path.
+slice of host memory into a single reused GPU staging buffer -- directly,
+or half by half through the double buffer -- and scatter into model parameters by
+name.  If no plan is cached, restore_weights falls back to a single-chunk
+path.
 
 All of that state lives on each vLLM worker (``worker._semip_*``) and
 runs there via ``collective_rpc``, not in this process.  At TP>1 the
@@ -603,6 +606,9 @@ def _semip_stage(worker):
 
 
 def _semip_unpin(worker):
+    # The double buffer is registered memory too, and nothing registered may
+    # be left when a cuda_checkpoint follows.
+    _semip_free_double_buffer(worker)
     # Idempotent: the attach buffer starts unpinned, so a cudaHostUnregister on
     # an unregistered (or already-unpinned) buffer would hard-error.
     buf = getattr(worker, "_semip_buf", None)
@@ -625,7 +631,47 @@ def _semip_repin(worker):
     return buf.numel()
 
 
-def _semip_plan_load_weights(worker, max_buffer_bytes=None):
+def _semip_form_double_buffer(worker, buffer_bytes, threads):
+    """Pin two halves of ``buffer_bytes`` for restore_weights.
+
+    Registered with cudaHostRegister rather than allocated with
+    ``pin_memory=True``: torch's caching host allocator keeps freed pinned
+    blocks, so the buffer could never be given back.  One event per half says
+    when its last H2D copy is done; the copies run on a side stream.
+    """
+    half_bytes = int(buffer_bytes) // 2
+    halves = []
+    try:
+        for _ in range(2):
+            half = torch.empty(half_bytes, dtype=torch.uint8)
+            _repin_buffer(half)
+            halves.append(half)
+    except BaseException:
+        for half in halves:
+            _unpin_buffer(half)
+        raise
+    worker._semip_double_buffer = {
+        "halves": halves,
+        "events": [torch.cuda.Event() for _ in halves],
+        "stream": torch.cuda.Stream(device=worker.device),
+        "half_bytes": half_bytes,
+        "threads": max(1, int(threads)),
+    }
+
+
+def _semip_free_double_buffer(worker):
+    db = getattr(worker, "_semip_double_buffer", None)
+    if db is None:
+        return 0
+    db["stream"].synchronize()
+    for half in db["halves"]:
+        _unpin_buffer(half)
+    worker._semip_double_buffer = None
+    return 2 * db["half_bytes"]
+
+
+def _semip_plan_load_weights(worker, max_buffer_bytes=None, buffer_bytes=None,
+                             buffer_threads=None):
     buf = worker._semip_buf
     index = worker._semip_index
     total_bytes = buf.numel()
@@ -659,8 +705,46 @@ def _semip_plan_load_weights(worker, max_buffer_bytes=None):
         plan.append((cur_lo, cur_hi, cur))
     worker._semip_chunk_plan = plan
     worker._semip_chunk_size = cs
+    # The double buffer is decided here, with the plan, and restore_weights
+    # only uses it: a pinned host copy needs none, and buffer_bytes 0 (or
+    # unset) asks for none, leaving the slow direct copy from pageable memory.
+    _semip_free_double_buffer(worker)
+    if (not getattr(worker, "_semip_pinned", False) and buffer_bytes
+            and int(buffer_bytes) >= 2):
+        _semip_form_double_buffer(worker, buffer_bytes, buffer_threads or 1)
+    db = getattr(worker, "_semip_double_buffer", None)
     return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs,
-            "free_bytes": free_bytes, "clamped": clamped}
+            "free_bytes": free_bytes, "clamped": clamped,
+            "double_buffer_bytes": 2 * db["half_bytes"] if db else 0,
+            "pinned": bool(getattr(worker, "_semip_pinned", False))}
+
+
+def _semip_double_buffer_h2d(db, src, dst, pool):
+    """Copy host ``src`` into device ``dst`` half by half through the double buffer.
+
+    Filling a half is a host memcpy split across the pool (``copy_`` drops the
+    GIL; vLLM workers run one OpenMP thread, so a single ``copy_`` would use
+    one core).  Each half's H2D runs on the side stream while the other half
+    fills, and a half is refilled only once its event says its copy is done.
+    """
+    halves, events, stream = db["halves"], db["events"], db["stream"]
+    half_bytes, threads = db["half_bytes"], db["threads"]
+    stream.wait_stream(torch.cuda.current_stream())
+    n = src.numel()
+    for i, off in enumerate(range(0, n, half_bytes)):
+        k = i % 2
+        m = min(half_bytes, n - off)
+        events[k].synchronize()
+        half = halves[k]
+        step = -(-m // threads)
+        list(pool.map(
+            lambda a: half[a:min(a + step, m)].copy_(
+                src[off + a:off + min(a + step, m)]),
+            range(0, m, step)))
+        with torch.cuda.stream(stream):
+            dst[off:off + m].copy_(half[:m], non_blocking=True)
+            events[k].record(stream)
+    stream.synchronize()
 
 
 def _semip_restore_weights(worker):
@@ -674,19 +758,29 @@ def _semip_restore_weights(worker):
         plan = [(0, total_bytes,
                  [(n, o, nb, dt, sh) for n, (o, nb, dt, sh) in index.items()])]
         cs = total_bytes
+    db = getattr(worker, "_semip_double_buffer", None)
+    pool = (ThreadPoolExecutor(max_workers=db["threads"])
+            if db is not None else None)
     torch.cuda.synchronize()
     gpu_buf = torch.empty(cs, dtype=torch.uint8, device=worker.device)
     loaded = 0
-    for chunk_lo, chunk_hi, members in plan:
-        n = chunk_hi - chunk_lo
-        gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
-        torch.cuda.synchronize()
-        for name, off, nbytes, dtype, shape in members:
-            start = off - chunk_lo
-            src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
-            targets[name].copy_(src)
-            loaded += 1
-        torch.cuda.synchronize()
+    try:
+        for chunk_lo, chunk_hi, members in plan:
+            n = chunk_hi - chunk_lo
+            if db is not None:
+                _semip_double_buffer_h2d(db, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
+            else:
+                gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
+            torch.cuda.synchronize()
+            for name, off, nbytes, dtype, shape in members:
+                start = off - chunk_lo
+                src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
+                targets[name].copy_(src)
+                loaded += 1
+            torch.cuda.synchronize()
+    finally:
+        if pool is not None:
+            pool.shutdown()
     gpu_buf.storage().resize_(0)
     del gpu_buf
     # Return the staging buffer to the CUDA *driver*, not just to torch's
@@ -699,10 +793,12 @@ def _semip_restore_weights(worker):
     # OOMs.  empty_cache() releases torch's cached blocks so cumem can map.
     torch.cuda.empty_cache()
     return {"bytes": total_bytes, "loaded": loaded,
-            "n_chunks": len(plan), "chunk_size": cs}
+            "n_chunks": len(plan), "chunk_size": cs,
+            "staging": "double_buffer" if db is not None else "direct"}
 
 
 def _semip_detach(worker):
+    _semip_free_double_buffer(worker)
     buf = getattr(worker, "_semip_buf", None)
     total = buf.numel() if buf is not None else 0
     if buf is not None and getattr(worker, "_semip_pinned", False):
@@ -3970,7 +4066,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if llm is None:
                     raise RuntimeError("plan_restore_weights requires init first")
                 mb = kwargs.get("max_buffer_bytes")
-                results = llm.collective_rpc(_semip_plan_load_weights, args=(mb,))
+                results = llm.collective_rpc(
+                    _semip_plan_load_weights,
+                    args=(mb, kwargs.get("buffer_bytes"), kwargs.get("buffer_threads")))
                 worker_bytes = [r["bytes"] for r in results]
                 chunk_bytes = [r["chunk_size"] for r in results]
                 n_chunks = [r["n_chunks"] for r in results]
@@ -3998,6 +4096,17 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                          min(chunk_bytes, default=0) / 2**30,
                          (f" -- clamped on rank(s) {clamped_ranks}"
                           if clamped_ranks else ""))
+                db_bytes = [r["double_buffer_bytes"] for r in results]
+                info["double_buffer_bytes_per_worker"] = db_bytes
+                if any(db_bytes):
+                    log.info("  double buffer: 2 x %.0f MiB pinned per worker",
+                             max(db_bytes) / 2 / 2**20)
+                elif all(r["pinned"] for r in results):
+                    log.info("  double buffer: none (host copy pinned)")
+                else:
+                    log.info("  double buffer: none (buffer_bytes=%s); "
+                             "restore_weights copies from pageable memory",
+                             kwargs.get("buffer_bytes"))
 
             elif cmd == "restore_weights":
                 if llm is None:
@@ -4007,8 +4116,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 total_loaded = sum(r["loaded"] for r in results)
                 info["bytes"] = total_bytes
                 info["n_chunks"] = max(r["n_chunks"] for r in results)
-                log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB)",
-                         total_loaded, info["n_chunks"], total_bytes / 2**30)
+                info["staging"] = sorted({r["staging"] for r in results})
+                log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB) "
+                         "via %s", total_loaded, info["n_chunks"],
+                         total_bytes / 2**30, "/".join(info["staging"]))
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
