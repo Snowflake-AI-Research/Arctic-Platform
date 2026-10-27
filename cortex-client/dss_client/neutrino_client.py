@@ -837,6 +837,15 @@ def _parse_s3_stage_credentials(raw_value: Any) -> dict[str, str]:
 # ─── HTTP client ─────────────────────────────────────────────────────────
 
 
+def _sub_job_id_params(sub_job_id: str | None) -> dict[str, dict[str, str]]:
+    """``params=`` kwargs for a sub-job-addressed request, or nothing when unset.
+
+    The key is omitted rather than sent empty so a request without a sub_job_id is
+    byte-identical to one from a client that predates the parameter.
+    """
+    return {"params": {"sub_job_id": sub_job_id}} if sub_job_id else {}
+
+
 class NeutrinoClient:
     """HTTP client for the Neutrino GS API (``cortex-training``).
 
@@ -912,7 +921,8 @@ class NeutrinoClient:
         # means the job was fetched but exposes no sampling max_seq_len (skip
         # validation); a missing key means it has not been resolved yet (e.g. a
         # transient get_job failure), so a later call will retry.
-        self._sampling_max_seq_len: dict[str, int | None] = {}
+        # Keyed on (job_id, sub_job_id); sub_job_id is None for the unaddressed case.
+        self._sampling_max_seq_len: dict[tuple[str, str | None], int | None] = {}
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
@@ -1310,40 +1320,71 @@ class NeutrinoClient:
                 f"bring the serialized request under the limit."
             )
 
-    def _resolve_sampling_max_seq_len(self, job_id: str) -> int | None:
-        """Return the sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
+    def _resolve_sampling_max_seq_len(
+        self, job_id: str, sub_job_id: str | None = None
+    ) -> int | None:
+        """Return a sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
 
-        The value is read from the job's sampling ``inference_config`` (the same
-        number the backend launches vLLM with as ``max_model_len``) and cached
-        per ``job_id``. A successful lookup — including a definitive "no sampling
-        sub-job" miss — is cached; a transient ``get_job`` failure is not, so a
-        later call retries rather than disabling validation permanently.
+        The value is read from the sub-job's ``inference_config`` (the same number
+        the backend launches vLLM with as ``max_model_len``) and cached per
+        ``(job_id, sub_job_id)``. A successful lookup — including a definitive
+        "no sampling sub-job" miss — is cached; a transient ``get_job`` failure is
+        not, so a later call retries rather than disabling validation permanently.
+
+        ``sub_job_id`` selects one sub-job. Without it, the value is only resolved
+        when the job has exactly one sampling sub-job: guessing between several
+        risks rejecting a prompt the chosen zone would have accepted, so ``None``
+        (validation skipped) is returned instead and the server decides.
+
+        Only ``job_type == "sampling"`` sub-jobs are considered. ``log_prob``
+        sub-jobs also carry an ``inference_config``, and its window has no bearing
+        on where a generate request runs.
         """
-        if job_id in self._sampling_max_seq_len:
-            return self._sampling_max_seq_len[job_id]
+        cache_key = (job_id, sub_job_id)
+        if cache_key in self._sampling_max_seq_len:
+            return self._sampling_max_seq_len[cache_key]
         try:
             job = self.get_job(job_id)
         except Exception:
             # Don't let a transient lookup failure break generate, and don't
             # cache the miss — the real request will surface any hard error.
             return None
-        max_seq_len: int | None = None
-        for sub in job.get("sub_jobs", []) or []:
-            if not isinstance(sub, dict):
-                continue
+
+        def _window(sub: dict) -> int | None:
             cfg = sub.get("inference_config")
             if not isinstance(cfg, dict):
-                continue
+                return None
             raw = cfg.get("max_seq_len")
             # Proto numbers can arrive as floats (e.g. 2048.0); coerce to int.
             if isinstance(raw, (int, float)) and raw > 0:
-                max_seq_len = int(raw)
-                break
-        self._sampling_max_seq_len[job_id] = max_seq_len
+                return int(raw)
+            return None
+
+        # SubJobRecord flattens the config into the record, so job_type sits at the
+        # top level. The REST schema accepts it case-insensitively, so normalise.
+        sampling = [
+            sub
+            for sub in (job.get("sub_jobs", []) or [])
+            if isinstance(sub, dict)
+            and str(sub.get("job_type", "")).lower() == JobType.SAMPLING.value
+        ]
+        max_seq_len: int | None = None
+        if sub_job_id is not None:
+            for sub in sampling:
+                if sub.get("sub_job_id") == sub_job_id:
+                    max_seq_len = _window(sub)
+                    break
+        elif len(sampling) == 1:
+            max_seq_len = _window(sampling[0])
+        self._sampling_max_seq_len[cache_key] = max_seq_len
         return max_seq_len
 
     def _check_prompt_lengths(
-        self, op: str, job_id: str, prompts: list[str | list[int]]
+        self,
+        op: str,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sub_job_id: str | None = None,
     ) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
 
@@ -1357,7 +1398,7 @@ class NeutrinoClient:
         """
         if not any(isinstance(p, list) for p in prompts):
             return
-        max_seq_len = self._resolve_sampling_max_seq_len(job_id)
+        max_seq_len = self._resolve_sampling_max_seq_len(job_id, sub_job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
@@ -1386,6 +1427,7 @@ class NeutrinoClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -1411,6 +1453,7 @@ class NeutrinoClient:
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
+                    **_sub_job_id_params(sub_job_id),
                     retry_on=(
                         _is_chunk_post_transient
                         if allow_group_restart
@@ -1507,6 +1550,7 @@ class NeutrinoClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -1525,6 +1569,14 @@ class NeutrinoClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request, e.g.
+                ``"{job_id}:sampling:1"``; discover the ids from
+                :meth:`get_job`'s ``sub_jobs``. Sent as a query parameter, since
+                the body is an opaque frame. Omit only when the job has exactly
+                one sampling sub-job — with more, the server rejects the request
+                and lists the valid ids.
         """
         payload: dict = {"prompts": prompts}
         if sampling_params is not None:
@@ -1533,7 +1585,7 @@ class NeutrinoClient:
             payload["routing_key"] = routing_key
         if strict is not None:
             payload["strict"] = strict
-        self._check_prompt_lengths("generate", job_id, prompts)
+        self._check_prompt_lengths("generate", job_id, prompts, sub_job_id)
         body = wire.dumps(
             payload,
             metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
@@ -1544,6 +1596,7 @@ class NeutrinoClient:
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            sub_job_id=sub_job_id,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
@@ -1556,6 +1609,7 @@ class NeutrinoClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
@@ -1566,6 +1620,10 @@ class NeutrinoClient:
         (``list[int]``) prompts are checked client-side against the sampling
         sub-job's ``max_seq_len`` and fail fast, while over-long string
         prompts are left to fail server-side in vLLM (see :meth:`generate`).
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request; see
+                :meth:`generate` for the format and when it may be omitted.
         """
         payload: dict = {"prompts": prompts}
         if sampling_params is not None:
@@ -1574,7 +1632,7 @@ class NeutrinoClient:
             payload["routing_key"] = routing_key
         if strict is not None:
             payload["strict"] = strict
-        self._check_prompt_lengths("generate_stream", job_id, prompts)
+        self._check_prompt_lengths("generate_stream", job_id, prompts, sub_job_id)
         body = json.dumps(payload).encode("utf-8")
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
@@ -1582,6 +1640,7 @@ class NeutrinoClient:
             f"{self._prefix}/{job_id}/generate-stream",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
+            **_sub_job_id_params(sub_job_id),
         )
         return resp.json()
 
