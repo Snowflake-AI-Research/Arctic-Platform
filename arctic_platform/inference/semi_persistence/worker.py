@@ -8,7 +8,7 @@ child process tree to disk and restoring it with new PIDs.
 Command protocol:  (cmd, kwargs)
 Result protocol:   (cmd, elapsed, error, info)
 """
-import glob, json, os, shutil, signal, stat, subprocess, sys, tempfile, time, ctypes, threading, queue, struct
+import contextlib, fcntl, glob, json, os, shutil, signal, stat, subprocess, sys, tempfile, time, ctypes, threading, queue, struct
 
 import pynvml
 import torch.multiprocessing as mp
@@ -659,6 +659,60 @@ def _helper_argv_expr(criu_argv):
     return f"[a.replace('@LOGFD@', str(LFD)) for a in {criu_argv!r}]"
 
 
+# Every pod on a node runs criu as the same uid, which may hold at most
+# fs.pipe-user-pages-soft (64 MiB) of pipes across the node without
+# CAP_SYS_RESOURCE.  A dump holds 8 MiB of page pipes, and once the budget is
+# spent criu cannot size the copy of a pipe it saves ("Unable to set a pipe
+# size"), so eight dumps at once can fail one.  A slot is an flock on one of
+# SEMIP_CONCURRENT_DUMPS files in the pod's /data-fast, which the kernel
+# releases if the holder dies.  Pods sharing a node do not share slots.
+_DUMP_SLOTS_DIR = "/data-fast/.semip-dump-slots"
+
+
+@contextlib.contextmanager
+def _dump_slot():
+    """Hold one of the pod's ``SEMIP_CONCURRENT_DUMPS`` (default 2; 0 = no
+    limit) dump slots, waiting for one to free up."""
+    n = int(os.environ.get("SEMIP_CONCURRENT_DUMPS", "2"))
+    if n <= 0:
+        yield
+        return
+    fds = []
+    try:
+        os.makedirs(_DUMP_SLOTS_DIR, exist_ok=True)
+        for k in range(n):
+            fds.append(os.open(os.path.join(_DUMP_SLOTS_DIR, f"slot{k}"),
+                               os.O_RDWR | os.O_CREAT, 0o666))
+    except OSError as e:
+        for fd in fds:
+            os.close(fd)
+        print(f"[semip] WARNING: no dump slots in {_DUMP_SLOTS_DIR} ({e}); "
+              f"dumping without a limit", flush=True)
+        yield
+        return
+    t0 = time.monotonic()
+    try:
+        while True:
+            for fd in fds:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    continue
+            else:
+                time.sleep(0.2)
+                continue
+            break
+        waited = time.monotonic() - t0
+        if waited >= 1:
+            print(f"[semip] waited {waited:.1f}s for one of the pod's {n} "
+                  f"dump slots", flush=True)
+        yield
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
@@ -781,7 +835,8 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     for ext in external_unix:
         cmd.extend(["--external", ext])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        with _dump_slot():
+            result = subprocess.run(cmd, capture_output=True, text=True)
     finally:
         shutil.rmtree(empty_libdir, ignore_errors=True)
     if result.returncode != 0:
