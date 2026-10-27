@@ -365,6 +365,8 @@ class _Observer:
             held.verify(hash_bytes=hash_bytes)
 
     def _rank_identity(self, *, required: bool) -> dict[str, Any]:
+        rank: int | None
+        world_size: int | None
         try:
             distributed = importlib.import_module("torch.distributed")
             available = getattr(distributed, "is_available", lambda: True)()
@@ -519,7 +521,7 @@ class _Observer:
         def observed(*args, **kwargs):
             return self._invoke(operation, original, args, kwargs)
 
-        observed.__inference_warmup_observer_request__ = self.request_sha256
+        setattr(observed, "__inference_warmup_observer_request__", self.request_sha256)
         return observed
 
     def _group_wrapper(self, operation: str, original, *, use_cpu_group: bool):
@@ -529,7 +531,7 @@ class _Observer:
             details = self._group_record(group, src, use_cpu_group=use_cpu_group)
             return self._invoke(operation, original, (group, *args), kwargs, group_record=details)
 
-        observed.__inference_warmup_observer_request__ = self.request_sha256
+        setattr(observed, "__inference_warmup_observer_request__", self.request_sha256)
         return observed
 
     def _patch(self, owner: Any, name: str, replacement: Any) -> None:

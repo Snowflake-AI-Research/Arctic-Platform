@@ -455,9 +455,10 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         or not args.config
         or args.all_configs
         or fixture_path is not None
-        or (args.test and not set(args.test) <= {"single-step-grads", "single-step-optimizer"})
+        or not args.test
+        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
     ):
-        raise SystemExit("--local-cortex-fixture requires one Cortex config and only single-step-grads/optimizer")
+        raise SystemExit("--local-cortex-fixture requires one Cortex config and only first-two checks")
     if local_fixture:
         require_local_cortex_gateway(backend)
     config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)

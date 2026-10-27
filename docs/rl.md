@@ -19,15 +19,17 @@ rewards, and advantage estimation; Arctic owns the heavy compute.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Shared server details are in [common.md](common.md).** Training-only supervised fine-tuning (SFT), without sampling, is documented in [sft.md](sft.md).
+Shared server details (CLI, endpoints, metrics, colocation):
+[`common.md`](common.md). Training-only SFT (no sampling) is planned in a
+forthcoming SFT PR.
 
-## SFT And RL
+## vs planned SFT
 
-| | SFT | RL |
+| | SFT (planned) | RL |
 |---|---|---|
 | Jobs | training only | training + sampling (+ optional log_prob) |
-| Client | `arctic_platform.sft.ArcticSFTClient` (blocking) | `arctic_platform.rl` factory (async HTTP/Ray) |
-| Loss path | `run_sft_pipeline` with `sft` / `sft_ce` | `run_pipeline` (e.g. GRPO) |
+| Client | forthcoming `arctic_platform.sft` | `arctic_platform.rl` factory (async HTTP/Ray) |
+| Loss path | planned `sft` / `sft_ce` | `run_pipeline` (e.g. GRPO) |
 | Extra ops | — | `generate`, `log_probs`, `sync_weights`, sleep/wake |
 
 ## Entry points
@@ -140,12 +142,12 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
         "max_prompt_len": int,
         "max_response_len": int,
         "zorro_train_enable": bool,   # optional per-call override
-        # Additional context fields depend on the selected loss.
+        ...
     },
     "processing": {
         "loss_fn": "ap_grpo",          # or "grpo" / dotted path
         "post": ["ap_compute_logprobs", ...],  # Cortex post is "compute_logprobs"
-        "config": {"eps_clip": 0.2},    # Additional options depend on the selected loss.
+        "config": {"eps_clip": 0.2, ...},
     },
 }
 ```

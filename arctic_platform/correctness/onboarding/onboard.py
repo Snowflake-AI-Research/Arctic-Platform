@@ -35,7 +35,6 @@ import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -67,6 +66,18 @@ def _stage(phase: str, name: str, detail: str = "") -> None:
     if detail:
         print(detail, flush=True)
     print(flush=True)
+
+
+@contextmanager
+def _phase(phase: str, name: str, detail: str = ""):
+    from arctic_platform.correctness.harness.report import total_duration
+
+    _stage(phase, name, detail)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"{phase.title()} run time: {total_duration(time.monotonic() - started)}", flush=True)
 
 
 class _ConsoleLog:
@@ -103,6 +114,7 @@ def logged_run(args: argparse.Namespace) -> int:
     if getattr(args, "probe_layers", None) is not None:
         return run(args)
     started = time.monotonic()
+    args._onboarding_times = {}
     previous_root = os.environ.get(CORRECTNESS_LOGDIR_ENV)
     args._resume_root = Path(previous_root or Path.cwd() / "work" / "logs") / "onboarding-state"
     args._diagnostics_dir = correctness_logdir("onboarding-")
@@ -124,15 +136,22 @@ def logged_run(args: argparse.Namespace) -> int:
                     except Exception as exc:
                         reason = f"{type(exc).__name__}: {exc}"
                         traceback.print_exc()
+                        timings = "".join(
+                            f"\nOnboarding time ({test_id}): {total_duration(elapsed)}\n"
+                            for test_id, elapsed in args._onboarding_times.items()
+                        )
                         (args._diagnostics_dir / "report.md").write_text(
                             f"# Onboarding Failed\n\nConfig: `{args.config}`\n\n"
-                            f"## Reason\n\n{reason}\n\nComplete traceback: [onboarding.log](onboarding.log)\n",
+                            f"## Reason\n\n{reason}\n{timings}\n"
+                            "Complete traceback: [onboarding.log](onboarding.log)\n",
                             encoding="utf-8",
                         )
                         _onboarding_failure(reason)
                         print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
                     finally:
+                        for test_id, elapsed in args._onboarding_times.items():
+                            print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)
                         print(f"Total run time: {total_duration(time.monotonic() - started)}", flush=True)
             finally:
                 logger.handlers = previous_handlers
@@ -227,6 +246,7 @@ def _resume_preparation_request(request: dict, root: Path) -> dict:
             raise ValueError(f"Onboarding source changed while recording retry state: {path}")
         tree = ast.parse(path.read_text())
         if relative == "onboarding/onboard.py":
+            tree = _resume_onboarding_timing(tree)
             footer_nodes = {
                 ast.dump(ast.parse(source).body[0])
                 for source in (
@@ -720,7 +740,7 @@ def _run_probe(args: argparse.Namespace, layers: int) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-    _stage("Phase 1/3", "Sizing Probe", f"Layers: {layers}")
+    _stage("Sizing", "Probe", f"Layers: {layers}")
     returncode = _stream_subprocess(_probe_command(args, layers, output), cwd=args.checkout_root, env=env)
     if not output.exists():
         raise RuntimeError(f"{layers}-layer sizing worker exited {returncode} without writing {output}")
@@ -1126,6 +1146,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.report import reference_progress
     from arctic_platform.correctness.harness.runner import run_reference
 
     config = load_config(args.config)
@@ -1187,19 +1208,15 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
 
     try:
         completed: dict[int, tuple[float, dict]] = {}
-        with tqdm(
-            total=CALIBRATION_RUNS, desc="Finding optimizer tolerance", unit="run", dynamic_ncols=True
-        ) as progress:
-            for start in range(0, CALIBRATION_RUNS, lanes):
-                with ThreadPoolExecutor(max_workers=lanes) as pool:
-                    futures = [
-                        pool.submit(one_run, index) for index in range(start, min(start + lanes, CALIBRATION_RUNS))
-                    ]
-                    for future in as_completed(futures):
-                        index, elapsed, result = future.result()
-                        completed[index] = (elapsed, result)
-                        progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
-                        progress.update()
+        for start in range(0, CALIBRATION_RUNS, lanes):
+            with ThreadPoolExecutor(max_workers=lanes) as pool:
+                futures = {
+                    pool.submit(one_run, index): index for index in range(start, min(start + lanes, CALIBRATION_RUNS))
+                }
+                for _, (index, elapsed, result) in reference_progress(
+                    futures, label="Finding optimizer tolerance", total=CALIBRATION_RUNS, completed=len(completed)
+                ):
+                    completed[index] = (elapsed, result)
         for index in range(CALIBRATION_RUNS):
             elapsed, result = completed[index]
             durations.append(elapsed)
@@ -1384,8 +1401,9 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
     return admitted
 
 
-def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "phase 3/3") -> dict:
+def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
+    _stage(phase, "Target Run", f"Validating the frozen {int(selected['layers'])}-layer fixture.")
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1447,8 +1465,6 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--",
             *command[3:],
         ]
-    description = selected.get("model_description", f"frozen {layers}-layer regression")
-    _stage(phase, "Target Validation", description)
     lines: list[str] = []
     with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
@@ -1539,7 +1555,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     from arctic_platform.correctness.harness.reference_records import file_identity
     from arctic_platform.correctness.harness.reference_records import load_record
     from arctic_platform.correctness.harness.reference_records import model_identity
-    from arctic_platform.correctness.harness.reference_records import publish_record
+    from arctic_platform.correctness.harness.reference_records import publish_record_set
     from arctic_platform.correctness.harness.reference_records import require_git_records_dir
     from arctic_platform.correctness.harness.reference_records import workload_identity
     from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
@@ -1673,10 +1689,15 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
             tolerances[arm.name] = tolerance
             arm_receipts[arm.name] = {"gate": gate, "identity": identity}
             validated.append((arm.name, identity, measurements))
-        # Check both arms before immutable publication; regression reads each record's own gate.
+        # Publish both validated arms in one transaction; regression reads each record's own gate.
         ctx.reference_records_dir = records_root
+        published = publish_record_set(
+            ctx,
+            [(identity, measurements) for _, identity, measurements in validated],
+            expected_identities=[identity for _, identity, _ in validated],
+        )
         for name, identity, measurements in validated:
-            path = publish_record(ctx, identity, measurements)
+            path = next(path for path in published.values() if path.name == f"{name}.json")
             arm_receipts[name]["record"] = str(path)
             arm_receipts[name]["record_identity"] = file_identity(path)
     selected = max(tolerances.values(), key=lambda tolerance: tolerance.absolute)
@@ -1735,32 +1756,33 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
         )
     args.optimizer_model_path = optimizer_model_path
     args.optimizer_layers = optimizer_layers
-    _stage(
+    with _phase(
         "Phase 1/3",
         "Optimizer Reference Fixture",
         f"using the minimum representative {optimizer_layers}-layer prefix and the frozen Test 1 cases",
-    )
-    if not local_fixture:
-        materialize_pretrained(
-            spec.model.source_checkpoint,
-            str(optimizer_model_path),
-            optimizer_layers,
-            vision_depth=spec.model.vision_depth,
-        )
-    print(f"phase 1/3 complete: reference={optimizer_model_path}", flush=True)
-    _stage(
-        "Phase 2/3",
-        "Optimizer Calibration",
-        f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference steps; "
-        "the progress bar will report ETA after each run",
-    )
+    ):
+        if not local_fixture:
+            materialize_pretrained(
+                spec.model.source_checkpoint,
+                str(optimizer_model_path),
+                optimizer_layers,
+                vision_depth=spec.model.vision_depth,
+            )
+        print(f"Reference fixture: {optimizer_model_path}", flush=True)
     try:
-        calibration_json = Path(
-            _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
-        )
+        with _phase(
+            "Phase 2/3",
+            "Optimizer Calibration",
+            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference steps per GAS arm; "
+            "completed workers and unfinished runs are reported without an ETA.",
+        ):
+            calibration_json = Path(
+                _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
+            )
         selected = {"layers": optimizer_layers}
-        validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
-        _require_validation_pass(validation, f"final {optimizer_layers}-layer Test 2 regression")
+        with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {optimizer_layers}-layer fixture."):
+            validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
+            _require_validation_pass(validation, f"final {optimizer_layers}-layer Test 2 regression")
     except BaseException:
         args.test_spec.write_bytes(previous_spec)
         raise
@@ -1862,53 +1884,58 @@ def _parent(args: argparse.Namespace) -> int:
         return _onboard_optimizer_test(args, config)
 
     full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
-    sizing_started = time.monotonic()
     if getattr(args, "reuse_sizing", None) is not None:
-        _stage(
+        with _phase(
             "Phase 1/3",
             "Retained Sizing",
             "Admitting the source-bound result without HF sizing replay.",
-        )
-        selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
+        ):
+            selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
     else:
-        _stage(
+        with _phase(
             "Phase 1/3",
             "Representative Fixture Sizing",
             f"Validating the minimum representative HF configuration at {args.tokens:,} tokens; "
             f"selected {representative_layers} of {full_layers} source layers, attention period {period}",
-        )
-        selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
+        ):
+            selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
     observations = [selected]
     if selected["status"] == "oom":
         raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
     if selected["status"] != "fit":
         raise RuntimeError(f"unexpected sizing status {selected['status']!r} for {representative_layers} layers")
     print(
-        f"phase 1/3 complete: selected={selected['layers']} layers "
-        f"peak={selected['peak_gib']:.3f} GiB elapsed={time.monotonic() - sizing_started:.1f}s",
+        f"Selected fixture: {selected['layers']} layers, peak={selected['peak_gib']:.3f} GiB",
         flush=True,
     )
 
     previous_spec = args.test_spec.read_bytes() if args.test_spec.exists() else None
     try:
-        _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
-        _stage(
+        with _phase(
             "Phase 2/3",
             "Gradient Calibration",
             f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
-        )
-        calibration_json = Path(
-            _resume_phase(
-                args,
-                "calibration",
-                lambda: str(_render_and_run_calibration(args, selected)),
+        ):
+            _stage("Reference", "Fixture Preparation", "Writing the fixture specification and frozen inputs.")
+            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
+            calibration_json = Path(
+                _resume_phase(
+                    args,
+                    "calibration",
+                    lambda: str(_render_and_run_calibration(args, selected)),
+                )
             )
-        )
-        calibration = json.loads(calibration_json.read_text())
-        if local_fixture:
-            _resume_phase(args, "references", lambda: _prepare_references(args))
-        validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
-        _require_validation_pass(validation, f"final {selected['layers']}-layer regression")
+            calibration = json.loads(calibration_json.read_text())
+            if local_fixture:
+                _stage(
+                    "Reference",
+                    "Deterministic Baseline Preparation",
+                    "Preparing compact HF records for GAS1 and GAS4 before target validation.",
+                )
+                _resume_phase(args, "references", lambda: _prepare_references(args))
+        with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {selected['layers']}-layer fixture."):
+            validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
+            _require_validation_pass(validation, f"final {selected['layers']}-layer regression")
     except BaseException:
         if previous_spec is None:
             args.test_spec.unlink(missing_ok=True)
@@ -2143,7 +2170,10 @@ def run(args: argparse.Namespace) -> int:
     if getattr(args, "prepare_references", False):
         if args.probe_layers is not None:
             raise ValueError("reference preparation cannot be combined with model sizing")
-        return _prepare_references(args)
+        selection = args.reference_tests or [args.test_id]
+        label = selection[0] if len(selection) == 1 else "combined reference preparation"
+        with _onboarding_test_time(args, label):
+            return _prepare_references(args)
     if getattr(args, "reference_tests", None):
         raise ValueError("--reference-tests requires --prepare-references")
     if args.probe_layers is not None:
@@ -2160,7 +2190,8 @@ def run(args: argparse.Namespace) -> int:
         ).exists()
     ):
         return _onboard_configuration(args)
-    return _parent(args)
+    with _onboarding_test_time(args, args.test_id):
+        return _parent(args)
 
 
 def _onboard_configuration(args: argparse.Namespace) -> int:
@@ -2170,7 +2201,10 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.reference_records import CRITERIA
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
+    from arctic_platform.correctness.harness.report import total_duration
 
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
     config = load_config(args.config)
     tests = registered_tests()
     requested = list(tests) if args.test_id == "all" else [args.test_id]
@@ -2224,19 +2258,21 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             child._diagnostics_dir = args._diagnostics_dir / test_id
             child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
         _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
-        try:
-            code = _parent(child)
-            results[test_id] = {
-                "status": "onboarded" if code == 0 else "failed",
-                "exit_code": code,
-                "output_dir": str(child.output_dir),
-            }
-        except UnsafeCleanupError:
-            raise
-        except Exception as exc:
-            results[test_id] = {"status": "failed", "reason": str(exc)}
-            traceback.print_exc()
-            _onboarding_failure(f"{test_id}: {exc}")
+        with _onboarding_test_time(child, test_id):
+            try:
+                code = _parent(child)
+                results[test_id] = {
+                    "status": "onboarded" if code == 0 else "failed",
+                    "exit_code": code,
+                    "output_dir": str(child.output_dir),
+                }
+            except UnsafeCleanupError:
+                raise
+            except Exception as exc:
+                results[test_id] = {"status": "failed", "reason": str(exc)}
+                traceback.print_exc()
+                _onboarding_failure(f"{test_id}: {exc}")
+        results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]
     references = [test_id for test_id in selected if test_id in CRITERIA and results[test_id]["status"] == "onboarded"]
     preparation_error = None
     if len(references) > 1:
@@ -2249,20 +2285,22 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / "combined-references",
             }
         )
-        try:
-            _prepare_references(preparation)
-        except UnsafeCleanupError:
-            raise
-        except Exception as exc:
-            preparation_error = str(exc)
-            traceback.print_exc()
-            _onboarding_failure(f"combined reference preparation: {exc}")
+        with _onboarding_test_time(args, "combined reference preparation"):
+            try:
+                _prepare_references(preparation)
+            except UnsafeCleanupError:
+                raise
+            except Exception as exc:
+                preparation_error = str(exc)
+                traceback.print_exc()
+                _onboarding_failure(f"combined reference preparation: {exc}")
     summary = {
         "config_id": config.config_id,
         "config": str(args.config),
         "test_spec": str(spec_path),
         "results": results,
         "combined_reference_error": preparation_error,
+        "combined_reference_elapsed_seconds": args._onboarding_times.get("combined reference preparation"),
     }
     destination = spec_path.with_name(f"{spec_path.stem}.onboarding.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2277,12 +2315,28 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                     "",
                     f"Status: {result['status']}",
                     "",
+                    (
+                        f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+                        if "elapsed_seconds" in result
+                        else "Onboarding time: not run"
+                    ),
+                    "",
                     result.get("reason", f"Exit code: {result.get('exit_code', 'not run')}"),
                     "",
                 ]
             )
         if preparation_error:
             lines.extend(["## Combined Reference Failure", "", preparation_error, ""])
+        if "combined reference preparation" in args._onboarding_times:
+            lines.extend(
+                [
+                    (
+                        "Combined reference preparation time: "
+                        f"{total_duration(args._onboarding_times['combined reference preparation'])}"
+                    ),
+                    "",
+                ]
+            )
         lines.extend(
             [
                 "## Retry",
@@ -2311,6 +2365,137 @@ def main(argv=None) -> int:
     )
     add_arguments(parser)
     return logged_run(parser.parse_args(argv))
+
+
+@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started
+
+
+def _resume_onboarding_timing(tree: ast.Module) -> ast.Module:
+    """Normalize only the exact reviewed per-test timing additions."""
+    removed = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            """@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started""",
+            "args._onboarding_times = {}",
+            """if not hasattr(args, "_onboarding_times"):
+    args._onboarding_times = {}""",
+            """timings = "".join(
+    f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"
+    for test_id, elapsed in args._onboarding_times.items()
+)""",
+            """for test_id, elapsed in args._onboarding_times.items():
+    print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)""",
+            'results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]',
+            """if "combined reference preparation" in args._onboarding_times:
+    lines.extend([
+        "Combined reference preparation time: "
+        f"{total_duration(args._onboarding_times['combined reference preparation'])}",
+        "",
+    ])""",
+        )
+    }
+    selection_nodes = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            "selection = args.reference_tests or [args.test_id]",
+            'label = selection[0] if len(selection) == 1 else "combined reference preparation"',
+        )
+    }
+    contexts = {
+        ast.dump(ast.parse(f"with {source}:\n    pass").body[0].items[0])
+        for source in (
+            "_onboarding_test_time(args, label)",
+            "_onboarding_test_time(args, args.test_id)",
+            "_onboarding_test_time(child, test_id)",
+            '_onboarding_test_time(args, "combined reference preparation")',
+        )
+    }
+    report_import = ast.dump(
+        ast.parse("from arctic_platform.correctness.harness.report import total_duration").body[0]
+    )
+    failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n{timings}\\n"'
+        '"Complete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    previous_failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    failure_report_node = ast.dump(ast.parse(failure_report, mode="eval").body)
+    timing_line = ast.dump(
+        ast.parse(
+            """(f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+if "elapsed_seconds" in result else "Onboarding time: not run")""",
+            mode="eval",
+        ).body
+    )
+    combined_time = ast.dump(
+        ast.parse('args._onboarding_times.get("combined reference preparation")', mode="eval").body
+    )
+
+    class TimingDisplay(ast.NodeTransformer):
+        function = None
+
+        def visit(self, node):
+            identity = ast.dump(node)
+            if identity in removed or self.function == "run" and identity in selection_nodes:
+                return None
+            if self.function == "_onboard_configuration" and identity == report_import:
+                return None
+            if identity == failure_report_node:
+                return ast.parse(previous_failure_report, mode="eval").body
+            return super().visit(node)
+
+        def visit_FunctionDef(self, node):
+            previous = self.function
+            self.function = node.name
+            node = self.generic_visit(node)
+            self.function = previous
+            return node
+
+        def visit_With(self, node):
+            node = self.generic_visit(node)
+            if len(node.items) == 1 and ast.dump(node.items[0]) in contexts:
+                return node.body
+            return node
+
+        def visit_Dict(self, node):
+            for index in range(len(node.keys) - 1, -1, -1):
+                if (
+                    isinstance(node.keys[index], ast.Constant)
+                    and node.keys[index].value == "combined_reference_elapsed_seconds"
+                    and ast.dump(node.values[index]) == combined_time
+                ):
+                    del node.keys[index]
+                    del node.values[index]
+            return self.generic_visit(node)
+
+        def visit_List(self, node):
+            for index in range(len(node.elts) - 2, -1, -1):
+                if ast.dump(node.elts[index]) == timing_line and ast.dump(node.elts[index + 1]) == ast.dump(
+                    ast.Constant(value="")
+                ):
+                    del node.elts[index : index + 2]
+            return self.generic_visit(node)
+
+    return TimingDisplay().visit(tree)
 
 
 if __name__ == "__main__":

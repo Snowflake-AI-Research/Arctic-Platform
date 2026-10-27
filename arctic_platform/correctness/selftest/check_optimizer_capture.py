@@ -843,7 +843,7 @@ def test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_bud
             cancels.append(transport.job_id)
             return {}
         if url.endswith("/save"):
-            assert kwargs["json"] == {"checkpoint_type": "resumable", "export_hf": False}
+            assert kwargs["json"] == {"checkpoint_type": "resumable"}
             step = counts[transport.job_id]
             record(transport.job_id, f"save-{step}")
             result = {"stage_path": f"@stage/checkpoints/cp_{transport.job_id.rsplit('-', 1)[-1]}-{step}/"}
@@ -3405,7 +3405,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     session = GatewaySession(tmp_path, 4, backend)
     events, replies, paths = ([], {}, [])
-    state = SimpleNamespace(step=0, failure=None, receipt=None, cancelled=False)
+    state = SimpleNamespace(step=0, failure=None, receipt=None, cancelled=False, training_child=None)
 
     async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
         assert asyncio.get_running_loop() is transport._loop
@@ -3416,6 +3416,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
         if url.endswith(":cancel") or (state.cancelled and method == "GET"):
             assert policy.max_retries == 0 and policy.timeout > 0
         if method == "POST" and url == transport._prefix:
+            state.training_child = kwargs["json"]["sub_job_configs"][0]["job_id"]
             return {"job_id": "local-parent"}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
             return {
@@ -3444,7 +3445,7 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
             events.append(f"save-{state.step}")
             shutil.copytree(pair.before if state.step == 0 else pair.after, path)
             result = {
-                "job_id": "actual-training-child",
+                "job_id": state.training_child,
                 "checkpoint_path": str(path),
                 "checkpoint_tag": f"global_step{state.step}",
                 "version": state.step,
@@ -3474,6 +3475,24 @@ def _local_cortex_optimizer_local_capture(tmp_path, monkeypatch, _local_cortex_o
         return {"request_id": request_id}
 
     monkeypatch.setattr(CortexTransport, "_send", send)
+
+    async def native_save(transport, method, url, **kwargs):
+        assert method == "POST"
+        assert url == f"http://127.0.0.1:8003/save-checkpoint?job_id={state.training_child}"
+        assert getattr(transport, "_native_gateway", False) is False
+        body = kwargs["json"]
+        assert set(body) == {"path", "checkpoint_type"}
+        reply = await send(
+            transport,
+            method,
+            f"{transport._prefix}/{transport.job_id}/save",
+            json={**body, "export_hf": False},
+            allow_redirects=False,
+        )
+        return json.dumps(replies[reply["request_id"]]).encode()
+
+    monkeypatch.delenv(cortex_fixture.LOCAL_NATIVE_FORWARD_ENV, raising=False)
+    monkeypatch.setattr(cortex_fixture.CorrectnessCortexTransport, "_native_http", native_save)
     client_config = _training_client_config(
         session, build_payload(load_config(_cortex_optimizer_capture_CONFIG).training, "local-fixture", 42)
     )
@@ -3831,6 +3850,7 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     args = SimpleNamespace(
         local_cortex_fixture=True,
         cortex_fixture=None,
+        base_url="http://127.0.0.1:8003",
         config=str(_cortex_optimizer_capture_CONFIG),
         all_configs=False,
         test=["single-step-optimizer"],
@@ -3844,6 +3864,9 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     widths = []
     monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
+    monkeypatch.setattr(
+        cli, "local_cortex_gateway", lambda *args, **kwargs: pytest.fail("explicit endpoint must remain external")
+    )
     monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: [_cortex_optimizer_capture_CONFIG])
     monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
     monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 128)
@@ -6338,3 +6361,497 @@ def test_automatic_participation_worker_closes_hooks_on_failure_or_destroy(monke
             assert worker.step() == {"global_steps": 1}
             assert worker.correctness_participation_receipt()["job_id"] == "child"
     assert all(not parameter._backward_hooks for parameter in worker._engine.module.parameters())
+
+
+@pytest.fixture
+def dense_allocation_runner_case(tmp_path, monkeypatch, request):
+    from copy import deepcopy
+
+    from arctic_platform.correctness.harness import storage
+
+    width = getattr(request, "param", 4)
+    cfg = load_config(_cortex_optimizer_capture_CONFIG).at_gpu_width(width)
+    spec = Spec.read(_cortex_optimizer_capture_SPEC)
+    spec.model.cache_path = str(tmp_path / "reviewed-model")
+    spec.test_settings["single-step-optimizer"]["model_cache_path"] = spec.model.cache_path
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    references = _cortex_optimizer_capture_prepared_references(monkeypatch, spec, cfg, tmp_path)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    admission = {"nodes": [{"host": "head", "slots": width // 2}, {"host": "peer", "slots": width // 2}]}
+    allocation_validator = capture.validate_dense_checkpoint_allocation
+    events, admitted, captures, payloads = [], [], [], []
+    original_files = (_cortex_optimizer_capture_CONFIG.read_bytes(), _cortex_optimizer_capture_SPEC.read_bytes())
+
+    def validate(value, *, expected_dp_world_size):
+        assert expected_dp_world_size == width
+        assert value == admission and value is not admission
+        admitted.append(deepcopy(value))
+        events.append("allocation")
+        return value["nodes"]
+
+    @contextmanager
+    def gateway(*args, **kwargs):
+        assert kwargs["backend"] is backend
+        events.append("gateway-enter")
+        yield "mock-session"
+        events.append("gateway-exit")
+
+    @contextmanager
+    def running_job(session, payload):
+        assert session == "mock-session"
+        payloads.append(deepcopy(payload))
+        events.append("job-enter")
+        yield "mock-job"
+        events.append("job-exit")
+
+    def step(session, job, body, **kwargs):
+        assert session == "mock-session" and job == "mock-job"
+        assert kwargs["local_checkpoint"] is True
+        assert kwargs["expected_dp_world_size"] == width
+        assert kwargs["learning_rate"] == 0.01
+        assert kwargs["optimizer_config"] == cfg.training["optimizer"]
+        assert kwargs["dense_checkpoint_allocation"] == admission
+        assert "native_layout_supplier" not in kwargs
+        captures.append(deepcopy(kwargs["dense_checkpoint_allocation"]))
+        kwargs["dense_checkpoint_allocation"]["nodes"][0]["slots"] = 99
+        events.append("capture")
+        manifest = _cortex_optimizer_capture_manifest(kwargs["output_dir"] / "states")
+        return StepResult(2.0, {"weight": 1.0}, optimizer_state_manifest=str(manifest))
+
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", validate)
+    monkeypatch.setattr(capture, "capture_optimizer_step", step)
+    monkeypatch.setattr(runner, "gateway", gateway)
+    monkeypatch.setattr(runner, "running_job", running_job)
+    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
+    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: {"model_name": spec.model.cache_path})
+    monkeypatch.setattr(
+        requests.Session, "request", lambda *args, **kwargs: pytest.fail("dense runner controls must not use network")
+    )
+
+    def execute(**options):
+        return runner.execute(
+            cfg,
+            spec,
+            [ArmDefinition("gas1", width, 32), ArmDefinition("gas4", 4 * width, 32)],
+            vocab_size=128,
+            workdir=tmp_path / "work",
+            **{
+                "select": ["single-step-optimizer"],
+                "client_backend": backend,
+                "local_cortex_fixture": True,
+                "dense_checkpoint_allocation": admission,
+                **options,
+            },
+        )
+
+    return SimpleNamespace(
+        cfg=cfg,
+        spec=spec,
+        backend=backend,
+        admission=admission,
+        references=references,
+        events=events,
+        admitted=admitted,
+        captures=captures,
+        payloads=payloads,
+        original_files=original_files,
+        allocation_validator=allocation_validator,
+        execute=execute,
+    )
+
+
+@pytest.mark.parametrize("order", ["batched", "interleaved"])
+@pytest.mark.parametrize("combined", [False, True])
+def test_dense_allocation_runner_new_forwards_original_dense_dp_and_isolates_each_arm(
+    dense_allocation_runner_case, order, combined
+):
+    case = dense_allocation_runner_case
+    selected = ["single-step-grads", "single-step-optimizer"] if combined else ["single-step-optimizer"]
+    original = json.loads(json.dumps(case.cfg.training))
+    results = case.execute(select=selected, order=order)
+    assert len(results) == 2 * len(selected) and all(result.outcome is Outcome.PASS for result in results)
+    assert case.admitted == [case.admission] and case.captures == [case.admission, case.admission]
+    assert case.admission["nodes"][0]["slots"] == 2
+    assert case.events[0] == "allocation" and case.events[-1] == "gateway-exit"
+    assert case.events.count("job-enter") == case.events.count("job-exit") == 2
+    assert all(row.metrics["stated_criterion_abs"] == 0.001 for row in results if row.test_id.endswith("optimizer"))
+    assert case.references == [(check, arm) for arm in ("gas1", "gas4") for check in selected]
+    assert case.cfg.training == original
+    assert (_cortex_optimizer_capture_CONFIG.read_bytes(), _cortex_optimizer_capture_SPEC.read_bytes()) == (
+        case.original_files
+    )
+
+
+@pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
+@pytest.mark.parametrize("order", ["batched", "interleaved"])
+def test_dense_allocation_runner_explicit16_preserves_placement_for_both_arms(dense_allocation_runner_case, order):
+    case = dense_allocation_runner_case
+    results = case.execute(order=order)
+    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
+    assert case.cfg.n_gpus == case.cfg.dp_size == 16 and case.cfg.sp_size == 1
+    assert case.cfg.training["ds_config"]["train_batch_size"] == 16
+    assert case.references == [("single-step-optimizer", arm) for arm in ("gas1", "gas4")]
+    assert len(case.captures) == len(case.payloads) == 2
+    assert all(sum(node["slots"] for node in admission["nodes"]) == 16 for admission in case.captures)
+    assert all(payload["training_config"]["n_gpus"] == 16 for payload in case.payloads)
+    assert all(result.metrics["stated_criterion_abs"] == 0.001 for result in results)
+    assert case.events.count("job-enter") == case.events.count("job-exit") == 2
+    assert case.events[-1] == "gateway-exit"
+
+
+@pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
+def test_dense_allocation_runner_explicit16_rejects_partial8_before_preparation(
+    dense_allocation_runner_case, monkeypatch
+):
+    from arctic_platform.correctness.harness import inference_export
+
+    case = dense_allocation_runner_case
+    for node in case.admission["nodes"]:
+        node["slots"] = 4
+    monkeypatch.setattr(inference_export, "validate_local_inference_allocation", lambda admission: admission["nodes"])
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", case.allocation_validator)
+    with pytest.raises(ValueError, match="complete DP world"):
+        case.execute()
+    assert case.cfg.n_gpus == case.cfg.dp_size == 16
+    assert not case.events and not case.references and not case.captures
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "no-local-fixture",
+        "preparation",
+        "rl",
+        "lora",
+        "onprem",
+        "remote",
+        "no-selection",
+        "gradients-only",
+        "mixed-selection",
+        "sp",
+        "ep",
+        "moe",
+        "tp",
+        "native-scope",
+        "native-source",
+        "native-supplier-source",
+    ],
+)
+def test_dense_allocation_runner_new_rejects_incompatible_route_before_references_or_resources(
+    dense_allocation_runner_case, bad
+):
+    case = dense_allocation_runner_case
+    options = {}
+    if bad == "no-local-fixture":
+        options["local_cortex_fixture"] = False
+    elif bad == "preparation":
+        options["prepare_references"] = True
+    elif bad == "rl":
+        case.cfg.native = case.cfg.native.model_copy(update={"sampling_gpus": 4})
+    elif bad == "lora":
+        case.cfg.training["peft_config"] = {"r": 32}
+    elif bad == "onprem":
+        options["client_backend"] = OnPremConfig()
+    elif bad == "remote":
+        options["client_backend"] = CortexConfig(base_url="http://not-local.example:8003")
+    elif bad == "no-selection":
+        options["select"] = None
+    elif bad == "gradients-only":
+        options["select"] = ["single-step-grads"]
+    elif bad == "mixed-selection":
+        options["select"] = ["single-step-optimizer", "inference-checkpoint-loss"]
+    elif bad == "sp":
+        case.cfg.training["sp_size"] = 2
+    elif bad == "ep":
+        case.cfg.training["ds_config"]["expert_parallel"] = {"enabled": True, "autoep_size": 2}
+    elif bad == "moe":
+        case.cfg.training["ds_config"]["moe"] = {"enabled": True}
+    elif bad == "tp":
+        case.cfg.training["ds_config"]["tensor_parallel"] = {"tp_size": 2}
+    elif bad == "native-scope":
+        options["native_optimizer_scope"] = lambda *args: pytest.fail("native scope must not run")
+    elif bad == "native-source":
+        options["native_optimizer_scope_source"] = {"path": "unread", "sha256": "0" * 64}
+    else:
+        options["native_optimizer_supplier_source"] = {"path": "unread", "sha256": "0" * 64}
+    with pytest.raises(ValueError, match="exclusive local Cortex SP1/EP1|loopback"):
+        case.execute(**options)
+    assert not case.events and not case.admitted and not case.captures and not case.references
+
+
+def test_dense_allocation_runner_new_allocation_rejection_precedes_reference_identity_and_resources(
+    dense_allocation_runner_case, monkeypatch
+):
+    case = dense_allocation_runner_case
+
+    def reject(*args, **kwargs):
+        raise ValueError("actual allocation identity differs")
+
+    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", reject)
+    monkeypatch.setattr(
+        reference_records, "model_identity", lambda *args: pytest.fail("read reference before admission")
+    )
+    with pytest.raises(ValueError, match="actual allocation identity"):
+        case.execute()
+    assert not case.events and not case.references
+
+
+def _dense_allocation_runner_args(tmp_path, *, raw=b'{"nodes":[{"host":"head","slots":4}]}'):
+    from arctic_platform.correctness import api
+
+    path = tmp_path / "allocation.json"
+    path.write_bytes(raw)
+    options = api.RunOptions(
+        backend="cortex-training",
+        base_url="http://127.0.0.1:8003",
+        local_cortex_fixture=True,
+        dense_checkpoint_allocation=path,
+        dense_checkpoint_allocation_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    request = api.RunRequest(config=str(_cortex_optimizer_capture_CONFIG), tests=("single-step-optimizer",))
+    return api._namespace(request, options), request, options
+
+
+@pytest.mark.parametrize("combined", [False, True])
+def test_dense_allocation_runner_new_maintained_parser_and_loader_have_distinct_optimizer_scope(tmp_path, combined):
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    selected = ["single-step-grads", "single-step-optimizer"] if combined else ["single-step-optimizer"]
+    argv = [
+        "--config",
+        request.config,
+        "--base-url",
+        options.base_url,
+        "--local-cortex-fixture",
+        "--dense-checkpoint-allocation",
+        str(options.dense_checkpoint_allocation),
+        "--dense-checkpoint-allocation-sha256",
+        options.dense_checkpoint_allocation_sha256,
+    ]
+    for test in selected:
+        argv.extend(["--test", test])
+    actual_request, actual_options = api.parse_run_args(argv)
+    assert actual_request.tests == tuple(selected)
+    assert actual_options.dense_checkpoint_allocation == options.dense_checkpoint_allocation
+    assert actual_options.dense_checkpoint_allocation_sha256 == options.dense_checkpoint_allocation_sha256
+    parsed = api._namespace(actual_request, actual_options)
+    assert cli._load_dense_checkpoint_allocation(parsed) == {"nodes": [{"host": "head", "slots": 4}]}
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"test": None},
+        {"test": ["single-step-grads"]},
+        {"test": ["single-step-optimizer", "inference-checkpoint-loss"]},
+        {"all_configs": True},
+        {"config": None},
+        {"backend": "onprem"},
+        {"prepare_references": True},
+        {"local_cortex_fixture": False},
+        {"cortex_fixture": Path("unread-publication.json")},
+        {"probe_layers": 1},
+        {"local_gateway_full_model": True},
+        {"peft_adapter": Path("unread-adapter")},
+        {"base_url": "http://remote.example"},
+    ],
+)
+def test_dense_allocation_runner_new_loader_rejects_scope_before_descriptor_read(tmp_path, monkeypatch, changed):
+    args, _, _ = _dense_allocation_runner_args(tmp_path)
+    vars(args).update(changed)
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: pytest.fail("unsafe scope reached descriptor read"))
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"nodes":[],"nodes":[]}',
+        b'{"nodes":[{"slots":1,"slots":2}]}',
+        b'{"nodes":[],"timeout_s":NaN}',
+        b'{"nodes":[],"timeout_s":Infinity}',
+        b"[]",
+        b"x" * (1024 * 1024 + 1),
+    ],
+)
+def test_dense_allocation_runner_new_loader_rejects_duplicate_nonfinite_nonobject_and_oversize(tmp_path, raw):
+    args, _, _ = _dense_allocation_runner_args(tmp_path, raw=raw)
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize("bad", ["missing-path", "missing-pin", "wrong-pin", "uppercase-pin", "short-pin"])
+def test_dense_allocation_runner_new_loader_requires_exact_paired_fullpin(tmp_path, bad):
+    args, _, _ = _dense_allocation_runner_args(tmp_path)
+    if bad == "missing-path":
+        args.dense_checkpoint_allocation = None
+    elif bad == "missing-pin":
+        args.dense_checkpoint_allocation_sha256 = None
+    else:
+        args.dense_checkpoint_allocation_sha256 = {
+            "wrong-pin": "0" * 64,
+            "uppercase-pin": "A" * 64,
+            "short-pin": "a" * 63,
+        }[bad]
+    with pytest.raises(ValueError):
+        cli._load_dense_checkpoint_allocation(args)
+
+
+@pytest.mark.parametrize("boundary", ["api", "batch"])
+def test_dense_allocation_runner_new_original_mixed_selection_rejected_before_grouping(
+    tmp_path, monkeypatch, boundary
+):
+    from dataclasses import replace
+
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    request = replace(request, tests=("single-step-optimizer", "inference-checkpoint-loss"))
+    args.test = list(request.tests)
+    monkeypatch.setattr(api, "select", lambda *args: pytest.fail("invalid original selection was grouped"))
+    monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("invalid selection created batch output"))
+    with pytest.raises(ValueError):
+        if boundary == "api":
+            api.run(request, options)
+        else:
+            cli.run_batch(args, selected=[])
+
+
+def test_dense_allocation_runner_new_maintained_cli_forwards_authenticated_descriptor_to_executor(
+    tmp_path, monkeypatch
+):
+    args, _, options = _dense_allocation_runner_args(tmp_path)
+    parsed = cli.parse_args(
+        [
+            "run",
+            "--config",
+            str(_cortex_optimizer_capture_CONFIG),
+            "--base-url",
+            options.base_url,
+            "--local-cortex-fixture",
+            "--test",
+            "single-step-optimizer",
+            "--dense-checkpoint-allocation",
+            str(options.dense_checkpoint_allocation),
+            "--dense-checkpoint-allocation-sha256",
+            options.dense_checkpoint_allocation_sha256,
+            "--out",
+            str(tmp_path / "report"),
+        ]
+    )
+    cfg = load_config(_cortex_optimizer_capture_CONFIG)
+    spec = Spec.read(_cortex_optimizer_capture_SPEC)
+    backend = CortexConfig(base_url=options.base_url)
+    forwarded = []
+    monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
+    monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: [_cortex_optimizer_capture_CONFIG])
+    monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
+    monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 128)
+    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        cortex_fixture,
+        "load_local_fixture",
+        lambda *args: {
+            "model_name": spec.model.cache_path,
+            "fixture_sha256": "mock-fixture",
+            "distribution": "local-gateway",
+        },
+    )
+    monkeypatch.setattr(
+        requests.Session, "request", lambda *args, **kwargs: pytest.fail("CLI forwarding must not use network")
+    )
+
+    def execute(run_cfg, run_spec, arms, **kwargs):
+        assert run_cfg.n_gpus == cfg.n_gpus == 4 and run_cfg.dp_size == 4
+        assert run_spec is spec and arms[0].global_batch_size == 4
+        assert kwargs["select"] == ["single-step-optimizer"] and kwargs["local_cortex_fixture"] is True
+        assert kwargs["dense_checkpoint_allocation"] == cli._load_dense_checkpoint_allocation(args)
+        forwarded.append(kwargs)
+        return []
+
+    assert cli._run_configs(parsed, executor=execute) == 0
+    assert len(forwarded) == 1
+    assert hashlib.sha256(options.dense_checkpoint_allocation.read_bytes()).hexdigest() == (
+        options.dense_checkpoint_allocation_sha256
+    )
+
+
+def test_dense_allocation_runner_new_library_keeps_pinned_metadata_in_original_request_before_batch(
+    tmp_path, monkeypatch
+):
+    from arctic_platform.correctness import api
+
+    args, request, options = _dense_allocation_runner_args(tmp_path)
+    selected = [api.SelectedCase("mock-dense", _cortex_optimizer_capture_CONFIG, "single-step-optimizer")]
+    reached = []
+    monkeypatch.setattr(
+        api, "select", lambda actual: selected if actual is request else pytest.fail("request replaced")
+    )
+    result = object()
+
+    def batch(actual, **kwargs):
+        assert actual.test == ["single-step-optimizer"]
+        assert actual.dense_checkpoint_allocation == args.dense_checkpoint_allocation
+        assert actual.dense_checkpoint_allocation_sha256 == args.dense_checkpoint_allocation_sha256
+        assert kwargs["selected"] is selected
+        reached.append(actual)
+        return result
+
+    monkeypatch.setattr(cli, "run_batch", batch)
+    assert api.run(request, options) is result
+    assert len(reached) == 1
+
+
+@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
+@pytest.mark.parametrize(
+    "tests",
+    [
+        ["single-step-optimizer"],
+        ["single-step-grads", "single-step-optimizer"],
+    ],
+)
+def test_local_cortex_optimizer_cli_local_fixture_accepts_explicit_supported_selection_before_dispatch(
+    monkeypatch, tests
+):
+    args = SimpleNamespace(
+        local_cortex_fixture=True,
+        cortex_fixture=None,
+        config=str(_cortex_optimizer_capture_CONFIG),
+        all_configs=False,
+        test=tests,
+    )
+    monkeypatch.setattr(cli, "_client_backend", lambda args: CortexConfig(base_url="http://127.0.0.1:8003"))
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("eligible dispatch")
+
+    monkeypatch.setattr(cli, "_resolve_configs", stop)
+    with pytest.raises(RuntimeError, match="eligible dispatch"):
+        cli.cmd_run(args)
+
+
+@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
+@pytest.mark.parametrize(
+    "selected",
+    [
+        None,
+        ["inference-checkpoint-loss"],
+        ["single-step-optimizer", "inference-checkpoint-loss"],
+        ["single-step-optimizer", "checkpoint-resume-loss"],
+        ["unknown-check"],
+    ],
+)
+def test_local_cortex_optimizer_cli_local_fixture_does_not_implicitly_enable_other_checks(monkeypatch, selected):
+    args = SimpleNamespace(
+        local_cortex_fixture=True,
+        cortex_fixture=None,
+        config=str(_cortex_optimizer_capture_CONFIG),
+        all_configs=False,
+        test=selected,
+    )
+    monkeypatch.setattr(cli, "_client_backend", lambda args: CortexConfig(base_url="http://127.0.0.1:8003"))
+    monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: pytest.fail("invalid selection dispatched"))
+    with pytest.raises(SystemExit, match="only first-two"):
+        cli.cmd_run(args)

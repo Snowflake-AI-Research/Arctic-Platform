@@ -282,8 +282,16 @@ class NativeCheckpointStore:
         }
 
     def _check_hostfile(self) -> None:
-        if self._hostfile_identity() != self._host_identity:
-            raise CheckpointStoreError("allocation hostfile changed")
+        observed = self._hostfile_identity()
+        if observed != self._host_identity:
+            changes = {
+                field: {"expected": expected, "observed": observed[field]}
+                for field, expected in self._host_identity.items()
+                if observed[field] != expected
+            }
+            raise CheckpointStoreError(
+                f"allocation hostfile changed: path={self.hostfile}; differences={json.dumps(changes, sort_keys=True)}"
+            )
 
     def _fanout(self, operation: str, binding: dict, identities: dict) -> dict:
         self._check_hostfile()

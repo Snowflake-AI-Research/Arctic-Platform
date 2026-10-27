@@ -44,9 +44,10 @@ def render(args: argparse.Namespace) -> str:
         "'Measure gradient-norm repeatability of the fixed reference.'\n\nfrom __future__ import"
         " annotations\n\nimport hashlib\nimport importlib.metadata\nimport json\nimport math\nimport os\nimport"
         " platform\nimport time\nfrom decimal import Decimal, ROUND_CEILING\nimport sys\nfrom concurrent.futures"
-        " import ThreadPoolExecutor, as_completed\nfrom pathlib import Path\n\nimport torch\nfrom transformers import"
-        " AutoConfig\nfrom tqdm.auto import tqdm\n\nfrom arctic_platform.correctness.harness.batches import"
-        " build_batch, save as save_batch\nfrom arctic_platform.correctness.harness.runner import run_reference\nfrom"
+        " import ThreadPoolExecutor\nfrom pathlib import Path\n\nimport torch\nfrom transformers import"
+        " AutoConfig\nfrom arctic_platform.correctness.harness.report import reference_progress\n\nfrom"
+        " arctic_platform.correctness.harness.batches import build_batch, save as save_batch\nfrom"
+        " arctic_platform.correctness.harness.runner import run_reference\nfrom"
         " arctic_platform.correctness.harness.batches import SEED\nfrom arctic_platform.correctness.harness.config"
         " import hash_directory\nfrom arctic_platform.correctness.onboarding.synth_model import"
         " materialize_pretrained\nfrom arctic_platform.correctness.reference.model_features import"
@@ -73,7 +74,8 @@ def render(args: argparse.Namespace) -> str:
         " importlib.metadata.PackageNotFoundError:\n            packages[distribution] = None\n    return {\n       "
         ' "python": sys.version.split()[0],\n        "platform": platform.platform(),\n        "cuda":'
         ' torch.version.cuda,\n        "packages": packages,\n    }\n\n\ndef main() -> int:\n    print(f"interpreter'
-        ' {sys.prefix}", flush=True)\n    materialize_pretrained(SOURCE_PATH, MODEL_PATH, LAYERS)\n    model_cfg ='
+        ' {sys.prefix}", flush=True)\n    print("Preparing the HF calibration fixture", flush=True)\n   '
+        " materialize_pretrained(SOURCE_PATH, MODEL_PATH, LAYERS)\n    model_cfg ="
         " AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)\n    inner = getattr(model_cfg,"
         ' "text_config", model_cfg)\n    layer_types = list(getattr(inner, "layer_types", ["full_attention"] *'
         ' int(inner.num_hidden_layers)))\n    spec = json.loads(SPEC_PATH.read_text())\n    arms = spec.get("arms",'
@@ -84,7 +86,8 @@ def render(args: argparse.Namespace) -> str:
         ' tensors")\n        if WORK_DIR is not None else correctness_workdir("reference-calibration-")\n    )\n   '
         " from arctic_platform.correctness.harness.config import reference_calibration_worker_count\n    lanes ="
         " reference_calibration_worker_count(__WORKERS__, runs=RUNS)\n\n    def one_run(index: int, batch_path: Path,"
-        " run_dir: Path) -> tuple[int, float, dict]:\n        started = time.monotonic()\n        result ="
+        ' run_dir: Path) -> tuple[int, float, dict]:\n        started = time.monotonic()\n        print(f"HF'
+        ' calibration start: arm={run_dir.name}, run={index}, device={index % lanes}", flush=True)\n        result ='
         " run_reference(\n            MODEL_PATH,\n            batch_path,\n            run_dir /"
         ' f"run-{index:02d}.json",\n            token_budget=REFERENCE_TOKEN_BUDGET,\n            ce_chunk=2048,\n    '
         "        attn=__ATTENTION__,\n            fp32_lm_head=__FP32_LM_HEAD__,\n           "
@@ -97,27 +100,27 @@ def render(args: argparse.Namespace) -> str:
         '    arm_name = arm["name"]\n        batch = build_batch(arm_name, arm["global_batch_size"],'
         ' arm["max_seq_len"], inner.vocab_size, seed=SEED)\n        batch_path = tensor_dir / f"batch-{arm_name}.pt"\n'
         '        save_batch(batch, batch_path)\n        run_dir = OUTPUT.parent / "calibration-runs" / arm_name\n     '
-        "   run_dir.mkdir(parents=True, exist_ok=True)\n        completed = {}\n        with tqdm(total=RUNS,"
-        ' desc=f"Finding tolerance {arm_name}", unit="run", dynamic_ncols=True) as progress:\n            for start in'
-        " range(0, RUNS, lanes):\n                with ThreadPoolExecutor(max_workers=lanes) as pool:\n               "
-        "     futures = [pool.submit(one_run, index, batch_path, run_dir)\n                               for index in"
-        " range(start, min(start + lanes, RUNS))]\n                    for future in as_completed(futures):\n         "
-        "               index, elapsed, result = future.result()\n                        completed[index] = result\n "
-        "                       progress.set_postfix_str(\n                            f\"loss={result['loss']:.6f},"
-        " peak={result['peak_gib']:.1f}GiB, \"\n                            f\"last={elapsed:.1f}s, {lanes} per"
-        ' wave"\n                        )\n                        progress.update()\n        results ='
-        ' [completed[index] for index in range(RUNS)]\n        names = sorted(results[0]["grad_norms"])\n        if'
-        ' not names:\n            raise RuntimeError(f"{arm_name}: reference runs returned no gradients")\n        for'
-        ' result in results:\n            if sorted(result["grad_norms"]) != names:\n                raise'
-        ' RuntimeError(f"{arm_name}: reference runs returned different gradient parameter sets")\n            if'
-        ' sorted(result["skipped_no_grad"]) != sorted(results[0]["skipped_no_grad"]):\n                raise'
-        ' RuntimeError(f"{arm_name}: reference runs skipped different parameters")\n            if'
-        ' result["active_tokens"] != batch.active_tokens:\n                raise RuntimeError(f"{arm_name}: reference'
-        ' active-token count differs from the calibration batch")\n            if not all(math.isfinite(value) and'
-        ' value >= 0 for value in result["grad_norms"].values()):\n                raise RuntimeError(f"{arm_name}:'
-        ' reference gradient norms must be finite and nonnegative")\n            if not'
-        ' math.isfinite(result["loss"]):\n                raise RuntimeError(f"{arm_name}: reference loss must be'
-        ' finite")\n        for name in names:\n            values = [result["grad_norms"][name] for result in'
+        "   run_dir.mkdir(parents=True, exist_ok=True)\n        completed = {}\n        for start in range(0, RUNS,"
+        " lanes):\n            with ThreadPoolExecutor(max_workers=lanes) as pool:\n                futures ="
+        " {pool.submit(one_run, index, batch_path, run_dir): index\n                           for index in"
+        " range(start, min(start + lanes, RUNS))}\n                for _, (index, elapsed, result) in"
+        ' reference_progress(\n                    futures, label=f"Finding tolerance {arm_name}", total=RUNS,'
+        " completed=len(completed)\n                ):\n                    completed[index] = result\n               "
+        '     print(f"HF calibration done: arm={arm_name}, run={index}, "\n                         '
+        " f\"loss={result['loss']:.6f}, peak={result['peak_gib']:.1f}GiB, \"\n                         "
+        ' f"elapsed={elapsed:.1f}s", flush=True)\n        print(f"Summarizing gradient variation for {arm_name}",'
+        " flush=True)\n        results = [completed[index] for index in range(RUNS)]\n        names ="
+        ' sorted(results[0]["grad_norms"])\n        if not names:\n            raise RuntimeError(f"{arm_name}:'
+        ' reference runs returned no gradients")\n        for result in results:\n            if'
+        ' sorted(result["grad_norms"]) != names:\n                raise RuntimeError(f"{arm_name}: reference runs'
+        ' returned different gradient parameter sets")\n            if sorted(result["skipped_no_grad"]) !='
+        ' sorted(results[0]["skipped_no_grad"]):\n                raise RuntimeError(f"{arm_name}: reference runs'
+        ' skipped different parameters")\n            if result["active_tokens"] != batch.active_tokens:\n            '
+        '    raise RuntimeError(f"{arm_name}: reference active-token count differs from the calibration batch")\n     '
+        '       if not all(math.isfinite(value) and value >= 0 for value in result["grad_norms"].values()):\n         '
+        '       raise RuntimeError(f"{arm_name}: reference gradient norms must be finite and nonnegative")\n          '
+        '  if not math.isfinite(result["loss"]):\n                raise RuntimeError(f"{arm_name}: reference loss must'
+        ' be finite")\n        for name in names:\n            values = [result["grad_norms"][name] for result in'
         ' results]\n            ranges.append({"arm": arm_name, "name": name, "minimum": min(values),\n               '
         '            "maximum": max(values), "range": max(values) - min(values), "values": values})\n        losses ='
         ' [result["loss"] for result in results]\n        arm_measurements[arm_name] = {\n           '
@@ -127,22 +130,23 @@ def render(args: argparse.Namespace) -> str:
         ' "losses": losses, "loss_range": max(losses) - min(losses),\n            "peak_gib": [result["peak_gib"] for'
         ' result in results],\n        }\n    ranges.sort(key=lambda row: row["range"], reverse=True)\n   '
         ' raw_variation = ranges[0]["range"]\n    computed_gate, selected_gate = _select_gate(raw_variation)\n   '
-        ' payload = {\n        "configuration": {\n            "model": f"{Path(SOURCE_PATH).name} {LAYERS}-layer'
-        ' hybrid slice",\n            "active_gdn_layers": layer_types.count("linear_attention"),\n           '
-        ' "active_full_attention_layers": layer_types.count("full_attention"),\n            "tokens": TOKENS,\n       '
-        '     "attention_implementation": __ATTENTION__,\n            "mixer_packing": mixer_packing,\n           '
-        ' "reference_token_budget": REFERENCE_TOKEN_BUDGET,\n            "runs": RUNS,\n           '
-        ' "seed_reset_each_run": SEED,\n            "deterministic_algorithms": False,\n           '
-        ' "cudnn_deterministic": False,\n            "cublas_workspace_config": None,\n           '
-        ' "flash_attention_deterministic": False,\n            "config_checksum": CONFIG_CHECKSUM,\n           '
-        ' "model_hash": hash_directory(Path(MODEL_PATH)),\n        },\n        "environment": _environment(),\n       '
-        ' "arms": arm_measurements,\n        "loss_range": max(arm["loss_range"] for arm in'
-        ' arm_measurements.values()),\n        "gradient_ranges": ranges,\n        "tolerance": {\n           '
-        ' "worst_arm": ranges[0]["arm"],\n            "raw_max_same_tensor_range": raw_variation,\n           '
-        ' "multiplier": GATE_SAFETY_FACTOR,\n            "computed_gate": computed_gate,\n           '
-        ' "rounding_quantum": float(GATE_QUANTUM),\n            "minimum_gate": float(GATE_QUANTUM),\n           '
-        ' "selected_gate": selected_gate,\n        },\n    }\n    OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n  '
-        '  OUTPUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")\n    print(f"loss range:'
+        ' print(f"Hashing calibration model files: {MODEL_PATH}", flush=True)\n    payload = {\n       '
+        ' "configuration": {\n            "model": f"{Path(SOURCE_PATH).name} {LAYERS}-layer hybrid slice",\n         '
+        '   "active_gdn_layers": layer_types.count("linear_attention"),\n            "active_full_attention_layers":'
+        ' layer_types.count("full_attention"),\n            "tokens": TOKENS,\n            "attention_implementation":'
+        ' __ATTENTION__,\n            "mixer_packing": mixer_packing,\n            "reference_token_budget":'
+        ' REFERENCE_TOKEN_BUDGET,\n            "runs": RUNS,\n            "seed_reset_each_run": SEED,\n           '
+        ' "deterministic_algorithms": False,\n            "cudnn_deterministic": False,\n           '
+        ' "cublas_workspace_config": None,\n            "flash_attention_deterministic": False,\n           '
+        ' "config_checksum": CONFIG_CHECKSUM,\n            "model_hash": hash_directory(Path(MODEL_PATH)),\n       '
+        ' },\n        "environment": _environment(),\n        "arms": arm_measurements,\n        "loss_range":'
+        ' max(arm["loss_range"] for arm in arm_measurements.values()),\n        "gradient_ranges": ranges,\n       '
+        ' "tolerance": {\n            "worst_arm": ranges[0]["arm"],\n            "raw_max_same_tensor_range":'
+        ' raw_variation,\n            "multiplier": GATE_SAFETY_FACTOR,\n            "computed_gate": computed_gate,\n'
+        '            "rounding_quantum": float(GATE_QUANTUM),\n            "minimum_gate": float(GATE_QUANTUM),\n     '
+        '       "selected_gate": selected_gate,\n        },\n    }\n    OUTPUT.parent.mkdir(parents=True,'
+        ' exist_ok=True)\n    print(f"Writing calibration results: {OUTPUT}", flush=True)\n   '
+        ' OUTPUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")\n    print(f"loss range:'
         ' {payload[\'loss_range\']:.9e}")\n    print(f"raw variation: {raw_variation:.9e}")\n    print(f"computed'
         ' {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")\n    print(f"selected gate: {selected_gate:.9e}")\n   '
         " print(f\"{'weight':64} {'minimum':>13} {'maximum':>13} {'range':>13}\")\n    for row in ranges[:10]:\n"

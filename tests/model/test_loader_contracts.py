@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,7 @@ from arctic_platform.model import canonical_parameter_name
 from arctic_platform.model import freeze_fp8_weights_and_scales
 from arctic_platform.model import model_parallelism_metadata_from_config
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import execute_subprocess_async
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
@@ -210,6 +212,22 @@ def test_freeze_fp8_weights_and_scales():
 
 
 class TestQwen3BoundedLossLoader(TestCasePlus):
+    def test_loss_import_does_not_load_training_services(self):
+        result = execute_subprocess_async(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss;"
+                    " assert callable(chunked_causal_lm_loss); assert not any(name in sys.modules for name in"
+                    " ('arctic_platform.sft', 'arctic_platform.client', 'arctic_platform.rl',"
+                    " 'arctic_platform.inference')); print('Shared loss imported without training services')"
+                ),
+            ],
+            env=self.get_env(),
+        )
+        self.assertEqual(result.returncode, 0)
+
     def _tiny_model(self):
         from transformers import Qwen3Config
         from transformers import Qwen3ForCausalLM
@@ -247,7 +265,7 @@ class TestQwen3BoundedLossLoader(TestCasePlus):
     def _assert_loaded_forward_and_backward(self, dtype, device):
         from transformers import Qwen3ForCausalLM
 
-        from arctic_platform.sft.chunked_cross_entropy import chunked_causal_lm_loss
+        from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 
         baseline = self._tiny_model().to(dtype=dtype)
         path = self.get_auto_remove_tmp_dir()

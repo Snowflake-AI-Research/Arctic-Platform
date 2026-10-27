@@ -1568,9 +1568,34 @@ def test_native_checkpoint_store_cleanup_failure_is_retained_and_can_be_retried(
 
 def test_native_checkpoint_store_hostfile_drift_rejects_before_fanout(_native_checkpoint_store_env):
     env = _native_checkpoint_store_env
+    expected = env.store._host_identity
     env.hostfile.write_text("node-1 slots=1\n")
-    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed"):
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed") as error:
         env.store.create(env.root)
+    assert env.calls == []
+    message = str(error.value)
+    assert f"path={env.hostfile}" in message
+    changes = json.loads(message.split("differences=", 1)[1])
+    observed = env.store._hostfile_identity()
+    assert expected["sha256"] != observed["sha256"]
+    assert changes == {
+        key: {"expected": expected[key], "observed": observed[key]}
+        for key in expected
+        if expected[key] != observed[key]
+    }
+
+
+def test_native_checkpoint_store_same_content_replacement_reports_identity_drift(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    replacement = env.hostfile.with_name("replacement-hostfile")
+    replacement.write_bytes(env.hostfile.read_bytes())
+    replacement.replace(env.hostfile)
+    with pytest.raises(env.module.CheckpointStoreError, match="hostfile changed") as error:
+        env.store.create(env.root)
+    changes = json.loads(str(error.value).split("differences=", 1)[1])
+    assert "sha256" not in changes
+    assert changes["path_identity"]["expected"] != changes["path_identity"]["observed"]
+    assert changes["target_identity"]["expected"] != changes["target_identity"]["observed"]
     assert env.calls == []
 
 

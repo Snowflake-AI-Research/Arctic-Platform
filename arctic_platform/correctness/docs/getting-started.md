@@ -97,9 +97,9 @@ All subsequent commands run from the checkout root.
 
 ## Step 3. Config Onboard
 
-**Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with sixteen nondeterministic calibration samples per gradient accumulation step (GAS) arm, GAS1 and GAS4. Sixteen samples is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
+**Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with eight nondeterministic calibration samples per gradient accumulation step (GAS) arm, GAS1 and GAS4. Eight samples is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
 
-**Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Sixteen samples require two waves of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
+**Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
 
 ```bash
 python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3-129m-one-h200.json
@@ -109,22 +109,24 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
 
-**Gradient calibration uses sixteen nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
+**Gradient calibration uses eight nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
 
 **Optimizer calibration shows a `tqdm` progress bar for each GAS arm, with elapsed time and ETA after every completed HF run.** Onboarding finishes with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, retained in `onboarding.log` as well as the terminal.
 
-**Each optimizer arm uses one deterministic baseline plus sixteen calibration repeats.** Each repeat starts an independent HF process, loads the fixture and saves optimizer state, so startup and capture time can dominate a tiny model. Both arms require thirty-four processes in total; calibration repeats overlap according to the local worker count. Compatible completed preparation is reused after a failed validation; regression uses prepared records without recalibrating. Existing records retain their original run counts and reviewed gates.
+**Each optimizer arm uses one deterministic baseline plus eight calibration repeats.** Each repeat starts an independent HF process, loads the fixture and saves optimizer state, so startup and capture time can dominate a tiny model. Both arms require eighteen processes in total; calibration repeats overlap according to the local worker count. Compatible completed preparation is reused after a failed validation; regression uses prepared records without recalibrating. Existing records retain their original run counts and reviewed gates.
 
 **To onboard only one check, add `--test single-step-grads` or `--test single-step-optimizer`.** Missing fixture prerequisites are handled automatically. An RL config is reported as inapplicable for these two supervised-reference checks; onboarding does not manufacture SFT measurements for RL.
 
-**The supplied config is copied into the checkout first.** External `.json` and `.config` files are imported byte for byte into `arctic_platform/correctness/configs/`, then treated as local configs. Identical copies are reused; different contents under an existing local filename are rejected without overwriting it. No automatic Git commit is made.
+**The supplied config is copied into the checkout first, with its filename unchanged.** External `.json` and `.config` files are imported byte for byte into `arctic_platform/correctness/configs/`, then treated as local configs. Identical copies are reused; different contents under an existing local filename are rejected without overwriting it. No automatic Git commit is made.
 
 **Existing Cortex-training recipes with `sub_job_configs` are accepted directly, alongside native client configs.** Point the same onboarding command at the recipe JSON; do not flatten or rewrite it. Import preserves the original bytes, training topology, sequence limit, optimizer, offload settings and weight format. The first-two checks still use their reduced reference fixture and existing correctness token cap, not a full-model or maximum-sequence-length run. A recipe with training and sampling sub-jobs remains classified as RL and is inapplicable to these two supervised checks.
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ../cortex-training/recipes/sft/configs/qwen38_flash_next.json
+  --config ../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
+
+**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Onboarding requires an existing file and does not resolve deleted recipe paths automatically. The imported filename is `h200-training-full.json`; use a distinct filename when importing a different recipe with that same basename.
 
 ## Step 4. Run Config Tests
 

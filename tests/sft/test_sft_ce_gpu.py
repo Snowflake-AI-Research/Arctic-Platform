@@ -28,7 +28,7 @@ import sys
 import pytest
 import torch
 
-from arctic_platform.sft.chunked_cross_entropy import chunked_causal_lm_loss
+from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.sft.processor import sft_ce_sum_from_hidden
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async

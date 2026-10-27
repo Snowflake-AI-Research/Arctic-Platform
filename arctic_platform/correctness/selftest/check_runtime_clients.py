@@ -32,9 +32,9 @@ import torch
 from pydantic import ValidationError
 
 from arctic_platform import wire
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.client import TrainingConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
@@ -47,6 +47,7 @@ from arctic_platform.correctness.harness.batches import load as load_batch
 from arctic_platform.correctness.harness.config import LoadedConfig
 from arctic_platform.correctness.harness.config import TestSpec as ConfigSpec
 from arctic_platform.correctness.harness.config import arms_for
+from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.cortex import CorrectnessCortexTransport
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
@@ -354,7 +355,7 @@ def test_client_backends_cortex_config_forwards_worker_settings_without_mutation
         model_name="model",
         training_gpus=8,
         backend=_client_backends_remote(),
-        training=TrainingConfig(ds_worker_config=worker, full_determinism=True),
+        training={"ds_worker_config": worker, "full_determinism": True},
         source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "parent"},
     )
     wire = config.to_cortex()[0]
@@ -412,6 +413,7 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 def test_client_backends_cortex_shutdown_closes_session_when_cancel_fails(monkeypatch):
     transport = CorrectnessCortexTransport(_client_backends_remote())
     transport.job_id = "parent"
+    transport._owns_job = True
     closed = []
     session = _client_backends_session_with_close_spy(transport, monkeypatch, closed)
     attempts = []
@@ -674,6 +676,64 @@ _cortex_model_identity_SPEC = _cortex_model_identity_ROOT / "specs/qwen3-8b-h200
 _driver_reviewed_root = Path(__file__).resolve().parents[1]
 
 
+def test_driver_reviewed_build_payload_forwards_top_level_moe_chunk_through_model_options():
+    training = {"ep_size": 8, "fused_lm_head_token_chunk_size": 1024, "prime_rl": {}}
+    before = deepcopy(training)
+    result = dss_driver.build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
+    assert result["model_options"]["lm_head.token_chunk_size"] == 1024
+    assert result["fused_lm_head_token_chunk_size"] == 1024
+    assert result["prime_rl"] == training["prime_rl"]
+    assert training == before
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"prime_rl": {"fused_lm_head_token_chunk_size": 4096}},
+        {"prime_rl": {"fused_lm_head_token_chunk_size": "disabled"}},
+        {"prime_rl": {"fused_lm_head_token_chunk_size": None}},
+        {"fused_lm_head_token_chunk_size": "disabled"},
+        {"fused_lm_head_token_chunk_size": None},
+        {"model_options": {"lm_head": {"token_chunk_size": 4096}}},
+        {"model_options": {"lm_head.token_chunk_size": 4096}},
+    ],
+)
+def test_driver_reviewed_build_payload_preserves_explicit_chunk_settings(settings):
+    training = {"ep_size": 8, **deepcopy(settings)}
+    before = deepcopy(training)
+    result = dss_driver.build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
+    for key, value in settings.items():
+        assert result[key] == value
+    assert result.get("model_options") == settings.get("model_options")
+    assert result.get("fused_lm_head_token_chunk_size") == settings.get("fused_lm_head_token_chunk_size")
+    assert training == before
+
+
+def test_driver_reviewed_build_payload_moe_chunk_fallback_preserves_other_options():
+    training = {
+        "ep_size": 8,
+        "model_options": {"attention": {"backend": "qsa_flex"}},
+        "prime_rl": {"fused_cross_entropy": False},
+    }
+    before = deepcopy(training)
+    result = dss_driver.build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
+    assert result["fused_lm_head_token_chunk_size"] == 2048
+    assert result["model_options"] == {
+        "attention": {"backend": "qsa_flex"},
+        "lm_head.token_chunk_size": 2048,
+    }
+    assert training == before
+
+
+@pytest.mark.parametrize("ep_size", [None, "invalid", True, {}, 1])
+def test_driver_reviewed_build_payload_chunk_does_not_coerce_ep_size(ep_size):
+    training = {"ep_size": ep_size, "fused_lm_head_token_chunk_size": 1024}
+    result = dss_driver.build_payload(training, "model", 42)["training_config"]
+    assert result["ep_size"] == ep_size
+    assert result["fused_lm_head_token_chunk_size"] == 1024
+    assert "model_options" not in result
+
+
 @pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
 def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(weight_format):
     cfg = load_config(_driver_reviewed_config)
@@ -930,7 +990,7 @@ class _hosted_Client:
 
 
 def test_hosted_the_created_sub_job_is_the_config_file_s_training_sub_job() -> None:
-    """Whatever the operator wrote reaches the server: typed fields as themselves, the rest as passthrough."""
+    """Preserve reviewed settings apart from suite diagnostics and the correctness token cap."""
     cfg = _hosted_config()
     wire = _hosted_wire(cfg)
     assert wire["job_type"] == "training"
@@ -938,9 +998,13 @@ def test_hosted_the_created_sub_job_is_the_config_file_s_training_sub_job() -> N
     assert wire["dtype"] == cfg.sub_job["dtype"]
     assert wire["seed"] == cfg.sub_job["seed"]
     for key, value in cfg.training.items():
-        if key in {"optimizer", "debug"}:
+        if key in {"optimizer", "debug", "mb_spec"}:
             continue
         assert wire["training_config"][key] == value, key
+    assert wire["training_config"]["mb_spec"] == {
+        **cfg.training.get("mb_spec", {}),
+        "max_tokens_per_mb": correctness_microbatch_tokens(cfg.max_tokens_per_mb),
+    }
     for key, value in cfg.training["optimizer"].items():
         assert wire["training_config"]["optimizer"]["name" if key == "type" else key] == value, key
 
@@ -1475,3 +1539,39 @@ def _synthetic_runtime_inputs(tmp_path, monkeypatch):
     monkeypatch.setitem(globals(), "_cortex_port_CONFIG", config)
     monkeypatch.setitem(globals(), "_cortex_port_ROOT", config.parents[3])
     monkeypatch.setitem(globals(), "_driver_reviewed_config", config)
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cortex_model_options_preserve_internal_debug_without_a_bridge():
+    worker = {
+        "ep_size": 8,
+        "sp_size": 8,
+        "model_options": {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {"token_chunk_size": 1024, "fp32": False, "cross_entropy": False},
+            "attention": {"backend": "qsa_flex"},
+        },
+        "prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}},
+    }
+    native = ArcticClientConfig(
+        model_name="model",
+        max_seq_len=262144,
+        training_gpus=8,
+        backend=_client_backends_remote(),
+        training={"ds_worker_config": worker},
+    )
+    native_before = native.model_dump()
+    config = CortexTrainingConfig.from_reviewed(native)
+    before = config.model_dump()
+    training = config.to_cortex()[0]["training_config"]
+    assert training["model_options"] == worker["model_options"]
+    assert training["prime_rl"] == worker["prime_rl"]
+    assert training["max_seq_len"] == 262144
+    assert training["sp_size"] == 8
+    assert "deepep_token_chunk_size" not in training
+    assert "fused_lm_head_token_chunk_size" not in training
+    assert config.model_dump() == before
+    training["model_options"]["lm_head"]["token_chunk_size"] = 2048
+    training["prime_rl"]["debug"]["gpu_mem_preallocate_gib"] = 0
+    assert config.model_dump() == before
+    assert native.model_dump() == native_before

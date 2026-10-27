@@ -958,6 +958,8 @@ def test_glm53_sparse_indices_are_padded_for_flashmla():
 
 
 def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
+    from arctic_platform.correctness.harness.participation import ParticipationCapture
+    from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
@@ -969,15 +971,34 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     apply_context_parallelism(model, cp_size=1, cp_group=None)
     sparse_attention = language_model.layers[-1].self_attn
     hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
-    output, _, _ = sparse_attention(
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    q_resid = sparse_attention.q_a_layernorm(sparse_attention.q_a_proj(hidden_states))
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    expected_indices = _select_sparse_indices(
+        sparse_attention.indexer,
         hidden_states,
-        attention_mask=torch.ones(1, 4, dtype=torch.bool),
+        q_resid,
+        attention_mask,
+        cu_seqlens,
+        cp_group=None,
+        cp_rank=0,
     )
-    output.square().sum().backward()
+    torch_assert_equal(sparse_attention.indexer(hidden_states, q_resid, attention_mask, cu_seqlens), expected_indices)
+    with ParticipationCapture(sparse_attention) as capture:
+        output, _, _ = sparse_attention(hidden_states, attention_mask=attention_mask)
+        output.square().sum().backward()
+        participation = capture.result()["parameters"]
 
     assert sparse_attention.q_a_proj.weight.grad is not None
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
     assert sparse_attention.indexer.wq_b.weight.grad is None
+    assert participation["q_a_proj.weight"]["state"] == "active"
+    indexer_parameters = {name: evidence for name, evidence in participation.items() if name.startswith("indexer.")}
+    assert indexer_parameters
+    for entry in indexer_parameters.values():
+        assert entry["state"] == "inactive"
+        assert entry["evidence"]["calls"] == 1
+        assert entry["evidence"]["integer_outputs_only"] is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")

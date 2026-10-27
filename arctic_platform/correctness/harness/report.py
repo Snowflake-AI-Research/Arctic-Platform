@@ -25,6 +25,9 @@ import socket
 import subprocess
 import sys
 import threading
+import time
+from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import wait
 from dataclasses import asdict
 from datetime import datetime
 from datetime import timezone
@@ -183,6 +186,37 @@ def total_duration(seconds: float) -> str:
     hours, remainder = divmod(math.ceil(seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def reference_progress(futures, *, label: str, total: int, completed: int = 0, interval: float = 30):
+    """Report completed parallel workers and periodic waits without a sequential ETA."""
+    started = time.monotonic()
+    pending = set(futures)
+
+    def report(detail: str) -> None:
+        active = ", ".join(str(futures[future]) for future in sorted(pending, key=futures.get)) or "none"
+        print(
+            f"{label}: {completed}/{total} completed; "
+            f"unfinished runs=[{active}]; wave elapsed={total_duration(time.monotonic() - started)}; {detail}",
+            flush=True,
+        )
+
+    report("wave started")
+    while pending:
+        done, _ = wait(pending, timeout=interval, return_when=FIRST_COMPLETED)
+        if not done:
+            report("waiting for workers to finish")
+            continue
+        for future in sorted(done, key=futures.get):
+            try:
+                result = future.result()
+            except BaseException:
+                report(f"run {futures[future]} failed")
+                raise
+            pending.remove(future)
+            completed += 1
+            report(f"run {futures[future]} finished")
+            yield futures[future], result
 
 
 def runtime_table(timing, wall_seconds: float) -> str:

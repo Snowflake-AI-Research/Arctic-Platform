@@ -12,7 +12,7 @@ launchers ship in this directory:
 | `run_qwen3_32b_bird_grpo_fsdp_4node.sh` | SkyRL FSDP-native | **4 × 8 H200** | Same hyperparams as the arctic sibling — the wall-clock A/B baseline. |
 
 The 4-node BIRD launcher is the direct SkyRL twin of the blog's flagship BIRD
-run (verl twin: [`recipes/rl/verl/txt2sql/run_qwen3_32b_bird_grpo_arl_zorro_yes.sh`](../../verl/txt2sql/run_qwen3_32b_bird_grpo_arl_zorro_yes.sh)).
+run (verl twin: [`recipes/rl/verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh`](../../verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh)).
 
 ## What's in this folder
 

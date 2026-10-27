@@ -427,6 +427,31 @@ def test_config_gpu_attention_disabled_lm_head_chunk_resolves_to_none(tmp_path: 
     assert load_config(path).lm_head_token_chunk_size is None
 
 
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, 8192),
+        ({"lm_head": {"token_chunk_size": 2048}}, 2048),
+        ({"lm_head.token_chunk_size": 1024}, 1024),
+        ({"lm_head.token_chunk_size": 1024, "lm_head": {"token_chunk_size": 2048}}, 1024),
+        ({"lm_head": {"token_chunk_size": "disabled"}}, None),
+        ({"lm_head.token_chunk_size": "disabled", "lm_head": {"token_chunk_size": 2048}}, None),
+        ({"lm_head": {"token_chunk_size": None}}, None),
+        ({"lm_head": {"token_chunk_size": True}}, None),
+        ({"lm_head": {"token_chunk_size": 0}}, 0),
+    ],
+)
+def test_config_gpu_attention_explicit_lm_head_chunk_precedes_legacy_settings(tmp_path, options, expected):
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    training = raw["training"]["ds_worker_config"]
+    training["fused_lm_head_token_chunk_size"] = 4096
+    training["prime_rl"] = {"fused_lm_head_token_chunk_size": 8192}
+    training["model_options"] = options
+    path.write_text(json.dumps(raw))
+    assert load_config(path).lm_head_token_chunk_size == expected
+
+
 def test_config_gpu_attention_config_checksum_is_canonical_and_tracks_training_behavior(tmp_path: Path) -> None:
     path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3", n_gpus=4)
     first = config_checksum(load_config(path))
@@ -1334,3 +1359,165 @@ def _rl_bootstrap_validation(status="pass"):
         "log": "/synthetic-only/run.log",
         "report": "/synthetic-only/report.json" if status == "pass" else None,
     }
+
+
+_FLASH_RECIPE_PATHS = {
+    "glm53-flash-bf16-rl-32gpus-256k": "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config",
+    "glm53-flash-bf16-sft-16gpus-256k": "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config",
+    "glm53-flash-lora-rl-16gpus-256k": "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
+    "glm53-flash-lora-sft-8gpus-256k": "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
+    "qwen38-flash-next-sft-16gpus-256k": "qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config",
+}
+
+
+def _flash_recipe_path(tmp_path, relative):
+    """Keep source-semantics controls independent of P1's deliberately small catalog."""
+    recipe = next((name for name, path in _FLASH_RECIPE_PATHS.items() if path == relative), None)
+    if recipe is None:
+        assert relative == "qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+        model, training, sampling = (
+            "Qwen/Qwen3-8B",
+            {"n_gpus": 4, "max_seq_len": 65536, "attn_implementation": "flash_attention_3"},
+            None,
+        )
+    else:
+        model, training, sampling = _flash_source_recipe(recipe)
+    sampling = deepcopy(sampling)
+    if sampling is not None:
+        sampling.pop("peft_config", None)
+    raw = _config_factory_native_config(training, model_name=model, sampling=sampling)
+    raw["backend"] = {
+        "type": "remote",
+        "protocol": "cortex",
+        "base_url": "http://127.0.0.1:8003",
+        "database": "dev",
+        "schema": "dev",
+    }
+    path = tmp_path / "configs" / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(raw))
+    return path
+
+
+def test_config_gpu_attention_flash_next_reviewed_recipe_keeps_training_settings(tmp_path: Path) -> None:
+    path = _flash_recipe_path(tmp_path, _FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"])
+    config = load_config(path)
+    validate_against_host(config, available_gpus=16, check_gpu_type=False)
+    assert config.config_id == "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
+    assert config.n_gpus == config.sp_size == 16
+    assert config.dp_size == 1
+    assert config.max_seq_len == config.max_tokens_per_mb == 262144
+    assert config.attention_implementation == "qsa_flex"
+    assert config.optimizer_dtype == "float32"
+    assert config.training["train_batch_size"] == 1
+    assert config.training["ep_size"] == 8
+    assert config.training["deepep_token_chunk_size"] == 8192
+    assert config.training["ac_config"]["offload_config"]["enabled"] is False
+    assert config.training["ds_config"]["zero_optimization"]["offload_optimizer"] == {
+        "device": "cpu",
+        "pin_memory": False,
+    }
+    assert config.native.backend.type == "remote"
+    assert config.native.backend.base_url == "http://127.0.0.1:8003"
+
+
+def test_config_gpu_attention_flash_next_cortex_wire_preserves_all_training_fields(tmp_path: Path) -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    path = _flash_recipe_path(tmp_path, _FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"])
+    native = load_config(path).native
+    wire = CortexTrainingConfig.model_validate(native.model_dump(mode="json")).to_cortex()
+    ds = native.training.ds_config
+    assert wire == [
+        {
+            "job_type": "training",
+            "model_name": "Qwen/Qwen3.8-Flash-Next",
+            "dtype": "bfloat16",
+            "seed": 42,
+            "training_config": {
+                **native.training.ds_worker_config,
+                "n_gpus": 16,
+                "max_seq_len": 262144,
+                "train_batch_size": 1,
+                "gradient_clipping": 1.0,
+                "optimizer": {"name": ds["optimizer"]["type"], **ds["optimizer"]["params"]},
+                "ds_config": ds,
+                "debug": {"full_determinism": False},
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("recipe", _FLASH_RECIPE_PATHS)
+def test_flash_recipe_native_conversion_preserves_complete_source_semantics(tmp_path: Path, recipe: str) -> None:
+    model, training, sampling = _flash_source_recipe(recipe)
+    path = _flash_recipe_path(tmp_path, _FLASH_RECIPE_PATHS[recipe])
+    native = load_config(path).native
+    expected_sampling = deepcopy(sampling)
+    if expected_sampling is not None and "peft_config" in expected_sampling:
+        assert expected_sampling.pop("peft_config") == training["peft_config"]
+    expected = _config_factory_native_config(training, model_name=model, sampling=expected_sampling)
+    expected["backend"] = {
+        "type": "remote",
+        "protocol": "cortex",
+        "base_url": "http://127.0.0.1:8003",
+        "database": "dev",
+        "schema": "dev",
+    }
+    assert native.model_dump(mode="json") == ArcticClientConfig.model_validate(expected).model_dump(mode="json")
+    raw = json.loads(path.read_text())
+    assert native.model_dump(mode="json", by_alias=True, exclude_unset=True) == raw
+    total_gpus = 32 if "-rl-32gpus-" in recipe else (16 if "-16gpus-" in recipe else 8)
+    assert native.training_gpus + native.sampling_gpus == total_gpus
+    assert native.max_seq_len == 262144
+    config = load_config(path)
+    validate_against_host(config, available_gpus=native.training_gpus, check_gpu_type=False)
+    assert config.attention_implementation == ("qsa_flex" if recipe.startswith("qwen38") else "sparse_mla")
+
+
+@pytest.mark.parametrize("recipe", _FLASH_RECIPE_PATHS)
+def test_flash_recipe_correctness_wire_retains_all_training_knobs(tmp_path: Path, recipe: str) -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    model, training, _ = _flash_source_recipe(recipe)
+    path = _flash_recipe_path(tmp_path, _FLASH_RECIPE_PATHS[recipe])
+    native = load_config(path).native
+    wire = CortexTrainingConfig.model_validate(native.model_dump(mode="json")).to_cortex()
+    actual = next(sub for sub in wire if sub["job_type"] == "training")
+    expected = deepcopy(training)
+    expected["ds_config"].update(
+        gradient_clipping=training["gradient_clipping"],
+        optimizer={
+            "type": training["optimizer"]["name"],
+            "params": {key: value for key, value in training["optimizer"].items() if key != "name"},
+        },
+    )
+    expected["debug"] = {"full_determinism": False}
+    assert actual == {
+        "job_type": "training",
+        "model_name": model,
+        "dtype": "bfloat16",
+        "seed": 42,
+        "training_config": expected,
+    }
+    if native.training.peft is not None and native.sampling_gpus:
+        sampling = next(sub for sub in wire if sub["job_type"] == "sampling")
+        assert sampling["inference_config"]["peft_config"] == native.training.peft
+
+
+@pytest.mark.parametrize(
+    ("relative", "target", "reference"),
+    [
+        *[(path, "sparse_mla", "sdpa") for recipe, path in _FLASH_RECIPE_PATHS.items() if recipe.startswith("glm53")],
+        (_FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"], "qsa_flex", "qsa_flex"),
+        ("qwen3-8b/h200/train-sft-full-4gpus-64k.config", "flash_attention_3", "flash_attention_3"),
+    ],
+)
+def test_reference_attention_preserves_native_recipe_and_target_backend(tmp_path, relative, target, reference):
+    config = load_config(_flash_recipe_path(tmp_path, relative))
+    before = deepcopy(config.native.model_dump(mode="json"))
+    checksum = config_checksum(config)
+    assert config.reference_attention_implementation == reference
+    assert config.attention_implementation == target
+    assert config.native.model_dump(mode="json") == before
+    assert config_checksum(config) == checksum

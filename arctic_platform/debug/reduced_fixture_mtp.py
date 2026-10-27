@@ -25,6 +25,7 @@ from contextlib import ExitStack
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel
@@ -283,7 +284,7 @@ def _authenticate_fixture(model, root: Path, config, request: ReducedFixtureMTP)
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if not isinstance(weight_map, dict) or not weight_map:
             raise ValueError("fixture index requires a nonempty weight_map")
-        indexed = {}
+        indexed: dict[str, set[str]] = {}
         for name, shard in weight_map.items():
             if not isinstance(name, str) or not isinstance(shard, str) or not shard.endswith(".safetensors"):
                 raise ValueError("fixture index has an invalid tensor or shard")
@@ -331,7 +332,7 @@ def maybe_capture_reduced_fixture_mtp(model, source_path: Path, config) -> None:
     import torch.distributed as dist
 
     distributed = dist.is_initialized()
-    result = [None, False]
+    result: list[Any] = [None, False]
     cause = None
     try:
         request = ReducedFixtureMTP.model_validate(supplied)
@@ -339,7 +340,7 @@ def maybe_capture_reduced_fixture_mtp(model, source_path: Path, config) -> None:
     except Exception as exc:
         cause = exc
         result[0] = f"{type(exc).__name__}: {exc}"
-    results = [result]
+    results: list[Any] = [result]
     if distributed:
         results = [None] * dist.get_world_size()
         dist.all_gather_object(results, result)

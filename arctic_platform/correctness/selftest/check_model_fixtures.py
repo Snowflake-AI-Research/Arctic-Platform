@@ -574,6 +574,8 @@ def test_cortex_fixture_fixture_cli_uses_local_vocab_and_records_published_targe
                 "cortex",
                 "--config",
                 str(path),
+                "--config-dir",
+                str(path.parents[2]),
                 "--test",
                 "single-step-grads",
                 "--cortex-fixture",

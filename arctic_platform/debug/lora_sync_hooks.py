@@ -28,6 +28,7 @@ import sys
 from contextlib import nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
+from importlib import import_module
 from pathlib import Path
 from types import CodeType
 from types import MethodType
@@ -1287,8 +1288,9 @@ async def maybe_collect_lora_sync(server, receive_task, send_tasks, *, schedule=
 
         result = maybe_sync_weights_result(received, sent)
         if schedule is not None:
-            from arctic_platform.common.utils.weight_sync import received_checksums
-            from arctic_platform.common.weight_checksum import compare_weight_checksums
+            # Optional transfer utilities must not become model-factory dependencies.
+            received_checksums = import_module("arctic_platform.common.utils.weight_sync").received_checksums
+            compare_weight_checksums = import_module("arctic_platform.common.weight_checksum").compare_weight_checksums
 
             workers_results = received.get("workers", [])
             result.update(

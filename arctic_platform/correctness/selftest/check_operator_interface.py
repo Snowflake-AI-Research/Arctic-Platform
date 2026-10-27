@@ -34,6 +34,8 @@ import sys
 import tempfile
 import time
 from argparse import Namespace
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextlib import nullcontext
 from pathlib import Path
@@ -290,6 +292,35 @@ def test_dense_checkpoint_onboarding_final_child_preserves_pair(
         if allocated:
             assert command[command.index(flag) + 1] == str(getattr(args, flag[2:].replace("-", "_")))
     assert args.test_spec.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("dense_checkpoint_allocation", None),
+        ("dense_checkpoint_allocation_sha256", None),
+        ("dense_checkpoint_allocation_sha256", "0" * 64),
+        ("dense_checkpoint_allocation_sha256", "BAD-PIN"),
+        ("prepare_references", True),
+        ("probe_layers", 4),
+        ("test_id", "single-step-grads"),
+        ("backend", "onprem"),
+        ("local_cortex_fixture", False),
+        ("peft_adapter", Path("/data-fast/foreign-adapter")),
+    ],
+)
+def test_dense_checkpoint_onboarding_rejects_before_storage(
+    _dense_checkpoint_onboarding_cli, monkeypatch, field, value
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    argv, _ = _dense_checkpoint_onboarding_cli
+    args = execution.parse_args(["onboard", *argv])
+    setattr(args, field, value)
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: pytest.fail("invalid allocation reached storage"))
+    monkeypatch.setattr(onboard, "_parent", lambda *a: pytest.fail("invalid allocation reached onboarding"))
+    with pytest.raises(ValueError):
+        onboard.run(args)
 
 
 def test_dense_checkpoint_onboarding_relative_path_binds_caller_bytes(
@@ -735,6 +766,41 @@ def test_historical_gradient_execution_forwards_exact_bindings(_historical_gradi
     assert captured[0]["select"] == ["single-step-grads"]
 
 
+def test_historical_gradient_execution_refuses_rl_before_separate_dispatch(_historical_gradient_cli, monkeypatch):
+    args, _ = _historical_gradient_cli
+    Path(args.config).write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {"n_gpus": 4, "max_seq_len": 16, "attn_implementation": "sdpa"},
+                sampling={"n_gpus": 4, "max_seq_len": 16},
+            )
+        )
+    )
+    assert execution.load_config(Path(args.config)).is_rl
+    recorded = []
+    monkeypatch.setattr(
+        execution,
+        "_frozen_spec",
+        lambda *a, **kw: pytest.fail("RL rejection reached frozen spec"),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_run_vocab_size",
+        lambda *a, **kw: pytest.fail("RL rejection read model metadata"),
+    )
+
+    def finish(results, *a, **kw):
+        recorded.extend(results)
+        return 1
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    assert execution._run_configs(args, executor=lambda *a, **kw: pytest.fail("RL reached SFT executor")) == 1
+    assert len(recorded) == 1
+    assert recorded[0].outcome is Outcome.FAIL
+    assert recorded[0].test_id == "-"
+    assert recorded[0].reason == "historical gradient references require a supervised config"
+
+
 def test_historical_gradient_execution_keeps_declared_width_with_larger_pool(_historical_gradient_cli, monkeypatch):
     args, _ = _historical_gradient_cli
     config_bytes = Path(args.config).read_bytes()
@@ -878,9 +944,15 @@ def test_historical_gradient_runner_records_provenance_before_target_and_keeps_b
 
 
 def _cli_config_selection_write_config(root: Path, gpu_type: str) -> Path:
-    path = root / "model" / gpu_type / "train.config"
+    from arctic_platform.correctness.harness.config import ReviewedClientConfig
+
+    path = root / "model" / gpu_type / f"model-{gpu_type}-train.config"
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "sp_size": 8})))
+    native_config = _config_factory_native_config({"n_gpus": 8, "sp_size": 8})
+    native_config["backend"] = {"type": "onprem"}
+    native = ReviewedClientConfig.model_validate(native_config)
+    config = {"hardware": gpu_type.upper(), "sub_job_configs": native.to_cortex()}
+    path.write_text(json.dumps(config))
     return path
 
 
@@ -1700,6 +1772,9 @@ def test_onboarding_prerequisites_check_actual_allocation_nodes(
     )
     remote = Mock(return_value=nodes)
     monkeypatch.setattr(preflight, "allocation_onboarding_prerequisites", remote)
+    if fault == "no-hostfile":
+        is_file = Path.is_file
+        monkeypatch.setattr(Path, "is_file", lambda path: False if path == Path("/job/hostfile") else is_file(path))
     if fault:
         with pytest.raises(ValueError):
             state.onboard._onboarding_preflight(state.args, state.config)
@@ -1758,11 +1833,11 @@ def test_onboarding_prerequisites_reference_workers_are_not_target_requirements(
 
 
 @pytest.mark.parametrize("available,expected", [(1, 1), (4, 4), (8, 8), (16, 8)])
-def test_onboarding_config_only_defaults_to_sixteen_samples_on_one_node(tmp_path, monkeypatch, available, expected):
+def test_onboarding_config_only_defaults_to_eight_samples_on_one_node(tmp_path, monkeypatch, available, expected):
     from arctic_platform.correctness.harness.config import reference_calibration_worker_count
 
     args = execution.parse_args(["onboard", "--config", str(tmp_path / "one-gpu.json")])
-    assert args.reference_calibration_runs == 16
+    assert args.reference_calibration_runs == 8
     assert args.reference_calibration_workers is None
     monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
     assert (
@@ -4980,6 +5055,7 @@ import signal
 import subprocess
 import sys
 from argparse import Namespace
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 import requests
@@ -4991,6 +5067,8 @@ root, mode, command = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 dss_driver._gateway_state_directory = lambda: root / "ownership"
 dss_driver._allocation_hostfile = lambda: None
 dss_driver._legacy_owned_gateways = lambda: []
+# Exercise stale-registry recovery; separate real-process tests cover the live owner guard.
+dss_driver._gateway_owner_guard = lambda *args: nullcontext()
 torch.cuda.device_count = lambda: 1
 requests.get = lambda *args, **kwargs: SimpleNamespace(status_code=200)
 original_popen = subprocess.Popen
@@ -5318,6 +5396,79 @@ def test_onboarding_heading_marker_is_distinct_from_inner_stages(capsys, phase, 
 
     onboard._stage(phase, "single step optimizer", "Config: example")
     assert capsys.readouterr().out == f"\n{marker} {phase}: Single Step Optimizer {marker}\nConfig: example\n\n"
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("phase failed"), KeyboardInterrupt()])
+def test_onboarding_phase_logs_one_heading_and_runtime_on_every_exit(monkeypatch, capsys, error):
+    from arctic_platform.correctness.onboarding import onboard
+
+    ticks = iter([100.0, 165.2])
+    monkeypatch.setattr(onboard, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+
+    def phase():
+        with onboard._phase("Phase 1/3", "Representative Fixture Sizing", "fixture details"):
+            assert "Representative Fixture Sizing" in capsys.readouterr().out
+            print("phase work")
+            if error is not None:
+                raise error
+
+    if error is None:
+        phase()
+    else:
+        with pytest.raises(type(error)) as caught:
+            phase()
+        assert caught.value is error
+    assert capsys.readouterr().out == "phase work\nPhase 1/3 run time: 00:01:06\n"
+
+
+def test_reference_progress_counts_completed_work_and_reports_waits(monkeypatch, capsys):
+    future = Future()
+    waits = []
+
+    def wait(pending, *, timeout, return_when):
+        waits.append(timeout)
+        assert pending == {future}
+        if len(waits) == 1:
+            output = capsys.readouterr().out
+            assert "0/1 completed" in output and "wave started" in output
+            assert "finished" not in output.replace("unfinished", "")
+            return set(), pending
+        output = capsys.readouterr().out
+        assert "0/1 completed" in output
+        assert "unfinished runs=[7]" in output
+        assert "waiting for workers to finish" in output
+        future.set_result("measured")
+        return {future}, set()
+
+    monkeypatch.setattr(report, "wait", wait)
+    assert list(report.reference_progress({future: 7}, label="Finding tolerance gas1", total=1)) == [(7, "measured")]
+    output = capsys.readouterr().out
+    assert "1/1 completed" in output and "unfinished runs=[none]" in output
+    assert "run 7 finished" in output and "ETA" not in output
+    assert waits == [30, 30]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("worker failed"), KeyboardInterrupt()])
+def test_reference_progress_never_counts_failed_workers_as_success(capsys, error):
+    future = Future()
+    future.set_exception(error)
+    with pytest.raises(type(error)) as caught:
+        list(report.reference_progress({future: 2}, label="Finding tolerance gas4", total=8, completed=3))
+    assert caught.value is error
+    output = capsys.readouterr().out
+    assert "3/8 completed" in output and "run 2 failed" in output
+    assert "4/8 completed" not in output and "run 2 finished" not in output
+
+
+def test_reference_progress_reports_slow_parallel_wave_without_eta(capsys):
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(time.sleep, 0.06): index for index in range(2)}
+        results = dict(report.reference_progress(futures, label="HF wave", total=4, completed=2, interval=0.01))
+    assert results == {0: None, 1: None}
+    output = capsys.readouterr().out
+    assert "waiting for workers to finish" in output
+    assert "2/4 completed" in output and "4/4 completed" in output
+    assert "wave elapsed=" in output and "ETA" not in output
 
 
 # Owned gateway scratch preparation.
@@ -6544,3 +6695,493 @@ with context:
         for entry in identities:
             if dss_driver._gateway_process_identity(entry["pid"]) == entry:
                 os.kill(entry["pid"], signal.SIGKILL)
+
+
+@pytest.mark.parametrize("failure", [None, "exit", "exception", "combined"])
+def test_onboarding_reports_each_attempt_time_and_separates_shared_preparation(
+    _onboarding_prerequisites, tmp_path, monkeypatch, capsys, failure
+):
+    state = _onboarding_prerequisites
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    clock = [100.0]
+    monkeypatch.setattr(state.onboard.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(state.onboard, "run", state.onboard._onboard_configuration)
+    calls = []
+
+    def parent(child):
+        calls.append(child.test_id)
+        child.test_spec.write_text("{}")
+        clock[0] += 64.01 if child.test_id == "single-step-grads" else 9.2
+        if child.test_id == "single-step-optimizer":
+            if failure == "exception":
+                raise RuntimeError("synthetic target failure")
+            if failure == "exit":
+                return 1
+        return 0
+
+    def prepare(child):
+        clock[0] += 3.05
+        if failure == "combined":
+            raise RuntimeError("synthetic combined failure")
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    monkeypatch.setattr(state.onboard, "_prepare_references", prepare)
+    assert state.onboard.logged_run(state.args) == int(failure is not None)
+    assert calls == ["single-step-grads", "single-step-optimizer"]
+    output = capsys.readouterr().out
+    assert "Onboarding time (single-step-grads): 00:01:05" in output
+    assert "Onboarding time (single-step-optimizer): 00:00:10" in output
+    combined = failure in (None, "combined")
+    assert ("Onboarding time (combined reference preparation): 00:00:04" in output) == combined
+    expected_total = "00:01:17" if combined else "00:01:14"
+    assert output.splitlines()[-1] == f"Total run time: {expected_total}"
+    log = (state.args._diagnostics_dir / "onboarding.log").read_text()
+    assert log.splitlines()[-1] == f"Total run time: {expected_total}"
+    assert "Onboarding time (single-step-optimizer): 00:00:10" in log
+    summary = json.loads((state.args._diagnostics_dir / "onboarding.json").read_text())
+    assert summary["results"]["single-step-grads"]["elapsed_seconds"] == pytest.approx(64.01)
+    assert summary["results"]["single-step-optimizer"]["elapsed_seconds"] == pytest.approx(9.2)
+    assert "elapsed_seconds" not in summary["results"]["hosted"]
+    if combined:
+        assert summary["combined_reference_elapsed_seconds"] == pytest.approx(3.05)
+    else:
+        assert summary["combined_reference_elapsed_seconds"] is None
+    markdown = (state.args._diagnostics_dir / "report.md").read_text()
+    assert "Onboarding time: 00:01:05" in markdown
+    assert "Onboarding time: 00:00:10" in markdown
+    assert "Onboarding time: not run" in markdown
+
+
+def test_onboarding_module_entrypoint_follows_timing_helpers():
+    from arctic_platform.correctness.onboarding import onboard
+
+    tree = ast.parse(Path(onboard.__file__).read_text())
+    entrypoint = tree.body[-1]
+    assert isinstance(entrypoint, ast.If)
+    assert ast.dump(entrypoint.test) == ast.dump(ast.parse('__name__ == "__main__"', mode="eval").body)
+    helpers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for name in ("_onboarding_test_time", "_resume_onboarding_timing"):
+        assert helpers[name].end_lineno < entrypoint.lineno
+
+
+def test_onboarding_dependency_skip_does_not_record_execution_time(_onboarding_prerequisites, monkeypatch):
+    state = _onboarding_prerequisites
+    monkeypatch.setattr(state.onboard, "_parent", lambda child: 1)
+    assert state.onboard._onboard_configuration(state.args) == 1
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert "elapsed_seconds" in summary["results"]["single-step-grads"]
+    assert summary["results"]["single-step-optimizer"] == {
+        "status": "failed",
+        "reason": "gradient fixture onboarding failed",
+    }
+    assert set(state.args._onboarding_times) == {"single-step-grads"}
+
+
+@pytest.mark.parametrize("prepare_references", [False, True])
+def test_onboarding_explicit_single_test_with_existing_spec_is_timed(
+    _onboarding_prerequisites, monkeypatch, prepare_references
+):
+    from arctic_platform.correctness.harness import config as config_module
+
+    state = _onboarding_prerequisites
+    state.args.test_id = "single-step-optimizer"
+    state.args.prepare_references = prepare_references
+    state.args.test_spec.write_text("{}")
+    monkeypatch.setattr(config_module, "local_config_path", lambda path: path)
+    monkeypatch.setattr(state.onboard, "_validate_storage", lambda *a: None)
+    clock = [100.0]
+    monkeypatch.setattr(state.onboard.time, "monotonic", lambda: clock[0])
+
+    def parent(child):
+        clock[0] += 12.34
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    monkeypatch.setattr(state.onboard, "_prepare_references", parent)
+    assert state.onboard.run(state.args) == 0
+    assert state.args._onboarding_times == {"single-step-optimizer": pytest.approx(12.34)}
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, UnsafeCleanupError])
+def test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup(tmp_path, monkeypatch, capsys, error):
+    from arctic_platform.correctness.onboarding import onboard
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    clock = [100.0]
+    monkeypatch.setattr(onboard.time, "monotonic", lambda: clock[0])
+
+    def run(args):
+        with onboard._onboarding_test_time(args, "single-step-grads"):
+            clock[0] += 6.1
+            raise error("synthetic interruption")
+
+    monkeypatch.setattr(onboard, "run", run)
+    args = Namespace(config="synthetic.json")
+    if error is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            onboard.logged_run(args)
+    else:
+        assert onboard.logged_run(args) == 1
+        assert "Onboarding time (single-step-grads): 00:00:07" in (args._diagnostics_dir / "report.md").read_text()
+    output = capsys.readouterr().out
+    assert output.splitlines()[-2:] == [
+        "Onboarding time (single-step-grads): 00:00:07",
+        "Total run time: 00:00:07",
+    ]
+    assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-2:] == output.splitlines()[-2:]
+
+
+@pytest.mark.parametrize("drift", ["timing-only", "recipe", "gate", "reference", "timer-side-effect"])
+def test_onboarding_retry_per_test_timing_preserves_only_unchanged_preparation(_onboarding_retry_sources, drift):
+    import inspect
+
+    onboard, args, root = _onboarding_retry_sources
+    source = root / "onboarding" / "onboard.py"
+    failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    previous = (
+        "def logged_run(args):\n"
+        "    try:\n"
+        "        return run(args)\n"
+        "    except Exception as exc:\n"
+        "        reason = str(exc)\n"
+        f"        report.write_text({failure_report}, encoding='utf-8')\n"
+        "        return 1\n"
+        "\ndef run(args):\n"
+        "    if args.prepare_references:\n"
+        "        return _prepare_references(args)\n"
+        "    return _parent(args)\n"
+        "\ndef _onboard_configuration(args):\n"
+        "    gate = 0.005\n"
+        "    for test_id in queue:\n"
+        "        code = _parent(child)\n"
+        "        results[test_id] = {'status': code}\n"
+        "    _prepare_references(preparation)\n"
+        "    summary = {'results': results, 'combined_reference_error': preparation_error}\n"
+        "    for test_id, result in results.items():\n"
+        "        lines.extend([f'## {test_id}', '', f\"Status: {result['status']}\", '',\n"
+        "            result.get('reason', f\"Exit code: {result.get('exit_code', 'not run')}\"), ''])\n"
+    )
+    source.write_text(previous)
+    onboard._resume_setup(args)
+    original = args._resume_dir
+    calibration = root / "calibration.json"
+    calibration.write_text('{"gate": 0.005}')
+    onboard._resume_phase(args, "calibration", lambda: str(calibration))
+    saved = (original / "calibration.json").read_bytes()
+
+    timed = (
+        inspect.getsource(onboard._onboarding_test_time)
+        + "\ndef logged_run(args):\n"
+        "    args._onboarding_times = {}\n"
+        "    try:\n"
+        "        return run(args)\n"
+        "    except Exception as exc:\n"
+        "        reason = str(exc)\n"
+        '        timings = "".join(f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"\n'
+        "            for test_id, elapsed in args._onboarding_times.items())\n"
+        '        report.write_text(f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"\n'
+        '            f"## Reason\\n\\n{reason}\\n{timings}\\n"\n'
+        '            "Complete traceback: [onboarding.log](onboarding.log)\\n", encoding="utf-8")\n'
+        "        return 1\n"
+        "    finally:\n"
+        "        for test_id, elapsed in args._onboarding_times.items():\n"
+        '            print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)\n'
+        "\ndef run(args):\n"
+        "    if args.prepare_references:\n"
+        "        selection = args.reference_tests or [args.test_id]\n"
+        '        label = selection[0] if len(selection) == 1 else "combined reference preparation"\n'
+        "        with _onboarding_test_time(args, label):\n"
+        "            return _prepare_references(args)\n"
+        "    with _onboarding_test_time(args, args.test_id):\n"
+        "        return _parent(args)\n"
+        "\ndef _onboard_configuration(args):\n"
+        "    from arctic_platform.correctness.harness.report import total_duration\n"
+        '    if not hasattr(args, "_onboarding_times"):\n'
+        "        args._onboarding_times = {}\n"
+        "    gate = 0.005\n"
+        "    for test_id in queue:\n"
+        "        with _onboarding_test_time(child, test_id):\n"
+        "            code = _parent(child)\n"
+        "            results[test_id] = {'status': code}\n"
+        '        results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]\n'
+        '    with _onboarding_test_time(args, "combined reference preparation"):\n'
+        "        _prepare_references(preparation)\n"
+        "    summary = {'results': results, 'combined_reference_error': preparation_error,\n"
+        '        "combined_reference_elapsed_seconds": args._onboarding_times.get("combined reference preparation")}\n'
+        "    for test_id, result in results.items():\n"
+        "        lines.extend([f'## {test_id}', '', f\"Status: {result['status']}\", '',\n"
+        "            (f\"Onboarding time: {total_duration(result['elapsed_seconds'])}\"\n"
+        '             if "elapsed_seconds" in result else "Onboarding time: not run"), "",\n'
+        "            result.get('reason', f\"Exit code: {result.get('exit_code', 'not run')}\"), ''])\n"
+        '    if "combined reference preparation" in args._onboarding_times:\n'
+        '        lines.extend(["Combined reference preparation time: "\n'
+        '            f"{total_duration(args._onboarding_times[\'combined reference preparation\'])}", ""])\n'
+    )
+    if drift == "recipe":
+        timed = timed.replace("_parent(child)", "_different_parent(child)")
+    elif drift == "gate":
+        timed = timed.replace("gate = 0.005", "gate = 0.100")
+    elif drift == "reference":
+        timed = timed.replace("_prepare_references(args)", "_different_references(args)")
+    elif drift == "timer-side-effect":
+        timed = timed.replace("        yield\n", "        _parent(args)\n        yield\n")
+    source.write_text(timed)
+    onboard._resume_setup(args)
+    assert args._resume_candidates == ([original] if drift == "timing-only" else [])
+    if drift == "timing-only":
+        assert onboard._resume_phase(
+            args, "calibration", lambda: pytest.fail("timing must not repeat compatible HF preparation")
+        ) == str(calibration)
+        assert (original / "calibration.json").read_bytes() == saved
+        validations = []
+        onboard._resume_phase(args, "validation", lambda: validations.append("current") or {"status": "pass"})
+        assert validations == ["current"]
+
+
+@pytest.fixture
+def selected_spec_case_state(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness.config import ArmSpec
+    from arctic_platform.correctness.harness.config import LoadedConfig
+    from arctic_platform.correctness.harness.config import ModelSpec
+    from arctic_platform.correctness.harness.config import TestSpec
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("selected-spec validation attempted a target, subprocess, network, or CUDA operation")
+
+    monkeypatch.setattr(execution, "execute", forbidden)
+    monkeypatch.setattr(execution, "local_cortex_gateway", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(dss_driver.socket, "gethostbyname", forbidden)
+    monkeypatch.setattr(dss_driver.socket, "create_connection", forbidden)
+    monkeypatch.setattr(dss_driver.socket.socket, "connect", forbidden)
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
+    path = tmp_path / "synthetic-selected.config"
+    cfg = LoadedConfig(
+        config_id="synthetic-selected-spec",
+        path=path,
+        sub_job={
+            "model_name": "synthetic-selected-model",
+            "seed": 42,
+            "training_config": {"n_gpus": 8, "max_seq_len": 8192, "attn_implementation": "sdpa"},
+        },
+    )
+    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
+    assert [(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in arms] == [
+        ("gas1", 8, 8192),
+        ("gas4", 32, 8192),
+    ]
+    spec = TestSpec(
+        config_id=cfg.config_id,
+        config_path=str(path),
+        config_checksum=execution.config_checksum(cfg),
+        model=ModelSpec(
+            source_checkpoint="synthetic-not-loaded",
+            num_hidden_layers=1,
+            vision_depth=None,
+            seed=42,
+            param_count=1,
+            cache_path="synthetic-not-loaded",
+            content_hash="synthetic-only",
+            sized_against_gib=None,
+        ),
+        arms=[
+            ArmSpec(
+                name=arm.name,
+                global_batch_size=arm.global_batch_size,
+                max_seq_len=arm.max_seq_len,
+                total_tokens=arm.total_tokens,
+                active_tokens=arm.total_tokens,
+                dss_microbatches=1 if arm.name == "gas1" else 4,
+                pad_fraction=0.0,
+            )
+            for arm in arms
+        ],
+        attn_implementations=["sdpa"],
+        applicable_tests=["single-step-optimizer"],
+    )
+    return SimpleNamespace(
+        cfg=cfg,
+        path=path,
+        derived=arms,
+        spec=spec,
+        candidate=tmp_path / "reviewed.json",
+        results=[],
+        specs={},
+        attention="sdpa",
+        tmp=tmp_path,
+    )
+
+
+@pytest.mark.parametrize("reviewed", ["gas1-only", "full"])
+@pytest.mark.parametrize("unselected_drift", ["none", "rows", "sequence"])
+def test_selected_spec_case_explicit_gas1_accepts_reviewed_shape_despite_unselected_derived_case(
+    selected_spec_case_state, reviewed, unselected_drift
+):
+    state = selected_spec_case_state
+    if reviewed == "gas1-only":
+        state.spec.arms = state.spec.arms[:1]
+    gas4 = state.derived[1]
+    if unselected_drift != "none":
+        state.derived[1] = execution.ArmDefinition(
+            gas4.name,
+            gas4.global_batch_size + (8 if unselected_drift == "rows" else 0),
+            gas4.max_seq_len + (1 if unselected_drift == "sequence" else 0),
+        )
+    prepared = selected_spec_case_prepare(state, ["gas1"])
+    assert prepared is not None, state.results
+    frozen, selected = prepared
+    assert selected == state.derived[:1] and selected[0].name == "gas1"
+    assert frozen == state.spec and state.specs[state.cfg.config_id] == frozen
+    assert state.results == []
+
+
+@pytest.mark.parametrize("cases", [None, []], ids=["absent", "empty"])
+@pytest.mark.parametrize("damage", ["none", "subset", "rows", "sequence", "extra", "order"])
+def test_selected_spec_case_unfiltered_keeps_complete_ordered_case_equality(
+    selected_spec_case_state, monkeypatch, cases, damage
+):
+    state = selected_spec_case_state
+    if damage == "subset":
+        state.spec.arms = state.spec.arms[:1]
+    elif damage == "rows":
+        state.spec.arms[1].global_batch_size += 8
+    elif damage == "sequence":
+        state.spec.arms[1].max_seq_len += 1
+    elif damage == "extra":
+        extra = copy.deepcopy(state.spec.arms[1])
+        extra.name = "gas16"
+        state.spec.arms.append(extra)
+    elif damage == "order":
+        state.spec.arms.reverse()
+    prepared = selected_spec_case_prepare(state, cases)
+    if damage == "none":
+        assert prepared is not None and prepared[0] == state.spec and prepared[1] == state.derived
+        assert not state.results
+    else:
+        selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+
+
+@pytest.mark.parametrize("location", ["reviewed", "derived"])
+@pytest.mark.parametrize("damage", ["missing", "rows", "sequence"])
+def test_selected_spec_case_selected_missing_or_changed_shape_is_recorded_nonpass(
+    selected_spec_case_state, monkeypatch, location, damage
+):
+    state = selected_spec_case_state
+    collection = state.spec.arms if location == "reviewed" else state.derived
+    if damage == "missing":
+        collection.pop(0)
+    elif location == "reviewed":
+        if damage == "rows":
+            collection[0].global_batch_size += 1
+        else:
+            collection[0].max_seq_len += 1
+    else:
+        arm = collection[0]
+        collection[0] = execution.ArmDefinition(
+            arm.name,
+            arm.global_batch_size + (1 if damage == "rows" else 0),
+            arm.max_seq_len + (1 if damage == "sequence" else 0),
+        )
+    prepared = selected_spec_case_prepare(state, ["gas1"])
+    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "cases,reviewed",
+    [
+        (["gas99"], "full"),
+        ([""], "full"),
+        (["gas1", "gas99"], "full"),
+        (["gas4"], "gas1-only"),
+        (["gas1", "gas4"], "gas1-only"),
+        (["gas1"], "empty"),
+    ],
+    ids=["unknown", "empty-name", "mixed-unknown", "unreviewed", "mixed-unreviewed", "empty-review"],
+)
+def test_selected_spec_case_unknown_or_unreviewed_selection_cannot_disappear_from_report(
+    selected_spec_case_state, monkeypatch, cases, reviewed
+):
+    state = selected_spec_case_state
+    if reviewed == "gas1-only":
+        state.spec.arms = state.spec.arms[:1]
+    elif reviewed == "empty":
+        state.spec.arms = []
+    prepared = selected_spec_case_prepare(state, cases)
+    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "location,duplicate",
+    [
+        ("requested", "gas1"),
+        ("reviewed", "gas1"),
+        ("reviewed", "gas4"),
+        ("derived", "gas1"),
+        ("derived", "gas4"),
+        ("both", "gas1"),
+    ],
+)
+def test_selected_spec_case_duplicate_requested_or_catalog_names_are_not_collapsed(
+    selected_spec_case_state, monkeypatch, location, duplicate
+):
+    state = selected_spec_case_state
+    cases = ["gas1", "gas1"] if location == "requested" else ["gas1"]
+    index = 0 if duplicate == "gas1" else 1
+    if location in {"reviewed", "both"}:
+        state.spec.arms.append(copy.deepcopy(state.spec.arms[index]))
+    if location in {"derived", "both"}:
+        state.derived.append(copy.deepcopy(state.derived[index]))
+    prepared = selected_spec_case_prepare(state, cases)
+    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+
+
+@pytest.mark.parametrize("reviewed", ["gas1-only", "full"])
+@pytest.mark.parametrize(
+    "damage", ["identity", "checksum", "missing-checksum", "config-content", "attention", "registry"]
+)
+def test_selected_spec_case_subset_selection_cannot_bypass_config_or_backend_or_registry_guards(
+    selected_spec_case_state, monkeypatch, reviewed, damage
+):
+    state = selected_spec_case_state
+    if reviewed == "gas1-only":
+        state.spec.arms = state.spec.arms[:1]
+    if damage == "identity":
+        state.spec.config_id = "foreign-config"
+    elif damage == "checksum":
+        state.spec.config_checksum = "0" * 64
+    elif damage == "missing-checksum":
+        state.spec.config_checksum = ""
+    elif damage == "config-content":
+        state.cfg.sub_job["seed"] = 43
+    elif damage == "attention":
+        state.attention = "unreviewed-backend"
+    else:
+        state.spec.applicable_tests.append("synthetic-unregistered-check")
+    prepared = selected_spec_case_prepare(state, ["gas1"])
+    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+
+
+def test_selected_spec_case_missing_review_records_nonpass_without_regenerating_spec(
+    selected_spec_case_state, monkeypatch
+):
+    state = selected_spec_case_state
+    prepared = selected_spec_case_prepare(state, ["gas1"], publish=False)
+    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
+    assert not state.candidate.exists()
+
+
+def test_selected_spec_case_explicit_multiple_selection_runs_only_reviewed_cases_in_derived_order(
+    selected_spec_case_state,
+):
+    state = selected_spec_case_state
+    prepared = selected_spec_case_prepare(state, ["gas4", "gas1"])
+    assert prepared is not None and prepared[1] == state.derived
+    assert [arm.name for arm in prepared[1]] == ["gas1", "gas4"]
+    assert prepared[0] == state.spec and state.results == []

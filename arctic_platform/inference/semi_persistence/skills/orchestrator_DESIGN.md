@@ -1964,9 +1964,9 @@ def _evict_for_phase2(model_id: str) -> None:
 
 `_generate_sync(incumbent)` Phase 1 + Phase 2 now share a
 single `gen_lock` acquisition, gated by a sentinel re-check
-loop. The following pseudocode omits the two phase bodies:
+loop:
 
-```text
+```python
 while True:
     with gen_lock:
         cur = Orchestrator._futures.get(model_id)

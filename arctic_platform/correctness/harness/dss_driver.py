@@ -219,8 +219,10 @@ def _recover_owned_gateway(record_path: Path) -> None:
         marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={record['token']}".encode()
         if marker not in environment or os.getpgid(gateway["pid"]) != gateway["pid"]:
             raise ValueError("live process does not match the recorded harness-owned gateway")
-        _stop_stale_gateway(gateway, record["log"])
-        _reap_owned_gateway_descendants(gateway, record["token"])
+        try:
+            _stop_stale_gateway(gateway, record["log"])
+        finally:
+            _reap_owned_gateway_descendants(gateway, record["token"])
         record_path.unlink()
     except UnsafeCleanupError:
         raise
@@ -1226,8 +1228,26 @@ def build_payload(
     weight_format: Optional[str] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
-    if lm_head_token_chunk_size is not None:
+    options = tc.get("model_options") or {}
+    lm_head_options = options.get("lm_head") or {}
+    canonical_chunk = "lm_head.token_chunk_size" in options or "token_chunk_size" in lm_head_options
+    prime_rl = tc.get("prime_rl") or {}
+    nested_chunk = "fused_lm_head_token_chunk_size" in prime_rl
+    if lm_head_token_chunk_size is not None and not canonical_chunk and not nested_chunk:
         tc.setdefault("fused_lm_head_token_chunk_size", lm_head_token_chunk_size)
+    chunk_size = tc.get("fused_lm_head_token_chunk_size")
+    ep_size = tc.get("ep_size", 1)
+    if (
+        type(ep_size) is int
+        and ep_size > 1
+        and not canonical_chunk
+        and not nested_chunk
+        and isinstance(chunk_size, int)
+        and not isinstance(chunk_size, bool)
+        and chunk_size > 0
+    ):
+        # DSS's canonical option reaches both the loss handler and the MoE model loader.
+        tc["model_options"] = {**options, "lm_head.token_chunk_size": chunk_size}
     if attn_implementation is not None:
         tc["attn_implementation"] = attn_implementation
     mb_spec = dict(tc.get("mb_spec") or {})

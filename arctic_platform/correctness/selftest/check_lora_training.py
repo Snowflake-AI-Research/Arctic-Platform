@@ -53,6 +53,8 @@ from transformers import Qwen3ForCausalLM
 from arctic_platform.client import CortexConfig
 from arctic_platform.correctness.harness import lora as deterministic_lora
 from arctic_platform.correctness.harness import lora as lora_init
+from arctic_platform.correctness.harness import native_adapter
+from arctic_platform.correctness.harness import reference_records
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness import sft
 from arctic_platform.correctness.harness import sft as gsm8k
@@ -60,8 +62,10 @@ from arctic_platform.correctness.harness import shared_lora_adapter as shared
 from arctic_platform.correctness.harness import storage
 from arctic_platform.correctness.harness import storage as workdir
 from arctic_platform.correctness.harness.batches import IGNORE_INDEX
+from arctic_platform.correctness.harness.batches import load
 from arctic_platform.correctness.harness.lora import canonical_name
 from arctic_platform.correctness.harness.registry import TestOutcome
+from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.reference import process_determinism
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
 from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
@@ -2991,6 +2995,76 @@ def test_lora_worker_preserves_post_constructor_source_error_when_shutdown_fails
 
 
 # Lora sync hooks.
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_lora_hooks_ordinary_transfer_loads_checksum_helpers_only_for_schedule(monkeypatch, scheduled):
+    monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
+    received = {"workers": [{"recv_l2_sq": 3.0}, {"recv_l2_sq": 3.0}]}
+    sent = [{"sent_l2_sq": 3.0}, {"sent_l2_sq": 3.0}]
+    result = {"status": "ok"}
+    imports = []
+
+    async def collect(receive_task, send_tasks):
+        return received, sent
+
+    def format_result(actual_received, actual_sent):
+        assert actual_received is received and actual_sent is sent
+        return result
+
+    def received_checksums(labels, workers):
+        assert labels == ["sampling replica 0", "sampling replica 1"]
+        assert workers is received["workers"]
+        return {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
+
+    def compare_weight_checksums(training, sampling):
+        assert training == {"training rank 2": 3.0, "training rank 5": 3.0}
+        assert sampling == {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
+        return {"checksum_match": True}
+
+    def load_module(name):
+        assert scheduled, "an unscheduled transfer loaded optional utilities"
+        imports.append(name)
+        return {
+            "arctic_platform.common.utils.weight_sync": SimpleNamespace(received_checksums=received_checksums),
+            "arctic_platform.common.weight_checksum": SimpleNamespace(
+                compare_weight_checksums=compare_weight_checksums
+            ),
+        }[name]
+
+    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", format_result)
+    monkeypatch.setattr(hooks, "import_module", load_module)
+    server = SimpleNamespace(_await_weight_sync_refs=collect)
+    schedule = (
+        SimpleNamespace(groups=[SimpleNamespace(sender_train_rank=rank) for rank in (2, 5)]) if scheduled else None
+    )
+
+    actual = asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=schedule))
+
+    assert actual is result
+    assert actual == {"status": "ok", **({"checksum_match": True} if scheduled else {})}
+    assert imports == (
+        ["arctic_platform.common.utils.weight_sync", "arctic_platform.common.weight_checksum"] if scheduled else []
+    )
+
+
+def test_lora_hooks_scheduled_transfer_preserves_optional_import_failure(monkeypatch):
+    monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
+    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", lambda received, sent: {"status": "ok"})
+    error = ImportError("transfer utilities unavailable")
+
+    async def collect(receive_task, send_tasks):
+        return {}, []
+
+    def load_module(name):
+        assert name == "arctic_platform.common.utils.weight_sync"
+        raise error
+
+    monkeypatch.setattr(hooks, "import_module", load_module)
+    server = SimpleNamespace(_await_weight_sync_refs=collect)
+    with pytest.raises(ImportError, match="transfer utilities unavailable") as caught:
+        asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=Schedule()))
+    assert caught.value is error
 
 
 class Server:
@@ -11165,3 +11239,2263 @@ def test_owned_worker_lease_zone_interrupt_new_restores_hooks_and_retains_primar
         assert "KeyboardInterrupt" in primary.__notes__[1]
     assert case.events == [("close", 11), ("close", 12), ("wait", 11), ("wait", 12)]
     assert server.run_cmd is original_run and server._head_argv is original_argv
+
+
+@pytest.fixture
+def native_spawn_globals_control(native_original_adapter, monkeypatch):
+    from types import FunctionType
+
+    from arctic_platform.correctness.harness import native_adapter
+    from arctic_platform.correctness.harness import native_lora
+
+    adapter = native_original_adapter
+    training = adapter.training
+    training.__name__ = "dss.ray_dss.jobs.gpu.training"
+    request, receipts = _native_original_composition_receipts(adapter)
+    request.update(
+        schema=native_lora.SCHEMA,
+        path=str(adapter.path),
+        model_name=adapter.metadata["model_name"],
+        training_gpus=1,
+    )
+    config_body = {
+        "job_type": "training",
+        "model_name": request["model_name"],
+        "training_config": {"n_gpus": 1, "debug": {native_lora.REQUEST_KEY: request}},
+    }
+    control = SimpleNamespace(
+        adapter=adapter,
+        training=training,
+        request=request,
+        expected_receipts=receipts[:1],
+        config={"job_id": "selected-child", "unchanged-native-option": object()},
+        ranks=[("owned-host", 0)],
+        source_stage=object(),
+        ref=object(),
+        events=[],
+        selected=[],
+        workers=[],
+        gets=[],
+        spawn_result=object(),
+        spawn_failure=None,
+        constructor_failure=None,
+        receipt_failure=None,
+        cleanup_failure=None,
+        drift=None,
+        receipt_drift=False,
+        ordinary=False,
+        namespace="detached",
+        supplier=None,
+        foreign=object(),
+        config_object=SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(config_body)),
+    )
+    original_load = native_adapter.initialize_adapter
+    original_engine = adapter.engine
+
+    def initialize(model, path, identity):
+        assert model is adapter.model and identity == adapter.identity
+        original_load(model, path, identity)
+        control.events.append("loaded-original")
+
+    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
+        control.events.append("native-engine")
+        return original_engine(
+            model, ds_config, optimizer=optimizer, ep_size=ep_size, mpu=mpu, model_path=model_path, rank=rank
+        )
+
+    adapter.engine = training.initialize_training_engine = engine
+    monkeypatch.setattr(native_adapter, "initialize_adapter", initialize)
+
+    class NativeWorker:
+        def __init__(self, cfg, source_stage_info=None):
+            assert cfg is control.config and source_stage_info is control.source_stage
+            control.workers.append(self)
+            control.events.append("native-constructor")
+            if control.ordinary:
+                assert training.initialize_training_engine is engine
+                return
+            assert training.initialize_training_engine is not engine
+            assert (
+                globals()["initialize_training_engine"](
+                    adapter.model,
+                    adapter.ds_config,
+                    optimizer=adapter.optimizer,
+                    ep_size=4,
+                    mpu=adapter.mpu,
+                    model_path="unchanged-model-path",
+                    rank=0,
+                )
+                is adapter.result
+            )
+            if control.constructor_failure is not None:
+                raise control.constructor_failure
+
+    def restored():
+        assert training._DeepSpeedWorker is NativeWorker
+        assert control.spawn_globals["_DeepSpeedWorker"] is control.spawn_worker_original
+        _native_original_adapter_restored(adapter)
+
+    def construct(selected, cfg, source_stage_info):
+        assert issubclass(selected, NativeWorker)
+        if control.ordinary:
+            assert selected is NativeWorker
+        else:
+            assert selected is not NativeWorker
+            assert training._DeepSpeedWorker is (selected if control.namespace == "shared" else NativeWorker)
+        # A Ray worker imports its own ordinary training module before subclass construction.
+        coordinator_binding = training._DeepSpeedWorker
+        training._DeepSpeedWorker = NativeWorker
+        try:
+            worker = selected(cfg, source_stage_info)
+        finally:
+            training._DeepSpeedWorker = coordinator_binding
+        if control.ordinary:
+            assert not hasattr(worker, "original_adapter_receipt")
+            return SimpleNamespace(native_worker=worker)
+
+        async def receipt():
+            restored()
+            control.events.append("remote-receipt")
+            if control.receipt_failure is not None:
+                raise control.receipt_failure
+            reported = worker.original_adapter_receipt()
+            if control.receipt_drift:
+                reported["initialization"]["verified_tensors"][0]["sha256"] = "0" * 64
+            return reported
+
+        return SimpleNamespace(original_adapter_receipt=SimpleNamespace(remote=receipt))
+
+    control.construct = construct
+    control.restored = restored
+    constructor = NativeWorker.__init__
+    bound_constructor = FunctionType(
+        constructor.__code__,
+        training.__dict__,
+        constructor.__name__,
+        constructor.__defaults__,
+        constructor.__closure__,
+    )
+    bound_constructor.__qualname__ = constructor.__qualname__
+    NativeWorker.__init__ = bound_constructor
+    training._DeepSpeedWorker = NativeWorker
+    control.worker_base = NativeWorker
+    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.jobs.gpu.training": training})
+    ray = ModuleType("ray")
+
+    def get(ref):
+        assert ref is control.ref
+        control.gets.append(ref)
+        return adapter.files
+
+    def remote(**options):
+        assert options == {"num_cpus": 1, "num_gpus": 0}
+        return lambda cls: cls
+
+    ray.get = get
+    ray.remote = remote
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(subprocess, "Popen", _native_first_two_forbidden)
+    monkeypatch.setattr(torch.cuda, "init", _native_first_two_forbidden)
+    import socket
+
+    monkeypatch.setattr(socket, "create_connection", _native_first_two_forbidden)
+
+    def coordinator(namespace="detached"):
+        control.namespace = namespace
+        spawn_globals = dict(training.__dict__) if namespace == "detached" else training.__dict__
+        if control.supplier is not None:
+            assert namespace == "detached"
+            spawn_globals["_DeepSpeedWorker"] = control.supplier
+        spawn_globals["_native_spawn_globals_control"] = control
+        template = _native_spawn_globals_template
+        spawn = FunctionType(
+            template.__code__, spawn_globals, "_spawn_workers", template.__defaults__, template.__closure__
+        )
+        assert spawn.__module__ == training.__name__
+        assert (spawn.__globals__ is training.__dict__) == (namespace == "shared")
+        assert "_DeepSpeedWorker" in spawn.__code__.co_names
+        control.spawn_globals = spawn_globals
+        control.spawn_worker_original = spawn_globals["_DeepSpeedWorker"]
+        control.spawn = spawn
+
+        class NativeCoordinator:
+            def __init__(self):
+                self._workers = []
+                self._info = SimpleNamespace(config=control.config_object, job_id="selected-child")
+
+            async def _kill_workers(self, hosts):
+                assert hosts == ["owned-host"]
+                restored()
+                control.events.append("owned-kill")
+                if control.cleanup_failure is not None:
+                    raise control.cleanup_failure
+                self._workers = []
+
+            def info(self):
+                return {"native_info": "preserved"}
+
+        NativeCoordinator._spawn_workers = spawn
+        training.GPUTrainingJob = SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=NativeCoordinator))
+        request["sources"] = native_lora._runtime_sources(training)
+        control.coordinator_base = NativeCoordinator
+        return native_lora._coordinator_class(training, request, control.ref)()
+
+    control.coordinator = coordinator
+    return control
+
+
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "spawn-runtime",
+        "spawn-interrupt",
+        "constructor-runtime",
+        "constructor-interrupt",
+        "receipt-runtime",
+        "receipt-drift",
+        "spawn-cleanup-runtime",
+        "spawn-cleanup-interrupt",
+        "receipt-cleanup-runtime",
+        "globals-drift",
+    ],
+)
+def test_native_spawn_globals_selected_subclass_preengine_receipt_and_all_exit_restoration(
+    native_spawn_globals_control, namespace, outcome, capsys
+):
+    from arctic_platform.correctness.harness import native_lora
+
+    control = native_spawn_globals_control
+    if outcome.startswith("spawn"):
+        error_type = KeyboardInterrupt if outcome == "spawn-interrupt" else RuntimeError
+        control.spawn_failure = error_type("copied-globals native spawn failed")
+    elif outcome.startswith("constructor"):
+        error_type = KeyboardInterrupt if outcome == "constructor-interrupt" else RuntimeError
+        control.constructor_failure = error_type("copied-globals native constructor failed")
+    elif outcome in {"receipt-runtime", "receipt-cleanup-runtime"}:
+        control.receipt_failure = RuntimeError("copied-globals remote receipt failed")
+    elif outcome == "receipt-drift":
+        control.receipt_drift = True
+    elif outcome.endswith("-drift"):
+        control.drift = outcome.split("-")[0]
+    if "cleanup" in outcome:
+        error_type = KeyboardInterrupt if outcome == "spawn-cleanup-interrupt" else RuntimeError
+        control.cleanup_failure = error_type("copied-globals owned cleanup failed")
+    coordinator = control.coordinator(namespace)
+    original_module = dict(control.training.__dict__)
+    original_globals = dict(control.spawn_globals)
+    failure = None
+    try:
+        asyncio.run(
+            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+        )
+    except BaseException as error:
+        failure = error
+    control.restored()
+    assert control.training.__dict__ == original_module
+    assert control.spawn.__globals__ == original_globals
+    assert len(control.selected) == len(control.workers) == 1
+    assert type(control.workers[0]) is control.selected[0]
+    assert control.gets == [control.ref]
+    assert len(control.adapter.calls) == 1
+    expected_events = ["native-spawn", "native-constructor", "loaded-original", "native-engine"]
+    if outcome in {"success", "receipt-runtime", "receipt-drift", "receipt-cleanup-runtime"}:
+        expected_events.append("remote-receipt")
+    if outcome != "success" and not outcome.startswith("constructor"):
+        expected_events.append("owned-kill")
+    assert control.events == expected_events
+    output = capsys.readouterr().out
+    if outcome == "success":
+        assert failure is None
+        assert coordinator._correctness_original_adapter_receipts == control.expected_receipts
+        assert coordinator.info() == {
+            "native_info": "preserved",
+            "correctness_original_adapter": {
+                "schema": native_lora.SCHEMA,
+                "workers": control.expected_receipts,
+            },
+        }
+        assert json.loads(output) == {
+            "schema": native_lora.SCHEMA,
+            "job_id": "selected-child",
+            "workers": control.expected_receipts,
+        }
+        receipt = control.workers[0].original_adapter_receipt()
+        receipt["rank"] = 99
+        assert control.workers[0].original_adapter_receipt() == control.expected_receipts[0]
+    else:
+        primary = control.spawn_failure or control.constructor_failure or control.receipt_failure
+        assert failure is primary if primary is not None else isinstance(failure, ValueError)
+        assert output == "" and not hasattr(coordinator, "_correctness_original_adapter_receipts")
+        if control.cleanup_failure is not None:
+            assert any(
+                f"{type(control.cleanup_failure).__name__}: {control.cleanup_failure}" in note
+                for note in getattr(failure, "__notes__", [])
+            )
+        else:
+            assert coordinator._workers == []
+        if outcome.startswith("constructor"):
+            assert not hasattr(control.workers[0], "_correctness_original_adapter_receipt")
+
+
+@pytest.mark.parametrize("scope", ["globals", "module"])
+@pytest.mark.parametrize("damage", ["foreign", "stale-subclass", "missing"])
+def test_native_spawn_globals_rejects_preexisting_foreign_stale_or_missing_worker_before_spawn(
+    native_spawn_globals_control, scope, damage
+):
+    control = native_spawn_globals_control
+    coordinator = control.coordinator()
+    bindings = control.spawn_globals if scope == "globals" else control.training.__dict__
+    if damage == "missing":
+        del bindings["_DeepSpeedWorker"]
+    elif damage == "stale-subclass":
+        bindings["_DeepSpeedWorker"] = type("StaleOriginalAdapterWorker", (control.worker_base,), {})
+    else:
+        bindings["_DeepSpeedWorker"] = control.foreign
+    before_module = dict(control.training.__dict__)
+    before_globals = dict(control.spawn_globals)
+    with pytest.raises(ValueError):
+        asyncio.run(
+            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+        )
+    assert control.events == control.selected == control.workers == control.gets == control.adapter.calls == []
+    assert coordinator._workers == []
+    assert control.training.__dict__ == before_module
+    assert control.spawn.__globals__ == before_globals
+    _native_original_adapter_restored(control.adapter)
+
+
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+def test_native_spawn_globals_ordinary_native_route_remains_unwrapped(native_spawn_globals_control, namespace, capsys):
+    control = native_spawn_globals_control
+    control.coordinator(namespace)
+    control.ordinary = True
+    coordinator = control.coordinator_base()
+    before_module = dict(control.training.__dict__)
+    before_globals = dict(control.spawn_globals)
+    assert (
+        asyncio.run(
+            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+        )
+        is control.spawn_result
+    )
+    control.restored()
+    assert control.events == ["native-spawn", "native-constructor"]
+    assert control.selected == [control.worker_base]
+    assert control.gets == control.adapter.calls == []
+    assert control.training.__dict__ == before_module and control.spawn.__globals__ == before_globals
+    assert not hasattr(coordinator._workers[0], "original_adapter_receipt")
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+def test_native_spawn_globals_installed_manager_leaves_unselected_training_dispatch_ordinary(
+    native_spawn_globals_control, monkeypatch, namespace
+):
+    from enum import Enum
+
+    from arctic_platform.correctness.harness import native_lora
+
+    control = native_spawn_globals_control
+    control.coordinator(namespace)
+    control.ordinary = True
+    actor = control.training.GPUTrainingJob
+    ordinary_config = SimpleNamespace(
+        model_dump=lambda **kwargs: {
+            "job_type": "training",
+            "model_name": "ordinary-model",
+            "training_config": {"n_gpus": 1},
+        }
+    )
+    info = SimpleNamespace(config=ordinary_config, layout=[SimpleNamespace(gpu_ids=[0])])
+
+    class ZoneType(Enum):
+        TRAINING = "training"
+
+    class Backend(Enum):
+        GPU = "gpu"
+
+    actor_key = (ZoneType.TRAINING, Backend.GPU)
+    manager_module = ModuleType("dss.ray_dss.zones.manager")
+    manager_module._ACTOR_CLS = {actor_key: actor}
+    spawned = []
+
+    class ZoneManager:
+        zone_type = ZoneType.TRAINING
+        backend = Backend.GPU
+
+        def _spawn_actor(self, actual_info):
+            assert actual_info is info and manager_module._ACTOR_CLS[actor_key] is actor
+            coordinator = actor.__ray_metadata__.modified_class()
+            spawned.append(coordinator)
+            return asyncio.run(
+                coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+            )
+
+    manager_module.ZoneManager = ZoneManager
+    monkeypatch.setitem(sys.modules, manager_module.__name__, manager_module)
+    monkeypatch.setattr(sys.modules["dss.ray_dss.zones"], "manager", manager_module, raising=False)
+    before_module = dict(control.training.__dict__)
+    before_globals = dict(control.spawn_globals)
+    manager = ZoneManager()
+    native_lora.install_manager(manager)
+    assert manager._spawn_actor(info) is control.spawn_result
+    control.restored()
+    assert control.events == ["native-spawn", "native-constructor"]
+    assert control.selected == [control.worker_base]
+    assert control.gets == control.adapter.calls == []
+    assert not hasattr(spawned[0]._workers[0], "original_adapter_receipt")
+    assert manager_module._ACTOR_CLS == {actor_key: actor}
+    assert control.training.__dict__ == before_module and control.spawn.__globals__ == before_globals
+
+
+@pytest.mark.parametrize("failure_type", [None, RuntimeError, KeyboardInterrupt])
+def test_native_spawn_globals_authenticated_deserialized_supplier_restores_exact_class(
+    native_spawn_globals_control, failure_type, capsys
+):
+    from types import FunctionType
+
+    control = native_spawn_globals_control
+    original = control.worker_base.__init__
+    constructor = FunctionType(
+        original.__code__,
+        dict(original.__globals__),
+        original.__name__,
+        original.__defaults__,
+        original.__closure__,
+    )
+    constructor.__qualname__ = original.__qualname__
+    control.supplier = type(
+        control.worker_base.__name__,
+        (),
+        {
+            "__module__": control.worker_base.__module__,
+            "__qualname__": control.worker_base.__qualname__,
+            "__init__": constructor,
+        },
+    )
+    assert control.supplier is not control.worker_base
+    assert constructor is not original and constructor.__globals__ is not original.__globals__
+    assert inspect.getsourcefile(constructor) == inspect.getsourcefile(original)
+    control.spawn_failure = failure_type("serialized supplier native spawn failed") if failure_type else None
+    coordinator = control.coordinator()
+    failure = None
+    try:
+        asyncio.run(
+            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+        )
+    except BaseException as error:
+        failure = error
+    assert failure is control.spawn_failure
+    control.restored()
+    assert control.spawn.__globals__["_DeepSpeedWorker"] is control.supplier
+    assert control.training._DeepSpeedWorker is control.worker_base
+    assert control.selected[0] is not control.supplier
+    assert issubclass(control.selected[0], control.worker_base)
+    assert control.gets == [control.ref] and len(control.adapter.calls) == 1
+    events = ["native-spawn", "native-constructor", "loaded-original", "native-engine"]
+    if failure_type is None:
+        events.append("remote-receipt")
+        assert json.loads(capsys.readouterr().out)["workers"] == control.expected_receipts
+    else:
+        events.append("owned-kill")
+        assert coordinator._workers == [] and capsys.readouterr().out == ""
+    assert control.events == events
+
+
+@pytest.fixture
+def native_first_two_control(_prepared_reference_runner_prepared_runner, tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import cortex_optimizer
+
+    case = _prepared_reference_runner_prepared_runner
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    peft_config = {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj"]}
+    case.cfg.training["peft_config"] = deepcopy(peft_config)
+    adapter = tmp_path / "original-pack"
+    adapter.mkdir()
+    identity = {"schema": "mock-shared-original", "tensor_sha256": "a" * 64}
+    backend = CortexConfig(base_url="http://127.0.0.1:8003", database="dev", schema="dev")
+    generated = []
+    bound = []
+    targets = []
+    fixtures = []
+
+    def generate(model, config, destination, *, seed):
+        assert model == case.spec.model.cache_path
+        assert config == peft_config and seed == runner.SEED
+        generated.append((model, deepcopy(config), Path(destination), seed))
+        return adapter
+
+    def identify(path, config=None):
+        assert Path(path) == adapter
+        assert config is None or config == peft_config
+        return deepcopy(identity)
+
+    def bind(payload, path, *, native_backend=None):
+        assert Path(path) == adapter and native_backend is backend
+        assert payload["training_config"]["peft_config"] == peft_config
+        assert "shared_peft_adapter" not in payload["training_config"]["debug"]
+        before = deepcopy(payload)
+        bound.append((before, Path(path), native_backend, deepcopy(identity)))
+        result = deepcopy(payload)
+        result["training_config"]["debug"]["mock_native_original_adapter"] = deepcopy(identity)
+        assert payload == before
+        return result
+
+    def fixture(actual_backend, spec):
+        assert actual_backend is backend and spec is case.spec
+        fixtures.append(True)
+        return {"model_name": case.spec.model.cache_path}
+
+    def target(session, job, body, **kwargs):
+        targets.append((session, job, deepcopy(kwargs)))
+        return SimpleNamespace(
+            optimizer_state_manifest=str(case.target_manifest),
+            avg_loss=2.0,
+            grad_norms={"module.layer.weight": 1.0},
+            model_calls=None,
+        )
+
+    monkeypatch.setattr(shared, "generate_adapter", generate)
+    monkeypatch.setattr(shared, "adapter_identity", identify)
+    monkeypatch.setattr(deterministic_lora, "materialize_adapter", _native_first_two_forbidden)
+    monkeypatch.setattr(deterministic_lora, "bind_payload", bind)
+    monkeypatch.setattr(cortex, "load_local_fixture", fixture)
+    monkeypatch.setattr(cortex, "load_fixture", lambda path, spec: {"model_name": case.spec.model.cache_path})
+    monkeypatch.setattr(runner, "fwd_bwd_step", target)
+    monkeypatch.setattr(cortex_optimizer, "capture_optimizer_step", target)
+
+    @contextlib.contextmanager
+    def running_job(session, payload):
+        assert session == "mock-target-session"
+        assert payload["model_name"] == case.spec.model.cache_path
+        if "mock_native_original_adapter" in payload["training_config"]["debug"]:
+            assert payload["training_config"]["debug"]["mock_native_original_adapter"] == identity
+            assert "shared_peft_adapter" not in payload["training_config"]["debug"]
+        else:
+            assert payload["training_config"]["debug"]["shared_peft_adapter"] == {
+                "path": str(adapter),
+                "identity": identity,
+            }
+        case.events.append(("job-enter",))
+        yield "mock-target-job"
+        case.events.append(("job-exit",))
+
+    monkeypatch.setattr(runner, "running_job", running_job)
+
+    def execute(*, selected=None, supplied=False, **kwargs):
+        options = {
+            "client_backend": backend,
+            "local_cortex_fixture": True,
+            **({"peft_adapter": adapter} if supplied else {}),
+            **kwargs,
+        }
+        return case.execute(
+            selected=["single-step-grads"] if selected is None else selected,
+            **options,
+        )
+
+    return SimpleNamespace(
+        case=case,
+        adapter=adapter,
+        identity=identity,
+        backend=backend,
+        generated=generated,
+        bound=bound,
+        targets=targets,
+        fixtures=fixtures,
+        execute=execute,
+    )
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [
+        ["single-step-grads"],
+        ["single-step-optimizer"],
+        ["single-step-grads", "single-step-optimizer"],
+    ],
+)
+@pytest.mark.parametrize("supplied", [False, True])
+def test_native_first_two_composition_keeps_exact_adapter_recipe_and_native_payload(
+    native_first_two_control, selected, supplied
+):
+    control = native_first_two_control
+    training = deepcopy(control.case.cfg.training)
+    results = control.execute(selected=selected, supplied=supplied)
+    assert len(results) == 2 * len(selected) and all(result.outcome is Outcome.PASS for result in results)
+    assert len(control.generated) == (0 if supplied else 1)
+    assert control.fixtures == [True]
+    assert len(control.bound) == 3 and len(control.targets) == 2
+    assert control.case.cfg.training == training
+    assert all(row[1:] == (control.adapter, control.backend, control.identity) for row in control.bound)
+    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
+    assert [event[2] for event in control.case.events if event[0] == "record"] == [
+        arm for arm in ("gas1", "gas4") for _ in selected
+    ]
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_native_first_two_unsupported_binding_stops_before_records_or_target(
+    native_first_two_control, monkeypatch, supplied
+):
+    control = native_first_two_control
+    calls = []
+
+    def reject(payload, path, *, native_backend):
+        assert native_backend is control.backend and Path(path) == control.adapter
+        calls.append(deepcopy(payload))
+        raise ValueError("owned gateway shared-pack capability unavailable")
+
+    monkeypatch.setattr(deterministic_lora, "bind_payload", reject)
+    with pytest.raises(ValueError, match="shared-pack capability unavailable"):
+        control.execute(supplied=supplied)
+    assert len(calls) == 1 and not control.case.events and not control.targets
+    assert not control.case.published
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_native_first_two_reference_preparation_never_binds_or_starts_target(
+    native_first_two_control, monkeypatch, supplied
+):
+    control = native_first_two_control
+    control.case.missing.update({("single-step-grads", "gas1"), ("single-step-grads", "gas4")})
+    measurements = []
+
+    def reference(model, batch, output, **kwargs):
+        assert model == control.case.spec.model.cache_path
+        assert kwargs["peft_adapter_path"] == control.adapter
+        assert kwargs["peft_config"] == control.case.cfg.training["peft_config"]
+        measurements.append((model, batch, deepcopy(kwargs)))
+        return {**deepcopy(control.case.record), "active_tokens": load(batch).active_tokens}
+
+    monkeypatch.setattr(deterministic_lora, "bind_payload", _native_first_two_forbidden)
+    monkeypatch.setattr(runner, "run_reference", reference)
+    assert control.execute(supplied=supplied, prepare_references=True) == []
+    assert len(measurements) == 2 and len(control.case.published) == 2
+    assert len(control.generated) == (0 if supplied else 1)
+    assert not control.bound and not control.targets and not control.fixtures
+    assert not any(event[0].startswith(("job-", "gateway-")) for event in control.case.events)
+    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
+
+
+def test_native_first_two_published_nonlocal_route_stays_rejected(native_first_two_control):
+    control = native_first_two_control
+    results = control.execute(local_cortex_fixture=False, cortex_fixture=Path("mock-publication.json"))
+    assert len(results) == 1 and results[0].outcome is Outcome.FAIL
+    assert "product-initialized LoRA adapter" in results[0].reason
+    assert not control.generated and not control.bound and not control.targets and not control.case.events
+
+
+def test_native_first_two_supplied_nonlocal_route_fails_before_adapter_read(native_first_two_control):
+    control = native_first_two_control
+    with pytest.raises(ValueError, match="explicit local Cortex"):
+        control.execute(supplied=True, local_cortex_fixture=False)
+    assert not control.generated and not control.bound and not control.targets and not control.case.events
+
+
+def test_native_first_two_onprem_preserves_legacy_shared_payload(native_first_two_control):
+    from arctic_platform.client import OnPremConfig
+
+    control = native_first_two_control
+    results = control.execute(client_backend=OnPremConfig(), local_cortex_fixture=False)
+    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
+    assert len(control.generated) == 1 and not control.bound and len(control.targets) == 2
+    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
+
+
+def test_native_first_two_adapter_mutation_after_reference_admission_cannot_rebind(
+    native_first_two_control, monkeypatch
+):
+    control = native_first_two_control
+    original_load = reference_records.load_record
+
+    def changed(ctx, identity):
+        record = original_load(ctx, identity)
+        control.identity["tensor_sha256"] = "b" * 64
+        return record
+
+    monkeypatch.setattr(reference_records, "load_record", changed)
+    results = control.execute()
+    assert len(results) == 2 and all(result.outcome is Outcome.FAIL for result in results)
+    assert all("shared adapter changed before native target binding" in result.reason for result in results)
+    assert len(control.bound) == 1 and not control.targets
+
+
+@pytest.fixture
+def native_shared_pack_control(generated_adapter_config, tmp_path, monkeypatch):
+    import socket
+    from types import FunctionType
+
+    from arctic_platform.correctness.harness import native_lora
+
+    source = generated_adapter_config
+    monkeypatch.setenv(storage.CORRECTNESS_TMPDIR_ENV, str(tmp_path / "worker-scratch"))
+    monkeypatch.setattr(subprocess, "Popen", _native_first_two_forbidden)
+    monkeypatch.setattr(socket.socket, "connect", _native_first_two_forbidden)
+    monkeypatch.setattr(socket, "create_connection", _native_first_two_forbidden)
+    monkeypatch.setattr(torch.cuda, "init", _native_first_two_forbidden)
+    monkeypatch.setattr(dist, "init_process_group", _native_first_two_forbidden)
+    monkeypatch.setattr(Qwen3ForCausalLM, "from_pretrained", _native_first_two_forbidden)
+    monkeypatch.setattr(Qwen3ForCausalLM, "forward", _native_first_two_forbidden)
+    monkeypatch.setattr(peft.PeftModel, "forward", _native_first_two_forbidden)
+    monkeypatch.setattr(transformers.GenerationMixin, "generate", _native_first_two_forbidden)
+    path = shared.generate_adapter(source.path, source.config, tmp_path / "seed42-pack", seed=42)
+    identity = shared.adapter_identity(path, source.config)
+    files = shared.adapter_files(path, identity)
+    control = SimpleNamespace(
+        native=native_lora,
+        source=source,
+        path=path,
+        identity=identity,
+        files=files,
+        events=[],
+        scratch=[],
+        staged=[],
+        cfg={"job_id": "synthetic-shared-child", "native-option": object()},
+        ds_config={"native-engine-option": object()},
+        source_stage=object(),
+        engine_result=object(),
+        engine_failure=None,
+        engine_drift=None,
+        constructor_failure=None,
+        rank=0,
+    )
+    original_workdir = storage.correctness_workdir
+
+    def workdir(prefix):
+        directory = original_workdir(prefix)
+        control.scratch.append(directory)
+        return directory
+
+    monkeypatch.setattr(storage, "correctness_workdir", workdir)
+    original_load = native_adapter.initialize_adapter
+
+    def initialize(model, directory, expected):
+        control.staged.append(Path(directory))
+        assert {item.name: item.read_bytes() for item in Path(directory).iterdir()} == control.files
+        original_load(model, directory, expected)
+        control.events.append(("real-peft-load", control.rank))
+
+    monkeypatch.setattr(native_adapter, "initialize_adapter", initialize)
+
+    def reset_model(rank=0):
+        control.rank = rank
+        control.model = _model()
+        control.base = {
+            name: _bytes(parameter)
+            for name, parameter in control.model.named_parameters()
+            if not parameter.requires_grad
+        }
+        with torch.no_grad():
+            for parameter in _installed(control.model).values():
+                parameter.fill_(9.0)
+        assert shared._tensor_identity(peft.get_peft_model_state_dict(control.model)) != identity["tensors"]
+
+    def namespace(mode="detached"):
+        training = ModuleType("dss.ray_dss.jobs.gpu.training")
+        training.__dict__.update(
+            _native_shared_pack_control=control, peft=peft, shared=shared, torch=torch, _bytes=_bytes
+        )
+        template = _native_shared_pack_engine_template
+        engine = FunctionType(template.__code__, training.__dict__, template.__name__)
+        engine.__qualname__ = template.__qualname__
+        training.initialize_training_engine = engine
+        constructor_globals = dict(training.__dict__) if mode == "detached" else training.__dict__
+        template = _native_shared_pack_constructor_template
+        constructor = FunctionType(template.__code__, constructor_globals, "__init__", template.__defaults__)
+        constructor.__qualname__ = "SyntheticNativeWorker.__init__"
+        worker = type("SyntheticNativeWorker", (), {"__module__": training.__name__, "__init__": constructor})
+        training._DeepSpeedWorker = worker
+        constructor_globals["_DeepSpeedWorker"] = worker
+        control.training = training
+        control.constructor = constructor
+        control.constructor_globals = constructor_globals
+        control.worker_base = worker
+        control.engine = engine
+        control.namespace_mode = mode
+        control.original_namespace = dict(constructor_globals)
+        control.original_module = dict(training.__dict__)
+        return constructor_globals
+
+    def restored():
+        assert control.constructor_globals == control.original_namespace
+        assert control.training.__dict__ == control.original_module
+        assert not shared._NATIVE_ADAPTER_SCOPE_LOCK.locked()
+        assert all(not directory.exists() for directory in control.scratch)
+        assert all(not directory.exists() for directory in control.staged)
+
+    def scope(**kwargs):
+        options = dict(job_id=control.cfg["job_id"], rank=control.rank)
+        options.update(kwargs)
+        return native_lora.native_shared_worker_adapter_scope(
+            control.training, control.constructor, control.files, control.identity, **options
+        )
+
+    control.reset_model = reset_model
+    control.namespace = namespace
+    control.restored = restored
+    control.scope = scope
+    reset_model()
+    namespace()
+    return control
+
+
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_native_shared_pack_real_seed42_fp32_load_precedes_stub_engine_and_restores_globals(
+    native_shared_pack_control, namespace, rank
+):
+    control = native_shared_pack_control
+    control.reset_model(rank)
+    globals_ = control.namespace(namespace)
+    assert (globals_ is control.training.__dict__) == (namespace == "shared")
+    assert control.identity["generation"] == {
+        "schema": "upstream-default-lora-v1",
+        "seed": 42,
+        "initializer": True,
+        "peft_config": control.identity["peft_config"],
+        "dependencies": {
+            "torch": str(torch.__version__),
+            "peft": peft.__version__,
+            "transformers": transformers.__version__,
+            "safetensors": safetensors.__version__,
+        },
+    }
+    assert not (control.path / "initialization.json").exists()
+    assert len(control.identity["tensors"]) == 4
+    assert all(entry["dtype"] == "torch.float32" for entry in control.identity["tensors"])
+    for name, tensor in load_file(str(control.path / "adapter_model.safetensors")).items():
+        assert bool(torch.count_nonzero(tensor)) == (".lora_A." in name)
+    with control.scope() as receipt:
+        assert globals_["initialize_training_engine"] is not control.engine
+        if namespace == "detached":
+            assert control.training.initialize_training_engine is control.engine
+        worker = control.worker_base(control.cfg, control.source_stage)
+        assert worker.engine is control.engine_result
+    assert receipt == {
+        "schema": "shared-peft-worker-initialization-v1",
+        "job_id": control.cfg["job_id"],
+        "rank": rank,
+        "engine_initializations": 1,
+        "shared_identity": control.identity,
+    }
+    assert control.events == [("synthetic-constructor", rank), ("real-peft-load", rank), ("stub-engine", rank)]
+    control.restored()
+
+
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing-init",
+        "duplicate-init",
+        "wrong-rank",
+        "boolean-rank",
+        "engine-runtime",
+        "engine-interrupt",
+        "constructor-runtime",
+        "constructor-interrupt",
+        "swallowed-engine",
+        "receipt-drift",
+        "binding-drift",
+        "pack-before-engine",
+        "pack-after-engine",
+        "pack-after-load",
+    ],
+)
+def test_native_shared_pack_worker_failure_restores_exact_binding_and_rejects_receipt(
+    native_shared_pack_control, namespace, failure, monkeypatch
+):
+    control = native_shared_pack_control
+    globals_ = control.namespace(namespace)
+    primary = RuntimeError("synthetic primary")
+    error = ValueError
+    match = "native shared adapter"
+    if failure.startswith("engine-") or failure == "swallowed-engine":
+        primary = KeyboardInterrupt("synthetic primary") if failure == "engine-interrupt" else primary
+        control.engine_failure = primary
+    if failure.startswith("constructor-"):
+        primary = KeyboardInterrupt("synthetic primary") if failure == "constructor-interrupt" else primary
+        control.constructor_failure = primary
+    if failure in {"engine-runtime", "engine-interrupt", "constructor-runtime", "constructor-interrupt"}:
+        error, match = type(primary), "synthetic primary"
+
+    def drift():
+        recipe = control.staged[-1] / "correctness_recipe.json"
+        changed = json.loads(recipe.read_bytes())
+        changed["seed"] = 43
+        recipe.write_text(json.dumps(changed))
+
+    if failure == "pack-after-engine":
+        control.engine_drift = drift
+    if failure == "pack-after-load":
+        original = native_adapter.initialize_adapter
+
+        def load(*args):
+            original(*args)
+            drift()
+
+        monkeypatch.setattr(native_adapter, "initialize_adapter", load)
+    with pytest.raises(error, match=match) as caught:
+        with control.scope() as receipt:
+            wrapped = globals_["initialize_training_engine"]
+            if failure == "missing-init":
+                pass
+            elif failure == "binding-drift":
+                globals_["initialize_training_engine"] = object()
+                wrapped(control.model, control.ds_config, rank=0)
+            elif failure == "pack-before-engine":
+                directory = next(control.scratch[-1].iterdir())
+                recipe = directory / "correctness_recipe.json"
+                recipe.write_text(json.dumps({**json.loads(recipe.read_bytes()), "seed": 43}))
+                wrapped(control.model, control.ds_config, rank=0)
+            elif failure in {"wrong-rank", "boolean-rank"}:
+                wrapped(control.model, control.ds_config, rank=1 if failure == "wrong-rank" else False)
+            elif failure == "swallowed-engine":
+                with pytest.raises(RuntimeError) as swallowed:
+                    control.worker_base(control.cfg, control.source_stage)
+                assert swallowed.value is primary
+            else:
+                control.worker_base(control.cfg, control.source_stage)
+                if failure == "duplicate-init":
+                    wrapped(control.model, control.ds_config, rank=0)
+                elif failure == "receipt-drift":
+                    receipt["engine_initializations"] = 2
+    if error is not ValueError:
+        assert caught.value is primary
+    if failure in {"missing-init", "wrong-rank", "boolean-rank", "binding-drift", "pack-before-engine"}:
+        assert not any(event[0] in {"real-peft-load", "stub-engine"} for event in control.events)
+    control.restored()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "namespace",
+        "module",
+        "qualname",
+        "code",
+        "source",
+        "missing-engine",
+        "foreign-engine",
+        "engine-module",
+        "engine-qualname",
+        "engine-code",
+        "engine-source",
+        "prewrapped-engine",
+    ],
+)
+def test_native_shared_pack_constructor_namespace_code_source_and_engine_guards(native_shared_pack_control, damage):
+    from types import FunctionType
+
+    control = native_shared_pack_control
+    namespace = control.constructor_globals
+    original_constructor = control.constructor
+    constructor = FunctionType(original_constructor.__code__, namespace, "__init__", original_constructor.__defaults__)
+    constructor.__qualname__ = original_constructor.__qualname__
+    if damage == "namespace":
+        namespace["__name__"] = "foreign.training"
+    elif damage == "module":
+        constructor.__module__ = "foreign.training"
+    elif damage == "qualname":
+        constructor.__qualname__ = "Foreign.__init__"
+    elif damage == "code":
+        constructor.__code__ = constructor.__code__.replace(co_name="changed_constructor")
+    elif damage == "source":
+        constructor.__code__ = constructor.__code__.replace(co_filename=shared.__file__)
+    elif damage == "missing-engine":
+        del namespace["initialize_training_engine"]
+    elif damage == "foreign-engine":
+        namespace["initialize_training_engine"] = object()
+    else:
+        engine = FunctionType(control.engine.__code__, namespace, control.engine.__name__)
+        engine.__qualname__ = control.engine.__qualname__
+        namespace["initialize_training_engine"] = engine
+        if damage == "engine-module":
+            engine.__module__ = "foreign.training"
+        elif damage == "engine-qualname":
+            engine.__qualname__ = "foreign_engine"
+        elif damage == "engine-code":
+            engine.__code__ = engine.__code__.replace(co_name="changed_engine")
+        elif damage == "engine-source":
+            engine.__code__ = engine.__code__.replace(co_filename=shared.__file__)
+        else:
+            engine._correctness_shared_native_adapter = True
+    before = dict(namespace)
+    with pytest.raises(ValueError, match="constructor (namespace|engine binding) differs"):
+        with control.native.native_shared_worker_adapter_scope(
+            control.training, constructor, control.files, control.identity, job_id="child", rank=0
+        ):
+            pytest.fail("mismatched constructor must not enter the scope")
+    assert namespace == before and not control.events and not control.scratch
+    assert not shared._NATIVE_ADAPTER_SCOPE_LOCK.locked()
+
+
+@pytest.mark.parametrize("job_id,rank", [("", 0), (" ", 0), (None, 0), ("child", -1), ("child", True), ("child", "0")])
+def test_native_shared_pack_worker_requires_explicit_job_and_integer_rank(native_shared_pack_control, job_id, rank):
+    control = native_shared_pack_control
+    with pytest.raises(ValueError, match="explicit job identity"):
+        with control.scope(job_id=job_id, rank=rank):
+            pytest.fail("invalid worker identity entered scope")
+    assert not control.scratch and not control.events
+    control.restored()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-config",
+        "missing-tensors",
+        "missing-recipe",
+        "extra-original",
+        "extra-path",
+        "nonbytes",
+        "config-drift",
+        "tensor-drift",
+        "recipe-drift",
+    ],
+)
+def test_native_shared_pack_worker_transfer_requires_exclusive_authenticated_files(native_shared_pack_control, damage):
+    control = native_shared_pack_control
+    files = dict(control.files)
+    if damage.startswith("missing-"):
+        name = {
+            "missing-config": "adapter_config.json",
+            "missing-tensors": "adapter_model.safetensors",
+            "missing-recipe": "correctness_recipe.json",
+        }[damage]
+        del files[name]
+    elif damage == "extra-original":
+        files["initialization.json"] = b"{}"
+    elif damage == "extra-path":
+        files["../escaped.json"] = b"{}"
+    elif damage == "nonbytes":
+        files["adapter_config.json"] = bytearray(files["adapter_config.json"])
+    elif damage == "config-drift":
+        files["adapter_config.json"] += b"\n"
+    elif damage == "tensor-drift":
+        state = load_file(str(control.path / "adapter_model.safetensors"))
+        state[next(iter(state))] = state[next(iter(state))] + 1
+        files["adapter_model.safetensors"] = save(state)
+    else:
+        recipe = json.loads(files["correctness_recipe.json"])
+        files["correctness_recipe.json"] = json.dumps({**recipe, "seed": 43}).encode()
+    with pytest.raises(ValueError, match="transfer|identity changed"):
+        with control.native.native_shared_worker_adapter_scope(
+            control.training, control.constructor, files, control.identity, job_id="child", rank=0
+        ):
+            pytest.fail("invalid transferred pack entered scope")
+    assert not control.events
+    control.restored()
+
+
+@pytest.mark.parametrize(
+    "key", ["schema", "peft_config", "adapter_config_sha256", "adapter_model_sha256", "tensors", "generation"]
+)
+def test_native_shared_pack_worker_authenticates_entire_identity(native_shared_pack_control, key):
+    control = native_shared_pack_control
+    identity = copy.deepcopy(control.identity)
+    del identity[key]
+    with pytest.raises(ValueError, match="generation recipe|identity changed"):
+        with control.native.native_shared_worker_adapter_scope(
+            control.training, control.constructor, control.files, identity, job_id="child", rank=0
+        ):
+            pytest.fail("incomplete identity entered scope")
+    assert not control.events
+    control.restored()
+
+
+def test_native_shared_pack_scope_is_nonreentrant_and_snapshots_inputs(native_shared_pack_control):
+    from types import FunctionType
+
+    control = native_shared_pack_control
+    before_identity, before_files = copy.deepcopy(control.identity), dict(control.files)
+    nested = FunctionType(
+        control.constructor.__code__, dict(control.original_namespace), "__init__", control.constructor.__defaults__
+    )
+    nested.__qualname__ = control.constructor.__qualname__
+    with control.scope() as receipt:
+        with pytest.raises(ValueError, match="already active"):
+            with control.native.native_shared_worker_adapter_scope(
+                control.training, nested, control.files, control.identity, job_id="other-child", rank=0
+            ):
+                pytest.fail("nested scope entered")
+        control.worker_base(control.cfg, control.source_stage)
+        control.identity["generation"]["seed"] = 99
+        control.files["correctness_recipe.json"] = b"{}"
+    assert receipt["shared_identity"] == before_identity
+    control.identity.clear()
+    control.identity.update(before_identity)
+    control.files.clear()
+    control.files.update(before_files)
+    control.restored()
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cleanup", ["temporary", "scratch", "both"])
+@pytest.mark.parametrize("primary_present", [True, False])
+def test_native_shared_pack_staging_cleanup_preserves_primary_and_restores_namespace_and_lock(
+    native_shared_pack_control, monkeypatch, failure_type, cleanup, primary_present
+):
+    control = native_shared_pack_control
+    primary = failure_type("primary engine failure")
+    cleanup_errors = []
+    original_temporary = control.native.tempfile.TemporaryDirectory
+    original_rmdir = Path.rmdir
+
+    class Temporary:
+        def __init__(self, *args, **kwargs):
+            self.delegate = original_temporary(*args, **kwargs)
+            self.name = self.delegate.name
+
+        def cleanup(self):
+            self.delegate.cleanup()
+            if cleanup in {"temporary", "both"}:
+                error = failure_type("temporary cleanup failure")
+                cleanup_errors.append(error)
+                raise error
+
+    def rmdir(path):
+        original_rmdir(path)
+        if path in control.scratch and cleanup in {"scratch", "both"}:
+            error = failure_type("scratch cleanup failure")
+            cleanup_errors.append(error)
+            raise error
+
+    monkeypatch.setattr(control.native.tempfile, "TemporaryDirectory", Temporary)
+    monkeypatch.setattr(Path, "rmdir", rmdir)
+    if primary_present:
+        control.engine_failure = primary
+    with pytest.raises(failure_type) as caught:
+        with control.scope():
+            control.worker_base(control.cfg, control.source_stage)
+    assert caught.value is (primary if primary_present else cleanup_errors[0])
+    notes = getattr(caught.value, "__notes__", [])
+    assert len(notes) == len(cleanup_errors) - int(not primary_present)
+    assert all("Shared adapter scratch cleanup also failed" in note for note in notes)
+    control.restored()
+
+
+@pytest.fixture
+def native_shared_pack_capability(native_shared_pack_control, monkeypatch):
+    import requests
+
+    control = native_shared_pack_control
+    pins = control.native._shared_runtime_sources(control.training)
+    capability = {"schema": control.native.SHARED_SCHEMA, "sources": pins}
+    response = SimpleNamespace(
+        status_code=200,
+        document={
+            control.native.SHARED_OPENAPI_KEY: capability,
+            control.native.OPENAPI_KEY: {"schema": control.native.SCHEMA, "sources": copy.deepcopy(pins)},
+        },
+    )
+    gets = []
+
+    class Session:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, **kwargs):
+            assert self.trust_env is False
+            gets.append((url, kwargs))
+            return SimpleNamespace(status_code=response.status_code, json=lambda: copy.deepcopy(response.document))
+
+        def post(self, *args, **kwargs):
+            pytest.fail("admission must not create a target job")
+
+    monkeypatch.setattr(requests, "Session", Session)
+    payload = {
+        "job_type": "training",
+        "model_name": "synthetic-config-only-qwen3",
+        "training_config": {
+            "peft_config": copy.deepcopy(control.source.config),
+            "n_gpus": 3,
+            "debug": {"unrelated-debug-option": True},
+        },
+        "unchanged-option": {"keep": "exact"},
+    }
+    return SimpleNamespace(
+        control=control,
+        pins=pins,
+        capability=capability,
+        response=response,
+        gets=gets,
+        payload=payload,
+        backend=SimpleNamespace(base_url="http://127.0.0.1:8000", host=None, pat=None),
+    )
+
+
+def test_native_shared_pack_bind_and_request_preserve_pack_payload_and_distinct_schema(native_shared_pack_capability):
+    case = native_shared_pack_capability
+    native = case.control.native
+    before = copy.deepcopy(case.payload)
+    bound = native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    assert case.payload == before and bound is not case.payload
+    assert bound["training_config"] is not case.payload["training_config"]
+    assert bound["training_config"]["debug"]["unrelated-debug-option"] is True
+    assert native.REQUEST_KEY not in bound["training_config"]["debug"]
+    assert "shared_peft_adapter" not in bound["training_config"]["debug"]
+    expected = {
+        "schema": native.SHARED_SCHEMA,
+        "path": str(case.control.path),
+        "identity": case.control.identity,
+        "sources": case.pins,
+        "training_gpus": 3,
+        "model_name": case.payload["model_name"],
+    }
+    assert bound["training_config"]["debug"][native.SHARED_REQUEST_KEY] == expected
+    config = SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(bound))
+    received = native._shared_request(config)
+    assert received == expected and received is not expected
+    received["identity"]["generation"]["seed"] = 99
+    assert native._shared_request(config) == expected
+    assert native._request(config) is None
+    assert case.gets == [("http://127.0.0.1:8000/openapi.json", {"timeout": 30, "allow_redirects": False})]
+    assert shared.adapter_files(case.control.path, case.control.identity) == case.control.files
+    assert not (case.control.path / "initialization.json").exists()
+    assert not case.control.events
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "external",
+        "https",
+        "authenticated",
+        "decorated",
+        "redirect",
+        "missing-shared",
+        "original-only",
+        "original-schema",
+        "extra-key",
+        "missing-source",
+        "extra-source",
+        "relative-path",
+        "short-hash",
+        "source-extra-key",
+        "source-not-dict",
+    ],
+)
+def test_native_shared_pack_capability_admission_is_local_explicit_and_source_complete(
+    native_shared_pack_capability, damage
+):
+    case = native_shared_pack_capability
+    native = case.control.native
+    if damage == "external":
+        case.backend.base_url = "http://external.invalid:8000"
+    elif damage == "https":
+        case.backend.base_url = "https://127.0.0.1:8000"
+    elif damage == "authenticated":
+        case.backend.pat = "synthetic-not-a-credential"
+    elif damage == "decorated":
+        case.backend.base_url += "/extra?query=value"
+    elif damage == "redirect":
+        case.response.status_code = 302
+    elif damage in {"missing-shared", "original-only"}:
+        del case.response.document[native.SHARED_OPENAPI_KEY]
+    elif damage == "original-schema":
+        case.capability["schema"] = native.SCHEMA
+    elif damage == "extra-key":
+        case.capability["unexpected"] = True
+    elif damage == "missing-source":
+        del case.pins["adapter"]
+    elif damage == "extra-source":
+        case.pins["unexpected"] = case.pins["engine"]
+    elif damage == "relative-path":
+        case.pins["engine"]["path"] = "relative.py"
+    elif damage == "short-hash":
+        case.pins["engine"]["sha256"] = "bad"
+    elif damage == "source-extra-key":
+        case.pins["engine"]["unexpected"] = True
+    else:
+        case.pins["engine"] = None
+    before = copy.deepcopy(case.payload)
+    with pytest.raises(ValueError):
+        native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    assert case.payload == before and not case.control.events
+    assert len(case.gets) == int(damage not in {"external", "https", "authenticated", "decorated"})
+
+
+@pytest.mark.parametrize(
+    "key", ["correctness_original_peft_adapter", "correctness_shared_peft_adapter", "shared_peft_adapter"]
+)
+def test_native_shared_pack_sender_never_overwrites_another_initialization(native_shared_pack_capability, key):
+    case = native_shared_pack_capability
+    case.payload["training_config"]["debug"][key] = {}
+    before = copy.deepcopy(case.payload)
+    with pytest.raises(ValueError, match="cannot replace another initialization"):
+        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    assert case.payload == before and not case.control.events
+
+
+def test_native_shared_pack_sender_rejects_deterministic_metadata(native_shared_pack_capability):
+    case = native_shared_pack_capability
+    (case.control.path / "initialization.json").write_text("{}")
+    with pytest.raises(ValueError, match="deterministic initialization metadata"):
+        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    assert not case.control.events
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-schema",
+        "missing-seed",
+        "missing-initializer",
+        "missing-peft_config",
+        "missing-dependencies",
+        "schema",
+        "seed-bool",
+        "seed-negative",
+        "seed-string",
+        "initializer-false",
+        "initializer-string",
+        "topology",
+        "extra-key",
+        "dependencies-not-dict",
+        "missing-torch",
+        "missing-peft",
+        "missing-transformers",
+        "missing-safetensors",
+        "extra-dependency",
+        "empty-dependency",
+        "nonstring-dependency",
+    ],
+)
+def test_native_shared_pack_generation_recipe_requires_every_authenticated_field(
+    native_shared_pack_capability, damage
+):
+    case = native_shared_pack_capability
+    recipe_path = case.control.path / "correctness_recipe.json"
+    recipe = json.loads(recipe_path.read_bytes())
+    if damage.startswith("missing-"):
+        key = damage[len("missing-") :]
+        del (recipe["dependencies"] if key in {"torch", "peft", "transformers", "safetensors"} else recipe)[key]
+    elif damage == "schema":
+        recipe["schema"] = "original-peft-initialization-v1"
+    elif damage.startswith("seed-"):
+        recipe["seed"] = {"seed-bool": True, "seed-negative": -1, "seed-string": "42"}[damage]
+    elif damage == "initializer-false":
+        recipe["initializer"] = False
+    elif damage == "initializer-string":
+        recipe["initializer"] = "gaussian"
+    elif damage == "topology":
+        recipe["peft_config"]["r"] = 3
+    elif damage == "extra-key":
+        recipe["unexpected"] = True
+    elif damage == "dependencies-not-dict":
+        recipe["dependencies"] = []
+    elif damage == "extra-dependency":
+        recipe["dependencies"]["unexpected"] = "v1"
+    elif damage == "empty-dependency":
+        recipe["dependencies"]["peft"] = ""
+    else:
+        recipe["dependencies"]["peft"] = 1
+    recipe_path.write_text(json.dumps(recipe))
+    with pytest.raises(ValueError, match="authenticated upstream-default generation recipe"):
+        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    assert not case.control.events
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "schema",
+        "extra-key",
+        "missing-schema",
+        "missing-path",
+        "missing-identity",
+        "missing-sources",
+        "missing-training_gpus",
+        "missing-model_name",
+        "job-type",
+        "model-name",
+        "gpu-zero",
+        "gpu-bool",
+        "gpu-mismatch",
+        "source-checkpoint",
+        "resume-checkpoint",
+        "resume-tag",
+        "original-conflict",
+        "legacy-conflict",
+        "outside-storage",
+        "identity-recipe",
+    ],
+)
+def test_native_shared_pack_request_requires_fresh_exact_job_and_exclusive_schema(
+    native_shared_pack_capability, damage
+):
+    case = native_shared_pack_capability
+    native = case.control.native
+    bound = native.bind_shared_adapter(case.payload, case.control.path, case.backend)
+    request = bound["training_config"]["debug"][native.SHARED_REQUEST_KEY]
+    if damage.startswith("missing-"):
+        del request[damage[len("missing-") :]]
+    elif damage == "schema":
+        request["schema"] = native.SCHEMA
+    elif damage == "extra-key":
+        request["original_metadata"] = {}
+    elif damage == "job-type":
+        bound["job_type"] = "inference"
+    elif damage == "model-name":
+        bound["model_name"] = "other-model"
+    elif damage.startswith("gpu-"):
+        request["training_gpus"] = {"gpu-zero": 0, "gpu-bool": True, "gpu-mismatch": 2}[damage]
+    elif damage == "source-checkpoint":
+        bound["source_checkpoint_info"] = {}
+    elif damage == "resume-checkpoint":
+        bound["resume_from_checkpoint"] = "other"
+    elif damage == "resume-tag":
+        bound["resume_checkpoint_tag"] = "other"
+    elif damage == "original-conflict":
+        bound["training_config"]["debug"][native.REQUEST_KEY] = {}
+    elif damage == "legacy-conflict":
+        bound["training_config"]["debug"]["shared_peft_adapter"] = {}
+    elif damage == "outside-storage":
+        request["path"] = "/tmp/not-admitted"
+    else:
+        request["identity"]["generation"]["initializer"] = False
+    before = copy.deepcopy(bound)
+    with pytest.raises(ValueError):
+        native._shared_request(SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(bound)))
+    assert bound == before and not case.control.events
+
+
+def test_native_shared_pack_absent_request_is_ordinary_and_source_pins_cover_loader_and_scope(
+    native_shared_pack_control,
+):
+    control = native_shared_pack_control
+    assert control.native._shared_request(SimpleNamespace(model_dump=lambda **kwargs: {})) is None
+    pins = control.native._shared_runtime_sources(control.training)
+    assert pins == control.native._runtime_sources(control.training)
+    assert pins["adapter"]["path"] == str(Path(shared.__file__))
+    assert pins["composition"]["path"] == str(Path(control.native.__file__))
+    assert pins["adapter"]["sha256"] == hashlib.sha256(Path(shared.__file__).read_bytes()).hexdigest()
+    assert pins["composition"]["sha256"] == hashlib.sha256(Path(control.native.__file__).read_bytes()).hexdigest()
+    control.native._verify_shared_runtime(control.training, pins)
+    for key in pins:
+        changed = copy.deepcopy(pins)
+        changed[key]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="runtime differs"):
+            control.native._verify_shared_runtime(control.training, changed)
+
+
+@pytest.fixture
+def native_shared_pack_coordinator(native_shared_pack_capability, monkeypatch):
+    from types import FunctionType
+
+    case = native_shared_pack_capability
+    control = case.control
+    control.ranks = [("synthetic-host-a", 0), ("synthetic-host-a", 1), ("synthetic-host-b", 0)]
+    control.selected = []
+    control.receipts = []
+    control.gets = []
+    control.kills = []
+    control.ref = object()
+    control.spawn_failure = None
+    control.spawn_drift = False
+    control.receipt_failure = None
+    control.receipt_damage = None
+    control.cleanup_failure = None
+    control.constructor_failure_rank = None
+    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.jobs.gpu.training": control.training})
+    ray = ModuleType("ray")
+
+    def get(ref):
+        assert ref is control.ref
+        control.gets.append(ref)
+        return control.files
+
+    def remote(**options):
+        assert options == {"num_cpus": 1, "num_gpus": 0}
+        return lambda cls: cls
+
+    ray.get = get
+    ray.remote = remote
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+    def restored():
+        assert control.training._DeepSpeedWorker is control.worker_base
+        assert control.spawn_globals["_DeepSpeedWorker"] is control.worker_base
+        control.restored()
+
+    def construct(selected, rank):
+        control.reset_model(rank)
+        monkeypatch.setenv("RANK", str(rank))
+        # Separate Ray processes have ordinary module bindings during worker construction.
+        coordinator_worker = control.training._DeepSpeedWorker
+        control.training._DeepSpeedWorker = control.worker_base
+        try:
+            saved_failure = control.constructor_failure
+            if control.constructor_failure_rank != rank:
+                control.constructor_failure = None
+            try:
+                worker = selected(control.cfg, control.source_stage)
+            finally:
+                control.constructor_failure = saved_failure
+        finally:
+            control.training._DeepSpeedWorker = coordinator_worker
+        receipt = worker.shared_adapter_receipt()
+        assert receipt["rank"] == rank
+        second = worker.shared_adapter_receipt()
+        second["engine_initializations"] = 99
+        assert worker.shared_adapter_receipt() == receipt
+        control.receipts.append(receipt)
+
+        async def reported():
+            restored()
+            control.events.append(("synthetic-receipt", rank))
+            if rank == 2 and control.receipt_failure is not None:
+                raise control.receipt_failure
+            result = worker.shared_adapter_receipt()
+            if control.receipt_damage == rank:
+                result["rank"] = 0 if rank else 1
+            return result
+
+        return SimpleNamespace(shared_adapter_receipt=SimpleNamespace(remote=reported))
+
+    control.construct = construct
+
+    def coordinator(spawn_namespace="detached"):
+        namespace = dict(control.training.__dict__) if spawn_namespace == "detached" else control.training.__dict__
+        template = _native_shared_pack_spawn_template
+        spawn = FunctionType(template.__code__, namespace, "_spawn_workers")
+        spawn.__qualname__ = "SyntheticNativeCoordinator._spawn_workers"
+        control.spawn_globals = namespace
+
+        class NativeCoordinator:
+            def __init__(self):
+                self._workers = []
+                self._info = SimpleNamespace(config=None, job_id=control.cfg["job_id"])
+
+            async def _kill_workers(self, hosts):
+                restored()
+                assert hosts == [host for host, _ in control.ranks]
+                control.kills.append(list(hosts))
+                self._workers.clear()
+                if control.cleanup_failure is not None:
+                    raise control.cleanup_failure
+
+            def info(self):
+                return {"ordinary-native-info": "preserved"}
+
+        NativeCoordinator._spawn_workers = spawn
+        control.training.GPUTrainingJob = SimpleNamespace(
+            __ray_metadata__=SimpleNamespace(modified_class=NativeCoordinator)
+        )
+        case.pins.clear()
+        case.pins.update(control.native._shared_runtime_sources(control.training))
+        bound = control.native.bind_shared_adapter(case.payload, control.path, case.backend)
+        request = bound["training_config"]["debug"][control.native.SHARED_REQUEST_KEY]
+        control.request = request
+        control.bound = bound
+        control.original_module = dict(control.training.__dict__)
+        if control.namespace_mode == "shared":
+            control.original_namespace = dict(control.training.__dict__)
+        selected = control.native._shared_coordinator_class(control.training, request, control.ref)
+        instance = selected()
+        instance._info.config = SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(bound))
+        return instance
+
+    control.coordinator = coordinator
+    control.coordinator_restored = restored
+    return control
+
+
+@pytest.mark.parametrize("spawn_namespace", ["detached", "shared"])
+def test_native_shared_pack_coordinator_constructs_every_rank_reports_receipts_and_restores_spawn(
+    native_shared_pack_coordinator, spawn_namespace, capsys
+):
+    control = native_shared_pack_coordinator
+    coordinator = control.coordinator(spawn_namespace)
+    asyncio.run(
+        coordinator._spawn_workers(control.cfg, control.ranks, "synthetic-master", 12345, control.source_stage)
+    )
+    control.coordinator_restored()
+    assert len(control.gets) == len(control.receipts) == 3 and not control.kills
+    assert [receipt["rank"] for receipt in control.receipts] == [0, 1, 2]
+    control.native._verify_shared_receipts(control.receipts, control.request, control.cfg["job_id"])
+    assert [event[0] for event in control.events] == [
+        "synthetic-spawn",
+        "synthetic-constructor",
+        "real-peft-load",
+        "stub-engine",
+        "synthetic-constructor",
+        "real-peft-load",
+        "stub-engine",
+        "synthetic-constructor",
+        "real-peft-load",
+        "stub-engine",
+        "synthetic-receipt",
+        "synthetic-receipt",
+        "synthetic-receipt",
+    ]
+    report = coordinator.info()
+    assert report == {
+        "ordinary-native-info": "preserved",
+        "correctness_shared_adapter": {"schema": control.native.SHARED_SCHEMA, "workers": control.receipts},
+    }
+    report["correctness_shared_adapter"]["workers"][0]["rank"] = 99
+    assert coordinator.info()["correctness_shared_adapter"]["workers"] == control.receipts
+    printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert printed == {
+        "schema": control.native.SHARED_SCHEMA,
+        "job_id": control.cfg["job_id"],
+        "workers": control.receipts,
+    }
+
+
+@pytest.mark.parametrize("spawn_namespace", ["detached", "shared"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "spawn-runtime",
+        "spawn-interrupt",
+        "constructor-runtime",
+        "constructor-interrupt",
+        "receipt-runtime",
+        "receipt-interrupt",
+        "receipt-rank0",
+        "receipt-rank1",
+        "receipt-rank2",
+        "spawn-binding",
+        "spawn-cleanup-runtime",
+        "receipt-cleanup-interrupt",
+    ],
+)
+def test_native_shared_pack_coordinator_failure_owns_teardown_and_preserves_primary(
+    native_shared_pack_coordinator, spawn_namespace, failure, capsys
+):
+    control = native_shared_pack_coordinator
+    # Interrupt the cleanup, not a receipt task that bypasses coordinator exception delivery in asyncio.
+    interrupt_primary = failure in {"spawn-interrupt", "constructor-interrupt", "receipt-interrupt"}
+    primary = (
+        KeyboardInterrupt("primary native failure") if interrupt_primary else RuntimeError("primary native failure")
+    )
+    expected = type(primary)
+    if failure.startswith("constructor-"):
+        control.constructor_failure = primary
+        control.constructor_failure_rank = 1
+    elif failure.startswith("receipt-rank"):
+        control.receipt_damage = int(failure[-1])
+        expected = ValueError
+    elif failure == "spawn-binding":
+        control.spawn_drift = True
+        expected = ValueError
+    elif failure.startswith("receipt-"):
+        control.receipt_failure = primary
+    else:
+        control.spawn_failure = primary
+    if "cleanup" in failure:
+        control.cleanup_failure = (
+            KeyboardInterrupt("owned cleanup failure")
+            if "interrupt" in failure
+            else RuntimeError("owned cleanup failure")
+        )
+    coordinator = control.coordinator(spawn_namespace)
+    with pytest.raises(expected) as caught:
+        asyncio.run(
+            coordinator._spawn_workers(control.cfg, control.ranks, "synthetic-master", 12345, control.source_stage)
+        )
+    if expected is not ValueError:
+        assert caught.value is primary
+    control.coordinator_restored()
+    assert len(control.kills) == 1 and not coordinator._workers
+    assert coordinator.info()["correctness_shared_adapter"]["workers"] == []
+    assert not capsys.readouterr().out.strip()
+    notes = getattr(caught.value, "__notes__", [])
+    if control.cleanup_failure is not None:
+        assert len(notes) == 1 and "Owned shared-adapter worker teardown also failed" in notes[0]
+        assert "owned cleanup failure" in notes[0]
+    else:
+        assert not notes
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "duplicate",
+        "schema",
+        "job",
+        "rank-bool",
+        "rank-order",
+        "init-zero",
+        "init-two",
+        "init-bool",
+        "identity",
+        "missing-field",
+        "extra-field",
+        "not-dict",
+    ],
+)
+def test_native_shared_pack_receipts_authenticate_every_rank_without_partial_acceptance(
+    native_shared_pack_capability, rank, damage
+):
+    case = native_shared_pack_capability
+    native = case.control.native
+    request = {"training_gpus": 3, "identity": case.control.identity}
+    receipts = [
+        {
+            "schema": "shared-peft-worker-initialization-v1",
+            "job_id": "child",
+            "rank": index,
+            "engine_initializations": 1,
+            "shared_identity": copy.deepcopy(case.control.identity),
+        }
+        for index in range(3)
+    ]
+    native._verify_shared_receipts(receipts, request, "child")
+    if damage == "missing":
+        del receipts[rank]
+    elif damage == "duplicate":
+        receipts[rank] = copy.deepcopy(receipts[(rank + 1) % 3])
+    elif damage == "schema":
+        receipts[rank]["schema"] = "original-peft-worker-initialization-v1"
+    elif damage == "job":
+        receipts[rank]["job_id"] = "other-child"
+    elif damage == "rank-bool":
+        receipts[rank]["rank"] = bool(rank)
+    elif damage == "rank-order":
+        receipts[rank]["rank"] = (rank + 1) % 3
+    elif damage.startswith("init-"):
+        receipts[rank]["engine_initializations"] = {"init-zero": 0, "init-two": 2, "init-bool": True}[damage]
+    elif damage == "identity":
+        receipts[rank]["shared_identity"]["generation"]["seed"] = 43
+    elif damage == "missing-field":
+        del receipts[rank]["shared_identity"]
+    elif damage == "extra-field":
+        receipts[rank]["initialization"] = {}
+    else:
+        receipts[rank] = None
+    with pytest.raises(ValueError, match="every worker|evidence differs"):
+        native._verify_shared_receipts(receipts, request, "child")
+
+
+@pytest.mark.parametrize("damage", ["existing-workers", "missing-rank", "config-drift", "source-drift"])
+def test_native_shared_pack_coordinator_rejects_layout_configuration_and_source_before_spawn(
+    native_shared_pack_coordinator, damage
+):
+    control = native_shared_pack_coordinator
+    coordinator = control.coordinator()
+    if damage == "existing-workers":
+        coordinator._workers = [object()]
+    elif damage == "missing-rank":
+        control.ranks = control.ranks[:-1]
+    elif damage == "config-drift":
+        control.bound["model_name"] = "other"
+    else:
+        control.request["sources"]["composition"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError):
+        asyncio.run(
+            coordinator._spawn_workers(control.cfg, control.ranks, "synthetic-master", 12345, control.source_stage)
+        )
+    assert not control.events and not control.gets and not control.kills
+    control.coordinator_restored()
+
+
+@pytest.fixture
+def native_ray_tracing_controls(tmp_path, monkeypatch):
+    import importlib.metadata
+    import importlib.util
+    import socket
+    from contextlib import contextmanager
+    from types import FunctionType
+
+    from arctic_platform.correctness.harness import native_lora
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Ray tracing controls attempted a cluster, subprocess, network, or model operation")
+
+    class ForbiddenPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            forbidden(*args, **kwargs)
+
+    monkeypatch.setenv(storage.CORRECTNESS_TMPDIR_ENV, str(tmp_path / "no-model-scratch"))
+    monkeypatch.setattr(subprocess, "Popen", ForbiddenPopen)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(torch.cuda, "init", forbidden)
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
+    monkeypatch.setattr(dist, "init_process_group", forbidden)
+    monkeypatch.setattr(Qwen3ForCausalLM, "from_pretrained", forbidden)
+    monkeypatch.setattr(Qwen3ForCausalLM, "forward", forbidden)
+    monkeypatch.setattr(peft.PeftModel, "forward", forbidden)
+    monkeypatch.setattr(transformers.GenerationMixin, "generate", forbidden)
+    monkeypatch.setattr(sys.modules[__name__], "_model", forbidden)
+    monkeypatch.setattr(sys.modules[__name__], "_native_original_adapter_model", forbidden)
+    monkeypatch.setattr(shared, "generate_adapter", forbidden)
+
+    installed = SimpleNamespace(inject=None, version=None, source=None, error=None, runtime="inert imports")
+    ray_site = Path("/home/yak/miniconda3/envs/vllm/lib/python3.12/site-packages")
+    helper_path = ray_site / "ray/util/tracing/tracing_helper.py"
+    if helper_path.is_file():
+        # Execute installed tracing code, not Ray's eager hardware/worker inventory.
+        ray = ModuleType("ray")
+        ray.__path__ = []
+        private = ModuleType("ray._private")
+        private.__path__ = []
+        worker = ModuleType("ray._private.worker")
+        runtime = ModuleType("ray.runtime_context")
+        ray.init = ray.shutdown = ray.remote = runtime.get_runtime_context = forbidden
+        ray._private, private.worker = private, worker
+        for module in (ray, private, worker, runtime):
+            monkeypatch.setitem(sys.modules, module.__name__, module)
+        inspect_spec = importlib.util.spec_from_file_location(
+            "ray._private.inspect_util", ray_site / "ray/_private/inspect_util.py"
+        )
+        inspect_module = importlib.util.module_from_spec(inspect_spec)
+        monkeypatch.setitem(sys.modules, inspect_spec.name, inspect_module)
+        inspect_spec.loader.exec_module(inspect_module)
+        helper_spec = importlib.util.spec_from_file_location("ray.util.tracing.tracing_helper", helper_path)
+        helper = importlib.util.module_from_spec(helper_spec)
+        monkeypatch.setitem(sys.modules, helper_spec.name, helper)
+        helper_spec.loader.exec_module(helper)
+        assert helper._is_tracing_enabled() is False
+        installed.inject = helper._inject_tracing_into_class
+        installed.version = next(
+            distribution.version
+            for distribution in importlib.metadata.distributions(path=[str(ray_site)])
+            if distribution.metadata["Name"].lower() == "ray"
+        )
+        installed.source = native_lora._source(installed.inject)
+        assert installed.source["sha256"] == hashlib.sha256(helper_path.read_bytes()).hexdigest()
+    else:
+        installed.error = "installed tracing helper file absent"
+
+    def original_control():
+        from arctic_platform.correctness.harness import native_adapter
+
+        training = ModuleType("selected_native_tracing_control")
+        tensor_specs = [
+            lora_init.LoraTensorSpec(f"tiny.lora_{factor}.weight", (1, 1), "float32") for factor in ("A", "B")
+        ]
+        manifest = lora_init.build_manifest(tensor_specs, 42)
+        data = save({spec.name: lora_init.generate_tensor(spec, 42) for spec in tensor_specs})
+        adapter = SimpleNamespace(
+            training=training,
+            path=tmp_path / "synthetic-original-pack",
+            worker_root=tmp_path / "unused-original",
+            files={"adapter_model.safetensors": data},
+            identity={"synthetic": "original-tracing"},
+            metadata={
+                "model_name": "synthetic-tracing-original",
+                "identity_sha256": "synthetic-original-identity",
+                "initialization": manifest,
+            },
+            manifest=manifest,
+            model=object(),
+            calls=[],
+            result=(object(), object(), object()),
+            ds_config={},
+            optimizer=object(),
+            mpu=object(),
+        )
+
+        def engine(model, ds_config, **kwargs):
+            assert model is adapter.model and ds_config is adapter.ds_config
+            adapter.calls.append((model, ds_config, kwargs))
+            return adapter.result
+
+        adapter.engine = training.initialize_training_engine = engine
+        monkeypatch.setattr(native_adapter, "initialize_adapter", lambda *args: None)
+
+        @contextmanager
+        def scope(native_training, worker_constructor, files, identity, metadata, *, job_id, rank):
+            assert native_training is training and files == adapter.files
+            assert worker_constructor is training._DeepSpeedWorker.__init__
+            assert identity == adapter.identity and metadata == adapter.metadata
+            ordinary_engine = training.initialize_training_engine
+            _, prototypes = _native_original_composition_receipts(adapter)
+            receipt = copy.deepcopy(prototypes[rank])
+            receipt["job_id"] = job_id
+            receipt["engine_initializations"] = 0
+
+            def scoped_engine(model, ds_config, **kwargs):
+                from arctic_platform.correctness.harness import native_adapter
+
+                native_adapter.initialize_adapter(model, adapter.path, identity)
+                receipt["engine_initializations"] += 1
+                return ordinary_engine(model, ds_config, **kwargs)
+
+            training.initialize_training_engine = scoped_engine
+            try:
+                yield receipt
+            finally:
+                training.initialize_training_engine = ordinary_engine
+
+        monkeypatch.setattr(native_lora, "native_original_worker_adapter_scope", scope)
+        # Reuse coordinator construction without the fixture's model-producing dependency.
+        return native_spawn_globals_control.__wrapped__(adapter, monkeypatch)
+
+    def shared_control():
+        peft_config = {"init_lora_weights": True}
+        identity = {
+            "schema": "shared-peft-adapter-v1",
+            "peft_config": peft_config,
+            "generation": {
+                "schema": "upstream-default-lora-v1",
+                "seed": 42,
+                "initializer": True,
+                "peft_config": peft_config,
+                "dependencies": {
+                    key: "synthetic-no-model" for key in ("torch", "peft", "transformers", "safetensors")
+                },
+            },
+        }
+        training = ModuleType("dss.ray_dss.jobs.gpu.training")
+        control = SimpleNamespace(
+            native=native_lora,
+            training=training,
+            identity=identity,
+            files={"synthetic-pack": b"no-model"},
+            path=tmp_path / "synthetic-shared-pack",
+            cfg={"job_id": "synthetic-shared-child"},
+            source_stage=object(),
+            events=[],
+            model=object(),
+            ds_config={},
+            rank=0,
+            engine_result=object(),
+            constructor_failure=None,
+            active_receipt=None,
+            namespace_mode="shared",
+        )
+        training.__dict__.update(_native_ray_tracing_control=control, _native_shared_pack_control=control)
+        engine = FunctionType(_native_ray_tracing_engine_template.__code__, training.__dict__)
+        engine.__qualname__ = _native_ray_tracing_engine_template.__qualname__
+        training.initialize_training_engine = engine
+        constructor = FunctionType(_native_ray_tracing_constructor_template.__code__, training.__dict__, "__init__")
+        constructor.__qualname__ = "SyntheticNativeWorker.__init__"
+        worker = type("SyntheticNativeWorker", (), {"__module__": training.__name__, "__init__": constructor})
+        control.engine, control.worker_base = engine, worker
+        training._DeepSpeedWorker = worker
+
+        def reset_model(rank):
+            control.rank = rank
+
+        def restored():
+            assert training._DeepSpeedWorker is worker and training.initialize_training_engine is engine
+            assert control.active_receipt is None
+
+        control.reset_model, control.restored = reset_model, restored
+        pins = {}
+        payload = {
+            "job_type": "training",
+            "model_name": "synthetic-tracing-shared",
+            "training_config": {"n_gpus": 3, "peft_config": peft_config},
+        }
+
+        def bind(actual, path, backend):
+            assert actual == payload and path == control.path
+            bound = copy.deepcopy(actual)
+            bound["training_config"]["debug"] = {
+                native_lora.SHARED_REQUEST_KEY: {
+                    "schema": native_lora.SHARED_SCHEMA,
+                    "path": str(path),
+                    "identity": copy.deepcopy(identity),
+                    "sources": copy.deepcopy(pins),
+                    "training_gpus": 3,
+                    "model_name": actual["model_name"],
+                }
+            }
+            return bound
+
+        @contextmanager
+        def scope(native_training, worker_constructor, files, expected_identity, *, job_id, rank):
+            assert native_training is training and worker_constructor is worker.__init__
+            assert files == control.files and expected_identity == identity
+            receipt = {
+                "schema": "shared-peft-worker-initialization-v1",
+                "job_id": job_id,
+                "rank": rank,
+                "engine_initializations": 0,
+                "shared_identity": copy.deepcopy(identity),
+            }
+            control.active_receipt = receipt
+            try:
+                yield receipt
+            finally:
+                control.active_receipt = None
+
+        monkeypatch.setattr(native_lora, "bind_shared_adapter", bind)
+        monkeypatch.setattr(native_lora, "native_shared_worker_adapter_scope", scope)
+        case = SimpleNamespace(control=control, pins=pins, payload=payload, backend=object())
+        return native_shared_pack_coordinator.__wrapped__(case, monkeypatch)
+
+    def create(route, namespace="detached", wrapper="faithful"):
+        control = original_control() if route == "original" else shared_control()
+        coordinator = control.coordinator(namespace)
+        training = control.training
+        base = training.GPUTrainingJob.__ray_metadata__.modified_class
+        leaf = base._spawn_workers
+        traces = []
+        if wrapper == "installed":
+            if installed.inject is None:
+                pytest.skip(f"installed Ray tracing helper unavailable: {installed.error}")
+
+            class TraceOnly:
+                pass
+
+            TraceOnly._spawn_workers = leaf
+            installed.inject(TraceOnly)
+            wrapped = TraceOnly._spawn_workers
+        else:
+            wrapped = _native_ray_tracing_wrap(leaf, traces)
+            if wrapper in {"nested", "copied"}:
+                wrapped = _native_ray_tracing_wrap(wrapped, traces)
+            if wrapper == "copied":
+                wrapped = _native_ray_tracing_copy_chain(wrapped)
+                leaf = inspect.unwrap(wrapped)
+                control.spawn_globals = leaf.__globals__
+                if route == "original":
+                    control.spawn = leaf
+                    control.namespace = "detached"
+        base._spawn_workers = wrapped
+        assert wrapped.__globals__["__name__"] == "ray.util.tracing.tracing_helper"
+        assert inspect.unwrap(wrapped) is leaf
+        assert inspect.iscoroutinefunction(wrapped) and inspect.iscoroutinefunction(leaf)
+        control.tracing_route = route
+        control.tracing_wrapped = wrapped
+        control.tracing_leaf = leaf
+        control.tracing_events = traces
+        control.tracing_kind = wrapper
+        control.tracing_installed = installed
+        return control, coordinator
+
+    return create
+
+
+@pytest.mark.parametrize("route", ["original", "shared"])
+@pytest.mark.parametrize("namespace", ["detached", "shared"])
+@pytest.mark.parametrize("wrapper", ["faithful", "nested", "copied", "installed"])
+def test_native_ray_tracing_wrapped_spawn_patches_native_leaf_and_retains_wrapped_invocation_and_receipts(
+    native_ray_tracing_controls, route, namespace, wrapper, capsys
+):
+    control, coordinator = native_ray_tracing_controls(route, namespace, wrapper)
+    snapshot = _native_ray_tracing_snapshot(control)
+    from arctic_platform.correctness.harness import native_lora
+
+    actual_namespace, actual_worker = native_lora._spawn_worker_binding(
+        control.tracing_wrapped, control.training, control.request["sources"]
+    )
+    assert actual_namespace is control.tracing_leaf.__globals__
+    assert actual_namespace is not control.tracing_wrapped.__globals__
+    assert actual_worker is control.worker_base
+    _native_ray_tracing_invoke(control, coordinator)
+    _native_ray_tracing_assert_restored(control, snapshot)
+    assert len(control.selected) == 1 and control.selected[0] is not control.worker_base
+    assert issubclass(control.selected[0], control.worker_base)
+    if wrapper == "installed":
+        assert control.tracing_installed.version and control.tracing_installed.source
+        assert "_ray_trace_ctx" in inspect.signature(control.tracing_wrapped).parameters
+    else:
+        depth = 1 if wrapper == "faithful" else 2
+        assert control.tracing_events == ["trace-enter"] * depth + ["trace-exit"] * depth
+    printed = json.loads(capsys.readouterr().out.strip())
+    if route == "original":
+        assert control.gets == [control.ref]
+        assert printed["workers"] == control.expected_receipts
+        assert coordinator.info()["correctness_original_adapter"]["workers"] == control.expected_receipts
+    else:
+        assert len(control.gets) == len(control.receipts) == 3
+        assert [row["rank"] for row in printed["workers"]] == [0, 1, 2]
+        native_lora._verify_shared_receipts(printed["workers"], control.request, control.cfg["job_id"])
+
+
+@pytest.mark.parametrize("route", ["original", "shared"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "spawn-runtime",
+        "spawn-interrupt",
+        "receipt-runtime",
+        "receipt-cleanup",
+        "spawn-cleanup-runtime",
+        "spawn-cleanup-interrupt",
+    ],
+)
+def test_native_ray_tracing_wrapper_failure_restores_exact_globals_and_preserves_primary_and_owned_cleanup(
+    native_ray_tracing_controls, route, failure, capsys
+):
+    # Each negative first proves the same wrapped/coordinator shape succeeds.
+    valid, baseline = native_ray_tracing_controls(route, "detached", "copied")
+    _native_ray_tracing_invoke(valid, baseline)
+    assert json.loads(capsys.readouterr().out)["workers"]
+    control, coordinator = native_ray_tracing_controls(route, "detached", "copied")
+    primary = (
+        KeyboardInterrupt("wrapped native primary")
+        if failure == "spawn-interrupt"
+        else RuntimeError("wrapped native primary")
+    )
+    if failure.startswith("receipt"):
+        control.receipt_failure = primary
+    else:
+        control.spawn_failure = primary
+    if "cleanup" in failure:
+        control.cleanup_failure = (
+            KeyboardInterrupt("wrapped owned cleanup")
+            if failure.endswith("interrupt")
+            else RuntimeError("wrapped owned cleanup")
+        )
+    snapshot = _native_ray_tracing_snapshot(control)
+    with pytest.raises(type(primary)) as caught:
+        _native_ray_tracing_invoke(control, coordinator)
+    assert caught.value is primary
+    _native_ray_tracing_assert_restored(control, snapshot)
+    assert control.tracing_events == ["trace-enter", "trace-enter", "trace-exit", "trace-exit"]
+    assert not capsys.readouterr().out.strip()
+    cleanup_events = control.events if route == "original" else control.kills
+    assert ("owned-kill" in cleanup_events) if route == "original" else len(cleanup_events) == 1
+    notes = getattr(primary, "__notes__", [])
+    if control.cleanup_failure is None:
+        assert not notes and not coordinator._workers
+    else:
+        assert any("wrapped owned cleanup" in note for note in notes)
+        assert any(type(control.cleanup_failure).__name__ in note for note in notes)
+
+
+@pytest.mark.parametrize("route", ["original", "shared"])
+@pytest.mark.parametrize("damage", ["leaf-namespace", "source", "foreign", "stale", "missing", "module-foreign"])
+def test_native_ray_tracing_authenticated_leaf_and_worker_guards_reject_without_touching_wrapper_globals(
+    native_ray_tracing_controls, route, damage, capsys
+):
+    from arctic_platform.correctness.harness import native_lora
+
+    valid, baseline = native_ray_tracing_controls(route, "detached", "nested")
+    _native_ray_tracing_invoke(valid, baseline)
+    assert json.loads(capsys.readouterr().out)["workers"]
+    control, coordinator = native_ray_tracing_controls(route, "detached", "nested")
+    native_lora._spawn_worker_binding(control.tracing_wrapped, control.training, control.request["sources"])
+    namespace = control.tracing_leaf.__globals__
+    if damage == "leaf-namespace":
+        namespace["__name__"] = "foreign.native.training"
+    elif damage == "source":
+        control.request["sources"]["training"]["sha256"] = "0" * 64
+    elif damage == "foreign":
+        namespace["_DeepSpeedWorker"] = object()
+    elif damage == "stale":
+        namespace["_DeepSpeedWorker"] = type("StaleAdapterWorker", (control.worker_base,), {})
+    elif damage == "missing":
+        namespace.pop("_DeepSpeedWorker")
+    else:
+        control.training._DeepSpeedWorker = type("ForeignModuleWorker", (), {"__init__": lambda self: None})
+    snapshot = _native_ray_tracing_snapshot(control)
+    with pytest.raises(ValueError):
+        _native_ray_tracing_invoke(control, coordinator)
+    module, chain = snapshot
+    assert control.training.__dict__ == module
+    assert all(actual == before for actual, before in chain)
+    assert control.tracing_events == [] and control.selected == [] and control.gets == []
+    assert not coordinator._workers and not capsys.readouterr().out.strip()
+
+
+@pytest.mark.parametrize("route", ["original", "shared"])
+@pytest.mark.parametrize("damage", ["sync-outer", "sync-leaf"])
+def test_native_ray_tracing_requires_both_wrapper_and_leaf_to_be_coroutines(
+    native_ray_tracing_controls, route, damage
+):
+    from functools import wraps
+
+    from arctic_platform.correctness.harness import native_lora
+
+    control, coordinator = native_ray_tracing_controls(route, "detached", "faithful")
+    native_lora._spawn_worker_binding(control.tracing_wrapped, control.training, control.request["sources"])
+    if damage == "sync-outer":
+
+        @wraps(control.tracing_leaf)
+        def invalid(*args, **kwargs):
+            pytest.fail("synchronous outer wrapper invoked")
+
+    else:
+
+        def synchronous_leaf(*args, **kwargs):
+            pytest.fail("synchronous leaf invoked")
+
+        invalid = _native_ray_tracing_wrap(synchronous_leaf, [])
+    snapshot = _native_ray_tracing_snapshot(control)
+    with pytest.raises(ValueError, match="namespace differs"):
+        native_lora._spawn_worker_binding(invalid, control.training, control.request["sources"])
+    _native_ray_tracing_assert_restored(control, snapshot)
+    assert not control.selected and not control.gets and not coordinator._workers
+
+
+@pytest.mark.parametrize("wrapper", ["faithful", "nested", "installed"])
+def test_native_ray_tracing_ordinary_native_dispatch_remains_wrapped_and_does_not_select_adapter(
+    native_ray_tracing_controls, wrapper, capsys
+):
+    control, _ = native_ray_tracing_controls("original", "detached", wrapper)
+    control.ordinary = True
+    coordinator = control.coordinator_base()
+    snapshot = _native_ray_tracing_snapshot(control)
+    assert _native_ray_tracing_invoke(control, coordinator) is control.spawn_result
+    _native_ray_tracing_assert_restored(control, snapshot)
+    assert control.selected == [control.worker_base]
+    assert control.events == ["native-spawn", "native-constructor"]
+    assert control.gets == control.adapter.calls == []
+    assert not capsys.readouterr().out.strip()
+    if wrapper != "installed":
+        depth = 1 if wrapper == "faithful" else 2
+        assert control.tracing_events == ["trace-enter"] * depth + ["trace-exit"] * depth
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("namespace", ["shared", "detached"])
+@pytest.mark.parametrize("receipt_failure", [False, True])
+def test_native_original_registered_coordinator_preserves_factor_receipts_and_owned_teardown(
+    native_original_registered_control, monkeypatch, wrapped, namespace, receipt_failure
+):
+    adapter = native_original_registered_control
+    scope = adapter.scope(wrapped=wrapped)
+
+    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
+        assert model is adapter.model and rank == 0
+        adapter.verify(model)
+        adapter.calls.append(model)
+        return adapter.result
+
+    adapter.engine = scope.training.initialize_training_engine = engine
+    _native_adapter_layout_forbid_state_apis(adapter.model, monkeypatch)
+    control = native_spawn_globals_control.__wrapped__(adapter, monkeypatch)
+    primary = RuntimeError("registered-factor receipt delivery failed") if receipt_failure else None
+    control.receipt_failure = primary
+    coordinator = control.coordinator(namespace)
+    with pytest.raises(RuntimeError) if primary is not None else contextlib.nullcontext():
+        asyncio.run(
+            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
+        )
+    control.restored()
+    assert adapter.calls == [adapter.model]
+    adapter.verify(adapter.model)
+    assert control.events == [
+        "native-spawn",
+        "native-constructor",
+        "loaded-original",
+        "native-engine",
+        "remote-receipt",
+    ] + (["owned-kill"] if primary is not None else [])
+    assert control.gets == [control.ref]
+    if primary is not None:
+        assert coordinator._workers == []
+        assert not hasattr(coordinator, "_correctness_original_adapter_receipts")
+    else:
+        assert coordinator._correctness_original_adapter_receipts == control.expected_receipts
+        receipt = control.workers[0].original_adapter_receipt()
+        receipt["rank"] = 99
+        assert control.workers[0].original_adapter_receipt() == control.expected_receipts[0]
+
+
+def _native_first_two_forbidden(*args, **kwargs):
+    raise AssertionError("HF, product initialization, or an extra allocation was reached")

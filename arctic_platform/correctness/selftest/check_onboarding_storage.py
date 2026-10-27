@@ -807,7 +807,7 @@ def test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_
     assert keywords["prepare_references"] is True
     assert keywords["select"] == [test_id]
     assert keywords["vocab_size"] == 128
-    assert keywords["reference_calibration_runs"] == 16
+    assert keywords["reference_calibration_runs"] == 8
     assert keywords["reference_calibration_workers"] is None
     assert keywords["client_backend"].base_url == "http://127.0.0.1:1"
     assert keywords["reference_records_dir"] == reference_records.DEFAULT_RECORDS_DIR
@@ -1164,7 +1164,7 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
 
     calls = _rendered_calibration_workers
-    assert len(calls) == 32
+    assert len(calls) == 16
     batch_paths = {batch_path for batch_path, output in calls}
     assert len(batch_paths) == 2
     for batch_path in batch_paths:
@@ -1179,10 +1179,10 @@ def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnosti
     )
     assert not list(diagnostics.rglob("*.pt"))
     payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["configuration"]["runs"] == 16
+    assert payload["configuration"]["runs"] == 8
     assert payload["tolerance"]["selected_gate"] == 0.001
     spec = json.loads(namespace["SPEC_PATH"].read_text())
-    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 16
+    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 8
     assert spec["test_tolerances"]["single-step-grads"]["worst_tensor"] == "model.weight"
     assert payload["tolerance"]["raw_max_same_tensor_range"] == 0.0
 
@@ -1233,7 +1233,7 @@ def test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diag
     assert result.is_file()
     assert (args.output_dir / "calibration-runs" / "batch-gas1.pt").is_file()
     assert (args.output_dir / "calibration-runs" / "batch-gas4.pt").is_file()
-    assert len(_rendered_calibration_workers) == 32
+    assert len(_rendered_calibration_workers) == 16
     assert not list(args._diagnostics_dir.rglob("*.pt"))
 
 
@@ -1269,7 +1269,7 @@ def test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing(_calibrat
             arm["name"], arm["global_batch_size"], arm["max_seq_len"], 128, seed=batches.SEED
         )
         actual = [batch for batch in measured if batch.name == arm["name"]]
-        assert len(actual) == 16
+        assert len(actual) == 8
         for batch in actual:
             for tensor in ("input_ids", "position_ids", "labels"):
                 assert torch.equal(getattr(batch, tensor), getattr(expected, tensor))
@@ -1278,7 +1278,7 @@ def test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing(_calibrat
         assert evidence["max_seq_len"] == expected.seq_len
         assert evidence["active_tokens"] == expected.active_tokens
         assert evidence["batch_hash"] == namespace["_batch_hash"](expected)
-        assert evidence["microbatches"] == [1] * 16
+        assert evidence["microbatches"] == [1] * 8
         assert evidence["skipped_no_grad"] == ["model.visual.weight"]
 
 
@@ -1299,9 +1299,9 @@ def test_gradient_calibration_measures_spread_only_within_each_arm(_calibration_
     namespace["run_reference"] = vary
     assert namespace["main"]() == 0
     payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["tolerance"]["raw_max_same_tensor_range"] == pytest.approx(0.030)
+    assert payload["tolerance"]["raw_max_same_tensor_range"] == pytest.approx(0.014)
     assert payload["tolerance"]["worst_arm"] == "gas4"
-    assert payload["tolerance"]["selected_gate"] == 0.121
+    assert payload["tolerance"]["selected_gate"] == 0.056
     assert payload["loss_range"] == 0
     assert {row["arm"] for row in payload["gradient_ranges"]} == {"gas1", "gas4"}
     assert len(payload["gradient_ranges"]) == 2
@@ -1397,16 +1397,16 @@ def test_gradient_calibration_never_overlaps_workers_on_the_same_gpu(_calibratio
     namespace["run_reference"] = observe
     assert namespace["main"]() == 0
     assert not active
-    assert devices.count(0) == 16
-    assert devices.count(1) == 16
+    assert devices.count(0) == 8
+    assert devices.count(1) == 8
 
 
 @pytest.mark.parametrize("available", [8, 16])
-def test_gradient_calibration_defaults_to_two_eight_gpu_waves_per_arm(_calibration_driver, monkeypatch, available):
+def test_gradient_calibration_defaults_to_one_eight_gpu_wave_per_arm(_calibration_driver, monkeypatch, available):
     import threading
 
     namespace = _calibration_driver
-    assert namespace["RUNS"] == 16
+    assert namespace["RUNS"] == 8
     monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
     reference = namespace["run_reference"]
     barrier = threading.Barrier(8, timeout=10)
@@ -1422,8 +1422,6 @@ def test_gradient_calibration_defaults_to_two_eight_gpu_waves_per_arm(_calibrati
         with lock:
             assert device == index % 8
             assert device not in active
-            if index >= 8:
-                assert completed[arm] >= set(range(8))
             active.add(device)
             devices.setdefault(arm, []).append(device)
         try:
@@ -1439,8 +1437,8 @@ def test_gradient_calibration_defaults_to_two_eight_gpu_waves_per_arm(_calibrati
     assert not active
     assert set(devices) == {"gas1", "gas4"}
     for arm in devices:
-        assert sorted(devices[arm]) == sorted(list(range(8)) * 2)
-        assert completed[arm] == set(range(16))
+        assert sorted(devices[arm]) == list(range(8))
+        assert completed[arm] == set(range(8))
 
 
 @pytest.mark.parametrize("arms", [[], [{"name": "gas1"}, {"name": "gas1"}]])
@@ -2499,7 +2497,7 @@ def test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_
 @pytest.mark.parametrize("fail_reference", [False, True])
 @pytest.mark.parametrize(
     ("available", "workers", "runs", "lanes"),
-    [(1, None, 2, 1), (8, None, 16, 8), (16, None, 16, 8), (16, 4, 7, 4)],
+    [(1, None, 2, 1), (8, None, 8, 8), (16, None, 8, 8), (8, None, 16, 8), (16, None, 16, 8), (16, 4, 7, 4)],
 )
 def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_cleans_only_owned_tree(
     _onboarding_storage_fast_root, tmp_path, monkeypatch, fail_reference, available, workers, runs, lanes
@@ -2846,7 +2844,7 @@ def _local_cortex_reference_publication(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("local_fixture", [True, False])
 def test_local_cortex_reference_publication_runs_after_frozen_gate_before_validation(
-    _local_cortex_reference_publication, local_fixture
+    _local_cortex_reference_publication, local_fixture, capsys
 ):
     state = _local_cortex_reference_publication
     state.args.local_cortex_fixture = local_fixture
@@ -2874,6 +2872,58 @@ def test_local_cortex_reference_publication_runs_after_frozen_gate_before_valida
     manifest = json.loads((state.args.output_dir / "onboarding.json").read_text())
     assert manifest["selected_gate"] == 0.005
     assert manifest["validation_attempts"] == [{"status": "pass", "report": "synthetic-report"}]
+    output = capsys.readouterr().out
+    for phase in range(1, 4):
+        assert output.count(f"*** Phase {phase}/3:") == 1
+        assert output.count(f"Phase {phase}/3 run time:") == 1
+    assert "Fixture Preparation" in output
+    if local_fixture:
+        assert "Deterministic Baseline Preparation" in output
+
+
+def test_onboarding_cached_validation_still_reports_phase_runtime(
+    _local_cortex_reference_publication, monkeypatch, capsys
+):
+    state = _local_cortex_reference_publication
+    resume = onboard._resume_phase
+
+    def cached(args, phase, operation):
+        if phase == "validation":
+            return {"status": "pass", "report": "retained-report"}
+        return resume(args, phase, operation)
+
+    monkeypatch.setattr(onboard, "_resume_phase", cached)
+    assert onboard._parent(state.args) == 0
+    assert "validation" not in state.events
+    output = capsys.readouterr().out
+    assert output.count("*** Phase 3/3:") == 1
+    assert output.count("Phase 3/3 run time:") == 1
+
+
+def test_gradient_calibration_announces_expensive_steps_before_starting(_calibration_driver, capsys):
+    namespace = _calibration_driver
+    original_reference = namespace["run_reference"]
+    original_materialize = namespace["materialize_pretrained"]
+    original_hash = namespace["hash_directory"]
+
+    def fixture(*args, **kwargs):
+        assert "Preparing the HF calibration fixture" in capsys.readouterr().out
+        return original_materialize(*args, **kwargs)
+
+    def reference(*args, **kwargs):
+        assert "HF calibration start:" in capsys.readouterr().out
+        return original_reference(*args, **kwargs)
+
+    def model_hash(*args, **kwargs):
+        output = capsys.readouterr().out
+        assert "Summarizing gradient variation for gas4" in output
+        assert "Hashing calibration model files:" in output
+        return original_hash(*args, **kwargs)
+
+    namespace.update(materialize_pretrained=fixture, run_reference=reference, hash_directory=model_hash)
+    assert namespace["main"]() == 0
+    output = capsys.readouterr().out
+    assert "Writing calibration results:" in output
 
 
 @pytest.mark.parametrize("existing", [True, False])
@@ -3033,7 +3083,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
         assert args.test_spec.read_bytes() == state.previous
         assert kwargs["select"] == ["single-step-optimizer"]
         assert kwargs["prepare_references"] is True
-        assert kwargs["reference_calibration_runs"] == 16
+        assert kwargs["reference_calibration_runs"] == 8
         assert kwargs[
             "reference_calibration_workers"
         ] == _fixed_tolerance_onboarding_SPEC.reference_calibration_worker_count(args.reference_calibration_workers)
@@ -3049,6 +3099,8 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
             return ["not reference-only"]
         ctx = SimpleNamespace(cfg=cfg, spec=actual_spec, config_id=cfg.config_id, reference_records_dir=staging)
         training = cfg.effective_training
+        entries = []
+        retained_entries = []
         for index, arm in enumerate(arms):
             if state.failure == "missing-arm" and arm.name == "gas4":
                 continue
@@ -3099,7 +3151,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                 "status": "reviewed",
                 "provenance": {
                     "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
-                    "calibration_runs": 16,
+                    "calibration_runs": 8,
                     "maximum_pairwise_norm_delta": spread,
                     "worst_quantity": "layer.weight::exp_avg",
                     "multiplier": 4,
@@ -3109,7 +3161,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
             if state.failure == "legacy-provenance":
                 gate["provenance"] = "retained full-tensor gate"
             if state.failure == "wrong-runs":
-                gate["provenance"]["calibration_runs"] = 8
+                gate["provenance"]["calibration_runs"] = 16
             if state.failure == "wrong-gate":
                 gate["absolute"] = 0.002
             if state.failure == "negative-spread":
@@ -3136,13 +3188,22 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                 },
                 "optimizer_norm_gate": gate,
             }
-            path = reference_records.publish_record(ctx, identity, measurements)
+            entries.append((identity, measurements))
             if state.failure == "publication-conflict":
                 retained = json.loads(json.dumps(measurements))
                 retained["loss"] = 2.0
-                old_ctx = SimpleNamespace(reference_records_dir=args.reference_records_dir)
-                reference_records.publish_record(old_ctx, identity, retained)
-            if state.failure == "corrupt-record":
+                retained_entries.append((identity, retained))
+        published = reference_records.publish_record_set(
+            ctx, entries, expected_identities=[identity for identity, _ in entries]
+        )
+        if retained_entries:
+            reference_records.publish_record_set(
+                SimpleNamespace(reference_records_dir=args.reference_records_dir),
+                retained_entries,
+                expected_identities=[identity for identity, _ in retained_entries],
+            )
+        if state.failure == "corrupt-record":
+            for path in published.values():
                 data = json.loads(path.read_text())
                 data["payload_sha256"] = "corrupt"
                 path.write_text(json.dumps(data))
@@ -3197,7 +3258,7 @@ def test_local_cortex_optimizer_scalar_norm_publication_preserves_test1_and_per_
         assert record["identity"] == receipt["identity"]
         assert record["measurements"]["optimizer_norm_gate"] == receipt["gate"]
         assert receipt["gate"]["absolute"] == (0.001 if name == "gas1" else 0.004)
-        assert receipt["gate"]["provenance"]["calibration_runs"] == 16
+        assert receipt["gate"]["provenance"]["calibration_runs"] == 8
     assert list(state.args.reference_records_dir.glob(".optimizer-onboarding-*")) == []
 
 
@@ -3262,14 +3323,14 @@ def test_local_cortex_optimizer_scalar_norm_rejects_unreviewed_fixture_before_ca
     assert not (state.args.output_dir / "onboarding-t02.json").exists()
 
 
-@pytest.mark.parametrize(("runs", "workers"), [(5, 1), (8, 8), (0, 8), (16, 0), (16, 9)])
+@pytest.mark.parametrize(("runs", "workers"), [(5, 1), (16, 8), (0, 8), (8, 0), (8, 9)])
 def test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before_reference(
     _local_cortex_optimizer_onboarding, runs, workers
 ):
     state = _local_cortex_optimizer_onboarding
     state.args.reference_calibration_runs = runs
     state.args.reference_calibration_workers = workers
-    with pytest.raises(ValueError, match="16 repeats|1 to 8 HF workers"):
+    with pytest.raises(ValueError, match="8 repeats|1 to 8 HF workers"):
         onboard._parent(state.args)
     assert state.events == []
     assert state.args.test_spec.read_bytes() == state.previous

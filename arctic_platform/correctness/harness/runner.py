@@ -28,7 +28,6 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
@@ -873,7 +872,7 @@ def execute(
     from .reference_records import batch_identity
     from .reference_records import load_record
     from .reference_records import model_identity
-    from .reference_records import publish_record
+    from .reference_records import publish_record_set
     from .reference_records import workload_identity
 
     def reference_identity(test_id: str, arm: ArmSpec) -> dict:
@@ -918,6 +917,8 @@ def execute(
         }
         return workload_identity(context, test_id, recipe)
 
+    prepared_entries = []
+
     def prepared_reference(arm: ArmSpec) -> None:
         identities = {test.test_id: reference_identity(test.test_id, arm) for test in per_arm_tests}
         records = {}
@@ -934,7 +935,10 @@ def execute(
                 else:
                     records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
-                if not prepare_references or "prepared HF reference missing:" not in str(exc):
+                if not prepare_references or not any(
+                    message in str(exc)
+                    for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                ):
                     raise
         if len(records) != len(identities):
             if not prepare_references:
@@ -945,14 +949,13 @@ def execute(
                 from decimal import ROUND_CEILING
                 from decimal import Decimal
 
-                from tqdm.auto import tqdm
-
                 from ..checks.optimizer_state import max_pairwise_optimizer_norm_delta
                 from ..checks.optimizer_state import summarize_optimizer_artifacts
 
                 calibration_workers = reference_calibration_worker_count(
                     reference_calibration_workers, runs=reference_calibration_runs
                 )
+                print(f"Summarizing deterministic optimizer states: arm={arm.name}", flush=True)
                 compact["optimizer_norms"] = summarize_optimizer_artifacts(
                     Path(reference["optimizer_state_manifest"]),
                     optimizer_config=optimizer_config,
@@ -964,33 +967,28 @@ def execute(
                     flush=True,
                 )
                 manifests = []
-                with tqdm(
-                    total=reference_calibration_runs,
-                    desc=f"Optimizer calibration {arm.name}",
-                    unit="run",
-                    file=sys.stdout,
-                    dynamic_ncols=True,
-                    mininterval=0,
-                    miniters=1,
-                ) as progress:
-                    for start in range(0, reference_calibration_runs, calibration_workers):
-                        indices = range(start, min(start + calibration_workers, reference_calibration_runs))
-                        with ThreadPoolExecutor(max_workers=calibration_workers) as pool:
-                            futures = {
-                                pool.submit(
-                                    measure_reference,
-                                    arm,
-                                    output_name=f"{arm.name}-calibration-{index}",
-                                    cuda_device=index % calibration_workers,
-                                    deterministic=False,
-                                ): index
-                                for index in indices
-                            }
-                            completed = {}
-                            for future in as_completed(futures):
-                                completed[futures[future]] = Path(future.result()["optimizer_state_manifest"])
-                                progress.update(1)
-                            manifests.extend(completed[index] for index in indices)
+                for start in range(0, reference_calibration_runs, calibration_workers):
+                    indices = range(start, min(start + calibration_workers, reference_calibration_runs))
+                    with ThreadPoolExecutor(max_workers=calibration_workers) as pool:
+                        futures = {
+                            pool.submit(
+                                measure_reference,
+                                arm,
+                                output_name=f"{arm.name}-calibration-{index}",
+                                cuda_device=index % calibration_workers,
+                                deterministic=False,
+                            ): index
+                            for index in indices
+                        }
+                        completed = {}
+                        for index, result in console.reference_progress(
+                            futures,
+                            label=f"Optimizer calibration {arm.name}",
+                            total=reference_calibration_runs,
+                            completed=len(manifests),
+                        ):
+                            completed[index] = Path(result["optimizer_state_manifest"])
+                        manifests.extend(completed[index] for index in indices)
                 print(
                     f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
                     f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
@@ -1029,8 +1027,9 @@ def execute(
                 }
             for test_id, identity in identities.items():
                 if test_id not in records:
-                    publish_record(context, identity, compact)
                     records[test_id] = compact
+        if prepare_references:
+            prepared_entries.extend((identity, records[test_id]) for test_id, identity in identities.items())
         primary = "single-step-optimizer" if stepping else "single-step-grads"
         context._reference_by_check[arm.name] = records
         context._reference[arm.name] = records[primary]
@@ -1042,6 +1041,12 @@ def execute(
     if prepare_references:
         for test in whole_run_tests:
             list(test.fn(context))
+        if prepared_entries:
+            publish_record_set(
+                context,
+                prepared_entries,
+                expected_identities=[identity for identity, _ in prepared_entries],
+            )
         print(f"HF reference preparation complete: {len(context.reference_record_paths)} record(s)", flush=True)
         return []
 

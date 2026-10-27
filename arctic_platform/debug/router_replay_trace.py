@@ -158,29 +158,38 @@ def maybe_configure_router_replay_trace(ds_config: dict, model: Any, rank: int) 
 def maybe_record_router_replay_received(sample_id: str, routed: Any) -> None:
     """Observe the value actually removed from the trainer's RX cache."""
     if _publication is not None:
-        _active.record_received([sample_id], [routed])
+        trace = active()
+        if trace is None:
+            raise RuntimeError("router-replay publication has no active trace")
+        trace.record_received([sample_id], [routed])
 
 
 def maybe_begin_router_replay_call(engine: Any, model_kwargs: dict, *, backward: bool | str) -> None:
     """Capture every training model call, including duplicated padding schedule calls."""
     if _publication is None or backward is False:
         return
+    trace = active()
+    if trace is None:
+        raise RuntimeError("router-replay publication has no active trace")
     if getattr(engine, "global_rank", None) != _publication["rank"]:
         raise RuntimeError("router-replay trace rank differs from the executing engine")
-    if len(_active.calls) != _publication["completed"]:
+    if len(trace.calls) != _publication["completed"]:
         raise RuntimeError("previous router-replay model call has no successful backward")
-    _active.begin_call(model_kwargs, padding=False)
+    trace.begin_call(model_kwargs, padding=False)
 
 
 def maybe_complete_router_replay_call(engine: Any) -> None:
     """Publish one immutable call only after its actual backward returned successfully."""
     if _publication is None:
         return
+    trace = active()
+    if trace is None:
+        raise RuntimeError("router-replay publication has no active trace")
     rank = _publication["rank"]
     if getattr(engine, "global_rank", None) != rank:
         raise RuntimeError("router-replay completion rank differs from the executing engine")
     index = _publication["completed"]
-    if len(_active.calls) != index + 1:
+    if len(trace.calls) != index + 1:
         raise RuntimeError("router-replay backward has no unique preceding model call")
     root = _publication["output_dir"]
     root.mkdir(parents=True, exist_ok=True)
@@ -189,9 +198,9 @@ def maybe_complete_router_replay_call(engine: Any) -> None:
         "request_id": _publication["request_id"],
         "rank": rank,
         "call_index": index,
-        "received": _active.received,
-        "calls": [_active.calls[index]],
-        "unattributed_router_calls": _active.unattributed,
+        "received": trace.received,
+        "calls": [trace.calls[index]],
+        "unattributed_router_calls": trace.unattributed,
     }
     with (root / f"rank-{rank}-call-{index}.json").open("x") as stream:
         json.dump(record, stream, separators=(",", ":"))

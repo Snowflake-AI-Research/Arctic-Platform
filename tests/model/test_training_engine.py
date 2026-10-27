@@ -603,7 +603,7 @@ class _ZeroInitializationFixture:
 
 
 def test_zero_initialization_trace_records_real_allocations_without_global_patch():
-    from arctic_platform.debug.zero_initialization import initialize_with_allocation_trace
+    from arctic_platform.debug.deepspeed_zero_initialization import initialize_with_allocation_trace
 
     optimizer = _ZeroInitializationFixture()
     original_zeros = torch.zeros
@@ -632,7 +632,7 @@ def test_zero_initialization_trace_records_real_allocations_without_global_patch
 
 
 def test_zero_initialization_trace_propagates_allocation_error(monkeypatch):
-    from arctic_platform.debug.zero_initialization import initialize_with_allocation_trace
+    from arctic_platform.debug.deepspeed_zero_initialization import initialize_with_allocation_trace
 
     optimizer = _ZeroInitializationFixture()
     rows = []
@@ -658,13 +658,13 @@ def test_zero_initialization_trace_propagates_allocation_error(monkeypatch):
 
 
 def test_zero_initialization_trace_disabled_keeps_config_identity(monkeypatch):
-    from arctic_platform.debug import zero_initialization
+    from arctic_platform.debug import deepspeed_zero_initialization
 
     monkeypatch.setattr(
-        zero_initialization, "zero_optimizer_class", lambda: pytest.fail("disabled trace imported ZeRO")
+        deepspeed_zero_initialization, "zero_optimizer_class", lambda: pytest.fail("disabled trace imported ZeRO")
     )
     config = {"zero_optimization": {"stage": 2}}
-    assert zero_initialization.maybe_initialize_with_zero_allocation_trace(
+    assert deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
         lambda **kwargs: kwargs, config, 0, model="model"
     ) == {"config": config, "model": "model"}
 
@@ -675,33 +675,39 @@ def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatc
     import json
     from contextlib import nullcontext
 
-    from arctic_platform.debug import zero_initialization
+    from arctic_platform.debug import deepspeed_zero_initialization
 
     stream = io.StringIO()
-    monkeypatch.setattr(zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
-    monkeypatch.setattr(zero_initialization, "open_trace", lambda directory, rank: nullcontext(stream))
+    monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
+    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: nullcontext(stream))
     original = _ZeroInitializationFixture.initialize_optimizer_states
     config = {
-        zero_initialization.TRAINING_OPTION: {"request_id": "test", "output_dir": "/data-fast/tmp/zero-test"},
+        deepspeed_zero_initialization.TRAINING_OPTION: {
+            "request_id": "test",
+            "output_dir": "/data-fast/tmp/zero-test",
+        },
         "zero_optimization": {"stage": 2},
     }
 
     def initialize(**kwargs):
-        assert zero_initialization.TRAINING_OPTION not in kwargs["config"]
+        assert deepspeed_zero_initialization.TRAINING_OPTION not in kwargs["config"]
         if fail_before_method:
             raise RuntimeError("engine failed before optimizer")
         return _ZeroInitializationFixture().initialize_optimizer_states()
 
     if fail_before_method:
         with pytest.raises(RuntimeError, match="engine failed before optimizer"):
-            zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
+            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
     else:
-        assert zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0) == "initialized"
+        assert (
+            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
+            == "initialized"
+        )
         rows = [json.loads(line) for line in stream.getvalue().splitlines()]
         assert rows[0]["request_id"] == "test"
         assert rows[-1]["event"] == "INITIALIZATION_COMPLETE"
     assert _ZeroInitializationFixture.initialize_optimizer_states is original
-    assert zero_initialization.TRAINING_OPTION in config
+    assert deepspeed_zero_initialization.TRAINING_OPTION in config
 
 
 @pytest.mark.parametrize(
@@ -714,11 +720,11 @@ def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatc
     ],
 )
 def test_zero_initialization_trace_rejects_invalid_request(option, rank):
-    from arctic_platform.debug import zero_initialization
+    from arctic_platform.debug import deepspeed_zero_initialization
 
     with pytest.raises(ValueError):
-        zero_initialization.maybe_initialize_with_zero_allocation_trace(
+        deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
             lambda **kwargs: pytest.fail("invalid trace initialized engine"),
-            {zero_initialization.TRAINING_OPTION: option},
+            {deepspeed_zero_initialization.TRAINING_OPTION: option},
             rank,
         )
