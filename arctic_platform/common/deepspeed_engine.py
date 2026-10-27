@@ -34,8 +34,8 @@ from pydantic import ConfigDict
 
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_configure_broadcast_training
+from arctic_platform.debug.deepspeed_zero_initialization import maybe_initialize_with_zero_allocation_trace
 from arctic_platform.debug.router_replay_trace import maybe_configure_router_replay_trace
-from arctic_platform.debug.zero_initialization import maybe_initialize_with_zero_allocation_trace
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 

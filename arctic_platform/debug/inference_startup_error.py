@@ -655,7 +655,7 @@ class _Producer:
                 source.close()
             except OSError as exc:
                 errors.append(exc)
-        root, self.root = getattr(self, "root", None), None
+        root = self.__dict__.pop("root", None)
         if root is not None:
             try:
                 root.close()

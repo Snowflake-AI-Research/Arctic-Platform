@@ -76,6 +76,7 @@ from ..harness.dss_driver import forward_logprobs
 from ..harness.dss_driver import fwd_bwd_step
 from ..harness.dss_driver import gateway
 from ..harness.dss_driver import log_probs
+from ..harness.dss_driver import minimum_context_parallel_row_tokens
 from ..harness.dss_driver import pack
 from ..harness.dss_driver import pack_logit_aligned
 from ..harness.dss_driver import running_job
@@ -370,32 +371,7 @@ def training_batches(examples: Sequence[gsm8k.Example], rows_per_step: int, pad_
 
 
 def _minimum_context_parallel_row_tokens(ctx, model_path: str) -> int:
-    """Read PLE's embedding and dilated-convolution context from the actual offline config."""
-    if (
-        getattr(ctx.cfg, "config_id", None) != _FLASHNEXT_CONFIG_ID
-        or ctx.cfg.training.get("model_provider") != "prime_rl"
-    ):
-        return 0
-    sp_size = ctx.cfg.sp_size
-    if sp_size <= 1:
-        return 0
-    from transformers import AutoConfig
-
-    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
-    text = getattr(source, "text_config", source)
-    if (
-        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
-        or text.model_type != "qwen4_exp_text"
-        or type(text.num_hidden_layers) is not int
-        or text.num_hidden_layers != 48
-    ):
-        raise ValueError("context-parallel inference requires the original full48 Flash-Next text configuration")
-    ngram = getattr(text, "ngram_size", None)
-    kernel = getattr(text, "ple_conv_kernel_size", None)
-    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
-        raise ValueError("context-parallel inference requires positive integer PLE ngram and convolution sizes")
-    local_context = max(ngram - 1, (kernel - 1) * ngram)
-    return sp_size * local_context
+    return minimum_context_parallel_row_tokens(ctx.cfg, model_path)
 
 
 def _extend_short_causal_rows(batch: Batch, minimum_tokens: int, pad_id: int) -> Batch:

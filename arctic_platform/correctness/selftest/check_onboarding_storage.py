@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import sys
+from dataclasses import replace
 from decimal import ROUND_CEILING
 from decimal import Decimal
 from pathlib import Path
@@ -3010,6 +3011,123 @@ def test_reference_storage_reference_fast_optimizer_output_still_reaches_engine(
 
 
 # Checkpoint onboarding.
+
+
+@pytest.fixture
+def _checkpoint_onboarding_initial_rl(_cortex_checkpoint_rl_config, _onboarding_checkout_roots, monkeypatch):
+    args, config, original_path = _cortex_checkpoint_rl_config
+    library, _ = _onboarding_checkout_roots
+    model = replace(
+        ConfigSpec.read(original_path).model, num_hidden_layers=48, seed=None, param_count=None, sized_against_gib=None
+    )
+    args.test_spec = library / "arctic_platform/correctness/specs" / f"{config.config_id}.json"
+    args.tokens = _fixed_tolerance_onboarding_SPEC.arms_for(config.max_seq_len, config.n_gpus)[0].max_seq_len
+    args.source_checkpoint = model.cache_path
+    args.backend = "onprem"
+    calls = []
+
+    def describe(source):
+        assert source == args.source_checkpoint
+        calls.append(("source", source))
+        return model, 256, {"tensor_payloads_read": False, "synthetic_control": True}
+
+    def measure(training, source, **kwargs):
+        assert not args.test_spec.exists()
+        assert training is config.training and source == model.cache_path
+        assert kwargs["slots"] == config.n_gpus
+        assert [arm.name for arm in kwargs["arms"]] == ["gas1", "gas4"]
+        assert all(arm.max_seq_len == args.tokens for arm in kwargs["arms"])
+        calls.append(("measure", source))
+        return 0.1001, "gas4 loss at iteration 10"
+
+    def validate(run_args, selected, **kwargs):
+        published = ConfigSpec.read(run_args.test_spec)
+        assert selected == {"layers": 48} and kwargs == {"phase": "phase 2/2"}
+        assert published.model == model and published.config_checksum == config_checksum(config)
+        assert published.applicable_tests == ["checkpoint-resume-loss"]
+        assert published.test_tolerances["checkpoint-resume-loss"].absolute == 0.201
+        assert published.test_settings["checkpoint-resume-loss"]["source_metadata"]["tensor_payloads_read"] is False
+        calls.append(("validate", model.cache_path))
+        return _fixed_tolerance_onboarding_regression("pass")(run_args, selected)
+
+    monkeypatch.setattr(synth_model, "describe_source_model", describe)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoConfig=SimpleNamespace(from_pretrained=lambda *a, **kw: SimpleNamespace(vocab_size=256))),
+    )
+    monkeypatch.setattr(checkpoint_resume, "measure_undeterministic_loss_range", measure)
+    monkeypatch.setattr(onboard, "_run_final_regression", validate)
+    monkeypatch.setattr(onboard, "_prepare_references", _onboarding_storage_unexpected)
+    return args, config, model, calls
+
+
+def test_checkpoint_onboarding_initial_rl_calibrates_original_model_without_supervised_reference(
+    _checkpoint_onboarding_initial_rl,
+):
+    args, config, model, calls = _checkpoint_onboarding_initial_rl
+    original_config = args.config.read_bytes()
+    assert onboard._onboard_checkpoint_resume(args, config) == 0
+    assert [call[0] for call in calls] == ["source", "measure", "validate"]
+    assert ConfigSpec.read(args.test_spec).model == model
+    assert args.config.read_bytes() == original_config
+    manifest = json.loads((args.output_dir / "onboarding-checkpoint-resume-loss.json").read_text())
+    assert manifest["bootstrapped_reference_free_rl"] is True
+    assert manifest["num_hidden_layers"] == 48 and manifest["absolute"] == 0.201
+
+
+def test_checkpoint_onboarding_initial_rl_calibration_failure_publishes_nothing(
+    _checkpoint_onboarding_initial_rl, monkeypatch
+):
+    args, config, _, _ = _checkpoint_onboarding_initial_rl
+
+    def fail(*a, **kw):
+        raise RuntimeError("calibration failed")
+
+    monkeypatch.setattr(checkpoint_resume, "measure_undeterministic_loss_range", fail)
+    with pytest.raises(RuntimeError, match="calibration failed"):
+        onboard._onboard_checkpoint_resume(args, config)
+    assert not args.test_spec.exists()
+    assert not list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+    assert not (args.output_dir / "onboarding-checkpoint-resume-loss.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["failed", "error", "interrupt"])
+def test_checkpoint_onboarding_initial_rl_failed_validation_archives_candidate(
+    _checkpoint_onboarding_initial_rl, monkeypatch, failure
+):
+    args, config, model, _ = _checkpoint_onboarding_initial_rl
+
+    def fail(run_args, selected, **kwargs):
+        assert ConfigSpec.read(run_args.test_spec).model == model
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        return _fixed_tolerance_onboarding_regression(failure)(run_args, selected)
+
+    monkeypatch.setattr(onboard, "_run_final_regression", fail)
+    with pytest.raises(KeyboardInterrupt if failure == "interrupt" else RuntimeError):
+        onboard._onboard_checkpoint_resume(args, config)
+    assert not args.test_spec.exists()
+    candidates = list(args.output_dir.glob("unvalidated-rl-spec-*.json"))
+    assert len(candidates) == 1
+    assert ConfigSpec.read(candidates[0]).model == model
+    assert not (args.output_dir / "onboarding-checkpoint-resume-loss.json").exists()
+
+
+@pytest.mark.parametrize("invalid", ["destination", "tokens"])
+def test_checkpoint_onboarding_initial_rl_rejects_changed_destination_or_width_before_source(
+    _checkpoint_onboarding_initial_rl, invalid
+):
+    args, config, _, calls = _checkpoint_onboarding_initial_rl
+    if invalid == "destination":
+        args.test_spec = args.output_dir / "custom.json"
+        error = "canonical spec"
+    else:
+        args.tokens //= 2
+        error = "config-derived"
+    with pytest.raises(ValueError, match=error):
+        onboard._onboard_checkpoint_resume(args, config)
+    assert calls == [] and not args.test_spec.exists()
 
 
 @pytest.fixture

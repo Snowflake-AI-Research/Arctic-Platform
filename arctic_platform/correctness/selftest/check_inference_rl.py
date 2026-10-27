@@ -593,7 +593,13 @@ def test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_eac
     "composite,ngram,kernel,expected",
     [(True, 3, 4, 144), (False, 2, 7, 192), (True, 5, 1, 64)],
 )
-def test_inference_ple_padding_floor_uses_effective_offline_config(monkeypatch, composite, ngram, kernel, expected):
+@pytest.mark.parametrize(
+    "config_id",
+    [check._FLASHNEXT_CONFIG_ID, "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k"],
+)
+def test_inference_ple_padding_floor_uses_effective_offline_config(
+    monkeypatch, composite, ngram, kernel, expected, config_id
+):
     text = SimpleNamespace(
         model_type="qwen4_exp_text",
         num_hidden_layers=48,
@@ -602,7 +608,7 @@ def test_inference_ple_padding_floor_uses_effective_offline_config(monkeypatch, 
     )
     source = SimpleNamespace(model_type="qwen4_exp", text_config=text) if composite else text
     cfg = SimpleNamespace(
-        config_id=check._FLASHNEXT_CONFIG_ID,
+        config_id=config_id,
         sp_size=16,
         training={"model_provider": "prime_rl"},
     )
@@ -643,7 +649,7 @@ def test_inference_ple_padding_refuses_missing_invalid_or_reduced_config(monkeyp
         sp_size=16,
         training={"model_provider": "prime_rl"},
     )
-    with pytest.raises(ValueError, match="context-parallel inference requires"):
+    with pytest.raises(ValueError, match="context-parallel Flash-Next requires"):
         check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "/actual/local/model")
 
 
@@ -2940,7 +2946,9 @@ def test_inference_sampling_topology_production_client_cortex_serializer_remains
     before = deepcopy(config.model_dump())
     sub = config.to_cortex()[0]
     assert sub["inference_config"]["n_gpus"] == 4
-    assert "tensor_parallel_size" not in sub["inference_config"]["vllm_config"]
+    expected = deepcopy(config.sampling.vllm)
+    expected.pop("max_model_len", None)
+    assert sub["inference_config"]["vllm_config"] == expected
     assert config.model_dump() == before
 
 
@@ -5503,6 +5511,21 @@ def test_router_replay_evidence_disabled_helpers_leave_inputs_unchanged():
     assert replay_evidence.active() is None
 
 
+@pytest.mark.parametrize("operation", ["receive", "begin", "complete"])
+def test_router_replay_evidence_rejects_publication_without_active_trace(
+    _router_replay_evidence_case, monkeypatch, operation
+):
+    engine, kwargs, _ = _router_replay_evidence_case
+    monkeypatch.setattr(replay_evidence, "_active", None)
+    with pytest.raises(RuntimeError, match="publication has no active trace"):
+        if operation == "receive":
+            replay_evidence.maybe_record_router_replay_received("sample", None)
+        elif operation == "begin":
+            replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward=True)
+        else:
+            replay_evidence.maybe_complete_router_replay_call(engine)
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -5946,10 +5969,56 @@ def test_rl_checks_rl_batch_uses_native_scalar_temperature_boundary():
     }
 
 
+@pytest.mark.parametrize("long_row", [False, True])
+def test_rl_checks_minimum_causal_tail_survives_packing_without_scoring_extra_tokens(long_row):
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import token_shard
+
+    rows = [list(range(1, 182)) if long_row else [5, 6, 7, 8], [9, 4]]
+    starts = [2, 1]
+    original = rl_batch(rows, starts, pad_id=0)
+    request = rl_batch(rows, starts, pad_id=0, minimum_row_tokens=144)
+    _, batch, _, _ = unpack_batch(request)
+    width = batch["input_ids"].shape[1]
+    batch["position_ids"] = torch.arange(width).expand(len(rows), width).clone()
+    for index, row in enumerate(rows):
+        length = len(row)
+        assert batch["input_ids"][index, :length].tolist() == row
+        assert batch["input_ids"][index, length:].eq(0).all()
+        assert torch.equal(
+            batch["loss_mask"][index, :length],
+            original["context"]["loss_mask"][index, :length],
+        )
+        assert batch["loss_mask"][index, length - 1 :].eq(0).all()
+    for indices in ([0], [1], [0, 1]):
+        group = {key: value[indices] for key, value in batch.items()}
+        packed, metadata = pack_microbatch(group)
+        assert metadata.valid_lengths.tolist() == [max(len(rows[index]), 144) for index in indices]
+        selected = packed["loss_mask"].bool()
+        expected_targets = [rows[index][starts[index] :] for index in indices]
+        assert packed["input_ids"].roll(-1, dims=1)[selected].tolist() == [
+            token for targets in expected_targets for token in targets
+        ]
+        assert int(selected.sum()) == sum(len(rows[index]) - starts[index] for index in indices)
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        shards = [token_shard(packed, metadata, 16, rank) for rank in range(16)]
+        assert all(shard["input_ids"].shape[1] >= 9 for shard in shards)
+        for field in ("input_ids", "position_ids", "loss_mask", "advantages"):
+            assert torch.equal(torch.cat([shard[field] for shard in shards], dim=1), packed[field])
+
+
+@pytest.mark.parametrize("minimum", [-1, True, 1.5])
+def test_rl_checks_rl_batch_rejects_invalid_minimum_row_tokens(minimum):
+    with pytest.raises(ValueError, match="minimum_row_tokens must be a nonnegative integer"):
+        rl_batch([[1, 2]], [1], pad_id=0, minimum_row_tokens=minimum)
+
+
 @pytest.mark.parametrize("check", [rl_weight_sync, rl_router_replay], ids=["weight-sync", "router-replay"])
 @pytest.mark.parametrize("local_model", [False, True], ids=["frozen-catalog-model", "configured-local-model"])
+@pytest.mark.parametrize("minimum_row_tokens", [0, 144], ids=["original-rows", "context-parallel-tail"])
 def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
-    tmp_path, monkeypatch, check, local_model
+    tmp_path, monkeypatch, check, local_model, minimum_row_tokens
 ):
     cfg = load_config(_rl_config_CONFIG)
     if local_model:
@@ -5996,6 +6065,13 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
     ]
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
     generated_samples = []
+    padding_inputs = []
+
+    def minimum_context_parallel_row_tokens(actual_cfg, model_path):
+        assert actual_cfg is cfg
+        assert model_path == cfg.model_name
+        padding_inputs.append((actual_cfg, model_path))
+        return minimum_row_tokens
 
     def load_tokenizer(path):
         tokenizer_paths.append(path)
@@ -6063,6 +6139,7 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
     monkeypatch.setattr(check.gsm8k, "read_rows", read_rows)
     monkeypatch.setattr(check.gsm8k, "tokenize_examples", tokenize_examples)
     monkeypatch.setattr(rl_driver, "RLClient", Client)
+    monkeypatch.setattr(rl_weight_sync, "minimum_context_parallel_row_tokens", minimum_context_parallel_row_tokens)
     if check is rl_router_replay:
 
         def collect(option, response, *, ranks):
@@ -6102,13 +6179,21 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
     assert native.training.ds_worker_config["attn_implementation"] == cfg.attention_implementation
     assert native.training.checkpoint_path == str(tmp_path / check.TEST_ID / "gateway" / "checkpoints")
     batch, replay = batches[0]
-    assert batch["kwargs"]["input_ids"].tolist() == [list(example.input_ids) for example in examples]
+    width = max(3, minimum_row_tokens) if check is rl_weight_sync else 3
+    assert batch["kwargs"]["input_ids"].tolist() == [
+        [*example.input_ids, *([0] * (width - len(example.input_ids)))] for example in examples
+    ]
+    assert batch["kwargs"]["attention_mask"].tolist() == [[1] * width for _ in examples]
+    assert batch["context"]["loss_mask"].tolist() == [[0.0, 1.0, *([0.0] * (width - 2))] for _ in examples]
     if check is rl_weight_sync:
+        assert padding_inputs == [(cfg, cfg.model_name)]
+        assert result.metrics["training_minimum_context_parallel_row_tokens"] == float(minimum_row_tokens)
         assert native.training.ds_worker_config["debug"]["weight_sync_manifest"] is True
         assert replay is None
         assert rates == [check.configured_learning_rate(cfg)]
         assert generations == []
     else:
+        assert padding_inputs == []
         assert native.training.ds_worker_config["router_replay"]["enabled"] is True
         assert replay == {
             "sampling_job_id": "native-sampling-job",

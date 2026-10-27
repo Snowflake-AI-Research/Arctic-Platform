@@ -333,7 +333,14 @@ class LoadedConfig:
     @property
     def lm_head_token_chunk_size(self) -> int | None:
         """Resolve an integer chunk size; runtime sentinels such as ``disabled`` mean no chunking."""
-        value = self.effective_training.get("fused_lm_head_token_chunk_size")
+        options = self.training.get("model_options") or {}
+        lm_head = options.get("lm_head") or {}
+        if "lm_head.token_chunk_size" in options:
+            value = options["lm_head.token_chunk_size"]
+        elif "token_chunk_size" in lm_head:
+            value = lm_head["token_chunk_size"]
+        else:
+            value = self.effective_training.get("fused_lm_head_token_chunk_size")
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         return None

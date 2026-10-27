@@ -127,7 +127,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     if model.config.model_type == "qwen3":
         from transformers.loss.loss_utils import ForCausalLMLoss
 
-        from arctic_platform.sft.chunked_cross_entropy import chunked_causal_lm_loss
+        from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 
         if model.loss_function is ForCausalLMLoss:
             model.loss_function = chunked_causal_lm_loss

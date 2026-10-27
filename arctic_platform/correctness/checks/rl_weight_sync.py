@@ -49,6 +49,7 @@ from ..harness.batches import SEED
 from ..harness.dss_driver import UnsafeCleanupError
 from ..harness.dss_driver import build_payload
 from ..harness.dss_driver import find_key
+from ..harness.dss_driver import minimum_context_parallel_row_tokens
 from ..harness.dss_driver import rl_batch
 from ..harness.dss_driver import rl_fwd_bwd
 from ..harness.dss_driver import running_rl_client
@@ -105,7 +106,13 @@ def _run(ctx) -> TestResult:
     pad_id = gsm8k.padding_token_id(tokenizer)
     learning_rate = configured_learning_rate(cfg)
     examples = gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(TRAIN_SPLIT, count=configured_rows_per_step(cfg)))
-    batch = rl_batch([e.input_ids for e in examples], [e.n_prompt for e in examples], pad_id)
+    minimum_row_tokens = minimum_context_parallel_row_tokens(cfg, model_path)
+    batch = rl_batch(
+        [e.input_ids for e in examples],
+        [e.n_prompt for e in examples],
+        pad_id,
+        minimum_row_tokens=minimum_row_tokens,
+    )
 
     training = build_payload(cfg.training, model_path, SEED, attn_implementation=ctx.attn_implementation)
     training["training_config"]["debug"]["weight_sync_manifest"] = True
@@ -128,7 +135,14 @@ def _run(ctx) -> TestResult:
         sync = sync_weights(client)
 
     failures, metrics = judge(sync)
-    metrics.update({"learning_rate": learning_rate, "train_rows": float(len(examples)), "train_loss": loss})
+    metrics.update(
+        {
+            "learning_rate": learning_rate,
+            "train_rows": float(len(examples)),
+            "train_loss": loss,
+            "training_minimum_context_parallel_row_tokens": float(minimum_row_tokens),
+        }
+    )
     return verdict(ctx, failures, metrics, weight_format=str(sync.get("weight_format")))
 
 

@@ -4057,6 +4057,76 @@ def test_lora_worker_preserves_post_constructor_source_error_when_shutdown_fails
 # Lora sync hooks.
 
 
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_lora_hooks_ordinary_transfer_loads_checksum_helpers_only_for_schedule(monkeypatch, scheduled):
+    monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
+    received = {"workers": [{"recv_l2_sq": 3.0}, {"recv_l2_sq": 3.0}]}
+    sent = [{"sent_l2_sq": 3.0}, {"sent_l2_sq": 3.0}]
+    result = {"status": "ok"}
+    imports = []
+
+    async def collect(receive_task, send_tasks):
+        return received, sent
+
+    def format_result(actual_received, actual_sent):
+        assert actual_received is received and actual_sent is sent
+        return result
+
+    def received_checksums(labels, workers):
+        assert labels == ["sampling replica 0", "sampling replica 1"]
+        assert workers is received["workers"]
+        return {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
+
+    def compare_weight_checksums(training, sampling):
+        assert training == {"training rank 2": 3.0, "training rank 5": 3.0}
+        assert sampling == {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
+        return {"checksum_match": True}
+
+    def load_module(name):
+        assert scheduled, "an unscheduled transfer loaded optional utilities"
+        imports.append(name)
+        return {
+            "arctic_platform.common.utils.weight_sync": SimpleNamespace(received_checksums=received_checksums),
+            "arctic_platform.common.weight_checksum": SimpleNamespace(
+                compare_weight_checksums=compare_weight_checksums
+            ),
+        }[name]
+
+    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", format_result)
+    monkeypatch.setattr(hooks, "import_module", load_module)
+    server = SimpleNamespace(_await_weight_sync_refs=collect)
+    schedule = (
+        SimpleNamespace(groups=[SimpleNamespace(sender_train_rank=rank) for rank in (2, 5)]) if scheduled else None
+    )
+
+    actual = asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=schedule))
+
+    assert actual is result
+    assert actual == {"status": "ok", **({"checksum_match": True} if scheduled else {})}
+    assert imports == (
+        ["arctic_platform.common.utils.weight_sync", "arctic_platform.common.weight_checksum"] if scheduled else []
+    )
+
+
+def test_lora_hooks_scheduled_transfer_preserves_optional_import_failure(monkeypatch):
+    monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
+    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", lambda received, sent: {"status": "ok"})
+    error = ImportError("transfer utilities unavailable")
+
+    async def collect(receive_task, send_tasks):
+        return {}, []
+
+    def load_module(name):
+        assert name == "arctic_platform.common.utils.weight_sync"
+        raise error
+
+    monkeypatch.setattr(hooks, "import_module", load_module)
+    server = SimpleNamespace(_await_weight_sync_refs=collect)
+    with pytest.raises(ImportError, match="transfer utilities unavailable") as caught:
+        asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=Schedule()))
+    assert caught.value is error
+
+
 class Server:
     weight_sync_ready = False
 

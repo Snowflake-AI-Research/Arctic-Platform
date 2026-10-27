@@ -1339,8 +1339,26 @@ def build_payload(
     weight_format: Optional[str] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
-    if lm_head_token_chunk_size is not None:
+    options = tc.get("model_options") or {}
+    lm_head_options = options.get("lm_head") or {}
+    canonical_chunk = "lm_head.token_chunk_size" in options or "token_chunk_size" in lm_head_options
+    prime_rl = tc.get("prime_rl") or {}
+    nested_chunk = "fused_lm_head_token_chunk_size" in prime_rl
+    if lm_head_token_chunk_size is not None and not canonical_chunk and not nested_chunk:
         tc.setdefault("fused_lm_head_token_chunk_size", lm_head_token_chunk_size)
+    chunk_size = tc.get("fused_lm_head_token_chunk_size")
+    ep_size = tc.get("ep_size", 1)
+    if (
+        type(ep_size) is int
+        and ep_size > 1
+        and not canonical_chunk
+        and not nested_chunk
+        and isinstance(chunk_size, int)
+        and not isinstance(chunk_size, bool)
+        and chunk_size > 0
+    ):
+        # DSS's canonical option reaches both the loss handler and the MoE model loader.
+        tc["model_options"] = {**options, "lm_head.token_chunk_size": chunk_size}
     if attn_implementation is not None:
         tc["attn_implementation"] = attn_implementation
     mb_spec = dict(tc.get("mb_spec") or {})
@@ -1725,22 +1743,61 @@ def step(client: RLClient, learning_rate: float) -> dict:
     return client.step(learning_rate)
 
 
-def rl_batch(rows: Sequence[Sequence[int]], loss_starts: Sequence[int], pad_id: int) -> Dict:
+def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
+    """Read PLE's required shard context from the configured full Flash-Next model."""
+    if (
+        getattr(cfg, "config_id", None)
+        not in (
+            "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
+            "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
+        )
+        or cfg.training.get("model_provider") != "prime_rl"
+        or cfg.sp_size <= 1
+    ):
+        return 0
+    from transformers import AutoConfig
+
+    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    text = getattr(source, "text_config", source)
+    if (
+        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
+        or text.model_type != "qwen4_exp_text"
+        or type(text.num_hidden_layers) is not int
+        or text.num_hidden_layers != 48
+    ):
+        raise ValueError("context-parallel Flash-Next requires the original full48 text configuration")
+    ngram = getattr(text, "ngram_size", None)
+    kernel = getattr(text, "ple_conv_kernel_size", None)
+    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
+        raise ValueError("context-parallel Flash-Next requires positive integer PLE ngram and convolution sizes")
+    return cfg.sp_size * max(ngram - 1, (kernel - 1) * ngram)
+
+
+def rl_batch(
+    rows: Sequence[Sequence[int]],
+    loss_starts: Sequence[int],
+    pad_id: int,
+    *,
+    minimum_row_tokens: int = 0,
+) -> Dict:
     """Right-padded RL batch in the format ``tests/sp/sp_gateway_harness.py:padded_rl_batch`` sends.
 
     ``loss_mask`` is logit aligned: the entry at ``s`` weights the prediction of the token at ``s + 1``, so a
     row whose scored tokens begin at ``p`` carries ones over ``p - 1`` through ``len(row) - 2``.
+    A minimum row length adds attention-active, loss-free causal tails so packing retains the shard context.
     """
     import torch
 
-    width = max(len(row) for row in rows)
+    if type(minimum_row_tokens) is not int or minimum_row_tokens < 0:
+        raise ValueError("minimum_row_tokens must be a nonnegative integer")
+    width = max(minimum_row_tokens, max(len(row) for row in rows))
     count = len(rows)
     input_ids = torch.full((count, width), int(pad_id), dtype=torch.long)
     attention_mask = torch.zeros(count, width, dtype=torch.long)
     loss_mask = torch.zeros(count, width, dtype=torch.float32)
     for index, (row, start) in enumerate(zip(rows, loss_starts, strict=True)):
         input_ids[index, : len(row)] = torch.tensor(list(row), dtype=torch.long)
-        attention_mask[index, : len(row)] = 1
+        attention_mask[index, : max(len(row), minimum_row_tokens)] = 1
         loss_mask[index, start - 1 : len(row) - 1] = 1.0
     return {
         "args": (),

@@ -77,7 +77,10 @@ from arctic_platform.correctness.harness.transport import Checkpoint
 from arctic_platform.testing_utils import torch_assert_equal
 
 from .check_catalog_configuration import _applicable_tests_spec
+
+# Importing the autouse fixture isolates operator config imports from the real catalog.
 from .check_operator_interface import _cli_config_selection_write_config
+from .check_operator_interface import _external_operator_catalog  # noqa: F401
 
 # Client backends.
 
@@ -2006,6 +2009,80 @@ def test_cortex_model_identity_cortex_e2e_without_published_identity_never_creat
 
 _driver_reviewed_root = Path(__file__).resolve().parents[1]
 _driver_reviewed_rl_config = _driver_reviewed_root / "configs/qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+
+
+def test_driver_reviewed_build_payload_forwards_top_level_moe_chunk_through_model_options():
+    cfg = load_config(_driver_reviewed_rl_config)
+    before = deepcopy(cfg.training)
+    assert cfg.training["fused_lm_head_token_chunk_size"] == 1024
+    assert "fused_lm_head_token_chunk_size" not in cfg.training["prime_rl"]
+    payload = build_payload(cfg.training, "model", 42, lm_head_token_chunk_size=2048)
+    training = payload["training_config"]
+    assert training["model_options"]["lm_head.token_chunk_size"] == 1024
+    assert training["fused_lm_head_token_chunk_size"] == 1024
+    assert training["prime_rl"] == cfg.training["prime_rl"]
+    assert cfg.training == before
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"prime_rl": {"fused_lm_head_token_chunk_size": 4096}},
+        {"prime_rl": {"fused_lm_head_token_chunk_size": "disabled"}},
+        {"prime_rl": {"fused_lm_head_token_chunk_size": None}},
+        {"fused_lm_head_token_chunk_size": "disabled"},
+        {"fused_lm_head_token_chunk_size": None},
+        {"model_options": {"lm_head": {"token_chunk_size": 4096}}},
+        {"model_options": {"lm_head.token_chunk_size": 4096}},
+    ],
+)
+def test_driver_reviewed_build_payload_preserves_explicit_chunk_settings(settings):
+    training = {"ep_size": 8, **deepcopy(settings)}
+    before = deepcopy(training)
+    result = build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
+    for key, value in settings.items():
+        assert result[key] == value
+    assert result.get("model_options") == settings.get("model_options")
+    assert result.get("fused_lm_head_token_chunk_size") == settings.get("fused_lm_head_token_chunk_size")
+    assert training == before
+
+
+def test_driver_reviewed_build_payload_moe_chunk_fallback_preserves_other_options():
+    training = {
+        "ep_size": 8,
+        "model_options": {"attention": {"backend": "qsa_flex"}},
+        "prime_rl": {"fused_cross_entropy": False},
+    }
+    before = deepcopy(training)
+    result = build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
+    assert result["fused_lm_head_token_chunk_size"] == 2048
+    assert result["model_options"] == {
+        "attention": {"backend": "qsa_flex"},
+        "lm_head.token_chunk_size": 2048,
+    }
+    assert training == before
+
+
+@pytest.mark.parametrize("ep_size", [None, "invalid", True, {}, 1])
+def test_driver_reviewed_build_payload_chunk_does_not_coerce_ep_size(ep_size):
+    training = {"ep_size": ep_size, "fused_lm_head_token_chunk_size": 1024}
+    result = build_payload(training, "model", 42)["training_config"]
+    assert result["ep_size"] == ep_size
+    assert result["fused_lm_head_token_chunk_size"] == 1024
+    assert "model_options" not in result
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"lm_head": {"token_chunk_size": 4096}},
+        {"lm_head.token_chunk_size": 4096},
+    ],
+)
+def test_driver_reviewed_config_reads_canonical_lm_head_chunk_size(options):
+    cfg = load_config(_driver_reviewed_rl_config)
+    cfg.training["model_options"] = options
+    assert cfg.lm_head_token_chunk_size == 4096
 
 
 @pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])

@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import torch
 
+from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.common.registry import LOSS_FNS
-from arctic_platform.sft.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.sft.processor import LOGIT_LOSS_FNS
 from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
 from arctic_platform.sft.processor import SFT_LOSS_FNS

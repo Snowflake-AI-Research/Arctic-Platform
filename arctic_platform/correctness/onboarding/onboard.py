@@ -1736,14 +1736,19 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
     test_id = args.test_id
     if test_id != TEST_ID:
         raise ValueError(f"{test_id} is not the checkpoint-resume check")
-    if not args.test_spec.exists():
+    bootstrap = config.is_rl and not args.test_spec.exists()
+    if bootstrap:
+        previous_spec = None
+        spec = _build_reference_free_rl_spec(args, config)
+    elif not args.test_spec.exists():
         raise ValueError(
             f"{test_id} reads the reduced model an onboarded config already has, so it requires an "
             f"existing reviewed spec at {args.test_spec}; onboard single-step-grads for "
             f"{config.config_id} first"
         )
-    previous_spec = args.test_spec.read_bytes()
-    spec = TestSpec.read(args.test_spec)
+    else:
+        previous_spec = args.test_spec.read_bytes()
+        spec = TestSpec.read(args.test_spec)
     if spec.config_id != config.config_id:
         raise ValueError(f"spec {spec.config_id!r} does not describe config {config.config_id!r}")
     current_checksum = config_checksum(config)
@@ -1805,7 +1810,12 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
         validation = _run_final_regression(args, {"layers": layers}, phase="phase 2/2")
         _require_validation_pass(validation, test_id, config_id=config.config_id)
     except BaseException:
-        args.test_spec.write_bytes(previous_spec)
+        if previous_spec is None:
+            if args.test_spec.exists():
+                failed_spec = args.output_dir / f"unvalidated-rl-spec-{time.time_ns()}.json"
+                shutil.move(str(args.test_spec), str(failed_spec))
+        else:
+            args.test_spec.write_bytes(previous_spec)
         raise
     manifest = {
         "config_id": config.config_id,
@@ -1821,6 +1831,7 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
         "num_hidden_layers": layers,
         "applicable_tests": spec.applicable_tests,
         "test_spec": str(args.test_spec),
+        "bootstrapped_reference_free_rl": bootstrap,
         "validation_attempts": [validation],
         "validated_report": validation["report"],
     }
