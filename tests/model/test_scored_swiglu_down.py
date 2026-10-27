@@ -81,10 +81,9 @@ def _saved_activation_bytes(fn, rows: int):
     return out, sum(saved)
 
 
-@pytest.mark.parametrize("fp8_block_size", [None, 128])
 @pytest.mark.parametrize("pad", [0, 9])
-def test_scored_experts_match_scaling_the_outputs_and_keep_no_output_copy(fp8_block_size, pad):
-    experts = _experts(fp8_block_size)
+def test_scored_experts_match_scaling_the_outputs_and_keep_no_output_copy(pad):
+    experts = _experts(128)
     counts, x, scores, grad = _inputs(pad)
     routed = int(counts.sum())
 
@@ -104,8 +103,7 @@ def test_scored_experts_match_scaling_the_outputs_and_keep_no_output_copy(fp8_bl
     assert _rel(x.grad[:routed], expected_dx[:routed]) < 1e-2
     assert _rel(scores.grad[:routed], expected_ds[:routed]) < 1e-2
     assert (out[routed:] == 0).all() and (scores.grad[routed:] == 0).all()
-    if fp8_block_size is not None:
-        assert (x.grad[routed:] == 0).all()
+    assert (x.grad[routed:] == 0).all()
     # Scaling afterwards keeps the [rows, dim] expert output for the score gradient; the folded path keeps nothing else.
     assert expected_saved - saved == x.shape[0] * _DIM * 2
 
@@ -139,6 +137,18 @@ def test_scored_swiglu_down_gradients_match_autograd_reference(limit):
     assert _rel(gate_grad, g64.grad) < 2e-2
     assert _rel(up_grad, u64.grad) < 2e-2
     assert _rel(scores.grad, s64.grad) < 1e-2
+
+
+def test_bf16_experts_keep_scaling_the_outputs():
+    # BF16 routed experts run through SonicMoE on the EP receive buffer; the grouped path scales afterwards.
+    experts = _experts(None)
+    counts, x, scores, _ = _inputs(9)
+
+    out = experts(x, counts, scores)
+    expected = apply_routing_weights(experts(x, counts), scores)
+
+    assert type(out.grad_fn).__name__ == "_ApplyRoutingWeightsBackward"
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_down_projection_lora_keeps_scaling_the_outputs():
