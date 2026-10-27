@@ -167,7 +167,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
 - **CRIU dump is destructive.** The child is killed once the image is written,
   so after `criu_dump` the model is always `saved` with no live process.
 - **A serving image's directory is derived, and the name is the cache key.**
-  `restore_and_wrap` computes
+  `restore_engine` computes
   `$SEMIP_IMAGE_CACHE/<sha256(vllm_config [+ device nodes])>_<sha256(image
   digest + driver)>[/replica<K>]` before it knows whether an image exists;
   there is no `semi_p_model_dir` job field, and `SEMIP_IMAGE_CACHE` defaults to
@@ -209,7 +209,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   cache miss, never an error, so the checks are strict on purpose. See
   `IMAGE_CACHE.md` Section 9.
 - **A miss fails the job unless it sets `SEMIP_DUMP_PUBLISH=1`.** There is no
-  plain-engine fallback. Without the flag `restore_and_wrap` raises, telling
+  plain-engine fallback. Without the flag `restore_engine` raises, telling
   the user to set `semi_p` to false (or remove it) and resubmit, or to add the
   flag. With it (in `vllm_config.extra_env`) the engine cold-starts, dumps,
   restores and serves, then publishes in the background (`_start_publish`
@@ -345,7 +345,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   without `CAP_SYS_ADMIN` needs `SEMIP_UNPRIVILEGED=1` set *when the image was
   dumped*, so the child sheds its capabilities and `restore_creds` can reinstate
   them. An image dumped without it cannot be restored there at all. The
-  serving adapter now defaults it to `1` (`restore_and_wrap`) and records the
+  serving restore now defaults it to `1` (`restore_engine`) and records the
   effective value in `meta.json` as `unprivileged`; a local image dumped under
   the other value refuses to restore, and a published one is a miss. See
   Complication 11.
@@ -423,7 +423,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   threads live only under `/proc/<pid>/task`. `criu_restore` preflights this and
   names the occupants; `scripts/pidcheck.py <image>` answers it up front, and
   `--burn-to 200000` before a cold start puts a new image's ids out of
-  contention for good. The serving adapter does that burn itself now
+  contention for good. The serving restore does that burn itself now
   (`SEMIP_PID_FLOOR`, 100000 by default, recorded in `meta.json`), because a
   *published* image is restored in a pod whose launcher holds the low ids by
   construction. See Complication 8 and `IMAGE_CACHE.md` §8.
@@ -471,7 +471,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
 | [`MULTINODE_TP16.md`](MULTINODE_TP16.md) | `nnodes > 1`: one engine across two pods. Why NCCL will not let a captured graph's communicator go (so the dump **drops** its graphs and the restore recaptures), the `MultiNode` parameter that keeps node identity out of the cache key, the pinned aws-ofi-nccl values that make a restore bit-identical, the joint `dump_id` protocol, and the measured numbers |
 | [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image — and why an image also has a warmth that nothing records |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |
-| [`dss_integration.md`](dss_integration.md) | Restoring an image from a DSS sampling job: the cross-repo config contract, the worker hook, the adapter |
+| [`dss_integration.md`](dss_integration.md) | Restoring an image from a DSS sampling job: the cross-repo config contract, the worker hook, the `AsyncLLM` front end |
 | [`IMAGE_CACHE.md`](IMAGE_CACHE.md) | The derived two-hash cache key, the node model-cache pipeline an image rides, how a miss is filled from the mirror, the multi-replica layout (§1), and the 2026-10-03 multi-replica roll with timings (§11) |
 | [`INSTALL.md`](INSTALL.md) | CRIU install (PPA and from-source), draft model sync |
 

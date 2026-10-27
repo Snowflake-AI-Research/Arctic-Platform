@@ -73,21 +73,6 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     return _stop_token_ids(eos, tokenizer)
 
 
-def _semip_grammar_stop_token_ids(model: str, tokenizer: Any) -> tuple[int, ...]:
-    """``_grammar_stop_token_ids`` for a restored engine, which has no vllm_config.
-
-    Reads the same generation config vLLM's default ``generation_config="auto"``
-    does.
-    """
-    from transformers import GenerationConfig
-
-    try:
-        eos = GenerationConfig.from_pretrained(model).eos_token_id
-    except OSError:
-        eos = None
-    return _stop_token_ids(eos, tokenizer)
-
-
 def _stop_token_ids(eos: Any, tokenizer: Any) -> tuple[int, ...]:
     stop = set()
     if isinstance(eos, int):
@@ -930,7 +915,7 @@ class InferenceWorker(StreamingWorkerMixin):
 
         # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
         # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
-        # kwargs); if set, build the Instance-backed adapter and return early.
+        # kwargs); if set, the loop below restores where it would build.
         semi_p = bool(engine_kwargs.pop("semi_p", False))
         # Popped unconditionally even though it is no longer a config field: a
         # dss that predates the derived image cache still sends it, and
@@ -940,38 +925,9 @@ class InferenceWorker(StreamingWorkerMixin):
         # same way and for the same reason: AsyncEngineArgs rejects what it
         # does not know, and Ray actor handles are certainly that.
         semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
-        if semi_p:
-            # A restored engine has neither, and serving without them returns
-            # plausible output that is wrong, so refuse before restoring.
-            if lora_adapter_path:
-                raise ValueError(
-                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
-                    "a restored engine serves the base weights it was dumped "
-                    "with. Disable semi_p for this job.")
-            if engine_kwargs.get("enable_return_routed_experts"):
-                raise ValueError(
-                    "semi_p does not capture routed experts, so router replay "
-                    "would get none. Disable semi_p for this job.")
-            from arctic_platform.inference.server.semip_engine import restore_and_wrap
-            self.llm = await asyncio.to_thread(
-                restore_and_wrap, engine_kwargs, semi_p_agents)
-            if not engine_kwargs.get("skip_tokenizer_init"):
-                self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
-                    engine_kwargs["model"], self.llm.get_tokenizer())
-            # Chat renders through vLLM's in-process renderer, which the
-            # restored engine's wrapper does not have.
-            self._stream_chat_engine = False
-            logger.info("Chat mode is unavailable: a semi_p engine serves token and text prompts only")
-            self.state = WorkerLifecycleState.READY
-            self._maybe_init_reasoning_parser(reasoning_parser_name)
-            logger.info(
-                "Worker %d initialized via semi_p restore: model=%s",
-                os.getpid(), engine_kwargs.get("model"),
-            )
-            return
 
         from arctic_platform.inference.semi_persistence import matched_baseline
-        if matched_baseline.requested():
+        if not semi_p and matched_baseline.requested():
             changed = matched_baseline.apply(engine_kwargs)
             logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
                         matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
@@ -1038,14 +994,20 @@ class InferenceWorker(StreamingWorkerMixin):
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
-                self.llm = AsyncLLM.from_vllm_config(
-                    vllm_config,
-                    stat_loggers=[RingStatLogger],
-                )
+                if semi_p:
+                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
+                else:
+                    self.llm = AsyncLLM.from_vllm_config(
+                        vllm_config,
+                        stat_loggers=[RingStatLogger],
+                    )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
-                if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                # semi_p is not retried here: the restore retries its own
+                # ports, so another attempt would only repeat a whole restore.
+                if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
