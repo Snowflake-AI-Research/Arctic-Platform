@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel
@@ -28,6 +29,7 @@ from pydantic import model_validator
 from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
+from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
 
 PinMemoryMaxSize = float | Literal["auto"]
 
@@ -194,6 +196,10 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     model_path_or_name: str = Field(..., description="HF model path or hub name.")
+    text_config_overrides: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Merged text config overrides; YaRN must explicitly set original_max_position_embeddings.",
+    )
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
@@ -201,6 +207,7 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+    debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
     @field_validator("dtype")
@@ -216,6 +223,17 @@ class ModelSpec(BaseModel):
         from arctic_platform.model.loader import get_loader_options_model
         from arctic_platform.model.loader import is_registered_loader
         from arctic_platform.model.loader import resolve_loader_name
+
+        # Existing DSS loaders carry AP controls in loader_options.debug.
+        legacy_debug = self.loader_options.get("debug")
+        if isinstance(legacy_debug, dict) and "gpu_mem_preallocate_gib" in legacy_debug:
+            if "gpu_mem_preallocate_gib" not in self.debug:
+                self.debug = {**self.debug, "gpu_mem_preallocate_gib": legacy_debug["gpu_mem_preallocate_gib"]}
+            self.loader_options = {
+                **self.loader_options,
+                "debug": {key: value for key, value in legacy_debug.items() if key != "gpu_mem_preallocate_gib"},
+            }
+        gpu_mem_preallocate_bytes({"debug": self.debug})
 
         if self.loader is None:
             self.loader = resolve_loader_name(self)

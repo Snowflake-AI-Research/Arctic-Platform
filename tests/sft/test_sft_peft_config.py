@@ -80,6 +80,56 @@ class TestPeftConfig(TestCasePlus):
                 with self.subTest(jobs=jobs, settings=settings), self.assertRaisesRegex(ValueError, "adapter sync"):
                     ArcticClientConfig(model_name="unused", training=TrainingConfig(**settings), **jobs)
 
+    def test_cortex_forwards_arctic_and_use_liger(self):
+        arctic = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "arctic", "ep_size": 4}),
+        )
+        training = arctic._cortex_training_sub_job()["training_config"]
+        self.assertEqual(training["model_provider"], "arctic")
+        self.assertNotIn("model_options", training)
+
+        liger = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"use_liger": True}),
+        )
+        training = liger._cortex_training_sub_job()["training_config"]
+        self.assertEqual(training["model_options"], {"liger": True})
+        self.assertNotIn("model_provider", training)
+        self.assertNotIn("use_liger", training)
+
+        legacy = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "prime_rl", "ep_size": 4}),
+        )
+        training = legacy._cortex_training_sub_job()["training_config"]
+        self.assertEqual(training["model_provider"], "arctic")
+
+    def test_cortex_rejects_retired_model_providers(self):
+        cases = (
+            ("liger", "use_liger=true"),
+            ("transformers", "must be 'huggingface' or 'arctic'"),
+        )
+        for provider, message in cases:
+            config = ArcticClientConfig(
+                model_name="unused",
+                training_gpus=1,
+                training=TrainingConfig(ds_worker_config={"model_provider": provider}),
+            )
+            with self.subTest(provider=provider), self.assertRaisesRegex(ValueError, message):
+                config._cortex_training_sub_job()
+
+        mixed = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "arctic", "use_liger": True}),
+        )
+        with self.assertRaisesRegex(ValueError, "model_options.lm_head.cross_entropy"):
+            mixed._cortex_training_sub_job()
+
     def test_cortex_keeps_training_and_sampling_peft(self):
         peft = {"peft_type": "LORA", "target_modules": ["q_proj"]}
         config = ArcticClientConfig(

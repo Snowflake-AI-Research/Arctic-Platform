@@ -50,6 +50,7 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import build_model
+from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self._gpu_mem_preallocation = None
         self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
@@ -213,6 +215,7 @@ class DeepSpeedWorker:
         loader_options = {
             key: ds_worker_config[key] for key in ("fp32_parity", "fp32_residual") if key in ds_worker_config
         }
+        debug_config = job_config.get("training_config")
         loaded = build_model(
             ModelSpec(
                 model_path_or_name=model_name,
@@ -220,6 +223,7 @@ class DeepSpeedWorker:
                 attn_implementation=ds_worker_config.get("attn_implementation"),
                 loader="huggingface",
                 parallelism=ParallelismConfig(sequence_parallel=self.sp_size),
+                debug=gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config),
                 patches=Patches(
                     liger=model_provider == "liger" or bool(ds_worker_config.get("use_liger")),
                     gradient_checkpointing=ds_worker_config.get("enable_gradient_checkpointing", True),
@@ -234,6 +238,7 @@ class DeepSpeedWorker:
             )
         )
         model = loaded.model
+        self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
@@ -1264,6 +1269,7 @@ class DeepSpeedWorker:
         if dist.is_initialized():
             dist.destroy_process_group()
         self.engine = None
+        self._gpu_mem_preallocation = None
         return True
 
 
