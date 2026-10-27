@@ -1,6 +1,9 @@
 # Shared server infrastructure (`arctic_platform.common`)
 
-**SFT and RL share the GPU backend.** The shared modules provide DeepSpeed workers, the Ray server, Ray cluster helpers, loss registries, and batch utilities. Client and protocol details are in [sft.md](sft.md) and [rl.md](rl.md).
+Protocol-agnostic GPU backend used by **RL** today and intended for forthcoming
+**SFT**: DeepSpeed workers, the Ray server, Ray cluster helpers, loss
+registries, and batch utils. RL-specific protocol docs: [`rl.md`](rl.md).
+SFT client/API docs will land with the SFT PR.
 
 ```
 arctic_platform/common/
@@ -91,14 +94,14 @@ at save).
   `training_config` + `ds_worker_config`).
 - **`log_prob`** — forward-only (`log_prob_config`); no optimizer state.
 
-**Each forward or forward/backward call selects a pipeline from `processing.loss_fn`.** The default registered `sft` and `sft_ce` losses use the supervised pipeline; other losses use the RL pipeline, including its sequence-parallel path when enabled.
+**Pipeline dispatch** (per `fwd_bwd` call, from `processing.loss_fn`):
 
 ```text
-sft / sft_ce -> run_sft_pipeline (arctic_platform.sft.processor)
-other losses -> run_pipeline or run_sequence_parallel_grpo
+loss_fn → run_pipeline (arctic_platform.rl GRPO, …)
 ```
 
-**Registered loss classes take precedence over legacy loss functions.** A class override of an SFT loss name uses the generic pipeline rather than the legacy supervised adapter. See [the worker's dispatch implementation](../arctic_platform/common/deepspeed_worker.py) and [SFT loss contracts](sft.md).
+A forthcoming SFT PR will add an SFT loss path (`sft` / `sft_ce`) on the same
+worker; that API is not present in this tree yet.
 
 If `ds_worker_config["zorro_train_enable"]` is true at init, the worker patches
 the HF model for ZoRRo Train (see [`rl.md`](rl.md#zorro-train)).

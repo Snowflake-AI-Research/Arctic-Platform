@@ -280,15 +280,11 @@ If loading a checkpoint into a sub-job with a **different DP size** (different
 with `load_optimizer_states=False`:
 
 ```python
-from dss_client import SubJobConfig
-
 training = SubJobConfig.training_job(
-    model_name="Qwen/Qwen3-1.7B",
-    optimizer={"name": "AdamW", "lr": 1e-4},
-    max_seq_len=2048,
-    train_batch_size=1,
+    model_name="...",
     n_gpus=16,  # Different from source checkpoint's DP size
     load_optimizer_states=False,  # REQUIRED for DP size change
+    ...
 )
 ```
 

@@ -174,6 +174,7 @@ def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
     recipes = []
     published = []
     missing = set()
+    incompatible = set()
     record_overrides = {}
     contexts = []
     record = {
@@ -224,15 +225,21 @@ def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
         events.append(("record", *key))
         if key in missing:
             raise reference_records.ReferencePrerequisiteError(f"prepared HF reference missing: {key[0]}/{key[1]}")
+        if key in incompatible:
+            raise reference_records.ReferencePrerequisiteError(
+                f"prepared HF reference incompatible: {key[0]}/{key[1]}"
+            )
         ctx.reference_record_paths["/".join(key)] = str(tmp_path / "records" / f"{key[1]}-{key[0]}.json")
         return {
             **copy.deepcopy({**record, **record_overrides.get(key, {})}),
             "active_tokens": identity["active_tokens"],
         }
 
-    def publish_record(ctx, identity, measurements):
-        events.append(("publish", identity["check_id"], identity["arm"]))
-        published.append((identity, measurements))
+    def publish_record_set(ctx, entries, *, expected_identities):
+        assert [identity for identity, _ in entries] == expected_identities
+        for identity, measurements in entries:
+            events.append(("publish", identity["check_id"], identity["arm"]))
+            published.append((identity, measurements))
 
     @contextmanager
     def gateway(workdir, gpus, **kwargs):
@@ -279,7 +286,7 @@ def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(reference_records, "model_identity", model_identity)
     monkeypatch.setattr(reference_records, "workload_identity", workload_identity)
     monkeypatch.setattr(reference_records, "load_record", load_record)
-    monkeypatch.setattr(reference_records, "publish_record", publish_record)
+    monkeypatch.setattr(reference_records, "publish_record_set", publish_record_set)
     monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
     monkeypatch.setattr(runner, "gateway", gateway)
     monkeypatch.setattr(runner, "running_job", running_job)
@@ -293,6 +300,7 @@ def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
         recipes=recipes,
         published=published,
         missing=missing,
+        incompatible=incompatible,
         record=record,
         record_overrides=record_overrides,
         contexts=contexts,
@@ -515,6 +523,7 @@ def test_prepared_reference_runner_combined_prepare_reuses_optimizer_calibration
         ("record", "single-step-grads", arm_name),
         ("record", "single-step-optimizer", arm_name),
         ("publish", "single-step-grads", arm_name),
+        ("publish", "single-step-optimizer", arm_name),
     ]
     identity, measurements = control.published[0]
     assert identity["check_id"] == "single-step-grads"
@@ -556,10 +565,11 @@ def test_optimizer_calibration_progress_completes_each_arm_and_retains_all_refer
         )
         assert calls.count((f"batch-{arm.name}.pt", True)) == 1
         assert calls.count((f"batch-{arm.name}.pt", False)) == 8
-    assert len(control.published) == 2
+    assert len(control.published) == 4
     assert all(
         measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 8
         for identity, measurements in control.published
+        if identity["check_id"] == "single-step-optimizer"
     )
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
 
@@ -610,10 +620,11 @@ def test_optimizer_calibration_defaults_to_one_eight_gpu_wave_per_arm(
     assert not active
     assert baseline == [arm.name for arm in control.arms]
     assert completed == {arm.name: set(range(8)) for arm in control.arms}
-    assert len(control.published) == len(control.arms)
+    assert len(control.published) == 2 * len(control.arms)
     assert all(
         measurements["optimizer_norm_gate"]["provenance"]["calibration_runs"] == 8
         for identity, measurements in control.published
+        if identity["check_id"] == "single-step-optimizer"
     )
     assert all(event[0] not in {"gateway-enter", "target"} for event in control.events)
 
@@ -684,10 +695,11 @@ def test_prepared_reference_runner_combined_prepare_preserves_existing_gradient_
     assert control.events == [
         ("record", "single-step-grads", "gas1"),
         ("record", "single-step-optimizer", "gas1"),
+        ("publish", "single-step-grads", "gas1"),
         ("publish", "single-step-optimizer", "gas1"),
     ]
-    assert len(control.published) == 1
-    identity, measurements = control.published[0]
+    assert len(control.published) == 2
+    identity, measurements = control.published[1]
     assert identity["check_id"] == "single-step-optimizer"
     assert "optimizer_state_manifest" not in measurements
     assert measurements["optimizer_norms"]["criterion"] == "optimizer-state-l2-norm-v1"
@@ -927,8 +939,13 @@ def _historical_gradient_record(_reference_records_ctx, monkeypatch):
     current["reference_sources"]["harness/names.py"] = copy.deepcopy(
         records._REVIEWED_GRADIENT_NAMES_TRANSITION["current"]
     )
+    monkeypatch.setattr(
+        records, "file_identity", lambda path: deepcopy(current["reference_sources"]["harness/names.py"])
+    )
     measurements = {**_reference_records_measurements(), "skipped_no_grad": ["visual.patch_embed.weight"]}
-    path = records.publish_record(_reference_records_ctx, historical, measurements)
+    path = records._legacy_record_path(_reference_records_ctx, historical)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(records._record_bytes(historical, measurements))
     raw = path.read_bytes()
     binding = {
         "record_path": str(path),
@@ -1127,6 +1144,8 @@ def test_historical_gradient_record_strict_json(_historical_gradient_record, bad
 def test_historical_gradient_record_never_falls_back_to_current_record(_historical_gradient_record):
     fixture = _historical_gradient_record
     current_path = records.publish_record(fixture.ctx, fixture.current, fixture.measurements)
+    # Successful latest-set migration removes legacy generations; retain explicitly supplied historical bytes.
+    fixture.path.write_bytes(fixture.raw)
     fixture.ctx.reference_record_paths.clear()
     fixture.binding["record_sha256"] = "0" * 64
     with pytest.raises(records.ReferencePrerequisiteError, match="raw SHA256 mismatch"):
@@ -1147,9 +1166,11 @@ def test_reference_records_publish_load_compact_measurements_without_hf(
     loaded = records.load_record(_reference_records_ctx, _reference_records_identity)
     assert loaded == measurements
     assert "measurements" not in loaded
-    assert path.parent == _reference_records_ctx.reference_records_dir / _reference_records_ctx.config_id / check_id
+    directory = _reference_records_ctx.reference_records_dir / _reference_records_ctx.config_id / check_id
+    assert path.parent == (directory / "gradients-only" if check_id == _reference_records_GRADS else directory)
     assert path.suffix == ".json"
-    assert _reference_records_ctx.reference_record_paths == {path.stem: str(path)}
+    assert path.name == ("trajectory.json" if check_id == _reference_records_E2E else "gas1.json")
+    assert _reference_records_ctx.reference_record_paths == {records._digest(_reference_records_identity): str(path)}
     payload = path.read_bytes()
     assert payload.endswith(b"\n")
     assert b"\n " not in payload
@@ -1225,6 +1246,334 @@ def test_reference_records_repeat_publication_is_byte_identical_and_does_not_rep
     assert list(path.parent.glob("*.json")) == [path]
 
 
+def _reference_records_set(identity, *, generation="current"):
+    entries = []
+    for arm in ("gas1", "gas4"):
+        current = deepcopy(identity)
+        current["python"] = generation
+        current["recipe"]["arm"] = arm
+        entries.append((current, _reference_records_measurements(current["check_id"])))
+    return entries
+
+
+def _publish_reference_set(ctx, entries):
+    return records.publish_record_set(ctx, entries, expected_identities=[identity for identity, _ in entries])
+
+
+def test_reference_set_replaces_both_arms_and_removes_old_generation(
+    _reference_records_ctx, _reference_records_identity
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    previous = _publish_reference_set(_reference_records_ctx, old)
+    _reference_records_ctx.reference_record_paths.clear()
+    new = _reference_records_set(_reference_records_identity)
+    current = _publish_reference_set(_reference_records_ctx, new)
+    assert set(current.values()) == set(previous.values())
+    assert sorted(path.name for path in current.values()) == ["gas1.json", "gas4.json"]
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == set(
+        current.values()
+    )
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
+    for identity, measurements in new:
+        assert records.load_record(_reference_records_ctx, identity) == measurements
+    for identity, _ in old:
+        with pytest.raises(records.ReferencePrerequisiteError, match="incompatible"):
+            records.load_record(_reference_records_ctx, identity)
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "wrong-generation", "invalid-measurement"])
+def test_reference_set_incomplete_or_invalid_replacement_leaves_previous_bytes(
+    _reference_records_ctx, _reference_records_identity, failure
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    paths = _publish_reference_set(_reference_records_ctx, old)
+    before = {path: path.read_bytes() for path in paths.values()}
+    new = _reference_records_set(_reference_records_identity)
+    expected = [deepcopy(identity) for identity, _ in new]
+    if failure == "missing":
+        new.pop()
+    elif failure == "duplicate":
+        new.append(new[0])
+    elif failure == "wrong-generation":
+        new[1][0]["python"] = "different"
+        expected[1] = new[1][0]
+    else:
+        new[1][1]["grad_norms"] = {}
+    with pytest.raises(records.ReferencePrerequisiteError):
+        records.publish_record_set(_reference_records_ctx, new, expected_identities=expected)
+    assert {path: path.read_bytes() for path in paths.values()} == before
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == set(before)
+
+
+def test_reference_set_single_arm_publication_cannot_erase_existing_complete_set(
+    _reference_records_ctx, _reference_records_identity
+):
+    paths = _publish_reference_set(_reference_records_ctx, _reference_records_set(_reference_records_identity))
+    before = {path: path.read_bytes() for path in paths.values()}
+    replacement = _reference_records_set(_reference_records_identity, generation="new")[0]
+    with pytest.raises(records.ReferencePrerequisiteError, match="every previously published arm"):
+        records.publish_record(_reference_records_ctx, *replacement)
+    assert {path: path.read_bytes() for path in paths.values()} == before
+
+
+def test_reference_set_publication_recovers_interrupted_legacy_conversion(
+    _reference_records_ctx, _reference_records_identity
+):
+    identity = _reference_records_identity
+    path = records._legacy_record_path(_reference_records_ctx, identity)
+    path.parent.mkdir(parents=True)
+    data = records._record_bytes(identity, _reference_records_measurements())
+    path.write_bytes(data)
+    directory = records._config_dir(_reference_records_ctx, identity)
+    previous = directory.parent / f".previous-{directory.name}"
+    directory.rename(previous)
+    assert not directory.exists()
+    assert records.load_record(_reference_records_ctx, identity) == _reference_records_measurements()
+    assert path.read_bytes() == data
+    assert not previous.exists()
+
+
+def test_reference_set_second_rename_failure_restores_legacy_directory(
+    _reference_records_ctx, _reference_records_identity, monkeypatch
+):
+    identity = _reference_records_identity
+    path = records._legacy_record_path(_reference_records_ctx, identity)
+    path.parent.mkdir(parents=True)
+    data = records._record_bytes(identity, _reference_records_measurements())
+    path.write_bytes(data)
+
+    original = records.os.rename
+
+    def fail(source, destination):
+        if ".set-" in str(source):
+            raise OSError("synthetic directory rename failure")
+        original(source, destination)
+
+    monkeypatch.setattr(records.os, "rename", fail)
+    with pytest.raises(OSError, match="directory rename failure"):
+        _publish_reference_set(_reference_records_ctx, _reference_records_set(identity))
+    assert path.read_bytes() == data
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".previous-*"))
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
+
+
+@pytest.mark.parametrize("switched", [False, True])
+def test_reference_set_recovers_abandoned_generation_without_removing_current_set(
+    _reference_records_ctx, _reference_records_identity, switched
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    _publish_reference_set(_reference_records_ctx, old)
+    directory = records._config_dir(_reference_records_ctx, _reference_records_identity)
+    abandoned = directory.parent / f".set-{directory.name}-interrupted"
+    staged = abandoned / directory.name
+    staged.mkdir(parents=True)
+    new = _reference_records_set(_reference_records_identity)
+    for identity, measurements in new:
+        path = staged / records._record_path(_reference_records_ctx, identity).relative_to(directory)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(records._record_bytes(identity, measurements))
+    previous = directory.parent / f".previous-{directory.name}"
+    os.rename(directory, previous)
+    if switched:
+        os.rename(staged, directory)
+    expected = new if switched else old
+    for identity, measurements in expected:
+        assert records.load_record(_reference_records_ctx, identity) == measurements
+    assert not list(directory.parent.glob(f".set-{directory.name}-*"))
+    assert not previous.exists()
+    assert directory.is_dir() and not directory.is_symlink()
+
+
+def test_reference_set_unowned_symlink_is_not_deleted_or_replaced(
+    _reference_records_ctx, _reference_records_identity, tmp_path
+):
+    directory = records._config_dir(_reference_records_ctx, _reference_records_identity)
+    directory.parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "untouched.txt"
+    marker.write_text("not a reference set")
+    directory.symlink_to(external, target_is_directory=True)
+    with pytest.raises(records.ReferencePrerequisiteError, match="must not be a symbolic link"):
+        _publish_reference_set(_reference_records_ctx, _reference_records_set(_reference_records_identity))
+    assert directory.resolve() == external
+    assert marker.read_text() == "not a reference set"
+
+
+def test_reference_set_mismatched_input_generation_preserves_previous_set(
+    _reference_records_ctx, _reference_records_identity
+):
+    old = _reference_records_set(_reference_records_identity)
+    paths = _publish_reference_set(_reference_records_ctx, old)
+    before = {path: path.read_bytes() for path in paths.values()}
+    new = _reference_records_set(_reference_records_identity, generation="new")
+    for index, (identity, _) in enumerate(new):
+        identity["recipe"]["synthetic_inputs"] = {"seed": index, "batch": {"name": identity["recipe"]["arm"]}}
+    with pytest.raises(records.ReferencePrerequisiteError, match="incompatible workload generations"):
+        _publish_reference_set(_reference_records_ctx, new)
+    assert {path: path.read_bytes() for path in paths.values()} == before
+
+
+@pytest.mark.parametrize("failure", ["fsync", "rename", "interrupt", "staged-corruption"])
+def test_reference_set_failed_staging_or_rename_preserves_previous_complete_set(
+    _reference_records_ctx, _reference_records_identity, monkeypatch, failure
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    paths = _publish_reference_set(_reference_records_ctx, old)
+    before = {path: path.read_bytes() for path in paths.values()}
+    new = _reference_records_set(_reference_records_identity)
+
+    def fail(*args):
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        raise OSError("synthetic set publication failure")
+
+    if failure == "staged-corruption":
+        original = Path.read_bytes
+
+        def corrupt(path):
+            data = original(path)
+            return data + b"changed" if ".set-" in str(path) and path.name == "gas4.json" else data
+
+        monkeypatch.setattr(Path, "read_bytes", corrupt)
+        error = records.ReferencePrerequisiteError
+    else:
+        if failure == "fsync":
+            monkeypatch.setattr(records.os, "fsync", fail)
+        else:
+            monkeypatch.setattr(records, "_publish_directory", fail)
+        error = KeyboardInterrupt if failure == "interrupt" else OSError
+    with pytest.raises(error):
+        _publish_reference_set(_reference_records_ctx, new)
+    assert {path: path.read_bytes() for path in paths.values()} == before
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == set(before)
+
+
+def test_reference_set_readers_observe_whole_set_before_and_after_directory_replacement(
+    _reference_records_ctx, _reference_records_identity, monkeypatch
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    _publish_reference_set(_reference_records_ctx, old)
+    original = records._publish_directory
+    observations = []
+    current = records._config_dir(_reference_records_ctx, _reference_records_identity)
+
+    def versions():
+        return {json.loads(path.read_bytes())["identity"]["python"] for path in current.rglob("*.json")}
+
+    def replace(staged, destination):
+        observations.append(versions())
+        assert {json.loads(path.read_bytes())["identity"]["python"] for path in staged.rglob("*.json")} == {"current"}
+        original(staged, destination)
+        observations.append(versions())
+
+    monkeypatch.setattr(records, "_publish_directory", replace)
+    _publish_reference_set(_reference_records_ctx, _reference_records_set(_reference_records_identity))
+    assert observations == [{"old"}, {"current"}]
+
+
+def test_reference_set_concurrent_generations_never_publish_mixed_arms(
+    _reference_records_ctx, _reference_records_identity
+):
+    barrier = Barrier(4)
+
+    def publish(generation):
+        entries = _reference_records_set(_reference_records_identity, generation=generation)
+        barrier.wait(timeout=10)
+        return _publish_reference_set(_reference_records_ctx, entries)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(publish, f"generation-{index}") for index in range(4)]
+        published = [future.result(timeout=20) for future in futures]
+    paths = set(published[-1].values())
+    assert len({json.loads(path.read_bytes())["identity"]["python"] for path in paths}) == 1
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == paths
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".prepare-*"))
+
+
+def test_reference_set_legacy_migration_removes_all_replaced_versions_preserving_other_workloads(
+    _reference_records_ctx, _reference_records_identity
+):
+    standalone = _reference_records_set(_reference_records_identity)
+    combined_identity = deepcopy(_reference_records_identity)
+    combined_identity["recipe"]["optimizer"] = {"learning_rate": 0.01}
+    combined = _reference_records_set(combined_identity)
+    untouched = []
+    for entries in (standalone, combined):
+        for identity, measurements in entries:
+            for generation in ("old", "current"):
+                legacy = {**identity, "python": generation}
+                path = records._legacy_record_path(_reference_records_ctx, legacy)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(records._record_bytes(legacy, measurements))
+                if entries is combined:
+                    untouched.append(path)
+    for identity, measurements in standalone:
+        assert records.load_record(_reference_records_ctx, identity) == measurements
+    published = _publish_reference_set(_reference_records_ctx, standalone)
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == {
+        *published.values(),
+        *untouched,
+    }
+    combined_published = _publish_reference_set(_reference_records_ctx, combined)
+    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == {
+        *published.values(),
+        *combined_published.values(),
+    }
+    for identity, measurements in standalone + combined:
+        assert records.load_record(_reference_records_ctx, identity) == measurements
+
+
+def test_reference_set_current_lookup_never_falls_back_to_obsolete_legacy_record(
+    _reference_records_ctx, _reference_records_identity
+):
+    old = _reference_records_set(_reference_records_identity, generation="old")
+    _publish_reference_set(_reference_records_ctx, _reference_records_set(_reference_records_identity))
+    legacy = records._legacy_record_path(_reference_records_ctx, old[0][0])
+    legacy.write_bytes(records._record_bytes(*old[0]))
+    with pytest.raises(records.ReferencePrerequisiteError, match="incompatible"):
+        records.load_record(_reference_records_ctx, old[0][0])
+
+
+def test_prepared_reference_runner_failure_on_second_arm_does_not_publish_first_arm(
+    _prepared_reference_runner_prepared_runner, monkeypatch
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.missing.update(("single-step-grads", arm.name) for arm in control.arms)
+
+    def reference(model, batch, output, **kwargs):
+        if batch.name == "batch-gas4.pt":
+            raise RuntimeError("synthetic second-arm failure")
+        return {"loss": 2.0, "microbatches": 1, "active_tokens": 28, "grad_norms": {"layer.weight": 1.0}}
+
+    monkeypatch.setattr(runner, "run_reference", reference)
+    with pytest.raises(RuntimeError, match="second-arm failure"):
+        control.execute(selected=["single-step-grads"], prepare_references=True)
+    assert not control.published
+    assert not any(event[0] in {"gateway-enter", "target"} for event in control.events)
+
+
+def test_prepared_reference_runner_explicit_preparation_replaces_incompatible_records_together(
+    _prepared_reference_runner_prepared_runner, monkeypatch
+):
+    control = _prepared_reference_runner_prepared_runner
+    control.incompatible.update(("single-step-grads", arm.name) for arm in control.arms)
+    monkeypatch.setattr(
+        runner,
+        "run_reference",
+        lambda *args, **kwargs: {
+            "loss": 2.0,
+            "microbatches": 1,
+            "active_tokens": 28,
+            "grad_norms": {"layer.weight": 1.0},
+        },
+    )
+    assert control.execute(selected=["single-step-grads"], prepare_references=True) == []
+    assert len(control.published) == len(control.arms)
+    assert not any(event[0] in {"gateway-enter", "target"} for event in control.events)
+
+
 def test_reference_records_conflicting_publication_preserves_original_record(
     _reference_records_ctx, _reference_records_identity
 ):
@@ -1257,7 +1606,7 @@ def test_reference_records_corrupt_or_incompatible_record_requires_onboarding(
         record["identity"]["config_checksum"] = "e" * 64
     path.write_text(json.dumps(record))
     _reference_records_ctx.reference_record_paths.clear()
-    with pytest.raises(records.ReferencePrerequisiteError, match="corrupt or incompatible.*run"):
+    with pytest.raises(records.ReferencePrerequisiteError, match="(corrupt|incompatible).*run"):
         records.load_record(_reference_records_ctx, _reference_records_identity)
     assert _reference_records_ctx.reference_record_paths == {}
 
@@ -1318,7 +1667,7 @@ def test_reference_records_changed_workload_identity_does_not_reuse_old_record(
     _reference_records_ctx.reference_record_paths.clear()
     with pytest.raises(records.ReferencePrerequisiteError, match="missing.*--prepare-references"):
         records.load_record(_reference_records_ctx, changed)
-    assert list(_reference_records_ctx.reference_records_dir.rglob("*.json")) == [path]
+    assert list(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == [path]
     assert not _reference_records_ctx.reference_record_paths
 
 
@@ -1556,7 +1905,7 @@ def test_reference_records_publication_is_visible_only_after_complete_bytes_are_
 ):
     measurements = _reference_records_measurements()
     original_fsync = records.os.fsync
-    original_link = records.os.link
+    original_publish = records._publish_directory
     synced = []
     observed = []
 
@@ -1564,24 +1913,28 @@ def test_reference_records_publication_is_visible_only_after_complete_bytes_are_
         original_fsync(fd)
         synced.append(fd)
 
-    def link(source, destination):
+    def publish(source, destination):
         assert synced
         assert not destination.exists()
-        with open(source, "rb") as stream:
+        with records._record_path(
+            SimpleNamespace(reference_records_dir=source.parent), _reference_records_identity
+        ).open("rb") as stream:
             pending = json.load(stream)
         assert pending["measurements"] == measurements
         assert pending["payload_sha256"] == records._digest(measurements)
-        original_link(source, destination)
-        observed.append(records.load_record(_reference_records_ctx, _reference_records_identity))
+        original_publish(source, destination)
+        observed.append(
+            json.loads(records._record_path(_reference_records_ctx, _reference_records_identity).read_bytes())
+        )
 
     monkeypatch.setattr(records.os, "fsync", fsync)
-    monkeypatch.setattr(records.os, "link", link)
+    monkeypatch.setattr(records, "_publish_directory", publish)
     path = records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    assert observed == [measurements]
+    assert [record["measurements"] for record in observed] == [measurements]
     assert not list(path.parent.glob(".prepare-*"))
 
 
-@pytest.mark.parametrize("failure", ["fsync", "link"])
+@pytest.mark.parametrize("failure", ["fsync", "rename"])
 def test_reference_records_failed_publication_removes_temporary_files(
     _reference_records_ctx, _reference_records_identity, monkeypatch, failure
 ):
@@ -1593,7 +1946,7 @@ def test_reference_records_failed_publication_removes_temporary_files(
     with pytest.raises(OSError, match="unit publication failure"):
         records.publish_record(_reference_records_ctx, _reference_records_identity, _reference_records_measurements())
     assert not list(_reference_records_ctx.reference_records_dir.rglob("*.json"))
-    assert not list(_reference_records_ctx.reference_records_dir.rglob(".prepare-*"))
+    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
     assert not _reference_records_ctx.reference_record_paths
 
 
@@ -2085,10 +2438,11 @@ def test_reference_observability_calibration_consumes_completed_runs_without_cha
     assert control.cfg.training == original_cfg
     assert control.spec.test_tolerances["single-step-grads"] == original_gate
     assert [event for event in control.events if event[0] == "publish"] == [
-        ("publish", "single-step-optimizer", "gas1")
+        ("publish", "single-step-grads", "gas1"),
+        ("publish", "single-step-optimizer", "gas1"),
     ]
     assert not any(event[0] in {"gateway-enter", "job-enter", "target"} for event in control.events)
-    identity, measurements = control.published[0]
+    identity, measurements = control.published[1]
     assert identity["check_id"] == "single-step-optimizer"
     assert measurements["loss"] == 3.0
     assert measurements["grad_norms"] == {"layer.weight": 3.0}
@@ -2373,7 +2727,11 @@ def test_reference_execution_witness_cli_and_compact_record_preserve_provenance(
     measurements = json.loads(output.read_text())
     assert measurements["reference_execution"] == witness
     assert measurements["skipped_no_grad"] == ["indexer.weight"]
-    identity = {"check_id": _reference_records_GRADS, "config_id": _reference_records_ctx.config_id}
+    identity = {
+        "check_id": _reference_records_GRADS,
+        "config_id": _reference_records_ctx.config_id,
+        "recipe": {"arm": "gas1"},
+    }
     path = records.publish_record(_reference_records_ctx, identity, measurements)
     original = path.read_bytes()
     _reference_records_no_hf(monkeypatch)

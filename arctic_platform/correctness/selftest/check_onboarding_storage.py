@@ -3958,6 +3958,8 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
             return ["not reference-only"]
         ctx = SimpleNamespace(cfg=cfg, spec=actual_spec, config_id=cfg.config_id, reference_records_dir=staging)
         training = cfg.effective_training
+        entries = []
+        retained_entries = []
         for index, arm in enumerate(arms):
             if state.failure == "missing-arm" and arm.name == "gas4":
                 continue
@@ -4045,13 +4047,22 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                 },
                 "optimizer_norm_gate": gate,
             }
-            path = reference_records.publish_record(ctx, identity, measurements)
+            entries.append((identity, measurements))
             if state.failure == "publication-conflict":
                 retained = json.loads(json.dumps(measurements))
                 retained["loss"] = 2.0
-                old_ctx = SimpleNamespace(reference_records_dir=args.reference_records_dir)
-                reference_records.publish_record(old_ctx, identity, retained)
-            if state.failure == "corrupt-record":
+                retained_entries.append((identity, retained))
+        published = reference_records.publish_record_set(
+            ctx, entries, expected_identities=[identity for identity, _ in entries]
+        )
+        if retained_entries:
+            reference_records.publish_record_set(
+                SimpleNamespace(reference_records_dir=args.reference_records_dir),
+                retained_entries,
+                expected_identities=[identity for identity, _ in retained_entries],
+            )
+        if state.failure == "corrupt-record":
+            for path in published.values():
                 data = json.loads(path.read_text())
                 data["payload_sha256"] = "corrupt"
                 path.write_text(json.dumps(data))

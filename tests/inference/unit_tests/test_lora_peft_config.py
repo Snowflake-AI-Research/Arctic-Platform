@@ -22,4 +22,6 @@ def test_normalize_lora_peft_config_fills_defaults():
 
 def test_normalize_lora_peft_config_rejects_unsupported_bias():
     with pytest.raises(ValueError, match="bias='all'"):
-        normalize_lora_peft_config({"peft_type": "Lora", "target_modules": ["q_proj"], "bias": "all"})
+        normalize_lora_peft_config(
+            {"peft_type": "Lora", "target_modules": ["q_proj"], "bias": "all"}
+        )

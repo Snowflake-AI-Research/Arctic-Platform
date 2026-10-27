@@ -1,8 +1,8 @@
 # Simple — single-GPU GRPO on GSM8K
 
 Single-GPU GRPO for **Qwen3-0.6B** on **GSM8K**, driven by SkyRL's PPO trainer with the
-[Arctic RL](../../../../arctic_platform/rl/) backend and the
-[ZoRRo](../../../../arctic_platform/rl/zorro_train/) optimization layer. Pure GRPO; no frozen
+[Arctic RL](../../../arctic_platform/rl/) backend and the
+[ZoRRo](../../../arctic_platform/rl/zorro_train/) optimization layer. Pure GRPO; no frozen
 reference model.
 
 This is the entry-point recipe: 1 GPU, 1 node, **no Ray cluster setup and no hostfile**.

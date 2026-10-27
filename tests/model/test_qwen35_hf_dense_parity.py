@@ -521,18 +521,15 @@ def test_activation_offload_forward_backward_matches_eager(monkeypatch, mode):
 
 def _compiled_layers(model: nn.Module, *, fullgraph: bool) -> nn.Module:
     torch._dynamo.reset()
-    # Check Dynamo tracing and graph-break handling without AOTAutograd rewriting the backward reductions.
+    # The compile patch's per-layer compilation, with a backend that traces the graph but runs it eagerly.
     for layer in model.model.layers:
-        layer.compile(fullgraph=fullgraph, backend="eager")
+        layer.compile(fullgraph=fullgraph, backend="aot_eager")
     return model
 
 
 @pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("fullgraph", [True, False], ids=["fullgraph", "graph-breaks"])
-def test_compiled_layers_forward_backward_match_eager(monkeypatch, mode, fullgraph):
-    if mode == "stock":
-        # Dynamo marks ordinary tracing as export in some torch versions; keep both runs on the non-export solver.
-        monkeypatch.setattr(modeling_qwen3_5, "is_torchdynamo_exporting", lambda: False)
+def test_compiled_layers_forward_backward_match_eager(mode, fullgraph):
     reference_model = _model_in_mode(mode)
     compiled_model = _compiled_layers(copy.deepcopy(reference_model), fullgraph=fullgraph)
 

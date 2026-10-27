@@ -289,7 +289,7 @@ def test_e2e_reference_records_shared_sft_source_is_bound_and_drift_requires_exp
     _e2e_reference_records_guard_launches(monkeypatch)
     with pytest.raises(
         reference_records.ReferencePrerequisiteError,
-        match="prepared HF reference missing",
+        match="prepared HF reference incompatible",
     ):
         check._run(_e2e_reference_records_ctx)
 
@@ -307,7 +307,7 @@ def test_e2e_reference_records_old_unbound_e2e_record_is_not_silently_relabelled
     _e2e_reference_records_guard_launches(monkeypatch)
     with pytest.raises(
         reference_records.ReferencePrerequisiteError,
-        match="prepared HF reference missing",
+        match="prepared HF reference incompatible",
     ):
         check._run(_e2e_reference_records_ctx)
     assert path.read_bytes() == before
@@ -365,7 +365,7 @@ def test_e2e_reference_records_input_or_workload_drift_requires_a_new_record_bef
     monkeypatch.setattr(check, "run_dss_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(
         reference_records.ReferencePrerequisiteError,
-        match="prepared HF reference missing",
+        match="prepared HF reference incompatible",
     ):
         check._run(_e2e_reference_records_ctx)
 

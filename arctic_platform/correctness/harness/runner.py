@@ -982,7 +982,7 @@ def execute(
     from .reference_records import batch_identity
     from .reference_records import load_record
     from .reference_records import model_identity
-    from .reference_records import publish_record
+    from .reference_records import publish_record_set
     from .reference_records import workload_identity
 
     def reference_identity(test_id: str, arm: ArmSpec) -> dict:
@@ -1027,6 +1027,8 @@ def execute(
         }
         return workload_identity(context, test_id, recipe)
 
+    prepared_entries = []
+
     def prepared_reference(arm: ArmSpec) -> None:
         identities = {test.test_id: reference_identity(test.test_id, arm) for test in per_arm_tests}
         records = {}
@@ -1043,7 +1045,10 @@ def execute(
                 else:
                     records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
-                if not prepare_references or "prepared HF reference missing:" not in str(exc):
+                if not prepare_references or not any(
+                    message in str(exc)
+                    for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                ):
                     raise
         if len(records) != len(identities):
             if not prepare_references:
@@ -1138,8 +1143,9 @@ def execute(
                 }
             for test_id, identity in identities.items():
                 if test_id not in records:
-                    publish_record(context, identity, compact)
                     records[test_id] = compact
+        if prepare_references:
+            prepared_entries.extend((identity, records[test_id]) for test_id, identity in identities.items())
         primary = "single-step-optimizer" if stepping else "single-step-grads"
         context._reference_by_check[arm.name] = records
         context._reference[arm.name] = records[primary]
@@ -1151,6 +1157,12 @@ def execute(
     if prepare_references:
         for test in whole_run_tests:
             list(test.fn(context))
+        if prepared_entries:
+            publish_record_set(
+                context,
+                prepared_entries,
+                expected_identities=[identity for identity, _ in prepared_entries],
+            )
         print(f"HF reference preparation complete: {len(context.reference_record_paths)} record(s)", flush=True)
         return []
 

@@ -36,7 +36,7 @@ on AWS p5en.48xlarge (192 vCPU, 2 TiB host memory, 8x H200) with vLLM v0.18.0.*
 ## Requirements
 
 - Linux with NVIDIA GPUs, and a driver providing `cuda-checkpoint`.
-- vLLM and ArcticInference installed (see the [repository README](../../../README.md)).
+- vLLM and ArcticInference installed (see the [repository README](../../README.md)).
 - CRIU 4.2 with the CUDA plugin.
 - Root, **or** an unprivileged user on a node granting
   `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE` with `SEMIP_UNPRIVILEGED=1` and
@@ -50,7 +50,10 @@ Ubuntu PPA, is in [`skills/INSTALL.md`](skills/INSTALL.md).
 
 ## Get started
 
-**Start at the repository root and change to this package directory in step 1.** Run the remaining commands from that directory. Modules import their siblings by bare name (`import worker`), so scripts either run from here or bootstrap `sys.path` themselves; the three public classes are also re-exported lazily from the package.
+All commands run from this directory. Modules import their siblings by bare name
+(`import worker`), so scripts either run from here or bootstrap `sys.path`
+themselves; the three public classes are also re-exported lazily from the
+package.
 
 ### 1. Build an image cache
 
@@ -59,7 +62,7 @@ pins its weights in CPU memory. Everything after this point restores from that
 image.
 
 ```bash
-cd arctic_platform/inference/semi_persistence
+cd arctic_inference/semi_persistence
 python scripts/register.py          # edit the configs inside to taste
 ```
 
@@ -159,11 +162,9 @@ expert parallel, cold-starting on one GPU pair and restoring onto another.
 
 ## Tests
 
-From the repository root:
-
 ```bash
-cd arctic_platform/inference/semi_persistence
-python -m pytest tests/ -sv     # CPU-only, no GPU needed
+cd arctic_inference/semi_persistence
+python -m pytest tests/ -q      # CPU-only, no GPU needed
 ```
 
 ## Notes and limitations

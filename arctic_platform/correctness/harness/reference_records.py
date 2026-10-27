@@ -25,7 +25,9 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import tempfile
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
 from functools import lru_cache
@@ -248,7 +250,7 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             raise ReferencePrerequisiteError("reference requires positive scored-answer-token count")
 
 
-def _record_path(ctx, identity: dict) -> Path:
+def _config_dir(ctx, identity: dict) -> Path:
     if (
         identity.get("check_id") not in CRITERIA
         or not isinstance(identity.get("config_id"), str)
@@ -257,7 +259,77 @@ def _record_path(ctx, identity: dict) -> Path:
     ):
         raise ReferencePrerequisiteError("invalid reference record config or check identity")
     root = Path(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR))
-    return root / identity["config_id"] / identity["check_id"] / f"{_digest(identity)}.json"
+    return root / identity["config_id"]
+
+
+def _record_path(ctx, identity: dict) -> Path:
+    directory = _config_dir(ctx, identity) / identity["check_id"]
+    if identity["check_id"] == "e2e-sft-train-validate":
+        return directory / "trajectory.json"
+    recipe = identity.get("recipe", {})
+    arm = recipe.get("synthetic_inputs", {}).get("batch", {}).get("name", recipe.get("arm"))
+    if not isinstance(arm, str) or re.fullmatch(r"[A-Za-z0-9_-]+", arm) is None:
+        raise ReferencePrerequisiteError("invalid reference record arm identity")
+    if identity["check_id"] == "single-step-grads":
+        directory /= "with-optimizer" if recipe.get("optimizer") is not None else "gradients-only"
+    return directory / f"{arm}.json"
+
+
+def _legacy_record_path(ctx, identity: dict) -> Path:
+    return _config_dir(ctx, identity) / identity["check_id"] / f"{_digest(identity)}.json"
+
+
+@contextmanager
+def _publication_lock(directory: Path, *, exclusive: bool):
+    import fcntl
+
+    # Keep the lock outside the directory being replaced; never replace its inode.
+    with (directory.parent / f".{directory.name}.lock").open("a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            if directory.is_symlink():
+                raise ReferencePrerequisiteError(f"reference directory must not be a symbolic link: {directory}")
+            previous = directory.parent / f".previous-{directory.name}"
+            abandoned = [
+                path
+                for path in directory.parent.glob(f".set-{directory.name}-*")
+                if path.is_dir() and not path.is_symlink()
+            ]
+            if previous.exists() or abandoned:
+                # Recover interruption between renames, then discard abandoned staging.
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                if previous.exists() and not directory.exists():
+                    os.rename(previous, directory)
+                elif previous.exists():
+                    shutil.rmtree(previous)
+                for path in directory.parent.glob(f".set-{directory.name}-*"):
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                if not exclusive:
+                    fcntl.flock(stream, fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def _publish_directory(staged: Path, current: Path) -> None:
+    """Rename the old set aside, install the prepared directory, then remove the old set."""
+    previous = current.parent / f".previous-{current.name}"
+    if current.exists():
+        os.rename(current, previous)
+    try:
+        os.rename(staged, current)
+    except BaseException:
+        if previous.exists() and not current.exists():
+            os.rename(previous, current)
+        raise
+    fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if previous.exists():
+        shutil.rmtree(previous)
 
 
 def require_git_records_dir(path: Path | str) -> Path:
@@ -321,7 +393,10 @@ def _load_historical_gradient_record(ctx, current_identity: dict, binding: dict)
         ):
             raise ReferencePrerequisiteError("historical reference schema is invalid")
         historical_identity = record["identity"]
-        if not isinstance(historical_identity, dict) or path.name != _record_path(ctx, historical_identity).name:
+        if (
+            not isinstance(historical_identity, dict)
+            or path.name != _legacy_record_path(ctx, historical_identity).name
+        ):
             raise ReferencePrerequisiteError("historical reference filename does not bind its original identity")
         if (
             type(historical_identity.get("schema")) is not int
@@ -390,12 +465,24 @@ def load_record(ctx, current_identity: dict, *, historical_binding=None) -> dict
         f"{shlex.join(selection + options)}"
     )
     try:
-        if path.stat().st_size > MAX_RECORD_BYTES:
-            raise ReferencePrerequisiteError(f"reference record is oversized: {path}")
-        record = json.loads(path.read_text())
+        directory = _config_dir(ctx, identity)
+        if not directory.parent.exists():
+            raise FileNotFoundError(path)
+        with _publication_lock(directory, exclusive=False):
+            # Legacy reuse is exact-identity only. Never fall back past a published latest set.
+            latest_files = [
+                item for item in path.parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None
+            ]
+            if not latest_files:
+                path = _legacy_record_path(ctx, identity)
+            if path.stat().st_size > MAX_RECORD_BYTES:
+                raise ReferencePrerequisiteError(f"reference record is oversized: {path}")
+            record = _strict_record_json(path.read_bytes())
     except FileNotFoundError as exc:
         raise ReferencePrerequisiteError(f"prepared HF reference missing: {path}; run {command}") from exc
-    except (UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, ReferencePrerequisiteError) as exc:
+        if "oversized" in str(exc):
+            raise
         raise ReferencePrerequisiteError(f"prepared HF reference corrupt: {path}; run {command}") from exc
     try:
         valid = (
@@ -407,6 +494,13 @@ def load_record(ctx, current_identity: dict, *, historical_binding=None) -> dict
     except (ValueError, TypeError) as exc:
         raise ReferencePrerequisiteError(f"prepared HF reference corrupt: {path}; run {command}") from exc
     if not valid:
+        if (
+            isinstance(record, dict)
+            and record.get("schema") == SCHEMA_VERSION
+            and record.get("identity") != identity
+            and record.get("payload_sha256") == _digest(record.get("measurements"))
+        ):
+            raise ReferencePrerequisiteError(f"prepared HF reference incompatible: {path}; run {command}")
         raise ReferencePrerequisiteError(f"prepared HF reference corrupt or incompatible: {path}; run {command}")
     try:
         validate_measurements(identity, record["measurements"])
@@ -421,7 +515,7 @@ def load_record(ctx, current_identity: dict, *, historical_binding=None) -> dict
     return record["measurements"]
 
 
-def publish_record(ctx, identity: dict, measurements: dict) -> Path:
+def _record_bytes(identity: dict, measurements: dict) -> bytes:
     validate_measurements(identity, measurements)
     data = _json(
         {
@@ -433,24 +527,138 @@ def publish_record(ctx, identity: dict, measurements: dict) -> Path:
     )
     if len(data) > MAX_RECORD_BYTES:
         raise ReferencePrerequisiteError("reference JSON exceeds compact record size limit")
-    path = _record_path(ctx, identity)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # A hard link publishes complete bytes atomically without overwriting a concurrent writer.
-    fd, temporary = tempfile.mkstemp(prefix=".prepare-", suffix=".json", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            if path.read_bytes() != data:
-                raise ReferencePrerequisiteError(f"conflicting immutable reference publication: {path}") from None
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    return data
+
+
+def _remove_replaced_legacy_records(ctx, staged: Path, identities: list[dict]) -> None:
+    replaced = {_record_path(ctx, identity).parent for identity in identities}
+    directory = _config_dir(ctx, identities[0])
+    for check_id in {identity["check_id"] for identity in identities}:
+        for path in (staged / check_id).glob("*.json"):
+            if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None:
+                continue
+            record = _strict_record_json(path.read_bytes())
+            identity = record["identity"]
+            if (
+                record.get("schema") != SCHEMA_VERSION
+                or identity.get("config_id") != directory.name
+                or identity.get("check_id") != check_id
+                or path.name != _legacy_record_path(ctx, identity).name
+                or record.get("payload_sha256") != _digest(record.get("measurements"))
+            ):
+                raise ReferencePrerequisiteError(f"cannot identify legacy reference for replacement: {path}")
+            validate_measurements(identity, record["measurements"])
+            if _record_path(ctx, identity).parent in replaced:
+                path.unlink()
+
+
+def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
+    """Publish all expected arms/checks together, retaining only their latest complete workload sets."""
+    entries = list(entries)
+    expected = list(expected_identities)
+    if not entries or not expected:
+        raise ReferencePrerequisiteError("reference publication requires a nonempty complete set")
+    directory = _config_dir(ctx, expected[0])
+    prepared = {}
+    groups = {}
+    for identity in expected:
+        path = _record_path(ctx, identity)
+        if _config_dir(ctx, identity) != directory:
+            raise ReferencePrerequisiteError("reference set must belong to one configuration")
+        if path in prepared:
+            raise ReferencePrerequisiteError("reference set has duplicate workload arms")
+        prepared[path] = identity
+        groups.setdefault(path.parent, []).append(identity)
+    for identities in groups.values():
+        generations = []
+        for identity in identities:
+            generation = deepcopy(identity)
+            recipe = generation["recipe"]
+            for field in ("arm", "batch"):
+                recipe.pop(field, None)
+            inputs = recipe.get("synthetic_inputs")
+            if isinstance(inputs, dict):
+                inputs.pop("batch", None)
+                inputs.pop("rows", None)
+            generations.append(_digest(generation))
+        if len(set(generations)) != 1:
+            raise ReferencePrerequisiteError("reference set mixes incompatible workload generations")
+    data_by_path = {}
+    for identity, measurements in entries:
+        path = _record_path(ctx, identity)
+        if path not in prepared or identity != prepared[path] or path in data_by_path:
+            raise ReferencePrerequisiteError("reference set has unexpected or duplicate workload identities")
+        data_by_path[path] = _record_bytes(identity, measurements)
+    if set(data_by_path) != set(prepared):
+        raise ReferencePrerequisiteError("reference publication requires every expected workload arm")
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with _publication_lock(directory, exclusive=True):
+        for parent in groups:
+            existing_arms = {
+                path.name for path in parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
+            }
+            expected_arms = {path.name for path in prepared if path.parent == parent}
+            if existing_arms - expected_arms:
+                raise ReferencePrerequisiteError("reference replacement must include every previously published arm")
+        # A repeated identity cannot silently acquire different measurements, even in a new set.
+        for path, data in data_by_path.items():
+            old = path if path.exists() else _legacy_record_path(ctx, prepared[path])
+            if old.exists():
+                previous = _strict_record_json(old.read_bytes())
+                if previous.get("identity") == prepared[path] and old.read_bytes() != data:
+                    raise ReferencePrerequisiteError(f"conflicting immutable reference publication: {path}")
+        unchanged = all(path.exists() and path.read_bytes() == data for path, data in data_by_path.items())
+        exact_files = all(
+            set(parent.iterdir()) == {path for path in prepared if path.parent == parent}
+            for parent in groups
+            if parent.exists()
+        )
+        legacy = any(list((directory / identity["check_id"]).glob("[0-9a-f]" * 64 + ".json")) for identity in expected)
+        if not (unchanged and exact_files and not legacy):
+            temporary = Path(tempfile.mkdtemp(prefix=f".set-{directory.name}-", dir=directory.parent))
+            staged = temporary / directory.name
+            try:
+                if directory.exists():
+                    shutil.copytree(directory, staged)
+                else:
+                    staged.mkdir()
+                for parent in groups:
+                    destination = staged / parent.relative_to(directory)
+                    if destination.exists():
+                        shutil.rmtree(destination)
+                    destination.mkdir(parents=True)
+                for path, data in data_by_path.items():
+                    destination = staged / path.relative_to(directory)
+                    with destination.open("xb") as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if destination.read_bytes() != data:
+                        raise ReferencePrerequisiteError(f"staged reference changed before publication: {destination}")
+                _remove_replaced_legacy_records(ctx, staged, expected)
+                for parent in sorted({staged, staged.parent, *(path for path in staged.rglob("*") if path.is_dir())}):
+                    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                _publish_directory(staged, directory)
+                fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            finally:
+                shutil.rmtree(temporary)
+    published = {_digest(identity): path for path, identity in prepared.items()}
     paths = getattr(ctx, "reference_record_paths", None)
     if paths is not None:
-        paths[_digest(identity)] = str(path)
-    print(f"Prepared HF reference: {path} ({len(data)} bytes)", flush=True)
-    return path
+        paths.update({key: str(path) for key, path in published.items()})
+    for path, data in data_by_path.items():
+        print(f"Prepared HF reference: {path} ({len(data)} bytes)", flush=True)
+    return published
+
+
+def publish_record(ctx, identity: dict, measurements: dict) -> Path:
+    """Publish a single-record workload; multi-arm preparation must use publish_record_set."""
+    return publish_record_set(ctx, [(identity, measurements)], expected_identities=[identity])[_digest(identity)]

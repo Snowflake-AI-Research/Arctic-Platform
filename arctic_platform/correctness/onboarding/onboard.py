@@ -2015,7 +2015,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     from arctic_platform.correctness.harness.reference_records import file_identity
     from arctic_platform.correctness.harness.reference_records import load_record
     from arctic_platform.correctness.harness.reference_records import model_identity
-    from arctic_platform.correctness.harness.reference_records import publish_record
+    from arctic_platform.correctness.harness.reference_records import publish_record_set
     from arctic_platform.correctness.harness.reference_records import require_git_records_dir
     from arctic_platform.correctness.harness.reference_records import workload_identity
     from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
@@ -2149,10 +2149,15 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
             tolerances[arm.name] = tolerance
             arm_receipts[arm.name] = {"gate": gate, "identity": identity}
             validated.append((arm.name, identity, measurements))
-        # Check both arms before immutable publication; regression reads each record's own gate.
+        # Publish both validated arms in one transaction; regression reads each record's own gate.
         ctx.reference_records_dir = records_root
+        published = publish_record_set(
+            ctx,
+            [(identity, measurements) for _, identity, measurements in validated],
+            expected_identities=[identity for _, identity, _ in validated],
+        )
         for name, identity, measurements in validated:
-            path = publish_record(ctx, identity, measurements)
+            path = next(path for path in published.values() if path.name == f"{name}.json")
             arm_receipts[name]["record"] = str(path)
             arm_receipts[name]["record_identity"] = file_identity(path)
     selected = max(tolerances.values(), key=lambda tolerance: tolerance.absolute)

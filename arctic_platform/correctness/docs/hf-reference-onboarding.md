@@ -29,7 +29,7 @@ python -m arctic_platform.correctness onboard \
 
 **Specifications and compact records serve different purposes.** A specification records model/input settings, applicability and reviewed tolerances; compact reference records contain independent HF measurements. The preparation-only commands below assume an existing reviewed specification and matching model assets.
 
-**Hugging Face (HF) reference measurements are prepared explicitly during onboarding, not regenerated during regression.** Use `onboard --prepare-references` with a matching reviewed SFT (supervised fine-tuning) config and frozen test specification. Preparation does not resize the fixture, rewrite historical gates, or run the target backend. Matching records are reused; missing records require HF computation, while incompatible or corrupt records must be resolved explicitly.
+**Hugging Face (HF) reference measurements are prepared explicitly during onboarding, not regenerated during regression.** Use `onboard --prepare-references` with a matching reviewed SFT (supervised fine-tuning) config and frozen test specification. Preparation does not resize the fixture, rewrite historical gates, or run the target backend. Matching records are reused; explicit preparation computes missing or incompatible records and replaces their complete workload sets. Corrupt records must be resolved before preparation; regression never replaces records.
 
 **The three supported check IDs select different compact measurements.**
 
@@ -37,7 +37,21 @@ python -m arctic_platform.correctness onboard \
 - `single-step-optimizer`: step-one Adam first-moment, second-moment, and update-residual L2 norms, with canonical parameter names and shapes.
 - `e2e-sft-train-validate`: 100 training losses and gradient norms, optimizer-step count, held-out validation cross-entropy, and scored-answer-token count.
 
-**Compact records are generated local artifacts, not files to commit.** They default to the locally retained, Git-ignored location `arctic_platform/correctness/reference_data`. Retain them for later regression; regression cannot regenerate missing HF measurements. Override the location with `--reference-records-dir` on both onboarding and regression; publication requires a directory inside the checkout, not Git tracking. [reference_records.py](../harness/reference_records.py) stores bounded JSON at `<config-id>/<check-id>/<workload-identity-sha256>.json`, with a measurement checksum. The workload identity binds the config, reference sources and dependency versions, model asset contents, initialization, input tensors, and check-specific options rather than machine-specific cache roots. Publication is immutable: conflicting measurements cannot silently replace an existing record.
+**Each workload folder retains only its latest complete reference set.** Compact records default to the local, Git-ignored `arctic_platform/correctness/reference_data` directory; they are generated artifacts, not files to commit. Override the directory with `--reference-records-dir` on both onboarding and regression. Publication requires a location inside the checkout, not Git tracking. [reference_records.py](../harness/reference_records.py) uses readable filenames:
+
+```text
+<config-id>/single-step-grads/gradients-only/gas1.json
+<config-id>/single-step-grads/gradients-only/gas4.json
+<config-id>/single-step-grads/with-optimizer/gas1.json
+<config-id>/single-step-grads/with-optimizer/gas4.json
+<config-id>/single-step-optimizer/gas1.json
+<config-id>/single-step-optimizer/gas4.json
+<config-id>/e2e-sft-train-validate/trajectory.json
+```
+
+**Replacement never deletes the previous set before preparation succeeds.** Preparation validates every selected arm and writes the complete replacement to a temporary directory. Under a per-configuration lock, publication renames the old configuration directory aside, renames the new directory into place, then deletes the old directory without automatic archival. The published layout uses ordinary directories, not symbolic links. Failed or incomplete staging leaves the previous set intact; a failed second rename restores the old directory. The next read or publication recovers an interrupted replacement and removes abandoned staging. Unselected workloads remain unchanged.
+
+**Readable filenames do not weaken reference validation.** Every JSON record retains its complete workload identity and measurement checksum. The identity binds the config, reference sources and dependency versions, model contents, initialization, input tensors and check-specific options, not machine-specific cache roots. Changed identities require explicit preparation; regression cannot regenerate references. Different measurements for an identical identity remain a publication conflict. Existing SHA-named records can be consumed only by exact identity; successful preparation removes validated legacy generations for the workloads being replaced. Explicit historical bindings below retain their original filenames and review requirements.
 
 **New single-step measurements also record the implementation and configuration used by HF.** The [reference engine](../reference/hf_single_gpu.py) captures the loaded model and decoder class identities, Python `forward` code digests, source-file content hashes, and effective configurations, including the attention backend that HF configuration serialization can omit. The engine compares these observations before and after execution and rejects a changed implementation, source file or configuration. The [reference CLI](../reference/__main__.py) retains these observations in `reference_execution`; compact-record publication and loading preserve that field without rerunning HF. This limited observation does not capture every transitive kernel or prove native target execution. Historical records without this field remain historical: neither regression nor this change reconstructs their original execution evidence.
 
