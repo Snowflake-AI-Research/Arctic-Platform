@@ -23,7 +23,7 @@ level = "debug"
 name = "Qwen/Qwen3.5-4B"
 
 [monitors.wandb]
-project = "prime_rl_ct"
+project = "prime_rl_cortex_training"
 
 [trainer.model]
 attn = "auto"
