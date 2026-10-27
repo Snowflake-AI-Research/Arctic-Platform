@@ -46,10 +46,8 @@ from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
-from arctic_platform.model import ModelSpec
-from arctic_platform.model import ParallelismConfig
-from arctic_platform.model import Patches
 from arctic_platform.model import build_model
+from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
@@ -176,65 +174,14 @@ class DeepSpeedWorker:
         model_provider = ds_worker_config.get("model_provider", "huggingface")
         if model_provider not in {"huggingface", "liger"}:
             raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
-        offload = (ds_worker_config.get("ac_config") or {}).get("offload_config") or {}
-        activation_offload = (
-            {key: value for key, value in offload.items() if key != "enabled" and value is not None}
-            if offload.get("enabled", False)
-            else None
-        )
-        token_chunk_size = ds_worker_config.get("fused_lm_head_token_chunk_size")
-        fp32_lm_head = ds_worker_config.get("fp32_lm_head", False)
-        lm_head = (
-            {
-                "fp32": fp32_lm_head,
-                "token_chunk_size": token_chunk_size,
-                "vocab_chunk_size": ds_worker_config.get("fused_lm_head_vocab_chunk_size", 8192),
-            }
-            if fp32_lm_head or token_chunk_size is not None
-            else None
-        )
-        tiled_size = ds_worker_config.get("tiled_mlp_token_chunk_size")
-        zorro_train = None
-        if ds_worker_config.get("zorro_train_enable", False):
-            zorro_train = {
-                key: ds_worker_config[key]
-                for key in (
-                    "response_len",
-                    "max_token_len",
-                    "rollout_n",
-                    "temperature",
-                    "use_unpad",
-                    "world_size",
-                    "logits_optimization",
-                    "logits_optimization_peak_mem_size_in_gib",
-                    "logits_compute_from_fp32_inputs",
-                    "logits_compute_in_fp32",
-                )
-                if key in ds_worker_config
-            }
-        loader_options = {
-            key: ds_worker_config[key] for key in ("fp32_parity", "fp32_residual") if key in ds_worker_config
-        }
         debug_config = job_config.get("training_config")
         loaded = build_model(
-            ModelSpec(
-                model_path_or_name=model_name,
+            ds_worker_dense_model_spec(
+                model_name,
+                ds_worker_config,
                 dtype=str(job_config.get("dtype") or "bfloat16"),
-                attn_implementation=ds_worker_config.get("attn_implementation"),
-                loader="huggingface",
-                parallelism=ParallelismConfig(sequence_parallel=self.sp_size),
+                sequence_parallel=self.sp_size,
                 debug=gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config),
-                patches=Patches(
-                    liger=model_provider == "liger" or bool(ds_worker_config.get("use_liger")),
-                    gradient_checkpointing=ds_worker_config.get("enable_gradient_checkpointing", True),
-                    activation_offload=activation_offload,
-                    compile=ds_worker_config.get("compile"),
-                    tiled_mlp={"token_chunk_size": tiled_size} if tiled_size is not None else None,
-                    lm_head=lm_head,
-                    zorro_train=zorro_train,
-                    peft=ds_worker_config.get("peft_config"),
-                ),
-                **({"loader_options": loader_options} if loader_options else {}),
             )
         )
         model = loaded.model

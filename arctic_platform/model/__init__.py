@@ -28,6 +28,8 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
+from arctic_platform.model.dense_spec import dense_model_spec
+from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
@@ -95,6 +97,8 @@ __all__ = [
     "checkpoint_peft_adapter_dir",
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
+    "dense_model_spec",
+    "ds_worker_dense_model_spec",
     "effective_fused_cross_entropy",
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
