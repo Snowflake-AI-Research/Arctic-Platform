@@ -1305,7 +1305,7 @@ def _stub_vllm_chat_modules(monkeypatch):
     modules = {
         "jinja2": {"TemplateError": type("TemplateError", (Exception,), {})},
         "vllm.entrypoints": {},
-        "vllm.entrypoints.chat_utils": {
+        "vllm.renderers.chat_utils": {
             "ChatTemplateResolutionError": type("ChatTemplateResolutionError", (ValueError,), {})
         },
         "vllm.entrypoints.openai": {},
@@ -1482,7 +1482,7 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
     import sys
 
     _stub_vllm_chat_modules(monkeypatch)
-    error = sys.modules["vllm.entrypoints.chat_utils"].ChatTemplateResolutionError
+    error = sys.modules["vllm.renderers.chat_utils"].ChatTemplateResolutionError
     engine = _engine_whose_renderer_raises(error("you must provide a chat template"))
 
     async def run_twice():

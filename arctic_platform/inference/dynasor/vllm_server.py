@@ -5,11 +5,13 @@ import time
 import multiprocessing
 import signal
 import sys
-from vllm.entrypoints.openai.cli_args import (make_arg_parser,
-                                              validate_parsed_serve_args)
-from vllm.utils import FlexibleArgumentParser
+from vllm.entrypoints.launchers.cli_args import (
+    make_arg_parser,
+    validate_parsed_serve_args,
+)
 from vllm.entrypoints.openai.api_server import run_server
-from vllm.entrypoints.utils import cli_env_setup
+from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 import arctic_platform.inference.dynasor.openai_server as openai_server
 
 def check_health(port: int, retry_interval: float = 1.0) -> bool:
