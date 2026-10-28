@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """Non-fused AdamW arithmetic for DeepSpeed's CPU-offloaded optimizer state."""
 
 from __future__ import annotations

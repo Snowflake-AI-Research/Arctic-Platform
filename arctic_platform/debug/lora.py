@@ -1902,12 +1902,6 @@ def receiver_extension():
     return LoRAWeightSyncExtension
 
 
-def _receiver_extension_attribute(name):
-    if name == "LoRAWeightSyncExtension":
-        return receiver_extension()
-    raise AttributeError(name)
-
-
 # Sampler
 
 

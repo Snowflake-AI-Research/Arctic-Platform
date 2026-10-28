@@ -133,7 +133,7 @@ def gated_training_steps(recorded: int) -> Tuple[int, ...]:
 class Replay:
     """The one materialized copy of the run's inputs, which both engines read from disk.
 
-    Files rather than in-memory batches, for the reason ``harness.batches`` exists: the reference runs in
+    Files rather than in-memory batches, for the reason ``harness.sft`` materializes inputs: the reference runs in
     its own process and may hold different library versions, so loading identical bytes removes the
     question of whether two generators agreed.
     """

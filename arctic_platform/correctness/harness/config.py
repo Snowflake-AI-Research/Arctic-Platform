@@ -121,10 +121,6 @@ class ArmSpec:
     dss_microbatches: int
     pad_fraction: float
 
-    @property
-    def exercises_accumulation(self) -> bool:
-        return self.dss_microbatches > 1
-
 
 @dataclass
 class ModelSpec:

@@ -38,6 +38,8 @@ Paths in this table are relative to `arctic_platform/correctness/`.
 
 **Consolidation removes replaced modules rather than leaving forwarding files.** Maintained coverage lives in `selftest/`, not in archived drivers. Historical suite counts and receipts are run results, not guarantees about the current checkout.
 
+**One-off fixture configurations and the old naming-source exception are retired.** Job-numbered, issue-numbered and 64-token experiment configs are not maintained operator workloads. Their frozen copies remain with the original evidence. The removed historical-gradient options cannot admit consolidated sources under obsolete `names.py` hashes; current reference loading still requires an exact identity.
+
 **The documented LM-head command remains supported.** Both forms invoke the same maintained diagnostic:
 
 ```bash

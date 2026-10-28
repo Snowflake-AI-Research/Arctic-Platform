@@ -9,7 +9,7 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 **Use the shared library and its maintained commands, not a new model-specific launcher.** Start with the [operator guide](../../arctic_platform/correctness/docs/running-tests.md) for prerequisites, selection and reports. The [code inventory](../../arctic_platform/correctness/docs/code-inventory.md) identifies implementation boundaries and retired experiments.
 
-**Read the [HF reference onboarding guide](../../arctic_platform/correctness/docs/hf-reference-onboarding.md) before changing preparation, compact records, calibration or cached-reference regression.** It defines reference identity, immutable publication, retry compatibility and explicit historical reuse.
+**Read the [HF reference onboarding guide](../../arctic_platform/correctness/docs/hf-reference-onboarding.md) before changing preparation, compact records, calibration or cached-reference regression.** It defines reference identity, latest-set publication and retry compatibility. Historical records remain evidence; current regression requires compatible current identities.
 
 **Keep maintained filenames descriptive and stable.** Do not include agent IDs, thread IDs or hashes in code filenames. Content-addressed reference records and immutable run receipts are data, not code, and retain their integrity keys. Extend the responsibility-based sections in `selftest/library.py`; `selftest/check_suite.py` is the single driver for all correctness selftests.
 

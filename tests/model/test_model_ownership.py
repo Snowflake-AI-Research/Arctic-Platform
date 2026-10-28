@@ -19,10 +19,8 @@ from pathlib import Path
 import pytest
 
 _DSS_COMPARISON_ADAPTERS = {
-    "correctness/harness/checkpoint_store.py",
     "correctness/harness/gateway.py",
     "correctness/harness/lora.py",
-    "correctness/harness/native_lora.py",
     "correctness/harness/storage.py",
     "debug/training.py",
 }

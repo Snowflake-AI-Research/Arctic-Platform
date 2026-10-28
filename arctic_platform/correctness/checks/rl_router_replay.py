@@ -18,7 +18,7 @@
 The sampling zone generates one answer per GSM8K prompt with router replay on and returns, beside each answer,
 the expert indices its routers chose at every captured position (``dss_return_back_router_info``). The training
 zone then runs one RL fwd-bwd over those same rows, replaying the sampler's routing, with
-``debug.router_replay_trace`` recording on every rank:
+``debug.training`` recording on every rank:
 
 - the routing each sample's replay id delivered from the sampler's cache;
 - for every model call, the packed tokens, their positions, and the ``routed_experts`` tensor handed to the

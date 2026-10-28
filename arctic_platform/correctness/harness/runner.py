@@ -100,7 +100,6 @@ class RunContext:
     prepare_references: bool = False
     reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
     reference_record_paths: Dict[str, str] = field(default_factory=dict)
-    reference_record_provenance: Dict[str, dict] = field(default_factory=dict)
     _reference: Dict[str, dict] = field(default_factory=dict)
     _reference_by_check: Dict[str, Dict[str, dict]] = field(default_factory=dict)
     _target: Dict[str, object] = field(default_factory=dict)
@@ -463,7 +462,6 @@ def execute(
     prepare_references: bool = False,
     reference_records_dir: Path | None = None,
     peft_adapter: Path | None = None,
-    historical_gradient_references: dict | None = None,
     reference_calibration_runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS,
     reference_calibration_workers: int | None = None,
     native_optimizer_scope=None,
@@ -480,19 +478,6 @@ def execute(
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
-    if historical_gradient_references is not None:
-        if (
-            select != ["single-step-grads"]
-            or prepare_references
-            or cfg.is_rl
-            or not isinstance(historical_gradient_references, dict)
-            or not historical_gradient_references
-            or set(historical_gradient_references) != {arm.name for arm in arm_defs}
-        ):
-            raise ValueError(
-                "historical gradient references require only single-step-grads and exactly the selected SFT arms"
-            )
-        historical_gradient_references = deepcopy(historical_gradient_references)
     if inference_sampling_topology is not None:
         from ..checks.inference_checkpoint_loss import _sampling_topology
 
@@ -1034,16 +1019,7 @@ def execute(
         records = {}
         for test_id, identity in identities.items():
             try:
-                if historical_gradient_references is not None:
-                    records[test_id] = load_record(
-                        context, identity, historical_binding=historical_gradient_references[arm.name]
-                    )
-                    (tmp / "reference-record-provenance.json").write_text(
-                        json.dumps(context.reference_record_provenance, indent=2, sort_keys=True, allow_nan=False)
-                        + "\n"
-                    )
-                else:
-                    records[test_id] = load_record(context, identity)
+                records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
                 if not prepare_references or not any(
                     message in str(exc)
