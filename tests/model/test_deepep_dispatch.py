@@ -17,16 +17,61 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from arctic_platform.model.implementations.moe.distributed import deepep
+
+@pytest.fixture
+def deepep(monkeypatch):
+    root = Path(__file__).resolve().parents[2] / "arctic_platform/model/implementations/moe"
+    package_name = "_deepep_lifetime_tests"
+    for name in (package_name, f"{package_name}.distributed"):
+        package = ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+
+    # Load the real tensor helpers without importing the optional distributed package.
+    modules = {}
+    for relative in ("token_combine", "routing_weights", "distributed.token_permute", "distributed.deepep"):
+        name = f"{package_name}.{relative}"
+        spec = importlib.util.spec_from_file_location(name, root / f"{relative.replace('.', '/')}.py")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        modules[relative] = (spec, module)
+
+    extension = ModuleType("deep_ep")
+    extension.Buffer = object
+    extension_utils = ModuleType("deep_ep.utils")
+    extension_utils.EventHandle = object
+    extension_utils.EventOverlap = object
+
+    class CudaLibrary:
+        def __init__(self, *args):
+            pass
+
+        def define(self, schema):
+            pass
+
+    # Only extension imports and CUDA registration are stubbed; lifetime logic is unchanged.
+    with monkeypatch.context() as imports:
+        imports.setitem(sys.modules, "deep_ep", extension)
+        imports.setitem(sys.modules, "deep_ep.utils", extension_utils)
+        imports.setattr(torch.library, "Library", CudaLibrary)
+        imports.setattr(torch.library, "impl", lambda *args: lambda function: function)
+        imports.setattr(torch.library, "register_autograd", lambda *args, **kwargs: None)
+        for spec, module in modules.values():
+            spec.loader.exec_module(module)
+    return modules["distributed.deepep"][1]
 
 
 @pytest.fixture
-def dispatched(monkeypatch):
+def dispatched(monkeypatch, deepep):
     event_calls = []
     event = SimpleNamespace(current_stream_wait=lambda: event_calls.append("wait"))
     handle = object()
@@ -42,7 +87,7 @@ def dispatched(monkeypatch):
     return SimpleNamespace(output=output, event_calls=event_calls, handle=handle, args=args)
 
 
-def test_abandoned_dispatch_releases_handle_and_waits_for_event(dispatched):
+def test_abandoned_dispatch_releases_handle_and_waits_for_event(dispatched, deepep):
     key = dispatched.output[-1].item()
     assert deepep._handle_cache[key] is dispatched.handle
     assert key in deepep._pending_dispatch_events
@@ -53,7 +98,7 @@ def test_abandoned_dispatch_releases_handle_and_waits_for_event(dispatched):
     assert dispatched.event_calls == ["wait"]
 
 
-def test_live_dispatch_remains_available_and_autograd_owns_its_handle(dispatched):
+def test_live_dispatch_remains_available_and_autograd_owns_its_handle(dispatched, deepep):
     key = dispatched.output[-1].item()
     ctx = SimpleNamespace()
     deepep._dispatch_setup_context(ctx, dispatched.args, dispatched.output)
@@ -66,7 +111,7 @@ def test_live_dispatch_remains_available_and_autograd_owns_its_handle(dispatched
     assert ctx.saved_handle is dispatched.handle
 
 
-def test_consumed_dispatch_is_not_waited_or_released_twice(dispatched):
+def test_consumed_dispatch_is_not_waited_or_released_twice(dispatched, deepep):
     key = dispatched.output[-1].item()
     deepep._sync_dispatch(key)
     saved = deepep._handle_cache.pop(key)
