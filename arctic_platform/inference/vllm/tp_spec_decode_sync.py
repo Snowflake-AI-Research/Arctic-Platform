@@ -34,8 +34,10 @@ ranks before anything reads them. It applies only when speculative decoding
 runs on more than one TP rank with every rank sampling the whole batch.
 ``ARCTIC_TP_SPEC_SYNC=0`` disables it.
 
-Every ``STATS_EVERY`` sample steps a rank logs the steps where rank 0's draft
-or sampled tokens (in the slots that are read) differed from its own, if any.
+With ``ARCTIC_TP_SPEC_SYNC_STATS=1``, a rank also copies its draft and sampled
+tokens before each broadcast and, every ``STATS_EVERY`` sample steps, logs the
+steps where rank 0's copy (in the slots that are read) differed from its own.
+Off by default, so the default path is only the broadcasts.
 
 Remove once the pinned vLLM synchronizes TP ranks during speculative decoding.
 
@@ -51,6 +53,7 @@ import torch
 
 _APPLIED = False
 STATS_EVERY = 5000
+STATS_ENABLED = os.getenv("ARCTIC_TP_SPEC_SYNC_STATS", "0") == "1"
 
 
 def _tp_group():
@@ -150,8 +153,8 @@ def wrap_propose(runner: Any) -> None:
 
     def propose(*args, **kwargs):
         draft_tokens = original_propose(*args, **kwargs)
-        if needs_sync(runner):
-            before = draft_tokens.clone() if STATS_EVERY else None
+        if isinstance(draft_tokens, torch.Tensor) and needs_sync(runner):
+            before = draft_tokens.clone() if STATS_ENABLED else None
             broadcast_from_rank0([draft_tokens])
             if before is not None:
                 _stats(runner).add("draft", drafts_differ(before, draft_tokens))
@@ -164,7 +167,7 @@ def wrap_propose(runner: Any) -> None:
 def sync_sampler_output(runner: Any, sampler_output: Any) -> None:
     before = (
         (sampler_output.sampled_token_ids.clone(), sampler_output.num_sampled.clone())
-        if STATS_EVERY
+        if STATS_ENABLED
         else None
     )
     broadcast_from_rank0(
