@@ -204,9 +204,10 @@ def _gather_ep_weight_to_cpu(
 
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
-    convert_layer_to_hf = getattr(model_type, "convert_layer_to_hf", None)
-    if convert_layer_to_hf is None:
+    if getattr(model_type, "convert_layer_to_hf", None) is None:
         raise RuntimeError(f"build_iter_full_hf_weights requires {model_type.__name__}.convert_layer_to_hf")
+    # Bound from the instance so a family whose layer mapping depends on its config can read it.
+    convert_layer_to_hf = model.convert_layer_to_hf
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist

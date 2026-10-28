@@ -164,7 +164,8 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
     assert leftovers == []
 
 
-def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path):
+@pytest.mark.parametrize("callback_name", ["convert_checkpoint_fn", "stream_convert_fn"])
+def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 
     source = tmp_path / "source"
@@ -193,7 +194,7 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
             unexpected_bulk_call,
             rank=0,
             local_rank=0,
-            convert_checkpoint_fn=convert_checkpoint,
+            **{callback_name: convert_checkpoint},
         )
 
     assert len(converted) == 1
@@ -202,7 +203,8 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
 
 
 @pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
-def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure):
+@pytest.mark.parametrize("callback_name", ["convert_checkpoint_fn", "stream_convert_fn"])
+def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 
     source = tmp_path / "source"
@@ -235,7 +237,7 @@ def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure):
             unexpected_bulk_call,
             rank=0,
             local_rank=0,
-            convert_checkpoint_fn=convert_checkpoint,
+            **{callback_name: convert_checkpoint},
         )
 
     assert not destination.exists()
@@ -586,8 +588,10 @@ def test_capture_mtp_weights_rejects_incomplete_or_mismatched_inventory(monkeypa
 @pytest.mark.parametrize("remote", [False, True])
 @pytest.mark.parametrize("cache_scope", ["ready", "node-local", "shared"])
 @pytest.mark.parametrize("checkpoint_conversion", [False, True])
+@pytest.mark.parametrize("stream_conversion", [False, True])
+@pytest.mark.parametrize("dequantize", [False, True])
 def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
-    monkeypatch, tmp_path, remote, cache_scope, checkpoint_conversion
+    monkeypatch, tmp_path, remote, cache_scope, checkpoint_conversion, stream_conversion, dequantize
 ):
     from types import SimpleNamespace
 
@@ -627,9 +631,12 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
     model = FakePrimeModel()
     if checkpoint_conversion:
         model.convert_to_prime_checkpoint = lambda source, destination: None
+    if stream_conversion:
+        model.stream_convert_to_prime = lambda source, destination: None
     config = SimpleNamespace(
         name="Qwen/test-offline-checkpoint" if remote else str(original),
         fsdp_cpu_offload=False,
+        dequantize_checkpoint=dequantize,
         debug=SimpleNamespace(random_init=False),
         weight_conversion_cache_dir=str(tmp_path / "cache"),
     )
@@ -655,9 +662,17 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
         capture,
     )
     monkeypatch.setattr(
-        model_builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.gate_up_proj"]
+        model_builder,
+        "load_state_dict_keys",
+        lambda path: ["model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.mlp.experts.gate_up_proj.scale"],
     )
-    monkeypatch.setattr(model_builder, "resolve_conversion_cache_path", lambda *args: converted)
+
+    def resolve_cache(actual_config, source, fmt):
+        assert actual_config is config and source == original
+        assert fmt == ("prime-dequantized" if dequantize else "prime")
+        return converted
+
+    monkeypatch.setattr(model_builder, "resolve_conversion_cache_path", resolve_cache)
     monkeypatch.setattr(model_builder, "conversion_cache_is_node_local", lambda path: cache_scope == "node-local")
     cache_written = cache_scope == "ready"
 
@@ -675,6 +690,7 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
             "rank": 0,
             "local_rank": 0,
             "convert_checkpoint_fn": getattr(model, "convert_to_prime_checkpoint", None),
+            "stream_convert_fn": getattr(model, "stream_convert_to_prime", None),
         }
         events.append(("convert_cache", source, destination))
         cache_written = True

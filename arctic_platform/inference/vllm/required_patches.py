@@ -18,6 +18,7 @@
 
 def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.config import ensure_dflash_max_position_patch
+    from arctic_platform.inference.vllm.deepseek_v41_lora import ensure_deepseek_v41_lora
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
     from arctic_platform.inference.vllm.dflash2_nan_fix import apply_dflash2_nan_fixes
     from arctic_platform.inference.vllm.glm5next_indexer_page import apply_glm5next_indexer_page_fix
@@ -40,3 +41,4 @@ def apply_required_vllm_patches() -> None:
     ensure_dflash_max_position_patch()
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
+    ensure_deepseek_v41_lora()
