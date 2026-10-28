@@ -36,6 +36,8 @@ _LOGPROB_SLICE_BYTES = 1 * (2**30)  # 1 GiB
 
 def _eager_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
     """Upcast to fp32 and return log_softmax over vocab at the label column."""
+    # Not torch.log_softmax: it sums the argmax's own exp(0) = 1, rounding a near-certain label's logprob and gradient
+    # to exactly 0 (https://jonbarron.info/softmaxfix/; arXiv:2610.36427 for the log1p below).
     logits = logits_chunk.float()
     peak, top = logits.max(-1, keepdim=True)
     labels = labels_chunk.unsqueeze(-1)
