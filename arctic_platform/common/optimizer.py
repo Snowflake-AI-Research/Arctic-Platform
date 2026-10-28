@@ -49,7 +49,6 @@ class OptimizerSettings(BaseModel):
     weight_decay: _NonNegative = 0.0
     betas: list[_Beta] = Field(default_factory=lambda: list(_DEFAULT_BETAS), min_length=2, max_length=2)
     eps: Annotated[float, Field(gt=0, strict=True, allow_inf_nan=False)] = 1e-8
-    adam_w_mode: StrictBool = True
     # ``None`` lets the model family decide. GLM-MoE leaves FusedAdam off.
     fused: StrictBool | None = None
     # Older clients send it here, but it applies to the whole job: the job's training config owns it.

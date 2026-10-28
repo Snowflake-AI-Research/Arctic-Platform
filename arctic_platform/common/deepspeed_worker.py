@@ -208,6 +208,7 @@ class DeepSpeedWorker:
                 mpu=None,
                 model_path=model_name,
                 rank=self.rank,
+                adam_w_mode=engine_spec.adam_w_mode,
             )
         else:
             # Forward-only/log-prob remains a separate no-optimizer contract.

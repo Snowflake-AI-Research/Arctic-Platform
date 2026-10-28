@@ -152,9 +152,9 @@ def test_existing_torch_adam_config_selects_torch_optimizer():
         betas=[0.8, 0.95],
         eps=1e-6,
         weight_decay=0.1,
-        adam_w_mode=False,
         fused=False,
     )
+    assert spec.adam_w_mode is False
 
 
 def test_sequence_parallel_must_divide_the_world():
@@ -266,6 +266,16 @@ def test_optimizer_choice_matches_the_class_built(optimizer, ds_config, fused, e
     assert (choice["implementation"], choice["reason"]) == expected
 
 
+def test_adam_w_mode_off_selects_adam():
+    choice = optimizer_choice(OptimizerSettings(fused=False), _ZERO2, fused=False, adam_w_mode=False)
+    optimizer = build_training_optimizer(
+        torch.nn.Linear(2, 2), OptimizerSettings(fused=False), _ZERO2, fused=False, adam_w_mode=False
+    )
+
+    assert choice == {"implementation": "torch_adam", "reason": "you disabled AdamW mode, so standard Adam ran"}
+    assert type(optimizer) is torch.optim.Adam
+
+
 def test_optimizer_implementation_rejects_unknown_names():
     with pytest.raises(AssertionError, match="Unhandled optimizer"):
         optimizer_implementation("sgd", fused=True)
@@ -307,8 +317,9 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
     sentinel = object()
     calls = {}
 
-    def _build(model, optimizer, ds_config, *, fused):
+    def _build(model, optimizer, ds_config, *, fused, adam_w_mode):
         calls["fused"] = fused
+        calls["adam_w_mode"] = adam_w_mode
         return sentinel
 
     def _initialize(*, model, config, **kwargs):
@@ -339,6 +350,7 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
     assert optimizer is sentinel
     assert choice["implementation"] == "fused_adam"
     assert calls["fused"] is True
+    assert calls["adam_w_mode"] is True
     assert calls["kwargs"] == {"optimizer": sentinel, "mpu": mpu}
 
 
