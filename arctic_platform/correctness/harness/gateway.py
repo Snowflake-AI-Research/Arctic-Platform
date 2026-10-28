@@ -75,6 +75,8 @@ from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+from arctic_platform.debug.training import maybe_configure_router_replay_sampling
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
 
 # Dss Driver
 
@@ -1690,9 +1692,6 @@ def running_rl_client(
         "training": training_only.training,
         "backend": training_only.backend,
     }
-    from arctic_platform.debug.training import maybe_configure_router_replay_sampling
-    from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
-
     updates["sampling"] = maybe_configure_broadcast_sampling(cfg.native.sampling, verify=weight_sync_verification)
     updates["sampling"] = maybe_configure_router_replay_sampling(
         updates["sampling"], verify=router_replay_verification

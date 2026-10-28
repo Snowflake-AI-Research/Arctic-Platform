@@ -80,13 +80,14 @@ def verify_sources(pins: dict[str, str]) -> None:
             raise RuntimeError(f"weight-sync source changed: {path}")
 
 
-def maybe_send_weights(worker, weights):
-    """Send the existing list once; evidence is derived from those same tensors."""
+@contextmanager
+def maybe_observe_weight_send(worker, weights):
+    """Observe a production-owned send without calling the transport."""
+    evidence = {}
     sender = worker._weight_sender
-    if sender is None:
-        return {"status": "not_initialized"}
     if not enabled():
-        return sender.send(weights)
+        yield evidence
+        return
     parameters = list(worker.engine.module.named_parameters())
     if any(hasattr(value, "ds_id") for _, value in parameters):
         raise ValueError("weight-sync evidence does not admit post-gather ZeRO3 tensor views")
@@ -99,21 +100,26 @@ def maybe_send_weights(worker, weights):
             raise ValueError("weight-sync names must be nonempty and unique")
         manifest[name] = tensor_manifest(value)
     verify_sources(origins)
-    result = sender.send(weights)
+    yield evidence
     verify_sources(origins)
     if manifest != {name: tensor_manifest(value) for name, value in weights}:
         raise RuntimeError("actually sent tensors changed during weight sync")
-    if not isinstance(result, dict):
-        raise TypeError("actual weight sender did not return a dictionary")
-    return {
-        **result,
-        "sent_manifest": manifest,
-        "trainer_parameters": {
+    evidence.update(
+        sent_manifest=manifest,
+        trainer_parameters={
             "numel": sum(value.numel() for _, value in parameters),
             "count": len(parameters),
         },
-        "evidence_sources": origins,
-    }
+        evidence_sources=origins,
+    )
+
+
+def maybe_annotate_weight_sync_result(result, evidence):
+    if not evidence:
+        return result
+    if not isinstance(result, dict):
+        raise TypeError("actual weight sender did not return a dictionary")
+    return {**result, **evidence}
 
 
 def _storage(value):
@@ -189,7 +195,8 @@ class ShadowVerifier:
         ):
             raise RuntimeError("weight loader changed the registered parameter identities or storage")
 
-    def load(self, name, value, *, loader=None):
+    @contextmanager
+    def observe_load(self, name, value, *, loader):
         import torch
         from torch.utils._python_dispatch import TorchDispatchMode
         from torch.utils._pytree import tree_flatten
@@ -198,11 +205,6 @@ class ShadowVerifier:
         if not isinstance(name, str) or not name or name in self.received:
             raise ValueError("received tensor names must be nonempty and unique")
         self._check_inventory()
-        if loader is None:
-
-            def loader(source_name, tensor):
-                return self.model.load_weights([(source_name, tensor)])
-
         verify_sources(self.sources)
         self.sources.update(source_files(loader))
         verify_sources(self.sources)
@@ -264,7 +266,7 @@ class ShadowVerifier:
                 return result
 
         with torch.no_grad(), Observe(False) as live:
-            result = loader(name, value)
+            yield
         # Each replay receives private input too; loaders must not mutate the wire tensor.
         with torch.no_grad(), Observe(True) as replay:
             loader(name, value.detach().clone())
@@ -275,7 +277,16 @@ class ShadowVerifier:
         entry["destinations"] = sorted(live.written)
         self.received[name] = entry
         self.touched.update(live.written)
-        return result
+
+    def load(self, name, value, *, loader=None):
+        """Debug-only convenience for a live load and its private shadow replay."""
+        if loader is None:
+
+            def loader(source_name, tensor):
+                return self.model.load_weights([(source_name, tensor)])
+
+        with self.observe_load(name, value, loader=loader):
+            return loader(name, value)
 
     def finish(self):
         import torch
@@ -1105,15 +1116,18 @@ def weight_sync_verification_environment():
             os.environ[VERIFY_ENV] = previous
 
 
-def maybe_send_broadcast_weights(sender, weights, send):
-    """Observe the existing stream once, without replacing its exporter or transport."""
+@contextmanager
+def maybe_observe_broadcast_send(sender, weights, send):
+    """Wrap the stream; the caller still executes its native transport."""
+    evidence = {}
     if not enabled():
-        return send(weights)
+        yield weights, evidence
+        return
     if _SEND.get() is not None:
         raise RuntimeError("nested broadcast weight verification is unsupported")
     state = {"trainer_parameters": None, "trainer_inventory": None}
     token = _SEND.set(state)
-    sources = source_files(send, type(sender), maybe_send_broadcast_weights)
+    sources = source_files(send, type(sender), maybe_observe_broadcast_send)
     manifest = {}
 
     def observed():
@@ -1128,21 +1142,18 @@ def maybe_send_broadcast_weights(sender, weights, send):
 
     try:
         verify_sources(sources)
-        result = send(observed())
+        yield observed(), evidence
         verify_sources(sources)
-        if not isinstance(result, dict):
-            raise TypeError("native broadcast sender did not return a dictionary")
         if not manifest or state["trainer_parameters"] is None:
             raise RuntimeError("broadcast sender has no complete collective trainer inventory")
         sources.update(state["evidence_sources"])
         verify_sources(sources)
-        return {
-            **result,
-            "sent_manifest": manifest,
-            "trainer_parameters": state["trainer_parameters"],
-            "trainer_inventory": state["trainer_inventory"],
-            "evidence_sources": sources,
-        }
+        evidence.update(
+            sent_manifest=manifest,
+            trainer_parameters=state["trainer_parameters"],
+            trainer_inventory=state["trainer_inventory"],
+            evidence_sources=sources,
+        )
     finally:
         _SEND.reset(token)
 
@@ -1252,16 +1263,13 @@ def maybe_bind_broadcast_loader(verifier, writer):
         verify_sources(verifier.sources)
 
 
-def maybe_load_broadcast_tensor(verifier, loader, name, value):
+@contextmanager
+def maybe_observe_broadcast_tensor(verifier, loader, name, value):
     if verifier is None:
-        return loader(name, value)
-    return verifier.load(name, value, loader=loader)
-
-
-def maybe_load_broadcast_strategy(loader, model, engine, verifier):
-    if verifier is None:
-        return loader(model, engine)
-    return loader(model, engine, verifier=verifier)
+        yield
+        return
+    with verifier.observe_load(name, value, loader=loader):
+        yield
 
 
 def maybe_broadcast_receiver_result(result, verifier, *, rank):

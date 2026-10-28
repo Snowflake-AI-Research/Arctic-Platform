@@ -56,6 +56,13 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.common.utils.weight_sync import received_checksums
+from arctic_platform.common.weight_checksum import compare_weight_checksums
+from arctic_platform.debug.lora import maybe_lora_max_param_bytes
+from arctic_platform.debug.lora import maybe_lora_replica_pool
+from arctic_platform.debug.lora import maybe_lora_sync_result
+from arctic_platform.debug.lora import maybe_prepare_lora_training
+from arctic_platform.debug.lora import maybe_project_lora_transfer_schedule
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -64,7 +71,6 @@ if TYPE_CHECKING:
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need Arctic Inference / vLLM."""
     require_any_dep_group("rl")
-    from arctic_platform.debug.lora import maybe_lora_replica_pool
     from arctic_platform.inference.server.replica_pool import ReplicaPool
 
     return maybe_lora_replica_pool(ReplicaPool)
@@ -1554,26 +1560,21 @@ class ArcticRLRayServer:
     async def _sync_weights_nccl(self, workers, pool: ReplicaPool) -> dict:
         """Non-colocated weight sync via NCCL (original path)."""
         await self.arctic_rl_ray_server_state.wake_inference.remote()
-        from arctic_platform.debug.lora import maybe_lora_transfer_schedule
-
-        schedule = maybe_lora_transfer_schedule(
-            _transfer_schedule_cls(),
+        schedule = _transfer_schedule_cls().build(
             training_sharding="dp",
             training_gpus=len(workers),
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
-        from arctic_platform.debug.lora import maybe_prepare_lora_training
-
+        schedule = maybe_project_lora_transfer_schedule(schedule)
         await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
         sender_ips = await self._await_training_refs(lambda: [workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
-            from arctic_platform.debug.lora import maybe_lora_max_param_bytes
-
-            max_param = await maybe_lora_max_param_bytes(self, workers[0])
+            max_param = (await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()]))[0]
+            max_param = maybe_lora_max_param_bytes(self, max_param)
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
@@ -1623,9 +1624,18 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        from arctic_platform.debug.lora import maybe_collect_lora_sync
-
-        results = await maybe_collect_lora_sync(self, receive_task, send_tasks, schedule=schedule)
+        pool_response, send_results = await self._await_weight_sync_refs(receive_task, send_tasks)
+        workers_results = pool_response.get("workers", [])
+        checksum = compare_weight_checksums(
+            {
+                f"training rank {group.sender_train_rank}": receipt.get("sent_l2_sq")
+                for group, receipt in zip(schedule.groups, send_results)
+            },
+            received_checksums(
+                [f"sampling replica {index}" for index in range(len(workers_results))], workers_results
+            ),
+        )
+        results = maybe_lora_sync_result(self, {"status": "ok", **checksum}, pool_response, send_results)
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         return results
 

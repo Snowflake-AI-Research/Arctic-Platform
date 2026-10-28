@@ -51,6 +51,7 @@ from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import maybe_select_participation_coordinator
 
 # Lora
 
@@ -1684,8 +1685,6 @@ def install_manager(manager) -> None:
     from dss.ray_dss.jobs.gpu import training
     from dss.ray_dss.zones import manager as manager_module
 
-    from arctic_platform.debug.training import maybe_spawn_participation_coordinator
-
     pass
     pass
 
@@ -1703,9 +1702,8 @@ def install_manager(manager) -> None:
         request = _request(info.config)
         shared_request = _shared_request(info.config) if request is None else None
         if request is None and shared_request is None:
-            return maybe_spawn_participation_coordinator(
-                manager_module, actor_key, original_actor, original_spawn, training, info
-            )
+            with maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
+                return original_spawn(info)
         selected_request = shared_request if shared_request is not None else request
         if sum(len(node.gpu_ids) for node in info.layout) != selected_request["training_gpus"]:
             raise ValueError("native original adapter manager allocation differs")

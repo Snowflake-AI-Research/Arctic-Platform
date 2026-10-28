@@ -62,6 +62,7 @@ from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import merge_worker_receipts
 
 # Names
 
@@ -3186,8 +3187,6 @@ def decode_optimizer_capture(
         _native_sources(native)
     participation, inactive_weights = None, {}
     if participation_receipts is not None:
-        from arctic_platform.debug.training import merge_worker_receipts
-
         pass
 
         if native is not None:

@@ -31,6 +31,11 @@ import torch
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
 from arctic_platform.debug.inference import maybe_install_inference_warmup_observer
+from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
+from arctic_platform.debug.weight_sync import maybe_begin_broadcast_load
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
+from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -578,9 +583,6 @@ class WeightSyncExtension:
         never skips a source: unresolved names fail after the receive completes.
         """
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
-        from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
-        from arctic_platform.debug.weight_sync import maybe_load_broadcast_tensor
-
         writer = _DirectParamWriter(model, self.device)
         maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
@@ -592,7 +594,8 @@ class WeightSyncExtension:
             view = writer.get_view(name)
             destination = writer.get_destination(name)
             if view is not None and destination is not None:
-                maybe_load_broadcast_tensor(verifier, lambda _, value: view.copy_(value), name, tensor)
+                with maybe_observe_broadcast_tensor(verifier, lambda _, value: view.copy_(value), name, tensor):
+                    view.copy_(tensor)
                 source_to_destinations[name] = [destination]
             else:
                 orphans.append(name)
@@ -645,9 +648,6 @@ class WeightSyncExtension:
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
         )
-        from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
-        from arctic_platform.debug.weight_sync import maybe_load_broadcast_tensor
-
         writer = _ShardAwareFusedWriter(model, self.device)
         maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
@@ -663,10 +663,14 @@ class WeightSyncExtension:
             recv_l2_sq.add_(source_l2_sq)
             destination = writer.destination_name(name)
             if destination is not None:
-                maybe_load_broadcast_tensor(verifier, writer.feed, name, tensor)
+                with maybe_observe_broadcast_tensor(verifier, writer.feed, name, tensor):
+                    writer.feed(name, tensor)
                 destinations = [destination]
             else:
-                loaded_names = maybe_load_broadcast_tensor(verifier, lambda source, value: model.load_weights([(source, value)]), name, tensor)
+                with maybe_observe_broadcast_tensor(
+                    verifier, lambda source, value: model.load_weights([(source, value)]), name, tensor
+                ):
+                    loaded_names = model.load_weights([(name, tensor)])
                 if isinstance(loaded_names, str):
                     destinations = [loaded_names]
                 else:
@@ -748,11 +752,6 @@ class WeightSyncExtension:
             get_tensor_model_parallel_world_size,
             get_world_group,
         )
-        from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
-        from arctic_platform.debug.weight_sync import maybe_begin_broadcast_load
-        from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
-        from arctic_platform.debug.weight_sync import maybe_load_broadcast_strategy
-
         maybe_admit_broadcast_receiver(self, engine_only=engine_only)
 
         if weight_format not in ("vllm", "hf"):
@@ -798,7 +797,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = maybe_load_broadcast_strategy(self._load_batched, model, engine, verifier)
+            ) = self._load_batched(model, engine, verifier=verifier)
         elif self.model_config.quantization:
             path = "fp8"
             loaded, recv_l2_sq = self._load_fp8(model, engine)
@@ -810,7 +809,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = maybe_load_broadcast_strategy(self._load_direct, model, engine, verifier)
+            ) = self._load_direct(model, engine, verifier=verifier)
         else:
             path = "batched"
             (
@@ -819,7 +818,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = maybe_load_broadcast_strategy(self._load_batched, model, engine, verifier)
+            ) = self._load_batched(model, engine, verifier=verifier)
 
         if (
             loaded_destination_validation_applicable

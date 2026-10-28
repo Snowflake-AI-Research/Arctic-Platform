@@ -39,7 +39,6 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
-from importlib import import_module
 from pathlib import Path
 from types import CodeType
 from types import MethodType
@@ -48,6 +47,7 @@ from uuid import uuid4
 
 from arctic_platform.debug import lora as legacy
 from arctic_platform.debug import lora as selected
+from arctic_platform.debug import weight_sync
 from arctic_platform.debug.weight_sync import VERIFY_ENV
 from arctic_platform.debug.weight_sync import SamplerEvidenceWorker
 from arctic_platform.debug.weight_sync import enabled
@@ -3972,17 +3972,9 @@ def maybe_prepare_lora_worker(worker, request):
     return prepare_lora_worker(worker, request)
 
 
-def maybe_send_lora_worker(worker):
+def send_prepared_lora_worker(worker):
     selected = selected_lora_request()
-    if selected is None:
-        from arctic_platform.debug.weight_sync import maybe_send_weights
-
-        weights = worker.get_weights()
-        sent_l2_sq = worker._weights_l2_sq(weights) if worker._weight_sender is not None else None
-        result = maybe_send_weights(worker, weights)
-        if worker._weight_sender is not None:
-            result["sent_l2_sq"] = sent_l2_sq
-        return result
+    _receiver_require(selected is not None, "staged LoRA request required for the debug worker")
     slot = getattr(worker, "_ap_owned_lora_preparation", None)
     _receiver_require(
         type(slot) is dict and slot["request"] == selected["training"],
@@ -4004,6 +3996,21 @@ def maybe_send_lora_worker(worker):
         "actual native sender routing changed during transfer",
     )
     return result
+
+
+def maybe_lora_training_worker(worker_class):
+    """Add debug RPCs before Ray registration only for an explicitly selected run."""
+    if selected_lora_request() is None:
+        return worker_class
+
+    class LoRATrainingWorker(worker_class):
+        def prepare_lora_weights(self, request):
+            return maybe_prepare_lora_worker(self, request)
+
+        def send_weights(self):
+            return send_prepared_lora_worker(self)
+
+    return LoRATrainingWorker
 
 
 def maybe_record_lora_sender(worker, group, schedule, base_port):
@@ -4058,19 +4065,15 @@ def maybe_release_lora_worker(worker):
     return None
 
 
-def maybe_lora_transfer_schedule(schedule_class, **kwargs):
-    native = schedule_class.build(**kwargs)
+def maybe_project_lora_transfer_schedule(native):
     request = selected_lora_request()
     if request is None:
         return native
     _receiver_require(
-        kwargs
-        == {
-            "training_sharding": "dp",
-            "training_gpus": 8,
-            "inference_replicas": 1,
-            "inference_tp": 8,
-        },
+        native.training_sharding == "dp"
+        and native.training_gpus == 8
+        and native.inference_replicas == 1
+        and native.inference_tp == 8,
         "actual original TRAIN8 and SAMPLE8 schedule geometry required",
     )
     _receiver_require(
@@ -4085,8 +4088,9 @@ def maybe_lora_transfer_schedule(schedule_class, **kwargs):
         "every native TP target must occur exactly once in retained native order",
     )
     origins = request["training"]["admitted_sources"]
+    schedule_class = type(native)
     group_class = type(native.groups[0])
-    _bind_sources(origins, maybe_lora_transfer_schedule, schedule_class.build, schedule_class, group_class)
+    _bind_sources(origins, maybe_project_lora_transfer_schedule, schedule_class.build, schedule_class, group_class)
     # A prepared actor-local list is replayable; the native sender consumes it for each target.
     native.groups = [group_class(group_id=0, sender_train_rank=0, targets=targets)]
     _receiver_require(
@@ -4097,7 +4101,7 @@ def maybe_lora_transfer_schedule(schedule_class, **kwargs):
         and native.groups[0].world_size == 2,
         "projected sender policy must retain actual native allocation geometry and targets",
     )
-    _bind_sources(origins, maybe_lora_transfer_schedule, schedule_class, group_class)
+    _bind_sources(origins, maybe_project_lora_transfer_schedule, schedule_class, group_class)
     return native
 
 
@@ -4130,9 +4134,9 @@ async def maybe_prepare_lora_training(server, workers, pool, schedule):
     return prepared
 
 
-async def maybe_lora_max_param_bytes(server, worker):
+def maybe_lora_max_param_bytes(server, native_max):
     if selected_lora_request() is None:
-        return (await server._await_training_refs(lambda: [worker.max_param_bytes.remote()]))[0]
+        return native_max
     prepared = getattr(server, "_ap_lora_training_preparation", None)
     _receiver_require(
         type(prepared) is dict and prepared["all_training_ranks_prepared"] is True, "all8 preparation required"
@@ -4153,31 +4157,10 @@ async def maybe_lora_max_param_bytes(server, worker):
     return max(sizes)
 
 
-async def maybe_collect_lora_sync(server, receive_task, send_tasks, *, schedule=None):
+def maybe_lora_sync_result(server, result, received, sent):
     request = selected_lora_request()
-    received, sent = await server._await_weight_sync_refs(receive_task, send_tasks)
     if request is None:
-        from arctic_platform.debug.weight_sync import maybe_sync_weights_result
-
-        result = maybe_sync_weights_result(received, sent)
-        if schedule is not None:
-            # Optional transfer utilities must not become model-factory dependencies.
-            received_checksums = import_module("arctic_platform.common.utils.weight_sync").received_checksums
-            compare_weight_checksums = import_module("arctic_platform.common.weight_checksum").compare_weight_checksums
-
-            workers_results = received.get("workers", [])
-            result.update(
-                compare_weight_checksums(
-                    {
-                        f"training rank {group.sender_train_rank}": receipt.get("sent_l2_sq")
-                        for group, receipt in zip(schedule.groups, sent)
-                    },
-                    received_checksums(
-                        [f"sampling replica {index}" for index in range(len(workers_results))], workers_results
-                    ),
-                )
-            )
-        return result
+        return {**result, **weight_sync.maybe_sync_weights_result(received, sent)}
     _receiver_require(
         len(sent) == 1
         and type(sent[0]) is dict
@@ -4200,9 +4183,9 @@ async def maybe_collect_lora_sync(server, receive_task, send_tasks, *, schedule=
         "allTP adapter installation is not storage/application/full-model/capacity admission",
     )
     _receiver_require(selected_lora_request() == request, "staged request changed during native transfer")
-    _bind_sources(request["training"]["admitted_sources"], maybe_collect_lora_sync)
+    _bind_sources(request["training"]["admitted_sources"], maybe_lora_sync_result)
     return {
-        "status": "ok",
+        **result,
         "weight_format": "lora",
         "targets": [{"send": sent, "recv": received}],
         "training_preparation": server._ap_lora_training_preparation,

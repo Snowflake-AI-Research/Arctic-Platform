@@ -45,6 +45,13 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
+from arctic_platform.debug.lora import maybe_admit_worker_construction
+from arctic_platform.debug.lora import maybe_lora_training_worker
+from arctic_platform.debug.lora import maybe_record_lora_sender
+from arctic_platform.debug.lora import maybe_release_lora_worker
+from arctic_platform.debug.lora import maybe_verify_worker_engine
+from arctic_platform.debug.weight_sync import maybe_annotate_weight_sync_result
+from arctic_platform.debug.weight_sync import maybe_observe_weight_send
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model import preserve_fp8_params_through_ds_cast
@@ -104,6 +111,7 @@ async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_opt
 
 
 @ray.remote
+@maybe_lora_training_worker
 class DeepSpeedWorker:
     """Single-GPU worker for DeepSpeed training."""
 
@@ -225,8 +233,6 @@ class DeepSpeedWorker:
         if spec.parallelism.sequence_parallel != self.sp_size:
             raise ValueError("worker sp_size disagrees with the resolved ModelSpec")
         parallel_groups = self._setup_model_parallel_groups(spec, ds_config, ds_worker_config)
-        from arctic_platform.debug.lora import maybe_admit_worker_construction
-
         maybe_admit_worker_construction(self, spec, ds_config, parallel_groups, build_model, deepspeed.initialize)
         loaded = (
             build_model(spec, parallel_groups=parallel_groups) if parallel_groups is not None else build_model(spec)
@@ -247,8 +253,6 @@ class DeepSpeedWorker:
         if spec.parallelism.expert_parallel > 1:
             preserve_fp8_params_through_ds_cast(model)
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
-        from arctic_platform.debug.lora import maybe_verify_worker_engine
-
         maybe_verify_worker_engine(self)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -868,8 +872,6 @@ class DeepSpeedWorker:
             device=torch.device(self._device),
             bucket_size=bucket_size,
         )
-        from arctic_platform.debug.lora import maybe_record_lora_sender
-
         maybe_record_lora_sender(self, group, schedule, base_port)
         return True
 
@@ -905,11 +907,6 @@ class DeepSpeedWorker:
         sq_sum = sq_sum.item()
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
-    def prepare_lora_weights(self, request: dict) -> dict:
-        from arctic_platform.debug.lora import maybe_prepare_lora_worker
-
-        return maybe_prepare_lora_worker(self, request)
-
     def _weights_l2_sq(self, weights: list[tuple[str, torch.Tensor]]) -> float:
         total = torch.zeros((), dtype=torch.float64, device=self._device)
         for _, weight in weights:
@@ -917,9 +914,14 @@ class DeepSpeedWorker:
         return total.item()
 
     def send_weights(self) -> dict:
-        from arctic_platform.debug.lora import maybe_send_lora_worker
-
-        return maybe_send_lora_worker(self)
+        if self._weight_sender is None:
+            return {"status": "not_initialized"}
+        weights = self.get_weights()
+        sent_l2_sq = self._weights_l2_sq(weights)
+        with maybe_observe_weight_send(self, weights) as evidence:
+            result = self._weight_sender.send(weights)
+        result["sent_l2_sq"] = sent_l2_sq
+        return maybe_annotate_weight_sync_result(result, evidence)
 
     def get_cuda_ipc_handles(self) -> dict:
         """Create CUDA IPC handles for all model parameters.
@@ -1350,8 +1352,6 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
-        from arctic_platform.debug.lora import maybe_release_lora_worker
-
         maybe_release_lora_worker(self)
         if self._weight_sender is not None:
             self._weight_sender.destroy()

@@ -16721,7 +16721,7 @@ def test_automatic_participation_dense_decode_requires_actual_child_and_all_rank
 def test_automatic_participation_disabled_preserves_original_spawn(monkeypatch):
     from arctic_platform.debug import training as debug
     from arctic_platform.debug.training import CAPTURE_ENV
-    from arctic_platform.debug.training import maybe_spawn_participation_coordinator
+    from arctic_platform.debug.training import maybe_select_participation_coordinator
 
     monkeypatch.delenv(CAPTURE_ENV, raising=False)
     monkeypatch.setattr(
@@ -16733,9 +16733,8 @@ def test_automatic_participation_disabled_preserves_original_spawn(monkeypatch):
     calls = []
     actor = object()
     manager = SimpleNamespace(_ACTOR_CLS={"training": actor})
-    result = maybe_spawn_participation_coordinator(
-        manager, "training", actor, lambda value: calls.append(value) or "native", None, info
-    )
+    with maybe_select_participation_coordinator(manager, "training", actor, None):
+        result = (lambda value: calls.append(value) or "native")(info)
     assert result == "native"
     assert calls == [info]
     assert manager._ACTOR_CLS["training"] is actor
@@ -24748,73 +24747,32 @@ def test_lora_worker_preserves_post_constructor_source_error_when_shutdown_fails
 # Lora sync hooks.
 
 
-@pytest.mark.parametrize("scheduled", [False, True])
-def test_lora_hooks_ordinary_transfer_loads_checksum_helpers_only_for_schedule(monkeypatch, scheduled):
+def test_lora_hooks_ordinary_transfer_loads_checksum_helpers_only_for_schedule(monkeypatch):
     monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
     received = {"workers": [{"recv_l2_sq": 3.0}, {"recv_l2_sq": 3.0}]}
     sent = [{"sent_l2_sq": 3.0}, {"sent_l2_sq": 3.0}]
-    result = {"status": "ok"}
-    imports = []
-
-    async def collect(receive_task, send_tasks):
-        return received, sent
+    result = {"status": "ok", "checksum_match": True}
 
     def format_result(actual_received, actual_sent):
         assert actual_received is received and actual_sent is sent
-        return result
-
-    def received_checksums(labels, workers):
-        assert labels == ["sampling replica 0", "sampling replica 1"]
-        assert workers is received["workers"]
-        return {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
-
-    def compare_weight_checksums(training, sampling):
-        assert training == {"training rank 2": 3.0, "training rank 5": 3.0}
-        assert sampling == {"sampling replica 0 rank 0": 3.0, "sampling replica 1 rank 0": 3.0}
-        return {"checksum_match": True}
-
-    def load_module(name):
-        assert scheduled, "an unscheduled transfer loaded optional utilities"
-        imports.append(name)
-        return {
-            "arctic_platform.common.utils.weight_sync": SimpleNamespace(received_checksums=received_checksums),
-            "arctic_platform.common.weight_checksum": SimpleNamespace(
-                compare_weight_checksums=compare_weight_checksums
-            ),
-        }[name]
+        return {"status": "ok", "targets": [received, sent]}
 
     monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", format_result)
-    monkeypatch.setattr(hooks, "import_module", load_module)
-    server = SimpleNamespace(_await_weight_sync_refs=collect)
-    schedule = (
-        SimpleNamespace(groups=[SimpleNamespace(sender_train_rank=rank) for rank in (2, 5)]) if scheduled else None
-    )
-
-    actual = asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=schedule))
-
-    assert actual is result
-    assert actual == {"status": "ok", **({"checksum_match": True} if scheduled else {})}
-    assert imports == (
-        ["arctic_platform.common.utils.weight_sync", "arctic_platform.common.weight_checksum"] if scheduled else []
-    )
+    actual = hooks.maybe_lora_sync_result(object(), result, received, sent)
+    assert actual == {**result, "targets": [received, sent]}
+    assert result == {"status": "ok", "checksum_match": True}
 
 
 def test_lora_hooks_scheduled_transfer_preserves_optional_import_failure(monkeypatch):
     monkeypatch.setattr(hooks, "selected_lora_request", lambda: None)
-    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", lambda received, sent: {"status": "ok"})
-    error = ImportError("transfer utilities unavailable")
+    error = RuntimeError("transfer evidence unavailable")
 
-    async def collect(receive_task, send_tasks):
-        return {}, []
-
-    def load_module(name):
-        assert name == "arctic_platform.common.utils.weight_sync"
+    def format_result(received, sent):
         raise error
 
-    monkeypatch.setattr(hooks, "import_module", load_module)
-    server = SimpleNamespace(_await_weight_sync_refs=collect)
-    with pytest.raises(ImportError, match="transfer utilities unavailable") as caught:
-        asyncio.run(hooks.maybe_collect_lora_sync(server, object(), [], schedule=Schedule()))
+    monkeypatch.setattr(rl_sampler_evidence, "maybe_sync_weights_result", format_result)
+    with pytest.raises(RuntimeError, match="transfer evidence unavailable") as caught:
+        hooks.maybe_lora_sync_result(object(), {"status": "ok"}, {}, [])
     assert caught.value is error
 
 
@@ -24932,7 +24890,7 @@ def test_lora_hooks_selected_send_does_not_use_base_get_weights(staged_request, 
     }
     expected = {"weight_format": "lora"}
     monkeypatch.setattr(hooks, "send_lora_worker", lambda actual: expected if actual is worker else None)
-    assert hooks.maybe_send_lora_worker(worker) is expected
+    assert hooks.send_prepared_lora_worker(worker) is expected
 
 
 def test_lora_hooks_cleanup_ignores_request_drift_and_does_not_destroy_sender(
@@ -25017,7 +24975,7 @@ def test_lora_hooks_bucket_geometry_comes_from_actual_adapter_not_base_manifest(
             }
         ],
     }
-    assert asyncio.run(hooks.maybe_lora_max_param_bytes(server, object())) == 1536
+    assert hooks.maybe_lora_max_param_bytes(server, 16384) == 1536
 
 
 def test_lora_hooks_installed_adapter_receipts_keep_judge_and_capacity_nonadmitting(
@@ -25041,7 +24999,11 @@ def test_lora_hooks_installed_adapter_receipts_keep_judge_and_capacity_nonadmitt
     async def send():
         return {"weight_format": "lora"}
 
-    result = asyncio.run(hooks.maybe_collect_lora_sync(server, receive(), [send()]))
+    async def sync():
+        received, sent = await server._await_weight_sync_refs(receive(), [send()])
+        return hooks.maybe_lora_sync_result(server, {"status": "ok"}, received, sent)
+
+    result = asyncio.run(sync())
     assert result["targets"][0]["recv"]["workers"] == [worker]
     assert result["training_preparation"] is server._ap_lora_training_preparation
     assert result["parameter_only_judge_admitted"] is result["capacity_admitted"] is False
@@ -25061,7 +25023,7 @@ def test_lora_hooks_transfer_preserves_native_awaiter_failure(
 
     monkeypatch.setattr(server, "_await_weight_sync_refs", collect)
     with pytest.raises(RuntimeError, match="sender failed") as caught:
-        asyncio.run(hooks.maybe_collect_lora_sync(server, receive_task, send_tasks))
+        asyncio.run(server._await_weight_sync_refs(receive_task, send_tasks))
     assert caught.value is error
 
 
@@ -25076,11 +25038,17 @@ def test_lora_hooks_production_calls_keep_prepare_before_init_and_sender_dispatc
     assert statements.index("maybe_prepare_lora_training") < statements.index("init_weight_sender.remote")
     assert statements.index("init_weight_sender.remote") < statements.index("send_weights.remote")
     assert "maybe_lora_max_param_bytes" in statements
+    assert "_transfer_schedule_cls().build(" in statements
+    assert "max_param_bytes.remote()" in statements
+    assert "_await_weight_sync_refs(receive_task, send_tasks)" in statements
+    assert "compare_weight_checksums(" in statements
     worker = ast.parse((root / "common/deepspeed_worker.py").read_text())
-    prepare = next(
-        node for node in ast.walk(worker) if isinstance(node, ast.FunctionDef) and node.name == "prepare_lora_weights"
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "prepare_lora_weights" for node in ast.walk(worker)
     )
-    assert "maybe_prepare_lora_worker(self, request)" in ast.unparse(prepare)
+    send = next(node for node in ast.walk(worker) if isinstance(node, ast.FunctionDef) and node.name == "send_weights")
+    assert "self._weight_sender.send(weights)" in ast.unparse(send)
+    assert "maybe_send" not in ast.unparse(send)
 
 
 class TransferGroup:
@@ -25115,12 +25083,13 @@ def test_lora_hooks_projects_only_sender_policy_preserving_native8_geometry_targ
     request["sampling"]["admitted_sources"] = request["training"]["admitted_sources"]
     path.write_text(json.dumps(request))
     monkeypatch.setenv(hooks.DIGEST_ENV, hashlib.sha256(path.read_bytes()).hexdigest())
-    schedule = hooks.maybe_lora_transfer_schedule(
-        NativeSchedule,
-        training_sharding="dp",
-        training_gpus=8,
-        inference_replicas=1,
-        inference_tp=8,
+    schedule = hooks.maybe_project_lora_transfer_schedule(
+        NativeSchedule.build(
+            training_sharding="dp",
+            training_gpus=8,
+            inference_replicas=1,
+            inference_tp=8,
+        )
     )
     assert schedule.training_gpus == schedule.inference_tp == 8 and schedule.inference_replicas == 1
     assert len(schedule.groups) == 1 and schedule.groups[0].sender_train_rank == 0
@@ -25131,24 +25100,26 @@ def test_lora_hooks_projects_only_sender_policy_preserving_native8_geometry_targ
 def test_lora_hooks_default_schedule_remains_original_when_unselected(monkeypatch):
     monkeypatch.delenv(hooks.REQUEST_ENV, raising=False)
     monkeypatch.delenv(hooks.DIGEST_ENV, raising=False)
-    schedule = hooks.maybe_lora_transfer_schedule(
-        NativeSchedule,
+    native = NativeSchedule.build(
         training_sharding="dp",
         training_gpus=8,
         inference_replicas=1,
         inference_tp=8,
     )
+    schedule = hooks.maybe_project_lora_transfer_schedule(native)
+    assert schedule is native
     assert len(schedule.groups) == 8 and [group.sender_train_rank for group in schedule.groups] == list(range(8))
 
 
 def test_lora_hooks_schedule_projection_cannot_relabel_training8_as1(staged_request):
     with pytest.raises(ValueError, match="TRAIN8"):
-        hooks.maybe_lora_transfer_schedule(
-            NativeSchedule,
-            training_sharding="dp",
-            training_gpus=1,
-            inference_replicas=1,
-            inference_tp=8,
+        hooks.maybe_project_lora_transfer_schedule(
+            NativeSchedule.build(
+                training_sharding="dp",
+                training_gpus=1,
+                inference_replicas=1,
+                inference_tp=8,
+            )
         )
 
 
@@ -25165,12 +25136,13 @@ def test_lora_hooks_captures_actual_initialized_sender_and_rejects_port_drift(st
     request["sampling"]["admitted_sources"] = request["training"]["admitted_sources"]
     path.write_text(json.dumps(request))
     monkeypatch.setenv(hooks.DIGEST_ENV, hashlib.sha256(path.read_bytes()).hexdigest())
-    schedule = hooks.maybe_lora_transfer_schedule(
-        NativeSchedule,
-        training_sharding="dp",
-        training_gpus=8,
-        inference_replicas=1,
-        inference_tp=8,
+    schedule = hooks.maybe_project_lora_transfer_schedule(
+        NativeSchedule.build(
+            training_sharding="dp",
+            training_gpus=8,
+            inference_replicas=1,
+            inference_tp=8,
+        )
     )
     worker = SimpleNamespace(rank=0, _ap_owned_lora_preparation={"request": request["training"]})
     worker._weight_sender = NativeSender(schedule.groups[0], schedule, 30000)
@@ -25178,10 +25150,10 @@ def test_lora_hooks_captures_actual_initialized_sender_and_rejects_port_drift(st
     assert binding["training_gpus"] == binding["inference_tp"] == 8
     assert binding["ports"] == list(range(30000, 30008))
     monkeypatch.setattr(hooks, "send_lora_worker", lambda actual: {"weight_format": "lora"})
-    assert hooks.maybe_send_lora_worker(worker)["weight_format"] == "lora"
+    assert hooks.send_prepared_lora_worker(worker)["weight_format"] == "lora"
     worker._weight_sender.ports[-1] += 1
     with pytest.raises(ValueError, match="targets or ports"):
-        hooks.maybe_send_lora_worker(worker)
+        hooks.send_prepared_lora_worker(worker)
 
 
 def test_lora_hooks_native_sender_missing_initialization_binding_never_dispatches(
@@ -25193,7 +25165,7 @@ def test_lora_hooks_native_sender_missing_initialization_binding_never_dispatche
         _weight_sender=object(),
     )
     with pytest.raises(ValueError, match="captured initialization"):
-        hooks.maybe_send_lora_worker(worker)
+        hooks.send_prepared_lora_worker(worker)
 
 
 def test_lora_hooks_unselected_send_preserves_existing_debug_sender_callback(
@@ -25203,21 +25175,19 @@ def test_lora_hooks_unselected_send_preserves_existing_debug_sender_callback(
 
     monkeypatch.delenv(hooks.REQUEST_ENV, raising=False)
     monkeypatch.delenv(hooks.DIGEST_ENV, raising=False)
-    weights, expected, seen = [("original", object())], {"status": "done"}, []
-    worker = SimpleNamespace(
-        get_weights=lambda: weights,
-        _weight_sender=object(),
-        _weights_l2_sq=lambda values: 32.5 if values is weights else pytest.fail("different transmitted weights"),
-    )
-
-    def original_send(actual, values):
-        seen.append((actual, values))
-        return expected
-
-    monkeypatch.setattr(weight_sync_evidence, "maybe_send_weights", original_send)
-    assert hooks.maybe_send_lora_worker(worker) is expected
-    assert expected["sent_l2_sq"] == 32.5
-    assert seen == [(worker, weights)]
+    monkeypatch.delenv(weight_sync_evidence.VERIFY_ENV, raising=False)
+    path = Path(__file__).resolve().parents[2] / "common/deepspeed_worker.py"
+    tree = ast.parse(path.read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "send_weights")
+    namespace = {
+        "maybe_observe_weight_send": weight_sync_evidence.maybe_observe_weight_send,
+        "maybe_annotate_weight_sync_result": weight_sync_evidence.maybe_annotate_weight_sync_result,
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    worker = _Worker()
+    worker._weights_l2_sq = lambda weights: 32.5
+    assert namespace["send_weights"](worker) == {"status": "done", "native_receipt": 17, "sent_l2_sq": 32.5}
+    assert hooks.maybe_lora_training_worker(_Worker) is _Worker
 
 
 def test_lora_hooks_unselected_bucket_preserves_actual_native_max_parameter_rpc(
@@ -25240,7 +25210,12 @@ def test_lora_hooks_unselected_bucket_preserves_actual_native_max_parameter_rpc(
         return await original_await(submit_refs)
 
     monkeypatch.setattr(server, "_await_training_refs", native_await)
-    assert asyncio.run(hooks.maybe_lora_max_param_bytes(server, worker)) == 16384
+
+    async def sync():
+        native_maximum = (await server._await_training_refs(lambda: [worker.max_param_bytes.remote()]))[0]
+        return hooks.maybe_lora_max_param_bytes(server, native_maximum)
+
+    assert asyncio.run(sync()) == 16384
     assert seen == ["native-awaiter", "original-rpc"]
 
 
@@ -53040,7 +53015,9 @@ def test_sampler_evidence_sender_passes_exact_existing_list_once(monkeypatch):
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
     worker = _Worker()
     weights = worker.get_weights()
-    result = sampler_evidence_evidence.maybe_send_weights(worker, weights)
+    with sampler_evidence_evidence.maybe_observe_weight_send(worker, weights) as evidence:
+        result = worker._weight_sender.send(weights)
+    result = sampler_evidence_evidence.maybe_annotate_weight_sync_result(result, evidence)
     assert worker._weight_sender.seen is weights
     assert result["native_receipt"] == 17
     assert result["trainer_parameters"] == {"numel": 2, "count": 1}
@@ -53052,7 +53029,10 @@ def test_sampler_evidence_disabled_sender_and_pool_are_unchanged(monkeypatch):
     monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
     worker = _Worker()
     weights = worker.get_weights()
-    assert sampler_evidence_evidence.maybe_send_weights(worker, weights) == {"status": "done", "native_receipt": 17}
+    with sampler_evidence_evidence.maybe_observe_weight_send(worker, weights) as evidence:
+        result = worker._weight_sender.send(weights)
+    assert sampler_evidence_evidence.maybe_annotate_weight_sync_result(result, evidence) is result
+    assert result == {"status": "done", "native_receipt": 17}
     pool_class = object()
     assert sampler.maybe_replica_pool(pool_class) is pool_class
 
@@ -53067,7 +53047,8 @@ def test_sampler_evidence_incomplete_sender_rejected_before_send(monkeypatch, un
     else:
         parameter.allreduce = False
     with pytest.raises(ValueError):
-        sampler_evidence_evidence.maybe_send_weights(worker, worker.get_weights())
+        with sampler_evidence_evidence.maybe_observe_weight_send(worker, worker.get_weights()):
+            worker._weight_sender.send(worker.get_weights())
     assert worker._weight_sender.seen is None
 
 
@@ -53298,8 +53279,10 @@ def test_native_broadcast_shadow_observes_real_fused_expert_callback(monkeypatch
     broadcast.maybe_bind_broadcast_loader(verifier, writer)
     w13 = torch.arange(8.0).reshape(1, 4, 2)
     w2 = torch.arange(4.0).reshape(1, 2, 2)
-    assert broadcast.maybe_load_broadcast_tensor(verifier, writer.feed, "experts.w13_weight", w13) is True
-    assert broadcast.maybe_load_broadcast_tensor(verifier, writer.feed, "experts.w2_weight", w2) is True
+    with broadcast.maybe_observe_broadcast_tensor(verifier, writer.feed, "experts.w13_weight", w13):
+        assert writer.feed("experts.w13_weight", w13) is True
+    with broadcast.maybe_observe_broadcast_tensor(verifier, writer.feed, "experts.w2_weight", w2):
+        assert writer.feed("experts.w2_weight", w2) is True
     result = broadcast.maybe_broadcast_receiver_result({"status": "done"}, verifier, rank=3)
     assert result["rank"] == 3
     assert result["weight_sync_verification"]["destinations"] == {
@@ -53315,9 +53298,11 @@ def test_native_broadcast_shadow_observes_actual_direct_view_copy():
     model = _PackedModel()
     verifier = _verifier(model)
     view = model.packed.data.view(2, 2)[1]
-    result = broadcast.maybe_load_broadcast_tensor(
-        verifier, lambda name, value: view.copy_(value), "actual-view", torch.tensor([3.0, 4.0])
-    )
+    value = torch.tensor([3.0, 4.0])
+    with broadcast.maybe_observe_broadcast_tensor(
+        verifier, lambda name, tensor: view.copy_(tensor), "actual-view", value
+    ):
+        result = view.copy_(value)
     assert result is view
     assert verifier.finish()["destinations"]["packed"] == {"uncovered": 2, "mismatched": 0}
     assert model.packed.tolist() == [0.0, 0.0, 3.0, 4.0]
@@ -53374,12 +53359,16 @@ def test_native_broadcast_disabled_preserves_stream_callback_and_result(monkeypa
         assert actual is weights
         return result
 
-    assert broadcast.maybe_send_broadcast_weights(object(), weights, send) is result
+    with broadcast.maybe_observe_broadcast_send(object(), weights, send) as (stream, evidence):
+        actual = send(stream)
+    assert broadcast.maybe_annotate_weight_sync_result(actual, evidence) is result
     assert broadcast.maybe_begin_broadcast_load(object(), object(), object()) is None
     assert broadcast.maybe_broadcast_receiver_result(result, None, rank=1) is result
     broadcast.maybe_bind_broadcast_trainer_inventory(object(), is_master=True, is_zero3=True)
     broadcast.maybe_admit_broadcast_receiver(object(), engine_only=False)
-    assert broadcast.maybe_load_broadcast_strategy(lambda model, engine: result, object(), object(), None) is result
+    value = torch.ones(2)
+    with broadcast.maybe_observe_broadcast_tensor(None, send, "weight", value):
+        assert value.sum() == 2
 
 
 @pytest.mark.parametrize("failure", [None, "mutation", "missing-inventory", "duplicate-name", "transport"])
@@ -53407,9 +53396,15 @@ def test_native_broadcast_sender_observes_once_and_always_resets_context(monkeyp
 
     if failure:
         with pytest.raises((ValueError, RuntimeError)):
-            broadcast.maybe_send_broadcast_weights(_sampler_evidence_Sender(), weights, send)
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (
+                stream,
+                evidence,
+            ):
+                send(stream)
     else:
-        result = broadcast.maybe_send_broadcast_weights(_sampler_evidence_Sender(), weights, send)
+        with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, evidence):
+            result = send(stream)
+        result = broadcast.maybe_annotate_weight_sync_result(result, evidence)
         assert result["actual_receipt"] == 7
         assert result["sent_manifest"] == {"weight": sampler_evidence_evidence.tensor_manifest(value)}
         assert result["trainer_parameters"] == {"numel": 2, "count": 1}

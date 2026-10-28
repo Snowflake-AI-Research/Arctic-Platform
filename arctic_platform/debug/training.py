@@ -565,13 +565,15 @@ CAPTURE_ENV = "ARCTIC_CORRECTNESS_PARTICIPATION_CAPTURE"
 GATEWAY_MODULE = "arctic_platform.debug.training"
 
 
-def maybe_spawn_participation_coordinator(manager_module, actor_key, original_actor, spawn, training, info):
+@contextmanager
+def maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
     if os.environ.get(CAPTURE_ENV) != "1":
-        return spawn(info)
+        yield
+        return
     selected = participation_coordinator_class(training)
     manager_module._ACTOR_CLS[actor_key] = selected
     try:
-        return spawn(info)
+        yield
     finally:
         manager_module._ACTOR_CLS[actor_key] = original_actor
 

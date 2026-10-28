@@ -45,6 +45,7 @@ import requests
 from arctic_platform.client.requests import export_checkpoint_request
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import TRACE_SCHEMA
 
 # Router Replay Trace
 
@@ -54,7 +55,6 @@ ROUTER_REPLAY_TRACE_CHUNK_BYTES = 4096
 
 def _node_trace_receipt(output_dir: str, request_id: str, token: str) -> dict:
     from arctic_platform.correctness.harness.storage import require_data_fast_path
-    from arctic_platform.debug.training import TRACE_SCHEMA
 
     root = require_data_fast_path(output_dir, label="router-replay evidence") / request_id
     if re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", request_id) is None:
@@ -149,8 +149,6 @@ def _decode_trace_chunks(output: str, *, hosts: list[str], request_id: str, toke
 
 
 def _merge_trace_receipts(receipts: list[dict], *, request_id: str, ranks: int, calls: int) -> list[dict]:
-    from arctic_platform.debug.training import TRACE_SCHEMA
-
     by_rank = {rank: {} for rank in range(ranks)}
     rank_hosts = {}
     for receipt in receipts:
