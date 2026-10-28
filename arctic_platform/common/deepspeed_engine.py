@@ -264,8 +264,8 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
     optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
     if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name in ("deepspeed_cpu_adam", "torch_cpu_adamw"):
         logger.info(
-            "training_config.ds_config.zero_optimization.offload_optimizer is configured; "
-            "using optimizer='deepspeed_cpu_adam'"
+            "training_config.ds_config.zero_optimization.offload_optimizer is configured; using optimizer=%r",
+            optimizer_name,
         )
     decay_params = [
         param
