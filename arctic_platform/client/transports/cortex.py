@@ -558,6 +558,7 @@ class CortexTransport(Transport):
         self._roles: list[str] = []
         self._owns_job = False
         self._awaiting_job_visibility = False
+        self._router_replay_sampling_ids: dict[tuple[str, str], str] = {}
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -630,14 +631,15 @@ class CortexTransport(Transport):
 
     def _call(self, request: Request, route: _Route | None = None) -> Any:
         route, future = self._submit(request, route)
-        return route.finish(*future.result())
+        return self._finish(request, route, *future.result())
 
     async def acall(self, request: Request) -> Any:
         route, future = self._submit(request)
-        return route.finish(*await asyncio.wrap_future(future))
+        return self._finish(request, route, *await asyncio.wrap_future(future))
 
     def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
         route = route or _route(request.op)
+        request = self._router_replay_request(request)
         url, sends = route.prepare(self._prefix, request)
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
@@ -803,6 +805,29 @@ class CortexTransport(Transport):
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+    def _finish(self, request: Request, route: _Route, chunks: list[bytes], result: dict) -> Any:
+        reply = route.finish(chunks, result)
+        if request.op == "operation" and request.body.get("operation_type") == "bootstrap-router-replay":
+            sampling_id = reply.get("sampling_job_id")
+            if sampling_id:
+                payload = request.body["payload"]
+                pair = (str(payload["target_sub_job_id"]), str(payload["source_sub_job_id"]))
+                self._router_replay_sampling_ids[pair] = str(sampling_id)
+        return reply
+
+    def _router_replay_request(self, request: Request) -> Request:
+        if request.op not in {"forward-backward", "forward"}:
+            return request
+        replay = request.body.get("router_replay")
+        if not isinstance(replay, dict) or not replay.get("sampling_job_id"):
+            return request
+        pair = (str(request.job_id), str(replay["sampling_job_id"]))
+        sampling_id = self._router_replay_sampling_ids.get(pair)
+        if sampling_id is None:
+            return request
+        # Bootstrap resolves public Cortex tokens to zone IDs; the frame must use that same pair.
+        return replace(request, body={**request.body, "router_replay": {**replay, "sampling_job_id": sampling_id}})
 
 
 def _clock(seconds: float) -> str:
