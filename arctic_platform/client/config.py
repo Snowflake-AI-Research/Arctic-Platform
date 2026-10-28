@@ -372,6 +372,8 @@ class ArcticClientConfig(BaseModel):
             )
         if provider:
             training["model_provider"] = provider
+        if "model_options" in worker:
+            training["model_options"] = deepcopy(worker["model_options"])
         if worker.get("use_liger"):
             options = dict(training.get("model_options") or {})
             options["liger"] = True
@@ -379,7 +381,7 @@ class ArcticClientConfig(BaseModel):
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
-        for key in ("ep_size", "mb_spec", "router_replay", "model_options"):
+        for key in ("ep_size", "mb_spec", "router_replay"):
             if key in worker:
                 training[key] = deepcopy(worker[key])
         if ds:
