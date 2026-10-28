@@ -27,15 +27,14 @@ tensor shape in the block -- is identical across both passes. Only the gathered 
 recompute normally with gradients; the checkpoint machinery checks metadata only, so this suffices.
 
 Call ``install_self_router_replay(block)`` on each block before ``checkpoint_wrapper``. Overhead is one
-detached int64 ``[tokens, top_k]`` index tensor per MoE layer, held only between a microbatch's paired forward
-and backward.
+detached int64 ``[tokens, top_k]`` index tensor per router call, held for the lifetime of its checkpoint graph.
 """
 
 from __future__ import annotations
 
-import collections
 import inspect
 import threading
+import weakref
 from functools import wraps
 
 import torch
@@ -49,10 +48,14 @@ def _in_recompute() -> bool:
     return getattr(thread_local, "depth", 0) > 0
 
 
+def _checkpoint_context():
+    thread_local = getattr(_ckpt, "_recompute_thread_local", _thread_local)
+    contexts = getattr(thread_local, "checkpoint_contexts", ())
+    return contexts[-1] if contexts else None
+
+
 def _install_recompute_detector() -> None:
-    """Wrap ``torch.utils.checkpoint._recomputation_hook`` so a module forward can tell whether it is running
-    the original pass or the backward recompute. The non-reentrant checkpoint resolves that name as a module
-    global at call time, so patching it here is picked up by all subsequent checkpoint calls.
+    """Track the non-reentrant checkpoint frame and recomputation scope through its saved-tensor hooks.
 
     The hook class closes over a thread_local captured here (not the module global) and that same object is
     stashed on _ckpt, so a second import of this module (e.g. resolved under a different module path) finds
@@ -62,19 +65,48 @@ def _install_recompute_detector() -> None:
         return
 
     thread_local = _thread_local
+    _BaseCheckpointHook = _ckpt._checkpoint_hook
     _BaseRecomputationHook = _ckpt._recomputation_hook
 
-    class _DetectingRecomputationHook(_BaseRecomputationHook):  # type: ignore[misc, valid-type]
+    class _DetectingCheckpointHook(_BaseCheckpointHook):  # type: ignore[misc, valid-type]
+        def __init__(self, frame):
+            super().__init__(frame)
+            self._replay_frame_ref = weakref.ref(frame)
+
         def __enter__(self):
-            thread_local.depth = getattr(thread_local, "depth", 0) + 1
-            return super().__enter__()
+            result = super().__enter__()
+            if not hasattr(thread_local, "checkpoint_contexts"):
+                thread_local.checkpoint_contexts = []
+            thread_local.checkpoint_contexts.append((self._replay_frame_ref(), False, {}))
+            return result
 
         def __exit__(self, *exc):
             try:
                 return super().__exit__(*exc)
             finally:
+                thread_local.checkpoint_contexts.pop()
+
+    class _DetectingRecomputationHook(_BaseRecomputationHook):  # type: ignore[misc, valid-type]
+        def __init__(self, target_frame_ref, gid):
+            super().__init__(target_frame_ref, gid)
+            self._replay_frame_ref = target_frame_ref
+
+        def __enter__(self):
+            result = super().__enter__()
+            if not hasattr(thread_local, "checkpoint_contexts"):
+                thread_local.checkpoint_contexts = []
+            thread_local.checkpoint_contexts.append((self._replay_frame_ref(), True, {}))
+            thread_local.depth = getattr(thread_local, "depth", 0) + 1
+            return result
+
+        def __exit__(self, *exc):
+            try:
+                return super().__exit__(*exc)
+            finally:
+                thread_local.checkpoint_contexts.pop()
                 thread_local.depth = max(0, getattr(thread_local, "depth", 1) - 1)
 
+    _ckpt._checkpoint_hook = _DetectingCheckpointHook
     _ckpt._recomputation_hook = _DetectingRecomputationHook
     _ckpt._recompute_thread_local = thread_local
     _ckpt._recompute_detector_installed = True
@@ -100,7 +132,7 @@ def _wrap_router(router) -> bool:
         return False
 
     original = router.forward
-    router._self_replay_queue = collections.deque()
+    router._self_replay_captures = weakref.WeakKeyDictionary()
     # Contract read by forward below: a router that never opts into fresh routing (only
     # TokenChoiceTopKRouter.enable_fresh_replay_routing does) keeps gather-only replay, so production replay
     # defers to it.
@@ -109,50 +141,37 @@ def _wrap_router(router) -> bool:
 
     @wraps(original)
     def forward(x, expert_bias=None, routed_experts=None):
-        replay_queue = router._self_replay_queue
-
         # Production replay (sampler-sourced routing) already feeds routed_experts to both passes; defer to it.
         if routed_experts is not None and not router.fresh_replay_routing:
             return original(x, expert_bias, routed_experts=routed_experts)
+
+        context = _checkpoint_context()
+        if context is not None and context[1]:
+            frame, _, positions = context
+            position = positions.get(router, 0)
+            captures = router._self_replay_captures.get(frame, ())
+            if position >= len(captures):
+                raise RuntimeError("router-replay recompute found no captured experts for its checkpoint forward")
+            positions[router] = position + 1
+            return original(x, expert_bias, routed_experts=captures[position])
 
         # An opted-in router picks experts by topk for tokens marked ROUTER_REPLAY_FRESH, so the experts the
         # original forward actually selected are captured and replayed verbatim on recompute. The router's
         # fresh-routing path saves the same tensors whichever experts it is handed, so no extra off-graph pass
         # is needed.
         if routed_experts is not None:
-            if _in_recompute():
-                if len(replay_queue) == 0:
-                    # Falling back to routed_experts would re-topk the fresh tokens and diverge from the forward.
-                    raise RuntimeError(
-                        "router-replay recompute found no captured experts for a fresh-routing replay forward"
-                    )
-                return original(x, expert_bias, routed_experts=replay_queue.popleft())
             out = original(x, expert_bias, routed_experts=routed_experts)
-            if torch.is_grad_enabled():
-                # Each graph-building forward is recomputed before this router's next one, so anything still
-                # queued belongs to a forward whose backward never ran (an aborted step); replaying it would hand
-                # this forward's recompute another step's experts.
-                replay_queue.clear()
-                replay_queue.append(out[1].detach())
-            return out
-
-        # Forward and recompute must save the same tensors, so both passes take the gather path
-        # (routed_experts=expert_indices). The discrete topk decision is made once off the autograd graph
-        # (no_grad, no saved tensors) on the original forward and replayed verbatim on recompute; the gathered
-        # weights are numerically identical to the model's expert_bias topk path.
-        if _in_recompute():
-            expert_indices = replay_queue.popleft() if replay_queue else None
-            if expert_indices is None:
-                return original(x, expert_bias)  # should not happen: each captured forward recomputes once
-            return original(x, expert_bias, routed_experts=expert_indices)
-
-        with torch.no_grad():
-            _, expert_indices, _ = original(x, expert_bias)
-        expert_indices = expert_indices.detach()
-        if torch.is_grad_enabled():
-            # Only capture graph-building (checkpointed) forwards; eval/no_grad forwards are never recomputed.
-            replay_queue.append(expert_indices)
-        return original(x, expert_bias, routed_experts=expert_indices)
+            expert_indices = out[1].detach()
+        else:
+            # Both passes gather so their saved tensors agree; the discrete topk runs off the autograd graph.
+            with torch.no_grad():
+                _, expert_indices, _ = original(x, expert_bias)
+            expert_indices = expert_indices.detach()
+            out = original(x, expert_bias, routed_experts=expert_indices)
+        if context is not None and torch.is_grad_enabled():
+            # Weak frame keys release abandoned graphs; replay cursors reset for every retained-graph backward.
+            router._self_replay_captures.setdefault(context[0], []).append(expert_indices)
+        return out
 
     router.forward = forward
     router._self_replay_wrapped = True
@@ -162,8 +181,8 @@ def _wrap_router(router) -> bool:
 def install_self_router_replay(module: torch.nn.Module) -> int:
     """Install capture/replay on every replayable MoE router under ``module``; return the number wrapped.
 
-    Call before wrapping the block with ``checkpoint_wrapper`` so only checkpointed blocks capture, keeping
-    each router's FIFO drained by its matching recompute.
+    Call before wrapping the block with ``checkpoint_wrapper``. Captures belong to each checkpoint frame, so
+    pending forwards and retained graphs cannot consume another forward's routing decisions.
     """
     _install_recompute_detector()
     num_wrapped = 0

@@ -907,7 +907,7 @@ class TestNcclWeightSyncRefs(TestCasePlus):
         schedule_class = SimpleNamespace(build=lambda **kwargs: schedule)
         with (
             patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=schedule_class),
-            patch("arctic_platform.debug.lora_sync_hooks.selected_lora_request", return_value=None),
+            patch("arctic_platform.debug.lora.selected_lora_request", return_value=None),
         ):
             async with server._training_op_lock:
                 result = await server._sync_weights_nccl(workers, pool)
@@ -919,7 +919,7 @@ class TestNcclWeightSyncRefs(TestCasePlus):
 
         async def _run():
             with (
-                patch("arctic_platform.debug.rl_sampler_evidence.enabled", return_value=False),
+                patch("arctic_platform.debug.weight_sync.enabled", return_value=False),
                 patch.object(
                     ArcticRLRayServer,
                     "_await_training_refs",
@@ -949,7 +949,7 @@ class TestNcclWeightSyncRefs(TestCasePlus):
             return received
 
         async def _run():
-            with patch("arctic_platform.debug.rl_sampler_evidence.enabled", return_value=True):
+            with patch("arctic_platform.debug.weight_sync.enabled", return_value=True):
                 server, result = await self._sync([_send], _receive)
             self.assertEqual(result["targets"], [{"send": [sent], "recv": received}])
             self.assertFalse(server._training_failed)

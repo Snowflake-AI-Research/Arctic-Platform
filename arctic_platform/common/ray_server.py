@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need Arctic Inference / vLLM."""
     require_any_dep_group("rl")
-    from arctic_platform.debug.lora_replica_pool_routing import maybe_lora_replica_pool
+    from arctic_platform.debug.lora import maybe_lora_replica_pool
     from arctic_platform.inference.server.replica_pool import ReplicaPool
 
     return maybe_lora_replica_pool(ReplicaPool)
@@ -1554,7 +1554,7 @@ class ArcticRLRayServer:
     async def _sync_weights_nccl(self, workers, pool: ReplicaPool) -> dict:
         """Non-colocated weight sync via NCCL (original path)."""
         await self.arctic_rl_ray_server_state.wake_inference.remote()
-        from arctic_platform.debug.lora_sync_hooks import maybe_lora_transfer_schedule
+        from arctic_platform.debug.lora import maybe_lora_transfer_schedule
 
         schedule = maybe_lora_transfer_schedule(
             _transfer_schedule_cls(),
@@ -1563,7 +1563,7 @@ class ArcticRLRayServer:
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
-        from arctic_platform.debug.lora_sync_hooks import maybe_prepare_lora_training
+        from arctic_platform.debug.lora import maybe_prepare_lora_training
 
         await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
@@ -1571,7 +1571,7 @@ class ArcticRLRayServer:
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
-            from arctic_platform.debug.lora_sync_hooks import maybe_lora_max_param_bytes
+            from arctic_platform.debug.lora import maybe_lora_max_param_bytes
 
             max_param = await maybe_lora_max_param_bytes(self, workers[0])
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
@@ -1623,7 +1623,7 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        from arctic_platform.debug.lora_sync_hooks import maybe_collect_lora_sync
+        from arctic_platform.debug.lora import maybe_collect_lora_sync
 
         results = await maybe_collect_lora_sync(self, receive_task, send_tasks, schedule=schedule)
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))

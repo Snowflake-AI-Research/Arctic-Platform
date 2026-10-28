@@ -59,10 +59,10 @@ def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
 @pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_job_accumulates_gradients_in_float32(dtype, fp32_masters):
+def test_bfloat16_job_leaves_accumulation_dtype_to_deepspeed(dtype, fp32_masters):
     ds_config = build_deepspeed_config(_spec(dtype=dtype, fp32_masters=fp32_masters))
 
-    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+    assert "data_types" not in ds_config
 
 
 @pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])
@@ -82,14 +82,23 @@ def test_explicit_accumulation_override_is_preserved(data_types):
 
 
 @pytest.mark.parametrize("fp32_masters", [False, True])
-def test_deepspeed_resolves_float32_accumulation_without_changing_model_precision(fp32_masters):
+def test_deepspeed_resolves_explicit_float32_accumulation_without_changing_model_precision(fp32_masters):
     from deepspeed.runtime.config import DeepSpeedConfig
     from deepspeed.runtime.engine import DeepSpeedEngine
 
-    ds_config = build_deepspeed_config(_spec(world_size=1, fp32_masters=fp32_masters))
+    ds_config = build_deepspeed_config(
+        _spec(
+            world_size=1,
+            fp32_masters=fp32_masters,
+            ds_overrides={"data_types": {"grad_accum_dtype": "fp32"}},
+        )
+    )
     config = DeepSpeedConfig(ds_config)
     engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
+    torch.nn.Module.__init__(engine)
     object.__setattr__(engine, "_config", config)
+    engine.optimizer = None
+    engine.checkpoint_engine = None
 
     assert engine.get_data_types() == (torch.bfloat16, torch.float32)
     assert ds_config["bf16"]["bf16_master_weights_and_grads"] is not fp32_masters
@@ -664,22 +673,44 @@ def test_zero_initialization_trace_disabled_keeps_config_identity(monkeypatch):
         deepspeed_zero_initialization, "zero_optimizer_class", lambda: pytest.fail("disabled trace imported ZeRO")
     )
     config = {"zero_optimization": {"stage": 2}}
-    assert deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
-        lambda **kwargs: kwargs, config, 0, model="model"
-    ) == {"config": config, "model": "model"}
+    with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+        assert init_config is config
+
+
+def test_zero_initialization_trace_rejects_missing_source_before_opening_trace(monkeypatch):
+    import inspect
+
+    from arctic_platform.debug import deepspeed_zero_initialization
+
+    original = _ZeroInitializationFixture.initialize_optimizer_states
+    monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
+    monkeypatch.setattr(inspect, "getsourcefile", lambda method: None)
+    monkeypatch.setattr(
+        deepspeed_zero_initialization, "open_trace", lambda *args: pytest.fail("unidentified source opened a trace")
+    )
+    config = {
+        deepspeed_zero_initialization.TRAINING_OPTION: {
+            "request_id": "missing-source",
+            "output_dir": "/data-fast/tmp/zero-test",
+        }
+    }
+    with pytest.raises(RuntimeError, match="inspectable optimizer source"):
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0):
+            pytest.fail("unidentified source entered initialization context")
+    assert _ZeroInitializationFixture.initialize_optimizer_states is original
+    assert deepspeed_zero_initialization.TRAINING_OPTION in config
 
 
 @pytest.mark.parametrize("fail_before_method", [False, True])
 def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatch, fail_before_method):
     import io
     import json
-    from contextlib import nullcontext
 
     from arctic_platform.debug import deepspeed_zero_initialization
 
     stream = io.StringIO()
     monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
-    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: nullcontext(stream))
+    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: stream)
     original = _ZeroInitializationFixture.initialize_optimizer_states
     config = {
         deepspeed_zero_initialization.TRAINING_OPTION: {
@@ -689,25 +720,98 @@ def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatc
         "zero_optimization": {"stage": 2},
     }
 
-    def initialize(**kwargs):
-        assert deepspeed_zero_initialization.TRAINING_OPTION not in kwargs["config"]
+    def initialize():
         if fail_before_method:
             raise RuntimeError("engine failed before optimizer")
         return _ZeroInitializationFixture().initialize_optimizer_states()
 
     if fail_before_method:
         with pytest.raises(RuntimeError, match="engine failed before optimizer"):
-            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
+            with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+                assert init_config == {"zero_optimization": {"stage": 2}}
+                initialize()
     else:
-        assert (
-            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
-            == "initialized"
-        )
-        rows = [json.loads(line) for line in stream.getvalue().splitlines()]
-        assert rows[0]["request_id"] == "test"
-        assert rows[-1]["event"] == "INITIALIZATION_COMPLETE"
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+            assert init_config == {"zero_optimization": {"stage": 2}}
+            assert initialize() == "initialized"
+            rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+            assert rows[0]["request_id"] == "test"
+            assert rows[-1]["event"] == "INITIALIZATION_COMPLETE"
+    assert stream.closed
     assert _ZeroInitializationFixture.initialize_optimizer_states is original
     assert deepspeed_zero_initialization.TRAINING_OPTION in config
+
+
+@pytest.mark.parametrize("with_optimizer", [False, True])
+@pytest.mark.parametrize("trace_enabled", [False, True])
+@pytest.mark.parametrize("fail_initialize", [False, True])
+def test_engine_initializes_once_inside_optional_trace(monkeypatch, with_optimizer, trace_enabled, fail_initialize):
+    import io
+
+    from arctic_platform.debug import deepspeed_zero_initialization
+
+    stream = io.StringIO()
+    original = _ZeroInitializationFixture.initialize_optimizer_states
+    monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
+    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: stream)
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    built = object()
+    monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: built)
+    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
+    ds_config = {"zero_optimization": {"stage": 2}}
+    if trace_enabled:
+        ds_config[deepspeed_zero_initialization.TRAINING_OPTION] = {
+            "request_id": "engine-test",
+            "output_dir": "/data-fast/tmp/zero-test",
+        }
+    model = torch.nn.Linear(1, 1)
+    mpu = object()
+    calls = []
+    failure = RuntimeError("engine initialization failed")
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        assert (_ZeroInitializationFixture.initialize_optimizer_states is not original) is trace_enabled
+        assert kwargs["config"] == {"zero_optimization": {"stage": 2}}
+        if not trace_enabled:
+            assert kwargs["config"] is ds_config
+        assert kwargs["model"] is model
+        assert kwargs["mpu"] is mpu
+        if with_optimizer:
+            assert kwargs["optimizer"] is built
+        else:
+            assert "optimizer" not in kwargs
+        if fail_initialize:
+            raise failure
+        assert _ZeroInitializationFixture().initialize_optimizer_states() == "initialized"
+        return "engine", kwargs.get("optimizer"), None, None
+
+    monkeypatch.setattr("deepspeed.initialize", initialize)
+
+    def run():
+        return initialize_training_engine(
+            model,
+            ds_config,
+            optimizer=OptimizerSettings() if with_optimizer else None,
+            ep_size=1,
+            mpu=mpu,
+            model_path="unused",
+            rank=0,
+        )
+
+    if fail_initialize:
+        with pytest.raises(RuntimeError) as caught:
+            run()
+        assert caught.value is failure
+    else:
+        engine, optimizer, choice = run()
+        assert engine == "engine"
+        assert optimizer is (built if with_optimizer else None)
+        assert (choice is not None) is with_optimizer
+    assert len(calls) == 1
+    assert _ZeroInitializationFixture.initialize_optimizer_states is original
+    assert stream.closed is trace_enabled
+    assert (deepspeed_zero_initialization.TRAINING_OPTION in ds_config) is trace_enabled
 
 
 @pytest.mark.parametrize(
@@ -723,8 +827,7 @@ def test_zero_initialization_trace_rejects_invalid_request(option, rank):
     from arctic_platform.debug import deepspeed_zero_initialization
 
     with pytest.raises(ValueError):
-        deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
-            lambda **kwargs: pytest.fail("invalid trace initialized engine"),
-            {deepspeed_zero_initialization.TRAINING_OPTION: option},
-            rank,
-        )
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(
+            {deepspeed_zero_initialization.TRAINING_OPTION: option}, rank
+        ):
+            pytest.fail("invalid trace entered initialization context")

@@ -35,7 +35,6 @@ import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -67,6 +66,18 @@ def _stage(phase: str, name: str, detail: str = "") -> None:
     if detail:
         print(detail, flush=True)
     print(flush=True)
+
+
+@contextmanager
+def _phase(phase: str, name: str, detail: str = ""):
+    from arctic_platform.correctness.harness.report import total_duration
+
+    _stage(phase, name, detail)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"{phase.title()} run time: {total_duration(time.monotonic() - started)}", flush=True)
 
 
 class _ConsoleLog:
@@ -192,7 +203,7 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
     configured = any(
         getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
@@ -241,7 +252,7 @@ def _validation_gateway(args: argparse.Namespace):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
-    from arctic_platform.correctness.harness.dss_driver import local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
     if getattr(args, "_automatic_checkpoint_bridge", False):
@@ -250,7 +261,7 @@ def _validation_gateway(args: argparse.Namespace):
         with _regression_gateway(SimpleNamespace(**{**vars(args), "out": directory})) as url:
             yield url
         return
-    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.correctness_participation") as url:
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.training") as url:
         yield url
 
 
@@ -488,7 +499,7 @@ def _resume_setup(args: argparse.Namespace) -> None:
     """Bind retained phase results to this config, options, sources and Python environment."""
     if not hasattr(args, "_resume_root"):
         return
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
 
     root = Path(__file__).resolve().parents[1]
     options = {
@@ -560,7 +571,7 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
     """Reuse only completed phases whose input specification and retained artifacts still match."""
     if not hasattr(args, "_resume_dir"):
         return operation()
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
 
     checkpoint = args._resume_dir / f"{phase}.json"
     input_spec = _checkpoint_file_identity(args.test_spec) if args.test_spec.exists() else None
@@ -604,7 +615,7 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
     if isinstance(result, dict) and result.get("model_path"):
         models[result["model_path"]] = model_identity(result["model_path"])
     if phase in {"references", "calibration", "validation"}:
-        from arctic_platform.correctness.harness.reference_records import DEFAULT_RECORDS_DIR
+        from arctic_platform.correctness.harness.storage import DEFAULT_RECORDS_DIR
 
         records = Path(args.reference_records_dir or DEFAULT_RECORDS_DIR) / args.test_spec.stem
         files.update({str(path): _checkpoint_file_identity(path) for path in records.rglob("*.json")})
@@ -668,8 +679,8 @@ def _select_source_checkpoint(override: str | None, config) -> str:
 def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str] | None = None) -> None:
     """Fail before fixture creation, sizing, calibration or adapter generation."""
     from arctic_platform.correctness.harness import storage
-    from arctic_platform.correctness.harness.dss_driver import _allocation_hostfile
-    from arctic_platform.correctness.harness.dss_driver import recover_local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import _allocation_hostfile
+    from arctic_platform.correctness.harness.gateway import recover_local_cortex_gateway
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
 
@@ -681,6 +692,21 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         ]
     if not selection:
         return
+    if not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection):
+        ds_config = config.training.get("ds_config") or {}
+        dtype = str(config.sub_job.get("dtype") or config.training.get("dtype") or "bfloat16").lower()
+        bf16 = ds_config.get("bf16")
+        bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
+        if bf16_enabled:
+            data_types = ds_config.get("data_types")
+            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else None
+            if accumulation != "fp32":
+                raise ValueError(
+                    f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "
+                    'Set data_types.grad_accum_dtype to "fp32" in the supplied configuration\'s training.ds_config '
+                    "(training_config.ds_config for Cortex recipes) before onboarding; "
+                    f"got {accumulation!r}. Onboarding does not change this setting."
+                )
     _configure_fixture_target(args, config, selection)
     if getattr(args, "_prerequisites_checked", False):
         return
@@ -775,7 +801,7 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         raise ValueError("onboarding prerequisites failed before model work:\n  " + "\n  ".join(failures))
     required_gpus = config.n_gpus
     if target_local and config.is_rl:
-        from arctic_platform.correctness.harness.dss_driver import rl_gpu_count
+        from arctic_platform.correctness.harness.gateway import rl_gpu_count
 
         required_gpus = rl_gpu_count(config)
     capacity = local["gpu_count"]
@@ -888,7 +914,7 @@ def _run_probe(args: argparse.Namespace, layers: int) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-    _stage("Phase 1/3", "Sizing Probe", f"Layers: {layers}")
+    _stage("Sizing", "Probe", f"Layers: {layers}")
     returncode = _stream_subprocess(_probe_command(args, layers, output), cwd=args.checkout_root, env=env)
     if not output.exists():
         raise RuntimeError(f"{layers}-layer sizing worker exited {returncode} without writing {output}")
@@ -905,16 +931,16 @@ def _sizing_request(args: argparse.Namespace, layers: int) -> dict:
     import torch
     import transformers
 
-    from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.reference_records import file_identity
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.storage import file_identity
 
     config = load_config(args.config)
     root = Path(__file__).resolve().parents[1]
     sources = [
         *sorted((root / "reference").glob("*.py")),
         root / "onboarding" / "synth_model.py",
-        *(root / "harness" / name for name in ("config.py", "batches.py", "sft.py", "names.py")),
+        *(root / "harness" / name for name in ("config.py", "sft.py", "sft.py", "optimizer.py")),
     ]
     return {
         "config_sha256": file_identity(args.config)["sha256"],
@@ -953,7 +979,7 @@ def _reuse_sizing(args: argparse.Namespace, layers: int) -> dict:
     from transformers import AutoConfig
 
     from arctic_platform.correctness.harness.config import hash_directory
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
     from arctic_platform.correctness.onboarding.synth_model import count_parameters
 
     receipt = _read_sizing_json(args.reuse_sizing, args.reuse_sizing_sha256)
@@ -1024,9 +1050,9 @@ def _probe_worker(args: argparse.Namespace) -> int:
     import torch
     from transformers import AutoConfig
 
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.reference.hf_single_gpu import run as run_reference
 
@@ -1090,10 +1116,10 @@ def _probe_worker(args: argparse.Namespace) -> int:
 
 def _spec_arms(cfg, arm_defs, vocab_size: int):
     """Describe the same generated comparison cases for reduced and full-source specifications."""
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import ArmSpec
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 
     arms = []
     for definition in arm_defs:
@@ -1204,7 +1230,7 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
 
 
 def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
-    from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+    from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
     path = getattr(args, "peft_adapter", None)
     if not config.training.get("peft_config"):
@@ -1212,7 +1238,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
             raise ValueError("--peft-adapter requires a LoRA training config")
         return None
     if path is None:
-        from arctic_platform.correctness.harness.shared_lora_adapter import generate_adapter
+        from arctic_platform.correctness.harness.lora import generate_adapter
 
         if model_path is None:
             return None
@@ -1287,14 +1313,14 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from transformers import AutoConfig
 
     from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
-    from arctic_platform.correctness.harness.batches import save
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.runner import run_reference
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
+    from arctic_platform.correctness.harness.sft import save
 
     config = load_config(args.config)
     spec = TestSpec.read(args.test_spec)
@@ -1355,19 +1381,17 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
 
     try:
         completed: dict[int, tuple[float, dict]] = {}
-        with tqdm(
-            total=CALIBRATION_RUNS, desc="Finding optimizer tolerance", unit="run", dynamic_ncols=True
-        ) as progress:
-            for start in range(0, CALIBRATION_RUNS, lanes):
-                with ThreadPoolExecutor(max_workers=lanes) as pool:
-                    futures = [
-                        pool.submit(one_run, index) for index in range(start, min(start + lanes, CALIBRATION_RUNS))
-                    ]
-                    for future in as_completed(futures):
-                        index, elapsed, result = future.result()
-                        completed[index] = (elapsed, result)
-                        progress.set_postfix_str(f"last={elapsed:.1f}s, {lanes} per wave")
-                        progress.update()
+        from arctic_platform.correctness.harness.report import reference_progress
+
+        for start in range(0, CALIBRATION_RUNS, lanes):
+            with ThreadPoolExecutor(max_workers=lanes) as pool:
+                futures = {
+                    pool.submit(one_run, index): index for index in range(start, min(start + lanes, CALIBRATION_RUNS))
+                }
+                for _, (index, elapsed, result) in reference_progress(
+                    futures, label="Finding optimizer tolerance", total=CALIBRATION_RUNS, completed=len(completed)
+                ):
+                    completed[index] = (elapsed, result)
         for index in range(CALIBRATION_RUNS):
             elapsed, result = completed[index]
             durations.append(elapsed)
@@ -1553,7 +1577,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
     return admitted
 
 
-def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "phase 3/3") -> dict:
+def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
@@ -1631,7 +1655,7 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             *command[3:],
         ]
     description = selected.get("model_description", f"frozen {layers}-layer regression")
-    _stage(phase, "Target Validation", description)
+    _stage(phase, "Target Run", description)
     lines: list[str] = []
     with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
@@ -1770,7 +1794,7 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
         if getattr(args, "backend", "onprem") == "cortex":
             from arctic_platform.correctness.harness.cortex import load_local_fixture
             from arctic_platform.correctness.harness.execution import _client_backend
-            from arctic_platform.correctness.harness.hosted import HostedTransport
+            from arctic_platform.correctness.harness.gateway import HostedTransport
 
             backend = _client_backend(args)
             if gateway_url is not None:
@@ -1965,7 +1989,7 @@ def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
     spec.applicable_tests = sorted({*spec.applicable_tests, test_id})
     try:
         spec.write(args.test_spec)
-        from arctic_platform.correctness.harness.reference_records import CRITERIA
+        from arctic_platform.correctness.harness.storage import CRITERIA
 
         if test_id in CRITERIA:
             _prepare_references(args)
@@ -2016,21 +2040,21 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     """Publish fresh per-arm scalar-norm references, never a legacy full-tensor gate."""
     from transformers import AutoConfig
 
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import load as load_batch
     from arctic_platform.correctness.harness.config import ArmDefinition
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.reference_records import CRITERIA
-    from arctic_platform.correctness.harness.reference_records import batch_identity
-    from arctic_platform.correctness.harness.reference_records import file_identity
-    from arctic_platform.correctness.harness.reference_records import load_record
-    from arctic_platform.correctness.harness.reference_records import model_identity
-    from arctic_platform.correctness.harness.reference_records import publish_record_set
-    from arctic_platform.correctness.harness.reference_records import require_git_records_dir
-    from arctic_platform.correctness.harness.reference_records import workload_identity
     from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
     from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import load as load_batch
+    from arctic_platform.correctness.harness.storage import CRITERIA
+    from arctic_platform.correctness.harness.storage import batch_identity
+    from arctic_platform.correctness.harness.storage import file_identity
+    from arctic_platform.correctness.harness.storage import load_record
+    from arctic_platform.correctness.harness.storage import model_identity
+    from arctic_platform.correctness.harness.storage import publish_record_set
+    from arctic_platform.correctness.harness.storage import require_git_records_dir
+    from arctic_platform.correctness.harness.storage import workload_identity
     from arctic_platform.correctness.reference.model_features import uses_mixer_packing
 
     test_id = "single-step-optimizer"
@@ -2087,7 +2111,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         expected_model = model_identity(args.optimizer_model_path)
         initialization = "external-model"
         if config.training.get("peft_config"):
-            from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+            from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
             initialization = adapter_identity(_shared_adapter(args, config, args.optimizer_model_path))
         training = config.effective_training
@@ -2227,32 +2251,33 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
         )
     args.optimizer_model_path = optimizer_model_path
     args.optimizer_layers = optimizer_layers
-    _stage(
+    with _phase(
         "Phase 1/3",
         "Optimizer Reference Fixture",
         f"using the minimum representative {optimizer_layers}-layer prefix and the frozen Test 1 cases",
-    )
-    if not local_fixture:
-        materialize_pretrained(
-            spec.model.source_checkpoint,
-            str(optimizer_model_path),
-            optimizer_layers,
-            vision_depth=spec.model.vision_depth,
-        )
-    print(f"phase 1/3 complete: reference={optimizer_model_path}", flush=True)
-    _stage(
-        "Phase 2/3",
-        "Optimizer Calibration",
-        f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference steps; "
-        "the progress bar will report ETA after each run",
-    )
+    ):
+        if not local_fixture:
+            materialize_pretrained(
+                spec.model.source_checkpoint,
+                str(optimizer_model_path),
+                optimizer_layers,
+                vision_depth=spec.model.vision_depth,
+            )
+        print(f"phase 1/3 complete: reference={optimizer_model_path}", flush=True)
     try:
-        calibration_json = Path(
-            _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
-        )
+        with _phase(
+            "Phase 2/3",
+            "Optimizer Calibration",
+            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference steps per GAS arm; "
+            "completed workers and periodic waits are logged.",
+        ):
+            calibration_json = Path(
+                _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
+            )
         selected = {"layers": optimizer_layers}
-        validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
-        _require_validation_pass(validation, f"final {optimizer_layers}-layer Test 2 regression")
+        with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {optimizer_layers}-layer fixture."):
+            validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
+            _require_validation_pass(validation, f"final {optimizer_layers}-layer Test 2 regression")
     except BaseException:
         args.test_spec.write_bytes(previous_spec)
         raise
@@ -2293,7 +2318,7 @@ def _parent(args: argparse.Namespace) -> int:
 
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import validate_against_host
-    from arctic_platform.correctness.harness.dss_driver import available_gpus
+    from arctic_platform.correctness.harness.gateway import available_gpus
     from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
 
     config = load_config(args.config)
@@ -2323,9 +2348,9 @@ def _parent(args: argparse.Namespace) -> int:
             "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
         )
     if getattr(args, "backend", "onprem") == "cortex":
-        from arctic_platform.correctness.harness.dss_driver import rl_gpu_count
         from arctic_platform.correctness.harness.execution import _client_backend
-        from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import rl_gpu_count
 
         full_model = getattr(args, "local_gateway_full_model", False)
         rl_fixed_check = (
@@ -2384,16 +2409,16 @@ def _parent(args: argparse.Namespace) -> int:
     full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
     sizing_started = time.monotonic()
     if getattr(args, "reuse_sizing", None) is not None:
-        _stage("Phase 1/3", "Retained Sizing", "Admitting the source-bound result without HF sizing replay.")
-        selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
+        with _phase("Phase 1/3", "Retained Sizing", "Admitting the source-bound result without HF sizing replay."):
+            selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
     else:
-        _stage(
+        with _phase(
             "Phase 1/3",
             "Representative Fixture Sizing",
             f"Validating the minimum representative HF configuration at {args.tokens:,} tokens; "
             f"selected {representative_layers} of {full_layers} source layers, attention period {period}",
-        )
-        selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
+        ):
+            selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
     observations = [selected]
     if selected["status"] == "oom":
         raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
@@ -2407,20 +2432,27 @@ def _parent(args: argparse.Namespace) -> int:
 
     previous_spec = args.test_spec.read_bytes() if args.test_spec.exists() else None
     try:
-        _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
-        _stage(
+        with _phase(
             "Phase 2/3",
             "Gradient Calibration",
             f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
-        )
-        calibration_json = Path(
-            _resume_phase(args, "calibration", lambda: str(_render_and_run_calibration(args, selected)))
-        )
-        calibration = json.loads(calibration_json.read_text())
-        if local_fixture:
-            _resume_phase(args, "references", lambda: _prepare_references(args))
-        validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
-        _require_validation_pass(validation, f"final {selected['layers']}-layer regression")
+        ):
+            _stage("Reference", "Fixture Preparation", "Writing the fixture specification and frozen inputs.")
+            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
+            calibration_json = Path(
+                _resume_phase(args, "calibration", lambda: str(_render_and_run_calibration(args, selected)))
+            )
+            calibration = json.loads(calibration_json.read_text())
+            if local_fixture:
+                _stage(
+                    "Reference",
+                    "Deterministic Baseline Preparation",
+                    "Preparing compact HF records for GAS1 and GAS4 before target validation.",
+                )
+                _resume_phase(args, "references", lambda: _prepare_references(args))
+        with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {selected['layers']}-layer fixture."):
+            validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
+            _require_validation_pass(validation, f"final {selected['layers']}-layer regression")
     except BaseException:
         if previous_spec is None:
             args.test_spec.unlink(missing_ok=True)
@@ -2576,9 +2608,9 @@ def _prepare_references(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.reference_records import CRITERIA
-    from arctic_platform.correctness.harness.reference_records import require_git_records_dir
     from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.storage import CRITERIA
+    from arctic_platform.correctness.harness.storage import require_git_records_dir
 
     selection = args.reference_tests or [args.test_id]
     if any(test_id not in CRITERIA for test_id in selection):
@@ -2713,11 +2745,11 @@ def run(args: argparse.Namespace) -> int:
 def _onboard_configuration(args: argparse.Namespace) -> int:
     """Resolve a config-only onboarding request and retain each check's actual result."""
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.dss_driver import UnsafeCleanupError
-    from arctic_platform.correctness.harness.reference_records import CRITERIA
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
     from arctic_platform.correctness.harness.report import total_duration
+    from arctic_platform.correctness.harness.storage import CRITERIA
 
     if not hasattr(args, "_onboarding_times"):
         args._onboarding_times = {}

@@ -39,6 +39,15 @@ from pydantic import SecretStr
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.correctness.harness.gateway import available_gpus
+from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import read_pat
+from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.storage import correctness_logdir
+from arctic_platform.correctness.harness.storage import correctness_workdir
+from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 from . import report as console
 from .config import ArmDefinition
@@ -52,11 +61,6 @@ from .config import local_gpu_type
 from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
-from .dss_driver import available_gpus
-from .dss_driver import local_cortex_gateway
-from .hosted import is_local_cortex_gateway
-from .hosted import read_pat
-from .hosted import require_local_cortex_gateway
 from .registry import RL_INAPPLICABLE_REASON
 from .registry import TestOutcome
 from .registry import TestResult
@@ -68,10 +72,6 @@ from .runner import cortex_unavailable_reason
 from .runner import execute
 from .runner import execute_rl
 from .runner import validate_local_full_model
-from .storage import correctness_logdir
-from .storage import correctness_workdir
-from .storage import ensure_no_interrupted_builds
-from .storage import require_data_fast_path
 
 CORRECTNESS_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -423,7 +423,7 @@ def _load_inference_initial_model_dir(args) -> Path | None:
         return None
     if _load_inference_export_allocation(args) is None:
         raise ValueError("inference initial model directory requires a pinned local inference export allocation")
-    from .inference_export import validate_initial_training_model_dir
+    from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
 
     return validate_initial_training_model_dir(value)
 
@@ -567,13 +567,11 @@ def _regression_gateway(args):
         yield None
         return
     if not getattr(args, "_automatic_checkpoint_bridge", False):
-        with local_cortex_gateway(
-            Path(args.out), gateway_module="arctic_platform.debug.correctness_participation"
-        ) as url:
+        with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.training") as url:
             yield url
         return
-    from .cortex import LOCAL_CHECKPOINT_BRIDGE_ENV
-    from .cortex import LOCAL_NATIVE_FORWARD_ENV
+    from arctic_platform.correctness.harness.cortex import LOCAL_CHECKPOINT_BRIDGE_ENV
+    from arctic_platform.correctness.harness.cortex import LOCAL_NATIVE_FORWARD_ENV
 
     names = (LOCAL_NATIVE_FORWARD_ENV, LOCAL_CHECKPOINT_BRIDGE_ENV)
     previous = {name: os.environ.get(name) for name in names}
@@ -618,7 +616,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         args.out = correctness_logdir("ap-correctness-run-")
     backend = _client_backend(args)
     if getattr(args, "reference_records_dir", None) is not None:
-        from .reference_records import require_git_records_dir
+        from arctic_platform.correctness.harness.storage import require_git_records_dir
 
         args.reference_records_dir = require_git_records_dir(args.reference_records_dir)
     remote = isinstance(backend, CortexConfig)
@@ -783,7 +781,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     execution[cfg.config_id]["gateway_url"] = gateway_url
                 published_fixture = None
                 if local_fixture:
-                    from .cortex import load_local_fixture
+                    from arctic_platform.correctness.harness.cortex import load_local_fixture
 
                     try:
                         published_fixture = load_local_fixture(backend, spec)
@@ -870,7 +868,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 gateway_url=backend.base_url,
             )
         if fixture_path is not None:
-            from .cortex import load_fixture
+            from arctic_platform.correctness.harness.cortex import load_fixture
 
             try:
                 published_fixture = load_fixture(fixture_path, spec)
@@ -896,7 +894,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 backend.base_url = gateway_url
                 execution[cfg.config_id]["gateway_url"] = gateway_url
             if local_fixture:
-                from .cortex import load_local_fixture
+                from arctic_platform.correctness.harness.cortex import load_local_fixture
 
                 try:
                     published_fixture = load_local_fixture(backend, spec)
@@ -1052,9 +1050,10 @@ def _saved_output(log):
 
 def run_batch(args, *, selected, executor=None):
     """Orchestrate independent groups without replacing the numerical runner."""
+    from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
+
     from ..api import BatchResult
     from ..api import aggregate_exit_code
-    from .reference_records import ReferencePrerequisiteError
 
     started = time.monotonic()
     _load_dense_checkpoint_allocation(args)
@@ -1221,13 +1220,12 @@ def cmd_onboard(args) -> int:
 def cmd_selftest(args) -> int:
     """Run the harness's own checks.
 
-    They live in the package rather than in the repository's test tree, and are named ``check_*.py``, so a
-    unit-test run cannot collect a correctness check. Supplying the collection pattern is therefore this
-    command's job.
+    The shared library lives in the package and is collected through one explicit driver, so default
+    repository pytest collection does not include these checks.
     """
     import pytest
 
-    selftest_dir = CORRECTNESS_DIR / "selftest"
+    selftest_driver = CORRECTNESS_DIR / "selftest" / "check_suite.py"
     runner_args = list(args.runner_args)
     has_basetemp = False
     for index, argument in enumerate(runner_args):
@@ -1241,7 +1239,7 @@ def cmd_selftest(args) -> int:
             has_basetemp = True
     if not has_basetemp:
         runner_args.extend(["--basetemp", str(correctness_workdir("ap-correctness-selftest-") / "pytest")])
-    return pytest.main(["-sv", "--instafail", "-o", "python_files=check_*.py", str(selftest_dir), *runner_args])
+    return pytest.main(["-sv", "--instafail", str(selftest_driver), *runner_args])
 
 
 def cmd_publish_fixture(args) -> int:

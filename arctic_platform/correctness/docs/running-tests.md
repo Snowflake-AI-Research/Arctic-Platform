@@ -241,7 +241,7 @@ For reviewed reduced-fixture single-step checks with an explicitly configured lo
 
 **A local multi-node inference check can use a hash-pinned allocation descriptor.** The descriptor is a JSON object supplied by the allocation owner after admitting the current nodes. The descriptor binds checkpoint export to the nodes in that one allocation; it does not establish model-file readiness, install a runtime, start a gateway, reserve GPUs or provide keepalive protection. This advanced route is separate from the complete first-two onboarding example above.
 
-**The descriptor must describe the actual allocation hostfile and node identities.** [The live validator](../harness/inference_export.py) requires these fields:
+**The descriptor must describe the actual allocation hostfile and node identities.** [The live validator](../harness/inference.py) requires these fields:
 
 | Field | Required value |
 | ----- | -------------- |
@@ -328,7 +328,7 @@ python -m pip install -e '.[correctness]'
 CUDA_VISIBLE_DEVICES= python -m arctic_platform.correctness selftest
 ```
 
-This runs maintained `check_*.py` controls using installed test dependencies. Implementation passes do not establish a full-model numerical pass.
+This collects the controls in `selftest/library.py` through the single `selftest/check_suite.py` driver using installed test dependencies. Implementation passes do not establish a full-model numerical pass.
 
 **Maintained experiments use one diagnostic command.**
 

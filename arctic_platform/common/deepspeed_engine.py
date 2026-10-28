@@ -33,9 +33,9 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 
 from arctic_platform.common.optimizer import OptimizerSettings
-from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_configure_broadcast_training
-from arctic_platform.debug.deepspeed_zero_initialization import maybe_initialize_with_zero_allocation_trace
-from arctic_platform.debug.router_replay_trace import maybe_configure_router_replay_trace
+from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 
@@ -104,8 +104,6 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         # NCCL bf16 all-reduce is not accumulated in fp32 internally.
         "communication_data_type": "fp32" if is_bf16 else None,
     }
-    if is_bf16:
-        ds_config["data_types"] = {"grad_accum_dtype": "fp32"}
     if spec.seed is not None:
         ds_config["seed"] = int(spec.seed)
     if spec.sequence_parallel > 1:
@@ -187,15 +185,12 @@ def initialize_training_engine(
     import deepspeed
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
-    if built is not None:
-        engine, built, _, _ = maybe_initialize_with_zero_allocation_trace(
-            deepspeed.initialize, ds_config, rank, model=model, optimizer=built, **init_kwargs
-        )
-    else:
-        engine, *_ = maybe_initialize_with_zero_allocation_trace(
-            deepspeed.initialize, ds_config, rank, model=model, **init_kwargs
-        )
-        built = None
+    with maybe_trace_zero_initialization(ds_config, rank) as init_config:
+        if built is not None:
+            engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=init_config, **init_kwargs)
+        else:
+            engine, *_ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
+            built = None
     return engine, built, choice
 
 

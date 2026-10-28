@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from arctic_platform.common.utils.batch import metric_is_summed
-from arctic_platform.debug.router_replay_trace import maybe_complete_router_replay_call
+from arctic_platform.debug.training import maybe_complete_router_replay_call
 
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss

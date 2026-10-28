@@ -894,7 +894,7 @@ def _reduced_fixture_mtp_case(tmp_path, *, mtp_payload=None, config_update=None,
 def test_reduced_fixture_mtp_default_delegates_exact_source_to_strict_capture(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
     from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_model()
@@ -919,7 +919,7 @@ def test_reduced_fixture_mtp_default_delegates_exact_source_to_strict_capture(mo
 def test_reduced_fixture_mtp_default_rejects_damaged_original_with_all_mtp_missing(monkeypatch, tmp_path, model_type):
     from types import SimpleNamespace
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
     from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model, source, _, _ = _reduced_fixture_mtp_case(tmp_path, model_type=model_type)
@@ -939,7 +939,7 @@ def test_reduced_fixture_mtp_accepts_exact_indexed_absence_but_full_export_remai
 ):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
 
     model, source, config, _ = _reduced_fixture_mtp_case(tmp_path, model_type=model_type)
@@ -971,7 +971,7 @@ def test_reduced_fixture_mtp_accepts_exact_indexed_absence_but_full_export_remai
 def test_reduced_fixture_mtp_rejects_runtime_family_mismatch(monkeypatch, tmp_path, model_type):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     model, source, config, _ = _reduced_fixture_mtp_case(tmp_path, model_type=model_type)
     model.config.text_config.model_type = "qwen4_exp_text" if model_type == "qwen3_5_moe_text" else "qwen3_5_moe_text"
@@ -985,7 +985,7 @@ def test_reduced_fixture_mtp_rejects_runtime_family_mismatch(monkeypatch, tmp_pa
 def test_reduced_fixture_mtp_rejects_partial_or_unexpected_mtp_inventory(monkeypatch, tmp_path, inventory):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     payload = _mtp_payload()
     if inventory == "partial":
@@ -1017,7 +1017,7 @@ def test_reduced_fixture_mtp_rejects_partial_or_unexpected_mtp_inventory(monkeyp
 def test_reduced_fixture_mtp_rejects_invalid_authorization_fields(monkeypatch, tmp_path, change, match):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     model, source, config, request = _reduced_fixture_mtp_case(tmp_path)
     change(request, config)
@@ -1034,7 +1034,7 @@ def test_reduced_fixture_mtp_rejects_invalid_authorization_fields(monkeypatch, t
 def test_reduced_fixture_mtp_rejects_snapshot_manifest_or_config_mismatch(monkeypatch, tmp_path, change, match):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     if change == "config":
         model, source, config, _ = _reduced_fixture_mtp_case(
@@ -1053,7 +1053,7 @@ def test_reduced_fixture_mtp_rejects_snapshot_manifest_or_config_mismatch(monkey
 def test_reduced_fixture_mtp_rejects_generation_mutation(monkeypatch, tmp_path):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     model, source, config, _ = _reduced_fixture_mtp_case(tmp_path)
     index_path = source / "model.safetensors.index.json"
@@ -1090,7 +1090,7 @@ def test_reduced_fixture_mtp_distributed_peer_failure_or_decision_mismatch_propa
 ):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     model, source, config, _ = _reduced_fixture_mtp_case(tmp_path)
     monkeypatch.setattr(reduced_fixture_mtp, "_authenticate_fixture", lambda *args: True)
@@ -1109,7 +1109,7 @@ def test_reduced_fixture_mtp_distributed_peer_failure_or_decision_mismatch_propa
 def test_reduced_fixture_mtp_distributed_local_failure_is_gathered_before_raise(monkeypatch, tmp_path):
     import torch
 
-    from arctic_platform.debug import reduced_fixture_mtp
+    from arctic_platform.debug import training as reduced_fixture_mtp
 
     model, source, config, _ = _reduced_fixture_mtp_case(tmp_path)
     monkeypatch.setattr(

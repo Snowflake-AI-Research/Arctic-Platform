@@ -13,7 +13,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 
-from arctic_platform.debug.lora_sync_hooks import maybe_observe_model_materialization
+from arctic_platform.debug.lora import maybe_observe_model_materialization
 from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp

@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 def cleanup_owned_gateway(record_path: Path, token: str) -> None:
-    from arctic_platform.correctness.harness import dss_driver
+    from arctic_platform.correctness.harness import gateway as dss_driver
 
     with (record_path.parent / "owner.lock").open("a") as lock:
         try:
@@ -44,7 +44,7 @@ def cleanup_owned_gateway(record_path: Path, token: str) -> None:
 
 
 def _cleanup_unrecorded_gateway(token: str) -> None:
-    from arctic_platform.correctness.harness import dss_driver
+    from arctic_platform.correctness.harness import gateway as dss_driver
 
     # The owner may die between launching the gateway and publishing its ownership record.
     marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode()

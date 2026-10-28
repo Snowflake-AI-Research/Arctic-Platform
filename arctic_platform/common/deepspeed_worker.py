@@ -225,7 +225,7 @@ class DeepSpeedWorker:
         if spec.parallelism.sequence_parallel != self.sp_size:
             raise ValueError("worker sp_size disagrees with the resolved ModelSpec")
         parallel_groups = self._setup_model_parallel_groups(spec, ds_config, ds_worker_config)
-        from arctic_platform.debug.lora_sync_hooks import maybe_admit_worker_construction
+        from arctic_platform.debug.lora import maybe_admit_worker_construction
 
         maybe_admit_worker_construction(self, spec, ds_config, parallel_groups, build_model, deepspeed.initialize)
         loaded = (
@@ -247,7 +247,7 @@ class DeepSpeedWorker:
         if spec.parallelism.expert_parallel > 1:
             preserve_fp8_params_through_ds_cast(model)
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
-        from arctic_platform.debug.lora_sync_hooks import maybe_verify_worker_engine
+        from arctic_platform.debug.lora import maybe_verify_worker_engine
 
         maybe_verify_worker_engine(self)
         self._device = get_accelerator().device_name(self.engine.local_rank)
@@ -396,7 +396,6 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
 
         return ds_config
 
@@ -869,7 +868,7 @@ class DeepSpeedWorker:
             device=torch.device(self._device),
             bucket_size=bucket_size,
         )
-        from arctic_platform.debug.lora_sync_hooks import maybe_record_lora_sender
+        from arctic_platform.debug.lora import maybe_record_lora_sender
 
         maybe_record_lora_sender(self, group, schedule, base_port)
         return True
@@ -907,7 +906,7 @@ class DeepSpeedWorker:
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
     def prepare_lora_weights(self, request: dict) -> dict:
-        from arctic_platform.debug.lora_sync_hooks import maybe_prepare_lora_worker
+        from arctic_platform.debug.lora import maybe_prepare_lora_worker
 
         return maybe_prepare_lora_worker(self, request)
 
@@ -918,7 +917,7 @@ class DeepSpeedWorker:
         return total.item()
 
     def send_weights(self) -> dict:
-        from arctic_platform.debug.lora_sync_hooks import maybe_send_lora_worker
+        from arctic_platform.debug.lora import maybe_send_lora_worker
 
         return maybe_send_lora_worker(self)
 
@@ -1351,7 +1350,7 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
-        from arctic_platform.debug.lora_sync_hooks import maybe_release_lora_worker
+        from arctic_platform.debug.lora import maybe_release_lora_worker
 
         maybe_release_lora_worker(self)
         if self._weight_sender is not None:

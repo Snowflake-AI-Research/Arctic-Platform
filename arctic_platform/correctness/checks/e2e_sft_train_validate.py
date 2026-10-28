@@ -60,37 +60,37 @@ from typing import Tuple
 import torch
 
 from arctic_platform.client import CortexConfig
-from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+from arctic_platform.correctness.harness import sft as gsm8k
+from arctic_platform.correctness.harness import storage as reference_records
+from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import build_payload
+from arctic_platform.correctness.harness.gateway import forward_logprobs
+from arctic_platform.correctness.harness.gateway import fwd_bwd_step
+from arctic_platform.correctness.harness.gateway import gateway
+from arctic_platform.correctness.harness.gateway import pack
+from arctic_platform.correctness.harness.gateway import pack_logit_aligned
+from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import running_job
+from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
+from arctic_platform.correctness.harness.sft import VALIDATION_SPLIT
+from arctic_platform.correctness.harness.sft import Batch
+from arctic_platform.correctness.harness.sft import configured_learning_rate
+from arctic_platform.correctness.harness.sft import configured_rows_per_step
+from arctic_platform.correctness.harness.sft import cross_entropy
+from arctic_platform.correctness.harness.sft import load
+from arctic_platform.correctness.harness.sft import reference_answer_logprobs
+from arctic_platform.correctness.harness.sft import save
+from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
-from ..harness import reference_records
-from ..harness import sft as gsm8k
-from ..harness.batches import SEED
-from ..harness.batches import Batch
-from ..harness.batches import load
-from ..harness.batches import save
 from ..harness.config import correctness_microbatch_tokens
 from ..harness.config import tolerance_text
-from ..harness.dss_driver import UnsafeCleanupError
-from ..harness.dss_driver import build_payload
-from ..harness.dss_driver import forward_logprobs
-from ..harness.dss_driver import fwd_bwd_step
-from ..harness.dss_driver import gateway
-from ..harness.dss_driver import pack
-from ..harness.dss_driver import pack_logit_aligned
-from ..harness.dss_driver import running_job
-from ..harness.hosted import require_local_cortex_gateway
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.sft import TRAIN_SPLIT
-from ..harness.sft import VALIDATION_SPLIT
-from ..harness.sft import configured_learning_rate
-from ..harness.sft import configured_rows_per_step
-from ..harness.sft import cross_entropy
-from ..harness.sft import reference_answer_logprobs
-from ..harness.storage import require_data_fast_path
 from ..reference.model_features import uses_mixer_packing
 
 TEST_ID = "e2e-sft-train-validate"
@@ -399,7 +399,7 @@ def run_dss_trajectory(
     )
     maybe_bind_reduced_fixture_mtp(payload, ctx.spec, getattr(ctx, "published_fixture", None))
     if peft_adapter_path is not None:
-        from ..harness.lora import bind_payload
+        from arctic_platform.correctness.harness.lora import bind_payload
 
         payload = bind_payload(
             payload,
@@ -603,7 +603,7 @@ def dataset_paths() -> Tuple[Path, Path]:
 def _prepare_adapter(ctx, model_path: str, workdir: Path) -> Tuple[Path | None, dict]:
     if not ctx.cfg.effective_training.get("peft_config"):
         return None, {"kind": "base-model"}
-    from ..harness import lora as deterministic_lora
+    from arctic_platform.correctness.harness import lora as deterministic_lora
 
     adapter = deterministic_lora.materialize_adapter(ctx.cfg, model_path, workdir / "adapter-init")
     if adapter is None:

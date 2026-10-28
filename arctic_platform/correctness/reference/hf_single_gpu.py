@@ -114,7 +114,7 @@ class ReferenceEngine:
 
 def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> dict:
     """Describe the actual loaded model and decoder, without reading weight tensors."""
-    from arctic_platform.correctness.harness.reference_records import file_identity
+    from arctic_platform.correctness.harness.storage import file_identity
 
     def portable_code(code):
         # Python embeds checkout paths in nested code objects; exclude those paths from the code digest.
@@ -228,8 +228,8 @@ def build_engine(
     if peft_adapter_path:
         from peft import PeftModel
 
-        from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
-        from arctic_platform.correctness.harness.shared_lora_adapter import initialize_adapter
+        from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
+        from arctic_platform.correctness.harness.lora import shared_initialize_adapter as initialize_adapter
 
         supplied_identity = adapter_identity(peft_adapter_path, peft_config)
         model = PeftModel.from_pretrained(model, peft_adapter_path, is_trainable=True)
@@ -471,7 +471,7 @@ def _forward_backward(
 
 
 def forward_backward(engine: ReferenceEngine, batch, **options) -> ForwardBackwardResult:
-    from arctic_platform.correctness.harness.participation import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
 
     with ParticipationCapture(engine.model, decoder=engine.decoder, head=engine.head) as capture:
         result = _forward_backward(engine, batch, **options)
@@ -553,7 +553,7 @@ def run(
     accumulator = forward.gradients
     skipped = forward.skipped_no_grad
     grad_norms = gradient_norms(accumulator, device)
-    from arctic_platform.correctness.harness.participation import active_gradient_norms
+    from arctic_platform.correctness.harness.optimizer import active_gradient_norms
 
     active_gradient_norms(forward.participation, grad_norms)
     optimizer_state_manifest = None

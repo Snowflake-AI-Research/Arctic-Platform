@@ -314,7 +314,7 @@ def main() -> None:
 
         pin_reduction_order(args.model, args.attn)
 
-    from ..harness.batches import load
+    from arctic_platform.correctness.harness.sft import load
 
     replay = json.loads(Path(args.replay).read_text())
     result = run(

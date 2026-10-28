@@ -27,10 +27,10 @@ from types import MappingProxyType
 from typing import Mapping
 
 from arctic_platform.client import CortexConfig
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 from ..harness.config import LoadedConfig
 from ..harness.config import TestSpec
-from ..harness.storage import require_data_fast_path
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
     from safetensors import safe_open
     from transformers.utils.hub import cached_file
 
-    from ..harness.hosted import require_local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
     require_local_cortex_gateway(backend)
     if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get("DSS_ALLOW_REMOTE_MODELS") != "1":

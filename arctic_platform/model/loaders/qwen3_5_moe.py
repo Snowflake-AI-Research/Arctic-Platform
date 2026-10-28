@@ -24,7 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
-from arctic_platform.debug.reduced_fixture_mtp import ReducedFixtureMTP
+from arctic_platform.debug.training import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config

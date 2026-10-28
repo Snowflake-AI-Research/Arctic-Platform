@@ -167,7 +167,7 @@ def run_adamw_step(
 
     inventory = None
     if participation is not None:
-        from arctic_platform.correctness.harness.participation import validate_participation
+        from arctic_platform.correctness.harness.optimizer import validate_participation
 
         inventory = validate_participation(participation)
         actual = {
@@ -221,8 +221,8 @@ def run_adamw_step(
     output_dir.mkdir(parents=True, exist_ok=True)
     inactive_weights = {}
     if inventory is not None:
-        from arctic_platform.correctness.harness.participation import validate_inactive_weights
-        from arctic_platform.correctness.harness.participation import weight_identity
+        from arctic_platform.correctness.harness.optimizer import validate_inactive_weights
+        from arctic_platform.correctness.harness.optimizer import weight_identity
 
         for name, source in model.named_parameters():
             if name not in inventory or inventory[name]["state"] != "inactive":

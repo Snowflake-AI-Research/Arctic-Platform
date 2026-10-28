@@ -27,17 +27,19 @@ from typing import Tuple
 
 import torch
 
-from ..harness.names import COMPARISON_STATE_KEYS
-from ..harness.names import OPTIMIZER_NORM_CRITERION
-from ..harness.names import STATE_KEYS
-from ..harness.names import CanonicalTensorGroup
-from ..harness.names import canonical_dss_tensor_groups
-from ..harness.names import normalize
-from ..harness.names import validate_optimizer_norm_summary as _validate_optimizer_norm_summary
-from ..harness.participation import canonical_participation
-from ..harness.participation import compare_participation
-from ..harness.participation import validate_inactive_weights
-from ..harness.participation import validate_optimizer_participation
+from arctic_platform.correctness.harness.optimizer import COMPARISON_STATE_KEYS
+from arctic_platform.correctness.harness.optimizer import OPTIMIZER_NORM_CRITERION
+from arctic_platform.correctness.harness.optimizer import STATE_KEYS
+from arctic_platform.correctness.harness.optimizer import CanonicalTensorGroup
+from arctic_platform.correctness.harness.optimizer import canonical_dss_tensor_groups
+from arctic_platform.correctness.harness.optimizer import canonical_participation
+from arctic_platform.correctness.harness.optimizer import compare_participation
+from arctic_platform.correctness.harness.optimizer import normalize
+from arctic_platform.correctness.harness.optimizer import validate_inactive_weights
+from arctic_platform.correctness.harness.optimizer import (
+    validate_optimizer_norm_summary as _validate_optimizer_norm_summary,
+)
+from arctic_platform.correctness.harness.optimizer import validate_optimizer_participation
 
 
 @dataclass(frozen=True)
@@ -273,6 +275,15 @@ def _load_norm_group(entries: Dict[str, Path], group: CanonicalTensorGroup) -> D
         raise ValueError(f"optimizer artifact concatenation shape mismatch for {group.originals}") from exc
 
 
+def _optimizer_l2_norm(value: "torch.Tensor") -> float:
+    if value.device.type != "cpu" or value.numel() <= 1_000_000:
+        return float(torch.linalg.vector_norm(value))
+    # A single FP32 CPU reduction loses contributions from billion-element experts.
+    squares = (float(chunk.double().square().sum()) for chunk in value.detach().reshape(-1).split(1_000_000))
+    norm = math.sqrt(math.fsum(squares))
+    return float(torch.tensor(norm, dtype=value.dtype))
+
+
 def summarize_optimizer_artifacts(
     manifest: Path, *, optimizer_config: dict, learning_rate: float, backend: str = "reference"
 ) -> dict:
@@ -330,7 +341,7 @@ def summarize_optimizer_artifacts(
         for state in COMPARISON_STATE_KEYS:
             if not bool(torch.isfinite(values[state]).all()):
                 raise ValueError(f"optimizer comparison tensor for {name}::{state} is not finite")
-            norm = float(torch.linalg.vector_norm(values[state]))
+            norm = _optimizer_l2_norm(values[state])
             if not math.isfinite(norm):
                 raise ValueError(f"optimizer norm for {name}::{state} is not finite")
             norms[state] = norm

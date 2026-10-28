@@ -32,7 +32,7 @@ from arctic_platform.debug.weight_sync_evidence import source_files
 from arctic_platform.debug.weight_sync_evidence import tensor_manifest
 from arctic_platform.debug.weight_sync_evidence import verify_sources
 
-_EXPORT_SHA = "fb53596b95ee4af94820d648b936d6bf585204f43d7dddca0bbd584662c11828"
+_EXPORT_SHA = "d25d1db0186d228c1b3ac7b7735d7d1368399589c9f13bc7f5383a6390368c10"
 
 
 def _admit(admitted, *objects):

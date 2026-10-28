@@ -38,10 +38,11 @@ from pathlib import Path
 from typing import List
 from typing import Tuple
 
-from ..harness.batches import SEED
+from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.storage import require_data_fast_path
+
 from ..harness.config import ModelSpec
 from ..harness.config import hash_directory
-from ..harness.storage import require_data_fast_path
 
 # A single H200 must hold the reference's weights, its fp32 gradient accumulator, the live gradients of
 # one backward pass, one microbatch of activations, and the chunked cross-entropy workspace. The margin
@@ -61,10 +62,10 @@ def describe_source_model(source: str) -> tuple[ModelSpec, int, dict]:
     Header element counts include buffers and do not establish architecture parameter counts. Neither a
     reference sizing measurement nor an initialization seed exists for this original pretrained model.
     """
-    from arctic_platform.correctness.harness.inference_export import original_schema_bytes
-    from arctic_platform.correctness.harness.inference_export import read_export_json
-    from arctic_platform.correctness.harness.inference_export import read_inventory
-    from arctic_platform.correctness.harness.inference_export import schema_sha
+    from arctic_platform.correctness.harness.inference import original_schema_bytes
+    from arctic_platform.correctness.harness.inference import read_export_json
+    from arctic_platform.correctness.harness.inference import read_inventory
+    from arctic_platform.correctness.harness.inference import schema_sha
 
     root = Path(source)
     if not root.is_dir():

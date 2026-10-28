@@ -30,7 +30,7 @@ import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
-from arctic_platform.debug.inference_warmup_observer import maybe_install_inference_warmup_observer
+from arctic_platform.debug.inference import maybe_install_inference_warmup_observer
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -578,7 +578,8 @@ class WeightSyncExtension:
         never skips a source: unresolved names fail after the receive completes.
         """
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
-        from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_bind_broadcast_loader, maybe_load_broadcast_tensor
+        from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+        from arctic_platform.debug.weight_sync import maybe_load_broadcast_tensor
 
         writer = _DirectParamWriter(model, self.device)
         maybe_bind_broadcast_loader(verifier, writer)
@@ -644,7 +645,8 @@ class WeightSyncExtension:
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
         )
-        from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_bind_broadcast_loader, maybe_load_broadcast_tensor
+        from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+        from arctic_platform.debug.weight_sync import maybe_load_broadcast_tensor
 
         writer = _ShardAwareFusedWriter(model, self.device)
         maybe_bind_broadcast_loader(verifier, writer)
@@ -746,7 +748,10 @@ class WeightSyncExtension:
             get_tensor_model_parallel_world_size,
             get_world_group,
         )
-        from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_admit_broadcast_receiver, maybe_begin_broadcast_load, maybe_broadcast_receiver_result, maybe_load_broadcast_strategy
+        from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
+        from arctic_platform.debug.weight_sync import maybe_begin_broadcast_load
+        from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
+        from arctic_platform.debug.weight_sync import maybe_load_broadcast_strategy
 
         maybe_admit_broadcast_receiver(self, engine_only=engine_only)
 

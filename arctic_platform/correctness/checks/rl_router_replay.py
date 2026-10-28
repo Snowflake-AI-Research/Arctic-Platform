@@ -49,23 +49,23 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
-from arctic_platform.debug.router_replay_trace import TRAINING_OPTION
+from arctic_platform.correctness.harness import sft as gsm8k
+from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import build_payload
+from arctic_platform.correctness.harness.gateway import generate
+from arctic_platform.correctness.harness.gateway import rl_batch
+from arctic_platform.correctness.harness.gateway import rl_fwd_bwd
+from arctic_platform.correctness.harness.gateway import running_rl_client
+from arctic_platform.correctness.harness.inference import collect_traces
+from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
+from arctic_platform.correctness.harness.sft import configured_rows_per_step
+from arctic_platform.debug.training import TRAINING_OPTION
 
-from ..harness import sft as gsm8k
-from ..harness.batches import SEED
-from ..harness.dss_driver import UnsafeCleanupError
-from ..harness.dss_driver import build_payload
-from ..harness.dss_driver import generate
-from ..harness.dss_driver import rl_batch
-from ..harness.dss_driver import rl_fwd_bwd
-from ..harness.dss_driver import running_rl_client
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.router_replay_trace import collect_traces
-from ..harness.sft import TRAIN_SPLIT
-from ..harness.sft import configured_rows_per_step
 
 TEST_ID = "rl-router-replay"
 

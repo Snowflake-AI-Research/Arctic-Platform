@@ -606,7 +606,7 @@ def iter_model_weights(
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
-    from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_bind_broadcast_trainer_inventory
+    from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
 
     maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":

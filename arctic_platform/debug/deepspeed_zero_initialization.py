@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 TRAINING_OPTION = "arctic_platform_zero_initialization_trace"
 
 
@@ -114,9 +117,12 @@ def open_trace(directory, rank):
     return path.open("x")
 
 
-def maybe_initialize_with_zero_allocation_trace(initialize, ds_config, rank, **kwargs):
+@contextmanager
+def maybe_trace_zero_initialization(ds_config: dict, rank: int) -> Iterator[dict]:
+    """Observe optional allocation traces without owning engine initialization."""
     if TRAINING_OPTION not in ds_config:
-        return initialize(config=ds_config, **kwargs)
+        yield ds_config
+        return
 
     import hashlib
     import inspect
@@ -144,7 +150,10 @@ def maybe_initialize_with_zero_allocation_trace(initialize, ds_config, rank, **k
     original = optimizer_class.initialize_optimizer_states
     if getattr(original, "_arctic_zero_trace", False):
         raise RuntimeError("ZeRO initialization trace already active")
-    source = Path(inspect.getsourcefile(original))
+    source_file = inspect.getsourcefile(original)
+    if source_file is None:
+        raise RuntimeError("ZeRO initialization trace requires an inspectable optimizer source")
+    source = Path(source_file)
     identity = {
         "request_id": request_id,
         "rank": rank,
@@ -166,12 +175,9 @@ def maybe_initialize_with_zero_allocation_trace(initialize, ds_config, rank, **k
                 return original(optimizer)
             return initialize_with_allocation_trace(original, optimizer, record)
 
-        observed._arctic_zero_trace = True
+        setattr(observed, "_arctic_zero_trace", True)
         optimizer_class.initialize_optimizer_states = observed
         try:
-            return initialize(
-                config={key: value for key, value in ds_config.items() if key != TRAINING_OPTION},
-                **kwargs,
-            )
+            yield {key: value for key, value in ds_config.items() if key != TRAINING_OPTION}
         finally:
             optimizer_class.initialize_optimizer_states = original

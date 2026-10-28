@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_platform.debug import inference_startup_error as durable_startup_error
+from arctic_platform.debug import inference as durable_startup_error
 from arctic_platform.inference.vllm import startup_error
 
 
@@ -219,7 +219,7 @@ def _durable_startup_error_new_directory_identity(path):
 @pytest.fixture
 def durable_startup_error_new_case(tmp_path, monkeypatch):
     durable_startup_error._reset_inference_startup_error_for_tests()
-    monkeypatch.delenv(durable_startup_error.REQUEST_ENV, raising=False)
+    monkeypatch.delenv(durable_startup_error.STARTUP_REQUEST_ENV, raising=False)
     monkeypatch.delenv(durable_startup_error.ATTEMPT_ENV, raising=False)
     root = tmp_path / "durable-startup-errors"
     root.mkdir(mode=0o700)
@@ -251,7 +251,7 @@ def durable_startup_error_new_case(tmp_path, monkeypatch):
 
 def _durable_startup_error_new_enable(monkeypatch, request):
     monkeypatch.setenv(
-        durable_startup_error.REQUEST_ENV,
+        durable_startup_error.STARTUP_REQUEST_ENV,
         json.dumps(request, sort_keys=True, separators=(",", ":")),
     )
 
@@ -269,7 +269,7 @@ def test_durable_startup_error_new_disabled_paths_are_exact_noops(
     vllm_logger,
 ):
     durable_startup_error._reset_inference_startup_error_for_tests()
-    monkeypatch.delenv(durable_startup_error.REQUEST_ENV, raising=False)
+    monkeypatch.delenv(durable_startup_error.STARTUP_REQUEST_ENV, raising=False)
     before = list(vllm_logger.handlers)
 
     assert (
@@ -288,7 +288,7 @@ def test_durable_startup_error_new_disabled_paths_are_exact_noops(
         is None
     )
     assert vllm_logger.handlers == before
-    assert durable_startup_error._ACTIVE is None
+    assert durable_startup_error.STARTUP_ACTIVE is None
 
 
 def test_durable_startup_error_new_records_full_nonoverwriting_tracebacks(
@@ -385,7 +385,7 @@ def test_durable_startup_error_new_rejects_unauthenticated_sources_and_roots(
     with pytest.raises((RuntimeError, ValueError)):
         durable_startup_error.maybe_install_inference_startup_error_producer()
 
-    assert durable_startup_error._ACTIVE is None
+    assert durable_startup_error.STARTUP_ACTIVE is None
     assert list(case.root.iterdir()) == []
 
 

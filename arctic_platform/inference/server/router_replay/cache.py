@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from arctic_platform.debug.router_replay_trace import maybe_record_router_replay_received
+from arctic_platform.debug.training import maybe_record_router_replay_received
 
 logger = logging.getLogger(__name__)
 

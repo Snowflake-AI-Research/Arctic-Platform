@@ -60,45 +60,45 @@ from typing import Sequence
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.debug.inference_startup_error import maybe_bind_inference_startup_error
-from arctic_platform.debug.inference_warmup_observer import maybe_bind_inference_warmup_observer
+from arctic_platform.correctness.harness import sft as gsm8k
+from arctic_platform.correctness.harness.cortex import CorrectnessClient
+from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import _inference_client_config
+from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
+from arctic_platform.correctness.harness.gateway import build_payload
+from arctic_platform.correctness.harness.gateway import forward_logprobs
+from arctic_platform.correctness.harness.gateway import fwd_bwd_step
+from arctic_platform.correctness.harness.gateway import gateway
+from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import log_probs
+from arctic_platform.correctness.harness.gateway import minimum_context_parallel_row_tokens
+from arctic_platform.correctness.harness.gateway import pack
+from arctic_platform.correctness.harness.gateway import pack_logit_aligned
+from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import running_job
+from arctic_platform.correctness.harness.gateway import sampling_payload
+from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
+from arctic_platform.correctness.harness.gateway import save_weights_only_checkpoint
+from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
+from arctic_platform.correctness.harness.sft import VALIDATION_SPLIT
+from arctic_platform.correctness.harness.sft import Batch
+from arctic_platform.correctness.harness.sft import _assert_answer_span
+from arctic_platform.correctness.harness.sft import configured_learning_rate
+from arctic_platform.correctness.harness.sft import configured_rows_per_step
+from arctic_platform.correctness.harness.sft import cross_entropy
+from arctic_platform.correctness.harness.sft import reference_answer_logprobs
+from arctic_platform.correctness.harness.storage import correctness_workdir
+from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.inference import maybe_bind_inference_startup_error
+from arctic_platform.debug.inference import maybe_bind_inference_warmup_observer
 
-from ..harness import sft as gsm8k
-from ..harness.batches import SEED
-from ..harness.batches import Batch
 from ..harness.config import correctness_microbatch_tokens
-from ..harness.cortex import CorrectnessClient
-from ..harness.cortex import CortexTrainingConfig
-from ..harness.dss_driver import UnsafeCleanupError
-from ..harness.dss_driver import _inference_client_config
-from ..harness.dss_driver import build_payload
-from ..harness.dss_driver import forward_logprobs
-from ..harness.dss_driver import fwd_bwd_step
-from ..harness.dss_driver import gateway
-from ..harness.dss_driver import log_probs
-from ..harness.dss_driver import minimum_context_parallel_row_tokens
-from ..harness.dss_driver import pack
-from ..harness.dss_driver import pack_logit_aligned
-from ..harness.dss_driver import running_job
-from ..harness.dss_driver import sampling_payload
-from ..harness.dss_driver import save_weights_only_checkpoint
-from ..harness.hosted import _local_checkpoint_metadata
-from ..harness.hosted import is_local_cortex_gateway
-from ..harness.hosted import require_local_cortex_gateway
-from ..harness.hosted import save_and_resolve_checkpoint_id
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
-from ..harness.sft import TRAIN_SPLIT
-from ..harness.sft import VALIDATION_SPLIT
-from ..harness.sft import _assert_answer_span
-from ..harness.sft import configured_learning_rate
-from ..harness.sft import configured_rows_per_step
-from ..harness.sft import cross_entropy
-from ..harness.sft import reference_answer_logprobs
-from ..harness.storage import correctness_workdir
-from ..harness.storage import require_data_fast_path
 
 TEST_ID = "inference-checkpoint-loss"
 
@@ -380,8 +380,8 @@ def _extend_short_causal_rows(batch: Batch, minimum_tokens: int, pad_id: int) ->
         return batch
     import torch
 
-    from ..harness.batches import IGNORE_INDEX
-    from ..harness.dss_driver import _attention_mask_from_position_ids
+    from arctic_platform.correctness.harness.gateway import _attention_mask_from_position_ids
+    from arctic_platform.correctness.harness.sft import IGNORE_INDEX
 
     lengths = _attention_mask_from_position_ids(batch.position_ids).sum(dim=1)
     if bool((lengths >= minimum_tokens).all()):
@@ -555,7 +555,7 @@ def materialize_checkpoint_processor_metadata(ctx, checkpoint_path: str | Path) 
     if source_path is None:
         return
 
-    from ..harness.inference_export import validate_initial_training_model_dir
+    from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
 
     source_path = validate_initial_training_model_dir(source_path)
     checkpoint_path = Path(checkpoint_path)
@@ -694,14 +694,14 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
     from transformers import AutoConfig
     from transformers.utils.hub import cached_file
 
-    from ..harness.inference_export import FAMILIES
-    from ..harness.inference_export import read_export_json
-    from ..harness.inference_export import read_inventory
-    from ..harness.inference_export import validate_glm53_full_config
-    from ..harness.inference_export import validate_glm53_full_schema
-    from ..harness.inference_export import validate_initial_training_model_dir
-    from ..harness.inference_export import validate_qwen4_local_export
-    from ..harness.inference_export import validate_text_projection
+    from arctic_platform.correctness.harness.inference import FAMILIES
+    from arctic_platform.correctness.harness.inference import read_export_json
+    from arctic_platform.correctness.harness.inference import read_inventory
+    from arctic_platform.correctness.harness.inference import validate_glm53_full_config
+    from arctic_platform.correctness.harness.inference import validate_glm53_full_schema
+    from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
+    from arctic_platform.correctness.harness.inference import validate_qwen4_local_export
+    from arctic_platform.correctness.harness.inference import validate_text_projection
 
     canonical = require_data_fast_path(weights_dir, label="local inference HF export")
     if weights_dir != canonical or weights_dir.is_symlink() or not weights_dir.is_dir():
@@ -840,7 +840,7 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
 
 
 def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenizer) -> Path:
-    from ..harness.inference_export import distribute_local_inference_export
+    from arctic_platform.correctness.harness.inference import distribute_local_inference_export
 
     require_local_cortex_gateway(backend)
     root = require_data_fast_path(correctness_workdir("cortex-inference-"), label="local inference save")
@@ -867,7 +867,7 @@ def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenize
 
 
 def local_cortex_sampling_config(ctx, backend: CortexConfig, weights_dir: Path, token_budget: int):
-    from ..harness.inference_export import require_local_inference_export_locality
+    from arctic_platform.correctness.harness.inference import require_local_inference_export_locality
 
     require_local_cortex_gateway(backend)
     weights_dir = validate_local_inference_export(ctx, weights_dir)
@@ -891,13 +891,13 @@ def _run(ctx) -> TestResult:
     managed = isinstance(backend, CortexConfig)
     local = managed and is_local_cortex_gateway(backend)
     if local:
-        from ..harness.inference_export import validate_local_inference_allocation
+        from arctic_platform.correctness.harness.inference import validate_local_inference_allocation
 
         require_local_cortex_gateway(backend)
         validate_local_inference_allocation(getattr(ctx, "inference_export_allocation", None))
     initial_model_dir = getattr(ctx, "inference_initial_model_dir", None)
     if initial_model_dir is not None:
-        from ..harness.inference_export import validate_initial_training_model_dir
+        from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
 
         if not local:
             raise ValueError("initial training model directory requires local Cortex inference")
@@ -907,7 +907,7 @@ def _run(ctx) -> TestResult:
     if initial_model_dir is not None:
         input_model_path = str(initial_model_dir)
     elif local and getattr(ctx, "local_gateway_full_model", False):
-        from ..harness.inference_export import validate_initial_training_model_dir
+        from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
 
         input_model_path = str(validate_initial_training_model_dir(getattr(ctx, "local_full_model_path", None)))
     gateway_slots = (

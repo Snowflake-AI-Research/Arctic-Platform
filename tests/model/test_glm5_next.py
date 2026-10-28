@@ -230,7 +230,7 @@ def _reviewed_auxiliary_fixture(tmp_path, inventory="absent"):
 
 
 def test_glm53_unauthorized_reduced_fixture_still_requires_original_auxiliary_weights(tmp_path, monkeypatch):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 
     model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
     config.debug.reduced_fixture_mtp = None
@@ -242,7 +242,7 @@ def test_glm53_unauthorized_reduced_fixture_still_requires_original_auxiliary_we
 def test_glm53_authenticated_reduced_fixture_loads_without_auxiliary_but_full_export_remains_strict(
     tmp_path, monkeypatch
 ):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
     from arctic_platform.model.implementations.glm53 import auxiliary_weights
 
     model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
@@ -255,7 +255,7 @@ def test_glm53_authenticated_reduced_fixture_loads_without_auxiliary_but_full_ex
 
 
 def test_glm53_authenticated_complete_auxiliary_inventory_is_preserved(tmp_path, monkeypatch):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
     from arctic_platform.model.implementations.glm53 import auxiliary_weights
 
     model, config, original = _reviewed_auxiliary_fixture(tmp_path, "complete")
@@ -271,7 +271,7 @@ def test_glm53_authenticated_complete_auxiliary_inventory_is_preserved(tmp_path,
 def test_glm53_authenticated_reduced_fixture_rejects_partial_or_unexpected_auxiliary_inventory(
     tmp_path, monkeypatch, inventory
 ):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 
     model, config, _ = _reviewed_auxiliary_fixture(tmp_path, inventory)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
@@ -281,7 +281,7 @@ def test_glm53_authenticated_reduced_fixture_rejects_partial_or_unexpected_auxil
 
 @pytest.mark.parametrize("change", ["bytes", "count", "family"])
 def test_glm53_reduced_fixture_rejects_changed_bytes_or_runtime_configuration(tmp_path, monkeypatch, change):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 
     model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
     if change == "bytes":
@@ -298,7 +298,7 @@ def test_glm53_reduced_fixture_rejects_changed_bytes_or_runtime_configuration(tm
 
 @pytest.mark.parametrize("peer", [["ValueError: peer bytes differ", False], [None, False]])
 def test_glm53_reduced_fixture_peer_failure_or_inventory_disagreement_reaches_every_rank(tmp_path, monkeypatch, peer):
-    from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+    from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 
     model, config, _ = _reviewed_auxiliary_fixture(tmp_path)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -566,6 +566,139 @@ def test_glm53_packed_hf_state_loads_strictly_into_native_model():
 
     for name, weight in native.state_dict().items():
         torch_assert_equal(weight, state[name])
+
+
+@pytest.mark.parametrize("target_format", ["prime", "hf"])
+def test_glm53_streaming_checkpoint_matches_whole_state_conversion(tmp_path, monkeypatch, target_format):
+    from safetensors.torch import save_file
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+
+    from arctic_platform.model.implementations.glm53 import modeling_glm5_next
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    set_seed(0)
+    model_class = modeling_glm5_next.Glm5NextForConditionalGenerationPrimeRL
+    original = dict(Glm5NextForConditionalGeneration(_tiny_config()).state_dict())
+    if target_format == "hf":
+        original = model_class.convert_to_prime(original)
+    expected = getattr(model_class, f"convert_to_{target_format}")(
+        {name: tensor.clone() for name, tensor in original.items()}
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    names = tuple(original)
+    for shard_index in range(2):
+        save_file(
+            {name: original[name].clone().contiguous() for name in names[shard_index::2]},
+            source / f"model-{shard_index}.safetensors",
+        )
+
+    observed_groups = []
+    convert = getattr(model_class, f"convert_to_{target_format}")
+
+    def observe_group(cls, state):
+        observed_groups.append(tuple(state))
+        return convert(state)
+
+    monkeypatch.setattr(model_class, f"convert_to_{target_format}", classmethod(observe_group))
+    destination = tmp_path / "converted"
+    getattr(model_class, f"convert_to_{target_format}_checkpoint")(source, destination)
+
+    converted = load_state_dict(destination)
+    assert converted.keys() == expected.keys()
+    for name, weight in expected.items():
+        torch_assert_equal(converted[name], weight)
+    assert len(observed_groups) > 4
+    for group in observed_groups:
+        layer_prefixes = {name.split(".", 4)[3] for name in group if name.startswith("model.language_model.layers.")}
+        assert len(layer_prefixes) <= 1
+        if not layer_prefixes:
+            assert len(group) == 1
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["weight_map"].keys() == expected.keys()
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_recognizes_packed_hf_checkpoint(suffix):
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    keys = dict.fromkeys([f"model.language_model.layers.3.mlp.experts.gate_up_proj{suffix}"])
+    assert Glm5NextForConditionalGenerationPrimeRL.is_hf_state_dict(keys)
+    assert not Glm5NextForConditionalGenerationPrimeRL.is_prime_state_dict(keys)
+
+
+@pytest.mark.parametrize("cache_scope", ["node-local", "shared"])
+@pytest.mark.parametrize("checkpoint_conversion", [False, True])
+def test_glm_dcp_forwards_optional_checkpoint_converter(monkeypatch, tmp_path, cache_scope, checkpoint_conversion):
+    from arctic_platform.model.implementations.glm52 import model_builder
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "converted"
+    cache_written = False
+    events = []
+
+    class FakePrimeModel:
+        config = types.SimpleNamespace(tie_word_embeddings=False)
+
+        def to_empty(self, *, device):
+            assert device == "cpu"
+
+        def state_dict(self):
+            return {}
+
+        def is_hf_state_dict(self, state):
+            return True
+
+        def is_prime_state_dict(self, state):
+            return True
+
+        def convert_to_prime(self, state):
+            return state
+
+    model = FakePrimeModel()
+    if checkpoint_conversion:
+        model.convert_to_prime_checkpoint = lambda source, destination: None
+    config = types.SimpleNamespace(
+        name=str(source), fsdp_cpu_offload=True, debug=types.SimpleNamespace(random_init=False)
+    )
+    monkeypatch.setattr(model_builder, "PreTrainedModelPrimeRL", FakePrimeModel)
+    monkeypatch.setattr(model_builder.torch.distributed, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(model_builder, "load_state_dict_keys", lambda path: [])
+    monkeypatch.setattr(model_builder, "resolve_conversion_cache_path", lambda *args: destination)
+    monkeypatch.setattr(model_builder, "conversion_cache_is_node_local", lambda path: cache_scope == "node-local")
+    monkeypatch.setattr(model_builder, "conversion_cache_ready", lambda path: cache_written)
+    monkeypatch.setattr(
+        model_builder, "get_world", lambda: types.SimpleNamespace(is_master=True, rank=0, local_rank=0)
+    )
+
+    def convert_cache(source_path, target_path, convert_fn, source_format, target_format, load_fn, save_fn, **kwargs):
+        nonlocal cache_written
+        assert source_path == source and target_path == destination
+        assert convert_fn == model.convert_to_prime
+        assert (source_format, target_format) == ("HF", "PrimeRL")
+        assert load_fn is model_builder.load_state_dict and save_fn is model_builder.save_state_dict
+        assert kwargs == {
+            "rank": 0,
+            "local_rank": 0,
+            "convert_checkpoint_fn": getattr(model, "convert_to_prime_checkpoint", None),
+        }
+        cache_written = True
+        events.append("conversion")
+
+    monkeypatch.setattr(model_builder, "ensure_node_local_conversion_cache", convert_cache)
+    monkeypatch.setattr(model_builder, "_write_conversion_cache", convert_cache)
+    monkeypatch.setattr(model_builder, "HuggingFaceStorageReader", lambda path: path)
+    monkeypatch.setattr(model_builder, "_init_buffers_post_meta", lambda model: None)
+    monkeypatch.setattr(model_builder, "_move_buffers_to_cuda", lambda model, config: None)
+
+    def load(state, *, storage_reader):
+        assert storage_reader == destination.as_posix() and cache_written
+        events.append("load")
+
+    monkeypatch.setattr(model_builder, "dcp_load", load)
+    model_builder.load_dcp_from_hf(model, config, parallel_dims=object())
+    assert events[events.index("conversion") + 1 : events.index("load")] == ["barrier"]
 
 
 @pytest.mark.parametrize("suffix", ["", ".weight"])
@@ -958,7 +1091,7 @@ def test_glm53_sparse_indices_are_padded_for_flashmla():
 
 
 def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
-    from arctic_platform.correctness.harness.participation import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
     from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL

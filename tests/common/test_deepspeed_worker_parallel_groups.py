@@ -55,6 +55,25 @@ def _spec(ep=8, sp=8):
     return SimpleNamespace(parallelism=SimpleNamespace(expert_parallel=ep, sequence_parallel=sp))
 
 
+@pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
+def test_worker_training_config_does_not_insert_accumulation_precision(runtime, job_config):
+    config = {}
+
+    result = runtime.worker.ds_training_config(job_config, config, {})
+
+    assert result is config
+    assert "data_types" not in result
+
+
+@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
+def test_worker_training_config_preserves_explicit_accumulation_precision(runtime, data_types):
+    config = {"data_types": deepcopy(data_types)}
+
+    result = runtime.worker.ds_training_config({}, config, {})
+
+    assert result["data_types"] == data_types
+
+
 def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):
     config = {"zero_optimization": {"stage": 2}}
     result = runtime.worker._setup_model_parallel_groups(_spec(), config, {"ep_group_layout": "packed"})

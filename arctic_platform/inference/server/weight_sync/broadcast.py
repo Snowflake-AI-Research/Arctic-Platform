@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_send_broadcast_weights
+from arctic_platform.debug.weight_sync import maybe_send_broadcast_weights
 from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
 
 
