@@ -19,6 +19,8 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup
 
+from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+
 from ..routing_weights import apply_routing_weights
 from .combine_replay import CombineReplay
 
@@ -89,16 +91,23 @@ def _get_buffer(group: ProcessGroup, num_tokens: int, hidden: int, num_topk: int
 class _Dispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, topk_idx, topk_weights, buffer, num_experts, handle: _Handle):
-        recv_x, _, recv_weights, value, _ = buffer.dispatch(
-            x,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_experts=num_experts,
-            expert_alignment=1,
-            num_sms=_num_sms,
-            do_expand=True,
-        )
-        handle.value = value
+        if handle.value is None:
+            recv_x, _, recv_weights, value, _ = buffer.dispatch(
+                x,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_experts=num_experts,
+                expert_alignment=1,
+                num_sms=_num_sms,
+                do_expand=True,
+            )
+            handle.value = value
+        else:
+            # A recompute: its forward's handle lays the rows out exactly as that forward received them.
+            value = handle.value
+            recv_x, _, recv_weights, _, _ = buffer.dispatch(
+                x, topk_weights=topk_weights, handle=value, num_sms=value.num_sms, do_expand=True
+            )
         ctx.buffer, ctx.handle, ctx.input_dtype, ctx.weight_dtype = buffer, value, x.dtype, topk_weights.dtype
         return recv_x, recv_weights.reshape(-1)
 
@@ -166,14 +175,28 @@ def dispatch_tokens_async(
     group: ProcessGroup,
     *,
     score_before_experts: bool = True,
+    replay: CombineReplay | None = None,
 ) -> _PendingDispatchState:
+    """``replay``, the layer's ``CombineReplay`` under full activation checkpointing, carries each dispatch handle of
+    a graph-building forward to its recompute. The unordered kernels deliver each expert's rows in arrival order, so
+    a recompute dispatched afresh could rebuild the saved activations in another order than the forward graph's
+    combine and its backward use; it reuses the forward's handle instead, which also skips the layout and CPU sync."""
     top_scores = top_scores.contiguous()
     topk_idx = selected_experts_indices.masked_fill(top_scores == 0, -1).to(deep_ep.topk_idx_t).contiguous()
     buffer = _get_buffer(group, hidden_states.shape[0], hidden_states.shape[1], topk_idx.shape[1])
     handle = _Handle()
+    if _in_recompute():
+        if replay is None:
+            raise RuntimeError(
+                "a DeepEP V2 dispatch is being recomputed without a CombineReplay to bring its forward's handle; "
+                "its rows would not line up with the forward graph"
+            )
+        handle.value = replay.take_dispatch()
     recv_x, recv_scores = _Dispatch.apply(
         hidden_states.contiguous(), topk_idx, top_scores.float(), buffer, num_experts, handle
     )
+    if replay is not None and not _in_recompute():
+        replay.keep_dispatch(handle.value)
     counts = handle.value.num_recv_tokens_per_expert_list
     num_rows = sum(counts)
     if recv_x.shape[0] != num_rows:
