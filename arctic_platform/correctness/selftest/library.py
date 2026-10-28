@@ -24,9 +24,11 @@ import base64
 import builtins
 import contextlib
 import copy
+import csv
 import errno
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import inspect
 import io
@@ -137,9 +139,7 @@ from arctic_platform.correctness.checks.fwd_bwd_step import _compare_arm
 from arctic_platform.correctness.checks.optimizer_state import COMPARISON_STATE_KEYS
 from arctic_platform.correctness.checks.optimizer_state import OPTIMIZER_NORM_CRITERION
 from arctic_platform.correctness.checks.optimizer_state import STATE_KEYS
-from arctic_platform.correctness.checks.optimizer_state import compare_optimizer_artifacts
 from arctic_platform.correctness.checks.optimizer_state import compare_optimizer_norms
-from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
 from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_norm_delta
 from arctic_platform.correctness.checks.optimizer_state import summarize_optimizer_artifacts
 from arctic_platform.correctness.diagnostics import __main__ as dispatch
@@ -207,14 +207,12 @@ from arctic_platform.correctness.harness.gateway import _labels_for_provider
 from arctic_platform.correctness.harness.gateway import _training_client_config
 from arctic_platform.correctness.harness.gateway import available_gpus
 from arctic_platform.correctness.harness.gateway import build_payload
-from arctic_platform.correctness.harness.gateway import copy_checkpoint_peft_adapter
 from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import pack_logit_aligned
 from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import rl_batch
 from arctic_platform.correctness.harness.gateway import rl_gpu_count
-from arctic_platform.correctness.harness.gateway import rl_sampling_payload
 from arctic_platform.correctness.harness.gateway import sampling_payload
 from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
 from arctic_platform.correctness.harness.inference import FAMILIES
@@ -14334,12 +14332,12 @@ def test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding(tm
     before_module = decoder._load(_cortex_optimizer_decode_model(pair.before))["module"]
     after_module = decoder._load(_cortex_optimizer_decode_model(pair.after))["module"]
     assert all((torch.equal(before_module[name], after_module[name]) for name in before_module))
-    comparison = compare_optimizer_artifacts(
-        manifest,
+    summary = summarize_optimizer_artifacts(
         manifest,
         optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
         learning_rate=_cortex_optimizer_decode_LR,
     )
+    comparison = compare_optimizer_norms(summary, summary)
     assert len(comparison.deltas) == 3 * len(pair.expected)
     assert all((item.delta_norm == 0 for item in comparison.deltas if item.state in ("exp_avg", "exp_avg_sq")))
     assert not comparison.only_dss and (not comparison.only_reference)
@@ -14367,9 +14365,8 @@ def test_cortex_optimizer_decode_decode_preserves_nonzero_actual_steps_without_r
     pair = _cortex_optimizer_decode_pair(tmp_path, before_step=10)
     manifest = decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
     assert json.loads(manifest.read_text())["step"] == 11
-    with pytest.raises(ValueError, match="expected=1"):
-        compare_optimizer_artifacts(
-            manifest,
+    with pytest.raises(ValueError, match="step 1"):
+        summarize_optimizer_artifacts(
             manifest,
             optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
             learning_rate=_cortex_optimizer_decode_LR,
@@ -15019,61 +15016,12 @@ def test_dss_driver_reference_allows_small_repo_report_with_data_fast_optimizer_
     assert not output.exists()
 
 
-def test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "global_step0" / "default"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == (
-        source / "adapter_model.safetensors"
-    ).read_bytes()
-
-
-def test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == (
-        source / "adapter_model.safetensors"
-    ).read_bytes()
-
-
-def test_dss_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy(tmp_path) -> None:
-    source = tmp_path / "checkpoint" / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    destination.mkdir()
-    (destination / "sentinel").write_text("preserve")
-    with pytest.raises(RuntimeError, match="no adapter tensors"):
-        copy_checkpoint_peft_adapter(source.parent, destination)
-    assert (destination / "sentinel").read_text() == "preserve"
-
-
 def test_dss_driver_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
     from arctic_platform.correctness.harness.gateway import save_weights_only_checkpoint
 
     client = SimpleNamespace(save_checkpoint=lambda **kwargs: {"hf_path": str(tmp_path), "path": str(tmp_path)})
     with pytest.raises(RuntimeError, match="no model config"):
         save_weights_only_checkpoint(None, SimpleNamespace(client=client), tmp_path)
-
-
-def test_dss_driver_copy_checkpoint_peft_adapter_rejects_a_full_model_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "global_step0" / "default"
-    source.mkdir(parents=True)
-    (source / "config.json").write_text("{}")
-    (source / "model.safetensors").write_bytes(b"full-model")
-    with pytest.raises(RuntimeError, match="no PEFT pack"):
-        copy_checkpoint_peft_adapter(checkpoint_root, tmp_path / "adapter")
 
 
 def test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None:
@@ -22481,6 +22429,294 @@ def test_lora_builder_rejects_drift_ignored_or_changed_factors_after_exactly_one
     with pytest.raises((ValueError, RuntimeError)):
         _observe(_lora_adapter_tensor_binding_admitted, mode=mode, model=model)
     assert LoRAModel.calls == 1
+
+
+# Selected LoRA receiver lifecycle. Synthetic callbacks test ownership, not native admission.
+
+
+class _SelectedLoRAEngine:
+    def __init__(self):
+        self.calls = 0
+        self.rows = [
+            ("layer.lora_A.weight", torch.ones(2, 3)),
+            ("layer.lora_B.weight", torch.ones(3, 2)),
+        ]
+
+    def receive_weights(self):
+        self.calls += 1
+        yield from self.rows
+
+
+class _SelectedLoRAObserver:
+    def __init__(self):
+        self.calls = 0
+        self.mutation = None
+
+    def observe(self, builder, **options):
+        self.calls += 1
+        evidence = {
+            "schema": "observed-lora-native-build-binding-v1",
+            "lora_int_id": options["lora_int_id"],
+            "original_received": {name: tensor_manifest(value) for name, value in options["tensors"].items()},
+            "received_bytes": sum(value.numel() * value.element_size() for value in options["tensors"].values()),
+            "all_received_adapter_factors_bound": True,
+            "built_factor_byte_correspondence_verified": True,
+            "matched_retained_model_parser_mapper_sources": True,
+            "native_builder_calls": 1,
+            "evidence_sources": options["admitted_sources"],
+        }
+        if self.mutation is not None:
+            key, value = self.mutation
+            evidence[key] = value
+        return ObservedLoRAOperation(builder(**options), evidence)
+
+
+class _SelectedLoRABase:
+    def _get_or_create_engine(self, *args, **kwargs):
+        self.engine_calls.append((args, kwargs))
+        return self.engine
+
+    def close_weight_sync(self):
+        self.closes += 1
+
+
+def _selected_lora_prepare(receiver):
+    if receiver.prepare_error is not None:
+        raise receiver.prepare_error
+    return dict(receiver.options)
+
+
+def _selected_lora_build(**options):
+    return SimpleNamespace(id=options["lora_int_id"])
+
+
+def _selected_lora_normalize(config, *, location):
+    assert location == "lora_config"
+    return deepcopy(config)
+
+
+def _selected_lora_parse(name, mapper):
+    return name, True
+
+
+def _selected_lora_remap(name, prefix):
+    return name
+
+
+def _selected_lora_prefix(model):
+    return "model"
+
+
+@pytest.fixture
+def _selected_lora_case(monkeypatch, tmp_path):
+    monkeypatch.setenv(VERIFY_ENV, "1")
+    source = tmp_path / "selected_callbacks.py"
+    source.write_text(
+        "class Manager:\n"
+        "    def __init__(self):\n"
+        "        self.adapters, self.calls = {}, []\n"
+        "    def add_adapter(self, adapter):\n"
+        "        self.calls.append('add')\n"
+        "        self.adapters[adapter.id] = adapter\n"
+        "        return True\n"
+        "    def activate_adapter(self, identity):\n"
+        "        self.calls.append('activate')\n"
+        "        return identity in self.adapters\n"
+        "    def _set_adapter(self, adapter):\n"
+        "        raise AssertionError('capture must not route slots')\n"
+        "    def get_adapter(self, identity):\n"
+        "        return self.adapters.get(identity)\n"
+        "    def remove_adapter(self, identity):\n"
+        "        self.calls.append('remove')\n"
+        "        self.adapters.pop(identity, None)\n"
+        "        return True\n"
+        "class Layer:\n"
+        "    def set_lora(self, *args):\n"
+        "        raise AssertionError('capture must not set adapter tensors')\n"
+        "    def forward(self, *args):\n"
+        "        raise AssertionError('capture must not execute forward')\n"
+        "class Model:\n"
+        "    def __init__(self):\n"
+        "        self.layer = Layer()\n"
+        "    def named_modules(self):\n"
+        "        yield '', self\n"
+        "        yield 'layers.0', self.layer\n"
+    )
+    spec = importlib.util.spec_from_file_location("_selected_lora_test_callbacks", source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    info = tmp_path / "selected_callbacks-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: selected-callbacks\nVersion: 1.0\n")
+    raw = source.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+    with (info / "RECORD").open("w", newline="") as stream:
+        csv.writer(stream).writerow([source.name, "sha256=" + digest, len(raw)])
+    distribution = importlib.metadata.PathDistribution(info)
+    manager, engine, observer = module.Manager(), _SelectedLoRAEngine(), _SelectedLoRAObserver()
+    model = module.Model()
+    output = tmp_path / "private-sources"
+    output.mkdir(mode=0o700)
+    output.chmod(0o700)
+    options = {
+        "distributions": (distribution,),
+        "output": output,
+        "max_source_bytes": 100_000,
+        "max_layers": 1,
+        "max_total_source_bytes": 100_000,
+        "observer": observer.observe,
+        "builder": _selected_lora_build,
+        "installer": installer,
+        "normalize_config": _selected_lora_normalize,
+        "native_model_class": module.Model,
+        "parse_name": _selected_lora_parse,
+        "remap_key": _selected_lora_remap,
+        "served_prefix_for_model": _selected_lora_prefix,
+    }
+    sources = source_files(
+        bindings.make_selected_receiver_extension,
+        bindings.owned_selected_received_lora,
+        _SelectedLoRAEngine,
+        _SelectedLoRAObserver,
+        _SelectedLoRABase,
+        _selected_lora_prepare,
+        _selected_lora_build,
+        _selected_lora_normalize,
+        _selected_lora_parse,
+        _selected_lora_remap,
+        _selected_lora_prefix,
+        installer,
+        module.Manager,
+        module.Model,
+    )
+    extension = bindings.make_selected_receiver_extension(
+        _SelectedLoRABase, prepare=_selected_lora_prepare, admitted_sources=sources
+    )
+    receiver = extension()
+    receiver.model_runner = SimpleNamespace(model=model, lora_manager=SimpleNamespace(_adapter_manager=manager))
+    receiver.model_config = SimpleNamespace(dtype=torch.float32, quantization=None)
+    receiver.engine, receiver.options = engine, options
+    receiver.closes, receiver.engine_calls, receiver.prepare_error = 0, [], None
+    request = {
+        "lora_int_id": 17,
+        "lora_name": "synthetic-owned",
+        "lora_config": {"r": 2},
+        "max_received_bytes": 48,
+        "admitted_sources": sources,
+    }
+    return SimpleNamespace(
+        receiver=receiver,
+        manager=manager,
+        engine=engine,
+        observer=observer,
+        source=source,
+        distribution=distribution,
+        output=output,
+        request=request,
+    )
+
+
+def _selected_lora_capture(case):
+    return bindings.capture_selected_lora_callbacks(
+        case.receiver,
+        distributions=(case.distribution,),
+        admitted_sources=case.request["admitted_sources"],
+        max_source_bytes=100_000,
+        max_layers=1,
+    )
+
+
+def _selected_lora_sync(case, **changes):
+    return case.receiver.sync_lora_weights("same-allocation-head", 12345, 1, 2, **{**case.request, **changes})
+
+
+def test_selected_lora_capture_and_private_publication_use_actual_distribution_record(_selected_lora_case):
+    case = _selected_lora_case
+    ticket = _selected_lora_capture(case)
+    assert case.manager.calls == []
+    assert ticket.evidence["callbacks_executed"] is ticket.evidence["runtime_admitted"] is False
+    pointer = bindings.publish_lora_callback_sources(ticket, output=case.output, max_total_source_bytes=100_000)
+    receipt = json.loads(Path(pointer["path"]).read_text())
+    assert hashlib.sha256(Path(pointer["path"]).read_bytes()).hexdigest() == pointer["sha256"]
+    assert receipt["selected_layer_names"] == ["layers.0"]
+    assert len(receipt["sources"]) == 1
+    snapshot = Path(receipt["sources"][0]["snapshot"]["path"])
+    assert snapshot.read_bytes() == case.source.read_bytes()
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in case.output.iterdir())
+    with pytest.raises(ValueError, match="earlier owner"):
+        bindings.publish_lora_callback_sources(ticket, output=case.output, max_total_source_bytes=100_000)
+
+
+@pytest.mark.parametrize("damage", ["record", "callback", "manager", "layer"])
+def test_selected_lora_capture_rejects_distribution_or_loaded_object_drift(_selected_lora_case, damage):
+    case = _selected_lora_case
+    ticket = _selected_lora_capture(case)
+    if damage == "record":
+        (case.distribution._path / "RECORD").write_text(f"{case.source.name},sha256={'A' * 43},1\n")
+    elif damage == "callback":
+        case.manager._set_adapter = lambda adapter: None
+    elif damage == "manager":
+        case.receiver.model_runner.lora_manager._adapter_manager = object()
+    else:
+        case.receiver.model_runner.model.layer = object()
+    with pytest.raises(ValueError):
+        ticket.guard()
+    assert case.manager.calls == []
+
+
+@pytest.mark.parametrize("damage", ["public", "occupied", "cap"])
+def test_selected_lora_publication_refuses_unsafe_output_before_writes(_selected_lora_case, damage):
+    case = _selected_lora_case
+    ticket = _selected_lora_capture(case)
+    cap = 100_000
+    if damage == "public":
+        case.output.chmod(0o755)
+    elif damage == "occupied":
+        (case.output / "foreign").write_text("preserve\n")
+    else:
+        cap = 1
+    before = {path.name: path.read_bytes() for path in case.output.iterdir()}
+    with pytest.raises(ValueError):
+        bindings.publish_lora_callback_sources(ticket, output=case.output, max_total_source_bytes=cap)
+    assert {path.name: path.read_bytes() for path in case.output.iterdir()} == before
+
+
+def test_selected_lora_rpc_retains_adapter_for_serving_and_closes_once(_selected_lora_case):
+    case = _selected_lora_case
+    assert _selected_lora_sync(case, engine_only=True)["status"] == "engine_ready"
+    assert case.engine.calls == case.observer.calls == 0
+    result = _selected_lora_sync(case)
+    assert result["selected_scope_retained_for_serving"] is True
+    assert result["runtime_admitted"] is result["capacity_admitted"] is result["adapter_storage_verified"] is False
+    assert result["numerical"] is None
+    assert case.manager.get_adapter(17) is not None and case.receiver.closes == 0
+    assert case.engine.calls == case.observer.calls == 1
+    case.receiver.close_weight_sync()
+    case.receiver.close_weight_sync()
+    assert case.manager.calls == ["add", "activate", "remove"]
+    assert case.receiver.closes == 1 and case.receiver._ap_owned_lora_installations == {}
+    with pytest.raises(ValueError, match="closed"):
+        _selected_lora_sync(case)
+
+
+@pytest.mark.parametrize("damage", ["prepare", "sources", "evidence", "wire"])
+def test_selected_lora_rpc_failure_closes_actual_transport_without_installing(_selected_lora_case, damage):
+    case = _selected_lora_case
+    changes = {}
+    if damage == "prepare":
+        case.receiver.prepare_error = RuntimeError("selected preparation failed")
+    elif damage == "sources":
+        changes["admitted_sources"] = {}
+    elif damage == "evidence":
+        case.observer.mutation = ("matched_retained_model_parser_mapper_sources", False)
+    else:
+        case.engine.rows.append(case.engine.rows[0])
+    with pytest.raises((ValueError, RuntimeError)):
+        _selected_lora_sync(case, **changes)
+    case.receiver.close_weight_sync()
+    assert case.manager.calls == [] and case.receiver.closes == 1
+    assert case.manager.get_adapter(17) is None
 
 
 # Lora receiver bindings.
@@ -37600,7 +37836,7 @@ def test_optimizer_norms_compare_uses_scalar_norm_difference_not_tensor_differen
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == pytest.approx(math.sqrt(52) - math.sqrt(5))
-    assert compare_optimizer_artifacts(dss, ref, **_optimizer_norms_KWARGS).worst_delta == 5.0
+    assert float(torch.linalg.vector_norm(torch.tensor([4.0, 6.0]) - torch.tensor([1.0, 2.0]))) == 5.0
 
 
 def test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetected(_optimizer_norms_artifact_root):
@@ -37615,7 +37851,7 @@ def test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetec
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == 0.0
-    assert compare_optimizer_artifacts(dss, ref, **_optimizer_norms_KWARGS).worst_delta == 10.0
+    assert float(torch.linalg.vector_norm(torch.tensor([-3.0, -4.0]) - torch.tensor([3.0, 4.0]))) == 10.0
 
 
 @pytest.mark.parametrize("value", [0.0, 1e-30, 0.25])
@@ -39389,7 +39625,7 @@ def _helper_storage_unsafe_destination(request, tmp_path):
     return alias / "output"
 
 
-@pytest.mark.parametrize("helper", ["gateway", "transport", "job", "weights", "adapter", "payload", "batch"])
+@pytest.mark.parametrize("helper", ["gateway", "transport", "job", "weights", "payload", "batch"])
 def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
     tmp_path, monkeypatch, _helper_storage_unsafe_destination, helper
 ):
@@ -39397,11 +39633,6 @@ def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
     def side_effect(*args, **kwargs):
         pytest.fail("unsafe destination reached a write or operational side effect")
 
-    checkpoint = tmp_path / "source"
-    source = checkpoint / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"weight": torch.ones(2)}, source / "adapter_model.safetensors")
     payload = {"training_config": {"n_gpus": 1}, "model_name": "read-only-model"}
     monkeypatch.setattr(Path, "mkdir", side_effect)
     monkeypatch.setattr(dss_driver.shutil, "rmtree", side_effect)
@@ -39425,8 +39656,6 @@ def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
             dss_driver.save_weights_only_checkpoint(
                 None, SimpleNamespace(client=client), _helper_storage_unsafe_destination
             )
-        elif helper == "adapter":
-            dss_driver.copy_checkpoint_peft_adapter(checkpoint, _helper_storage_unsafe_destination)
         elif helper == "payload":
             dss_driver.build_payload(
                 {"n_gpus": 1}, "read-only-model", 42, optimizer_state_output_dir=_helper_storage_unsafe_destination
@@ -39538,28 +39767,6 @@ def test_helper_storage_fast_batch_destination_is_canonical_and_read_inputs_rema
     outside_source.write_bytes((fast_root / "batch.pt").read_bytes())
     loaded = batches.load(outside_source)
     assert torch.equal(loaded.input_ids, batch.input_ids)
-
-
-def test_helper_storage_adapter_source_outside_fast_root_is_read_and_safe_destination_behavior_preserved(
-    tmp_path, monkeypatch
-):
-    fast_root = tmp_path / "fast"
-    fast_root.mkdir()
-    checkpoint = tmp_path / "read-only-source"
-    source = checkpoint / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"weight": torch.ones(2)}, source / "adapter_model.safetensors")
-    destination = fast_root / "unused" / ".." / "adapter"
-    existing = fast_root / "adapter"
-    existing.mkdir()
-    (existing / "stale").write_text("replace valid destination as before")
-    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", fast_root)
-    assert dss_driver.copy_checkpoint_peft_adapter(checkpoint, destination) == existing
-    assert not (existing / "stale").exists()
-    assert not (fast_root / "unused").exists()
-    assert (existing / "adapter_model.safetensors").read_bytes() == (source / "adapter_model.safetensors").read_bytes()
-    assert (source / "adapter_config.json").is_file()
 
 
 def test_helper_storage_remote_training_config_without_local_writes_allows_read_only_workdir():
@@ -44747,52 +44954,6 @@ def test_model_state_capture_hooks_are_inert_when_not_requested(_model_state_cap
     assert list(tmp_path.iterdir()) == []
 
 
-def _model_state_capture_write_pair(capture_module, tmp_path, changed_rank=None):
-    for rank in range(2):
-        engine = _model_state_capture_engine()
-        left = capture_module.model_state_manifest(engine, rank)
-        if rank == changed_rank:
-            engine.module.weight.data[0, 0] += 1
-        right = capture_module.model_state_manifest(engine, rank)
-        for phase, manifest in (("before-save", left), ("after-load", right)):
-            directory = tmp_path / phase
-            directory.mkdir(exist_ok=True)
-            (directory / f"rank-{rank:05d}.json").write_text(json.dumps(manifest))
-
-
-def test_model_state_capture_comparison_detects_frozen_rank_local_corruption(
-    _model_state_capture_capture_module, tmp_path
-):
-    _model_state_capture_write_pair(_model_state_capture_capture_module, tmp_path, changed_rank=1)
-    result = _model_state_capture_capture_module.compare_model_state(
-        tmp_path / "before-save", tmp_path / "after-load", ranks=2
-    )
-    assert result["exact"] is False
-    assert result["compared_tensors"] == 6
-    assert result["differences"] == [{"rank": 1, "kind": "parameter", "name": "weight", "fields": ["sha256"]}]
-
-
-def test_model_state_capture_comparison_rejects_incomplete_rank_coverage(
-    _model_state_capture_capture_module, tmp_path
-):
-    _model_state_capture_write_pair(_model_state_capture_capture_module, tmp_path)
-    (tmp_path / "after-load" / "rank-00001.json").unlink()
-    with pytest.raises(RuntimeError, match="rank coverage"):
-        _model_state_capture_capture_module.compare_model_state(
-            tmp_path / "before-save", tmp_path / "after-load", ranks=2
-        )
-
-
-def test_model_state_capture_comparison_reports_exact_model_state(_model_state_capture_capture_module, tmp_path):
-    _model_state_capture_write_pair(_model_state_capture_capture_module, tmp_path)
-    result = _model_state_capture_capture_module.compare_model_state(
-        tmp_path / "before-save", tmp_path / "after-load", ranks=2
-    )
-    assert result["exact"] is True
-    assert result["differences"] == []
-    assert result["compared_tensors"] == 6
-
-
 # Optimizer state check.
 
 _optimizer_state_check_COMPARE_KWARGS = {"optimizer_config": {}, "learning_rate": OPTIMIZER_LEARNING_RATE}
@@ -44826,7 +44987,14 @@ def _optimizer_state_check_states(value: torch.Tensor) -> dict[str, torch.Tensor
     }
 
 
-def test_optimizer_state_check_compare_optimizer_artifacts_aligns_qwen_moe_tensor_layouts(tmp_path):
+def _optimizer_state_check_compare(dss, reference):
+    return compare_optimizer_norms(
+        summarize_optimizer_artifacts(dss, backend="dss", **_optimizer_state_check_COMPARE_KWARGS),
+        summarize_optimizer_artifacts(reference, **_optimizer_state_check_COMPARE_KWARGS),
+    )
+
+
+def test_optimizer_state_check_norms_align_qwen_moe_tensor_layouts(tmp_path):
     w1 = torch.tensor([[[1.0, 2.0]]])
     w3 = torch.tensor([[[3.0, 4.0]]])
     w2 = torch.tensor([[[5.0], [6.0]]])
@@ -44852,14 +45020,14 @@ def test_optimizer_state_check_compare_optimizer_artifacts_aligns_qwen_moe_tenso
             "model.layers.0.mlp.shared_expert.gate_proj.weight": _optimizer_state_check_states(shared_gate),
         },
     )
-    result = compare_optimizer_artifacts(dss, reference, **_optimizer_state_check_COMPARE_KWARGS)
+    result = _optimizer_state_check_compare(dss, reference)
     assert result.only_dss == ["visual.unused.weight"]
     assert result.only_reference == []
     assert len(result.deltas) == 12
     assert result.worst_delta == 0.0
 
 
-def test_optimizer_state_check_compare_optimizer_artifacts_uses_full_tensor_residual_delta_norm(tmp_path):
+def test_optimizer_state_check_uses_scalar_residual_norm_difference(tmp_path):
     reference = _optimizer_state_check_write_artifact(
         tmp_path / "reference",
         "model.layer.weight",
@@ -44870,18 +45038,16 @@ def test_optimizer_state_check_compare_optimizer_artifacts_uses_full_tensor_resi
         "module.layer.weight",
         {"parameter_update": torch.tensor([4.0, 6.0]), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
-    result = compare_optimizer_artifacts(dss, reference, **_optimizer_state_check_COMPARE_KWARGS)
+    result = _optimizer_state_check_compare(dss, reference)
     assert result.only_dss == []
     assert result.only_reference == []
-    assert [(item.state, item.delta_norm) for item in result.deltas] == [
-        ("parameter_update_residual", 5.0),
-        ("exp_avg", 0.0),
-        ("exp_avg_sq", 0.0),
-    ]
-    assert result.worst_delta == 5.0
+    by_state = {item.state: item.delta_norm for item in result.deltas}
+    assert by_state["parameter_update_residual"] == pytest.approx(math.sqrt(52) - math.sqrt(5))
+    assert by_state["exp_avg"] == by_state["exp_avg_sq"] == 0.0
+    assert result.worst_delta == by_state["parameter_update_residual"]
 
 
-def test_optimizer_state_check_compare_optimizer_artifacts_rejects_shape_mismatch(tmp_path):
+def test_optimizer_state_check_norms_reject_shape_mismatch(tmp_path):
     reference = _optimizer_state_check_write_artifact(
         tmp_path / "reference",
         "layer.weight",
@@ -44893,7 +45059,7 @@ def test_optimizer_state_check_compare_optimizer_artifacts_rejects_shape_mismatc
         {"parameter_update": torch.zeros(3), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
     with pytest.raises(ValueError, match="shape mismatch"):
-        compare_optimizer_artifacts(dss, reference, **_optimizer_state_check_COMPARE_KWARGS)
+        _optimizer_state_check_compare(dss, reference)
 
 
 def test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_every_state(tmp_path):
@@ -44935,7 +45101,7 @@ def test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_ev
 
 def test_optimizer_state_check_pairwise_optimizer_variation_is_not_limited_to_the_first_run(tmp_path: Path) -> None:
     manifests = []
-    for index, value in enumerate((0.0, 1.0, -1.0)):
+    for index, value in enumerate((1.0, 0.0, 2.0)):
         manifests.append(
             _optimizer_state_check_write_artifact(
                 tmp_path / f"run-{index}",
@@ -44943,7 +45109,7 @@ def test_optimizer_state_check_pairwise_optimizer_variation_is_not_limited_to_th
                 {"parameter_update": torch.tensor([value]), "exp_avg": torch.zeros(1), "exp_avg_sq": torch.zeros(1)},
             )
         )
-    worst = max_pairwise_optimizer_delta(manifests, **_optimizer_state_check_COMPARE_KWARGS)
+    worst = max_pairwise_optimizer_norm_delta(manifests, **_optimizer_state_check_COMPARE_KWARGS)
     assert worst is not None
     assert (worst.name, worst.state, worst.delta_norm) == ("layer.weight", "parameter_update_residual", 2.0)
 
@@ -44984,10 +45150,10 @@ def test_optimizer_state_check_moment_implied_raw_update_difference_has_zero_res
         "layer.weight",
         _optimizer_state_check_first_step_adam_state(torch.tensor([-1e-06]), backend="dss"),
     )
-    result = compare_optimizer_artifacts(dss, reference, **_optimizer_state_check_COMPARE_KWARGS)
+    result = _optimizer_state_check_compare(dss, reference)
     by_state = {item.state: item.delta_norm for item in result.deltas}
     assert by_state["parameter_update_residual"] == pytest.approx(0.0, abs=1e-09)
-    assert by_state["exp_avg"] == pytest.approx(2e-07)
+    assert by_state["exp_avg"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_optimizer_state_check_unexplained_update_corruption_remains_in_residual(tmp_path: Path) -> None:
@@ -44996,7 +45162,7 @@ def test_optimizer_state_check_unexplained_update_corruption_remains_in_residual
     dss_states["parameter_update"] += 0.005
     reference = _optimizer_state_check_write_artifact(tmp_path / "reference-corrupt", "layer.weight", reference_states)
     dss = _optimizer_state_check_write_artifact(tmp_path / "dss-corrupt", "layer.weight", dss_states)
-    result = compare_optimizer_artifacts(dss, reference, **_optimizer_state_check_COMPARE_KWARGS)
+    result = _optimizer_state_check_compare(dss, reference)
     by_state = {item.state: item.delta_norm for item in result.deltas}
     assert by_state["parameter_update_residual"] == pytest.approx(0.005)
     assert by_state["exp_avg"] < 0.001
@@ -50212,7 +50378,8 @@ def test_driver_reviewed_inference_preserves_format_topology_and_independent_rep
     job_type,
 ):
     cfg = load_config(_driver_reviewed_rl_config)
-    payload = dss_driver.rl_sampling_payload(cfg, "/data-fast/models/reviewed")
+    payload = deepcopy(dss_driver.sub_job_of_type(cfg, "sampling"))
+    payload["model_name"] = "/data-fast/models/reviewed"
     payload["job_type"] = job_type
     if job_type == "log_prob":
         payload["inference_config"]["n_gpus"] = 8
@@ -50452,10 +50619,9 @@ def test_driver_reviewed_rl_rejects_unsupported_onprem_fields_before_transport(m
 def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monkeypatch, job_type):
     cfg = load_config(_driver_reviewed_rl_config)
     payload = (
-        deepcopy(cfg.sub_job)
-        if job_type == "training"
-        else dss_driver.rl_sampling_payload(cfg, "/data-fast/models/reviewed")
+        deepcopy(cfg.sub_job) if job_type == "training" else deepcopy(dss_driver.sub_job_of_type(cfg, "sampling"))
     )
+    payload["model_name"] = "/data-fast/models/reviewed"
     session = GatewaySession(Path("/data-fast/tmp/reviewed-prestart-control"), 32, OnPremConfig())
     monkeypatch.setattr(
         dss_driver,
@@ -53589,14 +53755,6 @@ def test_inference_checkpoint_loss_b200_uses_three_milliabsolute_gate() -> None:
     assert result.outcome is Outcome.PASS
     assert result.metrics["stated_criterion_abs"] == 0.003
     assert result.metrics["max_abs_diff"] == pytest.approx(0.001624)
-
-
-def test_inference_checkpoint_loss_forward_loss_reads_the_ap_response_contract() -> None:
-    from arctic_platform.correctness.harness.gateway import forward_loss
-
-    client = SimpleNamespace(fwd_no_grad=lambda body: {"avg_loss": [1.25]})
-    job = SimpleNamespace(client=client)
-    assert forward_loss(None, job, {"batch": {}}) == pytest.approx(1.25)
 
 
 def _inference_checkpoint_loss_generate_results():
@@ -58985,20 +59143,12 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
     assert os.environ[rl_weight_sync.VERIFY_ENV] == "test-original"
 
 
-def test_rl_checks_sampling_payload_keeps_the_config_and_swaps_only_the_model(tmp_path):
+def test_rl_checks_gpu_count_includes_both_sub_jobs(tmp_path):
     path = tmp_path / "job.config"
     path.write_text(
         json.dumps(_config_factory_native_config(_rl_config_TRAINING_CONFIG, sampling=_rl_config_SAMPLING_CONFIG))
     )
     cfg = load_config(path)
-    payload = rl_sampling_payload(cfg, "/models/reduced")
-    assert payload == {
-        "job_type": "sampling",
-        "model_name": "/models/reduced",
-        "dtype": "bfloat16",
-        "seed": 42,
-        "inference_config": {"n_gpus": 8, "max_seq_len": 4096, "vllm_config": {}},
-    }
     assert rl_gpu_count(cfg) == 16
 
 
@@ -59876,6 +60026,7 @@ def test_durable_startup_error_new_binding_rejects_invalid_identity_or_collision
 
 
 _SELFTEST_FIXTURES = (
+    "_selected_lora_case",
     "_isolated_gateway_ownership",
     "_external_operator_catalog",
     "_dense_checkpoint_onboarding_cli",
@@ -60554,11 +60705,7 @@ _SELFTEST_GROUPS = {
         "test_dss_driver_reference_runner_passes_the_harness_seed",
         "test_dss_driver_runner_requires_data_fast_before_operational_side_effects",
         "test_dss_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output",
-        "test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack",
-        "test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack",
-        "test_dss_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy",
         "test_dss_driver_full_model_weights_only_export_still_requires_model_config",
-        "test_dss_driver_copy_checkpoint_peft_adapter_rejects_a_full_model_pack",
         "test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness",
         "test_dss_driver_optimizer_capture_debug_config_defaults",
         "test_dss_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation",
@@ -61375,7 +61522,6 @@ _SELFTEST_GROUPS = {
         "test_helper_storage_direct_training_job_rejects_checkpoint_child_escape_before_allocation",
         "test_helper_storage_runner_rejects_derived_optimizer_symlink_before_mkdir_or_payload",
         "test_helper_storage_fast_batch_destination_is_canonical_and_read_inputs_remain_unrestricted",
-        "test_helper_storage_adapter_source_outside_fast_root_is_read_and_safe_destination_behavior_preserved",
         "test_helper_storage_remote_training_config_without_local_writes_allows_read_only_workdir",
         "test_helper_storage_weights_save_keeps_public_framing_and_does_not_restrict_returned_source",
         "test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_target_or_sizing",
@@ -61563,12 +61709,9 @@ _SELFTEST_GROUPS = {
         "test_model_state_capture_hash_cpu_transfers_are_bounded",
         "test_model_state_capture_save_load_hooks_capture_at_boundary_without_changing_results",
         "test_model_state_capture_hooks_are_inert_when_not_requested",
-        "test_model_state_capture_comparison_detects_frozen_rank_local_corruption",
-        "test_model_state_capture_comparison_rejects_incomplete_rank_coverage",
-        "test_model_state_capture_comparison_reports_exact_model_state",
-        "test_optimizer_state_check_compare_optimizer_artifacts_aligns_qwen_moe_tensor_layouts",
-        "test_optimizer_state_check_compare_optimizer_artifacts_uses_full_tensor_residual_delta_norm",
-        "test_optimizer_state_check_compare_optimizer_artifacts_rejects_shape_mismatch",
+        "test_optimizer_state_check_norms_align_qwen_moe_tensor_layouts",
+        "test_optimizer_state_check_uses_scalar_residual_norm_difference",
+        "test_optimizer_state_check_norms_reject_shape_mismatch",
         "test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_every_state",
         "test_optimizer_state_check_pairwise_optimizer_variation_is_not_limited_to_the_first_run",
         "test_optimizer_state_check_moment_implied_raw_update_difference_has_zero_residual",
@@ -61904,7 +62047,6 @@ _SELFTEST_GROUPS = {
         "test_inference_ple_padding_real_run_packs_training_and_validation_without_reselecting",
         "test_inference_checkpoint_loss_agreement_inside_the_gate_passes_and_outside_it_fails",
         "test_inference_checkpoint_loss_b200_uses_three_milliabsolute_gate",
-        "test_inference_checkpoint_loss_forward_loss_reads_the_ap_response_contract",
         "test_inference_checkpoint_loss_cortex_selects_expected_prompt_tokens_not_first_dictionary_entries",
         "test_inference_checkpoint_loss_cortex_rejects_wrong_generate_row_counts",
         "test_inference_checkpoint_loss_cortex_rejects_malformed_prompt_logprobs",
@@ -62074,7 +62216,7 @@ _SELFTEST_GROUPS = {
         "test_rl_checks_minimum_causal_tail_survives_packing_without_scoring_extra_tokens",
         "test_rl_checks_rl_batch_rejects_invalid_minimum_row_tokens",
         "test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones",
-        "test_rl_checks_sampling_payload_keeps_the_config_and_swaps_only_the_model",
+        "test_rl_checks_gpu_count_includes_both_sub_jobs",
         "test_inference_warmup_observer_new_disabled_paths_are_exact_noops",
         "test_inference_warmup_observer_new_sampling_payload_binds_descriptor_before_ray_import",
         "test_inference_warmup_observer_new_binding_rejects_malformed_or_conflicting_requests",

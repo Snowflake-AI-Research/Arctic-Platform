@@ -72,23 +72,6 @@ def _load_manifest(path: Path) -> Tuple[int, Dict[str, Path]]:
     return step, entries
 
 
-def _load_tensor_group(
-    entries: Dict[str, Path],
-    group: CanonicalTensorGroup,
-    device,
-) -> Dict[str, "torch.Tensor"]:
-    import torch
-
-    artifacts = [torch.load(entries[name], map_location="cpu", weights_only=True) for name in group.originals]
-    tensors = {}
-    for state in STATE_KEYS:
-        if any(state not in artifact for artifact in artifacts):
-            raise ValueError(f"optimizer artifact for {group.originals[0]} is missing {state}")
-        values = [artifact[state].to(device=device, dtype=torch.float32) for artifact in artifacts]
-        tensors[state] = values[0] if group.concatenate_dim is None else torch.cat(values, dim=group.concatenate_dim)
-    return tensors
-
-
 def _comparison_tensors(
     tensors: Dict[str, "torch.Tensor"], *, step: int, optimizer_config: dict, learning_rate: float, backend: str
 ) -> Dict[str, "torch.Tensor"]:
@@ -136,115 +119,6 @@ def _comparison_tensors(
         "exp_avg": exp_avg,
         "exp_avg_sq": exp_avg_sq,
     }
-
-
-def compare_optimizer_artifacts(
-    dss_manifest: Path, reference_manifest: Path, *, optimizer_config: dict, learning_rate: float
-) -> OptimizerComparison:
-    """Return moment deltas and the update delta left after each engine's own moments are accounted for."""
-    import torch
-
-    dss_step, dss = _load_manifest(Path(dss_manifest))
-    reference_step, reference = _load_manifest(Path(reference_manifest))
-    if dss_step != reference_step or dss_step != 1:
-        raise ValueError(
-            f"optimizer artifact step mismatch: Arctic Platform={dss_step}, reference={reference_step}, expected=1"
-        )
-
-    dss_groups = canonical_dss_tensor_groups(dss)
-    only_dss_keys = set(dss_groups) - set(reference)
-    shared = sorted(set(dss_groups) & set(reference))
-    deltas = []
-    comparison_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    for name in shared:
-        dss_tensors = _load_tensor_group(dss, dss_groups[name], comparison_device)
-        reference_tensors = torch.load(reference[name], map_location="cpu", weights_only=True)
-        reference_values = {}
-        for state in STATE_KEYS:
-            if state not in reference_tensors:
-                raise ValueError(f"optimizer artifact for {name} is missing {state}")
-            reference_values[state] = reference_tensors[state].to(device=comparison_device, dtype=torch.float32)
-            if dss_tensors[state].shape != reference_values[state].shape:
-                raise ValueError(
-                    f"optimizer artifact shape mismatch for {name}::{state}: "
-                    f"{tuple(dss_tensors[state].shape)} != {tuple(reference_values[state].shape)}"
-                )
-        dss_values = _comparison_tensors(
-            dss_tensors,
-            step=dss_step,
-            optimizer_config=optimizer_config,
-            learning_rate=learning_rate,
-            backend="dss",
-        )
-        reference_values = _comparison_tensors(
-            reference_values,
-            step=reference_step,
-            optimizer_config=optimizer_config,
-            learning_rate=learning_rate,
-            backend="reference",
-        )
-        for state in COMPARISON_STATE_KEYS:
-            delta_norm = torch.linalg.vector_norm(dss_values[state] - reference_values[state])
-            deltas.append(StateDelta(name=name, state=state, delta_norm=float(delta_norm.cpu())))
-        del dss_tensors, dss_values, reference_tensors, reference_values
-    return OptimizerComparison(
-        deltas=deltas,
-        only_dss=sorted(original for key in only_dss_keys for original in dss_groups[key].originals),
-        only_reference=sorted(set(reference) - set(dss_groups)),
-    )
-
-
-def max_pairwise_optimizer_delta(
-    manifests: List[Path], *, optimizer_config: dict, learning_rate: float, progress=None
-) -> StateDelta | None:
-    """Return the largest comparison-tensor delta among every pair of reference artifacts."""
-    import torch
-
-    loaded = [_load_manifest(Path(manifest)) for manifest in manifests]
-    if not loaded:
-        return None
-    if any(step != 1 for step, _ in loaded):
-        raise ValueError("optimizer calibration artifacts must all describe step 1")
-    names = set(loaded[0][1])
-    if any(set(entries) != names for _, entries in loaded[1:]):
-        raise ValueError("optimizer calibration runs returned different parameter sets")
-    comparison_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    worst = None
-    for name in sorted(names):
-        paths = [entries[name] for _, entries in loaded]
-        artifacts = []
-        expected_shapes = {}
-        for artifact_path in paths:
-            tensors = torch.load(artifact_path, map_location="cpu", weights_only=True)
-            for state in STATE_KEYS:
-                if state not in tensors:
-                    raise ValueError(f"optimizer artifact for {name} is missing {state}")
-                if state not in expected_shapes:
-                    expected_shapes[state] = tensors[state].shape
-                elif tensors[state].shape != expected_shapes[state]:
-                    raise ValueError(f"optimizer calibration shape mismatch for {name}::{state}")
-            artifacts.append(
-                _comparison_tensors(
-                    {state: tensors[state].to(device=comparison_device, dtype=torch.float32) for state in STATE_KEYS},
-                    step=1,
-                    optimizer_config=optimizer_config,
-                    learning_rate=learning_rate,
-                    backend="reference",
-                )
-            )
-
-        for state in COMPARISON_STATE_KEYS:
-            values = [artifact[state] for artifact in artifacts]
-            for left_index, left in enumerate(values[:-1]):
-                for right in values[left_index + 1 :]:
-                    delta = float(torch.linalg.vector_norm(left - right).cpu())
-                    if worst is None or delta > worst.delta_norm:
-                        worst = StateDelta(name=name, state=state, delta_norm=delta)
-            del values
-        del artifacts
-        if progress is not None:
-            progress.update()
-    return worst
 
 
 def _load_norm_group(entries: Dict[str, Path], group: CanonicalTensorGroup) -> Dict[str, "torch.Tensor"]:

@@ -30,7 +30,6 @@ import os
 import re
 import select
 import shlex
-import shutil
 import signal
 import socket
 import stat
@@ -1342,32 +1341,6 @@ def training_body(job: ArcticJob, body: dict) -> dict:
     return body
 
 
-def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
-    """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
-    destination = require_data_fast_path(destination, label="PEFT adapter output")
-    from safetensors import safe_open
-
-    candidates = [
-        checkpoint_root / "hf",
-        checkpoint_root / "default",
-        *sorted(checkpoint_root.glob("global_step*/default"), reverse=True),
-    ]
-    source = next(
-        (path for path in candidates if (path / "adapter_model.safetensors").is_file()),
-        None,
-    )
-    if source is None or not (source / "adapter_config.json").is_file():
-        raise RuntimeError(f"initial adapter checkpoint produced no PEFT pack under {checkpoint_root}")
-    if not json.loads((source / "adapter_config.json").read_text()).get("peft_type"):
-        raise RuntimeError(f"initial adapter checkpoint produced no PEFT type under {source}")
-    with safe_open(source / "adapter_model.safetensors", framework="pt") as adapter:
-        if not adapter.keys():
-            raise RuntimeError(f"initial adapter checkpoint produced no adapter tensors under {source}")
-    shutil.rmtree(destination, ignore_errors=True)
-    shutil.copytree(source, destination)
-    return destination
-
-
 def save_weights_only_checkpoint(session: GatewaySession, job: ArcticJob, path: str | Path) -> str:
     path = require_data_fast_path(path, label="weights checkpoint output")
     saved = job.client.save_checkpoint(path=str(path), export_hf=True)
@@ -1623,16 +1596,6 @@ def log_probs(
     return list(results)
 
 
-def forward_loss(session: GatewaySession, job: ArcticJob, body: dict) -> float:
-    """Return the loss from Arctic Platform's forward-only response."""
-    response = job.client.fwd_no_grad(training_body(job, body))
-    metrics = response.get("metrics") or {}
-    loss = response.get("avg_loss", metrics.get("loss"))
-    if loss is None:
-        raise RuntimeError(f"forward response carries no loss: {sorted(response)}")
-    return _scalar(loss)
-
-
 def forward_logprobs(session: GatewaySession, job: ArcticJob, body: dict):
     import torch
 
@@ -1703,13 +1666,6 @@ def sub_job_of_type(cfg, job_type: str) -> dict:
     if len(matches) != 1:
         raise ValueError(f"{cfg.config_id}: expected one {job_type} sub-job, found {len(matches)}")
     return matches[0]
-
-
-def rl_sampling_payload(cfg, model_path: str) -> dict:
-    """The config's sampling sub-job as written, serving the explicitly selected model."""
-    payload = copy.deepcopy(sub_job_of_type(cfg, "sampling"))
-    payload["model_name"] = str(model_path)
-    return payload
 
 
 def rl_gpu_count(cfg) -> int:

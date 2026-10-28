@@ -372,44 +372,6 @@ class ModelStateCaptureMixin:
         return restored_step
 
 
-def compare_model_state(left: Path, right: Path, *, ranks: int) -> dict:
-    expected = {f"rank-{rank:05d}.json" for rank in range(ranks)}
-    for directory in (left, right):
-        if {path.name for path in directory.glob("rank-*.json")} != expected:
-            raise RuntimeError(f"incomplete model-state rank coverage in {directory}")
-    differences = []
-    compared_tensors = 0
-    engines = []
-    for rank in range(ranks):
-        filename = f"rank-{rank:05d}.json"
-        before, after = (json.loads((directory / filename).read_text()) for directory in (left, right))
-        if before["rank"] != rank or after["rank"] != rank:
-            raise RuntimeError(f"model-state rank mismatch in {filename}")
-        engines.append({"rank": rank, "before": before["engine"], "after": after["engine"]})
-        for field in ("engine", "deepspeed_version"):
-            if before.get(field) != after.get(field):
-                differences.append({"rank": rank, "kind": "metadata", "name": field, "fields": [field]})
-        before_entries, after_entries = (
-            {(entry["kind"], entry["name"]): entry for entry in manifest["tensors"]} for manifest in (before, after)
-        )
-        for kind, name in sorted(before_entries.keys() | after_entries.keys()):
-            first, second = before_entries.get((kind, name)), after_entries.get((kind, name))
-            compared_tensors += 1
-            if first is None or second is None:
-                fields = ["missing"]
-            else:
-                fields = sorted(key for key in first.keys() | second.keys() if first.get(key) != second.get(key))
-            if fields:
-                differences.append({"rank": rank, "kind": kind, "name": name, "fields": fields})
-    return {
-        "exact": not differences,
-        "ranks": ranks,
-        "compared_tensors": compared_tensors,
-        "engines": engines,
-        "differences": differences,
-    }
-
-
 _OPTIMIZER_CAPTURE_WORKER: Any | None = None
 
 

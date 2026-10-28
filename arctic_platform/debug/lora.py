@@ -44,8 +44,6 @@ from types import MethodType
 from typing import Any
 from uuid import uuid4
 
-from arctic_platform.debug import lora as legacy
-from arctic_platform.debug import lora as selected
 from arctic_platform.debug import weight_sync
 from arctic_platform.debug.weight_sync import VERIFY_ENV
 from arctic_platform.debug.weight_sync import SamplerEvidenceWorker
@@ -4878,7 +4876,7 @@ def maybe_lora_sync_result(server, result, received, sent):
 
 
 def _pointer():
-    path, digest = os.environ.get(selected.PATH_ENV), os.environ.get(selected.SHA_ENV)
+    path, digest = os.environ.get(PATH_ENV), os.environ.get(SHA_ENV)
     if path is None and digest is None:
         return None
     _receiver_require(
@@ -4899,11 +4897,11 @@ def _pointer():
 
 def maybe_lora_replica_pool(pool_class):
     """Preserve the existing route unless an exact selected bootstrap is staged."""
-    reader, maker = legacy.selected_lora_request, selected.make_selected_lora_replica_pool
+    reader, maker = selected_lora_request, make_selected_lora_replica_pool
     request = reader()
     pointer = _pointer()
     if pointer is None:
-        return legacy.maybe_legacy_lora_replica_pool(pool_class)
+        return maybe_legacy_lora_replica_pool(pool_class)
     _receiver_require(request is not None, "selected bootstrap requires its staged LoRA request")
     origins = deepcopy(request["sampling"]["admitted_sources"])
     callbacks = (maybe_lora_replica_pool, _pointer, reader, maker)
@@ -4911,8 +4909,8 @@ def maybe_lora_replica_pool(pool_class):
     original = deepcopy(request)
     result = maker(pool_class, deepcopy(request["sampling"]), dict(pointer))
     _receiver_require(
-        legacy.selected_lora_request is reader
-        and selected.make_selected_lora_replica_pool is maker
+        selected_lora_request is reader
+        and make_selected_lora_replica_pool is maker
         and reader() == original
         and _pointer() == pointer,
         "selected LoRA request or bootstrap pointer changed during pool selection",

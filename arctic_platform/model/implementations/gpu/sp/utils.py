@@ -176,35 +176,6 @@ def prepare_token_partition(
     return local_batch, packed, mask, cu, partition
 
 
-def assemble_token_tensor(values: list[torch.Tensor], partitions: list[TokenPartition]) -> torch.Tensor:
-    """Concatenate exactly one ``[1, local_tokens, ...]`` result per SP member."""
-    if not partitions or len(values) != len(partitions):
-        raise ValueError("SP assembly needs one tensor and slice per member")
-    first = partitions[0]
-    expected = set(first.ranks)
-    if len(partitions) != len(expected) or {part.rank for part in partitions} != expected:
-        raise ValueError("SP assembly has missing or duplicate ranks")
-    pairs = sorted(zip(partitions, values), key=lambda pair: pair[0].local_rank)
-    exemplar = pairs[0][1]
-    for index, (part, value) in enumerate(pairs):
-        if (
-            part.ranks != first.ranks
-            or part.world_size != first.world_size
-            or part.row_shape != first.row_shape
-            or part.token_count != first.token_count
-            or part.local_rank != index
-            or part.rank != first.ranks[index]
-            or not torch.is_tensor(value)
-            or value.ndim < 2
-            or value.shape[:2] != (1, part.width)
-            or value.shape[2:] != exemplar.shape[2:]
-            or value.dtype != exemplar.dtype
-            or value.device != exemplar.device
-        ):
-            raise ValueError("SP assembly has inconsistent slices or tensor domains")
-    return torch.cat([value for _, value in pairs], dim=1)
-
-
 def restore_token_rows(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Restore gathered ``[1, valid_tokens, ...]`` to original padded rows."""
     if value.ndim < 2 or value.shape[:2] != (1, int(mask.sum().item())):

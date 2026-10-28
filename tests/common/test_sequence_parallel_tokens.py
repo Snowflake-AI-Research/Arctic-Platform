@@ -19,7 +19,6 @@
 
 import math
 from copy import deepcopy
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -206,44 +205,20 @@ def test_token_partition_rejects_false_rank_or_membership_binding(fault):
         sp.prepare_token_partition(_batch(), sp_info=info)
 
 
-def _partitions():
-    return [sp.prepare_token_partition(_batch(), sp_info=_info(rank=rank))[-1] for rank in (0, 2)]
-
-
-def test_token_assembly_uses_actual_group_order_and_restores_padding_with_gradient():
-    parts = _partitions()
-    values = [
-        torch.tensor([[[4.0], [5.0], [6.0], [7.0]]], requires_grad=True),
-        torch.tensor([[[0.0], [1.0], [2.0], [3.0]]], requires_grad=True),
-    ]
-    assembled = sp.assemble_token_tensor(values, parts)
-    torch_assert_equal(assembled, torch.arange(8.0).reshape(1, 8, 1))
+def test_restore_token_rows_restores_padding_with_gradient():
+    assembled = torch.arange(8.0).reshape(1, 8, 1).requires_grad_()
     _, _, mask, _, _ = sp.prepare_token_partition(_batch(), sp_info=_info())
     restored = sp.restore_token_rows(assembled, mask)
     torch_assert_equal(restored[:, :, 0], torch.tensor([[0.0, 1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 6.0, 7.0]]))
     restored.sum().backward()
-    for value in values:
-        torch_assert_equal(value.grad, torch.ones_like(value))
+    torch_assert_equal(assembled.grad, torch.ones_like(assembled))
 
 
-@pytest.mark.parametrize("fault", ["missing", "duplicate", "slice", "length", "dtype", "tail"])
-def test_token_assembly_rejects_partial_or_inconsistent_rank_tensor_domain(fault):
-    parts = _partitions()
-    values = [torch.ones(1, 4), torch.ones(1, 4)]
-    if fault == "missing":
-        parts, values = parts[:1], values[:1]
-    elif fault == "duplicate":
-        parts[1] = parts[0]
-    elif fault == "slice":
-        parts[1] = replace(parts[1], token_count=10)
-    elif fault == "length":
-        values[1] = torch.ones(1, 3)
-    elif fault == "dtype":
-        values[1] = values[1].double()
-    else:
-        values[1] = torch.ones(1, 4, 2)
+@pytest.mark.parametrize("shape", [(8,), (2, 4), (1, 7), (1, 9)])
+def test_restore_token_rows_rejects_incomplete_logical_rows(shape):
+    _, _, mask, _, _ = sp.prepare_token_partition(_batch(), sp_info=_info())
     with pytest.raises(ValueError):
-        sp.assemble_token_tensor(values, parts)
+        sp.restore_token_rows(torch.ones(shape), mask)
 
 
 class _Engine:
