@@ -195,19 +195,24 @@ def initialize_training_engine(
 
 
 def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) -> str:
-    """Map a caller optimizer name onto the implementation DeepSpeed will run."""
-    resolved = name.strip().lower().replace("-", "_")
-    if resolved in {"", "adam", "adamw"}:
-        if _optimizer_cpu_offload_enabled(ds_config):
-            return "deepspeed_cpu_adam" if fused else "torch_cpu_adamw"
-        return "fused_adam"
-    if resolved not in _OPTIMIZER_ALIASES:
+    """Resolve defaults by offload policy, while preserving explicit optimizer choices."""
+    normalized_name = name.strip().lower().replace("-", "_")
+    cpu_offload = _optimizer_cpu_offload_enabled(ds_config)
+
+    if normalized_name in {"", "adam", "adamw"}:
+        if not cpu_offload:
+            return "fused_adam"
+        if fused:
+            return "deepspeed_cpu_adam"
+        return "torch_cpu_adamw"
+
+    optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
+    if optimizer_name is None:
         supported = ", ".join(sorted(set(_OPTIMIZER_ALIASES.values())))
         raise ValueError(f"Unsupported optimizer {name!r}; supported values: {supported}")
-    selected = _OPTIMIZER_ALIASES[resolved]
-    if selected == "torch_adamw" and _optimizer_cpu_offload_enabled(ds_config):
+    if optimizer_name == "torch_adamw" and cpu_offload:
         return "torch_cpu_adamw"
-    return selected
+    return optimizer_name
 
 
 def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:

@@ -188,6 +188,44 @@ def test_nonfused_generic_offload_names_select_standard_cpu_arithmetic():
     assert resolve_optimizer_name("cpu_adam", _OFFLOAD, fused=False) == "deepspeed_cpu_adam"
 
 
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("name", ["", " ", "adam", " AdamW "])
+def test_default_optimizer_resolution_preserves_offload_and_fused_policy(name, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if not cpu_offload:
+        expected = "fused_adam"
+    elif fused:
+        expected = "deepspeed_cpu_adam"
+    else:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("fusedadam", "fused_adam"),
+        (" Fused-Adam ", "fused_adam"),
+        ("torch_adamw", "torch_adamw"),
+        (" Torch-AdamW ", "torch_adamw"),
+        ("deepspeed_cpu_adam", "deepspeed_cpu_adam"),
+        ("deepspeedcpuadam", "deepspeed_cpu_adam"),
+        ("cpu_adam", "deepspeed_cpu_adam"),
+        ("cpuadam", "deepspeed_cpu_adam"),
+        ("deep_speed_cpu_adam", "deepspeed_cpu_adam"),
+        (" Deep-Speed-CPU-Adam ", "deepspeed_cpu_adam"),
+    ],
+)
+def test_explicit_optimizer_aliases_preserve_selection_and_cpu_placement(name, expected, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if expected == "torch_adamw" and cpu_offload:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
+
+
 def test_unknown_optimizer_names_are_rejected():
     with pytest.raises(ValueError, match="Unsupported optimizer"):
         resolve_optimizer_name("sgd", _ZERO2)
@@ -415,10 +453,11 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 def test_initialize_glm_cpu_offload_honors_nonfused_policy(monkeypatch, force_cpu_optimizer):
     calls = {}
 
-    class _CPUAdam:
+    class _CPUAdam(torch.optim.Optimizer):
         def __init__(self, param_groups, **kwargs):
-            self.param_groups = param_groups
+            super().__init__(param_groups, {})
             self.adam_w_mode = kwargs["adamw_mode"]
+            self.fp32_optimizer_states = kwargs["fp32_optimizer_states"]
             self.ds_opt_adam = object()
 
     def _initialize(*, model, config, **kwargs):
@@ -595,6 +634,62 @@ def test_nonfused_cpu_adam_native_counter_and_checkpoint_resume(parameter_dtype,
             for key, value in zip(("exp_avg", "exp_avg_sq"), expected_moments):
                 assert restored[key].dtype == state_dtype
                 torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
+
+
+def test_cpu_adam_checkpoint_hooks_preserve_mixed_groups_without_aliasing_saved_moments():
+    from copy import deepcopy
+
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameters = [
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.float32)),
+    ]
+    optimizer = torch.optim.AdamW([{"params": [parameter]} for parameter in parameters])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    for parameter in parameters:
+        optimizer.state[parameter] = {
+            "step": torch.tensor(2.0),
+            "exp_avg": torch.tensor([0.123456, 0.234567, 0.345678]),
+            "exp_avg_sq": torch.tensor([0.012345, 0.023456, 0.034567]),
+        }
+    checkpoint = deepcopy(optimizer.state_dict())
+    for _ in range(2):
+        optimizer.load_state_dict(checkpoint)
+        assert checkpoint_state.moments == []
+        for index, parameter in enumerate(parameters):
+            for name in ("exp_avg", "exp_avg_sq"):
+                assert optimizer.state[parameter][name].dtype == torch.float32
+                torch.testing.assert_close(
+                    optimizer.state[parameter][name], checkpoint["state"][index][name], rtol=0, atol=0
+                )
+        saved_moment = checkpoint["state"][0]["exp_avg"].clone()
+        optimizer.state[parameters[0]]["exp_avg"].add_(1)
+        torch.testing.assert_close(checkpoint["state"][0]["exp_avg"], saved_moment, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid_groups", [None, [], [{"params": []}]])
+def test_cpu_adam_checkpoint_hooks_keep_empty_state_and_native_group_validation(invalid_groups):
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameter = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    optimizer = torch.optim.AdamW([parameter])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    checkpoint = optimizer.state_dict()
+    if invalid_groups is None:
+        optimizer.load_state_dict(checkpoint)
+    else:
+        checkpoint["param_groups"] = invalid_groups
+        with pytest.raises(ValueError, match="parameter group"):
+            optimizer.load_state_dict(checkpoint)
+    assert not optimizer.state
+    assert checkpoint_state.moments == []
 
 
 class _ZeroInitializationFixture:

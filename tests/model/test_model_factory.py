@@ -259,11 +259,14 @@ class TestHuggingFaceLoader:
 
     @pytest.mark.parametrize(("loader_options", "fp32_beta"), [({}, True), ({"fp32_parity": False}, False)])
     def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch, loader_options, fp32_beta):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
         from arctic_platform.model import ParallelismConfig
         from arctic_platform.model.loaders.huggingface import load_huggingface
 
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        model.loss_function = ForCausalLMLoss
         configured = []
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
         monkeypatch.setattr(

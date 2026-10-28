@@ -22,6 +22,7 @@ from collections import namedtuple
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -903,11 +904,9 @@ def _native_inventory_dtensor(torch, placement, *, meta=False):
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
     from torch.distributed.tensor._dtensor_spec import TensorMeta
 
-    # Actual Torch wrapper/spec with synthetic membership, not a process group.
-    mesh = object.__new__(DeviceMesh)
-    mesh.device_type = "cpu"
-    mesh.mesh = torch.tensor([4, 9], dtype=torch.int64)
-    mesh.mesh_dim_names = ("ep",)
+    # Construct real mesh metadata without creating a process group.
+    with patch("torch.distributed.device_mesh.get_rank", return_value=4):
+        mesh = DeviceMesh("cpu", [4, 9], mesh_dim_names=("ep",), _init_backend=False)
     local = torch.empty((2, 3), device="meta" if meta else "cpu")
     spec = DTensorSpec(mesh, (placement,), tensor_meta=TensorMeta(torch.Size((4, 3)), (3, 1), torch.float32))
     return DTensor(local, spec, requires_grad=False)
@@ -933,14 +932,19 @@ def test_native_model_inventory_dtensor_preserves_global_local_and_actual_mesh_w
     for name in ("full_tensor", "redistribute", "to_local"):
         monkeypatch.setattr(DTensor, name, forbidden)
     monkeypatch.setattr(torch.Tensor, "data_ptr", forbidden)
-    observed = memory.observe_native_model_inventory(model)
+    retained = []
+    observed = memory.observe_native_model_inventory(model, retained_objects=retained)
     row = observed["buffers"][0]["tensor"]
     assert row["shape"] == [4, 3] and row["stride"] == [3, 1] and row["logical_bytes"] == 48
     assert row["storage"] is None
     actual = row["dtensor"]
+    # Newer Torch exposes mesh membership through a fresh view on every access.
+    members = next(value for value in retained if f"tensor:{id(value):x}" == actual["mesh"]["members_object_id"])
+    assert type(members) is torch.Tensor
+    assert members.untyped_storage()._cdata == tensor.device_mesh.mesh.untyped_storage()._cdata
     assert actual["mesh"] == {
         "object_id": f"mesh:{id(tensor.device_mesh):x}",
-        "members_object_id": f"tensor:{id(tensor.device_mesh.mesh):x}",
+        "members_object_id": f"tensor:{id(members):x}",
         "device_type": "cpu",
         "shape": [2],
         "members": [4, 9],
@@ -1154,7 +1158,9 @@ def test_native_inventory_checkpoint_destinations_dtensor_detached_local_joins_a
     assert registered["object_id"] != destination["object_id"]
     assert registered["shape"] == destination["shape"] == [4, 3]
     assert registered["dtensor"]["local"]["storage"] == destination["dtensor"]["local"]["storage"]
-    assert registered["dtensor"]["mesh"] == destination["dtensor"]["mesh"]
+    # Membership views can differ; the shared mesh identity and contents cannot.
+    for field in ("object_id", "device_type", "shape", "members", "dim_names"):
+        assert registered["dtensor"]["mesh"][field] == destination["dtensor"]["mesh"][field]
     assert len(observed["storages"]) == 1 and observed["storages"][0]["nbytes"] == 24
 
 
