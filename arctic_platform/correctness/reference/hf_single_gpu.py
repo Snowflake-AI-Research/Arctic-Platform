@@ -224,7 +224,15 @@ def build_engine(
             cls, model_path, dtype=torch_dtype, attn_implementation=attn_implementation, device=device
         )
     else:
+        deepseek_v4 = getattr(cfg, "model_type", None) == "deepseek_v4"
+        if deepseek_v4:
+            from arctic_platform.correctness.reference.deepseek_v4_reference import install_kv_fake_quant
+            from arctic_platform.correctness.reference.deepseek_v4_reference import patch_rms_norm
+
+            patch_rms_norm()
         model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
+        if deepseek_v4:
+            install_kv_fake_quant(model)
     if peft_adapter_path:
         from peft import PeftModel
 

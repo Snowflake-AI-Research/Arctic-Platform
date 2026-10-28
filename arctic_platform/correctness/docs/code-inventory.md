@@ -17,7 +17,8 @@
 | `harness/participation.py` | Versioned parameter participation and complete gradient coverage. |
 | `harness/reference_records.py`, `harness/storage.py`, `harness/report.py`, `harness/names.py` | Compact record identity, fast scratch containment, reports, and parameter-name alignment. |
 | `reference/` | Independent single-GPU reference, one-step AdamW, model features, process determinism, and Qwen4 loading. |
-| `onboarding/` | Explicit sizing, calibration, fixture publication, and reference preparation. |
+| `gateway/` | `single-step-grads` for an unmodified catalog create-job body on a local cortex-training gateway: HF reference, target through the `cortex_training` client, LoRA adapter export from the resumable checkpoint, and multi-tree summaries. |
+| `onboarding/` | Explicit sizing, calibration, fixture publication, and reference preparation. `fp8_fixture.py` cuts a block-FP8 checkpoint to a reduced fixture's tensors for FP8 targets. |
 | `selftest/` | Synthetic CPU coverage for the retained checks and shared interfaces. No bundled real recipe dependencies. |
 | `diagnostics/` | `lm_head_chunking` and its stdlib dispatcher; altered-workload diagnostic only. |
 

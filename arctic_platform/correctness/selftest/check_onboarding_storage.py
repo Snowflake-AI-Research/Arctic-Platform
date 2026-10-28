@@ -1535,6 +1535,40 @@ def test_onboarding_reduce_config_still_rejects_partial_selected_block(monkeypat
     assert len(text.layer_types) == 45
 
 
+def _aperiodic_text() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_hidden_layers=43,
+        layer_types=["sliding", "sliding"] + ["csa", "hca"] * 20 + ["sliding"],
+        mlp_layer_types=["hash"] * 3 + ["moe"] * 40,
+    )
+
+
+def test_onboarding_reduce_config_accepts_aperiodic_prefix_covering_every_type(monkeypatch) -> None:
+    text = _aperiodic_text()
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: text)
+
+    _, original, period = synth_model.reduce_config("unused", 4)
+
+    assert (original, period) == (43, 42)
+    assert text.layer_types == ["sliding", "sliding", "csa", "hca"]
+    assert text.mlp_layer_types == ["hash", "hash", "hash", "moe"]
+
+
+@pytest.mark.parametrize(("layers", "name"), [(3, "layer_types"), (2, "layer_types")])
+def test_onboarding_reduce_config_rejects_aperiodic_prefix_missing_a_type(monkeypatch, layers, name) -> None:
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: _aperiodic_text())
+    with pytest.raises(ValueError, match=f"drops {name} entries"):
+        synth_model.reduce_config("unused", layers)
+
+
+def test_onboarding_reduce_config_rejects_aperiodic_prefix_missing_an_mlp_type(monkeypatch) -> None:
+    text = _aperiodic_text()
+    text.mlp_layer_types = ["hash"] * 4 + ["moe"] * 39
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: text)
+    with pytest.raises(ValueError, match="drops mlp_layer_types entries"):
+        synth_model.reduce_config("unused", 4)
+
+
 def test_onboarding_model_shape_accepts_source_ending_mid_block(monkeypatch) -> None:
     config = SimpleNamespace(
         text_config=SimpleNamespace(
