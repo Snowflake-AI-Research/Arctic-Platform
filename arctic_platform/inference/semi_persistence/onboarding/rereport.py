@@ -19,7 +19,8 @@
         [log_files_on=POD_LOG_DIR] [log_files_off=POD_LOG_DIR] [out_dir=DIR]
 
 Re-parses the logs the run saved (``<report>-logs/``) plus any GPU pod logs
-given, re-scores the perf checks from the saved measurements, then rewrites
+given, re-scores the perf checks from the saved measurements against the
+model file's current thresholds and re-applies the guided JSON rule, then rewrites
 the Markdown and JSON in place (or into ``out_dir``). No jobs are needed, so
 it works after the jobs are gone. With several reports,
 ``log_files_on`` may hold one subdirectory per semi_p job named by the first
@@ -34,6 +35,8 @@ import sys
 from pathlib import Path
 
 from arctic_platform.inference.semi_persistence.onboarding import book
+from arctic_platform.inference.semi_persistence.onboarding import correctness
+from arctic_platform.inference.semi_persistence.onboarding import jobs
 from arctic_platform.inference.semi_persistence.onboarding import perf
 from arctic_platform.inference.semi_persistence.onboarding import report
 from arctic_platform.inference.semi_persistence.onboarding import startup
@@ -66,6 +69,14 @@ def _pod_logs(paths: list[str], job_id: str | None) -> dict[str, list[str]]:
     return startup.read_files(chosen)
 
 
+def _current_thresholds(result: dict, pf: dict) -> dict:
+    """The model file's thresholds over today's defaults; the saved ones if the file is gone."""
+    try:
+        return jobs.load_model(result["model"].get("file") or result["model"]["name"]).thresholds
+    except (OSError, KeyError, ValueError):
+        return pf.get("thresholds") or {}
+
+
 def rebuild(path: Path, on_paths: list[str], off_paths: list[str], out_dir: str | None) -> Path:
     result = json.loads(path.read_text(encoding="utf-8"))
     result.pop("verdict", None)
@@ -85,7 +96,12 @@ def rebuild(path: Path, on_paths: list[str], off_paths: list[str], out_dir: str 
     pf = result.get("perf") or {}
     if pf.get("rows") and pf.get("latency"):
         replicas = int(result["model"].get("replicas", 1)) * int(result["model"].get("copies", 1))
-        pf.update(perf.score(pf["rows"], pf["latency"], replicas, pf.get("thresholds") or {}))
+        pf.update(perf.score(pf["rows"], pf["latency"], replicas, _current_thresholds(result, pf)))
+    for check in result.get("correctness") or []:
+        if check["name"] == "guided JSON" and check.get("required"):
+            check["passed"] = all(r["passed"] for r in check["variants"].values() if r["gated"])
+            correctness.apply_guided_parse_rule(
+                check, (check.get("reference_detail") or "").startswith("reference parses"))
     md = report.write(result, out_dir or str(path.parent))
     logger.info("%s: %s (%d semi_p pod log(s))", md, report.verdict(result)[0], len(on_pods))
     return md
