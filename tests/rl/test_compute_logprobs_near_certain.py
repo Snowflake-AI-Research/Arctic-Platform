@@ -13,13 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The unchunked compute_logprobs path keeps a near-certain label's log-probability and gradient.
-
-torch.log_softmax folds the argmax's own exp(0) = 1 into its normalizer, so once the label leads the other logits by
-more than ~16.6 nats in float32 its log-probability rounds to exactly 0 and its logit gradient to 0 while the others keep
-theirs (https://jonbarron.info/softmaxfix/). Writing the normalizer as softplus(logsumexp(others)) fixes that but turns
-the gradient into NaN when every other logit is -inf (arXiv:2610.36427); log1p of the others' sum avoids both.
-"""
+"""The unchunked compute_logprobs path keeps a near-certain label's log-probability and gradient."""
 
 import pytest
 import torch
@@ -38,8 +32,8 @@ def _logprobs(logits, labels):
     return out.detach(), logits.grad
 
 
-@pytest.mark.parametrize("margin", [4.0, 10.0, 14.0, 17.0, 20.0])
-def test_near_certain_label_matches_float64_log_softmax(margin):
+@pytest.mark.parametrize("margin", [4.0, 10.0, 14.0, 17.0, 20.0, 25.0, 40.0])
+def test_near_certain_label_matches_float64_reference(margin):
     """Value and gradient match float64 at every margin, for a near-certain label and for one beside it."""
     set_seed(0)
     logits = torch.randn(1, 2, VOCAB_SIZE)
@@ -53,8 +47,11 @@ def test_near_certain_label_matches_float64_log_softmax(margin):
     actual, grad = _logprobs(logits, labels)
 
     reference = logits.double().requires_grad_(True)
-    expected = torch.log_softmax(reference, -1).gather(-1, labels[..., None]).squeeze(-1)
+    selected = reference.gather(-1, labels[..., None]).squeeze(-1)
+    other_logits = reference.scatter(-1, labels[..., None], float("-inf"))
+    expected = -torch.nn.functional.softplus(other_logits.logsumexp(-1) - selected)
     expected.sum().backward()
+    # Relative tolerance preserves the tiny nonzero signal; an absolute tolerance would accept collapse.
     torch_assert_close(actual.double(), expected.detach(), rtol=1e-5, atol=0.0)
     torch_assert_close(grad.double(), reference.grad, rtol=1e-5, atol=1e-30)
 
