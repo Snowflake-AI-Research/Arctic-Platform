@@ -23,6 +23,7 @@ import os
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from typing import Any
 from typing import Literal
 from weakref import WeakKeyDictionary
@@ -384,7 +385,10 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
                     portable[export_name] = handle.get_tensor(name)
             if not portable:
                 raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
-            save_file(portable, weights_path, metadata=metadata)
+            with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+                temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
+                save_file(portable, temporary_path, metadata=metadata)
+                os.replace(temporary_path, weights_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:

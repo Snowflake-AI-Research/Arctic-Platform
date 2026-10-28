@@ -337,6 +337,34 @@ def test_peft_checkpoint_roundtrip_preserves_trained_tensors(tmp_path, wrapped, 
         assert torch.equal(actual[name], tensor), name
 
 
+def test_peft_normalization_failure_preserves_the_saved_adapter(tmp_path, monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+    weights_path = tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors"
+    original_bytes = []
+
+    def failed_save(tensors, filename, **kwargs):
+        original_bytes.append(weights_path.read_bytes())
+        assert Path(filename) != weights_path
+        Path(filename).write_bytes(b"incomplete normalization")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr("safetensors.torch.save_file", failed_save)
+    with pytest.raises(OSError, match="injected write failure"):
+        save_peft_adapters(model, str(tmp_path))
+
+    assert weights_path.read_bytes() == original_bytes[0]
+    saved = load_file(weights_path)
+    assert len(saved) == 2
+    assert all("_checkpoint_wrapped_module" in name for name in saved)
+    assert list(weights_path.parent.glob(".adapter-*")) == []
+
+
 def test_iter_lora_weights_rejects_non_lora_trainables():
     model = _Model(
         [
