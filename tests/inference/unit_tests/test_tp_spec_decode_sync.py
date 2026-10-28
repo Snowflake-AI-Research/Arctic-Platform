@@ -74,7 +74,8 @@ def _runner_class(sampled, num_sampled, num_rejected, draft):
     return Runner
 
 
-def test_rank0_drafts_and_samples_win(tp):
+def test_rank0_drafts_and_samples_win(tp, monkeypatch):
+    monkeypatch.setattr(sync, "STATS_ENABLED", True)
     sampled = torch.tensor([[5, 6, 0], [7, 0, 0]])
     draft = torch.tensor([[11, 12], [13, 14]])
     tp.rank0 = {
@@ -93,6 +94,26 @@ def test_rank0_drafts_and_samples_win(tp):
     stats = runner._arctic_tp_sync_stats
     assert stats.steps == {"draft": 1, "sample": 1}
     assert {k: int(v) for k, v in stats.corrected.items()} == {"draft": 1, "sample": 1}
+
+
+def test_default_path_is_only_the_broadcasts(tp, monkeypatch):
+    monkeypatch.setattr(sync, "STATS_ENABLED", False)
+    tp.rank0 = {(1, 2): torch.tensor([[3, 4]]), (1,): torch.tensor([2])}
+    draft = torch.tensor([[3, 9]])
+    runner = _runner_class(torch.tensor([[3, 4]]), torch.tensor([1]), torch.tensor([0]), draft)()
+
+    runner.speculator.propose()
+    out, num_sampled, _ = runner.sample(None, None, None)
+
+    assert draft.tolist() == [[3, 4]] and num_sampled.tolist() == [2]
+    assert not hasattr(runner, "_arctic_tp_sync_stats")
+
+
+def test_non_tensor_drafts_pass_through(tp):
+    runner = _runner_class(torch.tensor([[1]]), torch.tensor([1]), torch.tensor([0]), None)()
+
+    assert runner.speculator.propose() is None
+    assert tp.calls == []
 
 
 def test_no_sync_without_speculation_or_with_batch_sharded_sampling(tp):
