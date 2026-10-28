@@ -202,9 +202,10 @@ def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) ->
     if normalized_name in {"", "adam", "adamw"}:
         if not cpu_offload:
             return "fused_adam"
-        if fused:
+        elif fused:
             return "deepspeed_cpu_adam"
-        return "torch_cpu_adamw"
+        else:
+            return "torch_cpu_adamw"
 
     optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
     if optimizer_name is None:

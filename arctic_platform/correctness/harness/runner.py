@@ -128,7 +128,7 @@ class RunContext:
                 self.cfg,
                 attn_implementation=self.attn_implementation,
                 **({"model_name": self.target_model_name} if self.target_model_name is not None else {}),
-                **({"preserve_native_topology": True} if getattr(self.cfg, "is_rl", False) else {}),
+                **({"preserve_native_topology": True} if self.cfg.is_rl else {}),
                 spec=self.spec,
                 published_fixture=self.published_fixture,
             )

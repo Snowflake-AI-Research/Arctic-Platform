@@ -103,8 +103,11 @@ def _comparison_tensors(
     """
     import torch
 
-    beta1, beta2 = (float(value) for value in optimizer_config.get("betas", [0.9, 0.999]))
-    epsilon = float(optimizer_config.get("eps", 1e-8))
+    from arctic_platform.common.optimizer import OptimizerSettings
+
+    settings = OptimizerSettings.model_validate(optimizer_config)
+    beta1, beta2 = settings.betas
+    epsilon = settings.eps
     learning_rate = float(learning_rate)
     if backend == "dss":
         beta1 = float(torch.tensor(beta1, dtype=torch.float32))

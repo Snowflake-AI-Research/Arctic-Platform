@@ -229,9 +229,12 @@ class ModelSpec(BaseModel):
                 "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
             )
 
-        parallelism = ParallelismConfig(
-            expert_parallel=cfg.get("ep_size", 1),
-            sequence_parallel=cfg.get("sp_size", 1),
+        parallelism = ParallelismConfig.model_validate(
+            {
+                field: cfg[key]
+                for key, field in (("ep_size", "expert_parallel"), ("sp_size", "sequence_parallel"))
+                if key in cfg
+            }
         )
         if parallelism.expert_parallel > 1:
             from arctic_platform.model.moe_spec import moe_model_spec

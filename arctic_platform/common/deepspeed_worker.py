@@ -300,7 +300,7 @@ class DeepSpeedWorker:
             ep_size,
             world_size=self.world_size,
             gpus_per_node=gpus_per_node,
-            ep_group_layout=worker_config.get("ep_group_layout", "auto"),
+            **({"ep_group_layout": worker_config["ep_group_layout"]} if "ep_group_layout" in worker_config else {}),
         )
         self.mpu, self.sp_group, _, self.sp_rank = groups
         self.ep_group = expert_parallel_group(ep_size) if ep_size > 1 else None
@@ -521,7 +521,7 @@ class DeepSpeedWorker:
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
         sp_info = None
-        if getattr(self, "sp_size", 1) > 1:
+        if self.sp_size > 1:
             from arctic_platform.common.utils.sequence_parallel import validate_sequence_parallel_grpo
             from arctic_platform.common.utils.sequence_parallel import verify_sequence_parallel_reduction
 

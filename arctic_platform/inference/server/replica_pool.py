@@ -266,7 +266,7 @@ class ReplicaPool:
         if self._config is not None and self._config.ray_num_gpus is not None:
             return self._config.ray_num_gpus
         if (
-            not bool(getattr(self._config, "semi_p", False))
+            (self._config is None or not self._config.semi_p)
             and self._engine_kwargs().get("distributed_executor_backend") == "ray"
         ):
             # vLLM's Ray workers reserve their own GPUs; reserving them on the

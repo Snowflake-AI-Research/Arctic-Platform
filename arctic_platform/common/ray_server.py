@@ -977,7 +977,7 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        sp_size = self.jobs[job_id].get("sp_size", 1)
+        sp_size = self.jobs[job_id]["sp_size"]
         shards, reorder_indices, worker_sp_info = self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=True
         )
@@ -1055,7 +1055,7 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        sp_size = info.get("sp_size", 1)
+        sp_size = info["sp_size"]
         shards, reorder_indices, worker_sp_info = self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=False
         )
@@ -1647,7 +1647,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info["sp_size"])
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

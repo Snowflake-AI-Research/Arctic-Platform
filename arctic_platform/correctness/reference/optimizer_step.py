@@ -24,6 +24,7 @@ from typing import Dict
 
 import torch
 
+from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 NO_DECAY_NAMES = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
@@ -53,7 +54,8 @@ def master_dtype(optimizer_dtype: str):
 
 def assert_adamw_semantics(optimizer_config: dict) -> None:
     """Refuse a config whose optimizer is not one whose step this module reproduces."""
-    optimizer_name = str(optimizer_config.get("name", "AdamW")).strip().lower().replace("-", "_")
+    settings = OptimizerSettings.model_validate(optimizer_config)
+    optimizer_name = settings.name.strip().lower().replace("-", "_")
     if optimizer_name not in ADAMW_NAMES:
         raise ValueError(f"optimizer-state correctness supports AdamW semantics, got {optimizer_name!r}")
 
@@ -68,18 +70,18 @@ def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
 
     decay = [master for name, master in named_masters if _uses_weight_decay(name)]
     no_decay = [master for name, master in named_masters if not _uses_weight_decay(name)]
-    weight_decay = float(optimizer_config.get("weight_decay", 0.0))
+    settings = OptimizerSettings.model_validate(optimizer_config)
+    weight_decay = settings.weight_decay
     groups = []
     if decay:
         groups.append({"params": decay, "weight_decay": weight_decay})
     if no_decay:
         groups.append({"params": no_decay, "weight_decay": 0.0})
 
-    betas = optimizer_config.get("betas", [0.9, 0.999])
     kwargs = {
         "lr": float(learning_rate),
-        "betas": (float(betas[0]), float(betas[1])),
-        "eps": float(optimizer_config.get("eps", 1e-8)),
+        "betas": tuple(settings.betas),
+        "eps": settings.eps,
     }
     return torch.optim.AdamW(groups, foreach=False, fused=False, **kwargs)
 
