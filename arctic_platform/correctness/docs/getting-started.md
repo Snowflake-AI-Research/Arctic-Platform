@@ -111,7 +111,9 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **Gradient calibration uses eight nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
 
-**Optimizer calibration shows a `tqdm` progress bar for each GAS arm, with elapsed time and ETA after every completed HF run.** Onboarding finishes with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, retained in `onboarding.log` as well as the terminal.
+**Calibration reports completed HF workers, unfinished run IDs and elapsed time for each wave.** A run counts as complete only after its worker finishes successfully. While workers are unfinished, the console prints a waiting update every 30 seconds; it does not estimate a sequential ETA for parallel work.
+
+**Each check has three phases: sizing, tolerance calibration and target validation.** Each phase announces its start and ends with elapsed time, including on failure. Onboarding reports elapsed time per attempted test and then total wall-clock time in `HH:MM:SS` format, retained in `onboarding.log` as well as the terminal. Test times include work and owned cleanup during this invocation; checking reused phases still takes time, and shared preparation is reported separately.
 
 **Each optimizer arm uses one deterministic baseline plus eight calibration repeats.** Each repeat starts an independent HF process, loads the fixture and saves optimizer state, so startup and capture time can dominate a tiny model. Both arms require eighteen processes in total; calibration repeats overlap according to the local worker count. Compatible completed preparation is reused after a failed validation; regression uses prepared records without recalibrating. Existing records retain their original run counts and reviewed gates.
 
@@ -148,7 +150,9 @@ Read `./work/reports/output1/report.md`, `report.json`, and `full.log`. Every ru
 
 **Ctrl-C, SIGTERM and SIGHUP stop the automatically owned gateway during startup or execution.** The command reports shutdown, waits for its owned process, and restores the previous signal handlers; repeated stop signals do not interrupt that bounded cleanup. This applies to onboarding and regression, not an explicitly configured external service.
 
-**Both commands recover a stale harness-owned gateway before starting a replacement; onboarding also checks before HF calibration.** A local ownership record binds the gateway to its launch token, process start time and owning command. If that command was killed, startup stops the surviving gateway and waits for it to exit. Older, unrecorded gateways are recovered only when their exact launch, orphaned parent and retained onboarding or regression log identify them as harness-owned. An active command, unproven ownership or forced-shutdown failure stops the new command instead of killing an unrelated service. SIGKILL (`kill -9`), node failure and forced container termination cannot be trapped at the time they occur; detached Ray worker cleanup still requires separate verification.
+**Both commands recover a stale harness-owned gateway before starting a replacement; onboarding also checks before HF calibration.** A local ownership record binds the gateway to its launch token, process start time and owning command. If that command was killed, startup stops the surviving gateway and waits for it to exit. Older, unrecorded gateways are recovered only when their exact launch, orphaned parent and retained onboarding or regression log identify them as harness-owned. An active command, unproven ownership or forced-shutdown failure stops the new command instead of killing an unrelated service.
+
+**An independent cleanup process watches the owning command's lifetime pipe.** If the command exits unexpectedly, including through SIGKILL (`kill -9`), the cleanup process verifies ownership before stopping the gateway and its token-bound local descendants. Node loss can also terminate the cleanup process; complete distributed worker teardown remains a separate verification, and failed cleanup blocks subsequent workloads.
 
 **Check the resolved config file, model source and configured sequence length printed before model work.** For this demo, the source must be the tiny Qwen3 snapshot and the configured sequence length must be 128 tokens. An old gateway cannot change those HF reference settings. A log naming an old 8B configuration is not this tiny demo.
 
@@ -211,8 +215,6 @@ python -m arctic_platform.correctness run \
 ## Validation And Limits
 
 CPU selftests cover the extracted interfaces, training-only boundaries, external configurations, reference publication, optimizer decoding, shared LoRA adapter generation/loading/transport, and synthetic backend behavior. These are library tests, not new model or distributed-GPU results.
-
-The first assembled CPU run passed 1,601 tests and failed 33. Focused reruns passed all 33 corrected cases; nine added controls also passed. This is retained coverage plus focused reruns, not a clean full-suite rerun after the final fixes. Those fixes include fresh on-premises reference publication before validation and detection of changed model bytes when filesystem timestamps do not change.
 
 The `correctness` extra includes `pytest` and `pytest-instafail`, so the installation above also supports the selftest command:
 
