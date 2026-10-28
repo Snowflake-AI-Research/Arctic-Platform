@@ -25711,6 +25711,9 @@ def synthetic_native(monkeypatch):
         collective.get_process_group_ranks,
         collective.expert_group,
     )
+    # Synthetic controls exercise the current exporter, not the frozen production recipe.
+    exporter_path = str(Path(inspect.getsourcefile(lora_training_native.iter_lora_weights)).resolve())
+    monkeypatch.setattr(_lora_weight_sync_evidence_evidence, "_EXPORT_SHA", pins[exporter_path])
     return model, collective, pins
 
 
