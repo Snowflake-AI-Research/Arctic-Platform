@@ -190,15 +190,26 @@ def initialize_training_engine(
     return engine, built, choice
 
 
-def resolve_optimizer_name(name: str, ds_config: dict) -> str:
-    """Map a caller optimizer name onto the implementation DeepSpeed will run."""
-    resolved = name.strip().lower().replace("-", "_")
-    if resolved in {"", "adam", "adamw"}:
-        return "deepspeed_cpu_adam" if _optimizer_cpu_offload_enabled(ds_config) else "fused_adam"
-    if resolved not in _OPTIMIZER_ALIASES:
+def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) -> str:
+    """Resolve defaults by offload policy, while preserving explicit optimizer choices."""
+    normalized_name = name.strip().lower().replace("-", "_")
+    cpu_offload = _optimizer_cpu_offload_enabled(ds_config)
+
+    if normalized_name in {"", "adam", "adamw"}:
+        if not cpu_offload:
+            return "fused_adam"
+        elif fused:
+            return "deepspeed_cpu_adam"
+        else:
+            return "torch_cpu_adamw"
+
+    optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
+    if optimizer_name is None:
         supported = ", ".join(sorted(set(_OPTIMIZER_ALIASES.values())))
         raise ValueError(f"Unsupported optimizer {name!r}; supported values: {supported}")
-    return _OPTIMIZER_ALIASES[resolved]
+    if optimizer_name == "torch_adamw" and cpu_offload:
+        return "torch_cpu_adamw"
+    return optimizer_name
 
 
 def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
@@ -207,6 +218,8 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
         return "fused_adam"
     if optimizer_name == "deepspeed_cpu_adam":
         return "deepspeed_cpu_adam"
+    if optimizer_name == "torch_cpu_adamw":
+        return "deepspeed_cpu_adam_nonfused"
     if optimizer_name in ("torch_adamw", "fused_adam"):
         return "torch_adamw"
     raise AssertionError(f"Unhandled optimizer {optimizer_name!r}")
@@ -214,9 +227,11 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
 
 def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bool) -> dict[str, str]:
     """The implementation a job runs and the customer-facing reason."""
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
     implementation = optimizer_implementation(optimizer_name, fused=fused)
-    if implementation == "deepspeed_cpu_adam":
+    if implementation == "deepspeed_cpu_adam_nonfused":
+        reason = "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic"
+    elif implementation == "deepspeed_cpu_adam":
         reason = (
             "optimizer state is offloaded to CPU, so the CPU implementation (CPUAdam) ran"
             if _optimizer_cpu_offload_enabled(ds_config)
@@ -243,11 +258,11 @@ def cpu_adam_fp32_optimizer_states(ds_config: dict) -> bool:
 def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool):
     """Build AdamW with decay disabled on bias and norm parameters.
 
-    GPU ``FusedAdam`` by default, or ``DeepSpeedCPUAdam`` when ZeRO optimizer
-    offload is enabled.
+    Generic AdamW uses fused implementations unless the model or caller disables
+    them. Explicit CPUAdam remains selected regardless of that policy.
     """
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
-    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name == "deepspeed_cpu_adam":
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
+    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name in ("deepspeed_cpu_adam", "torch_cpu_adamw"):
         logger.info(
             "training_config.ds_config.zero_optimization.offload_optimizer is configured; "
             "using optimizer='deepspeed_cpu_adam'"
@@ -282,10 +297,10 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             eps=optimizer.eps,
             adam_w_mode=True,
         )
-    if implementation == "deepspeed_cpu_adam":
+    if implementation in ("deepspeed_cpu_adam", "deepspeed_cpu_adam_nonfused"):
         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
-        return DeepSpeedCPUAdam(
+        built = DeepSpeedCPUAdam(
             param_groups,
             lr=optimizer.lr,
             betas=betas,
@@ -293,6 +308,11 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             adamw_mode=True,
             fp32_optimizer_states=cpu_adam_fp32_optimizer_states(ds_config),
         )
+        if implementation == "deepspeed_cpu_adam_nonfused":
+            from arctic_platform.common.cpu_adam import configure_nonfused_cpu_adam
+
+            return configure_nonfused_cpu_adam(built)
+        return built
     import torch
 
     return torch.optim.AdamW(
