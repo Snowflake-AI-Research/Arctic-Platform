@@ -931,6 +931,53 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
     assert result["loaded_destination_trace_collected"] is True
 
 
+@pytest.mark.parametrize("entry_point", ["sync_weights", "sync_weights_broadcast"])
+def test_sync_refreshes_glm5next_kda_merged_conv_weight(monkeypatch, entry_point):
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 2
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    # vLLM 0.31.0 Glm5NextLinearAttention: fp32 [C, 1, 4] q/k/v conv weights, and the
+    # merged weight its first forward caches under inference mode (kda.py:505-515).
+    kda = nn.Module()
+    convs = []
+    for i, name in enumerate(("q_conv1d", "k_conv1d", "v_conv1d")):
+        conv = nn.Module()
+        conv.weight = nn.Parameter(torch.arange(12.0).view(3, 1, 4) + 100 * i, requires_grad=False)
+        setattr(kda, name, conv)
+        convs.append(conv)
+
+    def merged():
+        return torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]).contiguous()
+
+    with torch.inference_mode():
+        kda._merged_conv_weight = merged()
+    cache_address = kda._merged_conv_weight.data_ptr()
+
+    def load_in_place(model, engine):  # ColumnParallelLinear.weight_loader: param.data.copy_
+        for conv in convs:
+            conv.weight.data.add_(1.0)
+        return 3, 0.0, 0.0, {}, []
+
+    extension = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_runner=SimpleNamespace(model=nn.ModuleDict({"kda": kda})),
+        model_config=SimpleNamespace(quantization=None),
+        _get_or_create_engine=lambda *args, **kwargs: object(),
+        _get_or_create_broadcast_engine=lambda *args: object(),
+        _load_batched=load_in_place,
+        _build_result=lambda *args: {"status": "done"},
+    )
+
+    getattr(WeightSyncExtension, entry_point)(extension, "127.0.0.1", 1234, 1, 2)
+
+    assert torch.equal(kda._merged_conv_weight, merged()), "sampler still convolves with pre-sync conv weights"
+    assert kda._merged_conv_weight.data_ptr() == cache_address
+
+
 async def _noop_abort_all_streams():
     return None
 
