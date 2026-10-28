@@ -101,6 +101,17 @@ def test_validation_rejects_a_mask_of_the_wrong_size_and_a_negative_selector_wei
         loss.validation_callback({}, {"selector_loss_alpha": -1})
 
 
+@pytest.mark.parametrize("alpha", [float("nan"), float("inf"), True, "1.0"])
+def test_validation_rejects_a_selector_weight_that_is_not_a_finite_number(alpha):
+    with pytest.raises(ValueError, match="finite non-negative number"):
+        DFlash2Loss().validation_callback({}, {"selector_loss_alpha": alpha})
+
+
+@pytest.mark.parametrize("alpha", [None, 0, 0.0, 2, 0.5])
+def test_validation_accepts_unset_zero_and_positive_selector_weights(alpha):
+    DFlash2Loss().validation_callback({}, {} if alpha is None else {"selector_loss_alpha": alpha})
+
+
 def test_packed_window_weight_counts_only_rows_the_model_trains_on():
     # Row 2 is dropped by the model, so its supervised token must not weigh the window (the raw mask sums to 3).
     reduction = reduce(packed(TWO_TOKEN_RESPONSE, ONE_TOKEN_RESPONSE), packed(THREE_TOKEN_RESPONSE))

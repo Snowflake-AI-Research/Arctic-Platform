@@ -41,16 +41,31 @@ class DFlash2Options(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    draft_config: dict = Field(..., description="Content of the DFlash2 draft config.json (architectures + dflash_config).")
-    init_from: str | None = Field(None, description="Existing draft directory (config.json + model.safetensors) to start from.")
+    draft_config: dict = Field(
+        ..., description="Content of the DFlash2 draft config.json (architectures + dflash_config)."
+    )
+    init_from: str | None = Field(
+        None, description="Existing draft directory (config.json + model.safetensors) to start from."
+    )
     attention_backend: Literal["sdpa", "flex_attention", "eager"] = Field(
         "sdpa", description="Draft attention implementation (SpecForge's training.attention_backend)."
     )
     num_anchors: int = Field(512, gt=0, description="Anchor blocks sampled per sequence.")
-    loss_decay_gamma: float | None = Field(7.0, gt=0, description="Per-slot loss decay exp(-(k-1)/gamma); null disables.")
-    selector_loss_alpha: float = Field(1.0, ge=0, description="Default weight of the selector CE (the client may override per step).")
-    selector_stop_gradient: bool = Field(False, description="Detach the selector's inputs so only its own parameters train on its CE.")
-    objective_chunk_blocks: int = Field(128, gt=0, description="Blocks per vocabulary-projection chunk (bounds memory).")
+    loss_decay_gamma: float | None = Field(
+        7.0, gt=0, description="Per-slot loss decay exp(-(k-1)/gamma); null disables."
+    )
+    selector_loss_alpha: float = Field(
+        1.0,
+        ge=0,
+        allow_inf_nan=False,
+        description="Default weight of the selector CE (the client may override per step).",
+    )
+    selector_stop_gradient: bool = Field(
+        False, description="Detach the selector's inputs so only its own parameters train on its CE."
+    )
+    objective_chunk_blocks: int = Field(
+        128, gt=0, description="Blocks per vocabulary-projection chunk (bounds memory)."
+    )
     seed: int = Field(0, description="Seed for draft initialization and anchor sampling.")
 
     @model_validator(mode="after")

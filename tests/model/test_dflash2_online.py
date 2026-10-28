@@ -237,6 +237,48 @@ def test_save_pretrained_writes_the_draft_that_init_from_reloads(target, tmp_pat
         assert torch.equal(value, reloaded.draft.state_dict()[name]), name
 
 
+def consolidated_state(online_model):
+    """What the DeepSpeed worker hands ``save_pretrained``: full-precision weights keyed by the wrapper module."""
+    return {name: value.detach().clone().float() for name, value in online_model.state_dict().items()}
+
+
+def test_save_pretrained_exports_the_state_dict_the_worker_gathers_not_the_live_parameters(target, tmp_path):
+    online = make_online(target, seed=0)
+    consolidated = consolidated_state(online)
+    with torch.no_grad():  # under ZeRO-3 the live parameters are empty shards
+        for parameter in online.draft.parameters():
+            parameter.zero_()
+
+    online.save_pretrained(tmp_path, state_dict=consolidated, safe_serialization=True)
+
+    exported = load_file(tmp_path / "model.safetensors")
+    prefix = "online_model.draft_model."
+    expected = {name.removeprefix(prefix): value for name, value in consolidated.items() if name.startswith(prefix)}
+    assert exported.keys() == {name for name in expected if "rotary_emb" not in name}
+    for name, value in exported.items():
+        assert torch.equal(value, expected[name]), name
+    assert any(value.abs().sum() > 0 for value in exported.values())
+
+
+def test_save_pretrained_writes_the_state_dict_in_the_draft_dtype(target, tmp_path):
+    online = make_online(target, dtype=torch.bfloat16)
+
+    online.save_pretrained(tmp_path, state_dict=consolidated_state(online))
+
+    floating = [value for value in load_file(tmp_path / "model.safetensors").values() if value.is_floating_point()]
+    assert floating and all(value.dtype == torch.bfloat16 for value in floating)
+
+
+def test_save_pretrained_rejects_a_state_dict_that_lacks_draft_entries(target, tmp_path):
+    online = make_online(target)
+    truncated = {
+        name: value for name, value in consolidated_state(online).items() if not name.startswith("online_model")
+    }
+
+    with pytest.raises(ValueError, match="lacks draft entries"):
+        online.save_pretrained(tmp_path, state_dict=truncated)
+
+
 def test_init_from_rejects_a_checkpoint_that_does_not_match_the_draft(target, tmp_path):
     wider = copy.deepcopy(DRAFT_CONFIG)
     wider["intermediate_size"] = 128
@@ -252,6 +294,32 @@ def test_build_rejects_a_draft_vocabulary_that_differs_from_the_target(target):
     config["vocab_size"] = VOCAB + 8
 
     with pytest.raises(ValueError, match="does not match the target LM head"):
+        build_online_model(target, config, dtype=torch.float32, attention_backend="sdpa")
+
+
+def test_build_rejects_a_draft_width_that_differs_from_the_target(target):
+    config = copy.deepcopy(DRAFT_CONFIG)
+    config["hidden_size"] = HIDDEN * 2
+
+    with pytest.raises(ValueError, match="hidden_size=64 does not match the target's 32"):
+        build_online_model(target, config, dtype=torch.float32, attention_backend="sdpa")
+
+
+def test_build_rejects_a_draft_trained_for_a_different_target_depth(target):
+    config = copy.deepcopy(DRAFT_CONFIG)
+    config["num_target_layers"] = 6
+
+    with pytest.raises(ValueError, match="num_target_layers=6 does not match the target's 4 layers"):
+        build_online_model(target, config, dtype=torch.float32, attention_backend="sdpa")
+
+
+def test_build_rejects_a_captured_layer_the_target_does_not_have_below_its_last(target):
+    # Without ``num_target_layers`` the draft config cannot catch this itself; the target can.
+    config = copy.deepcopy(DRAFT_CONFIG)
+    del config["num_target_layers"]
+    config["dflash_config"]["target_layer_ids"] = [1, 3]
+
+    with pytest.raises(ValueError, match="must stay below the target's last layer"):
         build_online_model(target, config, dtype=torch.float32, attention_backend="sdpa")
 
 
@@ -313,6 +381,12 @@ def test_loader_rejects_a_draft_that_reads_the_targets_last_layer(target_dir):
 
     with pytest.raises((ValidationError, ValueError), match="last layer"):
         build_model(loader_spec(target_dir, loader_options={"draft_config": last_layer}))
+
+
+@pytest.mark.parametrize("alpha", [float("nan"), float("inf"), -1.0])
+def test_loader_rejects_a_selector_weight_that_is_not_finite_and_non_negative(target_dir, alpha):
+    with pytest.raises((ValidationError, ValueError), match="selector_loss_alpha"):
+        build_model(loader_spec(target_dir, loader_options={"selector_loss_alpha": alpha}))
 
 
 @pytest.mark.parametrize("patch", ["gradient_checkpointing", "liger"])

@@ -181,9 +181,30 @@ class DFlash2OnlineModel(nn.Module):
         return {"loss": loss, "dflash2_terms": terms}
 
     # --- serving-ready export, as SpecForge's `specforge export --to hf` ------------------------------------
-    def save_pretrained(self, save_directory: str | Path, **_: Any) -> None:
-        """Write only the draft: ``config.json`` and ``model.safetensors`` in the layout the serving stack loads."""
-        self.draft.save_pretrained(str(save_directory))
+    def save_pretrained(
+        self, save_directory: str | Path, *, state_dict: Optional[dict[str, torch.Tensor]] = None, **_: Any
+    ) -> None:
+        """Write only the draft: ``config.json`` and ``model.safetensors`` in the layout the serving stack loads.
+
+        The DeepSpeed worker passes a full-precision ``state_dict`` of this wrapper (the ZeRO checkpoint consolidated
+        on rank 0), because under ZeRO-3 the live parameters are empty shards. Its draft entries are exported, cast to
+        the draft's dtype; without one, the live draft is written.
+        """
+        draft_state = None
+        if state_dict is not None:
+            marker = "online_model.draft_model."
+            dtype = next(self.draft.parameters()).dtype
+            draft_state = {
+                key.partition(marker)[2]: value.to(dtype) if value.is_floating_point() else value
+                for key, value in state_dict.items()
+                if marker in key
+            }
+            missing = [
+                name for name in self.draft.state_dict() if "rotary_emb" not in name and name not in draft_state
+            ]
+            if missing:
+                raise ValueError(f"state_dict lacks draft entries (missing {len(missing)}, e.g. {missing[:3]})")
+        self.draft.save_pretrained(str(save_directory), state_dict=draft_state)
         apply_legacy_rope_scaling(str(save_directory))
 
     def load_draft(self, directory: str | Path) -> None:
@@ -195,6 +216,29 @@ class DFlash2OnlineModel(nn.Module):
         missing = [key for key in missing if "rotary_emb" not in key]
         if missing or unexpected:
             raise ValueError(f"draft checkpoint mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
+
+
+def check_draft_matches_target(draft_config: Any, target_config: Any) -> None:
+    """Fail at load time on a draft that cannot read this target, instead of at the first training step.
+
+    The draft projects the concatenated hidden states of ``target_layer_ids`` with ``Linear(len(ids) * hidden_size)``,
+    so its width must be the target's, and every captured layer must exist below the target's last one.
+    """
+    if draft_config.hidden_size != target_config.hidden_size:
+        raise ValueError(
+            f"draft hidden_size={draft_config.hidden_size} does not match the target's {target_config.hidden_size}: "
+            "the draft reads the target's hidden states"
+        )
+    layers = target_config.num_hidden_layers
+    declared = getattr(draft_config, "num_target_layers", None)
+    if declared is not None and declared != layers:
+        raise ValueError(f"draft num_target_layers={declared} does not match the target's {layers} layers")
+    layer_ids = list(draft_config.dflash_config["target_layer_ids"])
+    if layer_ids[-1] >= layers - 1:
+        raise ValueError(
+            f"draft target_layer_ids {layer_ids} must stay below the target's last layer (the target has {layers} "
+            "layers): the last layer's output is post-norm in training but pre-norm when captured for serving"
+        )
 
 
 def build_online_model(
@@ -216,6 +260,7 @@ def build_online_model(
     head, embed = target.get_output_embeddings(), target.get_input_embeddings()
     if head is None or config.vocab_size != head.weight.shape[0]:
         raise ValueError(f"draft vocab_size={config.vocab_size} does not match the target LM head")
+    check_draft_matches_target(config, text_backbone(target).config)
     config._attn_implementation = attention_backend
 
     torch.manual_seed(seed)

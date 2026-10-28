@@ -33,6 +33,7 @@ data-parallel gradient reduction.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -108,8 +109,11 @@ class DFlash2Loss(BaseLoss):
                 f"dflash2 loss_mask has {loss_mask.numel()} entries but input_ids has {input_ids.numel()}"
             )
         alpha = config.get("selector_loss_alpha")
-        if alpha is not None and (not isinstance(alpha, (int, float)) or alpha < 0):
-            raise ValueError(f"dflash2 config selector_loss_alpha must be a non-negative number, got {alpha!r}")
+        # NaN compares false against everything, so ``alpha < 0`` alone would let it through and poison the loss.
+        if alpha is not None and (
+            isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha) or alpha < 0
+        ):
+            raise ValueError(f"dflash2 config selector_loss_alpha must be a finite non-negative number, got {alpha!r}")
 
     def packed_reduction_callback(
         self,
