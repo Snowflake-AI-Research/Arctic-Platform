@@ -29,19 +29,18 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
-from arctic_platform.debug.router_replay_trace import RouterReplayTrace  # noqa: F401 - compatibility export
-from arctic_platform.debug.router_replay_trace import active  # noqa: F401
-from arctic_platform.debug.router_replay_trace import finish  # noqa: F401
-from arctic_platform.debug.router_replay_trace import record_router  # noqa: F401
-from arctic_platform.debug.router_replay_trace import start  # noqa: F401
+from arctic_platform.debug.training import TRACE_SCHEMA
+from arctic_platform.debug.training import RouterReplayTrace  # noqa: F401 - compatibility export
+from arctic_platform.debug.training import active  # noqa: F401
+from arctic_platform.debug.training import finish  # noqa: F401
+from arctic_platform.debug.training import record_router  # noqa: F401
+from arctic_platform.debug.training import start  # noqa: F401
 
 _RECEIPT = "ROUTER_REPLAY_TRACE_CHUNK "
 _CHUNK_BYTES = 4096
 
 
 def _node_trace_receipt(output_dir: str, request_id: str, token: str) -> dict:
-    from arctic_platform.debug.router_replay_trace import TRACE_SCHEMA
-
     from .storage import require_data_fast_path
 
     root = require_data_fast_path(output_dir, label="router-replay evidence") / request_id
@@ -133,8 +132,6 @@ def _decode_trace_chunks(output: str, *, hosts: list[str], request_id: str, toke
 
 
 def _merge_trace_receipts(receipts: list[dict], *, request_id: str, ranks: int, calls: int) -> list[dict]:
-    from arctic_platform.debug.router_replay_trace import TRACE_SCHEMA
-
     by_rank = {rank: {} for rank in range(ranks)}
     rank_hosts = {}
     for receipt in receipts:

@@ -22530,7 +22530,46 @@ def test_lora_debug_uses_one_maintained_library():
         bindings.stage_selected_lora_request,
         bindings.owned_selected_lora_bootstrap,
     ):
-        assert Path(inspect.getsourcefile(operation)).resolve() == library_path
+        assert Path(inspect.getsourcefile(inspect.unwrap(operation))).resolve() == library_path
+
+
+@pytest.mark.parametrize(
+    "module, retired, operations",
+    [
+        (
+            broadcast,
+            (
+                "weight_sync_evidence",
+                "ep_weight_sync_evidence",
+                "broadcast_weight_sync_evidence",
+                "rl_sampler_evidence",
+            ),
+            (
+                "maybe_observe_weight_send",
+                "prepare_collective_weights",
+                "maybe_observe_broadcast_send",
+                "SamplerEvidenceWorker",
+            ),
+        ),
+        (
+            warmup_observer,
+            ("inference_startup_error", "inference_warmup_observer"),
+            ("maybe_bind_inference_startup_error", "maybe_install_inference_warmup_observer"),
+        ),
+        (
+            debug_router_replay_trace,
+            ("reduced_fixture_mtp", "router_replay_trace", "correctness_participation"),
+            ("maybe_bind_reduced_fixture_mtp", "RouterReplayTrace", "maybe_select_participation_coordinator"),
+        ),
+    ],
+    ids=("weight-sync", "inference", "training"),
+)
+def test_debug_topics_use_one_maintained_library(module, retired, operations):
+    library_path = Path(module.__file__).resolve()
+    for name in retired:
+        assert not library_path.with_name(f"{name}.py").exists()
+    for name in operations:
+        assert Path(inspect.getsourcefile(inspect.unwrap(getattr(module, name)))).resolve() == library_path
 
 
 class Factors:

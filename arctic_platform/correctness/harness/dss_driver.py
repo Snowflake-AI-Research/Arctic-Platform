@@ -54,6 +54,8 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.requests import log_probs_request
+from arctic_platform.debug.training import maybe_configure_router_replay_sampling
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
 
 from .config import ReviewedClientConfig
 from .config import ReviewedSamplingConfig
@@ -283,7 +285,7 @@ def local_cortex_gateway(
     if gateway_module not in (
         "dss.ray_dss.gateway_server",
         "arctic_platform.correctness.harness.gateway",
-        "arctic_platform.debug.correctness_participation",
+        "arctic_platform.debug.training",
     ):
         raise ValueError("unsupported correctness gateway module")
     if allocation_members is not None and gateway_module != "arctic_platform.correctness.harness.gateway":
@@ -1682,9 +1684,6 @@ def running_rl_client(
         "training": training_only.training,
         "backend": training_only.backend,
     }
-    from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_configure_broadcast_sampling
-    from arctic_platform.debug.router_replay_trace import maybe_configure_router_replay_sampling
-
     updates["sampling"] = maybe_configure_broadcast_sampling(cfg.native.sampling, verify=weight_sync_verification)
     updates["sampling"] = maybe_configure_router_replay_sampling(
         updates["sampling"], verify=router_replay_verification

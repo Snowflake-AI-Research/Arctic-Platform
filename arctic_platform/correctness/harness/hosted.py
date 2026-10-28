@@ -27,7 +27,7 @@ from typing import Iterator
 from urllib.parse import urlsplit
 
 from arctic_platform.client import CortexConfig
-from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
 
 from .batches import SEED
 from .config import LoadedConfig

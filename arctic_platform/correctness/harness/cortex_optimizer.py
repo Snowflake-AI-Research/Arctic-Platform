@@ -1948,7 +1948,7 @@ def decode_optimizer_capture(
         _native_sources(native)
     participation, inactive_weights = None, {}
     if participation_receipts is not None:
-        from arctic_platform.debug.correctness_participation import merge_worker_receipts
+        from arctic_platform.debug.training import merge_worker_receipts
 
         from .participation import merge_rank_participation
 

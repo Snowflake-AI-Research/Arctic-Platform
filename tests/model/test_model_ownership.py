@@ -24,7 +24,6 @@ _DSS_COMPARISON_ADAPTERS = {
     "correctness/harness/lora.py",
     "correctness/harness/native_lora.py",
     "correctness/harness/storage.py",
-    "debug/correctness_participation.py",
     "debug/training.py",
 }
 
