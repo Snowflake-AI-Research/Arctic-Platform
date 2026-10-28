@@ -32,6 +32,7 @@ driven by the first one's placement, carries w2 split in halves.
 from __future__ import annotations
 
 import os
+from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -75,6 +76,10 @@ class UltraEPState:
         self.gate_up_grads = torch.zeros(experts_per_rank, 2, n13, dtype=torch.float32, device=w1.device)
         self.down_grads = torch.zeros(experts_per_rank, n2, dtype=torch.float32, device=w1.device)
         self.layer_of: dict[int, int] = {}
+        # Each layer's physical top-k ids from its graph-building forwards, oldest first: reroute_sparse keeps
+        # per-expert counters across calls, so rerouting the same tokens again in the recompute could send them to
+        # different copies and change the shapes the recompute rebuilds.
+        self.kept_routes: dict[int, deque] = {}
 
     def layer(self, module, w1: Tensor, w2: Tensor, w3: Tensor) -> int:
         key = id(module)
@@ -148,17 +153,29 @@ class _UltraEPFetch(torch.autograd.Function):
 class UltraEPPlan:
     """One MoE call's UltraEP placement, with the interface of ``expert_replicas.ReplicaPlan``."""
 
-    def __init__(self, state: UltraEPState, lid: int) -> None:
+    def __init__(self, state: UltraEPState, lid: int, building: bool, recompute: bool) -> None:
         self.state = state
         self.lid = lid
+        self.building = building
+        self.recompute = recompute
 
     @property
     def num_slots(self) -> int:
         return self.state.ranks * (self.state.experts_per_rank + self.state.spares)
 
     def remap(self, selected: Tensor) -> Tensor:
+        kept = self.state.kept_routes.setdefault(self.lid, deque())
+        if self.recompute:
+            if not kept:
+                raise RuntimeError("UltraEP: a recompute found no routing from its forward")
+            physical = kept.popleft()
+            if physical.shape != selected.shape:
+                raise RuntimeError(f"UltraEP: recompute routes {tuple(selected.shape)}, its forward {tuple(physical.shape)}")
+            return physical
         physical = selected.to(torch.int64).contiguous().clone()
         self.state.gate_up.reroute_sparse(self.lid, physical)
+        if self.building:
+            kept.append(physical)
         return physical
 
     def fetch(self, weights: tuple[Tensor, ...], group) -> tuple[Tensor, ...]:
@@ -170,7 +187,8 @@ _STATES: dict[int, UltraEPState] = {}
 
 
 def ultraep_plan(module, experts, group, selected: Tensor, building: bool) -> UltraEPPlan:
-    """This MoE call's plan: planned from ``selected`` unless the call is a recompute (``building`` False)."""
+    """This MoE call's plan: planned from ``selected`` unless the call is a recompute (``building`` False), which
+    reuses its forward's placement and routing."""
     w1, w2, w3 = experts.w1, experts.w2, experts.w3
     key = id(group)
     if key not in _STATES:
@@ -178,5 +196,7 @@ def ultraep_plan(module, experts, group, selected: Tensor, building: bool) -> Ul
     state = _STATES[key]
     lid = state.layer(module, w1, w2, w3)
     if building:
+        if torch.is_grad_enabled():  # a graph-building forward: whatever its last one kept has been recomputed
+            state.kept_routes.setdefault(lid, deque()).clear()
         state.gate_up.update_placement_sparse(lid, selected.to(torch.int64).contiguous())
-    return UltraEPPlan(state, lid)
+    return UltraEPPlan(state, lid, building=building and torch.is_grad_enabled(), recompute=not building)
