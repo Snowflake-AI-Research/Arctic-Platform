@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2026 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """Weight transfer, collective inventories, and sampler verification."""
 
 from __future__ import annotations
@@ -1164,8 +1161,6 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
         return
     import torch.distributed as dist
 
-    pass
-
     if is_zero3:
         raise ValueError("native broadcast evidence does not admit ZeRO3 tensor views")
     if not dist.is_initialized():
@@ -1334,11 +1329,6 @@ def _worker_actor():
     if limit_key in os.environ:
         environment[limit_key] = os.environ[limit_key]
     return ray.remote(runtime_env={"env_vars": environment})(SamplerEvidenceWorker)
-
-
-async def maybe_sync_weights(receive_task, send_tasks):
-    received, *sent = await asyncio.gather(receive_task, *send_tasks)
-    return maybe_sync_weights_result(received, sent)
 
 
 def maybe_sync_weights_result(received, sent):

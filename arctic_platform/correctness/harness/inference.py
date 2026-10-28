@@ -1218,53 +1218,6 @@ def _ssh_trust_parent(path, deadline):
         yield fd, revalidate
 
 
-def _publish_ssh_trust(path, raw, deadline):
-    """Publish already-authenticated trust bytes; never acquire keys or replace a slot."""
-    path = Path(path)
-    require_data_fast_path(path)
-    if type(raw) is not bytes or not 0 < len(raw) <= 4 * 1024**2:
-        raise ValueError("bounded original strict SSH trust bytes required")
-    with _ssh_trust_parent(path, deadline) as (parent, revalidate), contextlib.ExitStack() as descriptors:
-        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-        descriptors.callback(os.close, fd)
-        created = os.fstat(fd)
-        pending = memoryview(raw)
-        while pending:
-            _local_remaining(deadline)
-            count = os.write(fd, pending)
-            if count <= 0:
-                raise OSError("strict SSH trust publication made no progress")
-            pending = pending[count:]
-        os.fchmod(fd, 0o400)
-        os.fsync(fd)
-        held = os.fstat(fd)
-        if (
-            (held.st_dev, held.st_ino) != (created.st_dev, created.st_ino)
-            or held.st_size != len(raw)
-            or held.st_nlink != 1
-        ):
-            raise ValueError("strict SSH trust publication identity changed")
-        os.lseek(fd, 0, os.SEEK_SET)
-        digest = hashlib.sha256()
-        remaining = len(raw)
-        while remaining:
-            _local_remaining(deadline)
-            block = os.read(fd, min(remaining, 1024**2))
-            if not block:
-                raise ValueError("strict SSH trust publication truncated")
-            digest.update(block)
-            remaining -= len(block)
-        if os.read(fd, 1) or digest.hexdigest() != hashlib.sha256(raw).hexdigest():
-            raise ValueError("strict SSH trust publication bytes changed")
-        revalidate()
-        if _ssh_file_identity(os.fstat(fd)) != _ssh_file_identity(held) or _ssh_file_identity(
-            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        ) != _ssh_file_identity(held):
-            raise ValueError("strict SSH trust publication slot or file identity changed")
-        _local_remaining(deadline)
-        return {"known_hosts": str(path), "known_hosts_sha256": digest.hexdigest()}
-
-
 @contextlib.contextmanager
 def _held_ssh_trust(transport, deadline):
     path = Path(transport.get("known_hosts", ""))

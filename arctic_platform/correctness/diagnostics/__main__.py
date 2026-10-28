@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """List maintained diagnostics or invoke one existing module entry point."""
 
 from __future__ import annotations

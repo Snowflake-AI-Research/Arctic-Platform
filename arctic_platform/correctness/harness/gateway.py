@@ -830,6 +830,58 @@ def _reap_owned_gateway_descendants(gateway: dict, token: str, *, timeout: float
         raise UnsafeCleanupError("owned gateway descendants survived bounded teardown")
 
 
+# Keep the handshake independent of training imports; load cleanup only after abnormal EOF.
+_GATEWAY_CLEANUP_BOOTSTRAP = """
+import os
+import sys
+with os.fdopen(int(sys.argv[1]), "rb") as lifetime:
+    print("ready", flush=True)
+    os.dup2(2, 1)
+    if lifetime.readline() == b"done\\n":
+        sys.exit(0)
+from pathlib import Path
+from arctic_platform.correctness.harness.gateway import cleanup_owned_gateway
+cleanup_owned_gateway(Path(sys.argv[2]), sys.argv[3])
+"""
+
+
+def cleanup_owned_gateway(record_path: Path, token: str) -> None:
+    """Recover only the dead owner's gateway, without disturbing a replacement owner."""
+    with (record_path.parent / "owner.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _cleanup_unrecorded_gateway(token)
+            return
+        try:
+            if record_path.exists():
+                record = json.loads(record_path.read_text())
+                if record.get("token") == token:
+                    _recover_owned_gateway(record_path)
+        finally:
+            _cleanup_unrecorded_gateway(token)
+
+
+def _cleanup_unrecorded_gateway(token: str) -> None:
+    # Cover owner death between gateway launch and publication of its ownership record.
+    marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode()
+    for directory in _GATEWAY_PROC_ROOT.iterdir():
+        if not directory.name.isdecimal():
+            continue
+        try:
+            identity = _gateway_process_identity(int(directory.name))
+            if identity is None or identity["uid"] != os.getuid():
+                continue
+            if marker not in (directory / "environ").read_bytes().split(b"\0"):
+                continue
+            if os.getpgid(identity["pid"]) != identity["pid"]:
+                continue
+            _stop_stale_gateway(identity, "gateway.log")
+            _reap_owned_gateway_descendants(identity, token)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+
+
 @contextlib.contextmanager
 def _gateway_owner_guard(directory: Path, record_path: Path, token: str) -> Iterator[None]:
     """A pipe lifetime guard survives owner SIGKILL without monitoring unrelated services."""
@@ -841,7 +893,8 @@ def _gateway_owner_guard(directory: Path, record_path: Path, token: str) -> Iter
             guard = subprocess.Popen(
                 [
                     sys.executable,
-                    str(Path(__file__).with_name("gateway_cleanup.py")),
+                    "-c",
+                    _GATEWAY_CLEANUP_BOOTSTRAP,
                     str(reader),
                     str(record_path.resolve()),
                     token,
@@ -2081,7 +2134,6 @@ class HostedTrainingJob:
                     "catalog, so cross-job resume is unavailable (saved files retained)"
                 )
             require_local_checkpoint_id(checkpoint_id)
-            pass
 
             native_store = result.get("correctness_native_store") == NATIVE_STORE_SCHEMA
             if native_store and not getattr(self.client.transport, "_native_checkpoint_bridge", False):

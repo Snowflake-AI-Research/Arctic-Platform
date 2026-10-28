@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2026 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """LoRA adapters, training, receiver verification, and sampling."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import hashlib
 import importlib
@@ -28,6 +26,7 @@ import importlib.metadata
 import importlib.util
 import inspect
 import json
+import marshal
 import math
 import os
 import re
@@ -1946,7 +1945,6 @@ def make_lora_replica_pool(pool_class, request):
     """Use the external pool's public worker_cls without changing its scheduler."""
     _receiver_require(enabled(), "LoRA sampler evidence must be explicitly enabled")
     request = _sampler_request(request)
-    pass
 
     _bind_sources(
         request["admitted_sources"],
@@ -2019,8 +2017,6 @@ class LoRASamplerEvidenceWorker(SamplerEvidenceWorker):
             AsyncLLM.shutdown,
             serving_lora_request,
         )
-        pass
-        pass
 
         maybe_admit_sampler_construction(self, args, AsyncLLM.from_vllm_config, engine_kwargs)
         self.llm = AsyncLLM.from_vllm_config(args.create_engine_config(), stat_loggers=[RingStatLogger])
@@ -2199,13 +2195,731 @@ class LoRASamplerEvidenceWorker(SamplerEvidenceWorker):
             self._lora_request = None
 
 
+# Selected Receiver Callbacks
+
+_LORA_MANAGER_METHODS = ("add_adapter", "activate_adapter", "_set_adapter", "get_adapter", "remove_adapter")
+_LORA_LAYER_METHODS = ("set_lora", "forward")
+_SELECTED_PREPARATION_KEYS = {
+    "distributions",
+    "output",
+    "max_source_bytes",
+    "max_layers",
+    "max_total_source_bytes",
+    "observer",
+    "builder",
+    "installer",
+    "normalize_config",
+    "native_model_class",
+    "parse_name",
+    "remap_key",
+    "served_prefix_for_model",
+}
+
+
+def _lora_source_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _stable_lora_callback_source(path, cap):
+    path = Path(path)
+    _receiver_require(
+        path.is_absolute() and path.resolve(strict=True) == path and path.is_file() and (not path.is_symlink()),
+        "canonical regular callback source required",
+    )
+    before = path.stat()
+    _receiver_require(0 < before.st_size <= cap, "callback source byte cap exceeded")
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    _receiver_require(
+        _lora_source_identity(before)
+        == _lora_source_identity(opened)
+        == _lora_source_identity(after)
+        == _lora_source_identity(path.stat())
+        and len(raw) == before.st_size,
+        "callback source changed during read",
+    )
+    return raw
+
+
+def _lora_distribution_origin(filename, distributions, cap):
+    """Use exact caller-selected distributions, never a package tree search."""
+    filename = Path(filename)
+    matches = []
+    for distribution in distributions:
+        root = Path(distribution.locate_file("")).resolve(strict=True)
+        if not filename.is_relative_to(root):
+            continue
+        member = filename.relative_to(root).as_posix()
+        for row in distribution.files or ():
+            if str(row) != member:
+                continue
+            _receiver_require(
+                row.hash is not None
+                and row.hash.mode == "sha256"
+                and (type(row.size) is int)
+                and (0 < row.size <= cap),
+                "callback requires a bounded SHA256 distribution RECORD entry",
+            )
+            digest = base64.urlsafe_b64decode(row.hash.value + "=" * (-len(row.hash.value) % 4))
+            _receiver_require(len(digest) == 32, "callback RECORD digest must be SHA256")
+            raw = _stable_lora_callback_source(filename, cap)
+            _receiver_require(
+                len(raw) == row.size and hashlib.sha256(raw).digest() == digest,
+                "actual callback source differs from its distribution RECORD",
+            )
+            matches.append(
+                {
+                    "distribution": distribution.metadata["Name"],
+                    "version": distribution.version,
+                    "root": str(root),
+                    "member": member,
+                    "path": str(filename),
+                    "sha256": digest.hex(),
+                    "size_bytes": row.size,
+                }
+            )
+    _receiver_require(len(matches) == 1, "one exact selected distribution must own each callback source")
+    return matches[0]
+
+
+def _lora_callback_origin(method, owner, distributions, cap):
+    _receiver_require(
+        inspect.ismethod(method) and method.__self__ is owner and (not isinstance(owner, type)),
+        "callback must be bound to the actual selected object",
+    )
+    function = method.__func__
+    _receiver_require(inspect.isfunction(function), "native Python callback body required")
+    filename = inspect.getsourcefile(function)
+    _receiver_require(
+        filename is not None and function.__code__.co_filename == filename,
+        "actual callback code/source origin differs",
+    )
+    return {
+        "module": function.__module__,
+        "qualname": function.__qualname__,
+        "code_sha256": hashlib.sha256(marshal.dumps(function.__code__)).hexdigest(),
+        "loaded_code_equivalence_to_source_proven": False,
+        "source": _lora_distribution_origin(filename, distributions, cap),
+    }
+
+
+def _lora_adapter_layers(model):
+    """Enumerate only the actual model's registered native adapter layers."""
+    named = list(model.named_modules())
+    _receiver_require(
+        named and len({name for name, _ in named}) == len(named), "unique actual model module names required"
+    )
+    selected = {}
+    for name, layer in named:
+        descriptor = inspect.getattr_static(type(layer), "set_lora", None)
+        if descriptor is None:
+            continue
+        _receiver_require(
+            inspect.isfunction(descriptor), "selected adapter setter cannot be a property or dynamic descriptor"
+        )
+        _receiver_require(type(name) is str and name, "selected adapter layer requires a nonempty actual module name")
+        setter = getattr(layer, "set_lora")
+        _receiver_require(
+            inspect.ismethod(setter) and setter.__self__ is layer,
+            "selected adapter layer setter must be bound to its actual module",
+        )
+        selected[name] = layer
+    _receiver_require(
+        selected and len({id(layer) for layer in selected.values()}) == len(selected),
+        "nonempty unaliased actual adapter layer inventory required",
+    )
+    return selected
+
+
+@dataclass
+class SelectedLoRACallbacks:
+    receiver: object
+    runner: object
+    model: object
+    wrapper: object
+    manager: object
+    callbacks: dict
+    layers: dict
+    layer_callbacks: dict
+    distributions: tuple
+    max_source_bytes: int
+    sources: dict
+    evidence: dict
+
+    def guard(self):
+        verify_sources(self.sources)
+        _receiver_require(
+            self.receiver.model_runner is self.runner
+            and self.runner.model is self.model
+            and (self.runner.lora_manager is self.wrapper)
+            and (self.wrapper._adapter_manager is self.manager),
+            "actual receiver/manager identity changed",
+        )
+        _receiver_require(
+            all((getattr(self.manager, name) == callback for name, callback in self.callbacks.items())),
+            "selected manager callback changed",
+        )
+        current = _lora_adapter_layers(self.model)
+        _receiver_require(
+            current.keys() == self.layers.keys()
+            and all((current[name] is layer for name, layer in self.layers.items())),
+            "selected adapter layer inventory changed",
+        )
+        for name, methods in self.layer_callbacks.items():
+            _receiver_require(
+                all((getattr(self.layers[name], key) == method for key, method in methods.items())),
+                "selected layer callback changed",
+            )
+        actual = self.origins()
+        _receiver_require(actual == self.evidence["callback_origins"], "selected callback code/RECORD origin changed")
+        verify_sources(self.sources)
+        return actual
+
+    def origins(self):
+        return {
+            "manager": {
+                name: _lora_callback_origin(method, self.manager, self.distributions, self.max_source_bytes)
+                for name, method in self.callbacks.items()
+            },
+            "layers": {
+                name: {
+                    key: _lora_callback_origin(method, self.layers[name], self.distributions, self.max_source_bytes)
+                    for key, method in methods.items()
+                }
+                for name, methods in self.layer_callbacks.items()
+            },
+        }
+
+
+def capture_selected_lora_callbacks(receiver, *, distributions, admitted_sources, max_source_bytes, max_layers):
+    """Capture loaded objects only; never invoke a factory, install or forward."""
+    _receiver_require(enabled(), "selected LoRA callback capture must be explicitly enabled")
+    _receiver_require(
+        type(max_source_bytes) is int and max_source_bytes > 0 and (type(max_layers) is int) and (max_layers > 0),
+        "positive explicit capture bounds required",
+    )
+    _receiver_require(type(distributions) is tuple and distributions, "actual selected distributions required")
+    verify_sources(admitted_sources)
+    own_sources = source_files(capture_selected_lora_callbacks, SelectedLoRACallbacks)
+    _receiver_require(
+        own_sources.keys() <= admitted_sources.keys()
+        and all((admitted_sources[path] == digest for path, digest in own_sources.items())),
+        "actual capture helper source must be admitted",
+    )
+    runner = receiver.model_runner
+    model = runner.model
+    wrapper = runner.lora_manager
+    manager = wrapper._adapter_manager
+    _receiver_require(model is not None and manager is not None, "already-loaded actual native receiver required")
+    callbacks = {name: getattr(manager, name) for name in _LORA_MANAGER_METHODS}
+    layers = _lora_adapter_layers(model)
+    _receiver_require(len(layers) <= max_layers, "selected layer count exceeds explicit capture bound")
+    layer_callbacks = {
+        name: {key: getattr(layer, key) for key in _LORA_LAYER_METHODS} for name, layer in layers.items()
+    }
+    captured = SelectedLoRACallbacks(
+        receiver,
+        runner,
+        model,
+        wrapper,
+        manager,
+        callbacks,
+        layers,
+        layer_callbacks,
+        distributions,
+        max_source_bytes,
+        dict(admitted_sources),
+        {},
+    )
+    origins = captured.origins()
+    native = [
+        *origins["manager"].values(),
+        *(method for methods in origins["layers"].values() for method in methods.values()),
+    ]
+    for row in native:
+        pointer = row["source"]
+        previous = captured.sources.setdefault(pointer["path"], pointer["sha256"])
+        _receiver_require(previous == pointer["sha256"], "selected origin conflicts with caller-admitted source")
+    captured.evidence = {
+        "schema": "job3-selected-lora-callback-source-inventory-v1",
+        "callback_origins": origins,
+        "evidence_sources": dict(captured.sources),
+        "selected_layer_names": list(layers),
+        "manager_layer_correspondence_verified": False,
+        "transitive_kernel_source_closure_complete": False,
+        "loaded_code_equivalence_to_source_proven": False,
+        "model_constructed": False,
+        "callbacks_executed": False,
+        "runtime_admitted": False,
+        "adapter_storage_verified": False,
+        "adapter_application_verified": False,
+        "capacity_admitted": False,
+        "numerical": None,
+    }
+    captured.guard()
+    return captured
+
+
+def _read_lora_callback_source(path, *, sha256, size_bytes):
+    path = Path(path)
+    _receiver_require(
+        path.is_absolute() and path.resolve(strict=True) == path and path.is_file() and (not path.is_symlink()),
+        "canonical selected source required",
+    )
+    before = path.stat()
+    _receiver_require(before.st_size == size_bytes, "selected source size changed")
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        raw = stream.read(size_bytes + 1)
+        after = os.fstat(stream.fileno())
+    _receiver_require(
+        _lora_source_identity(before)
+        == _lora_source_identity(opened)
+        == _lora_source_identity(after)
+        == _lora_source_identity(path.stat())
+        and len(raw) == size_bytes
+        and (hashlib.sha256(raw).hexdigest() == sha256),
+        "selected callback source changed during read",
+    )
+    return raw
+
+
+def publish_lora_callback_sources(ticket, *, output, max_total_source_bytes):
+    """Retain only source bodies selected by the actual guarded callback ticket.
+
+    The receipt is input for deriving slot/kernel semantics, never evidence
+    that the manager selected those slots or that any adapter was applied.
+    """
+    _receiver_require(
+        type(max_total_source_bytes) is int and max_total_source_bytes > 0,
+        "positive total publication byte cap required",
+    )
+    own = source_files(publish_lora_callback_sources)
+    _receiver_require(
+        own.keys() <= ticket.sources.keys() and all((ticket.sources[path] == digest for path, digest in own.items())),
+        "actual publisher source must be in the captured operation closure",
+    )
+    origins = ticket.guard()
+    _receiver_require(
+        ticket.evidence["schema"] == "job3-selected-lora-callback-source-inventory-v1",
+        "actual selected callback capture schema required",
+    )
+    output = Path(output)
+    _receiver_require(
+        output.is_absolute()
+        and output.resolve(strict=True) == output
+        and output.is_dir()
+        and (not output.is_symlink())
+        and (stat.S_IMODE(output.stat().st_mode) == 448),
+        "canonical private caller-owned publication directory required",
+    )
+    _receiver_require(not any(output.iterdir()), "publication must not replace an earlier owner's source packet")
+    native = [
+        *origins["manager"].values(),
+        *(row for methods in origins["layers"].values() for row in methods.values()),
+    ]
+    sources = {}
+    for row in native:
+        selected = row["source"]
+        existing = sources.setdefault(selected["path"], selected)
+        _receiver_require(existing == selected, "selected callbacks disagree on one source file identity")
+    total = sum((row["size_bytes"] for row in sources.values()))
+    _receiver_require(0 < total <= max_total_source_bytes, "selected callback packet byte cap exceeded")
+    snapshots = []
+    for filename, row in sorted(sources.items()):
+        raw = _read_lora_callback_source(filename, sha256=row["sha256"], size_bytes=row["size_bytes"])
+        destination = output / (row["sha256"] + ".py")
+        _receiver_require(
+            not destination.exists(), "distinct selected sources must have distinct private snapshot names"
+        )
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 384)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _receiver_require(
+            _read_lora_callback_source(destination, sha256=row["sha256"], size_bytes=row["size_bytes"]) == raw,
+            "private selected source snapshot changed",
+        )
+        snapshots.append(
+            {
+                "installed": dict(row),
+                "snapshot": {"path": str(destination), "sha256": row["sha256"], "size_bytes": row["size_bytes"]},
+            }
+        )
+    _receiver_require(ticket.guard() == origins, "selected callback inventory changed during publication")
+    receipt = {
+        "schema": "job3-selected-lora-callback-private-source-packet-v1",
+        "callback_origins": origins,
+        "selected_layer_names": list(ticket.layers),
+        "sources": snapshots,
+        "total_source_bytes": total,
+        "source_before_after_equal": True,
+        "evidence_sources": dict(ticket.sources),
+        "manager_layer_correspondence_verified": False,
+        "transitive_kernel_source_closure_complete": False,
+        "loaded_code_equivalence_to_source_proven": False,
+        "callbacks_executed": False,
+        "model_constructed": False,
+        "runtime_admitted": False,
+        "adapter_storage_verified": False,
+        "adapter_application_verified": False,
+        "capacity_admitted": False,
+        "numerical": None,
+    }
+    destination = output / "callback-source-packet.json"
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 384)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(receipt, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {
+        "path": str(destination),
+        "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "size_bytes": destination.stat().st_size,
+    }
+
+
+def _verify_lora_build_evidence(operation, *, lora_int_id, received, size, sources):
+    _receiver_require(
+        type(operation) is ObservedLoRAOperation
+        and operation.evidence.get("schema") == "observed-lora-native-build-binding-v1"
+        and (operation.evidence.get("lora_int_id") == lora_int_id)
+        and (operation.evidence.get("original_received") == received)
+        and (operation.evidence.get("received_bytes") == size)
+        and (operation.evidence.get("all_received_adapter_factors_bound") is True)
+        and (operation.evidence.get("built_factor_byte_correspondence_verified") is True)
+        and (operation.evidence.get("matched_retained_model_parser_mapper_sources") is True)
+        and (operation.evidence.get("native_builder_calls") == 1)
+        and (operation.evidence.get("evidence_sources") == sources),
+        "source-matched one-build evidence must bind every actual received factor",
+    )
+
+
+@contextmanager
+def owned_received_lora(
+    receiver,
+    engine,
+    *,
+    lora_int_id,
+    lora_name,
+    lora_config,
+    max_received_bytes,
+    admitted_sources,
+    observer,
+    builder,
+    installer,
+    normalize_config,
+    native_model_class,
+    parse_name,
+    remap_key,
+    served_prefix_for_model,
+    teardown,
+):
+    with owned_receiver_binding(
+        receiver, adapter_id=lora_int_id, admitted_sources=admitted_sources, teardown=teardown
+    ) as binding:
+        _receiver_require(type(lora_name) is str and lora_name, "nonempty owned adapter name required")
+        _receiver_require(
+            type(max_received_bytes) is int and max_received_bytes > 0, "explicit positive received byte cap required"
+        )
+        _receiver_require(not receiver.model_config.quantization, "quantized adapter operation is not supported")
+        sources = _bind_sources(
+            binding.sources,
+            engine.receive_weights,
+            observer,
+            builder,
+            installer,
+            normalize_config,
+            native_model_class,
+            parse_name,
+            remap_key,
+            served_prefix_for_model,
+        )
+        config = normalize_config(lora_config, location="lora_config")
+        tensors, received, size = ({}, {}, 0)
+        for name, value in engine.receive_weights():
+            binding.guard()
+            _receiver_require(
+                type(name) is str and name and (name not in received), "wire tensor names must be nonempty and unique"
+            )
+            _receiver_require(
+                name.endswith((".lora_A.weight", ".lora_B.weight")),
+                "only original adapter A/B wire factors are supported",
+            )
+            size += value.numel() * value.element_size()
+            _receiver_require(size <= max_received_bytes, "received adapter byte cap exceeded")
+            received[name] = tensor_manifest(value)
+            clone = value.detach().to(device="cpu", copy=True).contiguous()
+            _receiver_require(
+                tensor_manifest(clone) == received[name], "retained adapter copy differs from actual wire bytes"
+            )
+            tensors[name] = clone
+            verify_sources(sources)
+        _receiver_require(received, "empty adapter transfer cannot install a policy")
+        binding.guard()
+        operation = observer(
+            builder,
+            lora_int_id=lora_int_id,
+            tensors=tensors,
+            lora_config=config,
+            device="cpu",
+            dtype=receiver.model_config.dtype,
+            model=binding.native_model,
+            native_model_class=native_model_class,
+            parse_name=parse_name,
+            remap_key=remap_key,
+            served_prefix_for_model=served_prefix_for_model,
+            max_binding_bytes=max_received_bytes,
+            admitted_sources=sources,
+        )
+        verify_sources(sources)
+        binding.guard()
+        _verify_lora_build_evidence(operation, lora_int_id=lora_int_id, received=received, size=size, sources=sources)
+        installation = binding.install(operation.value, installer=installer)
+        yield {
+            "schema": "job3-owned-received-lora-operation-v2",
+            "status": "adapter_installed",
+            "weight_format": "lora",
+            "lora_int_id": lora_int_id,
+            "lora_name": lora_name,
+            "received": deepcopy(received),
+            "received_bytes": size,
+            "wire_to_built": deepcopy(operation.evidence),
+            "manager_installation": installation,
+            "evidence_sources": sources,
+            "adapter_storage_verified": False,
+            "adapter_application_verified": False,
+            "full_parameter_coverage": False,
+            "capacity_admitted": False,
+            "numerical": None,
+        }
+        binding.guard()
+        verify_sources(sources)
+
+
+@contextmanager
+def owned_selected_received_lora(
+    receiver,
+    engine,
+    *,
+    distributions,
+    output,
+    max_source_bytes,
+    max_layers,
+    max_total_source_bytes,
+    admitted_sources,
+    teardown,
+    **operation,
+):
+    attempted, primary = (False, None)
+
+    def close_once():
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            teardown()
+
+    try:
+        _receiver_require(callable(teardown), "captured receiver teardown required")
+        sources = _bind_sources(
+            admitted_sources, close_once, teardown, capture_selected_lora_callbacks, publish_lora_callback_sources
+        )
+        ticket = capture_selected_lora_callbacks(
+            receiver,
+            distributions=distributions,
+            admitted_sources=sources,
+            max_source_bytes=max_source_bytes,
+            max_layers=max_layers,
+        )
+        pointer = publish_lora_callback_sources(ticket, output=output, max_total_source_bytes=max_total_source_bytes)
+        ticket.guard()
+        with owned_received_lora(
+            receiver, engine, admitted_sources=ticket.sources, teardown=close_once, **operation
+        ) as result:
+            ticket.guard()
+            yield {
+                **result,
+                "schema": "job3-owned-selected-received-lora-operation-v2",
+                "selected_callback_source_packet": pointer,
+                "manager_layer_correspondence_verified": False,
+                "transitive_kernel_source_closure_complete": False,
+                "loaded_code_equivalence_to_source_proven": False,
+                "runtime_admitted": False,
+            }
+            ticket.guard()
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            close_once()
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note("captured selected receiver teardown also failed: " + repr(error))
+
+
+def make_selected_receiver_extension(base_extension, *, prepare, admitted_sources):
+    """Extend the actual supplied external receiver, without constructing it.
+
+    ``prepare(receiver)`` supplies exact selected builder/parser and private
+    publication options. Native constructor/capacity admission and engine
+    extension selection remain the useful caller's responsibility.
+    """
+    _receiver_require(enabled(), "selected LoRA RPC requires explicit evidence opt-in")
+    _receiver_require(
+        isinstance(base_extension, type) and callable(prepare),
+        "actual external receiver class and explicit preparation callback required",
+    )
+    operation = owned_selected_received_lora
+    get_engine = base_extension._get_or_create_engine
+    close_engine = base_extension.close_weight_sync
+    sources = _bind_sources(
+        admitted_sources,
+        make_selected_receiver_extension,
+        prepare,
+        base_extension,
+        get_engine,
+        close_engine,
+        operation,
+    )
+
+    class SelectedLoRAReceiver(base_extension):
+
+        def close_weight_sync(self):
+            scope = getattr(self, "_ap_selected_rpc_scope", None)
+            self._ap_selected_rpc_scope = None
+            if scope is not None:
+                scope.__exit__(None, None, None)
+            else:
+                self._close_captured_engine()
+            return {
+                "owned_adapter_scope_closed": True,
+                "external_engine_cleanup_attempted": True,
+                "capacity_admitted": False,
+                "numerical": None,
+            }
+
+        def _close_captured_engine(self):
+            if not getattr(self, "_ap_selected_engine_close_attempted", False):
+                self._ap_selected_engine_close_attempted = True
+                return close_engine(self)
+            return None
+
+        def sync_lora_weights(
+            self,
+            master_addr,
+            master_port,
+            rank_offset,
+            world_size,
+            *,
+            lora_int_id,
+            lora_name,
+            lora_config,
+            max_received_bytes,
+            admitted_sources,
+            bucket_size=256 * 1024 * 1024,
+            engine_only=False,
+        ):
+            _receiver_require(enabled(), "selected LoRA RPC requires explicit evidence opt-in")
+            _receiver_require(
+                not getattr(self, "_ap_selected_engine_close_attempted", False),
+                "closed selected receiver cannot reopen its transport",
+            )
+            _receiver_require(
+                not getattr(self, "_ap_selected_sync_attempted", False), "selected adapter transfer is single-use"
+            )
+            _receiver_require(
+                rank_offset == 1
+                and world_size == 2
+                and (type(bucket_size) is int)
+                and (bucket_size > 0)
+                and (type(engine_only) is bool),
+                "retained external pairwise transport and positive bucket required",
+            )
+            try:
+                _receiver_require(admitted_sources == sources, "RPC sources differ from the frozen caller closure")
+                verify_sources(sources)
+                _receiver_require(
+                    type(self)._get_or_create_engine is get_engine, "selected native engine factory changed"
+                )
+                engine = get_engine(
+                    self,
+                    master_addr,
+                    master_port,
+                    bucket_size,
+                    False,
+                    engine_attr="_ws_engine",
+                    key_attr="_ws_engine_key",
+                )
+                verify_sources(sources)
+                if engine_only:
+                    return {
+                        "status": "engine_ready",
+                        "weight_format": "lora",
+                        "rank": 1,
+                        "world_size": 2,
+                        "adapter_storage_verified": False,
+                        "capacity_admitted": False,
+                    }
+                self._ap_selected_sync_attempted = True
+                options = prepare(self)
+                _receiver_require(
+                    type(options) is dict and set(options) == _SELECTED_PREPARATION_KEYS,
+                    "exact selected receiver preparation options required",
+                )
+                verify_sources(sources)
+                scope = operation(
+                    self,
+                    engine,
+                    **options,
+                    lora_int_id=lora_int_id,
+                    lora_name=lora_name,
+                    lora_config=deepcopy(lora_config),
+                    max_received_bytes=max_received_bytes,
+                    admitted_sources=sources,
+                    teardown=self._close_captured_engine,
+                )
+                result = scope.__enter__()
+                self._ap_selected_rpc_scope = scope
+                manager = self.model_runner.lora_manager._adapter_manager
+                adapter = manager.get_adapter(lora_int_id)
+                _receiver_require(adapter is not None, "selected scoped adapter disappeared before RPC return")
+                verify_sources(sources)
+                return {
+                    **deepcopy(result),
+                    "schema": "explicit-external-lora-installation-v1",
+                    "lora_added": result["manager_installation"]["added"],
+                    "lora_activated": result["manager_installation"]["activated"],
+                    "is_3d_lora_weight": bool(getattr(adapter, "is_3d_lora_weight", False)),
+                    "selected_scope_retained_for_serving": True,
+                    "runtime_admitted": False,
+                }
+            except BaseException as error:
+                scope = getattr(self, "_ap_selected_rpc_scope", None)
+                self._ap_selected_rpc_scope = None
+                try:
+                    if scope is None:
+                        self._close_captured_engine()
+                    else:
+                        scope.__exit__(type(error), error, error.__traceback__)
+                except BaseException as cleanup_error:
+                    if cleanup_error is not error:
+                        error.add_note("selected RPC cleanup also failed: " + repr(cleanup_error))
+                raise
+
+    return SelectedLoRAReceiver
+
+
 # Selected
 
 PATH_ENV = "ARCTIC_PLATFORM_SELECTED_LORA_BOOTSTRAP"
 SHA_ENV = "ARCTIC_PLATFORM_SELECTED_LORA_BOOTSTRAP_SHA256"
 SELECTED_LORA_EXTENSION = "arctic_platform.debug.lora.SelectedLoRAWeightSyncExtension"
-RPC_PATH = Path(__file__).resolve().parents[2] / ".codex-run-state/job-scripts/job3_lora_selected_rpc.py"
-RPC_SHA = "0ad85782bd2b4405b713635c6bfc036acfd5f2ff1977bf1d38c4b7a0bb394230"
 
 
 def _bytes(path):
@@ -2270,8 +2984,8 @@ def bootstrap_descriptor(pointer):
     verify_sources(sources)
     observed = source_files(bootstrap_descriptor, LoRASamplerEvidenceWorker, engine_kwargs_for_lora)
     _receiver_require(
-        observed.items() <= sources.items() and sources.get(str(RPC_PATH)) == RPC_SHA,
-        "bootstrap, frozen worker and scoped RPC sources must be admitted",
+        observed.items() <= sources.items(),
+        "bootstrap, worker and scoped receiver sources must be admitted",
     )
     for key in ("receiver", "prepare"):
         item = body[key]
@@ -2307,28 +3021,6 @@ def _symbol(item, sources):
     return value
 
 
-def _rpc_factory(sources):
-    raw = _bytes(RPC_PATH)
-    _receiver_require(hashlib.sha256(raw).hexdigest() == RPC_SHA, "frozen selected RPC changed")
-    verify_sources(sources)
-    key = "_job3_selected_sampler_rpc"
-    spec = importlib.util.spec_from_file_location(key, RPC_PATH)
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.modules.get(key)
-    sys.modules[key] = module
-    try:
-        exec(compile(raw, str(RPC_PATH), "exec", dont_inherit=True), module.__dict__)
-        _receiver_require(_bytes(RPC_PATH) == raw, "selected RPC changed during loading")
-        verify_sources(sources)
-    except BaseException:
-        if previous is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = previous
-        raise
-    return module.make_selected_receiver_extension
-
-
 def selected_receiver_extension(pointer):
     """Resolve the supplied native class without constructing a model/receiver."""
     _receiver_require(enabled(), "selected receiver bootstrap requires explicit opt-in")
@@ -2341,7 +3033,7 @@ def selected_receiver_extension(pointer):
         isinstance(receiver, type) and inspect.isfunction(prepare),
         "actual receiver class and function required",
     )
-    scoped = _rpc_factory(sources)(receiver, prepare=prepare, admitted_sources=sources)
+    scoped = make_selected_receiver_extension(receiver, prepare=prepare, admitted_sources=sources)
 
     class SelectedLoRAWeightSyncExtension(scoped):
         def sync_lora_weights(self, *args, **kwargs):
@@ -2356,7 +3048,7 @@ def selected_receiver_extension(pointer):
                 except BaseException as cleanup_error:
                     error.add_note("selected bootstrap cleanup also failed: " + repr(cleanup_error))
                 raise
-            # The frozen RPC owns its failures, including non-destructive
+            # The scoped receiver owns its failures, including non-destructive
             # rejection of a duplicate transfer while its first scope is live.
             result = super().sync_lora_weights(*args, **kwargs)
             try:
@@ -2501,8 +3193,6 @@ class SelectedLoRASamplerWorker(LoRASamplerEvidenceWorker):
                 AsyncLLM.shutdown,
                 serving_lora_request,
             )
-            pass
-            pass
 
             maybe_admit_sampler_construction(self, args, AsyncLLM.from_vllm_config, engine_kwargs)
             self.llm = AsyncLLM.from_vllm_config(args.create_engine_config(), stat_loggers=[RingStatLogger])
@@ -2615,8 +3305,6 @@ def _actual_components():
 
     from arctic_platform.common.peft import normalize_lora_peft_config
 
-    pass
-
     # Resolve the optional server only on the selected native worker.
     native = importlib.import_module("arctic_platform.inference.server.weight_sync.receiver")
 
@@ -2655,7 +3343,7 @@ def _rank_output(root, rank):
 
 
 def prepare_selected_lora_receiver(receiver):
-    """Supply the frozen RPC's exact options from actual selected-worker imports."""
+    """Supply exact receiver options from the selected worker's imports."""
     settings, sources = preparation_settings()
     components, get_world_group = _actual_components()
     observed = source_files(
@@ -2921,8 +3609,6 @@ def _initialization_request(
         and all(character in "0123456789abcdef" for character in digest),
         "selected initialization requires an explicit FAST request and SHA256",
     )
-    pass
-    pass
 
     raw = _bytes(path)
     _receiver_require(hashlib.sha256(raw).hexdigest() == digest, "initialization request changed")
@@ -2978,7 +3664,6 @@ def _initialization_request(
 
 
 def _initialization_code(actual, sources):
-    pass
 
     path = actual.co_filename
     _receiver_require(path in sources, "initialization callable origin is not admitted")
@@ -3006,7 +3691,6 @@ def _initialization_function(function, sources):
 
 
 def _initialization_slot(selected, subject, *surfaces, request_reader=_initialization_request):
-    pass
 
     pointer, request = selected
     sources = request["admitted_sources"]
@@ -3057,7 +3741,6 @@ def _initialization_slot(selected, subject, *surfaces, request_reader=_initializ
 
 
 def _guard_initialization(slot):
-    pass
 
     _receiver_require(
         slot["request_reader"]() == (slot["pointer"], slot["request"]),
@@ -3953,7 +4636,6 @@ def maybe_legacy_lora_replica_pool(pool_class):
         from arctic_platform.debug.weight_sync import maybe_replica_pool
 
         return maybe_replica_pool(pool_class)
-    pass
 
     return make_lora_replica_pool(pool_class, request["sampling"])
 
@@ -4436,234 +5118,6 @@ def stage_selected_lora_request(
         "native_engine_constructed": False,
         "numerical": None,
     }
-
-
-# Bootstrap
-
-PEER = "10.4.171.50"
-PYTHON = "/home/yak/miniconda3/envs/dss/bin/python"
-RAY = "/home/yak/miniconda3/envs/dss/bin/ray"
-
-
-def _bootstrap_require(value, message):
-    if not value:
-        raise ValueError(message)
-
-
-def _environment(staged):
-    _bootstrap_require(
-        staged["schema"] == "job3-selected-lora-staged-inputs-v1"
-        and staged["training_gpus"] == staged["sampling_gpus"] == 8
-        and staged["runtime_admitted"] is staged["capacity_admitted"] is False
-        and staged["native_engine_constructed"] is False
-        and staged["limits_are_capacity_proof"] is False
-        and staged["numerical"] is None,
-        "original source-only TRAIN8+SAMPLE8 staged inputs required",
-    )
-    settings = {
-        VERIFY_ENV: "1",
-        REQUEST_ENV: staged["request"]["path"],
-        DIGEST_ENV: staged["request"]["sha256"],
-        PATH_ENV: staged["bootstrap"]["path"],
-        SHA_ENV: staged["bootstrap"]["sha256"],
-    }
-    if "initialization" in staged:
-        pointer = staged["initialization"]
-        _bootstrap_require(
-            type(pointer) is dict and set(pointer) == {"path", "sha256"},
-            "exact staged initialization pointer required",
-        )
-        settings.update(
-            {INITIALIZATION_ENV: pointer["path"], INITIALIZATION_SHA_ENV: pointer["sha256"]},
-        )
-        selected = _initialization_request(environment=settings)
-        _bootstrap_require(
-            selected is not None
-            and selected[0] == pointer
-            and selected[1]["admitted_sources"] == staged["admitted_sources"],
-            "staged initialization must bind the same complete source closure",
-        )
-    _bootstrap_require(staged["environment"] == settings, "staged environment differs from pointers")
-    body = bootstrap_descriptor(staged["bootstrap"])
-    sources = staged["admitted_sources"]
-    _bootstrap_require(body["admitted_sources"] == sources, "bootstrap source closure differs")
-    for name in ("request", "settings"):
-        pointer = staged[name]
-        raw = _bytes(pointer["path"])
-        _bootstrap_require(
-            hashlib.sha256(raw).hexdigest() == pointer["sha256"],
-            "staged request or settings bytes changed",
-        )
-    _bootstrap_require(
-        sources.get(staged["settings"]["path"]) == staged["settings"]["sha256"],
-        "settings must belong to the shared source closure",
-    )
-    verify_sources(sources)
-    return settings, dict(sources)
-
-
-@contextmanager
-def owned_selected_lora_bootstrap(staged, *, cluster, base_environment, staging, guard):
-    """Wrap the supplied frozen context; do not start a cluster or construct a model."""
-    staged = deepcopy(staged)
-    settings, sources = _environment(staged)
-    original = cluster._pdsh
-    observed = source_files(
-        owned_selected_lora_bootstrap.__wrapped__,
-        _environment,
-        inspect.unwrap(base_environment),
-        original,
-        selected_lora_request,
-        _initialization_request,
-    )
-    _bootstrap_require(observed.items() <= sources.items(), "captured bootstrap sources must be admitted")
-    previous = {key: os.environ.get(key) for key in settings}
-    _bootstrap_require(
-        all(value is None or value == settings[key] for key, value in previous.items()),
-        "cannot replace another owner's request environment",
-    )
-    report = {
-        "schema": "job3-selected-lora-bootstrap-forwarding-v1",
-        "environment": dict(settings),
-        "peer_launches": [],
-        "peer_runtime_admitted": False,
-        "capacity_admitted": False,
-        "native_engine_constructed": False,
-        "numerical": None,
-        "callback_restored": False,
-        "environment_restored": False,
-    }
-    base_settings = None
-    primary = None
-
-    def launch_peer(hosts, argv, **kwargs):
-        _bootstrap_require(list(hosts) == [PEER], "only the current same-allocation peer is allowed")
-        if len(argv) == 4 and argv[:1] == [PYTHON] and argv[2] == "--cleanup-root":
-            # The frozen context already validates its exact captured cleanup path.
-            return original(hosts, argv, **kwargs)
-        root = cluster._spawned_temp_dir
-        _bootstrap_require(
-            type(base_settings) is dict
-            and type(root) is str
-            and re.fullmatch(r"/tmp/j3rl-[0-9a-f]{24}", root)
-            and argv[:1] == ["env"],
-            "captured native peer bootstrap command required",
-        )
-        prefix = ["env", *(f"{key}={value}" for key, value in sorted(base_settings.items()))]
-        command = argv[len(prefix) :]
-        _bootstrap_require(
-            argv[: len(prefix)] == prefix
-            and len(command) == 5
-            and command[:2] == [RAY, "start"]
-            and re.fullmatch(r"--address=10\.4\.166\.121:[0-9]{1,5}", command[2])
-            and command[3:] == [f"--temp-dir={root}", "--disable-usage-stats"]
-            and 1 <= int(command[2].rsplit(":", 1)[1]) <= 65535
-            and kwargs == {"check": False, "timeout": 600}
-            and all(key not in base_settings or base_settings[key] == value for key, value in settings.items()),
-            "exact retained native peer recipe and unchanged base environment required",
-        )
-        guard()
-        _bootstrap_require(_environment(staged) == (settings, sources), "staged inputs changed before peer launch")
-        merged = {**base_settings, **settings}
-        forwarded = ["env", *(f"{key}={value}" for key, value in sorted(merged.items())), *command]
-        result = original(hosts, forwarded, **kwargs)
-        report["peer_launches"].append(
-            {
-                "hosts": list(hosts),
-                "argv": forwarded,
-                "exit": result.returncode,
-                "runtime_admitted": False,
-            }
-        )
-        guard()
-        _bootstrap_require(_environment(staged) == (settings, sources), "staged inputs changed during peer launch")
-        return result
-
-    context = None
-    entered = False
-    callback_bound = False
-    environment_bound = False
-    try:
-        guard()
-        _bootstrap_require(
-            cluster._pdsh is original and all(os.environ.get(key) == value for key, value in previous.items()),
-            "captured bootstrap ownership changed before installation",
-        )
-        os.environ.update(settings)
-        environment_bound = True
-        request = selected_lora_request()
-        _bootstrap_require(
-            request["training"]["admitted_sources"] == request["sampling"]["admitted_sources"] == sources,
-            "actual selected request differs from staged sources",
-        )
-        cluster._pdsh = launch_peer
-        callback_bound = True
-        context = base_environment(staging, cluster=cluster, guard=guard)
-        base_receipt = context.__enter__()
-        entered = True
-        base_settings = dict(base_receipt["settings"])
-        report["base"] = base_receipt
-        try:
-            yield report
-        except BaseException as error:
-            primary = error
-            try:
-                context.__exit__(type(error), error, error.__traceback__)
-            except BaseException as cleanup_error:
-                error.add_note("captured bootstrap teardown also failed: " + repr(cleanup_error))
-            entered = False
-            raise
-        else:
-            entered = False
-            context.__exit__(None, None, None)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        try:
-            if entered and context is not None:
-                try:
-                    context.__exit__(None, None, None)
-                except BaseException as cleanup_error:
-                    if primary is None:
-                        primary = cleanup_error
-                        raise
-                    primary.add_note("captured bootstrap entry cleanup also failed: " + repr(cleanup_error))
-        finally:
-            ownership_changes = []
-            if callback_bound:
-                if cluster._pdsh is launch_peer:
-                    cluster._pdsh = original
-                else:
-                    ownership_changes.append("peer callback")
-            report["callback_restored"] = cluster._pdsh is original
-            if environment_bound:
-                for key, value in previous.items():
-                    if os.environ.get(key) != settings[key]:
-                        ownership_changes.append("environment key " + key)
-                    elif value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
-            report["environment_restored"] = all(os.environ.get(key) == value for key, value in previous.items())
-            restoration_error = (
-                ValueError("captured bootstrap ownership changed: " + ", ".join(ownership_changes))
-                if ownership_changes
-                else None
-            )
-            try:
-                verify_sources(sources)
-                guard()
-            except BaseException as cleanup_error:
-                if primary is None:
-                    if restoration_error is not None:
-                        cleanup_error.add_note(str(restoration_error))
-                    raise
-                primary.add_note("final bootstrap source guard also failed: " + repr(cleanup_error))
-            if restoration_error is not None:
-                if primary is None:
-                    raise restoration_error
-                primary.add_note(str(restoration_error))
 
 
 def __getattr__(name):

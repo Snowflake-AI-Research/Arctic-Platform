@@ -502,8 +502,6 @@ def _optimizer_capture_worker_class() -> Any:
                 or getattr(self, "_optimizer_participation_capture", None) is not None
             ):
                 return
-            pass
-            pass
 
             if self.engine.global_steps != 0:
                 raise ValueError("optimizer participation must be armed before the first backward")
@@ -558,8 +556,6 @@ def _optimizer_capture_worker_class() -> Any:
             return result
 
         def _optimizer_participation(self) -> tuple[dict, dict]:
-            pass
-            pass
 
             def observe():
                 capture = getattr(self, "_optimizer_participation_capture", None)
@@ -761,8 +757,6 @@ def _optimizer_capture_worker_class() -> Any:
             before_dir = output_dir / "before"
             self._optimizer_collective_check(self._relink_optimizer_state)
             model = self.engine.module if hasattr(self.engine, "module") else self.engine
-            pass
-            pass
 
             participation, inactive_weights = self._optimizer_participation()
 
@@ -1060,7 +1054,6 @@ def active_gradient_norms(record: dict, norms: dict) -> dict:
 
 
 def weight_identity(tensor) -> dict:
-    pass
 
     if not bool(tensor.isfinite().all()):
         raise ValueError("inactive weight witness contains nonfinite values")
@@ -1662,8 +1655,6 @@ def arm_native_optimizer_collector(
     nonce = uuid.uuid4().hex if nonce is None else nonce
     if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
         raise ValueError("native collector requires an exact hexadecimal nonce")
-    pass
-    pass
 
     if engine.global_steps != 0:
         raise ValueError("native participation must be armed before the first backward")
@@ -3187,7 +3178,6 @@ def decode_optimizer_capture(
         _native_sources(native)
     participation, inactive_weights = None, {}
     if participation_receipts is not None:
-        pass
 
         if native is not None:
             raise ValueError("ordinary participation receipts cannot replace native collector evidence")
@@ -3208,7 +3198,6 @@ def decode_optimizer_capture(
             {name: [0] for name in shapes},
         )
     if native is not None:
-        pass
 
         receipts = [
             [
@@ -3239,7 +3228,6 @@ def decode_optimizer_capture(
                 master_before = _parameter(before, group_index, name, "fp32_master")
                 master_after = _parameter(after, group_index, name, "fp32_master")
                 if name in inactive_weights:
-                    pass
 
                     inactive_weights[name]["master"] = {
                         "before": weight_identity(master_before),
@@ -3264,7 +3252,6 @@ def decode_optimizer_capture(
         manifest = output_dir / "manifest.json"
         provenance = {}
         if participation is not None:
-            pass
 
             validate_inactive_weights(participation, inactive_weights)
             provenance.update(participation=participation, inactive_weights=inactive_weights)

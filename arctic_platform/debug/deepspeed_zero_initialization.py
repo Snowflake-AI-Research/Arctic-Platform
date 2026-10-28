@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2026 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """Request-scoped observation of installed ZeRO initialization allocations."""
 
 from __future__ import annotations

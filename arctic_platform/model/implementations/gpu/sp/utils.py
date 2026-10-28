@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """Token-local model execution with a replicated logical-row GRPO objective.
 
 Sequence parallelism (SP) partitions one logical replica's packed tokens in

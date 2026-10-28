@@ -424,8 +424,6 @@ def bind_payload(payload: dict, adapter_path: str | Path | None, *, native_backe
             raise LoraInitializationPrerequisiteError("LoRA target requires a deterministic adapter initialization")
         return payload
     if native_backend is not None:
-        pass
-        pass
 
         root = Path(adapter_path)
         if (root / "initialization.json").exists():
@@ -482,8 +480,6 @@ def _topology(config: dict) -> dict:
 
 def _tensor_identity(state: dict) -> list[dict]:
     import torch
-
-    pass
 
     entries = []
     names = set()
@@ -633,7 +629,6 @@ def adapter_files(path: str | Path, expected_identity: dict) -> dict[str, bytes]
 
 
 def _verify_original_adapter(path: Path, expected_identity: dict, expected_original_metadata: dict) -> dict:
-    pass
 
     metadata = identity_metadata(path)
     if metadata != expected_original_metadata:
@@ -671,7 +666,6 @@ def native_worker_adapter_scope(
     rank: int,
 ):
     """Wrap the actual worker's imported engine initializer before optimizer creation."""
-    pass
 
     if not isinstance(job_id, str) or not job_id.strip() or type(rank) is not int or rank < 0:
         raise ValueError("native adapter scope requires an explicit job identity and nonnegative worker rank")
@@ -855,8 +849,6 @@ def _adapter_parameters(model) -> dict:
     import torch
     from peft.tuners.lora.layer import LoraLayer
 
-    pass
-
     parameters = {}
     seen = set()
     storage_seen = set()
@@ -904,8 +896,6 @@ def _adapter_parameters(model) -> dict:
 def initialize_native_adapter(model, path: str | Path, expected_identity: dict) -> None:
     """Transactionally copy exact native factors before optimizer construction."""
     import torch
-
-    pass
 
     state, identity = _read_adapter(path)
     if identity != expected_identity:
@@ -1025,7 +1015,6 @@ def bind_original_adapter(payload: dict, path: Path, backend) -> dict:
     from arctic_platform.correctness.harness import lora
 
     adapter_identity = shared_adapter_identity
-    pass
 
     capability = gateway_capability(backend)
     root = require_data_fast_path(path, label="native original PEFT adapter").resolve(strict=True)
@@ -1096,7 +1085,6 @@ def _verify_shared_identity(identity: dict) -> None:
 
 def bind_shared_adapter(payload: dict, path: Path, backend) -> dict:
     """Bind an actual upstream-default pack without inventing deterministic metadata."""
-    pass
     adapter_identity = shared_adapter_identity
 
     capability = gateway_capability(backend, shared=True)
@@ -1273,8 +1261,6 @@ def _native_worker_adapter_scope(
 ):
     from arctic_platform.correctness.harness import lora as native_adapter
     from arctic_platform.correctness.harness import lora as shared
-
-    pass
 
     if not isinstance(job_id, str) or not job_id.strip() or type(rank) is not int or rank < 0:
         raise ValueError("native shared adapter requires an explicit job identity and nonnegative worker rank")
@@ -1684,9 +1670,6 @@ def install_manager(manager) -> None:
     import ray
     from dss.ray_dss.jobs.gpu import training
     from dss.ray_dss.zones import manager as manager_module
-
-    pass
-    pass
 
     if manager.zone_type.value != "training" or manager.backend.value != "gpu":
         return

@@ -43,7 +43,6 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
 from arctic_platform.correctness.harness.gateway import build_payload
-from arctic_platform.correctness.harness.gateway import copy_checkpoint_peft_adapter
 from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
@@ -277,64 +276,6 @@ def run_reference(
             f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
         )
     return json.loads(out_path.read_text())
-
-
-def materialize_dss_peft_adapter(
-    cfg: LoadedConfig,
-    model_path: str,
-    workdir: Path,
-    *,
-    attn_implementation: str,
-) -> Path | None:
-    """Export the product-initialized adapter so the independent reference starts from identical bytes."""
-    if not cfg.training.get("peft_config"):
-        return None
-    workdir = require_data_fast_path(workdir, label="PEFT adapter workdir")
-    cfg = cfg.at_gpu_width(cfg.n_gpus)
-    backend = None
-    if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
-        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
-
-        if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
-            raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
-        backend = cfg.native.backend
-        require_local_cortex_gateway(backend)
-        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
-            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
-    workdir.mkdir(parents=True, exist_ok=True)
-    gateway_dir = workdir / "gateway"
-    gateway_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir = workdir / "adapter"
-    payload = build_payload(
-        cfg.training,
-        model_path,
-        SEED,
-        attn_implementation=attn_implementation,
-        weight_format=cfg.sub_job.get("weight_format"),
-    )
-    checkpoint_root = workdir / "checkpoint"
-    if backend is not None:
-        checkpoint_root = require_data_fast_path(checkpoint_root, label="GLM initial checkpoint")
-        adapter_dir = require_data_fast_path(adapter_dir, label="GLM initial adapter")
-        if adapter_dir.exists():
-            raise FileExistsError(f"GLM initial adapter already exists: {adapter_dir}")
-        checkpoint_root.mkdir()
-        payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
-    with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
-        with running_job(session, payload) as job:
-            if backend is not None:
-                from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
-
-                # The native EP checkpointer writes the unmerged adapter under global_step0/default.
-                saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
-                tag = _local_checkpoint_metadata(saved, checkpoint_root, "initial adapter save")
-                if tag != "global_step0":
-                    raise RuntimeError("GLM initial adapter save must report step zero")
-                exported_root = checkpoint_root
-            else:
-                saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
-                exported_root = Path(saved.get("hf_path") or saved["path"]).parent
-    return copy_checkpoint_peft_adapter(exported_root, adapter_dir)
 
 
 # The optimizer comparison needs a step large enough to separate a real disagreement from rounding, so

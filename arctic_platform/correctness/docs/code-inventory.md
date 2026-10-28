@@ -15,7 +15,7 @@ Paths in this table are relative to `arctic_platform/correctness/`.
 | `harness/sft.py` | Synthetic and configured inputs, dataset locations, training settings, and answer-token scoring. |
 | `harness/cortex.py` | Training transport contracts, local gateway client, fixture admission, and explicitly requested microbatch packing. Ordinary requests remain unsplit. |
 | `harness/lora.py` | Upstream PEFT reference adapters, content verification, native loading, and legacy E2E adapter recipes. Retained internal Ray loading is not an admitted Cortex-training target route. |
-| `harness/gateway.py`, `harness/gateway_cleanup.py` | Gateway ownership, supervised and RL training lifecycles, payloads, and owned-worker cleanup. |
+| `harness/gateway.py` | Gateway ownership, supervised and RL training lifecycles, payloads, and owned-worker cleanup. A standard-library-only subprocess watches the owner lifetime pipe and imports this library only after abnormal owner exit. |
 | `harness/optimizer.py` | Tensor-name alignment, participation coverage, optimizer capture, and checkpoint decoding. |
 | `harness/inference.py` | Checkpoint export, inference allocation validation, and router-replay evidence collection. |
 | `models/` | Shared original-model metadata and exact validation; metadata alone does not establish runtime or capacity admission. |

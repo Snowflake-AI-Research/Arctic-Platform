@@ -37,6 +37,7 @@ import math
 import os
 import re
 import runpy
+import select
 import shlex
 import shutil
 import signal
@@ -3917,47 +3918,6 @@ def test_inference_training_placement_uses_real_width_without_mutating_reviewed_
     assert options["inference_sampling_topology"] == (16, 8, 2)
     assert options["local_gateway_full_model"] is True
     admission.assert_called_once()
-
-
-@pytest.mark.parametrize("weight_format", [None, "hf", "vllm"])
-def test_inference_forwarding_runner_adapter_payload_keeps_native_weight_format(monkeypatch, tmp_path, weight_format):
-    from contextlib import contextmanager
-
-    from arctic_platform.correctness.harness.config import load_config
-
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/qwen3-8b/h200/train-sft-lora-4gpus-64k.config")
-    if weight_format is not None:
-        config.sub_job["weight_format"] = weight_format
-    captured = []
-
-    def payload(*args, **kwargs):
-        captured.append(kwargs)
-        return {}
-
-    @contextmanager
-    def session(*args, **kwargs):
-        yield object()
-
-    @contextmanager
-    def job(*args, **kwargs):
-        client = SimpleNamespace(save_checkpoint=lambda **kw: {"hf_path": str(tmp_path / "checkpoint" / "hf")})
-        yield SimpleNamespace(client=client)
-
-    monkeypatch.setattr(runner, "require_data_fast_path", lambda path, **kw: Path(path))
-    monkeypatch.setattr(runner, "build_payload", payload)
-    monkeypatch.setattr(runner, "gateway", session)
-    monkeypatch.setattr(runner, "running_job", job)
-    monkeypatch.setattr(runner, "copy_checkpoint_peft_adapter", lambda root, path: path)
-    assert (
-        runner.materialize_dss_peft_adapter(
-            config,
-            "unchanged",
-            tmp_path,
-            attn_implementation=config.attention_implementation,
-        )
-        == tmp_path / "adapter"
-    )
-    assert captured[0]["weight_format"] == weight_format
 
 
 @pytest.mark.parametrize(
@@ -8823,11 +8783,11 @@ def test_owned_gateway_real_process_signal_reaps_child(tmp_path, signum):
         "\nimport os\nimport signal\nimport subprocess\nimport sys\nfrom pathlib import Path\nfrom types import"
         " SimpleNamespace\nimport requests\nimport torch\nfrom arctic_platform.correctness.harness import gateway as"
         " dss_driver\n\ndirectory = Path(sys.argv[1])\noriginal_popen = subprocess.Popen\ndef start_gateway(*args,"
-        ' **kwargs):\n    if "gateway_cleanup.py" in str(args[0][1]):\n        return original_popen(*args,'
-        ' **kwargs)\n    return original_popen(\n        [sys.executable, "-c", "import time; time.sleep(300)"],\n    '
-        '    stdout=kwargs["stdout"], stderr=kwargs["stderr"], start_new_session=True, env=kwargs["env"],\n   '
-        " )\ndss_driver.subprocess.Popen = start_gateway\ndss_driver._allocation_hostfile = lambda:"
-        " None\ndss_driver._gateway_state_directory = lambda: directory /"
+        ' **kwargs):\n    if args[0][1:3] == ["-c", dss_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return'
+        ' original_popen(*args, **kwargs)\n    return original_popen(\n        [sys.executable, "-c", "import time;'
+        ' time.sleep(300)"],\n        stdout=kwargs["stdout"], stderr=kwargs["stderr"], start_new_session=True,'
+        ' env=kwargs["env"],\n    )\ndss_driver.subprocess.Popen = start_gateway\ndss_driver._allocation_hostfile ='
+        " lambda: None\ndss_driver._gateway_state_directory = lambda: directory /"
         ' "ownership"\ndss_driver._legacy_owned_gateways = lambda: []\ntorch.cuda.device_count = lambda:'
         " 1\nrequests.get = lambda *args, **kwargs: SimpleNamespace(status_code=200)\nwith"
         ' dss_driver.local_cortex_gateway(directory):\n    (directory / "ready").write_text(str(os.getpid()))\n   '
@@ -9075,19 +9035,17 @@ def test_owned_gateway_registry_records_launch_and_clears_after_cleanup(_automat
 def test_owned_gateway_cleanup_guard_respects_replacement_registry(tmp_path, monkeypatch, record_token, lock_busy):
     import fcntl
 
-    from arctic_platform.correctness.harness import gateway_cleanup
-
     path = tmp_path / "gateway.json"
     if record_token is not None:
         path.write_text(json.dumps({"token": record_token}))
     recover = Mock()
     scan = Mock()
     monkeypatch.setattr(dss_driver, "_recover_owned_gateway", recover)
-    monkeypatch.setattr(gateway_cleanup, "_cleanup_unrecorded_gateway", scan)
+    monkeypatch.setattr(dss_driver, "_cleanup_unrecorded_gateway", scan)
     with (tmp_path / "owner.lock").open("a") as lock:
         if lock_busy:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        gateway_cleanup.cleanup_owned_gateway(path, "old-token")
+        dss_driver.cleanup_owned_gateway(path, "old-token")
     if record_token == "old-token" and not lock_busy:
         recover.assert_called_once_with(path)
     else:
@@ -9096,18 +9054,53 @@ def test_owned_gateway_cleanup_guard_respects_replacement_registry(tmp_path, mon
     assert path.exists() == (record_token is not None)
 
 
-def test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_failure(tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness import gateway_cleanup
+def test_owned_gateway_cleanup_guard_normal_exit_uses_only_standard_library(tmp_path):
+    reader, writer = os.pipe()
+    process = None
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                dss_driver._GATEWAY_CLEANUP_BOOTSTRAP,
+                str(reader),
+                str(tmp_path / "gateway.json"),
+                "test-token",
+            ],
+            pass_fds=(reader,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(reader)
+        reader = None
+        assert select.select([process.stdout], [], [], 10)[0], "cleanup guard handshake timed out"
+        assert process.stdout.readline() == b"ready\n"
+        os.write(writer, b"done\n")
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr.decode()
+        assert stdout == stderr == b""
+        assert not list(tmp_path.iterdir())
+    finally:
+        if reader is not None:
+            os.close(reader)
+        os.close(writer)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
 
+
+def test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_failure(tmp_path, monkeypatch):
     path = tmp_path / "gateway.json"
     path.write_text(json.dumps({"token": "old-token"}))
     monkeypatch.setattr(
         dss_driver, "_recover_owned_gateway", Mock(side_effect=operator_interface_UnsafeCleanupError("unsafe"))
     )
     scan = Mock()
-    monkeypatch.setattr(gateway_cleanup, "_cleanup_unrecorded_gateway", scan)
+    monkeypatch.setattr(dss_driver, "_cleanup_unrecorded_gateway", scan)
     with pytest.raises(operator_interface_UnsafeCleanupError, match="unsafe"):
-        gateway_cleanup.cleanup_owned_gateway(path, "old-token")
+        dss_driver.cleanup_owned_gateway(path, "old-token")
     scan.assert_called_once_with("old-token")
     assert path.exists()
 
@@ -9129,12 +9122,13 @@ def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_co
         " signal.SIG_IGN); \"\n    f\"Path({str(root / 'worker.pid')!r}).write_text(str(os.getpid()));"
         ' time.sleep(300)"\n)\ngateway_script = (\n    "import subprocess,sys,time; "\n   '
         " f\"subprocess.Popen([sys.executable, '-c', {child_script!r}], start_new_session=True);"
-        ' time.sleep(300)"\n)\ndef start_gateway(*args, **kwargs):\n    if "gateway_cleanup.py" in str(args[0][1]):\n '
-        '       return original_popen(*args, **kwargs)\n    gateway = original_popen(\n        [sys.executable, "-c",'
-        ' gateway_script],\n        stdout=kwargs["stdout"], stderr=kwargs["stderr"], start_new_session=True,'
-        ' env=kwargs["env"],\n    )\n    (root / "gateway.pid").write_text(str(gateway.pid))\n    if phase =='
-        ' "unrecorded":\n        (root / "ready").write_text("")\n        signal.pause()\n    return'
-        ' gateway\ndss_driver.subprocess.Popen = start_gateway\ndirectory = root / "attempt"\ncontext ='
+        ' time.sleep(300)"\n)\ndef start_gateway(*args, **kwargs):\n    if args[0][1:3] == ["-c",'
+        " dss_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return original_popen(*args, **kwargs)\n    gateway ="
+        ' original_popen(\n        [sys.executable, "-c", gateway_script],\n        stdout=kwargs["stdout"],'
+        ' stderr=kwargs["stderr"], start_new_session=True, env=kwargs["env"],\n    )\n    (root /'
+        ' "gateway.pid").write_text(str(gateway.pid))\n    if phase == "unrecorded":\n        (root /'
+        ' "ready").write_text("")\n        signal.pause()\n    return gateway\ndss_driver.subprocess.Popen ='
+        ' start_gateway\ndirectory = root / "attempt"\ncontext ='
         " (onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=directory))\n           if"
         ' command == "onboarding" else dss_driver.local_cortex_gateway(directory))\nwith context:\n    (root /'
         ' "ready").write_text("")\n    signal.pause()\n'
@@ -14948,7 +14942,7 @@ def test_dss_driver_reference_runner_passes_the_harness_seed(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
-@pytest.mark.parametrize("boundary", ["execute", "execute_rl", "adapter", "reference_optimizer"])
+@pytest.mark.parametrize("boundary", ["execute", "execute_rl", "reference_optimizer"])
 def test_dss_driver_runner_requires_data_fast_before_operational_side_effects(tmp_path, monkeypatch, unsafe, boundary):
     from arctic_platform.correctness.harness import runner
 
@@ -14970,8 +14964,6 @@ def test_dss_driver_runner_requires_data_fast_before_operational_side_effects(tm
             runner.execute(cfg, None, [], vocab_size=128, workdir=destination)
         elif boundary == "execute_rl":
             runner.execute_rl(cfg, None, vocab_size=128, workdir=destination)
-        elif boundary == "adapter":
-            runner.materialize_dss_peft_adapter(cfg, "read-only-model", destination, attn_implementation="eager")
         else:
             runner.run_reference(
                 "read-only-model",
@@ -15064,36 +15056,6 @@ def test_dss_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_co
     with pytest.raises(RuntimeError, match="no adapter tensors"):
         copy_checkpoint_peft_adapter(source.parent, destination)
     assert (destination / "sentinel").read_text() == "preserve"
-
-
-def test_dss_driver_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypatch) -> None:
-    from arctic_platform.correctness.harness import runner
-
-    cfg = SimpleNamespace(
-        model_name="Qwen/Qwen3-8B",
-        training={"peft_config": {"peft_type": "LORA"}},
-        sub_job={},
-        n_gpus=1,
-    )
-    cfg.at_gpu_width = lambda width: cfg
-    source = tmp_path / "checkpoint" / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    calls = []
-
-    def save_checkpoint(**kwargs):
-        calls.append(kwargs)
-        return {"path": str(source.parent), "hf_path": str(source)}
-
-    monkeypatch.setattr(runner, "build_payload", lambda *args, **kwargs: {})
-    monkeypatch.setattr(runner, "gateway", lambda *args: contextlib.nullcontext(object()))
-    job = SimpleNamespace(client=SimpleNamespace(save_checkpoint=save_checkpoint))
-    monkeypatch.setattr(runner, "running_job", lambda *args: contextlib.nullcontext(job))
-    exported = runner.materialize_dss_peft_adapter(cfg, "unused", tmp_path, attn_implementation="eager")
-    assert exported == tmp_path / "adapter"
-    assert (exported / "adapter_model.safetensors").read_bytes() == (source / "adapter_model.safetensors").read_bytes()
-    assert calls == [{"path": str(source.parent), "export_hf": True}]
 
 
 def test_dss_driver_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
@@ -20108,7 +20070,6 @@ def _e2e_reference_records_publish(ctx, inputs=None):
 
 def _e2e_reference_records_guard_launches(monkeypatch):
     monkeypatch.setattr(lora_training_check, "run_reference_trajectory", _e2e_reference_records_forbidden)
-    monkeypatch.setattr(runner, "materialize_dss_peft_adapter", _e2e_reference_records_forbidden)
     monkeypatch.setattr(lora_training_check.subprocess, "Popen", _e2e_reference_records_forbidden)
     monkeypatch.setattr(lora_training_check, "gateway", _e2e_reference_records_forbidden)
     monkeypatch.setattr(lora_training_check, "running_job", _e2e_reference_records_forbidden)
@@ -20330,7 +20291,6 @@ def test_e2e_reference_records_explicit_preparation_runs_hf_once_publishes_scala
         monkeypatch.setattr(deterministic_lora, "identity_metadata", lambda path: {"mock": "exact-init"})
     monkeypatch.setattr(deterministic_lora, "bind_payload", _e2e_reference_records_forbidden)
     monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
-    monkeypatch.setattr(runner, "materialize_dss_peft_adapter", _e2e_reference_records_forbidden)
     calls = []
 
     def reference(context, replay, directory, prepared_adapter):
@@ -21760,7 +21720,6 @@ def test_lora_debug_uses_one_maintained_library():
         bindings.selected_lora_request,
         bindings.maybe_lora_replica_pool,
         bindings.stage_selected_lora_request,
-        bindings.owned_selected_lora_bootstrap,
     ):
         assert Path(inspect.getsourcefile(inspect.unwrap(operation))).resolve() == library_path
 
@@ -23375,7 +23334,7 @@ def test_staging_actual_config_and_consumers_agree_without_native_import(_lora_r
             load_config,
         )
     )
-    for path in (cfg.path, selected.RPC_PATH):
+    for path in (cfg.path,):
         options["admitted_sources"][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
     result = _lora_request_staging_helper.stage_selected_lora_request(cfg, **options)
     for name, value in result["environment"].items():
@@ -26800,274 +26759,6 @@ def test_initialization_hooks_production_calls_bracket_native_worker_and_sampler
         source = ast.unparse(worker)
         assert source.index("maybe_admit_sampler_construction(self,") < source.index("self.llm = AsyncLLM")
         assert source.index("self.llm = AsyncLLM") < source.index("maybe_verify_sampler_construction(self)")
-
-
-@contextlib.contextmanager
-def _initialization_bootstrap_base(staging, *, cluster, guard):
-    guard()
-    yield {"settings": {"SYNTHETIC_BASE_ENV": "unchanged"}}
-
-
-def _initialization_peer_launch(hosts, argv, **kwargs):
-    _INITIALIZATION_EVENTS.append(("peer", hosts, argv, kwargs))
-    return SimpleNamespace(returncode=0)
-
-
-@pytest.fixture
-def initialization_hooks_bootstrap(initialization_hooks, _lora_request_staging_inputs, monkeypatch, tmp_path):
-    from arctic_platform.debug import lora as bootstrap
-
-    control = initialization_hooks
-    cfg, options = _lora_request_staging_inputs
-    # Descriptor validation needs an admitted source, not the retained fleet experiment.
-    rpc_path = tmp_path / "selected_rpc.py"
-    rpc_path.write_text("# Synthetic RPC source for bootstrap descriptor validation.\n")
-    monkeypatch.setattr(selected, "RPC_PATH", rpc_path)
-    monkeypatch.setattr(selected, "RPC_SHA", hashlib.sha256(rpc_path.read_bytes()).hexdigest())
-    monkeypatch.setattr(_lora_request_staging_helper, "bootstrap_descriptor", selected.bootstrap_descriptor)
-    options["admitted_sources"].update(control.request["admitted_sources"])
-    options["admitted_sources"].update(
-        source_files(
-            bootstrap,
-            selected.bootstrap_descriptor,
-            selected.engine_kwargs_for_lora,
-            _initialization_bootstrap_base,
-        ),
-    )
-    options["admitted_sources"][str(selected.RPC_PATH)] = hashlib.sha256(selected.RPC_PATH.read_bytes()).hexdigest()
-    staged = _lora_request_staging_helper.stage_selected_lora_request(cfg, **options)
-    control.request["admitted_sources"] = staged["admitted_sources"]
-    control.publish()
-    pointer = {
-        "path": str(control.path),
-        "sha256": hashlib.sha256(control.path.read_bytes()).hexdigest(),
-    }
-    return SimpleNamespace(
-        bootstrap=bootstrap,
-        control=control,
-        staged=staged,
-        pointer=pointer,
-        cluster=SimpleNamespace(_pdsh=_initialization_peer_launch, _spawned_temp_dir="/tmp/j3rl-" + "a" * 24),
-    )
-
-
-@pytest.mark.parametrize("selected_initialization", [False, True])
-@pytest.mark.parametrize("prior_environment", [False, True])
-@pytest.mark.parametrize("body_failure", [False, True])
-def test_initialization_hooks_bootstrap_forwards_only_selected_pair_and_restores_owner(
-    initialization_hooks_bootstrap, monkeypatch, selected_initialization, prior_environment, body_failure
-):
-    case = initialization_hooks_bootstrap
-    staged = copy.deepcopy(case.staged)
-    if selected_initialization:
-        staged["initialization"] = case.pointer
-        staged["environment"].update(
-            {
-                hooks.INITIALIZATION_ENV: case.pointer["path"],
-                hooks.INITIALIZATION_SHA_ENV: case.pointer["sha256"],
-            },
-        )
-    keys = {*staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}
-    for key in keys:
-        monkeypatch.delenv(key, raising=False)
-    if prior_environment:
-        for key, value in staged["environment"].items():
-            monkeypatch.setenv(key, value)
-    before = {key: os.environ.get(key) for key in keys}
-    original = case.cluster._pdsh
-    failure = RuntimeError("synthetic bootstrap body failed")
-    receipt = None
-
-    def execute():
-        nonlocal receipt
-        with case.bootstrap.owned_selected_lora_bootstrap(
-            staged,
-            cluster=case.cluster,
-            base_environment=_initialization_bootstrap_base,
-            staging=object(),
-            guard=lambda: None,
-        ) as receipt:
-            assert {key: os.environ.get(key) for key in staged["environment"]} == staged["environment"]
-            result = case.cluster._pdsh(
-                [case.bootstrap.PEER],
-                [
-                    "env",
-                    "SYNTHETIC_BASE_ENV=unchanged",
-                    case.bootstrap.RAY,
-                    "start",
-                    "--address=10.4.166.121:23456",
-                    f"--temp-dir={case.cluster._spawned_temp_dir}",
-                    "--disable-usage-stats",
-                ],
-                check=False,
-                timeout=600,
-            )
-            assert result.returncode == 0
-            forwarded = receipt["peer_launches"][0]["argv"]
-            for key, value in staged["environment"].items():
-                assert f"{key}={value}" in forwarded
-            if not selected_initialization:
-                assert not any(item.startswith(hooks.INITIALIZATION_ENV + "=") for item in forwarded)
-                assert not any(item.startswith(hooks.INITIALIZATION_SHA_ENV + "=") for item in forwarded)
-            if body_failure:
-                raise failure
-
-    if body_failure:
-        with pytest.raises(RuntimeError) as caught:
-            execute()
-        assert caught.value is failure
-    else:
-        execute()
-    assert case.cluster._pdsh is original
-    assert {key: os.environ.get(key) for key in keys} == before
-    assert receipt["callback_restored"] and receipt["environment_restored"]
-    assert receipt["capacity_admitted"] is False and receipt["numerical"] is None
-    assert len(case.control.events) == 1 and case.control.events[0][0] == "peer"
-
-
-def test_initialization_hooks_bootstrap_rejects_mismatched_source_closure_before_environment(
-    initialization_hooks_bootstrap,
-):
-    case = initialization_hooks_bootstrap
-    case.control.request["admitted_sources"] = copy.deepcopy(case.control.request["admitted_sources"])
-    case.control.request["admitted_sources"].pop(str(Path(case.bootstrap.__file__).resolve()))
-    case.control.publish()
-    staged = copy.deepcopy(case.staged)
-    staged["initialization"] = {
-        "path": str(case.control.path),
-        "sha256": hashlib.sha256(case.control.path.read_bytes()).hexdigest(),
-    }
-    staged["environment"].update(
-        {
-            hooks.INITIALIZATION_ENV: staged["initialization"]["path"],
-            hooks.INITIALIZATION_SHA_ENV: staged["initialization"]["sha256"],
-        },
-    )
-    before = dict(os.environ)
-    with pytest.raises(ValueError, match="every actual adapter callable needs an admitted source identity"):
-        with case.bootstrap.owned_selected_lora_bootstrap(
-            staged,
-            cluster=case.cluster,
-            base_environment=_initialization_bootstrap_base,
-            staging=object(),
-            guard=lambda: None,
-        ):
-            pytest.fail("mismatched sources reached the bootstrap body")
-    assert dict(os.environ) == before and case.control.events == []
-    assert case.cluster._pdsh is _initialization_peer_launch
-
-
-@contextlib.contextmanager
-def _initialization_bootstrap_ownership_base(staging, *, cluster, guard):
-    guard()
-    yield {"settings": {"SYNTHETIC_BASE_ENV": "unchanged"}}
-    if cluster.teardown_failure is not None:
-        raise cluster.teardown_failure
-
-
-@pytest.mark.parametrize("changed_owner", ["callback", "environment", "both"])
-@pytest.mark.parametrize("primary_failure", ["none", "body", "teardown"])
-def test_bootstrap_restoration_preserves_foreign_owner(
-    initialization_hooks_bootstrap, monkeypatch, changed_owner, primary_failure
-):
-    case = initialization_hooks_bootstrap
-    keys = {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}
-    for key in keys:
-        monkeypatch.delenv(key, raising=False)
-    original = case.cluster._pdsh
-    foreign = object()
-    key = next(iter(case.staged["environment"]))
-    failure = RuntimeError("synthetic primary " + primary_failure)
-    case.cluster.teardown_failure = failure if primary_failure == "teardown" else None
-    receipt = None
-    with pytest.raises(ValueError if primary_failure == "none" else RuntimeError) as caught:
-        with case.bootstrap.owned_selected_lora_bootstrap(
-            case.staged,
-            cluster=case.cluster,
-            base_environment=_initialization_bootstrap_ownership_base,
-            staging=object(),
-            guard=lambda: None,
-        ) as receipt:
-            if changed_owner in ("callback", "both"):
-                case.cluster._pdsh = foreign
-            if changed_owner in ("environment", "both"):
-                monkeypatch.setenv(key, "foreign owner")
-            if primary_failure == "body":
-                raise failure
-    if primary_failure == "none":
-        assert "captured bootstrap ownership changed" in str(caught.value)
-    else:
-        assert caught.value is failure
-        assert any("captured bootstrap ownership changed" in note for note in failure.__notes__)
-    assert case.cluster._pdsh is (foreign if changed_owner in ("callback", "both") else original)
-    for name in case.staged["environment"]:
-        expected = "foreign owner" if name == key and changed_owner in ("environment", "both") else None
-        assert os.environ.get(name) == expected
-    assert receipt["callback_restored"] is (changed_owner == "environment")
-    assert receipt["environment_restored"] is (changed_owner == "callback")
-    assert receipt["peer_runtime_admitted"] is False
-    assert receipt["capacity_admitted"] is False and receipt["numerical"] is None
-
-
-def test_bootstrap_restoration_does_not_claim_state_before_installation(initialization_hooks_bootstrap, monkeypatch):
-    case = initialization_hooks_bootstrap
-    for key in {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}:
-        monkeypatch.delenv(key, raising=False)
-    key = next(iter(case.staged["environment"]))
-    foreign = object()
-    failure = RuntimeError("synthetic initial guard failure")
-
-    def guard():
-        case.cluster._pdsh = foreign
-        monkeypatch.setenv(key, "foreign guard owner")
-        raise failure
-
-    with pytest.raises(RuntimeError) as caught:
-        with case.bootstrap.owned_selected_lora_bootstrap(
-            case.staged,
-            cluster=case.cluster,
-            base_environment=_initialization_bootstrap_base,
-            staging=object(),
-            guard=guard,
-        ):
-            pytest.fail("failed initial guard reached bootstrap")
-    assert caught.value is failure
-    assert case.cluster._pdsh is foreign
-    assert os.environ[key] == "foreign guard owner"
-    assert all(os.environ.get(name) is None for name in case.staged["environment"] if name != key)
-
-
-@pytest.mark.parametrize("changed_owner", ["callback", "environment", "both"])
-def test_bootstrap_installation_preserves_foreign_owner_after_guard(
-    initialization_hooks_bootstrap, monkeypatch, changed_owner
-):
-    case = initialization_hooks_bootstrap
-    for key in {*case.staged["environment"], hooks.INITIALIZATION_ENV, hooks.INITIALIZATION_SHA_ENV}:
-        monkeypatch.delenv(key, raising=False)
-    key = next(iter(case.staged["environment"]))
-    original = case.cluster._pdsh
-    foreign = object()
-
-    def guard():
-        if changed_owner in ("callback", "both"):
-            case.cluster._pdsh = foreign
-        if changed_owner in ("environment", "both"):
-            monkeypatch.setenv(key, "foreign guard owner")
-
-    with pytest.raises(ValueError, match="ownership changed before installation"):
-        with case.bootstrap.owned_selected_lora_bootstrap(
-            case.staged,
-            cluster=case.cluster,
-            base_environment=_initialization_bootstrap_base,
-            staging=object(),
-            guard=guard,
-        ):
-            pytest.fail("foreign ownership reached bootstrap")
-    assert case.cluster._pdsh is (foreign if changed_owner in ("callback", "both") else original)
-    for name in case.staged["environment"]:
-        expected = "foreign guard owner" if name == key and changed_owner in ("environment", "both") else None
-        assert os.environ.get(name) == expected
-    assert case.control.events == []
 
 
 @pytest.mark.parametrize("change", ["code", "defaults", "keyword_defaults", "binding"])
@@ -41103,19 +40794,6 @@ def test_onboarding_storage_onboarding_entrypoints_reject_storage_before_checkou
     assert not (_onboarding_storage_fast_root / "work").exists()
 
 
-@pytest.mark.parametrize("field", ["output_dir", "optimizer_model_path"])
-def test_onboarding_storage_optimizer_calibration_rejects_storage_before_config_batch_or_model(
-    _onboarding_storage_fast_root, _onboarding_storage_invalid_destination, field
-):
-    args = argparse.Namespace(
-        output_dir=_onboarding_storage_fast_root / "work", optimizer_model_path=_onboarding_storage_fast_root / "model"
-    )
-    setattr(args, field, _onboarding_storage_invalid_destination)
-    with pytest.raises(ValueError, match="/data-fast"):
-        onboard._run_optimizer_calibration(args)
-    assert not (_onboarding_storage_fast_root / "work").exists()
-
-
 @pytest.mark.parametrize("operation", ["materialize", "materialize_pretrained"])
 def test_onboarding_storage_materializers_forward_canonical_fast_destination(
     _onboarding_storage_fast_root, tmp_path, monkeypatch, operation
@@ -41630,155 +41308,6 @@ def test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unre
     assert args.test_spec == tmp_path / "checkout" / "spec.json"
     assert args.probe_output == tmp_path / "checkout" / "probe.json"
     assert not args.output_dir.exists()
-
-
-def test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_back(
-    _onboarding_storage_fast_root, monkeypatch
-):
-    _onboarding_storage_fast_root.rmdir()
-    args = argparse.Namespace(
-        output_dir=_onboarding_storage_fast_root / "work", optimizer_model_path=_onboarding_storage_fast_root / "model"
-    )
-    with pytest.raises(ValueError, match="existing /data-fast"):
-        onboard._run_optimizer_calibration(args)
-    assert not _onboarding_storage_fast_root.exists()
-
-
-@pytest.mark.parametrize("fail_reference", [False, True])
-@pytest.mark.parametrize(
-    ("available", "workers", "runs", "lanes"),
-    [(1, None, 2, 1), (8, None, 8, 8), (16, None, 8, 8), (8, None, 16, 8), (16, None, 16, 8), (16, 4, 7, 4)],
-)
-def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_cleans_only_owned_tree(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch, fail_reference, available, workers, runs, lanes
-):
-    from threading import Barrier
-    from threading import Lock
-
-    import torch
-    import transformers
-
-    from arctic_platform.correctness.checks import optimizer_state
-    from arctic_platform.correctness.harness import config as config_module
-    from arctic_platform.correctness.harness import config as spec_module
-    from arctic_platform.correctness.harness import runner
-    from arctic_platform.correctness.harness import sft as batches
-
-    output = _onboarding_storage_fast_root / "output"
-    output.mkdir()
-    prior = _onboarding_storage_fast_root / "dss-correctness-calibration" / "test"
-    prior.mkdir(parents=True)
-    sentinel = prior / "sentinel"
-    sentinel.write_text("preexisting")
-    args = argparse.Namespace(
-        output_dir=output,
-        optimizer_model_path=_onboarding_storage_fast_root / "model",
-        config=tmp_path / "input.config",
-        test_spec=tmp_path / "checkout" / "spec.json",
-        optimizer_layers=4,
-        reference_token_budget=8,
-        reference_calibration_workers=workers,
-    )
-    config = SimpleNamespace(
-        config_id="test",
-        effective_training={},
-        training={"optimizer": {"name": "AdamW"}},
-        attention_implementation="eager",
-        reference_attention_implementation="sdpa",
-        lm_head_token_chunk_size=None,
-        optimizer_dtype="fp32",
-    )
-    spec = SimpleNamespace(
-        config_checksum="checksum",
-        arms=[SimpleNamespace(name="gas1", global_batch_size=1, max_seq_len=4)],
-        test_tolerances={},
-        test_settings={},
-        applicable_tests=[],
-    )
-
-    def write_spec(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}")
-
-    spec.write = write_spec
-    monkeypatch.setattr(config_module, "load_config", lambda path: config)
-    monkeypatch.setattr(config_module, "config_checksum", lambda cfg: "checksum")
-    monkeypatch.setattr(spec_module.TestSpec, "read", lambda path: spec)
-    monkeypatch.setattr(
-        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(vocab_size=8)
-    )
-    monkeypatch.setattr(batches, "build_synthetic_batch", lambda *args, **kwargs: object())
-    monkeypatch.setattr(batches, "save", lambda batch, path: path.write_text("mock batch"))
-
-    def adapter(*args, **kwargs):
-        assert kwargs["attn_implementation"] == "eager"
-        return None
-
-    monkeypatch.setattr(runner, "materialize_dss_peft_adapter", adapter)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: available)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(onboard, "CALIBRATION_RUNS", runs)
-    monkeypatch.setattr(optimizer_state, "max_pairwise_optimizer_delta", lambda *args, **kwargs: None)
-    created = []
-    deleted = []
-    active = set()
-    completed = set()
-    lock = Lock()
-    barriers = {start: Barrier(min(lanes, runs - start), timeout=10) for start in range(0, runs, lanes)}
-    real_rmtree = onboard.shutil.rmtree
-
-    def allocate(prefix):
-        root = workdir.correctness_workdir(prefix)
-        created.append(root)
-        return root
-
-    def cleanup(path, **kwargs):
-        deleted.append(path)
-        real_rmtree(path, **kwargs)
-
-    def reference(*positional, **kwargs):
-        assert kwargs["attn"] == "sdpa"
-        destination = kwargs["optimizer_output_dir"]
-        assert destination.parent.parent in created
-        if fail_reference:
-            raise RuntimeError("reference failed")
-        index = int(destination.parent.name.removeprefix("run-")) - 1
-        device = kwargs["cuda_device"]
-        start = index // lanes * lanes
-        with lock:
-            assert device == index % lanes
-            assert device not in active
-            assert completed >= set(range(start))
-            active.add(device)
-        try:
-            barriers[start].wait()
-            destination.mkdir()
-            manifest = destination / "manifest.json"
-            manifest.write_text('{"parameters": [{"name": "mock"}]}')
-            return {"optimizer_state_manifest": str(manifest), "loss": 1.0, "peak_gib": 0.0}
-        finally:
-            with lock:
-                active.remove(device)
-                completed.add(index)
-
-    monkeypatch.setattr(onboard, "correctness_workdir", allocate)
-    monkeypatch.setattr(onboard.shutil, "rmtree", cleanup)
-    monkeypatch.setattr(runner, "run_reference", reference)
-    for _ in range(2):
-        completed.clear()
-        if fail_reference:
-            with pytest.raises(RuntimeError, match="reference failed"):
-                onboard._run_optimizer_calibration(args)
-        else:
-            report = onboard._run_optimizer_calibration(args)
-            assert report == output / "optimizer-reference-repeatability.json"
-            assert args.test_spec.exists()
-            assert completed == set(range(runs))
-        assert not active
-    assert len(created) == 2 and created[0] != created[1]
-    assert deleted == created
-    assert all((path.parent == _onboarding_storage_fast_root / "tmp" and (not path.exists()) for path in created))
-    assert sentinel.read_text() == "preexisting"
 
 
 # Reference storage.
@@ -42932,7 +42461,6 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(onboard, "_run_probe", forbidden)
-    monkeypatch.setattr(onboard, "_run_optimizer_calibration", forbidden)
     monkeypatch.setattr(synth_model, "materialize_pretrained", forbidden)
     monkeypatch.setattr(runner, "run_reference", forbidden)
     monkeypatch.setattr(dss_driver, "available_gpus", forbidden)
@@ -43527,8 +43055,6 @@ def test_onboarding_pretrained_omitted_layers_do_not_warn(
 @pytest.fixture
 def _qwen4_residency_new_architecture(monkeypatch):
     import transformers as runtime_transformers
-
-    pass
 
     observed = []
 
@@ -49847,7 +49373,6 @@ def test_checkpoint_reduced_fixture_mtp_reaches_hosted_training_wire(tmp_path, m
     cfg.training["model_provider"] = "prime_rl"
     cfg.training["prime_rl"] = deepcopy(ctx.cfg.training["prime_rl"])
     if native_topology:
-        pass
 
         path = tmp_path / "rl.config"
         path.write_text(
@@ -52849,27 +52374,14 @@ def test_sampler_evidence_canonical_sync_keeps_actual_receipts(monkeypatch):
     received = {"workers": [{"all_rank_weight_sync_verification": [{"status": "ok"}]}]}
     sent = {"sent_manifest": {"wire": {"numel": 1}}}
 
-    async def ready(value):
-        return value
-
-    async def run():
-        return await sampler.maybe_sync_weights(ready(received), [ready(sent)])
-
-    result = asyncio.run(run())
+    result = sampler.maybe_sync_weights_result(received, [sent])
     assert result["targets"][0]["recv"] is received
     assert result["targets"][0]["send"][0] is sent
 
 
 def test_sampler_evidence_disabled_sync_retains_original_status_only(monkeypatch):
     monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
-
-    async def ready():
-        return {"native": "actual"}
-
-    async def run():
-        return await sampler.maybe_sync_weights(ready(), [ready()])
-
-    assert asyncio.run(run()) == {"status": "ok"}
+    assert sampler.maybe_sync_weights_result({"native": "actual"}, [{"native": "actual"}]) == {"status": "ok"}
 
 
 def test_sampler_evidence_no_fabricated_router_trace_or_generation():
@@ -55025,12 +54537,6 @@ def test_inference_export_hostfile_symlink_identity_change_blocks_published_samp
         replacement.replace(export._LOCAL_HOSTFILE_TARGET)
     with pytest.raises(ValueError, match="hostfile link or target identity changed"):
         export.require_local_inference_export_locality(ctx, root)
-
-
-def test_inference_export_integration_preserves_reviewed_glm_materializer_bytes():
-    # Includes only the reviewed hosted-to-gateway import relocation.
-    source = inspect.getsource(runner.materialize_dss_peft_adapter).encode()
-    assert hashlib.sha256(source).hexdigest() == "6a6d2822545ba33cb44d48071d1c88bccb76465728c73c80c83b333b57d9f884"
 
 
 def test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty():
@@ -60142,123 +59648,6 @@ def test_strict_ssh_consumer_new_inference_worker_context_keeps_trust_alive(
     assert not Path(path).exists()
 
 
-def test_strict_ssh_publisher_new_exact_created_generation_consumed_by_final_context(
-    tmp_path,
-):
-    path = tmp_path / "created-trust"
-    raw = b"[peer]:7878 ssh-ed25519 ALREADY_AUTHENTICATED\n"
-    result = export._publish_ssh_trust(path, raw, time.monotonic() + 15)
-    assert result == {
-        "known_hosts": str(path),
-        "known_hosts_sha256": hashlib.sha256(raw).hexdigest(),
-    }
-    assert path.stat().st_mode & 0o777 == 0o400
-    node = {"host": "peer"}
-    with export._strict_ssh_argv(
-        {"nodes": [node], "ssh": {"port": 7878, **result}},
-        node,
-        "owned",
-        time.monotonic() + 15,
-    ) as argv:
-        assert Path(_strict_ssh_consumer_new_path(argv)).read_bytes() == raw
-
-
-@pytest.mark.parametrize("existing", ["file", "symlink", "directory"])
-def test_strict_ssh_publisher_new_never_replaces_existing_slot(tmp_path, existing):
-    path = tmp_path / "created-trust"
-    if existing == "file":
-        path.write_bytes(b"original")
-    elif existing == "symlink":
-        target = tmp_path / "target"
-        target.write_bytes(b"original")
-        path.symlink_to(target)
-    else:
-        path.mkdir()
-    before = path.lstat()
-    with pytest.raises(FileExistsError):
-        export._publish_ssh_trust(path, b"authorized", time.monotonic() + 15)
-    assert path.lstat() == before
-    if existing != "directory":
-        assert path.read_bytes() == b"original"
-
-
-def test_strict_ssh_publisher_new_descriptor_chmod_cannot_mutate_replacement(tmp_path, monkeypatch):
-    path = tmp_path / "created-trust"
-    moved = tmp_path / "created-original"
-    original_chmod = os.fchmod
-
-    def substitute(fd, mode):
-        path.rename(moved)
-        path.write_bytes(b"replacement")
-        path.chmod(0o600)
-        original_chmod(fd, mode)
-
-    monkeypatch.setattr(export.os, "fchmod", substitute)
-    with pytest.raises(ValueError, match="publication slot or file identity changed"):
-        export._publish_ssh_trust(path, b"authorized", time.monotonic() + 15)
-    assert moved.stat().st_mode & 0o777 == 0o400
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert path.read_bytes() == b"replacement"
-
-
-@pytest.mark.parametrize("mutation", ["content", "hardlink", "parent"])
-def test_strict_ssh_publisher_new_rejects_drift_before_returning_any_binding(tmp_path, monkeypatch, mutation):
-    path = tmp_path / "created-trust"
-    original_sync = os.fsync
-
-    def mutate(fd):
-        original_sync(fd)
-        if mutation == "content":
-            path.chmod(0o600)
-            path.write_bytes(b"changed-trust")
-        elif mutation == "hardlink":
-            os.link(path, tmp_path / "alias")
-        else:
-            tmp_path.rename(tmp_path.with_name(tmp_path.name + "-moved"))
-            tmp_path.mkdir()
-
-    monkeypatch.setattr(export.os, "fsync", mutate)
-    with pytest.raises(ValueError, match="strict SSH trust.*changed"):
-        export._publish_ssh_trust(path, b"authorized", time.monotonic() + 15)
-
-
-@pytest.mark.parametrize("invalid", ["empty", "text", "oversized", "outside_fast", "parent_symlink"])
-def test_strict_ssh_publisher_new_invalid_inputs_fail_before_slot_creation(tmp_path, invalid):
-    path = tmp_path / "created-trust"
-    raw = b"authorized"
-    if invalid == "empty":
-        raw = b""
-    elif invalid == "text":
-        raw = "not original bytes"
-    elif invalid == "oversized":
-        raw = b"x" * (4 * 1024**2 + 1)
-    elif invalid == "outside_fast":
-        path = Path("/code") / "not-created-trust"
-    else:
-        alias = tmp_path.with_name(tmp_path.name + "-alias")
-        alias.symlink_to(tmp_path, target_is_directory=True)
-        path = alias / path.name
-    with pytest.raises((ValueError, OSError)):
-        export._publish_ssh_trust(path, raw, time.monotonic() + 15)
-    assert not path.exists()
-
-
-def test_strict_ssh_publisher_new_interrupted_write_retains_partial_evidence_and_closes_fd(tmp_path, monkeypatch):
-    path = tmp_path / "created-trust"
-    seen = []
-
-    def interrupted(fd, raw):
-        seen.append(fd)
-        raise OSError("write interrupted")
-
-    monkeypatch.setattr(export.os, "write", interrupted)
-    with pytest.raises(OSError, match="write interrupted"):
-        export._publish_ssh_trust(path, b"authorized", time.monotonic() + 15)
-    assert path.is_file() and path.read_bytes() == b""
-    with pytest.raises(OSError):
-        os.fstat(seen[0])
-
-
 def test_strict_ssh_publisher_new_libc_creation_failure_preserves_errno(monkeypatch):
     import ctypes
 
@@ -60546,7 +59935,6 @@ _SELFTEST_FIXTURES = (
     "generated_adapter_config",
     "worker_adapter_transfer",
     "initialization_hooks",
-    "initialization_hooks_bootstrap",
     "model_factory_initialization",
     "model_constructor_frame_binding",
     "model_materialization",
@@ -60793,7 +60181,6 @@ _SELFTEST_GROUPS = {
         "test_inference_training_placement_invalid_width_rejected_before_selection",
         "test_inference_training_placement_selection_rejected_before_catalog",
         "test_inference_training_placement_uses_real_width_without_mutating_reviewed_config",
-        "test_inference_forwarding_runner_adapter_payload_keeps_native_weight_format",
         "test_inference_forwarding_new_batch_topology_guard_precedes_selection",
         "test_inference_forwarding_new_topology_preserves_full_model_admission_before_check",
         "test_cli_config_selection_cli_entry_preserves_ray_auth_mode",
@@ -61170,7 +60557,6 @@ _SELFTEST_GROUPS = {
         "test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack",
         "test_dss_driver_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack",
         "test_dss_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy",
-        "test_dss_driver_materialize_peft_adapter_accepts_adapter_only_export",
         "test_dss_driver_full_model_weights_only_export_still_requires_model_config",
         "test_dss_driver_copy_checkpoint_peft_adapter_rejects_a_full_model_pack",
         "test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness",
@@ -61618,11 +61004,6 @@ _SELFTEST_GROUPS = {
         "test_initialization_hooks_sampler_positive_native_boundary_retains_recipe",
         "test_initialization_hooks_sampler_rejection_precedes_actual_constructor",
         "test_initialization_hooks_production_calls_bracket_native_worker_and_sampler_boundaries",
-        "test_initialization_hooks_bootstrap_forwards_only_selected_pair_and_restores_owner",
-        "test_initialization_hooks_bootstrap_rejects_mismatched_source_closure_before_environment",
-        "test_bootstrap_restoration_preserves_foreign_owner",
-        "test_bootstrap_restoration_does_not_claim_state_before_installation",
-        "test_bootstrap_installation_preserves_foreign_owner_after_guard",
         "test_initialization_cleanup_does_not_invoke_changed_destroy",
         "test_initialization_cleanup_drift_during_verification_preserves_primary",
         "test_initialization_runtime_method_default_drift_refuses_engine",
@@ -62053,7 +61434,6 @@ _SELFTEST_GROUPS = {
         "test_onboarding_storage_model_destination_rejected_before_config_or_sidecar_resolution",
         "test_onboarding_storage_build_spec_rejects_paths_before_allocation_or_model_work",
         "test_onboarding_storage_onboarding_entrypoints_reject_storage_before_checkout_or_config",
-        "test_onboarding_storage_optimizer_calibration_rejects_storage_before_config_batch_or_model",
         "test_onboarding_storage_materializers_forward_canonical_fast_destination",
         "test_onboarding_pretrained_generation_defaults_round_trip",
         "test_onboarding_pretrained_generation_defaults_restore_after_save_failure",
@@ -62069,8 +61449,6 @@ _SELFTEST_GROUPS = {
         "test_onboarding_storage_copy_sidecars_canonical_fast_destination_and_idempotency",
         "test_onboarding_storage_build_spec_accepts_fast_work_cache_and_separate_spec_output",
         "test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unrestricted",
-        "test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_back",
-        "test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_cleans_only_owned_tree",
         "test_reference_storage_reference_tensor_output_rejected_before_allocation",
         "test_reference_storage_reference_tensor_output_rejects_fast_symlink_escape",
         "test_reference_storage_reference_without_optimizer_output_still_reaches_engine",
@@ -62558,7 +61936,6 @@ _SELFTEST_GROUPS = {
         "test_inference_export_hostfile_symlink_prescribed_target_binds_bytes_and_order",
         "test_inference_export_hostfile_symlink_changed_during_validation_rejected",
         "test_inference_export_hostfile_symlink_identity_change_blocks_published_sampling",
-        "test_inference_export_integration_preserves_reviewed_glm_materializer_bytes",
         "test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty",
         "test_inference_export_integration_real_runner_admits_and_copies_allocation",
         "test_inference_export_integration_real_runner_rejects_unadmitted_route_before_work",
@@ -62717,12 +62094,6 @@ _SELFTEST_GROUPS = {
         "test_strict_ssh_consumer_new_unadmitted_endpoint_or_expired_budget",
         "test_strict_ssh_consumer_new_closes_every_descriptor_after_one_close_failure",
         "test_strict_ssh_consumer_new_inference_worker_context_keeps_trust_alive",
-        "test_strict_ssh_publisher_new_exact_created_generation_consumed_by_final_context",
-        "test_strict_ssh_publisher_new_never_replaces_existing_slot",
-        "test_strict_ssh_publisher_new_descriptor_chmod_cannot_mutate_replacement",
-        "test_strict_ssh_publisher_new_rejects_drift_before_returning_any_binding",
-        "test_strict_ssh_publisher_new_invalid_inputs_fail_before_slot_creation",
-        "test_strict_ssh_publisher_new_interrupted_write_retains_partial_evidence_and_closes_fd",
         "test_strict_ssh_publisher_new_libc_creation_failure_preserves_errno",
         "test_strict_ssh_lifetime_new_export_pipe_keeps_generation_until_owned_cleanup",
         "test_durable_startup_error_new_sampling_payload_binds_static_request",
