@@ -970,7 +970,7 @@ class MoE(nn.Module):
             and sonic_routed_experts_applicable(experts)
         )
         combine_kwargs = {}
-        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
+        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep", "deepep_v2"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
 
