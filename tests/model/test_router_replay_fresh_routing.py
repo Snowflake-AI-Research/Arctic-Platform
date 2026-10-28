@@ -24,11 +24,14 @@ checkpointing the self-replay wrapper hands the recompute the experts the forwar
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as ckpt
 
+from arctic_platform.model.implementations.gpu import router_replay_recompute
 from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
 from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
 from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
@@ -129,7 +132,8 @@ def test_checkpoint_recompute_with_fresh_tokens_matches_uncheckpointed_gradients
     assert install_self_router_replay(block) == 1
     ckpt.checkpoint(block, x, routed, use_reentrant=False).sum().backward()
 
-    assert len(block.router._self_replay_queue) == 0  # every captured forward was drained by its recompute
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
     torch_assert_close(block.router.gate.weight.grad, reference.router.gate.weight.grad, rtol=0, atol=0)
     torch_assert_close(block.proj.weight.grad, reference.proj.weight.grad, rtol=0, atol=0)
 
@@ -214,7 +218,8 @@ def test_wrapper_replays_forward_experts_for_fresh_tokens():
     torch_assert_equal(recompute_idx, forward_idx)
     replayed = routed[:, 0] != ROUTER_REPLAY_FRESH
     torch_assert_equal(forward_idx[replayed], routed[replayed])
-    assert len(block.router._self_replay_queue) == 0
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
 
 
 def test_wrapper_raises_on_capture_underflow_for_fresh_tokens():
@@ -222,7 +227,7 @@ def test_wrapper_raises_on_capture_underflow_for_fresh_tokens():
     assert install_self_router_replay(block) == 1
     block.router.fresh_replay_routing = True
     y = _backward_through_checkpoint(block, _routing((2,)))
-    block.router._self_replay_queue.clear()  # the capture the recompute would replay is gone
+    block.router._self_replay_captures.clear()  # the capture the recompute would replay is gone
 
     with pytest.raises(RuntimeError, match="no captured experts"):
         y.sum().backward()
@@ -240,25 +245,162 @@ def test_wrapping_defaults_routers_to_strict_production_replay():
 
     assert block.router.raw_topk_calls == 0
     assert all(torch.equal(idx, routed) for (_, _, idx) in block.router.calls)
-    assert len(block.router._self_replay_queue) == 0
+    assert len(block.router._self_replay_captures) == 0
 
 
-def test_aborted_forward_does_not_leak_experts_into_the_next_step():
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_aborted_forward_does_not_leak_experts_into_the_next_step(fresh_routing):
     """A captured forward whose backward never ran must not hand its experts to the next step's recompute."""
     block = _DriftingBlock()
     assert install_self_router_replay(block) == 1
-    block.router.fresh_replay_routing = True
-    _backward_through_checkpoint(block, _routing((2,)))  # forward only: the step aborts before backward
-    assert len(block.router._self_replay_queue) == 1
+    block.router.fresh_replay_routing = fresh_routing
+    abandoned = _backward_through_checkpoint(block, _routing((2,)) if fresh_routing else None)
+    assert len(block.router._self_replay_captures) == 1
+    del abandoned
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
 
-    routed = _routing((5, 9))
+    routed = _routing((5, 9)) if fresh_routing else None
     _backward_through_checkpoint(block, routed).sum().backward()
 
     (_, _, forward_idx), (_, _, recompute_idx) = block.router.calls[-2:]
     torch_assert_equal(recompute_idx, forward_idx)
-    replayed = routed[:, 0] != ROUTER_REPLAY_FRESH
-    torch_assert_equal(recompute_idx[replayed], routed[replayed])
-    assert len(block.router._self_replay_queue) == 0
+    if routed is not None:
+        replayed = routed[:, 0] != ROUTER_REPLAY_FRESH
+        torch_assert_equal(recompute_idx[replayed], routed[replayed])
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
+
+
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_pending_checkpoint_forwards_replay_their_own_experts(fresh_routing):
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    block.router.fresh_replay_routing = fresh_routing
+
+    first = _backward_through_checkpoint(block, _routing((2,)) if fresh_routing else None)
+    first_experts = block.router.calls[-1][2].clone()
+    second = _backward_through_checkpoint(block, _routing((5, 9)) if fresh_routing else None)
+    second_experts = block.router.calls[-1][2].clone()
+
+    second.sum().backward()
+    torch_assert_equal(block.router.calls[-1][2], second_experts)
+    first.sum().backward()
+    torch_assert_equal(block.router.calls[-1][2], first_experts)
+    del first, second
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
+
+
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_retained_checkpoint_graph_replays_the_same_experts_on_each_backward(fresh_routing):
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    block.router.fresh_replay_routing = fresh_routing
+    output = _backward_through_checkpoint(block, _routing((2,)) if fresh_routing else None)
+    experts = block.router.calls[-1][2].clone()
+
+    output.sum().backward(retain_graph=True)
+    first_gradient = block.router.gate.weight.grad.clone()
+    torch_assert_equal(block.router.calls[-1][2], experts)
+    block.zero_grad(set_to_none=True)
+    output.sum().backward()
+    torch_assert_equal(block.router.calls[-1][2], experts)
+    torch_assert_equal(block.router.gate.weight.grad, first_gradient)
+
+
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_repeated_router_calls_in_one_checkpoint_keep_their_own_captures(fresh_routing):
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    block.router.fresh_replay_routing = fresh_routing
+    routed = _routing((2,)) if fresh_routing else None
+    x = torch.randn(12, 16, requires_grad=True)
+
+    def forward(values):
+        return block(values, routed) + block(values * 2, routed)
+
+    output = ckpt.checkpoint(forward, x, use_reentrant=False)
+    experts = [indices for recompute, replayed, indices in block.router.calls if not recompute and replayed]
+    assert len(experts) == 2
+    output.sum().backward()
+    recomputed = [indices for recompute, _, indices in block.router.calls if recompute]
+    assert len(recomputed) == 2
+    for expected, actual in zip(experts, recomputed, strict=True):
+        torch_assert_equal(actual, expected)
+
+
+def test_uncheckpointed_forwards_do_not_retain_router_captures():
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    block(torch.randn(12, 16, requires_grad=True)).sum().backward()
+    assert len(block.router._self_replay_captures) == 0
+
+
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_nested_checkpoints_restore_outer_context_and_match_gradients(fresh_routing):
+    set_seed(3)
+    x = torch.randn(5, 8, requires_grad=True)
+    routed = _mixed_routing() if fresh_routing else None
+    reference = _RouterBlock(_router())
+    reference(reference(reference(x, routed), routed), routed).sum().backward()
+    expected_input_gradient = x.grad.clone()
+    x.grad = None
+    block = _RouterBlock(_router())
+    assert install_self_router_replay(block) == 1
+
+    def forward(values):
+        outer_context = router_replay_recompute._checkpoint_context()
+        assert outer_context is not None
+        first = block(values, routed)
+        middle = ckpt.checkpoint(block, first, routed, use_reentrant=False)
+        assert router_replay_recompute._checkpoint_context() is outer_context
+        return block(middle, routed)
+
+    output = ckpt.checkpoint(forward, x, use_reentrant=False)
+    assert router_replay_recompute._checkpoint_context() is None
+    output.sum().backward()
+    assert router_replay_recompute._checkpoint_context() is None
+    assert not _in_recompute()
+    torch_assert_equal(x.grad, expected_input_gradient)
+    torch_assert_equal(block.router.gate.weight.grad, reference.router.gate.weight.grad)
+    torch_assert_equal(block.proj.weight.grad, reference.proj.weight.grad)
+    del output
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
+
+
+@pytest.mark.parametrize("failure_phase", ["forward", "recompute"])
+def test_checkpoint_exceptions_restore_context_for_the_next_forward(failure_phase):
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    x = torch.randn(12, 16, requires_grad=True)
+
+    def forward(values):
+        if failure_phase == "recompute" and _in_recompute():
+            raise ValueError("aborted checkpoint")
+        result = block(values)
+        if failure_phase == "forward":
+            raise ValueError("aborted checkpoint")
+        return result
+
+    with pytest.raises(ValueError, match="aborted checkpoint"):
+        if failure_phase == "forward":
+            ckpt.checkpoint(forward, x, use_reentrant=False)
+        else:
+            output = ckpt.checkpoint(forward, x, use_reentrant=False)
+            output.sum().backward()
+    if failure_phase == "recompute":
+        del output
+    assert router_replay_recompute._checkpoint_context() is None
+    assert not _in_recompute()
+    block.zero_grad(set_to_none=True)
+    _backward_through_checkpoint(block, None).sum().backward()
+    torch_assert_equal(block.router.calls[-1][2], block.router.calls[-2][2])
+    assert router_replay_recompute._checkpoint_context() is None
+    assert not _in_recompute()
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
 
 
 def test_install_sets_the_wrapped_marker_trainers_check():
