@@ -1,4 +1,5 @@
 from arctic_platform.inference.vllm import config
+from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
@@ -64,6 +65,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_mamba_completion_refresh",
         lambda: calls.append("mamba_completion_refresh"),
     )
+    monkeypatch.setattr(
+        deepseek_v41_lora,
+        "ensure_deepseek_v41_lora",
+        lambda: calls.append("deepseek_v41_lora"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -78,4 +84,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dflash_max_position",
         "mrope_yarn",
         "mamba_completion_refresh",
+        "deepseek_v41_lora",
     ]
