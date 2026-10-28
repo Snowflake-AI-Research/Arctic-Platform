@@ -45,6 +45,41 @@ from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 # Allocation-local native checkpoint bridge. No DSS process, API or GPU is started.
 
 
+@pytest.mark.parametrize("fused", [None, False, True])
+def test_native_checkpoint_bridge_training_config_round_trips_optional_optimizer_defaults(fused):
+    from dss.ray_dss.models import JobConfig
+
+    from arctic_platform.correctness.harness.gateway import _training_config
+
+    optimizer = {"lr": 1e-5}
+    if fused is not None:
+        optimizer["fused"] = fused
+    config = JobConfig.model_validate(
+        {
+            "job_id": "generated",
+            "model_name": "control-model",
+            "model_post_init": ["control-hook"],
+            "training_config": {
+                "optimizer": optimizer,
+                "ds_config": {"checkpoint": {"tag_validation": "Fail"}},
+            },
+        }
+    )
+    original = config.model_dump(mode="json", by_alias=True)
+
+    raw = _training_config(config)
+    assert "job_id" not in raw
+    assert raw["model_post_init"] == ["control-hook"]
+    assert raw["training_config"]["ds_config"] == {"checkpoint": {"tag_validation": "Fail"}}
+    if fused is None:
+        assert "fused" not in raw["training_config"]["optimizer"]
+    else:
+        assert raw["training_config"]["optimizer"]["fused"] is fused
+    restored = JobConfig.model_validate({**raw, "job_id": config.job_id})
+    assert restored.model_dump(mode="json", by_alias=True) == original
+    assert config.model_dump(mode="json", by_alias=True) == original
+
+
 # Checkpoint resume.
 
 

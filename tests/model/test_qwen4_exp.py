@@ -356,6 +356,103 @@ def test_qwen38_conversion_rejects_mixed_expert_layouts(packed_projection):
     assert all(state[name] is value for name, value in original.items())
 
 
+def test_qwen38_checkpoint_conversion_matches_bulk_across_source_shards(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+    from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_checkpoint_to_prime
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = {
+        **_indexed_expert_weights("model.language_model.layers.0", range(3)),
+        **_indexed_expert_weights("model.language_model.layers.1", range(2)),
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight": (
+            torch.arange(12).reshape(3, 4)
+        ),
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight": (
+            torch.arange(8).reshape(2, 4)
+        ),
+        "model.language_model.embed_tokens.weight": torch.arange(12).reshape(3, 4),
+        "lm_head.weight": torch.arange(16).reshape(4, 4),
+    }
+    names = list(original)
+    for shard in range(3):
+        save_file({name: original[name] for name in names[shard::3]}, source / f"shard-{shard}.safetensors")
+    expected = {name: tensor.clone() for name, tensor in original.items()}
+    convert_hf_to_prime(expected)
+    destination = tmp_path / "prime"
+    saved_sizes = []
+    ordinary_save = weights.save_file
+
+    def save_group(state, path, **kwargs):
+        assert not (destination / "model.safetensors.index.json").exists()
+        saved_sizes.append(sum(value.numel() * value.element_size() for value in state.values()))
+        return ordinary_save(state, path, **kwargs)
+
+    monkeypatch.setattr(weights, "save_file", save_group)
+    convert_hf_checkpoint_to_prime(source, destination)
+    actual = weights.load_state_dict(destination)
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["total_size"] == sum(t.numel() * t.element_size() for t in expected.values())
+    assert len(saved_sizes) == 4
+    assert max(saved_sizes) < index["metadata"]["total_size"]
+    assert weights.load_state_dict(source).keys() == original.keys()
+
+
+@pytest.mark.parametrize("invalid_layout", ["expert-gap", "expert-missing", "expert-mixed", "ple-gap"])
+def test_qwen38_checkpoint_conversion_rejects_incomplete_groups_before_writing(tmp_path, invalid_layout):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_checkpoint_to_prime
+
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, [0, 2] if invalid_layout == "expert-gap" else range(2))
+    if invalid_layout == "expert-missing":
+        del state[f"{prefix}.mlp.experts.1.down_proj.weight"]
+    elif invalid_layout == "expert-mixed":
+        state[f"{prefix}.mlp.experts.w1"] = torch.ones(2, 3, 4)
+    elif invalid_layout == "ple-gap":
+        state[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_1.weight"] = torch.ones(2, 4)
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file(state, source / "model.safetensors")
+    destination = tmp_path / "prime"
+    with pytest.raises((KeyError, ValueError)):
+        convert_hf_checkpoint_to_prime(source, destination)
+    assert not destination.exists()
+
+
+def test_qwen38_checkpoint_conversion_failure_never_publishes_index(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+    from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_checkpoint_to_prime
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"first": torch.ones(2), "second": torch.ones(3)}, source / "model.safetensors")
+    destination = tmp_path / "prime"
+    calls = 0
+    ordinary_save = weights.save_file
+
+    def fail_second_group(state, path, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected shard write failure")
+        return ordinary_save(state, path, **kwargs)
+
+    monkeypatch.setattr(weights, "save_file", fail_second_group)
+    with pytest.raises(OSError, match="injected shard write"):
+        convert_hf_checkpoint_to_prime(source, destination)
+    assert calls == 2
+    assert not (destination / "model.safetensors.index.json").exists()
+
+
 @pytest.mark.parametrize("include_skipped", [False, True])
 def test_qwen38_full_hf_export_restores_ple_shards(monkeypatch, include_skipped):
     from types import SimpleNamespace

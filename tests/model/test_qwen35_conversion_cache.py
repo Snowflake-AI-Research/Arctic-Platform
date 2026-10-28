@@ -164,6 +164,84 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
     assert leftovers == []
 
 
+def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "cache" / "prime"
+    converted = []
+
+    def unexpected_bulk_call(*args):
+        raise AssertionError("checkpoint conversion must not load the entire state dict")
+
+    def convert_checkpoint(source_path, temporary_path):
+        assert source_path == source
+        assert temporary_path.parent == destination.parent
+        assert not destination.exists()
+        converted.append(temporary_path)
+        _write_ready_cache(temporary_path)
+
+    for _ in range(2):
+        conversion_cache.ensure_node_local_conversion_cache(
+            source,
+            destination,
+            unexpected_bulk_call,
+            "HF",
+            "PrimeRL",
+            unexpected_bulk_call,
+            unexpected_bulk_call,
+            rank=0,
+            local_rank=0,
+            convert_checkpoint_fn=convert_checkpoint,
+        )
+
+    assert len(converted) == 1
+    assert not converted[0].exists()
+    assert conversion_cache.conversion_cache_ready(destination)
+
+
+@pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
+def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "cache" / "prime"
+
+    def unexpected_bulk_call(*args):
+        raise AssertionError("checkpoint callback must bypass bulk conversion")
+
+    def convert_checkpoint(source_path, temporary_path):
+        assert source_path == source
+        temporary_path.mkdir()
+        if failure == "exception":
+            raise RuntimeError("injected checkpoint conversion failure")
+        if failure == "missing-index":
+            (temporary_path / "model.safetensors").write_bytes(b"partial")
+        else:
+            (temporary_path / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "missing.safetensors"}})
+            )
+
+    with pytest.raises(RuntimeError, match="conversion failure|complete checkpoint"):
+        conversion_cache.ensure_node_local_conversion_cache(
+            source,
+            destination,
+            unexpected_bulk_call,
+            "HF",
+            "PrimeRL",
+            unexpected_bulk_call,
+            unexpected_bulk_call,
+            rank=0,
+            local_rank=0,
+            convert_checkpoint_fn=convert_checkpoint,
+        )
+
+    assert not destination.exists()
+    assert not list(destination.parent.glob("prime.tmp-*"))
+
+
 def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
@@ -505,7 +583,12 @@ def test_capture_mtp_weights_rejects_incomplete_or_mismatched_inventory(monkeypa
     assert "_ap_preserved_mtp_weights" not in model.__dict__
 
 
-def test_qwen_dcp_capture_uses_original_source_before_converted_cache(monkeypatch, tmp_path):
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("cache_scope", ["ready", "node-local", "shared"])
+@pytest.mark.parametrize("checkpoint_conversion", [False, True])
+def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
+    monkeypatch, tmp_path, remote, cache_scope, checkpoint_conversion
+):
     from types import SimpleNamespace
 
     from arctic_platform.model.implementations.qwen35 import model_builder
@@ -542,14 +625,25 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(monkeypatc
             return ()
 
     model = FakePrimeModel()
+    if checkpoint_conversion:
+        model.convert_to_prime_checkpoint = lambda source, destination: None
     config = SimpleNamespace(
-        name=str(original),
+        name="Qwen/test-offline-checkpoint" if remote else str(original),
         fsdp_cpu_offload=False,
         debug=SimpleNamespace(random_init=False),
         weight_conversion_cache_dir=str(tmp_path / "cache"),
     )
     monkeypatch.setattr(model_builder, "PreTrainedModelPrimeRL", FakePrimeModel)
     monkeypatch.setattr(model_builder.torch.distributed, "barrier", lambda: events.append(("barrier",)))
+
+    def download(*, repo_id, repo_type, allow_patterns):
+        assert remote, "Local checkpoint must not call the Hub"
+        assert repo_id == config.name and repo_type == "model"
+        assert allow_patterns == ["*.safetensors", "*.safetensors.index.json"]
+        events.append(("download",))
+        return str(original)
+
+    monkeypatch.setattr(model_builder, "snapshot_download", download)
 
     def capture(captured_model, source, captured_config):
         assert captured_config is config
@@ -564,8 +658,30 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(monkeypatc
         model_builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.gate_up_proj"]
     )
     monkeypatch.setattr(model_builder, "resolve_conversion_cache_path", lambda *args: converted)
-    monkeypatch.setattr(model_builder, "conversion_cache_is_node_local", lambda path: False)
-    monkeypatch.setattr(model_builder, "conversion_cache_ready", lambda path: True)
+    monkeypatch.setattr(model_builder, "conversion_cache_is_node_local", lambda path: cache_scope == "node-local")
+    cache_written = cache_scope == "ready"
+
+    def cache_ready(path):
+        assert path == converted
+        return cache_written
+
+    def convert_cache(source, destination, convert_fn, source_format, target_format, load_fn, save_fn, **kwargs):
+        nonlocal cache_written
+        assert source == original and destination == converted
+        assert convert_fn == model.convert_to_prime
+        assert source_format == "HF" and target_format == "PrimeRL"
+        assert load_fn is model_builder.load_state_dict and save_fn is model_builder.save_state_dict
+        assert kwargs == {
+            "rank": 0,
+            "local_rank": 0,
+            "convert_checkpoint_fn": getattr(model, "convert_to_prime_checkpoint", None),
+        }
+        events.append(("convert_cache", source, destination))
+        cache_written = True
+
+    monkeypatch.setattr(model_builder, "conversion_cache_ready", cache_ready)
+    monkeypatch.setattr(model_builder, "ensure_node_local_conversion_cache", convert_cache)
+    monkeypatch.setattr(model_builder, "_write_conversion_cache", convert_cache)
     monkeypatch.setattr(model_builder, "get_world", lambda: SimpleNamespace(is_master=True, rank=0, local_rank=0))
     monkeypatch.setattr(model_builder, "HuggingFaceStorageReader", lambda path: ("reader", Path(path)))
     monkeypatch.setattr(model_builder, "maybe_observe_checkpoint_reader", lambda reader, *args: reader)
@@ -580,6 +696,13 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(monkeypatc
     assert ("capture", model, original) in events
     assert ("dcp_load", ("reader", converted)) in events
     assert events.index(("capture", model, original)) < events.index(("dcp_load", ("reader", converted)))
+    assert (("download",) in events) is remote
+    assert (("convert_cache", original, converted) in events) is (cache_scope != "ready")
+    if cache_scope != "ready":
+        conversion_index = events.index(("convert_cache", original, converted))
+        assert events.index(("capture", model, original)) < conversion_index
+        load_index = events.index(("dcp_load", ("reader", converted)))
+        assert ("barrier",) in events[conversion_index + 1 : load_index]
 
 
 def _rewrite_mtp_index(source, mutate):

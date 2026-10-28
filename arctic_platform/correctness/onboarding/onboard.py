@@ -1403,7 +1403,6 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
-    _stage(phase, "Target Run", f"Validating the frozen {int(selected['layers'])}-layer fixture.")
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1465,6 +1464,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--",
             *command[3:],
         ]
+    description = selected.get("model_description", f"frozen {layers}-layer regression")
+    _stage(phase, "Target Run", description)
     lines: list[str] = []
     with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
@@ -1768,13 +1769,13 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
                 optimizer_layers,
                 vision_depth=spec.model.vision_depth,
             )
-        print(f"Reference fixture: {optimizer_model_path}", flush=True)
+        print(f"phase 1/3 complete: reference={optimizer_model_path}", flush=True)
     try:
         with _phase(
             "Phase 2/3",
             "Optimizer Calibration",
             f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference steps per GAS arm; "
-            "completed workers and unfinished runs are reported without an ETA.",
+            "completed workers and periodic waits are logged.",
         ):
             calibration_json = Path(
                 _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
@@ -1884,6 +1885,7 @@ def _parent(args: argparse.Namespace) -> int:
         return _onboard_optimizer_test(args, config)
 
     full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
+    sizing_started = time.monotonic()
     if getattr(args, "reuse_sizing", None) is not None:
         with _phase(
             "Phase 1/3",
@@ -1905,7 +1907,8 @@ def _parent(args: argparse.Namespace) -> int:
     if selected["status"] != "fit":
         raise RuntimeError(f"unexpected sizing status {selected['status']!r} for {representative_layers} layers")
     print(
-        f"Selected fixture: {selected['layers']} layers, peak={selected['peak_gib']:.3f} GiB",
+        f"phase 1/3 complete: selected={selected['layers']} layers "
+        f"peak={selected['peak_gib']:.3f} GiB elapsed={time.monotonic() - sizing_started:.1f}s",
         flush=True,
     )
 

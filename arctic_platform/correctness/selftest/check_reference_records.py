@@ -476,6 +476,7 @@ def test_optimizer_calibration_defaults_to_one_eight_gpu_wave_per_arm(
             index = int(output.stem.rsplit("-", 1)[-1])
             device = kwargs["cuda_device"]
             with lock:
+                assert 0 <= index < 8
                 assert device == index % 8
                 assert device not in active
                 active.add(device)

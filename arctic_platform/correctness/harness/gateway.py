@@ -66,7 +66,7 @@ def _metadata(
 
 
 def _training_config(config) -> dict:
-    raw = deepcopy(config.model_dump(mode="json", by_alias=True))
+    raw = deepcopy(config.model_dump(mode="json", by_alias=True, exclude_none=True))
     training = raw.get("training_config")
     if (
         str(raw.get("job_type")) != "training"

@@ -525,7 +525,14 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         return
 
     if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
+        # DCP needs tensor shards and their index, not uncached Hub documentation.
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=config.name,
+                repo_type="model",
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
     else:
         logger.info(
             f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
@@ -549,6 +556,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."
@@ -567,6 +575,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -579,6 +588,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                 )
 
     # All ranks wait for master rank to finish conversion
