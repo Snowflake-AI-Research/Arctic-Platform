@@ -197,8 +197,9 @@ def test_deepseek_v4_matches_the_reported_per_token_cost():
     short = FlopsCounter(config, 0, enable_gradient_checkpointing=True).estimate_tflos([1024])
     long = FlopsCounter(config, 0, enable_gradient_checkpointing=True).estimate_tflos([1024, 2048])
     assert long > short
+    # Without recompute: 6 per activated parameter and 7 of flash's 9 attention matmuls.
     no_recompute = tflops_per_token(config, 65536, enable_gradient_checkpointing=False)
-    assert abs(no_recompute - 0.14061 * 6 / 8) < 5e-5
+    assert abs(no_recompute - 0.10642) < 5e-5
 
 
 def _glm53_flash():
@@ -242,3 +243,51 @@ def test_glm53_flash_matches_the_reported_attention_terms():
     assert abs(tflops_per_token(config, 262144) - 0.24688) < 5e-5
     outer = _Config(model_type="glm5_next", text_config=config)
     assert tflops_per_token(outer, 65536) == tflops_per_token(config, 65536)
+
+
+def _qwen3_5_dense():
+    config = _qwen3_moe()
+    config.model_type = "qwen3_5_text"
+    config.intermediate_size = 48
+    return config
+
+
+def test_qwen3_5_dense_matches_the_hybrid_moe_count_with_one_expert():
+    dense = _qwen3_5_dense()
+    moe = _qwen3_moe()
+    moe.model_type = "qwen3_5_moe_text"
+    moe.num_experts_per_tok = 1
+    moe.num_experts = 0
+    for checkpoint in (False, True):
+        got = FlopsCounter(dense, 0, enable_gradient_checkpointing=checkpoint).estimate_tflos([32, 40])
+        expected = FlopsCounter(moe, 0, enable_gradient_checkpointing=checkpoint).estimate_tflos([32, 40])
+        assert got == expected
+    outer = _Config(model_type="qwen3_5", text_config=dense)
+    assert tflops_per_token(outer, 64) == tflops_per_token(dense, 64)
+
+
+@pytest.mark.parametrize("make_config", [_llama, _qwen3_5_dense, _glm53_flash, _deepseek_v4_flash])
+def test_lora_drops_only_the_frozen_weight_gradients(make_config):
+    config = make_config()
+    # Attention has no weights, so the LoRA saving per token does not depend on the sequence length.
+    saved = [
+        tflops_per_token(config, seq_len, 1000) - tflops_per_token(config, seq_len, 1000, lora=True)
+        for seq_len in (64, 4096)
+    ]
+    assert saved[0] > 0
+    assert saved[0] == pytest.approx(saved[1], rel=1e-9)
+    full = FlopsCounter(config, 1000, enable_gradient_checkpointing=False)
+    lora = FlopsCounter(config, 1000, enable_gradient_checkpointing=False, lora=True)
+    forward = full.estimate_tflos([64], forward_only=True) - lora.estimate_tflos([64], forward_only=True)
+    assert forward == 0
+
+
+@pytest.mark.parametrize("make_config", [_llama, _qwen3_5_dense, _glm53_flash])
+def test_partial_checkpointing_interpolates(make_config):
+    config = make_config()
+    off, half, on = (
+        tflops_per_token(config, 4096, 1000, enable_gradient_checkpointing=fraction) for fraction in (False, 0.5, True)
+    )
+    assert half == pytest.approx((off + on) / 2, rel=1e-12)
+    with pytest.raises(ValueError):
+        FlopsCounter(config, 1000, enable_gradient_checkpointing=1.5)

@@ -15,9 +15,9 @@
 
 # Adapted from ArcticTraining's trainer/flops_counter.py, which adapts
 # https://github.com/volcengine/verl/blob/main/verl/utils/flops_counter.py
-# DeepSeek-V4 and GLM-5.3-Flash are counted with the checkpointed per-token
-# convention used for the H200 step reports: 8 FLOPs per activated parameter,
-# plus the sparse attention and indexer terms.
+# DeepSeek-V4 and GLM-5.3-Flash use the per-token convention of the H200 step
+# reports: 8 FLOPs per activated parameter when checkpointed, plus the sparse
+# attention and indexer terms.
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ VALID_CONFIG_TYPE = frozenset(
         "deepseek_v4",
         "glm5_next",
         "glm5_next_text",
+        "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
         "minicpmv",
@@ -60,6 +62,7 @@ def estimate_decoder_transformer_tflos(
     batch_of_seqlens,
     enable_gradient_checkpointing,
     forward_only=False,
+    lora=False,
 ):
     """Total teraFLOPs and token count for a batch of packed or unpacked samples.
 
@@ -67,7 +70,7 @@ def estimate_decoder_transformer_tflos(
     unpacked sample is ``[[seqlen]]``. Unknown ``model_type`` values use the
     dense decoder formula.
     """
-    flops_counter = FlopsCounter(hf_model_config, model_size, enable_gradient_checkpointing)
+    flops_counter = FlopsCounter(hf_model_config, model_size, enable_gradient_checkpointing, lora=lora)
     seqlen = 0
     tflos = 0.0
     for seqlens in batch_of_seqlens:
@@ -77,10 +80,15 @@ def estimate_decoder_transformer_tflos(
 
 
 def tflops_per_token(
-    config, seq_len: int, model_size: int = 0, *, enable_gradient_checkpointing: bool = True
+    config,
+    seq_len: int,
+    model_size: int = 0,
+    *,
+    enable_gradient_checkpointing: bool | float = True,
+    lora: bool = False,
 ) -> float:
     """TeraFLOPs per token at ``seq_len``. Multiply by tokens/second to get TFLOP/s."""
-    counter = FlopsCounter(config, model_size, enable_gradient_checkpointing)
+    counter = FlopsCounter(config, model_size, enable_gradient_checkpointing, lora=lora)
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
     return counter.estimate_tflos([seq_len]) / seq_len
@@ -93,16 +101,26 @@ class FlopsCounter:
     checkpointing recomputes the forward. Attention follows the flash or
     eager backward and is halved for causal masks. ``forward_only`` counts
     the forward matmuls only.
+
+    ``enable_gradient_checkpointing`` is a bool or the fraction of layers
+    that recompute their forward. ``lora`` drops the weight gradients of the
+    frozen base weights (2 of the 6); the adapter matmuls are not counted.
     """
 
     def __init__(
         self,
         config: Any,
         model_size,
-        enable_gradient_checkpointing: bool = False,
+        enable_gradient_checkpointing: bool | float = False,
         causal: bool = True,
         attn_implementation: str | None = None,
+        lora: bool = False,
     ):
+        if not 0 <= enable_gradient_checkpointing <= 1:
+            raise ValueError(
+                "enable_gradient_checkpointing must be a bool or a fraction in [0, 1], "
+                f"got {enable_gradient_checkpointing}"
+            )
         self.estimate_func = {
             "qwen2": self._estimate_qwen2_flops,
             "llama": self._estimate_qwen2_flops,
@@ -112,6 +130,8 @@ class FlopsCounter:
             "qwen3": self._estimate_qwen2_flops,
             "qwen3_moe": self._estimate_qwen2_moe_flops,
             "qwen3_next": self._estimate_qwen2_moe_flops,
+            "qwen3_5": self._estimate_qwen3_5_flops,
+            "qwen3_5_text": self._estimate_qwen3_5_flops,
             "qwen3_5_moe": self._estimate_qwen2_moe_flops,
             "qwen3_5_moe_text": self._estimate_qwen2_moe_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
@@ -123,9 +143,9 @@ class FlopsCounter:
         }
         self.config = getattr(config, "text_config", config)
         self.model_size = model_size
-        # GEMM multipliers on N*tokens: forward 2, backward 4. Checkpointing
-        # recomputes one forward, which adds 2.
-        self.dense_flops_multiplier = 8 if enable_gradient_checkpointing else 6
+        # GEMM multipliers on N*tokens: forward 2, backward 4 (input and weight
+        # gradients, 2 each). Checkpointing recomputes one forward, which adds 2.
+        self.dense_flops_multiplier = 2 + (2 if lora else 4) + 2 * enable_gradient_checkpointing
 
         # Attention is counted in matmuls of an S x S x d product (2 FLOPs each).
         # Flash recomputes the score matrix in the backward (5 matmuls); eager
@@ -136,17 +156,19 @@ class FlopsCounter:
             attn_implementation = getattr(self.config, "_attn_implementation", None) or "flash_attention_2"
         self.attn_implementation = attn_implementation
         recompute = attn_implementation not in ("eager", "math")
-        matmuls = 2 + (5 if recompute else 4)
-        if enable_gradient_checkpointing:
-            matmuls += 2
+        matmuls = 2 + (5 if recompute else 4) + 2 * enable_gradient_checkpointing
         self.attn_flops_multiplier = 2 * matmuls
         self.causal_factor = 0.5 if causal else 1.0
 
-    def _dense_flops_multiplier(self, forward_only: bool) -> int:
+    def _dense_flops_multiplier(self, forward_only: bool) -> float:
         return 2 if forward_only else self.dense_flops_multiplier
 
+    def _attn_span_flops_multiplier(self, forward_only: bool) -> float:
+        """Attention FLOPs per (query, key, head dim) when every query sees the whole span."""
+        return 4 if forward_only else self.attn_flops_multiplier
+
     def _attn_flops_multiplier(self, forward_only: bool) -> float:
-        return (4 if forward_only else self.attn_flops_multiplier) * self.causal_factor
+        return self._attn_span_flops_multiplier(forward_only) * self.causal_factor
 
     def _estimate_dense_decoder_transformer_tflos(self, tokens_sum, batch_seqlens, delta_time=1, forward_only=False):
         del tokens_sum, delta_time
@@ -230,13 +252,23 @@ class FlopsCounter:
 
     def _estimate_qwen2_moe_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
         hidden_size = self.config.hidden_size
+        moe_intermediate_size = self.config.moe_intermediate_size
+        moe_topk = self.config.num_experts_per_tok
+        num_experts = self.config.num_experts
+        moe_mlp_n = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
+        return self._estimate_hybrid_attention_flops(moe_mlp_n, tokens_sum, batch_seqlens, delta_time, forward_only)
+
+    def _estimate_qwen3_5_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
+        mlp_n = self.config.hidden_size * self.config.intermediate_size * 3
+        return self._estimate_hybrid_attention_flops(mlp_n, tokens_sum, batch_seqlens, delta_time, forward_only)
+
+    def _estimate_hybrid_attention_flops(self, mlp_n, tokens_sum, batch_seqlens, delta_time, forward_only):
+        """Every ``full_attention_interval``-th layer is full attention; the rest are gated delta-net."""
+        hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
         num_hidden_layers = self.config.num_hidden_layers
         num_key_value_heads = self.config.num_key_value_heads
         num_attention_heads = self.config.num_attention_heads
-        moe_intermediate_size = self.config.moe_intermediate_size
-        moe_topk = self.config.num_experts_per_tok
-        num_experts = self.config.num_experts
         head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
         q_size = num_attention_heads * head_dim
         k_size = num_key_value_heads * head_dim
@@ -246,9 +278,8 @@ class FlopsCounter:
         num_full_attention_layers = num_hidden_layers // full_attention_interval
         num_linear_attention_layers = num_hidden_layers - num_full_attention_layers
 
-        moe_mlp_n = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
         embed_and_lm_head_n = vocab_size * hidden_size
-        dense_n = moe_mlp_n * num_hidden_layers + embed_and_lm_head_n
+        dense_n = mlp_n * num_hidden_layers + embed_and_lm_head_n
         dense_n_flops = self._dense_flops_multiplier(forward_only) * dense_n * tokens_sum
 
         seqlen_square_sum = sum(seqlen**2 for seqlen in batch_seqlens)
@@ -293,27 +324,31 @@ class FlopsCounter:
         flops_all_token = dense_n_flops + full_attn_flops + linear_attn_flops
         return flops_all_token * (1.0 / delta_time) / 1e12
 
-    def _estimate_deepseek_v4_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
-        """Checkpointed DeepSeek-V4 count, scaled when recompute or the backward is off.
+    def _estimate_sparse_attention_flops(self, terms, batch_seqlens, delta_time, forward_only):
+        """Per-token dense, fixed-span, and causal terms times each sequence length.
 
-        The 8 / 9 / 18 factors are the training-step convention: recompute on,
-        causal compressed attention, and fixed-span attention (sliding window
-        and indexer top-k). Other modes scale that count by the dense
-        multiplier over 8.
+        Checkpointed, that is 8 per activated parameter, 18 per fixed-span
+        (query, key, head dim) such as a sliding window or indexer top-k, and
+        9 per causal one, the convention of the H200 step reports.
         """
+        activated, span, causal = terms
+        per_token = (
+            self._dense_flops_multiplier(forward_only) * activated
+            + self._attn_span_flops_multiplier(forward_only) * span
+        )
+        causal_per_key = self._attn_flops_multiplier(forward_only) * causal
+        total = sum((per_token + causal_per_key * seqlen) * seqlen for seqlen in batch_seqlens)
+        return total * (1.0 / delta_time) / 1e12
+
+    def _estimate_deepseek_v4_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
         del tokens_sum
-        per_token = _deepseek_v4_checkpointed_flops_per_token(self.config, batch_seqlens)
-        total = sum(flops * seqlen for flops, seqlen in zip(per_token, batch_seqlens))
-        scale = self._dense_flops_multiplier(forward_only) / 8
-        return total * scale * (1.0 / delta_time) / 1e12
+        terms = _deepseek_v4_flops_terms(self.config)
+        return self._estimate_sparse_attention_flops(terms, batch_seqlens, delta_time, forward_only)
 
     def _estimate_glm5_next_flops(self, tokens_sum, batch_seqlens, delta_time, forward_only):
-        """Checkpointed GLM-5.3-Flash count, scaled like DeepSeek-V4."""
         del tokens_sum
-        per_token = _glm5_next_checkpointed_flops_per_token(self.config, batch_seqlens)
-        total = sum(flops * seqlen for flops, seqlen in zip(per_token, batch_seqlens))
-        scale = self._dense_flops_multiplier(forward_only) / 8
-        return total * scale * (1.0 / delta_time) / 1e12
+        terms = _glm5_next_flops_terms(self.config)
+        return self._estimate_sparse_attention_flops(terms, batch_seqlens, delta_time, forward_only)
 
     def estimate_tflos(self, batch_seqlens, delta_time=1, forward_only=False):
         """TeraFLOPs for one row of sequence lengths. ``delta_time`` is ignored."""
@@ -322,7 +357,8 @@ class FlopsCounter:
         return func(tokens_sum, batch_seqlens, delta_time=delta_time, forward_only=forward_only)
 
 
-def _deepseek_v4_checkpointed_flops_per_token(config, batch_seqlens) -> list[float]:
+def _deepseek_v4_flops_terms(config) -> tuple[float, float, float]:
+    """Activated parameters, fixed-span attention, and causal attention per key."""
     hidden = config.hidden_size
     heads = config.num_attention_heads
     head_dim = config.head_dim
@@ -367,22 +403,15 @@ def _deepseek_v4_checkpointed_flops_per_token(config, batch_seqlens) -> list[flo
         + lm_head
     )
 
-    fixed = 8 * activated + 18 * num_layers * heads * head_dim * window
-    fixed += 18 * n_csa * heads * head_dim * config.index_topk
-    return [
-        fixed
-        + 9 * n_hca * heads * head_dim * (seqlen / hca_rate)
-        + 9 * n_csa * index_heads * index_dim * (seqlen / csa_rate)
-        for seqlen in batch_seqlens
-    ]
+    span = num_layers * heads * head_dim * window + n_csa * heads * head_dim * config.index_topk
+    causal = n_hca * heads * head_dim / hca_rate + n_csa * index_heads * index_dim / csa_rate
+    return activated, span, causal
 
 
-def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float]:
-    """GLM-5.3-Flash FLOPs per token at each sequence length.
+def _glm5_next_flops_terms(config) -> tuple[float, float, float]:
+    """GLM-5.3-Flash activated parameters, top-k attention, and causal indexer per key.
 
-    Dense GEMMs are 8 times the activated parameters. Each sparse layer adds
-    the causal indexer over the sequence (9) and the selected top-k attention
-    (18). Linear-attention layers contribute their projections only.
+    Linear-attention layers contribute their projections only.
     """
     hidden = config.hidden_size
     heads = config.num_attention_heads
@@ -447,6 +476,5 @@ def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float
         + config.vocab_size * hidden
     )
 
-    fixed = 8 * activated + 18 * n_sparse * heads * value * config.index_topk
-    indexer_per_token = 9 * n_indexer * index_heads * index_dim
-    return [fixed + indexer_per_token * seqlen for seqlen in batch_seqlens]
+    span = n_sparse * heads * value * config.index_topk
+    return activated, span, n_indexer * index_heads * index_dim
