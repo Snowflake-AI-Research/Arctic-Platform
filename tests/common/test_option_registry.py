@@ -75,6 +75,7 @@ EXPECTED_PROFILES = {
     "glm5_next",
     "qwen4_exp",
     "deepseek_v4",
+    "deepseek_v41",
     "dflash2",
 }
 
@@ -531,7 +532,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 23 options x 8 profiles = 184 cells, ")
+        assert out[0].startswith("check passed: 23 options x 9 profiles = 207 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())
