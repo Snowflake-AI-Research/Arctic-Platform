@@ -113,7 +113,7 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
     def encode(request: Request, body: dict) -> list[Send]:
-        frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+        frame = _training_frame(body) if wire_op == "fwd-bwd" else wire.dumps(body, metadata=_CHUNKED_RESULTS)
         chunks = wire.encode_byte_chunks(
             frame, kind="request", operation=wire_op, max_bytes=_MAX_OCTET_BYTES, force_chunk=force_chunk
         )
@@ -174,7 +174,7 @@ def _forward(request: Request, body: dict) -> list[Send]:
     final POST answers with a request_id -- the earlier ones report the chunk
     was cached -- so they must be posted in order and the last reply kept.
     """
-    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    frame = _training_frame(body)
     max_json_bytes = _OPERATION_MAX_JSON_BYTES
     chunks = wire.encode_byte_chunks(
         frame,
@@ -866,3 +866,13 @@ def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
     if "metrics" in result:
         decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
     return decoded
+
+
+def _training_frame(body: dict) -> bytes:
+    """Keep replay coordination in the metadata the zone reads, outside the model batch."""
+    batch = dict(body)
+    metadata = dict(_CHUNKED_RESULTS)
+    replay = batch.pop("router_replay", None)
+    if replay is not None:
+        metadata["router_replay"] = replay
+    return wire.dumps(batch, metadata=metadata)
