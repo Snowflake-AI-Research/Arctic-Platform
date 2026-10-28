@@ -21,9 +21,14 @@ options into the forward, and reports the model's ratio metrics as additive ``lo
 them to get exact pooled ratios (the names are SpecForge's metric names, for example
 ``dflash2/selector/greedy_accepted_length``).
 
+``loss_mask`` is the platform's prediction-aligned mask (entry ``i`` weights the logits at ``i`` that predict token
+``i + 1``). It is forwarded unchanged; the model converts each row to token alignment, because it is the one that
+splits the packed window into rows.
+
 Normalisation: each window's loss is ``(sum w*CE + alpha*sum w*covered*selCE) / sum w`` over that window's blocks.
-Windows of a rank are combined weighted by their supervised-token counts, and ranks are averaged by the data-parallel
-gradient reduction.
+Windows of a rank are combined weighted by the supervised tokens of the rows that reach the draft loss (rows too short
+to hold an anchor and a target are skipped by the model and carry no weight), and ranks are averaged by the
+data-parallel gradient reduction.
 """
 
 from __future__ import annotations
@@ -40,6 +45,37 @@ from .packed_reduction import local_mean_packed_loss_reduction
 TERMS_OUTPUT_KEY = "dflash2_terms"
 
 
+def _supervised_token_weight(microbatch: dict) -> float:
+    """Supervised-token mass of the rows of ``microbatch`` that the model keeps for the draft loss.
+
+    Rows are what ``DFlash2OnlineModel.forward`` sees: the ``position_ids`` resets of a packed window, or the
+    ``attention_mask`` lengths of a padded ``[B, S]`` microbatch. The model's own row rule decides which rows count.
+    """
+    from arctic_platform.model.implementations.dflash2.online import row_spans
+    from arctic_platform.model.implementations.dflash2.online import trainable_row_mask
+
+    loss_mask = microbatch.get("loss_mask")
+    if not torch.is_tensor(loss_mask):
+        raise ValueError("dflash2 requires context['loss_mask'] marking supervised tokens (1) and others (0)")
+    position_ids = microbatch.get("position_ids")
+    attention_mask = microbatch.get("attention_mask")
+    if torch.is_tensor(position_ids):
+        flat = loss_mask.reshape(-1)
+        rows = [flat[start:end] for start, end in row_spans(position_ids)]
+    elif torch.is_tensor(attention_mask) and attention_mask.shape == loss_mask.shape and loss_mask.ndim == 2:
+        lengths = attention_mask.sum(dim=1).tolist()
+        rows = [loss_mask[index, : int(length)] for index, length in enumerate(lengths)]
+    elif loss_mask.ndim == 1 or loss_mask.shape[0] == 1:
+        rows = [loss_mask.reshape(-1)]
+    else:
+        raise ValueError(
+            "dflash2 cannot split a padded loss_mask into rows without position_ids or an attention_mask of the "
+            f"same shape, got loss_mask shape {tuple(loss_mask.shape)}"
+        )
+    kept = (trainable_row_mask(row) for row in rows)
+    return float(sum(mask.sum() for mask in kept if mask is not None))
+
+
 class DFlash2Loss(BaseLoss):
     name = "dflash2"
 
@@ -53,7 +89,8 @@ class DFlash2Loss(BaseLoss):
         loss_mask = context.get("loss_mask")
         if not torch.is_tensor(loss_mask):
             raise ValueError("dflash2 requires context['loss_mask'] marking supervised tokens (1) and others (0)")
-        # The data plane packs rows into one window; its mask may be [T] while the model takes [1, T].
+        # The data plane packs rows into one window; its mask may be [T] while the model takes [1, T]. The mask stays
+        # prediction-aligned here: the model shifts it per row.
         model_kwargs["loss_mask"] = loss_mask.reshape(1, -1)
         alpha = config.get("selector_loss_alpha")
         if alpha is not None:
@@ -81,11 +118,7 @@ class DFlash2Loss(BaseLoss):
         loss_fn_name: str,
     ) -> PackedLossReduction:
         del config, loss_fn_name
-        weights = []
-        for microbatch in microbatches:
-            loss_mask = microbatch.get("loss_mask")
-            weights.append(float(loss_mask.sum()) if torch.is_tensor(loss_mask) else 1.0)
-        return local_mean_packed_loss_reduction(weights)
+        return local_mean_packed_loss_reduction([_supervised_token_weight(microbatch) for microbatch in microbatches])
 
     def output_callback(self, model_outputs: dict) -> None:
         model_outputs.pop("logits", None)

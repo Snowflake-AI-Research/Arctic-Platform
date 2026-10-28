@@ -18,7 +18,8 @@ SpecForge's ``OnlineDFlashModel`` (vendored unchanged) trains on padded ``[B, S]
 were captured by a separate server. Here the target runs inside the training step instead, and the DSS data plane
 hands the model a packed ``[1, T]`` window with ``position_ids`` restarting per row. This module is the glue:
 
-1. split the window back into rows at the ``position_ids`` resets,
+1. split the window back into rows at the ``position_ids`` resets and convert each row's prediction-aligned
+   ``loss_mask`` to the token alignment SpecForge trains on,
 2. run the frozen target on each row to get the hidden states of ``target_layer_ids`` (what the capture server gives
    SpecForge),
 3. pad the rows into the ``[B, S]`` batch ``OnlineDFlashModel`` expects and call it, and
@@ -53,6 +54,22 @@ def row_spans(position_ids: torch.Tensor) -> list[tuple[int, int]]:
         starts = [0] + starts
     ends = starts[1:] + [flat.numel()]
     return list(zip(starts, ends))
+
+
+def trainable_row_mask(prediction_mask: torch.Tensor) -> Optional[torch.Tensor]:
+    """Token-aligned supervision mask of one row, or ``None`` when the row cannot form a block.
+
+    ``prediction_mask`` is the platform ``loss_mask`` for the row, ``[..., L]``: entry ``i`` weights the logits at
+    ``i`` that predict token ``i + 1``. The draft objective instead weights the token at each position, so entry
+    ``j`` of the result is ``prediction_mask[j - 1]`` and the row's first token is never supervised.
+
+    A block needs an anchor and its first target to both be supervised, which is two adjacent supervised tokens.
+    """
+    token_mask = torch.zeros_like(prediction_mask)
+    token_mask[..., 1:] = prediction_mask[..., :-1]
+    if not bool(((token_mask[..., :-1] > 0.5) & (token_mask[..., 1:] > 0.5)).any()):
+        return None
+    return token_mask
 
 
 def text_backbone(target: nn.Module) -> nn.Module:
@@ -114,6 +131,7 @@ class DFlash2OnlineModel(nn.Module):
         per_position_metrics: bool = False,
         **_: Any,
     ) -> dict[str, Any]:
+        """``loss_mask`` is the platform's prediction-aligned mask over the packed window (see ``trainable_row_mask``)."""
         if loss_mask is None:
             raise ValueError("DFlash2 training needs a loss_mask marking the supervised tokens")
         if position_ids is None:
@@ -122,8 +140,8 @@ class DFlash2OnlineModel(nn.Module):
 
         rows = []
         for start, end in row_spans(position_ids):
-            row_mask = loss_mask[:, start:end]
-            if end - start < 3 or int(((row_mask[:, :-1] > 0.5) & (row_mask[:, 1:] > 0.5)).sum()) == 0:
+            row_mask = trainable_row_mask(loss_mask[:, start:end])
+            if row_mask is None:
                 continue  # no anchor with a supervised successor: this row cannot form a block
             rows.append((input_ids[:, start:end], row_mask, self.target_context(input_ids[:, start:end])))
 
@@ -138,7 +156,11 @@ class DFlash2OnlineModel(nn.Module):
         longest = max(ids.shape[1] for ids, _, _ in rows)
 
         def pad(x: torch.Tensor) -> torch.Tensor:
-            return torch.nn.functional.pad(x, (0, 0, 0, longest - x.shape[1])) if x.ndim == 3 else torch.nn.functional.pad(x, (0, longest - x.shape[1]))
+            return (
+                torch.nn.functional.pad(x, (0, 0, 0, longest - x.shape[1]))
+                if x.ndim == 3
+                else torch.nn.functional.pad(x, (0, longest - x.shape[1]))
+            )
 
         ids = torch.cat([pad(r[0]) for r in rows], dim=0)
         mask = torch.cat([pad(r[1]) for r in rows], dim=0)
