@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from arctic_platform.common.utils import sequence_parallel as sp
+from arctic_platform.common import deepspeed_worker
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.rl.processors import BaseLoss
 from arctic_platform.rl.processors import prepare_request_loss
@@ -191,7 +191,9 @@ def _sp_execution_worker():
 def test_sp_execution_worker_preserves_objective_gas_scales_boundaries_and_steps(monkeypatch, backward):
     worker, info, request = _sp_execution_worker()
     guards, calls = [], []
-    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", lambda engine, **kwargs: guards.append(kwargs))
+    monkeypatch.setattr(
+        deepspeed_worker, "verify_sequence_parallel_reduction", lambda engine, **kwargs: guards.append(kwargs)
+    )
 
     def selected(engine, batch, meta, processing, device, **kwargs):
         assert engine is worker.engine
@@ -208,7 +210,7 @@ def test_sp_execution_worker_preserves_objective_gas_scales_boundaries_and_steps
             "batch": {"logprobs": batch["input_ids"].float()},
         }
 
-    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    monkeypatch.setattr(deepspeed_worker, "run_sequence_parallel_grpo", selected)
     result = worker._forward_maybe_backward(request, backward=backward)
     assert [call["loss_scale"] for call in calls] == [0.25, 0.75]
     assert calls[0]["loss_object"] is calls[1]["loss_object"]
@@ -241,8 +243,8 @@ def test_sp_execution_worker_rejects_unselected_reducer_before_model(monkeypatch
     def unexpected(*args, **kwargs):
         pytest.fail("SP adapter must not run after failed reduction admission")
 
-    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", reject)
-    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", unexpected)
+    monkeypatch.setattr(deepspeed_worker, "verify_sequence_parallel_reduction", reject)
+    monkeypatch.setattr(deepspeed_worker, "run_sequence_parallel_grpo", unexpected)
     with pytest.raises(ValueError, match="unselected reducer"):
         worker.forward_backward(request)
     assert not worker.engine.events
@@ -250,13 +252,13 @@ def test_sp_execution_worker_rejects_unselected_reducer_before_model(monkeypatch
 
 def test_sp_execution_worker_rejects_membership_changed_during_execution(monkeypatch):
     worker, info, request = _sp_execution_worker()
-    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", lambda *args, **kwargs: None)
+    monkeypatch.setattr(deepspeed_worker, "verify_sequence_parallel_reduction", lambda *args, **kwargs: None)
 
     def selected(*args, **kwargs):
         info["world_size"] = 8
         return {"avg_loss": 0.0, "batch": {}, "metrics": {}}
 
-    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    monkeypatch.setattr(deepspeed_worker, "run_sequence_parallel_grpo", selected)
     with pytest.raises(RuntimeError, match="membership changed"):
         worker.forward_backward(request)
 
@@ -273,8 +275,8 @@ def test_sp_execution_worker_rechecks_reducer_before_publishing_result(monkeypat
     def selected(*args, **kwargs):
         return {"avg_loss": 0.0, "batch": {}, "metrics": {}}
 
-    monkeypatch.setattr(sp, "verify_sequence_parallel_reduction", verify)
-    monkeypatch.setattr(sp, "run_sequence_parallel_grpo", selected)
+    monkeypatch.setattr(deepspeed_worker, "verify_sequence_parallel_reduction", verify)
+    monkeypatch.setattr(deepspeed_worker, "run_sequence_parallel_grpo", selected)
     with pytest.raises(ValueError, match="selected reducer changed"):
         worker.forward_backward(request)
     assert len(calls) == 2

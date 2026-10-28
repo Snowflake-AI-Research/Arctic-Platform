@@ -22511,6 +22511,28 @@ def test_sft_reference_scoring_rejects_nonfinite_answer_tokens(value):
 # Lora adapter storage evidence.
 
 
+def test_lora_debug_uses_one_maintained_library():
+    library_path = Path(bindings.__file__).resolve()
+    assert library_path.name == "lora.py"
+    assert not list(library_path.parent.glob("lora_*.py"))
+    for operation in (
+        bindings.observe_lora_storage_write,
+        bindings.observe_lora_build,
+        bindings.owned_receiver_binding,
+        bindings.prepare_collective_lora_weights,
+        bindings.receive_and_install_lora,
+        bindings.make_lora_replica_pool,
+        bindings.make_selected_lora_replica_pool,
+        bindings.prepare_selected_lora_receiver,
+        bindings.prepare_lora_worker,
+        bindings.selected_lora_request,
+        bindings.maybe_lora_replica_pool,
+        bindings.stage_selected_lora_request,
+        bindings.owned_selected_lora_bootstrap,
+    ):
+        assert Path(inspect.getsourcefile(operation)).resolve() == library_path
+
+
 class Factors:
     def __init__(self, module_name, *, stacked=False):
         self.module_name, self.rank, self.lora_alpha, self.scaling = (

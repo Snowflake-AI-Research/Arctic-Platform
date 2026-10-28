@@ -63,6 +63,8 @@ from arctic_platform.debug.lora import maybe_lora_replica_pool
 from arctic_platform.debug.lora import maybe_lora_sync_result
 from arctic_platform.debug.lora import maybe_prepare_lora_training
 from arctic_platform.debug.lora import maybe_project_lora_transfer_schedule
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -928,8 +930,6 @@ class ArcticRLRayServer:
     def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
         worker_sp_info = None
         if sp_size > 1:
-            from arctic_platform.common.utils.sequence_parallel import validate_sequence_parallel_grpo
-
             _, _, meta, processing = unpack_batch(batch)
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
             worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
@@ -940,8 +940,6 @@ class ArcticRLRayServer:
     def _logical_model_results(results, worker_sp_info, *, sp_size: int):
         if worker_sp_info is None:
             return results
-        from arctic_platform.common.utils.sequence_parallel import collect_sequence_parallel_results
-
         return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
 
     async def shutdown(self) -> None:

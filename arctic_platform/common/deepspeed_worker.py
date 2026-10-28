@@ -56,6 +56,9 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import verify_sequence_parallel_reduction
 
 logger = logging.getLogger(__name__)
 
@@ -526,9 +529,6 @@ class DeepSpeedWorker:
         return_tensors = meta_data.get("worker_return_tensors", False)
         sp_info = None
         if self.sp_size > 1:
-            from arctic_platform.common.utils.sequence_parallel import validate_sequence_parallel_grpo
-            from arctic_platform.common.utils.sequence_parallel import verify_sequence_parallel_reduction
-
             if args:
                 raise ValueError("SP model route requires named token inputs, not positional arguments")
             validate_sequence_parallel_grpo(meta_data, processing, backward=backward)
@@ -618,8 +618,6 @@ class DeepSpeedWorker:
                     backward=backward,
                 )
             elif sp_info is not None:
-                from arctic_platform.common.utils.sequence_parallel import run_sequence_parallel_grpo
-
                 if backward:
                     self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
                 micro_batch_output = run_sequence_parallel_grpo(

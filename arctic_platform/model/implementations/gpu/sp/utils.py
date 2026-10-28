@@ -26,6 +26,7 @@ source admission and constructor capacity remain the operational caller's work.
 
 from __future__ import annotations
 
+import importlib
 import math
 from dataclasses import dataclass
 from numbers import Real
@@ -34,7 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 
-from .server_models import resolve_parallelism_degree
+server_models = importlib.import_module("arctic_platform.common.utils.server_models")
 
 # Fields are prediction aligned except input_ids and position_ids. Unknown
 # tensors cannot be silently replicated, dropped, or interpreted as token fields.
@@ -81,8 +82,8 @@ class TokenPartition:
 def _membership(info: dict) -> tuple[int, int, tuple[int, ...], int]:
     if not isinstance(info, dict):
         raise ValueError("SP membership must be an actual worker record")
-    world = resolve_parallelism_degree(info.get("world_size"), "world_size")
-    size = resolve_parallelism_degree(info.get("sp_size"), "sp_size")
+    world = server_models.resolve_parallelism_degree(info.get("world_size"), "world_size")
+    size = server_models.resolve_parallelism_degree(info.get("sp_size"), "sp_size")
     rank, local = info.get("rank"), info.get("sp_rank")
     ranks = info.get("sp_ranks")
     if (
@@ -118,10 +119,10 @@ def prepare_token_partition(
         raise ValueError("undeclared SP token fields")
     ids, attention = batch.get("input_ids"), batch.get("attention_mask")
     if (
-        not torch.is_tensor(ids)
+        not isinstance(ids, torch.Tensor)
         or ids.ndim != 2
         or ids.dtype not in (torch.int32, torch.int64)
-        or not torch.is_tensor(attention)
+        or not isinstance(attention, torch.Tensor)
         or attention.shape != ids.shape
         or attention.device != ids.device
         or ids.numel() == 0
@@ -140,7 +141,7 @@ def prepare_token_partition(
     if "position_ids" not in tensors:
         tensors["position_ids"] = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
     for name, value in tensors.items():
-        if not torch.is_tensor(value) or value.ndim < 2 or value.shape[:2] != ids.shape:
+        if not isinstance(value, torch.Tensor) or value.ndim < 2 or value.shape[:2] != ids.shape:
             raise ValueError(f"SP token field {name!r} must have leading input_ids shape")
         if value.device != ids.device:
             raise ValueError(f"SP token field {name!r} must be on the input_ids device")
@@ -239,7 +240,7 @@ class _TokenLocalEngine:
         return self.engine.train()
 
     def __call__(self, **kwargs):
-        from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
+        processors = importlib.import_module("arctic_platform.rl.processors")
 
         part = self.partition
         _check_group(part, self.group)
@@ -260,7 +261,7 @@ class _TokenLocalEngine:
             raise ValueError("selected PrimeRL SP model must return its native output dict")
         if set(outputs) - {"logits", "logprobs", "entropy", "loss"} or outputs.get("loss") is not None:
             raise ValueError("selected SP GRPO model returned an unsupported output domain")
-        local_logprobs = compute_logprobs_post(outputs, local_kwargs, {}, "unused")["logprobs"]
+        local_logprobs = processors.compute_logprobs_post(outputs, local_kwargs, {}, "unused")["logprobs"]
         if local_logprobs.shape != (1, part.width):
             raise ValueError("SP native logprobs do not cover exactly the local token slice")
         _check_group(part, self.group)
@@ -320,15 +321,17 @@ def verify_sequence_parallel_reduction(engine, *, sp_info: dict, sp_group) -> No
 
 def collect_sequence_parallel_results(results: list[dict], *, worker_sp_info: list[dict], sp_size: int) -> list[dict]:
     """Keep one replicated logical result per actual SP group, in shard order."""
-    from .batch import sequence_parallel_worker_groups
+    batch_utils = importlib.import_module("arctic_platform.common.utils.batch")
 
-    groups = sequence_parallel_worker_groups(worker_sp_info, len(worker_sp_info), sp_size)
+    groups = batch_utils.sequence_parallel_worker_groups(worker_sp_info, len(worker_sp_info), sp_size)
     if len(results) != len(worker_sp_info) or any(
         not isinstance(result, dict) or result.get("_sequence_parallel_info") != info
         for result, info in zip(results, worker_sp_info)
     ):
         raise ValueError("SP result membership differs from its dispatched worker")
-    sequence_parallel_worker_groups([result["_sequence_parallel_info"] for result in results], len(results), sp_size)
+    batch_utils.sequence_parallel_worker_groups(
+        [result["_sequence_parallel_info"] for result in results], len(results), sp_size
+    )
     # Each worker gathered the same complete logprobs and evaluated the full
     # logical objective. Summing these replicas would multiply loss/counts by SP.
     return [
@@ -359,9 +362,8 @@ def run_sequence_parallel_grpo(
     contributions and averages logical DP replicas. This source adapter is not
     installed-runtime, native-capacity, router-application or numerical proof.
     """
-    from arctic_platform.rl.processors import apply_packed_loss_reduction
-    from arctic_platform.rl.processors import run_pipeline
-    from arctic_platform.rl.processors.base_loss import resolve_loss
+    # Keep the optional RL runtime outside the model library's import/typecheck boundary.
+    processors = importlib.import_module("arctic_platform.rl.processors")
 
     validate_sequence_parallel_grpo(meta, processing, backward=backward)
     if (
@@ -382,9 +384,9 @@ def run_sequence_parallel_grpo(
         or (configured_dp is not None and (type(configured_dp) is not int or configured_dp != logical_dp))
     ):
         raise ValueError("SP meta dp_size does not match actual logical-DP membership")
-    loss_object = resolve_loss("grpo") if loss_object is None else loss_object
+    loss_object = processors.resolve_loss("grpo") if loss_object is None else loss_object
     adapter = _TokenLocalEngine(engine, part, sp_group)
-    result = run_pipeline(
+    result = processors.run_pipeline(
         adapter,
         (),
         packed,
@@ -397,7 +399,7 @@ def run_sequence_parallel_grpo(
         loss_object=loss_object,
     )
     if backward:
-        apply_packed_loss_reduction(adapter, result.pop("loss_tensor"), loss_scale, backward=True)
+        processors.apply_packed_loss_reduction(adapter, result.pop("loss_tensor"), loss_scale, backward=True)
     _check_group(part, sp_group)
     result["batch"] = {name: restore_token_rows(value, mask) for name, value in result.get("batch", {}).items()}
     return result

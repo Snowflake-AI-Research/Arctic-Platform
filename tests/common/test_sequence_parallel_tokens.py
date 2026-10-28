@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from arctic_platform.common.utils import sequence_parallel as sp
+from arctic_platform.model.implementations.gpu.sp import utils as sp
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 

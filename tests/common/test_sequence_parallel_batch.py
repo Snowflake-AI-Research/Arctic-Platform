@@ -27,9 +27,9 @@ from arctic_platform.common.utils.batch import _split_batch
 from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.batch import sequence_parallel_worker_groups
-from arctic_platform.common.utils.sequence_parallel import collect_sequence_parallel_results
 from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import sp_size_from_job_config
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
 from arctic_platform.testing_utils import torch_assert_equal
 
 
