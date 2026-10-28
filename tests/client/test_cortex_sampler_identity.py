@@ -21,13 +21,15 @@ from concurrent.futures import Future
 
 import pytest
 
-from arctic_platform.client.transports.base import Request
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.cortex import CortexTransport
 
 
 @pytest.fixture
 def transport():
     result = object.__new__(CortexTransport)
+    result.config = CortexConfig(base_url="http://gs.test")
     result._router_replay_sampling_ids = {}
     return result
 
@@ -67,17 +69,16 @@ def test_bootstrap_response_translates_only_the_matching_pair(transport, monkeyp
     assert transport._router_replay_request(other_sampler) is other_sampler
 
 
-@pytest.mark.parametrize("operation", ["forward", "forward-backward", "optimizer-step"])
+@pytest.mark.parametrize("operation", ["forward", "forward-backward", "step"])
 def test_submit_prepares_the_translated_request_only_for_forward(transport, monkeypatch, operation):
     transport._router_replay_sampling_ids[("training", "public-sampling")] = "zone-sampling"
-    transport._prefix = "test-prefix"
     request = _request(operation, {"router_replay": {"sampling_job_id": "public-sampling"}})
     prepared = []
 
     class Route:
         @staticmethod
         def prepare(prefix, forwarded):
-            assert prefix == "test-prefix"
+            assert prefix == transport._prefix
             prepared.append(forwarded)
             return "test-url", []
 
@@ -85,6 +86,6 @@ def test_submit_prepares_the_translated_request_only_for_forward(transport, monk
     monkeypatch.setattr(transport, "_on_loop", lambda value: value)
     transport._submit(request, Route())
     assert prepared[0].body["router_replay"]["sampling_job_id"] == (
-        "public-sampling" if operation == "optimizer-step" else "zone-sampling"
+        "public-sampling" if operation == "step" else "zone-sampling"
     )
     assert request.body["router_replay"]["sampling_job_id"] == "public-sampling"
