@@ -128,6 +128,38 @@ def test_worker_moe_spec_dense_bridge_keeps_generic_patches():
     assert spec.loader == "huggingface"
 
 
+@pytest.mark.parametrize(
+    "sp",
+    [
+        {"sp_size": 2},
+        {"sequence_parallel": 2},
+        {"sequence_parallel_size": 2},
+        {"parallelism": {"sequence_parallel": 2}},
+    ],
+)
+def test_worker_moe_spec_dense_bridge_does_not_enable_loader_sp(sp):
+    spec = ModelSpec.from_ds_worker_config("unused", {"attn_implementation": "sdpa", "ep_size": 1, **sp})
+    assert spec.parallelism.expert_parallel == spec.parallelism.sequence_parallel == 1
+    assert spec.loader == "huggingface"
+
+
+@pytest.mark.parametrize("key", ["sequence_parallel", "sequence_parallel_size", "parallelism"])
+def test_worker_moe_spec_resolves_canonical_sp_aliases(tmp_path, worker_config, key):
+    worker_config.pop("sp_size")
+    worker_config[key] = {"sequence_parallel": 8} if key == "parallelism" else 8
+    spec = ModelSpec.from_ds_worker_config(_model_path(tmp_path), worker_config)
+    assert spec.parallelism.sequence_parallel == 8
+
+
+@pytest.mark.parametrize("ep_size", [1, 8])
+@pytest.mark.parametrize("key", ["sequence_parallel", "sequence_parallel_size", "parallelism"])
+def test_worker_moe_spec_rejects_conflicting_sp_aliases(worker_config, ep_size, key):
+    worker_config["ep_size"] = ep_size
+    worker_config[key] = {"sequence_parallel": 2} if key == "parallelism" else 2
+    with pytest.raises(ValueError, match="conflicting sequence-parallel degrees"):
+        ModelSpec.from_ds_worker_config("unused", worker_config)
+
+
 def test_worker_moe_spec_alias_only_moe_options(tmp_path, worker_config):
     worker_config["prime_rl"].pop("deepep_token_chunk_size")
     worker_config["model_options"]["moe"] = {"comm_token_chunk": 2048, "grouped_mm": False}

@@ -29,6 +29,7 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.common.config import resolve_sp_size
 from arctic_platform.common.config import validate_peft_config
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
@@ -230,11 +231,10 @@ class ModelSpec(BaseModel):
             )
 
         parallelism = ParallelismConfig.model_validate(
-            {
-                field: cfg[key]
-                for key, field in (("ep_size", "expert_parallel"), ("sp_size", "sequence_parallel"))
-                if key in cfg
-            }
+            dict(
+                **({"expert_parallel": cfg["ep_size"]} if "ep_size" in cfg else {}),
+                sequence_parallel=resolve_sp_size({"ds_worker_config": cfg}),
+            )
         )
         if parallelism.expert_parallel > 1:
             from arctic_platform.model.moe_spec import moe_model_spec
@@ -318,7 +318,6 @@ class ModelSpec(BaseModel):
             model_path_or_name=model_name,
             dtype="bfloat16",
             attn_implementation=cfg["attn_implementation"],
-            parallelism=parallelism,
             debug=gpu_memory_debug_config(cfg),
             patches=Patches(
                 liger=cfg.get("use_liger", False),
