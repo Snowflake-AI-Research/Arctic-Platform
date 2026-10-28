@@ -190,7 +190,7 @@ def plan_from_dockerfile(
 
         if name == "ARG":
             active_args = global_args if plan is None else stage_args
-            scope = {**global_args, **caller_args} if plan is None else {**plan.env, **stage_args}
+            scope = {**global_args, **caller_args} if plan is None else {**stage_args, **plan.env}
             if "=" in value:
                 for k, v in _parse_kv(value).items():
                     active_args[k] = caller_args[k] if k in caller_args else _expand(v, scope)
