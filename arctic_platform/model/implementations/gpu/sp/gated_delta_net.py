@@ -446,8 +446,10 @@ def head_parallel_gated_delta_net(
     beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
+    # FLA's chunk rule applies grouped value attention for HV > H itself, reading key head hv // (HV // H) for value
+    # head hv: the assignment repeat_interleave builds, without the two copies and their BF16 backward sums.
     replication = num_value_heads // num_key_heads
-    if replication > 1:
+    if replication > 1 and not getattr(gated_delta_rule, "__module__", "").startswith("fla."):
         query = query.repeat_interleave(replication, dim=2)
         key = key.repeat_interleave(replication, dim=2)
 
