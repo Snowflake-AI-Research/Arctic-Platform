@@ -42,6 +42,28 @@ constrains what runs correctly here:
 
 ## Operational limits
 
+### Router-replay Wire Contract
+
+**Replay coordination belongs to DSSST1 frame metadata, not the model batch.** For both `forward` and `forward-backward`, serialize `router_replay` next to `response_options` in the frame metadata. Keep tensor inputs and per-row `rr_sample_ids`, `rr_replay_meta` and `rr_discard` in the model payload. Chunk envelopes wrap that completed frame without changing its metadata.
+
+```python
+frame = wire.dumps(
+    batch,
+    metadata=dict(
+        response_options=dict(format="dssst1", delivery="chunked"),
+        router_replay=dict(sampling_job_id="zone-sampling-id", identity_version=1),
+    ),
+)
+```
+
+**The transport translates public sampler IDs using successful bootstrap responses.** `bootstrap-router-replay` accepts public source and target sub-job IDs and returns `sampling_job_id`. The transport caches that zone sampler ID under the pair `(public_training_id, public_sampling_id)`. For subsequent `forward` and `forward-backward` requests, only that matching pair is translated; other pairs, other operations and the caller's original request remain unchanged. A request without a cached mapping retains its supplied ID rather than guessing another sampler.
+
+**The consuming zone implements this contract.** Its [metadata reader](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L995) extracts `router_replay.sampling_job_id`; its [forward/backward handler](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L2529) resolves the zone pair from that metadata, and its [bootstrap response](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L3343) returns the sampler ID. `tests/client/test_cortex_sampler_identity.py` decodes transmitted single and multi-chunk frames after bootstrap and checks the zone-visible sampler ID.
+
+**This fix shares the frame-metadata encoder with [PR #326](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/326).** The encoder is identical in both branches so this branch remains independently testable; the sampler-ID translation is specific to this fix.
+
+### Resource And Delivery Limits
+
 * **8 GPUs per account.** The GSM8K recipe asks for 4 training + 4 sampling,
   which is exactly the cap, so two runs cannot coexist.
 * **A response is capped at 128 MiB.** `post=["compute_logprobs"]` returns a

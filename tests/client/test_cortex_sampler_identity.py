@@ -17,12 +17,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 from concurrent.futures import Future
+from copy import deepcopy
 
 import pytest
+import torch
 
+from arctic_platform import wire
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.transport import Request
+from arctic_platform.client.transports import cortex as cortex_module
 from arctic_platform.client.transports.cortex import CortexTransport
 
 
@@ -89,3 +94,48 @@ def test_submit_prepares_the_translated_request_only_for_forward(transport, monk
         "public-sampling" if operation == "step" else "zone-sampling"
     )
     assert request.body["router_replay"]["sampling_job_id"] == "public-sampling"
+
+
+@pytest.mark.parametrize("operation", ["forward", "forward-backward"])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_bootstrapped_pair_is_sent_in_zone_visible_frame_metadata(transport, monkeypatch, operation, chunked):
+    bootstrap = _request(
+        "operation",
+        dict(
+            operation_type="bootstrap-router-replay",
+            payload=dict(target_sub_job_id="training", source_sub_job_id="public-sampling"),
+        ),
+    )
+    reply = dict(status="ok", sampling_job_id="zone-sampling")
+    transport._finish(bootstrap, cortex_module._route("operation"), [], reply)
+    if chunked:
+        monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 32768)
+        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 32768)
+    replay = dict(sampling_job_id="public-sampling", identity_version=1)
+    request = _request(
+        operation,
+        dict(
+            batch=dict(input_ids=torch.arange(5000 if chunked else 3).reshape(1, -1), rr_sample_ids=["rr1:sample-1"]),
+            router_replay=deepcopy(replay),
+        ),
+    )
+    captured = []
+    monkeypatch.setattr(transport, "_deliver", lambda route, request, url, sends: captured.extend(sends))
+    monkeypatch.setattr(transport, "_on_loop", lambda result: result)
+    transport._submit(request, cortex_module._route(operation))
+    frames = [
+        send["data"] if operation == "forward-backward" else base64.b64decode(send["json"]["payload"]["payload_b64"])
+        for send in captured
+    ]
+    frame = (
+        wire.decode_byte_chunks(frames, kind="request")
+        if operation == "forward-backward" or len(frames) > 1
+        else frames[0]
+    )
+    if chunked:
+        assert len(frames) > 1
+    assert wire.read_metadata(frame)["router_replay"] == dict(sampling_job_id="zone-sampling", identity_version=1)
+    decoded = wire.loads(frame)
+    assert "router_replay" not in decoded
+    assert decoded["batch"]["rr_sample_ids"] == ["rr1:sample-1"]
+    assert request.body["router_replay"] == replay
