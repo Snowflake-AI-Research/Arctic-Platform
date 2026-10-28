@@ -738,3 +738,104 @@ def test_packed_ple_survives_custom_lm_head():
     packed = model(input_ids=ids, position_ids=positions, **kwargs)
     separate = model(input_ids=ids[:, 4:], position_ids=positions[:, 4:], **kwargs)
     torch.testing.assert_close(packed[:, 4:], separate, rtol=0, atol=1e-6)
+
+
+def _indexed_expert_weights(prefix, expert_ids):
+    shapes = {"gate_proj": (3, 4), "up_proj": (3, 4), "down_proj": (4, 3)}
+    return {
+        f"{prefix}.mlp.experts.{expert_idx}.{projection}.weight": (
+            torch.arange(shape[0] * shape[1], dtype=torch.bfloat16).reshape(shape) + expert_idx * 16 + projection_idx
+        )
+        for expert_idx in reversed(expert_ids)
+        for projection_idx, (projection, shape) in enumerate(shapes.items())
+    }
+
+
+def test_qwen38_conversion_stacks_indexed_experts_in_numeric_order():
+    prefix = "model.language_model.layers.0"
+    original = _indexed_expert_weights(prefix, range(12))
+    other_layer = _indexed_expert_weights("model.language_model.layers.1", range(2))
+    state = {**original, **other_layer}
+    state[f"{prefix}.mlp.gate.weight"] = torch.arange(48).reshape(12, 4)
+
+    from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_layer_to_prime
+
+    convert_hf_layer_to_prime(state, 0)
+    for prime_projection, hf_projection in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        expected = torch.stack(
+            [original[f"{prefix}.mlp.experts.{expert_idx}.{hf_projection}.weight"] for expert_idx in range(12)]
+        )
+        torch.testing.assert_close(state[f"{prefix}.mlp.experts.{prime_projection}"], expected, rtol=0, atol=0)
+    assert not set(original).intersection(state)
+    assert f"{prefix}.mlp.router.gate.weight" in state
+    for name, value in other_layer.items():
+        assert state[name] is value
+
+    convert_hf_to_prime(state)
+    assert "model.language_model.layers.1.mlp.experts.w1" in state
+    convert_prime_to_hf(state)
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.gate_up_proj"],
+        torch.cat(
+            [
+                torch.stack([original[f"{prefix}.mlp.experts.{idx}.gate_proj.weight"] for idx in range(12)]),
+                torch.stack([original[f"{prefix}.mlp.experts.{idx}.up_proj.weight"] for idx in range(12)]),
+            ],
+            dim=1,
+        ),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.down_proj"],
+        torch.stack([original[f"{prefix}.mlp.experts.{idx}.down_proj.weight"] for idx in range(12)]),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("expert_ids", [[1], [0, 2], [0, 1, 3]])
+def test_qwen38_conversion_rejects_noncontiguous_indexed_experts(expert_ids):
+    state = _indexed_expert_weights("model.language_model.layers.0", expert_ids)
+    original = state.copy()
+    with pytest.raises(KeyError, match="Non-contiguous Qwen3.8 experts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_qwen38_conversion_rejects_incomplete_indexed_experts(projection):
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    del state[f"{prefix}.mlp.experts.1.{projection}.weight"]
+    original = state.copy()
+    with pytest.raises(KeyError, match="Incomplete Qwen3.8 expert"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+def test_qwen38_conversion_validates_indexed_layers_before_mutating_checkpoint():
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    state.update(_indexed_expert_weights("model.language_model.layers.1", [0, 2]))
+    state[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_0.weight"] = torch.ones(2, 4)
+    state[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_1.weight"] = torch.ones(2, 4)
+    original = state.copy()
+    with pytest.raises(KeyError, match="Non-contiguous Qwen3.8 experts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("packed_projection", ["gate_up_proj", "down_proj", "w1", "w2", "w3"])
+def test_qwen38_conversion_rejects_mixed_expert_layouts(packed_projection):
+    prefix = "model.language_model.layers.0"
+    state = _indexed_expert_weights(prefix, range(2))
+    state[f"{prefix}.mlp.experts.{packed_projection}"] = torch.ones(2, 3, 4)
+    original = state.copy()
+    with pytest.raises(ValueError, match="Mixed Qwen3.8 expert layouts"):
+        convert_hf_to_prime(state)
+    assert set(state) == set(original)
+    assert all(state[name] is value for name, value in original.items())
