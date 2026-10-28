@@ -370,6 +370,42 @@ def test_nested_checkpoints_restore_outer_context_and_match_gradients(fresh_rout
     assert len(block.router._self_replay_captures) == 0
 
 
+@pytest.mark.parametrize("fresh_routing", [False, True])
+def test_nested_drifting_router_replays_every_original_call(fresh_routing):
+    set_seed(9)
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    block.router.fresh_replay_routing = fresh_routing
+    routed = _routing((2, 5)) if fresh_routing else None
+    x = torch.randn(12, 16, requires_grad=True)
+
+    def forward(values):
+        first = block(values, routed)
+        middle = ckpt.checkpoint(block, first, routed, use_reentrant=False)
+        return block(middle, routed)
+
+    output = ckpt.checkpoint(forward, x, use_reentrant=False)
+    expected = [indices for recompute, replayed, indices in block.router.calls if not recompute and replayed]
+    assert len(expected) == 3
+    assert block.router.raw_topk_calls == 3
+    output.sum().backward(retain_graph=True)
+    assert block.router.raw_topk_calls == 3
+    first_gradient = x.grad.clone()
+    first_weight_gradient = block.router.gate.weight.grad.clone()
+    recomputed = [indices for recompute, _, indices in block.router.calls if recompute]
+    for actual in recomputed:
+        assert any(torch.equal(actual, indices) for indices in expected)
+    x.grad = None
+    block.zero_grad(set_to_none=True)
+    output.sum().backward()
+    assert block.router.raw_topk_calls == 3
+    torch_assert_equal(x.grad, first_gradient)
+    torch_assert_equal(block.router.gate.weight.grad, first_weight_gradient)
+    del output
+    gc.collect()
+    assert len(block.router._self_replay_captures) == 0
+
+
 @pytest.mark.parametrize("failure_phase", ["forward", "recompute"])
 def test_checkpoint_exceptions_restore_context_for_the_next_forward(failure_phase):
     block = _DriftingBlock()

@@ -49,9 +49,13 @@ def _in_recompute() -> bool:
 
 
 def _checkpoint_context():
-    thread_local = getattr(_ckpt, "_recompute_thread_local", _thread_local)
-    contexts = getattr(thread_local, "checkpoint_contexts", ())
+    contexts = _checkpoint_contexts()
     return contexts[-1] if contexts else None
+
+
+def _checkpoint_contexts():
+    thread_local = getattr(_ckpt, "_recompute_thread_local", _thread_local)
+    return getattr(thread_local, "checkpoint_contexts", ())
 
 
 def _install_recompute_detector() -> None:
@@ -145,21 +149,19 @@ def _wrap_router(router) -> bool:
         if routed_experts is not None and not router.fresh_replay_routing:
             return original(x, expert_bias, routed_experts=routed_experts)
 
-        context = _checkpoint_context()
-        if context is not None and context[1]:
-            frame, _, positions = context
+        contexts = _checkpoint_contexts()
+        recompute_context = next((context for context in reversed(contexts) if context[1]), None)
+        if recompute_context is not None:
+            frame, _, positions = recompute_context
             position = positions.get(router, 0)
             captures = router._self_replay_captures.get(frame, ())
             if position >= len(captures):
                 raise RuntimeError("router-replay recompute found no captured experts for its checkpoint forward")
             positions[router] = position + 1
-            return original(x, expert_bias, routed_experts=captures[position])
-
-        # An opted-in router picks experts by topk for tokens marked ROUTER_REPLAY_FRESH, so the experts the
-        # original forward actually selected are captured and replayed verbatim on recompute. The router's
-        # fresh-routing path saves the same tensors whichever experts it is handed, so no extra off-graph pass
-        # is needed.
-        if routed_experts is not None:
+            expert_indices = captures[position]
+            out = original(x, expert_bias, routed_experts=expert_indices)
+        elif routed_experts is not None:
+            # Fresh tokens may pick new experts only on the original forward.
             out = original(x, expert_bias, routed_experts=routed_experts)
             expert_indices = out[1].detach()
         else:
@@ -168,9 +170,12 @@ def _wrap_router(router) -> bool:
                 _, expert_indices, _ = original(x, expert_bias)
             expert_indices = expert_indices.detach()
             out = original(x, expert_bias, routed_experts=expert_indices)
-        if context is not None and torch.is_grad_enabled():
-            # Weak frame keys release abandoned graphs; replay cursors reset for every retained-graph backward.
-            router._self_replay_captures.setdefault(context[0], []).append(expert_indices)
+        if torch.is_grad_enabled():
+            # Outer frames capture nested calls too. A new inner forward during outer recompute inherits
+            # the replayed experts and records them for its own later backward.
+            for frame, recompute, _ in contexts:
+                if not recompute:
+                    router._self_replay_captures.setdefault(frame, []).append(expert_indices)
         return out
 
     router.forward = forward
