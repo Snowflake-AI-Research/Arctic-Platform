@@ -23,6 +23,7 @@ import types
 import pytest
 import torch.nn as nn
 from pydantic import ValidationError
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
@@ -264,6 +265,7 @@ class TestHuggingFaceLoader:
 
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        model.loss_function = ForCausalLMLoss
         configured = []
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
         monkeypatch.setattr(
