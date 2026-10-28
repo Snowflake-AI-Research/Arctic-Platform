@@ -17,11 +17,14 @@ asyncio or extra threads.
 Attach allocates CPU memory sized to model.named_parameters().  Stage
 snapshots the post-processed GPU parameters into that buffer.
 plan_restore_weights walks the param index once and caches a chunk plan
-(chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.
+(chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.  If the host
+buffer is pageable it also forms a small pinned double buffer (buffer_bytes
+split into two halves) that restore_weights stages through.
 restore_weights then loops over the cached plan: per chunk, copy a
-slice of host memory into a single reused GPU staging buffer and
-scatter into model parameters by name.  If no plan is cached,
-restore_weights falls back to a single-chunk path.
+slice of host memory into a single reused GPU staging buffer -- directly,
+or half by half through the double buffer -- and scatter into model parameters by
+name.  If no plan is cached, restore_weights falls back to a single-chunk
+path.
 
 All of that state lives on each vLLM worker (``worker._semip_*``) and
 runs there via ``collective_rpc``, not in this process.  At TP>1 the
@@ -603,6 +606,9 @@ def _semip_stage(worker):
 
 
 def _semip_unpin(worker):
+    # The double buffer is registered memory too, and nothing registered may
+    # be left when a cuda_checkpoint follows.
+    _semip_free_double_buffer(worker)
     # Idempotent: the attach buffer starts unpinned, so a cudaHostUnregister on
     # an unregistered (or already-unpinned) buffer would hard-error.
     buf = getattr(worker, "_semip_buf", None)
@@ -622,10 +628,53 @@ def _semip_repin(worker):
         return buf.numel()
     _repin_buffer(buf)
     worker._semip_pinned = True
+    # restore_weights copies a pinned host copy directly; the chunk plan
+    # stands, as it does not depend on how the copy is staged.
+    _semip_free_double_buffer(worker)
     return buf.numel()
 
 
-def _semip_plan_load_weights(worker, max_buffer_bytes=None):
+def _semip_form_double_buffer(worker, buffer_bytes, threads):
+    """Pin two halves of ``buffer_bytes`` for restore_weights.
+
+    Registered with cudaHostRegister rather than allocated with
+    ``pin_memory=True``: torch's caching host allocator keeps freed pinned
+    blocks, so the buffer could never be given back.  One event per half says
+    when its last H2D copy is done; the copies run on a side stream.
+    """
+    half_bytes = int(buffer_bytes) // 2
+    halves = []
+    try:
+        for _ in range(2):
+            half = torch.empty(half_bytes, dtype=torch.uint8)
+            _repin_buffer(half)
+            halves.append(half)
+    except BaseException:
+        for half in halves:
+            _unpin_buffer(half)
+        raise
+    worker._semip_double_buffer = {
+        "halves": halves,
+        "events": [torch.cuda.Event() for _ in halves],
+        "stream": torch.cuda.Stream(device=worker.device),
+        "half_bytes": half_bytes,
+        "threads": max(1, int(threads)),
+    }
+
+
+def _semip_free_double_buffer(worker):
+    db = getattr(worker, "_semip_double_buffer", None)
+    if db is None:
+        return 0
+    db["stream"].synchronize()
+    for half in db["halves"]:
+        _unpin_buffer(half)
+    worker._semip_double_buffer = None
+    return 2 * db["half_bytes"]
+
+
+def _semip_plan_load_weights(worker, max_buffer_bytes=None, buffer_bytes=None,
+                             buffer_threads=None):
     buf = worker._semip_buf
     index = worker._semip_index
     total_bytes = buf.numel()
@@ -659,8 +708,64 @@ def _semip_plan_load_weights(worker, max_buffer_bytes=None):
         plan.append((cur_lo, cur_hi, cur))
     worker._semip_chunk_plan = plan
     worker._semip_chunk_size = cs
+    # The double buffer is decided here, with the plan, and restore_weights
+    # only uses it: a pinned host copy needs none, and buffer_bytes 0 (or
+    # unset) asks for none, leaving the slow direct copy from pageable memory.
+    _semip_free_double_buffer(worker)
+    if (not getattr(worker, "_semip_pinned", False) and buffer_bytes
+            and int(buffer_bytes) >= 2):
+        _semip_form_double_buffer(worker, buffer_bytes, buffer_threads or 1)
+    db = getattr(worker, "_semip_double_buffer", None)
     return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs,
-            "free_bytes": free_bytes, "clamped": clamped}
+            "free_bytes": free_bytes, "clamped": clamped,
+            "double_buffer_bytes": 2 * db["half_bytes"] if db else 0,
+            "pinned": bool(getattr(worker, "_semip_pinned", False))}
+
+
+def _semip_double_buffer_h2d(db, src, dst, pool):
+    """Copy host ``src`` into device ``dst`` half by half through the double buffer.
+
+    Filling a half is a host memcpy split across the pool (``copy_`` drops the
+    GIL; vLLM workers run one OpenMP thread, so a single ``copy_`` would use
+    one core).  Each half's H2D runs on the side stream while the other half
+    fills, and a half is refilled only once its event says its copy is done.
+    """
+    halves, events, stream = db["halves"], db["events"], db["stream"]
+    half_bytes, threads = db["half_bytes"], db["threads"]
+    stream.wait_stream(torch.cuda.current_stream())
+    n = src.numel()
+    fill_s = wait_s = 0.0
+    for i, off in enumerate(range(0, n, half_bytes)):
+        k = i % 2
+        m = min(half_bytes, n - off)
+        t0 = time.perf_counter()
+        events[k].synchronize()
+        t1 = time.perf_counter()
+        half = halves[k]
+        step = -(-m // threads)
+        list(pool.map(
+            lambda a: half[a:min(a + step, m)].copy_(
+                src[off + a:off + min(a + step, m)]),
+            range(0, m, step)))
+        fill_s += time.perf_counter() - t1
+        wait_s += t1 - t0
+        with torch.cuda.stream(stream):
+            dst[off:off + m].copy_(half[:m], non_blocking=True)
+            events[k].record(stream)
+    t0 = time.perf_counter()
+    stream.synchronize()
+    return fill_s, wait_s + time.perf_counter() - t0
+
+
+def _cpu_throttled():
+    """``(nr_throttled, throttled_usec)`` from this pod's cgroup v2 ``cpu.stat``,
+    or None where it cannot be read."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            stat = dict(line.split() for line in f if line.strip())
+        return int(stat["nr_throttled"]), int(stat["throttled_usec"])
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def _semip_restore_weights(worker):
@@ -674,19 +779,35 @@ def _semip_restore_weights(worker):
         plan = [(0, total_bytes,
                  [(n, o, nb, dt, sh) for n, (o, nb, dt, sh) in index.items()])]
         cs = total_bytes
+    db = getattr(worker, "_semip_double_buffer", None)
+    pool = (ThreadPoolExecutor(max_workers=db["threads"])
+            if db is not None else None)
     torch.cuda.synchronize()
     gpu_buf = torch.empty(cs, dtype=torch.uint8, device=worker.device)
     loaded = 0
-    for chunk_lo, chunk_hi, members in plan:
-        n = chunk_hi - chunk_lo
-        gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
-        torch.cuda.synchronize()
-        for name, off, nbytes, dtype, shape in members:
-            start = off - chunk_lo
-            src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
-            targets[name].copy_(src)
-            loaded += 1
-        torch.cuda.synchronize()
+    fill_s = h2d_s = scatter_s = 0.0
+    try:
+        for chunk_lo, chunk_hi, members in plan:
+            n = chunk_hi - chunk_lo
+            t0 = time.perf_counter()
+            if db is not None:
+                fill, _ = _semip_double_buffer_h2d(db, buf[chunk_lo:chunk_hi], gpu_buf[:n], pool)
+                fill_s += fill
+            else:
+                gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            for name, off, nbytes, dtype, shape in members:
+                start = off - chunk_lo
+                src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
+                targets[name].copy_(src)
+                loaded += 1
+            torch.cuda.synchronize()
+            h2d_s += t1 - t0
+            scatter_s += time.perf_counter() - t1
+    finally:
+        if pool is not None:
+            pool.shutdown()
     gpu_buf.storage().resize_(0)
     del gpu_buf
     # Return the staging buffer to the CUDA *driver*, not just to torch's
@@ -699,10 +820,13 @@ def _semip_restore_weights(worker):
     # OOMs.  empty_cache() releases torch's cached blocks so cumem can map.
     torch.cuda.empty_cache()
     return {"bytes": total_bytes, "loaded": loaded,
-            "n_chunks": len(plan), "chunk_size": cs}
+            "n_chunks": len(plan), "chunk_size": cs,
+            "staging": "double_buffer" if db is not None else "direct",
+            "h2d_s": h2d_s, "fill_s": fill_s, "scatter_s": scatter_s}
 
 
 def _semip_detach(worker):
+    _semip_free_double_buffer(worker)
     buf = getattr(worker, "_semip_buf", None)
     total = buf.numel() if buf is not None else 0
     if buf is not None and getattr(worker, "_semip_pinned", False):
@@ -713,6 +837,99 @@ def _semip_detach(worker):
     worker._semip_chunk_size = None
     worker._semip_pinned = False
     return total
+
+
+# LoRA state -- the adapter slots, their enabled flags and the punica index
+# buffers -- lives in plain tensor attributes that vLLM allocates with the
+# weights, so a level-2 sleep discards it as well.  It is not in the host copy:
+# a dumped engine holds no adapter, so the image would only carry empty slots.
+# A serving child stages it into a host buffer of its own before every sleep,
+# because adapters load and swap slots without any call semi-p sees, and puts
+# it back after restore_weights.  The first restore after CRIU has nothing
+# staged and zeroes it instead, which is the state vLLM creates it in.
+def _semip_lora_manager(worker):
+    return getattr(getattr(worker.model_runner, "lora_manager", None),
+                   "_adapter_manager", None)
+
+
+def _semip_lora_views(worker):
+    """A flat byte view of each CUDA storage behind the LoRA state, in a fixed order."""
+    manager = _semip_lora_manager(worker)
+    if manager is None:
+        return []
+    from vllm.lora.layers import BaseLayerWithLoRA
+
+    model = worker.model_runner.model
+    owned = {t.untyped_storage().data_ptr()
+             for t in [*model.parameters(), *model.buffers()]}
+    holders = [m for m in model.modules() if isinstance(m, BaseLayerWithLoRA)]
+    holders += list(getattr(manager, "punica_wrapper_mapping", {}).values())
+
+    # The punica wrapper keeps its per-batch metadata in dataclasses
+    # (LoRAKernelMeta), so the walk enters those as well as containers.
+    import dataclasses
+
+    visited = set()
+
+    def tensors(value):
+        if isinstance(value, torch.Tensor):
+            yield value
+            return
+        if id(value) in visited:
+            return
+        if isinstance(value, (list, tuple, dict)):
+            visited.add(id(value))
+            for item in (value.values() if isinstance(value, dict) else value):
+                yield from tensors(item)
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            visited.add(id(value))
+            for item in vars(value).values():
+                yield from tensors(item)
+
+    seen, views = set(), []
+    for holder in holders:
+        for value in vars(holder).values():
+            for t in tensors(value):
+                storage = t.untyped_storage()
+                ptr = storage.data_ptr()
+                if not t.is_cuda or ptr in owned or ptr in seen or storage.nbytes() == 0:
+                    continue
+                seen.add(ptr)
+                views.append(torch.empty(0, dtype=torch.uint8, device=t.device).set_(storage))
+    return views
+
+
+def _semip_stage_lora(worker):
+    views = _semip_lora_views(worker)
+    bufs = getattr(worker, "_semip_lora_bufs", None)
+    if bufs is None or [b.numel() for b in bufs] != [v.numel() for v in views]:
+        bufs = [torch.empty(v.numel(), dtype=torch.uint8) for v in views]
+        worker._semip_lora_bufs = bufs
+    for buf, view in zip(bufs, views):
+        buf.copy_(view)
+    torch.cuda.synchronize()
+    return sum(b.numel() for b in bufs)
+
+
+def _semip_restore_lora(worker):
+    views = _semip_lora_views(worker)
+    bufs = getattr(worker, "_semip_lora_bufs", None)
+    if bufs is None:
+        for view in views:
+            view.zero_()
+    else:
+        if [b.numel() for b in bufs] != [v.numel() for v in views]:
+            raise RuntimeError("LoRA state layout changed since it was staged")
+        for buf, view in zip(bufs, views):
+            view.copy_(buf)
+    torch.cuda.synchronize()
+    manager = _semip_lora_manager(worker)
+    if manager is not None:
+        # Makes the next step rebuild the punica metadata rather than trust
+        # what was put back: zeroes after CRIU map every token to slot 0.
+        manager._last_mapping = None
+        manager._last_slot_layout = None
+    return sum(v.numel() for v in views)
 
 
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
@@ -2071,7 +2288,61 @@ def _collective_rpc_with_timeout(llm, fn, args, timeout_s=None, log=None):
     return box["result"]
 
 
-def _reinit_nccl(worker, port, master_addr=None, ifname=None):
+def _default_route_ifname(route_file="/proc/net/route"):
+    """The interface of this network namespace's IPv4 default route, or None."""
+    try:
+        with open(route_file) as f:
+            next(f, None)
+            for line in f:
+                fields = line.split()
+                if (len(fields) > 3 and fields[1] == "00000000"
+                        and int(fields[3], 16) & 0x1):  # RTF_UP
+                    return fields[0]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _single_node_job_nccl(worker, job_nccl_env):
+    """Give a restored single-node rank the restoring job's NCCL settings and
+    a routable bootstrap interface, ahead of ``_reinit_nccl``'s rebuild.
+
+    The cold start bound every NCCL socket to loopback so the image restores
+    on any node (``vllm_child_loop``), and a restored process keeps the dump
+    job's environment. A communicator to another pod -- a trainer's weight
+    sync -- needs a routable address and this job's settings (its
+    aws-ofi-nccl rails, say), and nothing is dumped after a restore, so from
+    here on NCCL bootstraps on the job's ``NCCL_SOCKET_IFNAME`` or, unset,
+    this pod's default-route interface. The rank's own groups are local and
+    run over NVLink/P2P either way. Returns ``nccl_bootstrap.reset()``'s
+    report, or None where the rank stays on loopback, which only a
+    communicator to another pod notices.
+    """
+    rank = getattr(worker, "rank", "?")
+    env = dict(job_nccl_env or {})
+    target = env.pop("NCCL_SOCKET_IFNAME", None) or _default_route_ifname()
+    os.environ.update(env)
+    if not target:
+        print(f"[semip] rank {rank}: no default route, so NCCL stays on "
+              f"loopback and a communicator to another pod will fail",
+              flush=True)
+        return None
+    import nccl_bootstrap
+    os.environ["NCCL_SOCKET_IFNAME"] = target
+    try:
+        report = nccl_bootstrap.reset()
+    except Exception as e:  # noqa: BLE001 - serving does not need it
+        os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+        print(f"[semip] rank {rank}: NCCL stays on loopback, since resetting "
+              f"its bootstrap failed ({type(e).__name__}: {e}); a communicator "
+              f"to another pod will fail", flush=True)
+        return None
+    print(f"[semip] rank {rank}: NCCL bootstraps on {target} with "
+          f"{len(env)} setting(s) from this job", flush=True)
+    return report
+
+
+def _reinit_nccl(worker, port, master_addr=None, ifname=None, job_nccl_env=None):
     """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
     canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
     look up.
@@ -2080,6 +2351,8 @@ def _reinit_nccl(worker, port, master_addr=None, ifname=None):
     from the environment: this process is restored, so its ``environ`` is the
     dump's and nothing the restoring job sets would be visible here.  It falls
     back to the inherited value so a single-node restore is unchanged.
+    ``job_nccl_env`` is the restoring job's NCCL settings, for the same reason;
+    a single-node rank takes them (see ``_single_node_job_nccl``).
     """
     import traceback
     import weakref
@@ -2101,6 +2374,8 @@ def _reinit_nccl(worker, port, master_addr=None, ifname=None):
             _net_reset = nccl_bootstrap.reset()
             print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
                   f"nccl_bootstrap.reset -> {_net_reset}", flush=True)
+        elif not _is_multinode():
+            _net_reset = _single_node_job_nccl(worker, job_nccl_env)
         # NVLS / SymmMem exchange fds that do not survive CRIU -> keep them off.
         # FlashInfer allreduce is off for a different reason -- the captured
         # graphs must hold `cross_device_reduce` nodes for the rebind to have
@@ -2857,6 +3132,139 @@ def _log_graph_census(llm, log, when):
     return census
 
 
+# -- Serving the engine core over ZMQ ----------------------------------------
+#
+# After a restore, ``serve_core`` hands this child's ``EngineCore`` to a real
+# vLLM ``AsyncLLM`` front end in the server process.  The core stays where it
+# is; it gains vLLM's own socket threads and is driven by the main loop through
+# ``_semip_serving_tick`` instead of by ``LLMEngine.step``.
+
+# Commands a serving child refuses: requests arrive over the sockets, vLLM's
+# pause replaces semi-p's, and a dump would capture live sockets and threads.
+_SERVING_REFUSED_CMDS = frozenset(
+    {"generate", "pause", "resume", "prepare_criu_dump", "serve_core"})
+
+# How long an idle serving child waits for a request before checking the pipe.
+_SERVING_IDLE_WAIT_S = 0.005
+
+_SERVING_READY_TIMEOUT_S = 30.0
+
+
+def _semip_core_summary(vllm_config):
+    """The fields a front end must agree on with the core it attaches to.
+
+    A plain dict of plain values, so it crosses the pipe; the config itself
+    holds live modules.  ``server/semip_frontend.core_summary`` reads the same
+    fields from the front end's config, and a test keeps the two in step.
+    """
+    mc = vllm_config.model_config
+    pc = vllm_config.parallel_config
+    sc = vllm_config.scheduler_config
+    cc = vllm_config.cache_config
+    so = getattr(vllm_config, "structured_outputs_config", None)
+    spec = getattr(vllm_config, "speculative_config", None)
+    return {
+        "model": str(mc.model),
+        "tokenizer": str(mc.tokenizer),
+        "dtype": str(mc.dtype).removeprefix("torch."),
+        "tensor_parallel_size": int(pc.tensor_parallel_size),
+        "worker_extension_cls": str(getattr(pc, "worker_extension_cls", "") or ""),
+        "max_num_seqs": int(sc.max_num_seqs),
+        "max_num_batched_tokens": int(sc.max_num_batched_tokens),
+        "reasoning_parser": str(getattr(so, "reasoning_parser", "") or ""),
+        "structured_outputs_backend": str(getattr(so, "backend", "") or ""),
+        "speculative_method": str(getattr(spec, "method", "") or ""),
+        "num_speculative_tokens": int(
+            getattr(spec, "num_speculative_tokens", 0) or 0),
+        "lora": getattr(vllm_config, "lora_config", None) is not None,
+        "max_model_len": int(mc.max_model_len),
+        "block_size": int(cc.block_size),
+        "num_gpu_blocks": int(cc.num_gpu_blocks or 0),
+        "enable_prefix_caching": bool(cc.enable_prefix_caching),
+    }
+
+
+def _semip_serve_core(core, input_address, output_address):
+    """Turn this child's in-process ``EngineCore`` into a ZMQ-served one.
+
+    The object becomes an ``EngineCoreProc`` in place -- its scheduler, KV
+    cache and executor are the restored ones -- with the attributes
+    ``EngineCoreProc.__init__`` would have set, then vLLM's own input and
+    output socket threads.  The front end binds both addresses; the input
+    thread connects and sends the ready message the front end waits for.
+    """
+    import queue
+    import threading
+
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
+
+    core.__class__ = EngineCoreProc
+    core.input_queue = queue.Queue()
+    core.output_queue = queue.Queue()
+    core.engine_index = 0
+    core.engines_running = False
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.tensor_ipc_receiver = None
+    core.has_coordinator = False
+    core.frontend_stats_publish_address = None
+    core.publish_dp_lb_stats = False
+    core.last_counts = (0, 0)
+    core.addresses = None
+    core.process_input_queue_block = False
+    core.enable_fault_tolerance = False
+    core.model_executor.register_failure_callback(
+        lambda: core.input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, b"")))
+
+    identity = core.engine_index.to_bytes(length=2, byteorder="little")
+    ready = threading.Event()
+    input_thread = threading.Thread(
+        target=core.process_input_sockets,
+        args=([input_address], None, identity, ready),
+        daemon=True, name="semip-core-input")
+    input_thread.start()
+    core.output_thread = threading.Thread(
+        target=core.process_output_sockets,
+        args=([output_address], None, core.engine_index),
+        daemon=True, name="semip-core-output")
+    core.output_thread.start()
+
+    if not ready.wait(timeout=_SERVING_READY_TIMEOUT_S):
+        raise RuntimeError(
+            "engine core input thread "
+            + ("died" if not input_thread.is_alive() else "is not ready")
+            + f" after {_SERVING_READY_TIMEOUT_S:.0f}s")
+    return _semip_core_summary(core.vllm_config)
+
+
+def _semip_serving_tick(core, pipe_conn, asleep,
+                        idle_wait_s=_SERVING_IDLE_WAIT_S):
+    """One main-loop pass for a serving core; True when a pipe command waits.
+
+    Takes in what the input thread queued, then steps the core when it has
+    work.  An asleep core is never stepped: a paused scheduler still calls
+    ``execute_model``, and the executor is asleep.  Requests that arrive while
+    asleep still reach the scheduler and run after ``wake_up_kv_cache``.
+    """
+    import queue
+
+    core._process_input_queue()
+    if asleep:
+        return pipe_conn.poll(idle_wait_s)
+    if core.has_work():
+        core._process_engine_step()
+        return pipe_conn.poll(0)
+    if pipe_conn.poll(0):
+        return True
+    try:
+        request = core.input_queue.get(timeout=idle_wait_s)
+    except queue.Empty:
+        return False
+    core._handle_client_request(*request)
+    return pipe_conn.poll(0)
+
+
 def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     multinode=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
@@ -3070,6 +3478,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     _paused = False
     _dormant = False
     _saved_requests = []
+    # The core once ``serve_core`` has handed it to a front end; from then on
+    # the main loop drives it through ``_semip_serving_tick``.
+    _served_core = None
 
     def _alloc_engine_id():
         nonlocal _next_engine_id
@@ -3392,8 +3803,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 pipe_conn.send(("generate_done", elapsed, None, info))
 
     def _drain_engine():
+        if _served_core is not None:
+            while (_served_core.has_work()
+                   and not _served_core.is_scheduler_paused()):
+                _served_core._process_engine_step()
+            return
         while engine is not None and engine.has_unfinished_requests():
             _process_step_outputs(engine.step())
+
+    def _lora_enabled():
+        return getattr(llm.llm_engine.vllm_config, "lora_config", None) is not None
 
     # The five rungs the post-restore pass drives to verify the rebind.  Still
     # wave 9's ladder: it is no longer a warmup, but keeping the shapes fixed
@@ -3594,6 +4013,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     def _handle_command(cmd, kwargs):
         nonlocal llm, engine
         nonlocal _paused, _dormant
+        nonlocal _served_core
 
         error = None
         info = {}
@@ -3943,7 +4363,23 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 # drain just runs the engine to completion as in a
                 # normal cold sleep.
                 _drain_engine()
-                llm.sleep(level=2)
+                if _served_core is not None and _lora_enabled():
+                    staged = sum(llm.collective_rpc(_semip_stage_lora))
+                    log.info("  staged %.2f MiB of LoRA state", staged / 2**20)
+                # "keep", not the default "abort": the engine is drained, so
+                # the two pause the same, and the routed-experts connector
+                # refuses the cache reset an "abort" pause makes.
+                try:
+                    llm.sleep(level=2, mode="keep")
+                except BaseException:
+                    # vLLM pauses the scheduler before it fails, and nothing
+                    # resumes it, so a failed sleep would stop all serving.
+                    try:
+                        llm.wake_up(tags=["scheduling"])
+                    except Exception:
+                        log.warning("  resuming the scheduler after a failed "
+                                    "sleep also failed", exc_info=True)
+                    raise
                 torch.cuda.synchronize(0)
                 torch.cuda.empty_cache()
                 # Set _dormant AFTER llm.sleep so the fail-fast in
@@ -3970,7 +4406,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if llm is None:
                     raise RuntimeError("plan_restore_weights requires init first")
                 mb = kwargs.get("max_buffer_bytes")
-                results = llm.collective_rpc(_semip_plan_load_weights, args=(mb,))
+                results = llm.collective_rpc(
+                    _semip_plan_load_weights,
+                    args=(mb, kwargs.get("buffer_bytes"), kwargs.get("buffer_threads")))
                 worker_bytes = [r["bytes"] for r in results]
                 chunk_bytes = [r["chunk_size"] for r in results]
                 n_chunks = [r["n_chunks"] for r in results]
@@ -3998,17 +4436,42 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                          min(chunk_bytes, default=0) / 2**30,
                          (f" -- clamped on rank(s) {clamped_ranks}"
                           if clamped_ranks else ""))
+                db_bytes = [r["double_buffer_bytes"] for r in results]
+                info["double_buffer_bytes_per_worker"] = db_bytes
+                if any(db_bytes):
+                    log.info("  double buffer: 2 x %.0f MiB pinned per worker",
+                             max(db_bytes) / 2 / 2**20)
+                elif all(r["pinned"] for r in results):
+                    log.info("  double buffer: none (host copy pinned)")
+                else:
+                    log.info("  double buffer: none (buffer_bytes=%s); "
+                             "restore_weights copies from pageable memory",
+                             kwargs.get("buffer_bytes"))
 
             elif cmd == "restore_weights":
                 if llm is None:
                     raise RuntimeError("restore_weights requires init first")
+                throttled = _cpu_throttled()
                 results = llm.collective_rpc(_semip_restore_weights)
+                throttled = [b - a for a, b in zip(throttled, _cpu_throttled())] if throttled else None
                 total_bytes = sum(r["bytes"] for r in results)
                 total_loaded = sum(r["loaded"] for r in results)
                 info["bytes"] = total_bytes
                 info["n_chunks"] = max(r["n_chunks"] for r in results)
-                log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB)",
-                         total_loaded, info["n_chunks"], total_bytes / 2**30)
+                info["staging"] = sorted({r["staging"] for r in results})
+                for key in ("h2d_s", "fill_s", "scatter_s"):
+                    info[key] = round(max(r[key] for r in results), 3)
+                log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB) "
+                         "via %s; slowest worker: host to GPU %.2fs (of it "
+                         "filling the double buffer %.2fs), scatter %.2fs; "
+                         "CPU throttled %s", total_loaded, info["n_chunks"],
+                         total_bytes / 2**30, "/".join(info["staging"]),
+                         info["h2d_s"], info["fill_s"], info["scatter_s"],
+                         f"{throttled[0]} period(s), {throttled[1] / 1e6:.2f}s"
+                         if throttled else "unknown")
+                if _lora_enabled():
+                    lora_bytes = sum(llm.collective_rpc(_semip_restore_lora))
+                    log.info("  restored %.2f MiB of LoRA state", lora_bytes / 2**20)
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
@@ -4543,7 +5006,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 port = int(kwargs.get("port") or 0) or get_open_port()
                 results = _collective_rpc_with_timeout(
                     llm, _reinit_nccl,
-                    (port, kwargs.get("master_addr"), kwargs.get("ifname")),
+                    (port, kwargs.get("master_addr"), kwargs.get("ifname"),
+                     kwargs.get("job_nccl_env")),
                     timeout_s=kwargs.get("timeout_s"), log=log)
                 failures = [r for r in results
                             if isinstance(r, dict) and not r.get("ok", True)]
@@ -4678,6 +5142,19 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 log.info("  loaded weights: %.2f GiB across %d worker(s)",
                          total / 2**30, len(results))
 
+            elif cmd == "serve_core":
+                if llm is None:
+                    raise RuntimeError("serve_core requires an initialized engine")
+                if _active_reqs or llm.llm_engine.has_unfinished_requests():
+                    raise RuntimeError(
+                        "serve_core with semi-p requests in flight")
+                core = llm.llm_engine.engine_core.engine_core
+                info.update(_semip_serve_core(
+                    core, kwargs["input_address"], kwargs["output_address"]))
+                _served_core = core
+                log.info("  serving engine core: input=%s output=%s",
+                         kwargs["input_address"], kwargs["output_address"])
+
             else:
                 error = f"unknown command: {cmd}"
 
@@ -4696,10 +5173,15 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
     try:
         while True:
+            if _served_core is not None and not _semip_serving_tick(
+                    _served_core, pipe_conn, _dormant):
+                continue
+
             if engine is None and llm is not None:
                 engine = llm.llm_engine
 
-            has_active = (engine is not None
+            has_active = (_served_core is None
+                          and engine is not None
                           and engine.has_unfinished_requests()
                           and not _paused)
 
@@ -4723,6 +5205,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 break
 
             log.info(">>> %s", cmd)
+
+            if _served_core is not None and cmd in _SERVING_REFUSED_CMDS:
+                error = f"{cmd} refused: the engine core is serving a front end"
+                log.warning("<<< %s FAILED (0.000s): %s", cmd, error)
+                if cmd == "generate":
+                    pipe_conn.send(("generate_done", 0.0, error,
+                                    {"req_id": kwargs.get("req_id")}))
+                else:
+                    pipe_conn.send((cmd, 0.0, error, {}))
+                continue
 
             if cmd == "generate":
                 req_id = kwargs.get("req_id")
@@ -4782,6 +5274,12 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         log.error("FATAL in main loop (cmd=%s): %s: %s",
                   cmd, type(_fatal).__name__, _fatal)
         log.error("%s", _trace)
+        if _served_core is not None:
+            try:
+                _served_core._send_engine_dead()
+            except Exception:
+                log.warning("could not tell the front end the core died",
+                            exc_info=True)
         try:
             pipe_conn.send((
                 cmd if cmd is not None else "__fatal__",
