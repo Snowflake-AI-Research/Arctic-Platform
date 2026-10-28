@@ -26,9 +26,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from arctic_platform.testing_utils import require_torch_gpu
+
 
 @pytest.fixture
 def deepep(monkeypatch):
+    return _load_deepep(monkeypatch)
+
+
+def _load_deepep(monkeypatch):
     root = Path(__file__).resolve().parents[2] / "arctic_platform/model/implementations/moe"
     package_name = "_deepep_lifetime_tests"
     for name in (package_name, f"{package_name}.distributed"):
@@ -82,9 +88,24 @@ def dispatched(monkeypatch, deepep):
     monkeypatch.setattr(deepep, "_handle_cache", {})
     monkeypatch.setattr(deepep, "_pending_dispatch_events", {})
     monkeypatch.setattr(deepep, "_new_event_overlap", lambda: None)
+    finalizers = []
+    finalize = deepep.weakref.finalize
+
+    def record_finalizer(*args, **kwargs):
+        result = finalize(*args, **kwargs)
+        finalizers.append(result)
+        return result
+
+    monkeypatch.setattr(deepep.weakref, "finalize", record_finalizer)
     args = [torch.ones(1, 1)] * 7
     output = deepep._dispatch_op_impl(*args)
-    return SimpleNamespace(output=output, event_calls=event_calls, handle=handle, args=args)
+    return SimpleNamespace(output=output, event_calls=event_calls, handle=handle, args=args, finalizers=finalizers)
+
+
+def test_live_dispatch_does_not_finalize_during_interpreter_shutdown(dispatched):
+    assert len(dispatched.finalizers) == 1
+    assert dispatched.finalizers[0].alive
+    assert dispatched.finalizers[0].atexit is False
 
 
 def test_abandoned_dispatch_releases_handle_and_waits_for_event(dispatched, deepep):
@@ -121,3 +142,34 @@ def test_consumed_dispatch_is_not_waited_or_released_twice(dispatched, deepep):
     assert dispatched.event_calls == ["wait"]
     assert deepep._handle_cache == {}
     assert deepep._pending_dispatch_events == {}
+
+
+@require_torch_gpu
+def test_abandoned_dispatch_through_registered_cuda_op(monkeypatch):
+    deepep = _load_deepep(monkeypatch)
+    events = []
+    handle = object()
+
+    def dispatch(**kwargs):
+        return kwargs["x"].clone(), kwargs["topk_idx"].clone(), kwargs["topk_weights"].clone(), [1], handle, event
+
+    event = SimpleNamespace(current_stream_wait=lambda: events.append("wait"))
+    monkeypatch.setattr(deepep, "_buffer", SimpleNamespace(dispatch=dispatch))
+    monkeypatch.setattr(deepep, "_new_event_overlap", lambda: None)
+    deepep._deepep_cuda_ops_registered = False
+    deepep.register_deepep_cuda_ops()
+    for requires_grad in (False, True):
+        x = torch.ones(1, 8, device="cuda", requires_grad=requires_grad)
+        indices = torch.zeros(1, 1, dtype=torch.int64, device="cuda")
+        weights = torch.ones(1, 1, device="cuda")
+        counts = torch.ones(1, dtype=torch.int32, device="cuda")
+        output = torch.ops.ap_deepep.dispatch(x, indices, weights, counts, counts, indices.bool(), counts)
+        key = output[-1].item()
+        assert deepep._handle_cache[key] is handle
+        assert key in deepep._pending_dispatch_events
+        del output
+        gc.collect()
+        torch.cuda.synchronize()
+        assert key not in deepep._handle_cache
+        assert key not in deepep._pending_dispatch_events
+    assert events == ["wait", "wait"]
