@@ -171,8 +171,8 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.31.0",
-    "xgrammar==0.2.7",
+    "vllm==0.32.0",
+    "xgrammar==0.2.8",
 ]
 
 # [sft] plus the in-tree Arctic Inference sampler. That extra pins vLLM.
