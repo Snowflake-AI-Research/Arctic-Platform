@@ -95,6 +95,13 @@ class _BoundedDeque:
         self._buf: deque[Any] = deque(maxlen=max_items)
         self._lock = threading.Lock()
 
+    def __getstate__(self) -> dict[str, Any]:
+        return {"_buf": self._buf, "_lock": None}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._buf = state["_buf"]
+        self._lock = threading.Lock()
+
     def push(self, item: Any) -> None:
         with self._lock:
             self._buf.append(item)
@@ -304,6 +311,18 @@ class ConcurrencyHistory:
         self._retention_s = retention_s
         self._times: list[float] = []
         self._limits: list[int] = []
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "_retention_s": self._retention_s,
+            "_times": self._times,
+            "_limits": self._limits,
+            "_lock": None,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
         self._lock = threading.Lock()
 
     def record(self, limit: int) -> None:

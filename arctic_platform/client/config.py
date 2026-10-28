@@ -103,6 +103,7 @@ class CortexConfig(BaseSettings):
         description="cortex: Snowflake schema.",
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
+    verify_ssl: bool = Field(True, description="cortex: verify HTTPS certificates.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
     request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
     poll_timeout: float = Field(
@@ -110,6 +111,25 @@ class CortexConfig(BaseSettings):
     )
     job_ready_timeout: float = Field(
         1800.0, gt=0, description="Maximum total seconds to wait for a Cortex job to reach RUNNING."
+    )
+    # Every job on a shared account has the same submitter, so put a person or
+    # run name here. Existing launchers export CORTEX_JOB_COMMENT.
+    job_comment: str | None = Field(
+        None,
+        validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
+        description="cortex: comment stored on the job at create time.",
+    )
+    # The server reclaims a job nobody is using, so a client that is killed
+    # outright still releases its GPUs. None keeps the server default (30 min).
+    idle_timeout_seconds: int | None = Field(
+        None,
+        description="cortex: seconds a job may sit idle before the server reclaims it; 0 disables, else 300-604800.",
+    )
+    pending_timeout_seconds: int | None = Field(
+        None,
+        ge=300,
+        le=604_800,
+        description="cortex: seconds a job may wait for capacity before the server fails it (default 24h).",
     )
 
     @model_validator(mode="after")
@@ -121,6 +141,9 @@ class CortexConfig(BaseSettings):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
             if not (self.pat and self.pat.get_secret_value()):
                 raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
+        idle = self.idle_timeout_seconds
+        if idle is not None and idle != 0 and not 300 <= idle <= 604_800:
+            raise ValueError("cortex: idle_timeout_seconds must be 0 or between 300 and 604800.")
         return self
 
 
@@ -331,13 +354,31 @@ class ArcticClientConfig(BaseModel):
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
+        provider = worker.get("model_provider")
+        if provider == "liger":
+            raise ValueError(
+                "ds_worker_config.model_provider='liger' is not accepted. "
+                "Set use_liger=true to apply Liger kernels on a huggingface model."
+            )
+        if provider == "prime_rl":
+            provider = "arctic"
+        if provider and provider not in {"huggingface", "arctic"}:
+            raise ValueError(f"ds_worker_config.model_provider must be 'huggingface' or 'arctic', got {provider!r}.")
+        if worker.get("use_liger") and provider == "arctic":
+            raise ValueError(
+                "use_liger applies to huggingface models. On the arctic provider, "
+                "set model_options.lm_head.cross_entropy."
+            )
         if provider:
             training["model_provider"] = provider
+        if worker.get("use_liger"):
+            options = dict(training.get("model_options") or {})
+            options["liger"] = True
+            training["model_options"] = options
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
-        for key in ("ep_size", "mb_spec"):
+        for key in ("ep_size", "mb_spec", "router_replay"):
             if key in worker:
                 training[key] = worker[key]
         if ds:
@@ -351,8 +392,11 @@ class ArcticClientConfig(BaseModel):
         # flattening them onto inference_config is silently ignored (extra="allow").
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
-        vllm.pop("tensor_parallel_size", None)  # owned by n_gpus on this wire
-        inference: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": n_gpus}
+        inference: dict[str, Any] = {
+            **(self.sampling.arctic_inference_config or {}),
+            "max_seq_len": self.max_seq_len,
+            "n_gpus": n_gpus,
+        }
         if vllm:
             inference["vllm_config"] = vllm
         if self.training.peft:

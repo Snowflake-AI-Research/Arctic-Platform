@@ -1164,6 +1164,26 @@ def pytest_terminal_summary_main(tr, id):
 # --- distributed testing functions --- #
 
 
+@contextlib.contextmanager
+def single_rank_process_group():
+    """Yield the default process group, with one rank.
+
+    The root ``tests/conftest.py`` normally provides it, but tests that tear the session group down leave none behind,
+    so a single-rank gloo group is created here when none exists and destroyed again only if it was created here.
+    """
+    import torch.distributed as dist
+
+    created = not dist.is_initialized()
+    if created:
+        dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
+    assert dist.get_world_size() == 1
+    try:
+        yield dist.group.WORLD
+    finally:
+        if created and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 class _RunOutput:
     def __init__(self, returncode, stdout, stderr):
         self.returncode = returncode

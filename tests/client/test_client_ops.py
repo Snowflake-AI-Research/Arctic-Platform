@@ -60,7 +60,7 @@ class FakeTransport(Transport):
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"results": ["ok"], "loss": 0.0}
+        return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -75,6 +75,20 @@ def _call(client, method: str, *args, **kwargs):
     if inspect.isawaitable(result):
         return asyncio.run(result)
     return result
+
+
+def _stop_stream_after_one_event(stream) -> None:
+    """Read one event from a sync or async stream, then close it early."""
+    if not inspect.isasyncgen(stream):
+        next(stream)
+        stream.close()
+        return
+
+    async def drive():
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(drive())
 
 
 def _build(monkeypatch, cls):
@@ -154,7 +168,7 @@ class TestOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/x", "step": 2}
+        assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -227,6 +241,50 @@ class TestOpMapping:
         assert _last(client).op == "sleep-training"
         _call(client, "wake_training")
         assert _last(client).op == "wake-training"
+
+
+class TestSyncWeightsChecksum:
+    """``sync_weights``'s ``checksum_match`` must be acted on, not only logged (see ``ArcticRLRayServer.weight_sync``)."""
+
+    class _MismatchTransport(FakeTransport):
+        """A transport whose weight-sync op reports a failed checksum; every other op is a plain no-op."""
+
+        def call(self, request: Request) -> dict:
+            self.calls.append(request)
+            if request.op == "operation" and request.body.get("operation_type") == "weight-sync":
+                return {
+                    "sent_l2_sq": 32.5,
+                    "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+                    "checksum_rtol": 1e-9,
+                    "checksum_match": False,
+                    "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+                }
+            return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
+
+        async def acall(self, request: Request) -> dict:
+            return self.call(request)
+
+    def _build_mismatch(self, monkeypatch, cls):
+        monkeypatch.setattr(base_module, "make_transport", self._MismatchTransport)
+        return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_raises_on_checksum_mismatch(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        with pytest.raises(RuntimeError, match="did not prove delivery"):
+            _call(client, "sync_weights")
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_strict_checksum_false_returns_the_dict_instead(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        out = _call(client, "sync_weights", strict_checksum=False)
+        assert out["checksum_match"] is False
+        assert out["checksum_error"]
+
+    def test_sync_weights_missing_checksum_does_not_raise(self, client):
+        """A transport that never computed a checksum (the default ``FakeTransport``) is not a reported failure."""
+        out = _call(client, "sync_weights")
+        assert "checksum_match" not in out
 
 
 class TestLifecycle:
@@ -315,6 +373,7 @@ class TestOpRegistry:
         _call(rl_client, "save_checkpoint")
         _call(rl_client, "load_checkpoint")
         _call(rl_client, "generate", ["hi"])
+        _stop_stream_after_one_event(rl_client.generate_stream(["hi"]))  # submit, poll, cancel
         _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
         n_before = len(rl_client.transport.calls)
@@ -356,8 +415,19 @@ class TestClusterRequestBuilders:
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
+                ),
+            ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
             (
                 cluster_requests.export_checkpoint_request("job-1", "step-1"),
@@ -387,6 +457,7 @@ class TestClusterRequestBuilders:
         requests = (
             cluster_requests.list_jobs_request(),
             cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
             cluster_requests.cancel_job_request("job"),
             cluster_requests.capacity_request(),
             cluster_requests.list_checkpoints_request("job"),
@@ -403,8 +474,8 @@ class TestClusterClientMethods:
         """Account-level ops need no stored handle."""
         _call(client, "list_jobs", "running")
         assert _last(client) == cluster_requests.list_jobs_request("running")
-        _call(client, "capacity", "H200")
-        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
         _call(client, "cancel_job", "job-9")
         assert _last(client) == cluster_requests.cancel_job_request("job-9")
 
@@ -646,6 +717,21 @@ class TestCortexNoopOffload:
 
     def test_leaves_untouched_when_nothing_to_drop(self):
         assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
+
+
+class TestCortexSamplingSubJob:
+    def test_forwards_tensor_parallel_size(self):
+        """Neutrino's sampler reads TP from vllm_config and defaults to 1; n_gpus does not set it."""
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            sampling_gpus=16,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            sampling={"vllm": {"tensor_parallel_size": 16}},
+        )
+        (sampling,) = [sub for sub in cfg.to_cortex() if "inference_config" in sub]
+        assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 16
 
 
 class TestCortexBackendOnlyConstruction:
