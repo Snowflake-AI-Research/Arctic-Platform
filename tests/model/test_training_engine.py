@@ -100,6 +100,55 @@ def test_seed_and_zero_bucket_are_written_before_client_overrides():
     assert ds_config["zero_optimization"] == {"stage": 1}
 
 
+def test_a_client_bf16_block_keeps_the_master_weight_keys_it_does_not_state():
+    # The shape every catalog training body ships, and what a customer writes
+    # by hand. A shallow merge would drop both master-weight keys and send
+    # CPU-Adam back to 16 bytes per parameter of host memory.
+    ds_config = build_deepspeed_config(
+        _spec(ds_overrides={"bf16": {"enabled": True}, **_OFFLOAD}),
+    )
+
+    assert ds_config["bf16"] == {
+        "enabled": True,
+        "bf16_master_weights_and_grads": True,
+        "bf16_optimizer_states": True,
+    }
+    assert cpu_adam_fp32_optimizer_states(ds_config) is False
+    assert resolve_optimizer_name("AdamW", ds_config) == "deepspeed_cpu_adam"
+
+
+def test_a_client_bf16_block_wins_where_it_states_a_key():
+    overrides = {
+        "bf16": {"enabled": True, "bf16_optimizer_states": False},
+        "communication_data_type": "fp32",
+    }
+    ds_config = build_deepspeed_config(_spec(ds_overrides=overrides))
+
+    assert ds_config["bf16"]["bf16_optimizer_states"] is False
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+    assert cpu_adam_fp32_optimizer_states(ds_config) is True
+    # The override the caller handed in is not mutated.
+    assert overrides["bf16"] == {"enabled": True, "bf16_optimizer_states": False}
+
+
+def test_fp32_masters_survive_a_client_bf16_block():
+    ds_config = build_deepspeed_config(
+        _spec(fp32_masters=True, ds_overrides={"bf16": {"enabled": True}}),
+    )
+
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is False
+    assert ds_config["bf16"]["bf16_optimizer_states"] is False
+    assert cpu_adam_fp32_optimizer_states(ds_config) is True
+
+
+def test_a_client_fp16_block_keeps_the_resolved_enable_flag():
+    ds_config = build_deepspeed_config(
+        _spec(ds_overrides={"fp16": {"loss_scale": 0}, "communication_data_type": "fp32"}),
+    )
+
+    assert ds_config["fp16"] == {"loss_scale": 0, "enabled": False}
+
+
 @pytest.mark.parametrize("lowered", ["bf16", "bfloat16", "BF16", "fp16"])
 def test_lowering_the_reduction_dtype_under_bfloat16_parameters_is_refused(lowered):
     with pytest.raises(ValueError, match="communication_data_type must be fp32"):
