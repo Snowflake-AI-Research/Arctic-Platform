@@ -317,7 +317,7 @@ def _gather_ep_parameter(parameter: Any, *, dim: int) -> torch.Tensor:
 
 
 def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
-    """Gather a PEFT adapter pack onto rank zero."""
+    """Gather adapter tensors with live module names for PEFT's selection."""
     adapter_parameters = [
         (name, parameter) for name, parameter in model.named_parameters() if is_peft_adapter_tensor_name(name)
     ]
@@ -335,25 +335,21 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
         with deepspeed.zero.GatheredParameters(parameters, modifier_rank=0):
             if rank != 0:
                 return {}
-            return {
-                strip_activation_checkpoint_segments(name): parameter.detach().cpu().contiguous()
-                for name, parameter in adapter_parameters
-            }
+            return {name: parameter.detach().cpu().contiguous() for name, parameter in adapter_parameters}
 
     output: dict[str, torch.Tensor] = {}
     for name, parameter in adapter_parameters:
-        export_name = strip_activation_checkpoint_segments(name)
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
             if not dist.is_initialized():
                 raise RuntimeError(f"EP-sharded LoRA parameter {name!r} needs a process group")
-            gather_dim = 1 if "lora_B" in export_name.split(".") else 0
+            gather_dim = 1 if "lora_B" in name.split(".") else 0
             gathered = _gather_ep_parameter(parameter, dim=gather_dim)
             if rank == 0:
-                output[export_name] = gathered.detach().cpu().contiguous()
+                output[name] = gathered.detach().cpu().contiguous()
         elif rank == 0:
-            output[export_name] = parameter.detach().cpu().contiguous()
+            output[name] = parameter.detach().cpu().contiguous()
     return output
 
 
@@ -370,6 +366,25 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True)
+    # PEFT must select against live wrapped names before we make the pack portable.
+    if any(strip_activation_checkpoint_segments(name) != name for name in state):
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        for adapter_name in model.peft_config:
+            output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
+            weights_path = os.path.join(output_dir, "adapter_model.safetensors")
+            with safe_open(weights_path, framework="pt") as handle:
+                metadata = handle.metadata()
+                portable = {}
+                for name in handle.keys():
+                    export_name = strip_activation_checkpoint_segments(name)
+                    if export_name in portable:
+                        raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                    portable[export_name] = handle.get_tensor(name)
+            if not portable:
+                raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
+            save_file(portable, weights_path, metadata=metadata)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:

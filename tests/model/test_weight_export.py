@@ -283,6 +283,60 @@ def test_hf_and_adapter_checkpoint_contract(tmp_path):
     assert (adapter / "adapter_model.safetensors").is_file()
 
 
+class _AdapterBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+        self.head = nn.Linear(4, 2, bias=False)
+        self.config = {"model_type": "test"}
+
+    def forward(self, hidden):
+        return self.head(self.proj(hidden))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("adapter_name", ["default", "trained"])
+def test_peft_checkpoint_roundtrip_preserves_trained_tensors(tmp_path, wrapped, adapter_name):
+    from peft import LoraConfig
+    from peft import PeftModel
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    config = LoraConfig(r=2, lora_alpha=2, target_modules=["proj"], modules_to_save=["head"])
+    model = get_peft_model(_AdapterBase(), config, adapter_name=adapter_name)
+    with torch.no_grad():
+        model.base_model.model.proj.lora_A[adapter_name].weight.fill_(0.25)
+        model.base_model.model.proj.lora_B[adapter_name].weight.fill_(0.5)
+        model.base_model.model.head.modules_to_save[adapter_name].weight.fill_(0.75)
+    expected = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if "lora_" in name or "modules_to_save" in name
+    }
+    if wrapped:
+        model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+        model.base_model.model.head = checkpoint_wrapper(model.base_model.model.head)
+
+    save_peft_adapters(model, str(tmp_path))
+
+    adapter = tmp_path / PEFT_ADAPTER_DIRNAME
+    if adapter_name != "default":
+        adapter /= adapter_name
+    saved = load_file(adapter / "adapter_model.safetensors")
+    assert len(saved) == 3
+    assert all("_checkpoint_wrapped_module" not in name for name in saved)
+    reloaded = PeftModel.from_pretrained(_AdapterBase(), adapter, adapter_name=adapter_name)
+    actual = {
+        name: parameter.detach()
+        for name, parameter in reloaded.named_parameters()
+        if "lora_" in name or "modules_to_save" in name
+    }
+    assert actual.keys() == expected.keys()
+    for name, tensor in expected.items():
+        assert torch.equal(actual[name], tensor), name
+
+
 def test_iter_lora_weights_rejects_non_lora_trainables():
     model = _Model(
         [
