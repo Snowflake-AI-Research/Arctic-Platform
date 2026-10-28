@@ -129,6 +129,24 @@ Forwarded in the `initialize` payload (`JobConfig`):
 `build_model_config()` merges `vllm_config` with ArcticInference signals from
 `arctic_inference_config` (e.g. `zorro_inference.enable` → `use_fca=True`).
 
+### Gradient Accumulation Precision
+
+**AP no longer inserts an FP32 gradient-accumulation default into `ds_config`.** Explicit `data_types.grad_accum_dtype` values are preserved; when the field is omitted, DeepSpeed selects the accumulation dtype. For BF16 jobs using ZeRO, omission now selects BF16 accumulation instead of the FP32 accumulation previously inserted by AP. This is a training-numerics default change, not just a change to configuration forwarding.
+
+**Set `data_types.grad_accum_dtype` to `"fp32"` to retain the previous AP accumulation precision.** Include this block in the supplied `ds_config`, alongside the existing BF16 and ZeRO settings:
+
+```json
+{
+  "data_types": {
+    "grad_accum_dtype": "fp32"
+  }
+}
+```
+
+**BF16 model precision and gradient-accumulation precision are separate choices.** The override above does not change BF16 model weights to FP32. Omitting the override can change accumulated gradients, gradient norms and training trajectories, even when an individual loss measurement matches.
+
+**The small-model control does not validate large-model convergence.** A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four observed matching losses and gradient norms for the former default, omission and explicit FP32. Large-model adoption of BF16 accumulation still needs explicit model-owner sign-off and representative loss and gradient-norm validation; the small control does not establish that approval or numerical equivalence.
+
 ### GLM-5.3 Sparse Attention
 
 **The GLM-5.3 loader's `attn_implementation` selects automatic or forced sparse attention.** The selection reaches every sparse layer, including with sequence parallelism disabled (SP1):
