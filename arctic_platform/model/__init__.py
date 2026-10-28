@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.fp8 import preserve_fp8_params_throug
 from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
 from arctic_platform.model.implementations.gpu.lm_head import mark_lm_head_targets_validated
 from arctic_platform.model.implementations.gpu.lm_head import validated_lm_head_targets_to
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import validate_packed_gated_delta_net_kernels
 from arctic_platform.model.implementations.moe.config_validation import effective_fused_cross_entropy
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
@@ -148,6 +149,7 @@ __all__ = [
     "validate_expert_parallel",
     "validate_sequence_parallel",
     "validate_lm_head_fused_ce_config",
+    "validate_packed_gated_delta_net_kernels",
     "validated_lm_head_targets_to",
     "weight_export_contract",
 ]
