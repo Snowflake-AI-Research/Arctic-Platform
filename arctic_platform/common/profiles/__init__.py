@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.profiles import deepseek_v4
+from arctic_platform.common.profiles import dflash2
 from arctic_platform.common.profiles import generic_moe
 from arctic_platform.common.profiles import glm5_next
 from arctic_platform.common.profiles import glm_moe_dsa
@@ -33,7 +34,7 @@ from arctic_platform.common.profiles import huggingface
 from arctic_platform.common.profiles import qwen3_5_moe
 from arctic_platform.common.profiles import qwen4_exp
 
-_PROFILE_MODULES = (huggingface, generic_moe, qwen3_5_moe, glm_moe_dsa, glm5_next, qwen4_exp, deepseek_v4)
+_PROFILE_MODULES = (huggingface, generic_moe, qwen3_5_moe, glm_moe_dsa, glm5_next, qwen4_exp, deepseek_v4, dflash2)
 
 
 def register(registry: Registry) -> None:
