@@ -11,16 +11,45 @@ same value); ``ARL_DEEPEP_V2_MAX_TOKENS`` sizes it explicitly. ``ARL_DEEPEP_V2_N
 count, with 0 for the library's own choice.
 """
 
+import filecmp
+import glob
 import os
 from dataclasses import dataclass
 
-import deep_ep
 import torch
 from torch.distributed import ProcessGroup
 
 from ..routing_weights import apply_routing_weights
 from .combine_replay import CombineReplay
 
+
+def _import_deep_ep():
+    """``deep_ep`` asserts at import that one NCCL runtime is mapped, but it counts every mapped ``libnccl*`` file,
+    so aws-ofi-nccl's plugins (``libnccl-net-ofi.so``, ``libnccl-tuner-ofi.so``), which NCCL has loaded by the time a
+    trainer imports this module, fail it. Skip that check and run it here on the runtime libraries alone."""
+    suppressed = os.environ.get("EP_SUPPRESS_NCCL_CHECK")
+    os.environ["EP_SUPPRESS_NCCL_CHECK"] = "1"
+    try:
+        import deep_ep
+        from deep_ep.utils.find_pkgs import find_nccl_root
+    finally:
+        if suppressed is None:
+            del os.environ["EP_SUPPRESS_NCCL_CHECK"]
+        else:
+            os.environ["EP_SUPPRESS_NCCL_CHECK"] = suppressed
+    if int(suppressed or 0):
+        return deep_ep
+    with open("/proc/self/maps") as maps:
+        loaded = {line.split()[-1] for line in maps if os.path.basename(line.split()[-1]).startswith("libnccl.so")}
+    if len(loaded) > 1:
+        raise RuntimeError(f"more than one NCCL runtime is mapped: {sorted(loaded)}")
+    linked = sorted(glob.glob(f"{find_nccl_root()}/lib/libnccl.so*"))
+    if loaded and not (linked and filecmp.cmp(next(iter(loaded)), linked[0], shallow=False)):
+        raise RuntimeError(f"the mapped NCCL runtime {sorted(loaded)} is not the one deep_ep was linked with {linked}")
+    return deep_ep
+
+
+deep_ep = _import_deep_ep()
 _BufferType = getattr(deep_ep, "EPBuffer", None) or deep_ep.ElasticBuffer
 _buffers: dict[tuple, object] = {}
 _num_sms = 0
