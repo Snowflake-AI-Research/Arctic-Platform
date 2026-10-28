@@ -129,6 +129,18 @@ def test_loader_options_are_forwarded_whole(monkeypatch):
     assert seen[0]["loader_options"] == given
 
 
+def test_ac_config_layers_checkpoint_exactly_those_layers():
+    spec = _spec(training_options={"activation_checkpointing": True, "ac_config": {"layers": [0, 1, 2, 4]}})
+
+    assert spec.patches.gradient_checkpointing == [0, 1, 2, 4]
+    with pytest.raises(ValueError, match="ac_config.layers requires activation_checkpointing true"):
+        _spec(training_options={"activation_checkpointing": False, "ac_config": {"layers": [0]}})
+    with pytest.raises(ValidationError, match="lists a layer twice"):
+        _spec(training_options={"activation_checkpointing": True, "ac_config": {"layers": [0, 0]}})
+    with pytest.raises(ValidationError, match="layers is empty"):
+        _spec(training_options={"activation_checkpointing": True, "ac_config": {"layers": []}})
+
+
 def test_loader_options_are_validated_by_the_huggingface_schema():
     parity_off = _spec(loader_options={"fp32_parity": False})
     residual_on = _spec(loader_options={"fp32_residual": True})
