@@ -88,6 +88,7 @@ class MoEArgs:
     route_norm: bool = False
     route_scale: float = 1.0
     score_before_experts: bool = True
+    fp32_router_logits: bool = False
 
     # token-choice
     top_k: int = 1
@@ -359,6 +360,67 @@ class GroupedExperts(nn.Module):
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
 
+    @staticmethod
+    def _grouped_lora_fn(
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        ab: dict,
+        deltas: tuple[torch.Tensor | None, ...],
+    ):
+        """Expert LoRA for tokens packed by expert: two grouped GEMMs per projection on CUDA.
+
+        The routed-token count is read once for all three projections. Fused PEFT deltas
+        and CPU tensors keep the per-expert path.
+        """
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora
+
+        if not ab or not x.is_cuda or any(d is not None for d in deltas):
+            return lambda inputs, name, delta: _packed_expert_linear(inputs, delta, num_tokens_per_expert, ab.get(name))
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        _offsets_must_cover_no_more_than_the_rows("fp8 lora", x, num_tokens_per_expert, offsets)
+        rows = int(offsets[-1])
+
+        def lora(inputs: torch.Tensor, name: str, delta: torch.Tensor | None):
+            if name not in ab:
+                return 0
+            return grouped_expert_lora(inputs, ab[name], offsets, rows)
+
+        return lora
+
+    def _forward_fp8_decoded(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ab: dict,
+    ) -> torch.Tensor:
+        """Block-FP8 experts decoded to BF16 for each grouped GEMM (W8A16), plus grouped expert LoRA.
+
+        One routed-token count serves every projection; tokens need no per-expert padding and
+        activations are not quantized.
+        """
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
+        from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
+        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        _offsets_must_cover_no_more_than_the_rows("fp8", x, num_tokens_per_expert, offsets)
+        rows = int(offsets[-1])
+        block_size = cast(int, self.fp8_block_size)
+        projections = dict(zip(("w1", "w2", "w3"), zip(weights, scales)))
+
+        def project(inputs: torch.Tensor, name: str) -> torch.Tensor:
+            weight, scale = projections[name]
+            out = grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
+            if name in ab:
+                # In place on the routed rows: the decoded GEMM saves nothing it returns.
+                out[:rows] += grouped_expert_lora_rows(inputs, ab[name], offsets, rows)
+            return out
+
+        h = fused_swiglu(project(x, "w1"), project(x, "w3"), self.swiglu_limit)
+        return project(h, "w2")
+
     def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -376,17 +438,14 @@ class GroupedExperts(nn.Module):
             s2 = _maybe_to_local(self.w2_scale_inv)
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
+            if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab)
             if self.use_grouped_mm:
-                gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
-                    x, d1, num_tokens_per_expert, ab.get("w1")
-                )
-                up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
-                    x, d3, num_tokens_per_expert, ab.get("w3")
-                )
+                lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
+                gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
+                up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w3", d3)
                 h = _apply_swiglu(gate, up, self.swiglu_limit)
-                return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + (
-                    _packed_expert_linear(h, d2, num_tokens_per_expert, ab.get("w2"))
-                )
+                return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + lora(h, "w2", d2)
             counts = num_tokens_per_expert.tolist()
             n_pad = x.shape[0] - sum(counts)
             splits = torch.split(x[: sum(counts)], counts, dim=0)
@@ -463,6 +522,7 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: ``sigmoid``, ``softmax``, or DeepSeek V4's ``sqrtsoftplus``.
         route_norm (bool): Whether to normalize the routing scores when using sigmoid.
         route_scale (float): Scaling factor applied to the routing scores.
+        fp32_logits (bool): Compute the gate GEMM in fp32 from the bf16 operands, as the model's reference does.
     """
 
     def __init__(
@@ -473,9 +533,11 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"],
         route_norm: bool,
         route_scale: float,
+        fp32_logits: bool = False,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.fp32_logits = fp32_logits
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_func = score_func
@@ -495,7 +557,12 @@ class TokenChoiceTopKRouter(nn.Module):
         assert (
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
-        scores = self.gate(x)
+        if self.fp32_logits:
+            # Autocast would run the GEMM in bf16 despite the fp32 operands.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                scores = F.linear(x.float(), self.gate.weight.float())
+        else:
+            scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -614,6 +681,7 @@ class MoE(nn.Module):
             score_func=moe_args.score_func,
             route_norm=moe_args.route_norm,
             route_scale=moe_args.route_scale,
+            fp32_logits=moe_args.fp32_router_logits,
         )
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         # TODO: Add the s back and use FF when the weights support it

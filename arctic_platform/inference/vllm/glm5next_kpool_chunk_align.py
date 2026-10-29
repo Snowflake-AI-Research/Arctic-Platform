@@ -15,7 +15,7 @@
 
 """Refuse GLM-5.3-Flash's pooled indexer cache unless prefill chunks are pool-aligned.
 
-vLLM 0.31's ``_kpool_compress_insert`` (models/glm5next/nvidia/sparse_indexer.py)
+vLLM 0.31 and 0.32's ``_kpool_compress_insert`` (models/glm5next/nvidia/sparse_indexer.py)
 builds each pool's index key from the last ``index_kpool`` rows of the batch, so a
 chunk that starts mid-pool leaves that pool unwritten or pools it from the previous
 request's keys. Only ``mamba_cache_mode == "align"``, which vLLM sets when prefix
