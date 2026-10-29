@@ -469,6 +469,54 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
     assert "skipped 1/2" in caplog.records[-1].getMessage()
 
 
+def test_hf_sync_of_declared_export_buffers_passes_loaded_destination_check(monkeypatch):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    def ngram_model():
+        # Qwen3.8 shape: a trained parameter beside constant int64 hash tables that
+        # Qwen4ExpTextNGramEmbeddingPrimeRL declares in _dss_weight_export_buffers.
+        model = nn.Module()
+        model.model = nn.Module()
+        model.model.layers = nn.ModuleList([nn.Module()])
+        ngram = model.model.layers[0].ngram_embedding = nn.Module()
+        ngram._dss_weight_export_buffers = frozenset({"layer_multipliers"})
+        ngram.weight = nn.Parameter(torch.zeros(2))
+        ngram.register_buffer("layer_multipliers", torch.tensor([23703573157769, 8052911324071]))
+        return model
+
+    class Trainer(nn.Module):
+        @staticmethod
+        def convert_layer_to_hf(layer_state, layer_index):
+            return layer_state
+
+    class Sampler(nn.Module):
+        def load_weights(self, weights):
+            # vLLM's loaders also place persistent buffers and report them as loaded.
+            state = self.state_dict(keep_vars=True)
+            for name, tensor in weights:
+                state[name].data.copy_(tensor)
+            return {name for name, _ in weights}
+
+    trainer, sampler = Trainer(), Sampler()
+    trainer.model = ngram_model().model
+    sampler.model = ngram_model().model
+    trainer.model.layers[0].ngram_embedding.weight.data.copy_(torch.tensor([3.0, 4.0]))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        sampler,
+        _FakeEngine(list(build_iter_full_hf_weights(trainer)())),
+    )
+    _, loaded_l2_sq, _, _ = _model_parameter_l2(
+        sampler, torch.device("cpu"), _loaded_destination_names(mappings)
+    )
+
+    assert torch.equal(sampler.model.layers[0].ngram_embedding.weight, torch.tensor([3.0, 4.0]))
+    assert recv_l2_sq == applied_l2_sq == loaded_l2_sq == 25.0
+    assert skipped == []
+
+
 def test_load_direct_still_rejects_orphan_sources(monkeypatch):
     class FakeWriter:
         def __init__(self, model, device) -> None:
