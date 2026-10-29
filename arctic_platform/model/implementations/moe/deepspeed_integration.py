@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Mapping
+from urllib.parse import quote
 
 import torch
 import torch.nn as nn
@@ -17,6 +21,7 @@ from arctic_platform.debug.lora import maybe_observe_model_materialization
 from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
+from arctic_platform.model.loader import canonical_parameter_name
 
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
@@ -46,6 +51,147 @@ class MoEDeepSpeedAdapter:
     hf_weight_export: Callable[[nn.Module], Callable] | None = None
 
 
+def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
+    if not any(isinstance(module, (MoE, LatentMoE)) for module in model.modules()):
+        return {}
+    groups: dict[str, dict[str, nn.Parameter]] = {}
+    for name, parameter in model.named_parameters():
+        if getattr(parameter, "allreduce", True) is False:
+            group_name = parameter.group_name
+            groups.setdefault(group_name, {})[name] = parameter
+    return groups
+
+
+def _ep_checkpoint_identity(group_name: str) -> dict:
+    import deepspeed.utils.groups as ds_groups
+
+    return dict(
+        group_name=group_name,
+        ep_size=ds_groups._get_expert_parallel_world_size(group_name),
+        ep_rank=ds_groups._get_expert_parallel_rank(group_name),
+    )
+
+
+def _ep_checkpoint_path(directory, tag, identity: dict) -> Path:
+    group_name = quote(identity["group_name"], safe="")
+    return Path(directory) / tag / f"ap_ep_{group_name}_rank_{identity['ep_rank']:02d}_model_states.pt"
+
+
+def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
+    import deepspeed.utils.groups as ds_groups
+    from deepspeed.checkpoint.constants import FROZEN_PARAM_FRAGMENTS
+
+    original_load = engine_type._load_checkpoint
+    original_module_load = engine_type.load_module_state_dict
+    load_signature = signature(original_load)
+    module_load_signature = signature(original_module_load)
+
+    def wrap_save(original_save):
+        save_signature = signature(original_save)
+
+        @wraps(original_save)
+        def save(self, *args, **kwargs):
+            bound = save_signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            arguments = bound.arguments
+            parameters = _ep_checkpoint_parameters(self.module)
+            if len(parameters) > 0 and self.zero_optimization_partition_weights():
+                raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
+            result = original_save(self, *args, **kwargs)
+            for group_name, named_parameters in parameters.items():
+                data_rank = ds_groups._get_expert_data_parallel_rank(group_name)
+                if not self.checkpoint_engine.is_data_parallel_writer(data_rank):
+                    continue
+                identity = _ep_checkpoint_identity(group_name)
+                state = {
+                    name: parameter.detach()
+                    for name, parameter in named_parameters.items()
+                    if parameter.requires_grad or not arguments["exclude_frozen_parameters"]
+                }
+                self.checkpoint_engine.save(
+                    dict(
+                        version=1,
+                        **identity,
+                        exclude_frozen_parameters=arguments["exclude_frozen_parameters"],
+                        module=state,
+                    ),
+                    str(_ep_checkpoint_path(arguments["save_dir"], arguments["tag"], identity)),
+                )
+            return result
+
+        return save
+
+    @wraps(original_load)
+    def load(self, *args, **kwargs):
+        bound = load_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        parameters = _ep_checkpoint_parameters(self.module)
+        if len(parameters) == 0:
+            return original_load(self, *args, **kwargs)
+        if self.zero_optimization_partition_weights():
+            raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
+        local_state = {}
+        for group_name, named_parameters in parameters.items():
+            identity = _ep_checkpoint_identity(group_name)
+            path = _ep_checkpoint_path(arguments["load_dir"], arguments["tag"], identity)
+            if not path.is_file():
+                raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
+            shard = self.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
+            if (
+                not isinstance(shard, dict)
+                or type(shard.get("version")) is not int
+                or shard["version"] != 1
+                or any(shard.get(key) != value for key, value in identity.items())
+                or type(shard.get("exclude_frozen_parameters")) is not bool
+                or not isinstance(shard.get("module"), dict)
+            ):
+                raise ValueError(f"AP expert-parallel checkpoint shard metadata does not match: {path}")
+            expected_names = {
+                name
+                for name, parameter in named_parameters.items()
+                if parameter.requires_grad or not shard["exclude_frozen_parameters"]
+            }
+            if set(shard["module"]) != expected_names:
+                raise ValueError(f"AP expert-parallel checkpoint parameter coverage does not match: {path}")
+            for name, value in shard["module"].items():
+                if not isinstance(value, torch.Tensor) or value.shape != named_parameters[name].shape:
+                    raise ValueError(f"AP expert-parallel checkpoint tensor shape does not match for {name}: {path}")
+            local_state.update(shard["module"])
+        self._ap_ep_checkpoint_state = local_state
+        try:
+            return original_load(*bound.args, **bound.kwargs)
+        finally:
+            del self._ap_ep_checkpoint_state
+
+    @wraps(original_module_load)
+    def load_module(self, *args, **kwargs):
+        if not hasattr(self, "_ap_ep_checkpoint_state"):
+            return original_module_load(self, *args, **kwargs)
+        bound = module_load_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        checkpoint = dict(bound.arguments["checkpoint"])
+        checkpoint["module"] = dict(checkpoint["module"])
+        checkpoint["module"].update(
+            (canonical_parameter_name(name), value) for name, value in self._ap_ep_checkpoint_state.items()
+        )
+        # DeepSpeed restores frozen fragments after the module, so both must use the local shard.
+        if checkpoint.get(FROZEN_PARAM_FRAGMENTS) is not None:
+            fragments = dict(checkpoint[FROZEN_PARAM_FRAGMENTS])
+            fragments.update(
+                (name, value) for name, value in self._ap_ep_checkpoint_state.items() if name in fragments
+            )
+            checkpoint[FROZEN_PARAM_FRAGMENTS] = fragments
+        bound.arguments["checkpoint"] = checkpoint
+        return original_module_load(*bound.args, **bound.kwargs)
+
+    engine_type._save_moe_checkpoint = wrap_save(engine_type._save_moe_checkpoint)
+    # Frozen expert-only models follow DeepSpeed's ordinary checkpoint path.
+    engine_type._save_checkpoint = wrap_save(engine_type._save_checkpoint)
+    engine_type._load_checkpoint = load
+    engine_type.load_module_state_dict = load_module
+
+
 def patch_deepspeed_moe_detection() -> None:
     import deepspeed.runtime.engine as ds_engine
 
@@ -70,6 +216,7 @@ def patch_deepspeed_moe_detection() -> None:
             if num_experts is not None:
                 self.num_experts.append(num_experts)
 
+    _patch_deepspeed_ep_checkpoints(ds_engine.DeepSpeedEngine)
     ds_engine.DeepSpeedEngine._configure_distributed_model = patched
     ds_engine.DeepSpeedEngine._ap_moe_patched = True
 
@@ -237,8 +384,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
-                getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
+                getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids
             ):
                 continue
             hf_name = hf_export_param_name(name)

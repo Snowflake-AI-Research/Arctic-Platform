@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
+from arctic_platform.debug.weight_sync import maybe_complete_broadcast_trainer_inventory
 
 WeightFormat = Literal["hf", "vllm", "lora"]
 WeightIterator = Iterator[tuple[str, torch.Tensor]]
@@ -617,6 +618,7 @@ def iter_model_weights(
     maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     contract = weight_export_contract(model)
@@ -626,6 +628,7 @@ def iter_model_weights(
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
         iterator = builder(_family_model_for_export(model))
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     if weight_format == "vllm" and contract is not None:
@@ -637,3 +640,4 @@ def iter_model_weights(
         is_zero3=is_zero3,
         checkpoint_dir=checkpoint_dir,
     )
+    maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)

@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 from copy import deepcopy
 
 import pytest
@@ -38,22 +35,26 @@ def worker():
 
 
 @pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_omitted_accumulation_precision_is_not_inserted(worker, job_config):
+def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job_config):
     config = {}
     assert worker.ds_training_config(job_config, config, {}) is config
-    assert "data_types" not in config
+    assert config["data_types"] == {"grad_accum_dtype": "fp32"}
 
 
-@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
+@pytest.mark.parametrize(
+    "data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}, {"other_setting": True}]
+)
 def test_explicit_accumulation_precision_is_preserved(worker, data_types):
-    config = {"data_types": deepcopy(data_types)}
+    supplied = deepcopy(data_types)
+    config = {"data_types": supplied}
     worker.ds_training_config({}, config, {})
     assert config["data_types"] == data_types
+    assert config["data_types"] is supplied
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
 @pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_job_leaves_accumulation_dtype_to_deepspeed(dtype, fp32_masters):
+def test_bfloat16_config_builder_does_not_insert_worker_accumulation_default(dtype, fp32_masters):
     ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=4, dtype=dtype, fp32_masters=fp32_masters))
     assert "data_types" not in ds_config
 
@@ -95,8 +96,8 @@ def test_deepspeed_resolves_explicit_float32_accumulation_without_changing_model
 
 
 @require_torch_gpu
-def test_worker_accumulation_default_change_records_loss_and_gradient_norm(worker):
-    """Measure the default change, and prove explicit FP32 preserves the former behavior."""
+def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
+    """The retained worker default and explicit FP32 must produce identical training metrics."""
     import deepspeed
     import torch.distributed as dist
 
@@ -112,7 +113,7 @@ def test_worker_accumulation_default_change_records_loss_and_gradient_norm(worke
         )
     measurements = {}
     try:
-        for label in ("previous_default", "deepspeed_default", "explicit_fp32"):
+        for label in ("worker_default", "explicit_fp32"):
             set_seed(17)
             model = torch.nn.Linear(16, 8, bias=False, device="cuda", dtype=torch.bfloat16)
             config = dict(
@@ -123,10 +124,11 @@ def test_worker_accumulation_default_change_records_loss_and_gradient_norm(worke
                 gradient_clipping=0.0,
                 steps_per_print=1000,
             )
-            if label in ("previous_default", "explicit_fp32"):
+            if label == "explicit_fp32":
                 config["data_types"] = dict(grad_accum_dtype="fp32")
             worker.ds_training_config({"training_config": {"optimizer": {"torch_adam": True, "lr": 0.01}}}, config, {})
             engine, *_ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            assert engine.get_data_types() == (torch.bfloat16, torch.float32)
             losses = []
             norms = []
             for _ in range(8):
@@ -151,9 +153,8 @@ def test_worker_accumulation_default_change_records_loss_and_gradient_norm(worke
             )
             del engine, model
         for metric in ("loss", "grad_norm"):
-            torch_assert_equal(measurements["previous_default"][metric], measurements["explicit_fp32"][metric])
-        assert torch.isfinite(measurements["deepspeed_default"]["loss"]).all()
-        assert torch.isfinite(measurements["deepspeed_default"]["grad_norm"]).all()
+            assert torch.isfinite(measurements["worker_default"][metric]).all()
+            torch_assert_equal(measurements["worker_default"][metric], measurements["explicit_fp32"][metric])
     finally:
         if owns_group:
             dist.destroy_process_group()

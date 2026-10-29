@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import importlib
 import inspect
 import json
 import math
@@ -126,9 +127,10 @@ def _storage(value):
 class ShadowVerifier:
     """Replay supported ATen loaders into private storages, never into live NaNs.
 
-    Unknown/custom operations and writes outside registered parameters or
-    newly allocated temporaries fail before dispatch. Shared parameter storages,
-    nonfloating parameters and quantized loaders are deliberately unsupported.
+    Unknown/custom operations and writes outside registered parameters,
+    complete persistent integer buffers or newly allocated temporaries fail
+    before dispatch. Shared parameter views require one complete backing owner.
+    Nonfloating parameters and quantized loaders are deliberately unsupported.
     """
 
     def __init__(self, model, *, max_shadow_bytes: int):
@@ -138,13 +140,21 @@ class ShadowVerifier:
 
         self.model = model
         self.parameters = dict(model.named_parameters())
+        self.integer_dtypes = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
+        self.buffer_inventory = self._buffer_inventory()
+        self.buffers = {
+            name: value
+            for name, value in model.named_buffers()
+            if name in self.buffer_inventory and self.buffer_inventory[name][-1]
+        }
         self.aliases = {name: id(value) for name, value in model.named_parameters(remove_duplicate=False)}
         self.layouts = {
-            name: (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+            name: (tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype, value.device)
             for name, value in self.parameters.items()
         }
-        self.storage_names: dict[tuple[str, int, int], str] = {}
-        total = 0
+        self.storage_keys = {}
+        self.storage_names: dict[tuple[str, int, int], set[str]] = {}
+        storage_owners = {}
         if not self.parameters:
             raise ValueError("weight-sync model has no parameters")
         for name, value in self.parameters.items():
@@ -152,17 +162,63 @@ class ShadowVerifier:
                 value.device.type == "meta"
                 or value.layout != torch.strided
                 or not value.is_floating_point()
-                or not value.is_contiguous()
-                or value.storage_offset() != 0
                 or value.numel() == 0
-                or value.untyped_storage().nbytes() != value.numel() * value.element_size()
+                or value.storage_offset() < 0
+                or any(stride < 0 for stride in value.stride())
             ):
                 raise ValueError(f"unsupported shadow parameter layout: {name}")
+            # Increasing strides prove distinct element addresses without a tensor-sized index map.
+            span = 1
+            for stride, size in sorted(
+                (stride, size) for size, stride in zip(value.shape, value.stride()) if size > 1
+            ):
+                if stride < span:
+                    raise ValueError(f"unsupported overlapping shadow parameter layout: {name}")
+                span += (size - 1) * stride
             key = _storage(value)
-            if key in self.storage_names:
-                raise ValueError("shared parameter storages require an explicit supported loader")
-            self.storage_names[key] = name
-            total += value.numel() * value.element_size()
+            if (value.storage_offset() + span) * value.element_size() > key[2]:
+                raise ValueError(f"unsupported shadow parameter storage bounds: {name}")
+            self.storage_keys[name] = key
+            self.storage_names.setdefault(key, set()).add(name)
+            if value.storage_offset() == 0 and value.numel() * value.element_size() == key[2]:
+                if key in storage_owners:
+                    raise ValueError("shared parameter storages require one complete backing owner")
+                storage_owners[key] = name
+        for key, names in self.storage_names.items():
+            if key not in storage_owners:
+                raise ValueError("unsupported shared parameter storage without a complete backing owner")
+            owner = self.parameters[storage_owners[key]]
+            if any(self.parameters[name].dtype != owner.dtype for name in names):
+                raise ValueError("unsupported reinterpretation of shared parameter storage")
+        buffer_storages: dict[tuple[str, int, int], list[str]] = {}
+        for name, value in model.named_buffers(remove_duplicate=False):
+            if value.layout == torch.strided and value.device.type != "meta":
+                key = _storage(value)
+                if value.dtype in self.integer_dtypes and name not in self.buffers and key in self.storage_names:
+                    raise ValueError(f"unsupported shadow buffer storage or alias: {name}")
+                buffer_storages.setdefault(key, []).append(name)
+        for name, value in self.buffers.items():
+            if (
+                value.device.type == "meta"
+                or value.layout != torch.strided
+                or value.numel() == 0
+                or not value.is_contiguous()
+                or value.storage_offset() != 0
+                or not self.buffer_inventory[name][-1]
+            ):
+                raise ValueError(f"unsupported shadow buffer layout or persistence: {name}")
+            key = _storage(value)
+            if (
+                value.numel() * value.element_size() != key[2]
+                or key in self.storage_names
+                or buffer_storages[key] != [name]
+            ):
+                raise ValueError(f"unsupported shadow buffer storage or alias: {name}")
+            self.storage_keys[name] = key
+            self.storage_names[key] = {name}
+            storage_owners[key] = name
+        self.registered = {**self.parameters, **self.buffers}
+        total = sum(key[2] for key in self.storage_names)
         if type(max_shadow_bytes) is not int or not 0 < total <= max_shadow_bytes:
             raise ValueError(f"shadow allocation {total} exceeds the explicit {max_shadow_bytes} byte limit")
         self.sources = source_files(
@@ -171,11 +227,99 @@ class ShadowVerifier:
             tree_map,
             *[value.weight_loader for value in self.parameters.values() if hasattr(value, "weight_loader")],
         )
+        self.padding = self._projection_padding()
+        for entry in self.padding.values():
+            self.sources.update(source_files(type(entry["module"]), type(entry["projection"])))
         verify_sources(self.sources)
-        self.shadows = {name: torch.full_like(value, float("nan")) for name, value in self.parameters.items()}
-        self.shadow_names = {_storage(value): name for name, value in self.shadows.items()}
+        self.backings = {
+            key: torch.full(
+                (key[2] // self.registered[name].element_size(),),
+                float("nan") if name in self.parameters else 0,
+                dtype=self.registered[name].dtype,
+                device=self.registered[name].device,
+            )
+            for key, name in storage_owners.items()
+        }
+        self.shadows = {
+            name: (
+                self.backings[self.storage_keys[name]].as_strided(value.shape, value.stride(), value.storage_offset())
+            )
+            for name, value in self.registered.items()
+        }
+        for name, entry in self.padding.items():
+            with torch.no_grad():
+                self.shadows[name][entry["start"] :].copy_(self.parameters[name][entry["start"] :])
+        self.shadow_names = {_storage(value): self.storage_names[key] for key, value in self.backings.items()}
         self.received: dict[str, dict] = {}
         self.touched: set[str] = set()
+
+    def _projection_padding(self):
+        """Only the installed Qwen HC loader's unused trailing rows are padding."""
+        result = {}
+        origin = "vllm.models.qwen4_exp.nvidia.hyperconnection"
+        for prefix, module in self.model.named_modules():
+            if type(module).__module__ != origin or type(module).__name__ != "GatedResidual":
+                continue
+            if type(module) is not importlib.import_module(origin).GatedResidual:
+                raise ValueError("HC padding requires the actual installed GatedResidual class")
+            if module.use_combine is False:
+                continue
+            rank, count, hidden, padding = module.lora_rank, module.hc_count, module.hidden_size, module.pad_size
+            if (
+                module.use_combine is not True
+                or any(type(size) is not int or size <= 0 for size in (rank, count, hidden))
+                or type(padding) is not int
+                or padding != (-(rank + count)) % 16
+            ):
+                raise ValueError("invalid HC projection padding geometry")
+            projection = module.input_mix_weight_down_block_inject
+            sizes = [rank, count] + ([padding] if padding else [])
+            name = f"{prefix}." if prefix else ""
+            name += "input_mix_weight_down_block_inject.weight"
+            value = self.parameters.get(name)
+            if (
+                value is None
+                or value is not projection.weight
+                or list(projection.output_sizes) != sizes
+                or tuple(value.shape) != (sum(sizes), count * hidden)
+                or not value.is_contiguous()
+                or value.storage_offset() != 0
+                or self.storage_names[self.storage_keys[name]] != {name}
+            ):
+                raise ValueError("invalid HC projection padding storage or output partitions")
+            if padding:
+                result[name] = dict(
+                    module=module,
+                    projection=projection,
+                    geometry=(rank, count, hidden, padding),
+                    start=rank + count,
+                    before=tensor_manifest(value[rank + count :]),
+                )
+        return result
+
+    def _buffer_inventory(self):
+        import torch
+
+        persistent = {
+            f"{prefix}.{name}" if prefix else name
+            for prefix, module in self.model.named_modules(remove_duplicate=False)
+            for name in module._buffers
+            if name not in module._non_persistent_buffers_set
+        }
+        return {
+            name: (
+                id(value),
+                _storage(value) if value.layout == torch.strided and value.device.type != "meta" else None,
+                tuple(value.shape),
+                tuple(value.stride()) if value.layout == torch.strided else None,
+                value.storage_offset() if value.layout == torch.strided else None,
+                value.dtype,
+                value.device,
+                name in persistent,
+            )
+            for name, value in self.model.named_buffers(remove_duplicate=False)
+            if value.dtype in self.integer_dtypes
+        }
 
     def _check_inventory(self):
         current = dict(self.model.named_parameters())
@@ -185,12 +329,26 @@ class ShadowVerifier:
             or set(current) != set(self.parameters)
             or any(
                 current[name] is not value
-                or self.storage_names.get(_storage(value)) != name
-                or (tuple(value.shape), tuple(value.stride()), value.dtype, value.device) != self.layouts[name]
+                or _storage(value) != self.storage_keys[name]
+                or (tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype, value.device)
+                != self.layouts[name]
                 for name, value in self.parameters.items()
             )
         ):
             raise RuntimeError("weight loader changed the registered parameter identities or storage")
+        if self._buffer_inventory() != self.buffer_inventory:
+            raise RuntimeError("weight loader changed the registered buffer inventory or identities")
+        for name, entry in self.padding.items():
+            module = entry["module"]
+            rank, count, hidden, padding = entry["geometry"]
+            if (
+                module.use_combine is not True
+                or (module.lora_rank, module.hc_count, module.hidden_size, module.pad_size) != entry["geometry"]
+                or module.input_mix_weight_down_block_inject is not entry["projection"]
+                or list(entry["projection"].output_sizes) != [rank, count, padding]
+                or tensor_manifest(self.parameters[name][entry["start"] :]) != entry["before"]
+            ):
+                raise RuntimeError(f"weight loader changed unused HC projection padding: {name}")
 
     @contextmanager
     def observe_load(self, name, value, *, loader):
@@ -225,15 +383,13 @@ class ShadowVerifier:
                 def substitute(tensor):
                     if not isinstance(tensor, torch.Tensor):
                         return tensor
-                    destination = verifier.storage_names.get(_storage(tensor))
-                    if destination is None or not self.shadow:
+                    key = _storage(tensor)
+                    if key not in verifier.storage_names or not self.shadow:
                         return tensor
-                    parameter = verifier.parameters[destination]
-                    if tensor.dtype != parameter.dtype:
+                    backing = verifier.backings[key]
+                    if tensor.dtype != backing.dtype:
                         raise ValueError("reinterpretation of parameter storage is unsupported")
-                    return verifier.shadows[destination].as_strided(
-                        tensor.shape, tensor.stride(), tensor.storage_offset()
-                    )
+                    return backing.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
 
                 for index, argument in enumerate(func._schema.arguments):
                     if argument.alias_info is None or not argument.alias_info.is_write:
@@ -248,7 +404,21 @@ class ShadowVerifier:
                         if self.shadow:
                             destination = destination or verifier.shadow_names.get(key)
                         if destination is not None:
-                            self.written.add(destination)
+                            for buffer_name in destination.intersection(verifier.buffers):
+                                buffer = verifier.buffers[buffer_name]
+                                source = args[1] if len(args) > 1 else kwargs.get("src")
+                                if (
+                                    func is not torch.ops.aten.copy_.default
+                                    or tensor.dtype != buffer.dtype
+                                    or tensor.shape != buffer.shape
+                                    or tensor.stride() != buffer.stride()
+                                    or tensor.storage_offset() != 0
+                                    or not isinstance(source, torch.Tensor)
+                                    or source.shape != buffer.shape
+                                    or source.dtype != buffer.dtype
+                                ):
+                                    raise ValueError("integer buffer writes require one complete, exact-dtype copy")
+                            self.written.update(destination)
                         elif key not in self.owned:
                             raise ValueError("weight loader writes an input, buffer or unowned storage")
                 call_args = tree_map(substitute, args)
@@ -292,12 +462,17 @@ class ShadowVerifier:
         verify_sources(self.sources)
         destinations = {}
         for name in sorted(self.touched):
-            live = self.parameters[name].detach()
+            live = self.registered[name].detach()
             shadow = self.shadows[name]
-            uncovered = torch.isnan(shadow)
+            uncovered = torch.isnan(shadow) if name in self.parameters else torch.zeros_like(shadow, dtype=torch.bool)
+            if name in self.padding:
+                entry = self.padding[name]
+                if tensor_manifest(shadow[entry["start"] :]) != entry["before"]:
+                    raise RuntimeError(f"shadow loader changed unused HC projection padding: {name}")
+                uncovered[entry["start"] :] = False
             byte_diff = (
-                live.reshape(-1).view(torch.uint8).reshape(-1, live.element_size())
-                != shadow.reshape(-1).view(torch.uint8).reshape(-1, shadow.element_size())
+                live.contiguous().reshape(-1).view(torch.uint8).reshape(-1, live.element_size())
+                != shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, shadow.element_size())
             ).any(dim=1)
             destinations[name] = {
                 "uncovered": int(uncovered.sum().item()),
@@ -313,6 +488,9 @@ class ShadowVerifier:
                 name: value.numel() for name, value in self.parameters.items() if name not in self.touched
             },
             "evidence_sources": self.sources,
+            "preserved_padding": {
+                name: dict(start_row=entry["start"], **entry["before"]) for name, entry in self.padding.items()
+            },
         }
 
 
@@ -423,6 +601,11 @@ def global_inventory(records: list[dict]) -> dict:
                     or any(character not in "0123456789abcdef" for character in entry["sha256"])
                 ):
                     raise ValueError("invalid actual tensor geometry")
+                skipped = entry.get("skip_weight_sync", False)
+                if type(skipped) is not bool or (skipped and (kind != "parameters" or entry["requires_grad"])):
+                    raise ValueError(f"weight-sync skips require explicitly frozen parameters: {name}")
+                if skipped != base.get("skip_weight_sync", False):
+                    raise ValueError(f"weight-sync skip classification differs across ranks: {name}")
                 if any(entry.get(key) != base.get(key) for key in ("shape", "numel", "dtype", "requires_grad")):
                     raise ValueError(f"rank-local tensor geometry differs: {name}")
                 members = entry.get("ep_ranks")
@@ -462,6 +645,7 @@ def global_inventory(records: list[dict]) -> dict:
                 "dtype": base["dtype"],
                 "requires_grad": base.get("requires_grad"),
                 "ep_groups": [list(group) for group in sorted(groups)],
+                "skip_weight_sync": base.get("skip_weight_sync", False),
             }
         result[kind] = inventory
     return result
@@ -1051,6 +1235,7 @@ def bind_receiver_results(
 # Broadcast Weight Sync Evidence
 
 _SEND = ContextVar("native_broadcast_weight_evidence", default=None)
+_EXPORT = ContextVar("native_broadcast_export_inventory", default=None)
 TRAINING_OPTION = "arctic_platform_weight_sync_verify"
 SHADOW_MAX_BYTES_ENV = "ARCTIC_PLATFORM_WEIGHT_SYNC_SHADOW_MAX_BYTES"
 
@@ -1126,6 +1311,7 @@ def maybe_observe_broadcast_send(sender, weights, send):
     token = _SEND.set(state)
     sources = source_files(send, type(sender), maybe_observe_broadcast_send)
     manifest = {}
+    wire_buffers = {}
 
     def observed():
         for name, value in weights:
@@ -1133,6 +1319,31 @@ def maybe_observe_broadcast_send(sender, weights, send):
                 raise ValueError("broadcast tensor names must be nonempty and unique")
             entry = tensor_manifest(value)
             manifest[name] = entry
+            if any(_storage(value) == _storage(parameter) for parameter in state.get("skipped_objects", {}).values()):
+                raise ValueError("broadcast unexpectedly sent explicitly skipped frozen storage")
+            matches = [
+                buffer_name
+                for buffer_name, buffer in state.get("buffer_objects", {}).items()
+                if (
+                    value.untyped_storage()._cdata == buffer.untyped_storage()._cdata
+                    and value.dtype == buffer.dtype
+                    and value.shape == buffer.shape
+                    and value.stride() == buffer.stride()
+                    and value.storage_offset() == buffer.storage_offset()
+                )
+            ]
+            if len(matches) > 1:
+                raise ValueError("exported tensor aliases multiple registered trainer buffers")
+            if matches:
+                buffer_name = matches[0]
+                if buffer_name in wire_buffers.values():
+                    raise ValueError(f"registered trainer buffer sent more than once: {buffer_name}")
+                source_entry = state["rank_records"][0]["buffers"][buffer_name]
+                if any(entry[key] != source_entry[key] for key in ("shape", "dtype", "numel", "sha256")):
+                    raise RuntimeError(f"registered trainer buffer changed before sending: {buffer_name}")
+                if state["trainer_inventory"]["buffers"][buffer_name]["ep_groups"]:
+                    raise ValueError("native buffer evidence does not admit rank-local EP views")
+                wire_buffers[name] = buffer_name
             yield name, value
             if tensor_manifest(value) != entry:
                 raise RuntimeError("actually sent broadcast tensor changed during transfer")
@@ -1145,14 +1356,44 @@ def maybe_observe_broadcast_send(sender, weights, send):
             raise RuntimeError("broadcast sender has no complete collective trainer inventory")
         sources.update(state["evidence_sources"])
         verify_sources(sources)
+        if wire_buffers:
+            _verify_trainer_replicas(
+                state["rank_records"], state["trainer_inventory"], buffer_names=wire_buffers.values()
+            )
+        buffers = state["trainer_inventory"].get("buffers", {})
+        if state.get("skipped_objects") and state.get("skipped_proof") is None:
+            raise RuntimeError("skipped frozen weights have no all-rank export completion proof")
         evidence.update(
             sent_manifest=manifest,
             trainer_parameters=state["trainer_parameters"],
+            trainer_buffers={
+                "numel": sum(entry["global_numel"] for entry in buffers.values()),
+                "count": len(buffers),
+                "wire_numel": sum(buffers[name]["global_numel"] for name in wire_buffers.values()),
+                "wire_sources": wire_buffers,
+            },
             trainer_inventory=state["trainer_inventory"],
             evidence_sources=sources,
         )
+        if state.get("skipped_proof") is not None:
+            evidence["trainer_skipped_parameters"] = state["skipped_proof"]
     finally:
+        _EXPORT.set(None)
         _SEND.reset(token)
+
+
+def _explicitly_skipped_parameters(model):
+    skipped_ids = {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "_dss_skip_weight_sync", False) is True
+        for parameter in module.parameters(recurse=False)
+    }
+    return {
+        name: value
+        for name, value in model.named_parameters()
+        if id(value) in skipped_ids or getattr(value, "_dss_skip_weight_sync", False) is True
+    }
 
 
 def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
@@ -1160,6 +1401,9 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
     if not enabled():
         return
     import torch.distributed as dist
+
+    from arctic_platform.model.weight_export import iter_model_weights
+    from arctic_platform.model.weight_export import weight_export_contract
 
     if is_zero3:
         raise ValueError("native broadcast evidence does not admit ZeRO3 tensor views")
@@ -1169,38 +1413,62 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
     sources = source_files(
         maybe_bind_broadcast_trainer_inventory,
         type(model).named_parameters,
+        type(model).named_buffers,
         dist.all_gather_object,
         global_inventory,
+        _verify_trainer_replicas,
+        _explicitly_skipped_parameters,
+        iter_model_weights,
     )
-    parameters = {}
+    contract = weight_export_contract(model)
+    if contract is not None:
+        sources.update(source_files(*(builder for builder in (contract.hf, contract.vllm) if builder is not None)))
+    objects = {}
+    local_inventory = {"parameters": {}, "buffers": {}}
     error = None
     try:
         if is_master != (rank == 0):
             raise ValueError("exporter master does not match the actual training rank")
-        for name, value in model.named_parameters():
-            if hasattr(value, "ds_id"):
-                raise ValueError("native broadcast evidence does not admit ZeRO3 tensor views")
-            members = None
-            if getattr(value, "allreduce", True) is False:
-                import deepspeed.utils.groups as groups
+        objects = {
+            "parameters": dict(model.named_parameters()),
+            "buffers": dict(model.named_buffers(remove_duplicate=False)),
+        }
+        parameter_storages = {_storage(value) for value in objects["parameters"].values()}
+        buffer_storages = [_storage(value) for value in objects["buffers"].values()]
+        if len(set(buffer_storages)) != len(buffer_storages):
+            raise ValueError("registered trainer buffers have ambiguous storage aliases")
+        if parameter_storages.intersection(buffer_storages):
+            raise ValueError("registered trainer parameters and buffers share storage")
+        skipped_ids = {id(value) for value in _explicitly_skipped_parameters(model).values()}
+        for module in model.modules():
+            if getattr(module, "_dss_skip_weight_sync", False) is True:
+                sources.update(source_files(type(module)))
+        for kind, tensors in objects.items():
+            for name, value in tensors.items():
+                if hasattr(value, "ds_id"):
+                    raise ValueError("native broadcast evidence does not admit ZeRO3 tensor views")
+                members = None
+                if getattr(value, "allreduce", True) is False:
+                    import deepspeed.utils.groups as groups
 
-                group_name = getattr(value, "group_name", None)
-                if not isinstance(group_name, str) or not group_name:
-                    raise ValueError("expert shard has no actual named process group")
-                group = groups._get_expert_parallel_group(group_name)
-                members = list(dist.get_process_group_ranks(group))
-                sources.update(source_files(groups._get_expert_parallel_group, dist.get_process_group_ranks))
-            parameters[name] = {
-                **tensor_manifest(value),
-                "requires_grad": value.requires_grad,
-                "ep_ranks": members,
-            }
-        if not parameters:
+                    group_name = getattr(value, "group_name", None)
+                    if not isinstance(group_name, str) or not group_name:
+                        raise ValueError("expert shard has no actual named process group")
+                    group = groups._get_expert_parallel_group(group_name)
+                    members = list(dist.get_process_group_ranks(group))
+                    sources.update(source_files(groups._get_expert_parallel_group, dist.get_process_group_ranks))
+                local_inventory[kind][name] = {
+                    **tensor_manifest(value),
+                    "requires_grad": value.requires_grad,
+                    "ep_ranks": members,
+                    "skip_weight_sync": kind == "parameters" and id(value) in skipped_ids,
+                }
+        if not local_inventory["parameters"]:
             raise ValueError("actual trainer has no registered parameters")
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     verify_sources(sources)
-    local = {"rank": rank, "world_size": world, "parameters": parameters, "buffers": {}, "error": error}
+    local = {"rank": rank, "world_size": world, **local_inventory, "error": error}
     records = [None] * world
     dist.all_gather_object(records, local)
     errors = [record.get("error") for record in records if isinstance(record, dict) and record.get("error")]
@@ -1209,6 +1477,21 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
     inventory = global_inventory(records)
     _verify_trainer_replicas(records, inventory)
     verify_sources(sources)
+    skipped_objects = {
+        name: value
+        for name, value in objects["parameters"].items()
+        if inventory["parameters"][name]["skip_weight_sync"]
+    }
+    _EXPORT.set(
+        dict(
+            model=model,
+            objects=skipped_objects,
+            storages={name: _storage(value) for name, value in skipped_objects.items()},
+            local=local,
+            records=records,
+            inventory=inventory,
+        )
+    )
     state = _SEND.get()
     if is_master:
         if state is None or state["trainer_parameters"] is not None:
@@ -1219,17 +1502,86 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
                 "count": len(inventory["parameters"]),
             },
             trainer_inventory=inventory,
+            buffer_objects=objects["buffers"],
+            rank_records=sorted(records, key=lambda record: record["rank"]),
             evidence_sources=sources,
+            skipped_objects=skipped_objects,
         )
 
 
-def _verify_trainer_replicas(records, inventory):
+def maybe_complete_broadcast_trainer_inventory(model, *, is_master):
+    """Every export rank proves intentionally omitted frozen storage stayed unchanged."""
+    if not enabled():
+        return
+    import torch.distributed as dist
+
+    export = _EXPORT.get()
+    _EXPORT.set(None)
+    if export is None or export["model"] is not model:
+        raise RuntimeError("export completion has no matching collective trainer inventory")
+    if not export["objects"]:
+        return
+    error = None
+    actual = {}
+    try:
+        if is_master != (dist.get_rank() == 0):
+            raise RuntimeError("skipped frozen export completion changed the master rank")
+        current = dict(model.named_parameters())
+        skipped = _explicitly_skipped_parameters(model)
+        if set(skipped) != set(export["objects"]):
+            raise RuntimeError("skipped frozen parameter classification changed")
+        for name, value in export["objects"].items():
+            if current.get(name) is not value or _storage(value) != export["storages"][name]:
+                raise RuntimeError(f"skipped frozen parameter identity changed: {name}")
+            actual[name] = tensor_manifest(value)
+            before = export["local"]["parameters"][name]
+            if value.requires_grad or any(actual[name][key] != before[key] for key in actual[name]):
+                raise RuntimeError(f"skipped frozen parameter bytes or layout changed: {name}")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    local = dict(rank=dist.get_rank(), world_size=dist.get_world_size(), parameters=actual, error=error)
+    completed = [None] * dist.get_world_size()
+    dist.all_gather_object(completed, local)
+    if any(
+        not isinstance(entry, dict)
+        or type(entry.get("rank")) is not int
+        or entry.get("world_size") != dist.get_world_size()
+        or not isinstance(entry.get("parameters"), dict)
+        for entry in completed
+    ):
+        raise RuntimeError("skipped frozen export completion has invalid rank records")
+    by_rank = {entry["rank"]: entry for entry in completed}
+    if len(by_rank) != dist.get_world_size() or set(by_rank) != set(range(dist.get_world_size())):
+        raise RuntimeError("skipped frozen export completion has incomplete rank coverage")
+    for before in export["records"]:
+        after = by_rank[before["rank"]]
+        if after["error"] is not None:
+            raise RuntimeError("skipped frozen export completion failed: " + after["error"])
+        if set(after["parameters"]) != set(export["objects"]):
+            raise RuntimeError("skipped frozen export completion changed its parameter inventory")
+        for name, value in after["parameters"].items():
+            if any(value[key] != before["parameters"][name][key] for key in value):
+                raise RuntimeError(f"skipped frozen export completion changed rank bytes: {name}")
+    if is_master:
+        state = _SEND.get()
+        if state is None:
+            raise RuntimeError("skipped frozen export completion has no active sender")
+        state["skipped_proof"] = dict(schema="frozen-weight-sync-skip-v1", before=export["records"], after=completed)
+        state["evidence_sources"].update(source_files(maybe_complete_broadcast_trainer_inventory))
+
+
+def _verify_trainer_replicas(records, inventory, *, buffer_names=()):
     by_rank = {record["rank"]: record for record in records}
-    for name, entry in inventory["parameters"].items():
-        groups = entry["ep_groups"] or [[rank] for rank in sorted(by_rank)]
-        for shards in zip(*groups):
-            if len({by_rank[rank]["parameters"][name]["sha256"] for rank in shards}) != 1:
-                raise ValueError(f"actual trainer replica bytes disagree: {name}")
+    selected = {
+        "parameters": inventory["parameters"],
+        "buffers": {name: inventory["buffers"][name] for name in buffer_names},
+    }
+    for kind, tensors in selected.items():
+        for name, entry in tensors.items():
+            groups = entry["ep_groups"] or [[rank] for rank in sorted(by_rank)]
+            for shards in zip(*groups):
+                if len({by_rank[rank][kind][name]["sha256"] for rank in shards}) != 1:
+                    raise ValueError(f"actual trainer replica bytes disagree: {name}")
 
 
 def maybe_admit_broadcast_receiver(receiver, *, engine_only):

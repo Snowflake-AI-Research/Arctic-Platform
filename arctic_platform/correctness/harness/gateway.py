@@ -732,13 +732,16 @@ def _owned_gateway_descendants(gateway: dict, token: str) -> list[dict]:
             descendants.append(identity)
         except FileNotFoundError:
             continue
-        except PermissionError:
+        except PermissionError as exc:
             if not original_session:
                 continue
             # Linux may revoke environ access between a killed task's stat reads.
             if _gateway_process_identity(int(directory.name)) is None:
                 continue
-            raise
+            raise UnsafeCleanupError(
+                f"process {directory.name} in the owned gateway session has an unreadable environment;"
+                " ownership cannot be verified"
+            ) from exc
     if descendants and leader is not None and leader != gateway:
         raise UnsafeCleanupError("owned gateway PID was reused; refusing descendant cleanup")
     return descendants

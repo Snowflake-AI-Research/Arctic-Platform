@@ -16,6 +16,7 @@
 import os
 import sys
 from datetime import timedelta
+from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -23,9 +24,311 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 from arctic_platform.model.implementations.moe import deepspeed_integration as common
 from arctic_platform.testing_utils import require_torch_gpu
+
+
+@pytest.fixture
+def ep_checkpoint_engine(monkeypatch):
+    class FixtureMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert = nn.Parameter(torch.tensor([1.0, 2.0]))
+            self.frozen = nn.Parameter(torch.tensor([3.0, 4.0]), requires_grad=False)
+            for parameter in self.parameters():
+                parameter.allreduce = False
+                parameter.group_name = "ep_size_2"
+
+    monkeypatch.setattr(common, "MoE", FixtureMoE)
+    groups = ModuleType("deepspeed.utils.groups")
+    groups._get_expert_parallel_world_size = lambda name: 2
+    groups._get_expert_parallel_rank = lambda name: 1
+    groups._get_expert_data_parallel_rank = lambda name: 0
+    constants = ModuleType("deepspeed.checkpoint.constants")
+    constants.FROZEN_PARAM_FRAGMENTS = "frozen_param_fragments"
+    utils = ModuleType("deepspeed.utils")
+    utils.groups = groups
+    deepspeed = ModuleType("deepspeed")
+    deepspeed.utils = utils
+    checkpoint = ModuleType("deepspeed.checkpoint")
+    checkpoint.constants = constants
+    for name, module in (
+        ("deepspeed", deepspeed),
+        ("deepspeed.utils", utils),
+        ("deepspeed.utils.groups", groups),
+        ("deepspeed.checkpoint", checkpoint),
+        ("deepspeed.checkpoint.constants", constants),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class CheckpointStorage:
+        writer = True
+
+        def __init__(self):
+            self.saved_paths = []
+
+        def is_data_parallel_writer(self, rank):
+            assert rank == 0
+            return self.writer
+
+        def save(self, state, path):
+            self.saved_paths.append(path)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(state, path)
+
+        def load(self, path, map_location):
+            return torch.load(path, map_location=map_location, weights_only=False)
+
+    class Engine:
+        partition_weights = False
+
+        def __init__(self):
+            self.module = FixtureMoE()
+            self.checkpoint_engine = CheckpointStorage()
+            self.calls = []
+            self.saved_checkpoint = None
+
+        def zero_optimization_partition_weights(self):
+            return self.partition_weights
+
+        def _save_checkpoint(self, save_dir, tag, client_state=None, exclude_frozen_parameters=False):
+            self.calls.append(("save", save_dir, tag, client_state, exclude_frozen_parameters))
+            self.saved_checkpoint = dict(
+                module={
+                    name: torch.zeros_like(parameter)
+                    for name, parameter in self.module.state_dict(keep_vars=True).items()
+                    if parameter.requires_grad or not exclude_frozen_parameters
+                },
+            )
+            if not exclude_frozen_parameters:
+                self.saved_checkpoint["frozen_param_fragments"] = {
+                    name: torch.zeros_like(parameter)
+                    for name, parameter in self.module.named_parameters()
+                    if not parameter.requires_grad
+                }
+            return "saved"
+
+        _save_moe_checkpoint = _save_checkpoint
+
+        def _load_checkpoint(
+            self,
+            load_dir,
+            tag,
+            load_module_strict=True,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=True,
+            load_module_only=False,
+            custom_load_fn=None,
+        ):
+            self.calls.append(
+                ("load", load_module_strict, load_optimizer_states, load_lr_scheduler_states, load_module_only)
+            )
+            self.load_module_state_dict(self.saved_checkpoint, load_module_strict, custom_load_fn)
+            return "loaded", dict(tag=tag)
+
+        def load_module_state_dict(self, checkpoint, strict=True, custom_load_fn=None):
+            self.calls.append(("module", strict, custom_load_fn))
+            if custom_load_fn is None:
+                self.module.load_state_dict(checkpoint["module"], strict=strict)
+            else:
+                custom_load_fn(src=checkpoint["module"], dst=self.module)
+            for name, value in checkpoint.get("frozen_param_fragments", {}).items():
+                self.module.get_parameter(name).data.copy_(value)
+
+    common._patch_deepspeed_ep_checkpoints(Engine)
+    return Engine()
+
+
+@pytest.mark.parametrize("save_method", ["_save_moe_checkpoint", "_save_checkpoint"])
+def test_ep_checkpoint_restores_rank_local_trainable_and_frozen_weights(ep_checkpoint_engine, tmp_path, save_method):
+    engine = ep_checkpoint_engine
+    expected = {name: parameter.detach().clone() for name, parameter in engine.module.named_parameters()}
+    assert getattr(engine, save_method)(tmp_path, "tiny", dict(case="local")) == "saved"
+    with torch.no_grad():
+        for parameter in engine.module.parameters():
+            parameter.add_(10)
+
+    assert engine._load_checkpoint(tmp_path, "tiny") == ("loaded", dict(tag="tiny"))
+
+    for name, parameter in engine.module.named_parameters():
+        torch.testing.assert_close(parameter, expected[name], atol=0, rtol=0)
+    assert not hasattr(engine, "_ap_ep_checkpoint_state")
+    assert torch.count_nonzero(engine.saved_checkpoint["module"]["expert"]) == 0
+    assert torch.count_nonzero(engine.saved_checkpoint["frozen_param_fragments"]["frozen"]) == 0
+
+
+def test_ep_checkpoint_excluded_frozen_weights_remain_untouched(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine._save_moe_checkpoint(tmp_path, "tiny", exclude_frozen_parameters=True)
+    with torch.no_grad():
+        engine.module.expert.add_(10)
+        engine.module.frozen.fill_(23)
+
+    engine._load_checkpoint(tmp_path, "tiny", load_module_strict=False)
+
+    torch.testing.assert_close(engine.module.expert, torch.tensor([1.0, 2.0]), atol=0, rtol=0)
+    torch.testing.assert_close(engine.module.frozen, torch.full((2,), 23.0), atol=0, rtol=0)
+
+
+def test_ep_checkpoint_preserves_custom_loader_and_load_flags(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine._save_moe_checkpoint(tmp_path, "tiny")
+    calls = []
+
+    def custom_loader(*, src, dst):
+        calls.append(src)
+        dst.load_state_dict(src)
+
+    engine._load_checkpoint(
+        tmp_path,
+        "tiny",
+        load_module_strict=False,
+        load_optimizer_states=False,
+        load_lr_scheduler_states=False,
+        load_module_only=True,
+        custom_load_fn=custom_loader,
+    )
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0]["expert"], torch.tensor([1.0, 2.0]), atol=0, rtol=0)
+    assert ("load", False, False, False, True) in engine.calls
+    assert ("module", False, custom_loader) in engine.calls
+
+
+@pytest.mark.parametrize("save_method", ["_save_moe_checkpoint", "_save_checkpoint"])
+@pytest.mark.parametrize("placement", ["root", "block", "nested"])
+@pytest.mark.parametrize("exclude_frozen", [False, True])
+@pytest.mark.parametrize("custom_load", [False, True])
+def test_ep_checkpoint_restores_activation_wrapped_weights(
+    ep_checkpoint_engine, tmp_path, save_method, placement, exclude_frozen, custom_load
+):
+    engine = ep_checkpoint_engine
+    if placement == "root":
+        engine.module = checkpoint_wrapper(engine.module)
+    elif placement == "block":
+        engine.module = nn.Sequential(checkpoint_wrapper(engine.module))
+    else:
+        engine.module = checkpoint_wrapper(nn.Sequential(checkpoint_wrapper(engine.module)))
+    expected = {name: parameter.detach().clone() for name, parameter in engine.module.named_parameters()}
+    getattr(engine, save_method)(tmp_path, "wrapped", exclude_frozen_parameters=exclude_frozen)
+    shard = engine.checkpoint_engine.load(engine.checkpoint_engine.saved_paths[0], torch.device("cpu"))
+    assert set(shard["module"]) == {
+        name for name, parameter in engine.module.named_parameters() if parameter.requires_grad or not exclude_frozen
+    }
+    if placement == "block":
+        assert all("_checkpoint_wrapped_module" in name for name in shard["module"])
+    assert all("_checkpoint_wrapped_module" not in name for name in engine.saved_checkpoint["module"])
+    with torch.no_grad():
+        for parameter in engine.module.parameters():
+            parameter.fill_(23)
+
+    loaded = []
+
+    def custom_loader(*, src, dst):
+        loaded.append(src)
+        dst.load_state_dict(src, strict=not exclude_frozen)
+
+    engine._load_checkpoint(
+        tmp_path,
+        "wrapped",
+        load_module_strict=not exclude_frozen,
+        custom_load_fn=custom_loader if custom_load else None,
+    )
+
+    for name, parameter in engine.module.named_parameters():
+        target = torch.full_like(parameter, 23) if exclude_frozen and not parameter.requires_grad else expected[name]
+        torch.testing.assert_close(parameter, target, atol=0, rtol=0)
+    if custom_load:
+        assert len(loaded) == 1
+        assert all("_checkpoint_wrapped_module" not in name for name in loaded[0])
+    assert not hasattr(engine, "_ap_ep_checkpoint_state")
+
+
+def test_ep_checkpoint_uses_distinct_paths_for_same_size_groups(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine.module.frozen.group_name = "other/ep_size_2"
+    engine._save_moe_checkpoint(tmp_path, "tiny")
+
+    paths = engine.checkpoint_engine.saved_paths
+    assert len(paths) == len(set(paths)) == 2
+    assert all(Path(path).parent == tmp_path / "tiny" for path in paths)
+    engine._load_checkpoint(tmp_path, "tiny")
+    torch.testing.assert_close(engine.module.frozen, torch.tensor([3.0, 4.0]), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("failure", ["missing", "version", "identity", "coverage", "shape", "non_tensor", "policy"])
+def test_ep_checkpoint_rejects_incompatible_shard_before_loading(ep_checkpoint_engine, tmp_path, failure):
+    engine = ep_checkpoint_engine
+    engine._save_moe_checkpoint(tmp_path, "tiny")
+    path = Path(engine.checkpoint_engine.saved_paths[0])
+    if failure == "missing":
+        path.rename(path.with_suffix(".missing"))
+        error = FileNotFoundError
+    else:
+        state = engine.checkpoint_engine.load(path, torch.device("cpu"))
+        if failure == "version":
+            state["version"] = True
+        elif failure == "identity":
+            state["ep_rank"] = 0
+        elif failure == "coverage":
+            del state["module"]["expert"]
+        elif failure == "shape":
+            state["module"]["expert"] = torch.zeros(3)
+        elif failure == "non_tensor":
+            state["module"]["expert"] = [1, 2]
+        else:
+            state["exclude_frozen_parameters"] = None
+        torch.save(state, path)
+        error = ValueError
+
+    before = len(engine.calls)
+    with pytest.raises(error, match="AP expert-parallel checkpoint"):
+        engine._load_checkpoint(tmp_path, "tiny")
+    assert len(engine.calls) == before
+    assert not hasattr(engine, "_ap_ep_checkpoint_state")
+
+
+def test_ep_checkpoint_failure_clears_local_state(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine._save_moe_checkpoint(tmp_path, "tiny")
+
+    def fail(*, src, dst):
+        raise RuntimeError("custom load failed")
+
+    with pytest.raises(RuntimeError, match="custom load failed"):
+        engine._load_checkpoint(tmp_path, "tiny", custom_load_fn=fail)
+    assert not hasattr(engine, "_ap_ep_checkpoint_state")
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_ep_checkpoint_rejects_partitioned_weights_before_original_call(ep_checkpoint_engine, tmp_path, operation):
+    engine = ep_checkpoint_engine
+    engine.partition_weights = True
+    with pytest.raises(ValueError, match="ZeRO stage 3"):
+        if operation == "save":
+            engine._save_moe_checkpoint(tmp_path, "tiny")
+        else:
+            engine._load_checkpoint(tmp_path, "tiny")
+    assert engine.calls == []
+
+
+def test_ep_checkpoint_nonwriter_does_not_save_shards(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine.checkpoint_engine.writer = False
+    engine._save_moe_checkpoint(tmp_path, "tiny")
+    assert engine.checkpoint_engine.saved_paths == []
+    assert len(engine.calls) == 1
+
+
+def test_ep_checkpoint_dense_model_keeps_original_paths(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine.module = nn.Linear(2, 2)
+    engine._save_moe_checkpoint(tmp_path, "tiny", exclude_frozen_parameters=True)
+    engine._load_checkpoint(tmp_path, "tiny")
+    assert engine.checkpoint_engine.saved_paths == []
+    assert engine.calls[-1] == ("module", True, None)
 
 
 def _mock_ep_all_gather(monkeypatch, shards):

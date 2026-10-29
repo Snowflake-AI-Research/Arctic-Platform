@@ -8391,8 +8391,41 @@ def test_owned_gateway_descendant_unreadable_environment_requires_verified_exit(
     if exited:
         assert not dss_driver._owned_gateway_descendants(state.gateway, "owned-token")
     else:
-        with pytest.raises(PermissionError, match="exit race"):
+        with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
             dss_driver._owned_gateway_descendants(state.gateway, "owned-token")
+
+
+@pytest.mark.parametrize("exits", [False, True])
+def test_owned_gateway_unreadable_descendant_grace_never_signals(_owned_gateway_descendant, monkeypatch, exits):
+    state = _owned_gateway_descendant
+    read_bytes = Path.read_bytes
+    clock = [0.0]
+
+    def read(path):
+        if path == state.child / "environ":
+            raise PermissionError("synthetic exit race")
+        return read_bytes(path)
+
+    def pause(duration):
+        clock[0] += duration
+        if exits:
+            fields = state.fields.copy()
+            fields[0] = "Z"
+            (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
+
+    send = Mock()
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(dss_driver.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dss_driver.time, "sleep", pause)
+    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
+    if exits:
+        dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+        assert clock[0] == 0.05
+    else:
+        with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
+            dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+        assert clock[0] == 0.1
+    send.assert_not_called()
 
 
 @pytest.mark.parametrize("code", [0, 3, 38])
@@ -52142,6 +52175,71 @@ def test_sampler_evidence_shadow_byte_mismatch_is_reported():
     assert result["destinations"]["packed"]["mismatched"] == 1
 
 
+class _SamplerHcPadding(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lora_rank = 3
+        self.hc_count = 2
+        self.hidden_size = 4
+        self.pad_size = 11
+        self.use_combine = True
+        self.input_mix_weight_down_block_inject = torch.nn.Linear(8, 16, bias=False)
+        self.input_mix_weight_down_block_inject.output_sizes = [3, 2, 11]
+
+    def load_weights(self, weights):
+        for name, value in weights:
+            start, count = (0, 3) if name == "down" else (3, 2)
+            self.input_mix_weight_down_block_inject.weight.data.narrow(0, start, count).copy_(value)
+
+
+def _sampler_hc_padding_model(monkeypatch):
+    origin = "vllm.models.qwen4_exp.nvidia.hyperconnection"
+    module = ModuleType(origin)
+    module.__file__ = __file__
+    module.GatedResidual = type("GatedResidual", (_SamplerHcPadding,), dict(__module__=origin))
+    monkeypatch.setitem(sys.modules, origin, module)
+    return module.GatedResidual()
+
+
+@pytest.mark.parametrize("case", ["complete", "partial", "live-corruption", "shadow-corruption", "bad-geometry"])
+def test_sampler_evidence_hc_padding_requires_exact_geometry_and_preserved_bytes(monkeypatch, case):
+    model = _sampler_hc_padding_model(monkeypatch)
+    if case == "bad-geometry":
+        model.input_mix_weight_down_block_inject.output_sizes = [3, 2, 10]
+        with pytest.raises(ValueError, match="padding storage or output partitions"):
+            _verifier(model)
+        return
+    verifier = _verifier(model)
+    name = "input_mix_weight_down_block_inject.weight"
+    padding_before = tensor_manifest(model.input_mix_weight_down_block_inject.weight[5:])
+    verifier.load("down", torch.ones(3, 8))
+    if case != "partial":
+        verifier.load("inject", torch.full((2, 8), 2.0))
+    if case == "live-corruption":
+        with torch.no_grad():
+            model.input_mix_weight_down_block_inject.weight[5, 0] += 1
+    elif case == "shadow-corruption":
+        verifier.shadows[name][5, 0] += 1
+    if case in ("live-corruption", "shadow-corruption"):
+        with pytest.raises(RuntimeError, match="unused HC projection padding"):
+            verifier.finish()
+        return
+    result = verifier.finish()
+    assert result["destinations"][name] == dict(uncovered=16 if case == "partial" else 0, mismatched=0)
+    assert result["preserved_padding"][name] == dict(start_row=5, **padding_before)
+    assert tensor_manifest(model.input_mix_weight_down_block_inject.weight[5:]) == padding_before
+
+
+def test_sampler_evidence_hc_lookalike_does_not_exempt_missing_weights():
+    model = _SamplerHcPadding()
+    verifier = _verifier(model)
+    verifier.load("down", torch.ones(3, 8))
+    verifier.load("inject", torch.full((2, 8), 2.0))
+    result = verifier.finish()
+    assert result["destinations"]["input_mix_weight_down_block_inject.weight"]["uncovered"] == 88
+    assert result["preserved_padding"] == {}
+
+
 def test_sampler_evidence_shadow_duplicate_wire_names_fail():
     verifier = _verifier(_PackedModel())
     verifier.load("left", torch.tensor([1.0, 2.0]))
@@ -52159,6 +52257,98 @@ def test_sampler_evidence_shadow_shared_storage_not_inferred():
     model.extra = torch.nn.Parameter(model.packed.data)
     with pytest.raises(ValueError, match="shared"):
         _verifier(model)
+
+
+class _MlaViewModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.kv_b_proj = torch.nn.Linear(4, 10, bias=False, dtype=torch.bfloat16)
+        projection = self.kv_b_proj.weight.data.T.view(4, 2, 5)
+        uk, uv = projection.split([2, 3], dim=-1)
+        self.W_UV = torch.nn.Parameter(uv.transpose(0, 1), requires_grad=False)
+        self.W_UK_T = torch.nn.Parameter(uk.permute(1, 2, 0), requires_grad=False)
+
+    def load_weights(self, weights):
+        parameters = dict(self.named_parameters())
+        for name, value in weights:
+            parameters[name].data.copy_(value)
+
+
+@pytest.mark.parametrize("destination", ["kv_b_proj.weight", "W_UV", "W_UK_T"])
+def test_sampler_evidence_shadow_mla_views_share_private_backing(destination):
+    model = _MlaViewModel()
+    identities = {name: id(value) for name, value in model.named_parameters()}
+    verifier = _verifier(model)
+    live = dict(model.named_parameters())
+    value = torch.arange(live[destination].numel(), dtype=torch.bfloat16).reshape(live[destination].shape)
+    verifier.load(destination, value)
+    result = verifier.finish()
+    assert result["received"][destination]["destinations"] == sorted(live)
+    for name, parameter in live.items():
+        expected = parameter.numel() if destination == "kv_b_proj.weight" or name == destination else 0
+        if name == "kv_b_proj.weight":
+            expected = value.numel()
+        assert result["destinations"][name] == {"uncovered": parameter.numel() - expected, "mismatched": 0}
+    assert len({sampler_evidence_evidence._storage(value) for value in verifier.shadows.values()}) == 1
+    assert sampler_evidence_evidence._storage(verifier.shadows[destination]) != sampler_evidence_evidence._storage(
+        live[destination]
+    )
+    assert {name: id(value) for name, value in model.named_parameters()} == identities
+
+
+def test_sampler_evidence_shadow_mla_alias_mismatch_is_reported():
+    model = _MlaViewModel()
+    verifier = _verifier(model)
+    verifier.load("kv_b_proj.weight", torch.zeros_like(model.kv_b_proj.weight))
+    with torch.no_grad():
+        model.W_UV[0, 0, 0] = 1
+    result = verifier.finish()
+    assert result["destinations"]["W_UV"]["mismatched"] == 1
+    assert result["destinations"]["kv_b_proj.weight"]["mismatched"] == 1
+    assert result["destinations"]["W_UK_T"]["mismatched"] == 0
+
+
+def test_sampler_evidence_shadow_mla_budget_counts_unique_backing_once():
+    model = _MlaViewModel()
+    size = model.kv_b_proj.weight.untyped_storage().nbytes()
+    sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size)
+    with pytest.raises(ValueError, match="explicit"):
+        sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size - 1)
+
+
+@pytest.mark.parametrize("layout", ["partial", "overlap", "expanded", "reinterpreted"])
+def test_sampler_evidence_shadow_unsafe_storage_views_are_rejected(layout):
+    model = _PackedModel()
+    if layout == "partial":
+        model.packed = torch.nn.Parameter(torch.zeros(8)[1:5])
+    elif layout == "overlap":
+        model.extra = torch.nn.Parameter(model.packed.data.as_strided((2, 2), (1, 1)))
+    elif layout == "expanded":
+        model.extra = torch.nn.Parameter(model.packed.data[:1].expand(2))
+    else:
+        model.extra = torch.nn.Parameter(model.packed.data.view(torch.float64))
+    with pytest.raises(ValueError, match="unsupported|shared"):
+        _verifier(model)
+
+
+def test_sampler_evidence_shadow_alias_offset_drift_is_rejected():
+    model = _MlaViewModel()
+    verifier = _verifier(model)
+    model.W_UK_T.data = model.kv_b_proj.weight.data.as_strided(
+        model.W_UK_T.shape, model.W_UK_T.stride(), storage_offset=4
+    )
+    with pytest.raises(RuntimeError, match="identities"):
+        verifier.finish()
+
+
+def test_sampler_evidence_shadow_dense_permutation_preserves_layout():
+    model = _PackedModel()
+    model.packed = torch.nn.Parameter(torch.zeros(2, 3).T)
+    verifier = _verifier(model)
+    value = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    verifier.load("packed", value, loader=lambda name, tensor: model.packed.data.copy_(tensor))
+    assert verifier.shadows["packed"].stride() == model.packed.stride()
+    assert verifier.finish()["destinations"]["packed"] == {"uncovered": 0, "mismatched": 0}
 
 
 def test_sampler_evidence_shadow_exception_never_exposes_nan_to_live_model():
@@ -52189,6 +52379,164 @@ def test_sampler_evidence_shadow_buffer_mutation_rejected_before_write():
     with pytest.raises(ValueError, match="buffer"):
         _verifier(model).load("left", torch.tensor([1.0, 2.0]))
     assert model.buffer.item() == 0
+
+
+class _IntegerBufferModel(_PackedModel):
+    def __init__(self, *, persistent=True):
+        super().__init__()
+        self.register_buffer("ngram", torch.zeros(4, dtype=torch.int64), persistent=persistent)
+
+    def load_weights(self, weights):
+        for _, value in weights:
+            self.ngram.copy_(value.to(device=self.ngram.device, dtype=self.ngram.dtype))
+
+
+def test_sampler_evidence_shadow_integer_buffer_complete_copy_is_byte_verified():
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+    original = model.ngram
+    value = torch.tensor([0, -1, 2**53 + 1, -(2**53 + 1)])
+    verifier.load("wire.ngram", value)
+    record = verifier.finish()
+    assert model.ngram is original
+    assert torch.equal(model.ngram, value)
+    assert record["received"]["wire.ngram"]["destinations"] == ["ngram"]
+    assert record["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 0}
+    assert record["non_parameter_destinations"] == []
+    assert record["untouched_parameters"] == {"packed": 4, "other": 1}
+    assert sampler_evidence_evidence._storage(verifier.shadows["ngram"]) != sampler_evidence_evidence._storage(
+        model.ngram
+    )
+
+
+def test_sampler_evidence_shadow_integer_buffer_byte_drift_is_reported():
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+    verifier.load("ngram", torch.arange(4, dtype=torch.int64))
+    model.ngram[2] = 2**53 + 1
+    assert verifier.finish()["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 1}
+
+
+@pytest.mark.parametrize("mutation", ["partial", "add", "fill", "reinterpret", "broadcast"])
+def test_sampler_evidence_shadow_integer_buffer_unsafe_writes_fail_before_mutation(mutation):
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+
+    def loader(name, value):
+        if mutation == "partial":
+            model.ngram[:2].copy_(value[:2])
+        elif mutation == "add":
+            model.ngram.add_(value)
+        elif mutation == "fill":
+            model.ngram.fill_(1)
+        elif mutation == "reinterpret":
+            model.ngram.view(torch.int32).copy_(torch.ones(8, dtype=torch.int32))
+        else:
+            model.ngram.copy_(value[:1])
+
+    with pytest.raises(ValueError, match="buffer"):
+        verifier.load("ngram", torch.arange(4, dtype=torch.int64), loader=loader)
+    assert model.ngram.tolist() == [0] * 4
+    assert verifier.received == {}
+
+
+@pytest.mark.parametrize("layout", ["alias", "parameter-alias", "partial", "nonpersistent"])
+def test_sampler_evidence_shadow_integer_buffer_unsupported_ownership_is_rejected(layout):
+    model = _IntegerBufferModel(persistent=layout != "nonpersistent")
+    if layout == "alias":
+        model.register_buffer("alias", model.ngram)
+    elif layout == "parameter-alias":
+        model.ngram = model.packed.data.view(torch.int32)
+    elif layout == "partial":
+        model.ngram = torch.zeros(8, dtype=torch.int64)[1:5]
+    with pytest.raises(ValueError, match="buffer"):
+        _verifier(model).load("ngram", torch.arange(4, dtype=torch.int64))
+    assert model.ngram.tolist() == [0] * 4
+
+
+@pytest.mark.parametrize("change", ["replace", "reshape", "persistence"])
+def test_sampler_evidence_shadow_integer_buffer_inventory_drift_is_rejected(change):
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+    if change == "replace":
+        model.ngram = torch.zeros_like(model.ngram)
+    elif change == "reshape":
+        model.ngram.data = model.ngram.data.reshape(2, 2)
+    else:
+        model._non_persistent_buffers_set.add("ngram")
+    with pytest.raises(RuntimeError, match="identities|inventory"):
+        verifier.finish()
+
+
+def test_sampler_evidence_shadow_integer_buffer_budget_includes_private_storage(monkeypatch):
+    model = _IntegerBufferModel()
+    total = sum(value.untyped_storage().nbytes() for value in [*model.parameters(), model.ngram])
+    sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=total)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "full", lambda *args, **kwargs: pytest.fail("allocation preceded budget check"))
+        with pytest.raises(ValueError, match="explicit"):
+            sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=total - 1)
+
+
+def test_sampler_evidence_shadow_nonpersistent_integer_buffer_allows_parameter_load():
+    model = _PackedModel()
+    model.register_buffer("temporary", torch.arange(8, dtype=torch.int64), persistent=False)
+    original = model.temporary
+    saved = original.clone()
+    budget = sum(value.untyped_storage().nbytes() for value in model.parameters())
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=budget)
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    assert verifier.finish()["destinations"] == {"packed": {"uncovered": 2, "mismatched": 0}}
+    assert model.temporary is original
+    assert torch.equal(model.temporary, saved)
+    assert "temporary" in verifier.buffer_inventory
+    assert "temporary" not in verifier.shadows
+
+
+@pytest.mark.parametrize("operation", ["copy", "fill", "add", "view"])
+def test_sampler_evidence_shadow_nonpersistent_integer_buffer_write_fails_before_mutation(operation):
+    model = _IntegerBufferModel(persistent=False)
+    verifier = _verifier(model)
+
+    def loader(name, value):
+        if operation == "copy":
+            model.ngram.copy_(value)
+        elif operation == "fill":
+            model.ngram.fill_(1)
+        elif operation == "add":
+            model.ngram.add_(value)
+        else:
+            model.ngram.view(2, 2)[0].copy_(value[:2])
+
+    with pytest.raises(ValueError, match="buffer or unowned storage"):
+        verifier.load("ngram", torch.arange(4, dtype=torch.int64), loader=loader)
+    assert model.ngram.tolist() == [0] * 4
+    assert verifier.received == {}
+
+
+@pytest.mark.parametrize("change", ["replace", "reshape", "persistence", "alias"])
+def test_sampler_evidence_shadow_nonpersistent_integer_buffer_inventory_drift_is_rejected(change):
+    model = _IntegerBufferModel(persistent=False)
+    verifier = _verifier(model)
+    if change == "replace":
+        model.ngram = torch.zeros_like(model.ngram)
+    elif change == "reshape":
+        model.ngram.data = model.ngram.data.reshape(2, 2)
+    elif change == "persistence":
+        model._non_persistent_buffers_set.remove("ngram")
+    else:
+        model.register_buffer("alias", model.ngram, persistent=False)
+    with pytest.raises(RuntimeError, match="identities|inventory"):
+        verifier.finish()
+
+
+@pytest.mark.parametrize("alias", ["parameter", "persistent-buffer"])
+def test_sampler_evidence_shadow_nonpersistent_integer_buffer_alias_is_rejected(alias):
+    model = _IntegerBufferModel()
+    value = model.packed.data.view(torch.int32) if alias == "parameter" else model.ngram
+    model.register_buffer("temporary", value, persistent=False)
+    with pytest.raises(ValueError, match="buffer storage or alias"):
+        _verifier(model)
 
 
 def test_sampler_evidence_shadow_selected_source_drift_prevents_load(monkeypatch):
@@ -52472,6 +52820,175 @@ def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypa
         assert len(calls) == 1
     finally:
         broadcast._SEND.reset(token)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "complete",
+        "trainable-skip",
+        "mutation",
+        "replacement",
+        "missing-completion",
+        "sent-skip",
+        "replica-drift",
+        "changed-skip",
+        "invalid-rank",
+        "missing-rank",
+    ],
+)
+def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(monkeypatch, case):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(broadcast.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_parameter("frozen", torch.nn.Parameter(torch.ones(3), requires_grad=case == "trainable-skip"))
+    model.frozen._dss_skip_weight_sync = True
+    calls = []
+
+    def gather(records, local):
+        calls.append(local)
+        replica = copy.deepcopy(local)
+        replica["rank"] = 1
+        if case == "replica-drift" and len(calls) == 2:
+            replica["parameters"]["frozen"]["sha256"] = "0" * 64
+        elif case == "invalid-rank" and len(calls) == 2:
+            replica["world_size"] = 3
+        elif case == "missing-rank" and len(calls) == 2:
+            replica = None
+        records[:] = [local, replica]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+
+    def send(stream):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+        list(stream)
+
+    def weights():
+        yield "weight", model.weight
+        if case == "sent-skip":
+            yield "frozen", model.frozen
+        if case == "mutation":
+            model.frozen.data.add_(1)
+        elif case == "replacement":
+            model.frozen.data = model.frozen.detach().clone()
+        elif case == "changed-skip":
+            model.frozen._dss_skip_weight_sync = False
+        if case != "missing-completion":
+            broadcast.maybe_complete_broadcast_trainer_inventory(model, is_master=True)
+
+    try:
+        if case == "complete":
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights(), send) as (
+                stream,
+                evidence,
+            ):
+                send(stream)
+            assert len(calls) == 2
+            assert evidence["trainer_parameters"]["numel"] == 5
+            assert evidence["trainer_inventory"]["parameters"]["frozen"]["skip_weight_sync"] is True
+            assert evidence["trainer_skipped_parameters"]["schema"] == "frozen-weight-sync-skip-v1"
+        else:
+            with pytest.raises((ValueError, RuntimeError), match="frozen|skip"):
+                with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights(), send) as (
+                    stream,
+                    evidence,
+                ):
+                    send(stream)
+    finally:
+        broadcast._EXPORT.set(None)
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["complete", "unexported-drift", "exported-drift", "duplicate", "copied", "partial", "mutation"],
+)
+def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica(monkeypatch, case):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_buffer("exported", torch.arange(4, dtype=torch.float32))
+    model.register_buffer("counter", torch.ones(3))
+
+    def gather(records, local):
+        replica = copy.deepcopy(local)
+        replica["rank"] = 1
+        if case in ("exported-drift", "unexported-drift"):
+            name = "exported" if case == "exported-drift" else "counter"
+            replica["buffers"][name]["sha256"] = "0" * 64
+        records[:] = [local, replica]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    value = model.exported.clone() if case == "copied" else model.exported
+    if case == "partial":
+        value = value[:2]
+    weights = [("weight", model.weight), ("native.bias", value)]
+    if case == "duplicate":
+        weights.append(("second.bias", value))
+
+    def send(stream):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+        if case == "mutation":
+            model.exported.add_(1)
+        return list(stream)
+
+    if case in ("exported-drift", "duplicate", "mutation"):
+        with pytest.raises((ValueError, RuntimeError), match="replica bytes|sent more than once|changed"):
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, _):
+                send(stream)
+    else:
+        with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, evidence):
+            actual = send(stream)
+        assert actual[1][1] is value
+        expected = {} if case in ("copied", "partial") else {"native.bias": "exported"}
+        assert evidence["trainer_buffers"] == {
+            "numel": 7,
+            "count": 2,
+            "wire_numel": 4 if expected else 0,
+            "wire_sources": expected,
+        }
+        assert evidence["trainer_parameters"] == {"numel": 2, "count": 1}
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize("case", ["buffer-alias", "parameter-alias", "enumeration"])
+def test_native_broadcast_invalid_buffer_inventory_fails_collectively(monkeypatch, case):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_buffer("first", torch.ones(4))
+    if case == "buffer-alias":
+        model.register_buffer("second", model.first)
+    elif case == "parameter-alias":
+        model.register_buffer("second", model.weight.detach())
+    else:
+
+        def fail_enumeration(**kwargs):
+            raise RuntimeError("buffer enumeration failed")
+
+        monkeypatch.setattr(model, "named_buffers", fail_enumeration)
+    calls = []
+
+    def gather(records, local):
+        calls.append(local)
+        records[:] = [local, {**copy.deepcopy(local), "rank": 1}]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="collective trainer inventory failed"):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+    assert len(calls) == 1 and calls[0]["error"] is not None
 
 
 def test_native_broadcast_trainer_replica_disagreement_is_rejected():
@@ -52826,6 +53343,7 @@ def test_ep_evidence_actual_native_iterator_prepares_once_then_sends_exact_retai
     assert result["actual_fixture_receipt"] == 17
     assert result["trainer_parameters"]["numel"] == 112
     assert result["trainer_buffers"] == {"numel": 16, "count": 2, "wire_numel": 8}
+    assert rl_weight_sync.exported_buffer_numel(result, result["sent_manifest"]) == 8
     assert sum(entry["numel"] for entry in result["sent_manifest"].values()) == 120
     assert len(gathers) == 3
 
@@ -58263,6 +58781,138 @@ def test_rl_checks_weight_sync_agreement_passes():
 
 
 @pytest.mark.parametrize(
+    "case", ["complete", "missing-proof", "missing-rank", "changed-bytes", "trainable", "wrong-count", "extra-sent"]
+)
+def test_rl_checks_weight_sync_subtracts_only_collectively_proven_frozen_skips(case):
+    sync = _rl_checks_sync()
+    sender = sync["targets"][0]["send"]["results"][0]
+    records = []
+    for rank in range(2):
+        parameters = {
+            name: dict(**tensor_manifest(torch.ones(size, dtype=torch.bfloat16)), requires_grad=True, ep_ranks=None)
+            for name, size in (("a.weight", 4), ("b.weight", 6))
+        }
+        parameters["frozen"] = dict(
+            **tensor_manifest(torch.ones(3, dtype=torch.bfloat16)),
+            requires_grad=case == "trainable",
+            ep_ranks=None,
+            skip_weight_sync=True,
+        )
+        records.append(dict(rank=rank, world_size=2, parameters=parameters, buffers={}))
+    sender["trainer_parameters"]["numel"] = 13
+    if case == "trainable":
+        with pytest.raises(ValueError, match="explicitly frozen"):
+            broadcast.global_inventory(records)
+        return
+    sender["trainer_inventory"] = broadcast.global_inventory(records)
+    after = [
+        dict(
+            rank=record["rank"],
+            world_size=2,
+            error=None,
+            parameters={
+                "frozen": {key: record["parameters"]["frozen"][key] for key in rl_weight_sync._MANIFEST_FIELDS}
+            },
+        )
+        for record in records
+    ]
+    sender["trainer_skipped_parameters"] = dict(schema="frozen-weight-sync-skip-v1", before=records, after=after)
+    if case == "missing-proof":
+        sender.pop("trainer_skipped_parameters")
+    elif case == "missing-rank":
+        after.pop()
+    elif case == "changed-bytes":
+        after[1]["parameters"]["frozen"]["sha256"] = "0" * 64
+    elif case == "wrong-count":
+        sender["trainer_parameters"]["numel"] = 14
+    elif case == "extra-sent":
+        sender["sent_manifest"]["frozen"] = after[0]["parameters"]["frozen"]
+    if case in ("complete", "extra-sent"):
+        failed, metrics = rl_weight_sync.judge(sync)
+        assert metrics["trainer_skipped_frozen_elements"] == 3
+        assert metrics["trainer_elements"] == 10
+        assert (len(failed) == 0) is (case == "complete")
+    else:
+        with pytest.raises(RuntimeError, match="frozen"):
+            rl_weight_sync.judge(sync)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "complete",
+        "nonexported",
+        "missing-binding",
+        "missing-inventory",
+        "duplicate",
+        "wrong-shape",
+        "wrong-dtype",
+        "ep-buffer",
+        "wrong-count",
+        "arbitrary-extra",
+        "legacy-nonexported",
+    ],
+)
+def test_rl_checks_weight_sync_counts_only_bound_exported_buffers(case):
+    sync = _rl_checks_sync()
+    sender = sync["targets"][0]["send"]["results"][0]
+    sender["trainer_parameters"] = {"count": 1, "numel": 6}
+    source = {
+        "local_shape": [4],
+        "local_numel": 4,
+        "global_numel": 4,
+        "dtype": "bfloat16",
+        "requires_grad": False,
+        "ep_groups": [],
+    }
+    sender["trainer_inventory"] = {
+        "buffers": {"bias": source, "counter": {**source, "local_shape": [3], "local_numel": 3, "global_numel": 3}}
+    }
+    sender["trainer_buffers"] = {
+        "numel": 7,
+        "count": 2,
+        "wire_numel": 4,
+        "wire_sources": {"a.weight": "bias"},
+    }
+    if case in ("nonexported", "legacy-nonexported"):
+        sender["trainer_parameters"]["numel"] = 10
+        sender["trainer_buffers"].update(wire_numel=0, wire_sources={})
+        if case == "legacy-nonexported":
+            sender["trainer_buffers"].pop("wire_sources")
+            sender.pop("trainer_inventory")
+    elif case == "missing-binding":
+        sender["trainer_buffers"].pop("wire_sources")
+    elif case == "missing-inventory":
+        sender.pop("trainer_inventory")
+    elif case == "duplicate":
+        sender["trainer_buffers"]["wire_sources"]["second.bias"] = "bias"
+        sender["sent_manifest"]["second.bias"] = copy.deepcopy(sender["sent_manifest"]["a.weight"])
+    elif case == "wrong-shape":
+        source["local_shape"] = [2, 2]
+    elif case == "wrong-dtype":
+        source["dtype"] = "float32"
+    elif case == "ep-buffer":
+        source["ep_groups"] = [[0, 1]]
+    elif case == "wrong-count":
+        sender["trainer_buffers"]["wire_numel"] = 5
+    elif case == "arbitrary-extra":
+        sender["sent_manifest"]["extra.weight"] = _rl_checks_entry(4, "extra")
+        for rank in range(2):
+            _rl_checks_rank(sync, rank)["received"]["extra.weight"] = {
+                **sender["sent_manifest"]["extra.weight"],
+                "destinations": ["a.weight"],
+            }
+    if case in ("complete", "nonexported", "legacy-nonexported", "arbitrary-extra"):
+        failed, metrics = rl_weight_sync.judge(sync)
+        assert metrics["trainer_elements"] == 10
+        assert metrics["trainer_exported_buffer_elements"] == (4 if case in ("complete", "arbitrary-extra") else 0)
+        assert [failure.name for failure in failed] == (["trainer elements sent"] if case == "arbitrary-extra" else [])
+    else:
+        with pytest.raises(RuntimeError):
+            rl_weight_sync.judge(sync)
+
+
+@pytest.mark.parametrize(
     "mutate,expected",
     [
         (
@@ -60483,6 +61133,7 @@ _SELFTEST_GROUPS = {
         "test_owned_gateway_descendants_ignore_other_sessions_and_zombies",
         "test_owned_gateway_descendants_include_token_bound_detached_workers",
         "test_owned_gateway_descendant_unreadable_environment_requires_verified_exit",
+        "test_owned_gateway_unreadable_descendant_grace_never_signals",
         "test_owned_gateway_pidfd_libc_fallback_preserves_errors",
         "test_owned_gateway_pidfd_prefers_python_interface",
         "test_owned_gateway_pidfd_missing_libc_support_fails_closed",
@@ -61979,6 +62630,8 @@ _SELFTEST_GROUPS = {
         "test_native_broadcast_disabled_preserves_stream_callback_and_result",
         "test_native_broadcast_sender_observes_once_and_always_resets_context",
         "test_native_broadcast_inventory_collects_actual_rank_before_binding",
+        "test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica",
+        "test_native_broadcast_invalid_buffer_inventory_fails_collectively",
         "test_native_broadcast_trainer_replica_disagreement_is_rejected",
         "test_native_broadcast_quantized_receive_rejected_before_transport",
         "test_sampler_evidence_close_resources_even_when_source_guard_would_fail",
@@ -62191,6 +62844,7 @@ _SELFTEST_GROUPS = {
         "test_rl_checks_local_gateway_admits_both_observed_rl_checks",
         "test_rl_checks_rl_execution_retains_traceback_for_unwrapped_check_failure",
         "test_rl_checks_weight_sync_agreement_passes",
+        "test_rl_checks_weight_sync_counts_only_bound_exported_buffers",
         "test_rl_checks_weight_sync_disagreement_fails",
         "test_rl_checks_weight_sync_without_sampler_verification_raises",
         "test_rl_checks_router_replay_agreement_passes",

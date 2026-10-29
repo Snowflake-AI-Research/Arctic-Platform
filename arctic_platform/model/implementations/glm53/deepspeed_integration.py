@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
 from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
@@ -33,8 +34,6 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from .auxiliary_weights import iter_preserved_auxiliary_weights
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
-
-GLM53_ATTN_BACKEND = "sparse_mla"
 
 
 def _build_model_config(

@@ -171,7 +171,10 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
 
     failed: List[Mismatch] = []
     sent_numel = sum(int(entry["numel"]) for entry in sent.values())
-    held_numel = int(holdings[0]["numel"])
+    parameter_numel = int(holdings[0]["numel"])
+    skipped_numel = skipped_parameter_numel(target.get("send"), parameter_numel)
+    wire_buffer_numel = exported_buffer_numel(target.get("send"), sent)
+    held_numel = parameter_numel - skipped_numel + wire_buffer_numel
     if sent_numel != held_numel:
         failed.append(Mismatch("trainer elements sent", float(sent_numel), float(held_numel)))
 
@@ -239,11 +242,124 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         "sent_tensors": float(len(sent)),
         "sent_elements": float(sent_numel),
         "trainer_elements": float(held_numel),
+        "trainer_parameter_elements": float(parameter_numel),
+        "trainer_skipped_frozen_elements": float(skipped_numel),
+        "trainer_exported_buffer_elements": float(wire_buffer_numel),
         "trainer_parameter_tensors": float(holdings[0].get("count", 0)),
         "sampler_ranks": float(len(ranks)),
     }
     metrics.update({f"sampler_{key}": float(value) for key, value in totals.items()})
     return failed, metrics
+
+
+def skipped_parameter_numel(send: dict, parameter_numel: int) -> int:
+    """Subtract only explicit frozen skips with unchanged bytes on every export rank."""
+    from arctic_platform.debug.weight_sync import global_inventory
+
+    inventories = [entry for entry in find_key(send, "trainer_inventory") if entry]
+    proofs = [entry for entry in find_key(send, "trainer_skipped_parameters") if entry]
+    skipped = {
+        name: entry
+        for inventory in inventories
+        for name, entry in inventory.get("parameters", {}).items()
+        if entry.get("skip_weight_sync") is True
+    }
+    if not skipped and not proofs:
+        return 0
+    if len(inventories) != 1 or len(proofs) != 1:
+        raise RuntimeError("skipped frozen parameters require one collective completion proof")
+    proof = proofs[0]
+    if proof.get("schema") != "frozen-weight-sync-skip-v1":
+        raise RuntimeError("unsupported skipped frozen parameter proof")
+    try:
+        before = proof["before"]
+        inventory = global_inventory(before)
+        if inventory != inventories[0]:
+            raise ValueError("completion proof does not bind the actual trainer inventory")
+        parameters = inventory["parameters"]
+        if sum(entry["global_numel"] for entry in parameters.values()) != parameter_numel:
+            raise ValueError("completion proof does not bind the actual trainer element count")
+        after = proof["after"]
+        if not isinstance(after, list) or len(after) != len(before):
+            raise ValueError("completion proof requires every training rank")
+        by_rank = {}
+        for entry in after:
+            rank = entry["rank"]
+            if (
+                type(rank) is not int
+                or rank in by_rank
+                or entry["world_size"] != len(before)
+                or entry["error"] is not None
+                or set(entry["parameters"]) != set(skipped)
+            ):
+                raise ValueError("invalid skipped frozen completion rank")
+            by_rank[rank] = entry
+        if set(by_rank) != set(range(len(before))):
+            raise ValueError("completion proof requires unique complete training ranks")
+        for entry in before:
+            for name in skipped:
+                if parameters[name]["requires_grad"] is not False:
+                    raise ValueError("skipped parameter is not frozen")
+                observed = by_rank[entry["rank"]]["parameters"][name]
+                original = entry["parameters"][name]
+                if set(observed) != set(_MANIFEST_FIELDS) or any(
+                    observed[field] != original[field] for field in _MANIFEST_FIELDS
+                ):
+                    raise ValueError("skipped frozen parameter changed during export")
+        return sum(entry["global_numel"] for entry in skipped.values())
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid skipped frozen parameter proof: {exc}") from exc
+
+
+def exported_buffer_numel(send: dict, sent: Dict[str, dict]) -> int:
+    """Count only buffers bound to the observed stream or retained collective proof."""
+    holdings = [entry for entry in find_key(send, "trainer_buffers") if entry]
+    if not holdings:
+        return 0
+    if len(holdings) != 1:
+        raise RuntimeError("weight-sync needs exactly one sender's buffer inventory")
+    buffers = holdings[0]
+    wire_sources = buffers.get("wire_sources")
+    if wire_sources is None:
+        if buffers.get("wire_numel") == 0:
+            return 0
+        preparations = [entry for entry in find_key(send, "collective_preparation") if entry]
+        if len(preparations) != 1 or preparations[0].get("emitted_manifest") != sent:
+            raise RuntimeError("exported buffers require the actual trainer inventory and wire sources")
+        preparation = preparations[0]
+        inventory = preparation["global_inventory"]["buffers"]
+        names = [entry["name"] for entry in preparation["wire_sources"].values() if entry["kind"] == "buffers"]
+        # Collective preparation already verified every gather and packing byte region before transport.
+        count = sum(inventory[name]["global_numel"] for name in names)
+    else:
+        inventories = [entry for entry in find_key(send, "trainer_inventory") if entry]
+        if not isinstance(wire_sources, dict) or len(inventories) != 1:
+            raise RuntimeError("exported buffers require the actual trainer inventory and wire sources")
+        inventory = inventories[0]["buffers"]
+        names = list(wire_sources.values())
+        count = 0
+        for wire_name, source_name in wire_sources.items():
+            source = inventory.get(source_name)
+            tensor = sent.get(wire_name)
+            if (
+                source is None
+                or tensor is None
+                or source["ep_groups"]
+                or tensor["shape"] != source["local_shape"]
+                or tensor["dtype"] != source["dtype"]
+                or tensor["numel"] != source["global_numel"]
+            ):
+                raise RuntimeError("exported buffer is not bound to a complete actual trainer tensor")
+            count += source["global_numel"]
+    if len(set(names)) != len(names):
+        raise RuntimeError("a trainer buffer was transmitted more than once")
+    if (
+        buffers.get("wire_numel") != count
+        or buffers["numel"] != sum(entry["global_numel"] for entry in inventory.values())
+        or buffers["count"] != len(inventory)
+    ):
+        raise RuntimeError("exported buffer element count is not bound to its wire sources")
+    return count
 
 
 def verdict(ctx, failed: List[Mismatch], metrics: Dict[str, float], *, weight_format: str) -> TestResult:

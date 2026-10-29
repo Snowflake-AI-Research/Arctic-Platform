@@ -23,19 +23,18 @@ vLLM release:
 """
 
 from itertools import product as iprod
-from typing import Any, Iterable
+from typing import Any
+from typing import Iterable
 
 import torch
-from vllm.v1.attention.backends.gdn_attn import (
-    GDNAttentionMetadataBuilder,
-)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.core.single_type_kv_cache_manager import (
-    MambaManager,
-    SingleTypeKVCacheManager,
-)
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
-from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import KVBlockZeroer
 
 from arctic_platform.inference.patching import ArcticPatch
 
@@ -52,8 +51,7 @@ def _sanitize_stale_gdn_metadata(metadata):
     return metadata
 
 
-class GDNAttentionMetadataBuilderPatch(
-        ArcticPatch[GDNAttentionMetadataBuilder]):
+class GDNAttentionMetadataBuilderPatch(ArcticPatch[GDNAttentionMetadataBuilder]):
 
     _orig_build = GDNAttentionMetadataBuilder.build
 
@@ -62,8 +60,7 @@ class GDNAttentionMetadataBuilderPatch(
         return _sanitize_stale_gdn_metadata(metadata)
 
 
-class SingleTypeKVCacheManagerPatch(
-        ArcticPatch[SingleTypeKVCacheManager]):
+class SingleTypeKVCacheManagerPatch(ArcticPatch[SingleTypeKVCacheManager]):
 
     _orig_init = SingleTypeKVCacheManager.__init__
 
@@ -104,10 +101,8 @@ class MambaManagerPatch(ArcticPatch[MambaManager]):
         num_tokens: int,
         num_tokens_main_model: int,
     ):
-        if (self.mamba_cache_mode != "align"
-                or not self._record_new_block_ids):
-            return self._orig_allocate_new_blocks(
-                request_id, num_tokens, num_tokens_main_model)
+        if self.mamba_cache_mode != "align" or not self._record_new_block_ids:
+            return self._orig_allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
 
         pool = self.block_pool
         pool_vars = vars(pool)
@@ -126,16 +121,14 @@ class MambaManagerPatch(ArcticPatch[MambaManager]):
         # that can also appear in the method's return value.
         pool.get_new_blocks = tracked_get_new_blocks
         try:
-            result = self._orig_allocate_new_blocks(
-                request_id, num_tokens, num_tokens_main_model)
+            result = self._orig_allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
         finally:
             if had_override:
                 pool.get_new_blocks = previous_override
             else:
                 delattr(pool, "get_new_blocks")
 
-        self.new_block_ids.extend(block.block_id
-                                  for block in allocated_blocks)
+        self.new_block_ids.extend(block.block_id for block in allocated_blocks)
         return result
 
 
@@ -151,9 +144,7 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         self.device = device
-        self._meta: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
-            | None) = None
+        self._meta: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None = None
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -174,9 +165,7 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
                 if layer_name in runner_only_attn_layers:
                     continue
                 layer_cache = static_forward_context[layer_name].kv_cache
-                kvs = (list(layer_cache)
-                       if isinstance(layer_cache, (list, tuple)) else
-                       [layer_cache])
+                kvs = list(layer_cache) if isinstance(layer_cache, (list, tuple)) else [layer_cache]
                 for kv in kvs:
                     if not isinstance(kv, torch.Tensor):
                         continue
@@ -184,69 +173,66 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
                         continue
                     data_ptr = kv.data_ptr()
 
-                    assert kv.shape[0] % num_blocks == 0, (
-                        f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                        f"multiple of {num_blocks} logical blocks")
-                    ratio = kv.shape[0] // num_blocks
+                    if group.kernel_block_stride != 0:
+                        assert isinstance(spec, AttentionSpec)
+                        manager_rows = spec.get_num_kernel_states(spec.block_size)
+                        assert manager_rows % kv.shape[-2] == 0
+                        ratio = manager_rows // kv.shape[-2]
+                        logical_stride = group.kernel_block_stride
+                        assert 0 < ratio <= logical_stride
+                        assert (num_blocks - 1) * logical_stride + ratio <= kv.shape[
+                            0
+                        ], f"{layer_name}: packed cache does not cover {num_blocks} logical blocks"
+                    else:
+                        assert kv.shape[0] % num_blocks == 0, (
+                            f"{layer_name}: {kv.shape[0]} kernel blocks is not "
+                            f"a multiple of {num_blocks} logical blocks"
+                        )
+                        ratio = kv.shape[0] // num_blocks
+                        logical_stride = ratio
 
                     element_size = kv.element_size()
                     block_stride_bytes = kv.stride(0) * element_size
                     assert block_stride_bytes % 4 == 0
-                    assert kv.shape[0] % ratio == 0
                     outer_dims = [
-                        dim for dim in range(1, kv.ndim)
-                        if kv.stride(dim) * element_size > block_stride_bytes
+                        dim for dim in range(1, kv.ndim) if kv.stride(dim) * element_size > block_stride_bytes
                     ]
-                    outer_strides = [
-                        kv.stride(dim) * element_size for dim in outer_dims
-                    ]
-                    inner_dims = [
-                        dim for dim in range(1, kv.ndim)
-                        if dim not in outer_dims
-                    ]
+                    outer_strides = [kv.stride(dim) * element_size for dim in outer_dims]
+                    inner_dims = [dim for dim in range(1, kv.ndim) if dim not in outer_dims]
                     kernel_page_bytes = element_size + sum(
-                        (kv.shape[dim] - 1) * kv.stride(dim) * element_size
-                        for dim in inner_dims)
+                        (kv.shape[dim] - 1) * kv.stride(dim) * element_size for dim in inner_dims
+                    )
                     assert kernel_page_bytes % 4 == 0
-                    logical_block_stride_bytes = block_stride_bytes * ratio
+                    logical_block_stride_bytes = block_stride_bytes * logical_stride
+                    # Adjacent pages of this layer can share a zeroing segment;
+                    # the manager stride still skips other layers' packed pages.
+                    pages_per_segment = ratio if kernel_page_bytes == block_stride_bytes else 1
+                    segment_page_bytes = kernel_page_bytes * pages_per_segment
                     ranges = (range(kv.shape[dim]) for dim in outer_dims)
                     for outer in iprod(*ranges):
-                        offset_bytes = sum(
-                            index * stride
-                            for index, stride in zip(outer, outer_strides))
+                        offset_bytes = sum(index * stride for index, stride in zip(outer, outer_strides))
                         assert (data_ptr + offset_bytes) % 4 == 0
-                        for virtual_index in range(ratio):
-                            address = (data_ptr + offset_bytes
-                                       + virtual_index * block_stride_bytes)
+                        for virtual_index in range(0, ratio, pages_per_segment):
+                            address = data_ptr + offset_bytes + virtual_index * block_stride_bytes
                             if (index := seen_ptrs.get(address)) is not None:
-                                assert seg_block_strides[index] == (
-                                    logical_block_stride_bytes // 4)
-                                seg_page_sizes[index] = max(
-                                    seg_page_sizes[index],
-                                    kernel_page_bytes // 4)
+                                assert seg_block_strides[index] == (logical_block_stride_bytes // 4)
+                                seg_page_sizes[index] = max(seg_page_sizes[index], segment_page_bytes // 4)
                                 continue
                             seen_ptrs[address] = len(seg_addrs)
                             seg_addrs.append(address)
-                            seg_block_strides.append(
-                                logical_block_stride_bytes // 4)
-                            seg_page_sizes.append(kernel_page_bytes // 4)
+                            seg_block_strides.append(logical_block_stride_bytes // 4)
+                            seg_page_sizes.append(segment_page_bytes // 4)
 
         if not seg_addrs:
             self._meta = None
             return
 
         max_page_size_el = max(seg_page_sizes)
-        block_size = min(1 << (max_page_size_el - 1).bit_length(),
-                         1024)
+        block_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
         self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64,
-                         device=self.device),
-            torch.tensor(seg_block_strides,
-                         dtype=torch.int64,
-                         device=self.device),
-            torch.tensor(seg_page_sizes,
-                         dtype=torch.int64,
-                         device=self.device),
+            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
+            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
             (max_page_size_el + block_size - 1) // block_size,
             block_size,
             len(seg_addrs),

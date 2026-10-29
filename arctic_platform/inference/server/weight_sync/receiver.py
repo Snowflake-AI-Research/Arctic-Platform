@@ -78,12 +78,13 @@ def _model_parameter_l2(
             loaded_l2_sq.add_(value)
             found.add(name)
 
+    if loaded_destinations is not None:
+        found.update(name for name, _ in model.named_buffers() if name in loaded_destinations)
     missing = loaded_destinations - found if loaded_destinations is not None else set()
     if missing:
         sample = sorted(missing)[:8]
         raise RuntimeError(
-            "Weight sync resolved destination names that are not model parameters: "
-            f"{sample}"
+            f"Weight sync resolved destination names that are not model parameters or registered buffers: {sample}"
         )
 
     param_l2 = None
@@ -578,7 +579,6 @@ class WeightSyncExtension:
         or copies.  Requires BF16, TP=1.
         """
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
-
         writer = _DirectParamWriter(model, self.device)
         param_views: dict[str, torch.Tensor] = {}
         for name in writer.all_keys():
@@ -604,12 +604,25 @@ class WeightSyncExtension:
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Bucket path for TP=1 non-quantized models.
 
-        Copies from the engine's bucket buffer into pre-computed parameter views.
+        Uses the model loader for mapped names, otherwise pre-computed views.
         Returns the received count, all-byte and applied-source squared-L2
         norms, canonical destination mapping, and skipped names. Direct loading
         never skips a source: unresolved names fail after the receive completes.
         """
+        if getattr(model, "hf_to_vllm_mapper", None) is not None:
+            result = self._load_batched(model, engine, verifier=verifier)
+            loaded, _, _, _, skipped = result
+            if len(skipped) > 0:
+                sample = "\n".join(f"  - {name}" for name in skipped[:10])
+                raise AssertionError(
+                    f"Weight sync (_load_direct) received {len(skipped)}/{loaded} "
+                    "tensor(s) whose names have no destination in the model loader.\n"
+                    f"Sample orphan names:\n{sample}"
+                )
+            return result
+
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
+
         writer = _DirectParamWriter(model, self.device)
         maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
@@ -669,8 +682,9 @@ class WeightSyncExtension:
         ``weight_loader`` to shard correctly.  Non-fused names fall through
         untouched, so the HF-named (``weight_format="hf"``) path is unaffected.
 
-        Returns the received count, all-byte and applied-source squared-L2
-        norms, canonical destination mapping, and skipped source names.
+        Returns the received count, all-byte and applied-parameter-source
+        squared-L2 norms, canonical destination mapping, and skipped sources.
+        Registered buffers are loaded and mapped but excluded from parameter norms.
         """
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
@@ -705,7 +719,8 @@ class WeightSyncExtension:
             destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
-                applied_source_l2_sq.add_(source_l2_sq)
+                if any(destination in param_names for destination in destinations):
+                    applied_source_l2_sq.add_(source_l2_sq)
             else:
                 skipped_source_names.append(name)
             loaded += 1
