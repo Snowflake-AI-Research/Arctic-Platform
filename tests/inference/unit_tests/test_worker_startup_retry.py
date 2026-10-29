@@ -86,7 +86,10 @@ def test_initialize_rejects_kv_b_lora_on_mla_before_engine_start(monkeypatch, tm
 
     class FakeEngineArgs:
         def create_engine_config(self):
-            return types.SimpleNamespace(model_config=types.SimpleNamespace(use_mla=True))
+            return types.SimpleNamespace(
+                model_config=types.SimpleNamespace(use_mla=True, architecture="Glm5NextForConditionalGeneration"),
+                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False, reasoning_parser="deepseek_r1"),
+            )
 
     class FakeAsyncLLM:
         @classmethod
@@ -107,7 +110,7 @@ def test_initialize_rejects_kv_b_lora_on_mla_before_engine_start(monkeypatch, tm
         asyncio.run(worker.initialize(kwargs))
 
 
-@pytest.mark.parametrize("use_mla, targets", [(True, ["q_a_proj", "q_b_proj", "o_proj"]), (False, ["kv_b_proj"])])
+@pytest.mark.parametrize("use_mla, targets", [(True, ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"]), (False, ["kv_b_proj"])])
 def test_mla_lora_guard_allows_servable_targets(use_mla, targets):
     config = types.SimpleNamespace(use_mla=use_mla)
     worker_mod._validate_mla_lora_targets(config, {"target_modules": targets})
