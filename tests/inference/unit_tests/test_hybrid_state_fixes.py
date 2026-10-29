@@ -7,10 +7,10 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.worker.utils import KVBlockZeroer
 
-from arctic_platform.inference.vllm.dflash2_nan_fix import KVBlockZeroerPatch
-from arctic_platform.inference.vllm.dflash2_nan_fix import MambaManagerPatch
-from arctic_platform.inference.vllm.dflash2_nan_fix import SingleTypeKVCacheManagerPatch
-from arctic_platform.inference.vllm.dflash2_nan_fix import _sanitize_stale_gdn_metadata
+from arctic_platform.inference.vllm.hybrid_state_fixes import KVBlockZeroerPatch
+from arctic_platform.inference.vllm.hybrid_state_fixes import MambaManagerPatch
+from arctic_platform.inference.vllm.hybrid_state_fixes import SingleTypeKVCacheManagerPatch
+from arctic_platform.inference.vllm.hybrid_state_fixes import _sanitize_stale_gdn_metadata
 from arctic_platform.testing_utils import require_torch_gpu
 
 
@@ -152,51 +152,69 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
     assert addresses == {conv_state.data_ptr(), recurrent_state.data_ptr()}
 
 
-def _packed_attention_zeroer(device):
-    cache = torch.ones((9, 1, 2), dtype=torch.float32, device=device)
+def _packed_attention_fixture(device):
+    num_blocks = 5
     spec = MLAAttentionSpec(
-        block_size=2,
+        block_size=8,
         num_kv_heads=1,
-        head_size=2,
+        head_size=16,
         dtype=torch.float32,
+        tokens_per_state=2,
     )
-    layer_name = "indexer.k_cache"
+    layer_name = "model.layers.3.self_attn.indexer.k_cache"
     group = AttentionGroup(
         backend=None,
         layer_names=[layer_name],
         kv_cache_spec=spec,
         kv_cache_group_id=0,
-        kernel_block_stride=5,
+        kernel_block_size=4,
     )
+    # Two other layers' pages sit between this layer's blocks.
+    packed = torch.ones((num_blocks, 3, 4, 16), dtype=torch.float32, device=device)
+    kv_cache = group.map_kv_cache_to_kernel_blocks(packed[:, :1])
+    assert group.kernel_block_stride
+    assert kv_cache.shape[0] % num_blocks != 0
+    static_forward_context = {layer_name: SimpleNamespace(kv_cache=kv_cache)}
+    return packed, group, static_forward_context, num_blocks
+
+
+def test_packed_cache_bound_to_kernel_blocks_matches_upstream_zeroer():
+    device = torch.device("cpu")
+    _, group, static_forward_context, num_blocks = _packed_attention_fixture(device)
+
+    expected = KVBlockZeroer(device, [group], [8], static_forward_context, num_blocks)
     zeroer = SimpleNamespace()
-    KVBlockZeroerPatch.__init__(
-        zeroer,
-        device,
-        [group],
-        [2],
-        {layer_name: SimpleNamespace(kv_cache=cache)},
-        num_blocks=2,
-    )
-    return zeroer, cache
+    KVBlockZeroerPatch.__init__(zeroer, device, [group], [8], static_forward_context, num_blocks)
+
+    assert zeroer._meta is not None
+    for actual, reference in zip(zeroer._meta, expected._meta):
+        if isinstance(reference, torch.Tensor):
+            torch.testing.assert_close(actual, reference)
+        else:
+            assert actual == reference
 
 
 def test_packed_attention_uses_manager_blocks_for_zeroing_metadata():
-    zeroer, cache = _packed_attention_zeroer(torch.device("cpu"))
+    packed, group, context, num_blocks = _packed_attention_fixture(torch.device("cpu"))
+    zeroer = SimpleNamespace()
+    KVBlockZeroerPatch.__init__(zeroer, torch.device("cpu"), [group], [8], context, num_blocks)
 
     addresses, strides, pages, _, _, count = zeroer._meta
-    assert addresses.tolist() == [cache.data_ptr()]
-    assert strides.tolist() == [10]
-    assert pages.tolist() == [4]
+    assert addresses.tolist() == [packed.data_ptr()]
+    assert strides.tolist() == [packed.stride(0)]
+    assert pages.tolist() == [packed[:, :1].numel() // num_blocks]
     assert count == 1
 
 
 @require_torch_gpu
 def test_packed_attention_zeroes_only_selected_manager_block():
-    zeroer, cache = _packed_attention_zeroer(torch.device("cuda"))
+    packed, group, context, num_blocks = _packed_attention_fixture(torch.device("cuda"))
+    zeroer = SimpleNamespace()
+    KVBlockZeroerPatch.__init__(zeroer, torch.device("cuda"), [group], [8], context, num_blocks)
 
     KVBlockZeroer.zero_block_ids(zeroer, [1])
     torch.cuda.synchronize()
 
-    expected = torch.ones_like(cache)
-    expected[5:7] = 0
-    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    expected = torch.ones_like(packed)
+    expected[1, :1] = 0
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
