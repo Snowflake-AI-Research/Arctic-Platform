@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform.common.peft import PEFT_LORA_DEFAULT_R
+
 # Model types the upstream counter names. Types without a specific estimator
 # fall back to the dense decoder formula.
 VALID_CONFIG_TYPE = frozenset(
@@ -62,7 +64,7 @@ def estimate_decoder_transformer_tflos(
     batch_of_seqlens,
     enable_gradient_checkpointing,
     forward_only=False,
-    lora=False,
+    peft_config=None,
 ):
     """Total teraFLOPs and token count for a batch of packed or unpacked samples.
 
@@ -70,7 +72,7 @@ def estimate_decoder_transformer_tflos(
     unpacked sample is ``[[seqlen]]``. Unknown ``model_type`` values use the
     dense decoder formula.
     """
-    flops_counter = FlopsCounter(hf_model_config, model_size, enable_gradient_checkpointing, lora=lora)
+    flops_counter = FlopsCounter(hf_model_config, model_size, enable_gradient_checkpointing, peft_config=peft_config)
     seqlen = 0
     tflos = 0.0
     for seqlens in batch_of_seqlens:
@@ -85,10 +87,10 @@ def tflops_per_token(
     model_size: int = 0,
     *,
     enable_gradient_checkpointing: bool | float = True,
-    lora: bool = False,
+    peft_config: dict[str, Any] | None = None,
 ) -> float:
     """TeraFLOPs per token at ``seq_len``. Multiply by tokens/second to get TFLOP/s."""
-    counter = FlopsCounter(config, model_size, enable_gradient_checkpointing, lora=lora)
+    counter = FlopsCounter(config, model_size, enable_gradient_checkpointing, peft_config=peft_config)
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
     return counter.estimate_tflos([seq_len]) / seq_len
@@ -103,8 +105,9 @@ class FlopsCounter:
     the forward matmuls only.
 
     ``enable_gradient_checkpointing`` is a bool or the fraction of layers
-    that recompute their forward. ``lora`` drops the weight gradients of the
-    frozen base weights (2 of the 6); the adapter matmuls are not counted.
+    that recompute their forward. With a LoRA ``peft_config`` the frozen base
+    weights skip their weight gradients (2 of the 6), and each adapted
+    Linear adds ``r * (in + out)`` trainable parameters at the full count.
     """
 
     def __init__(
@@ -114,7 +117,7 @@ class FlopsCounter:
         enable_gradient_checkpointing: bool | float = False,
         causal: bool = True,
         attn_implementation: str | None = None,
-        lora: bool = False,
+        peft_config: dict[str, Any] | None = None,
     ):
         if not 0 <= enable_gradient_checkpointing <= 1:
             raise ValueError(
@@ -145,7 +148,9 @@ class FlopsCounter:
         self.model_size = model_size
         # GEMM multipliers on N*tokens: forward 2, backward 4 (input and weight
         # gradients, 2 each). Checkpointing recomputes one forward, which adds 2.
-        self.dense_flops_multiplier = 2 + (2 if lora else 4) + 2 * enable_gradient_checkpointing
+        self.trainable_flops_multiplier = 6 + 2 * enable_gradient_checkpointing
+        self.dense_flops_multiplier = self.trainable_flops_multiplier - (2 if peft_config else 0)
+        self.lora_params = _lora_adapter_params(self.config, peft_config) if peft_config else 0
 
         # Attention is counted in matmuls of an S x S x d product (2 FLOPs each).
         # Flash recomputes the score matrix in the backward (5 matmuls); eager
@@ -354,7 +359,9 @@ class FlopsCounter:
         """TeraFLOPs for one row of sequence lengths. ``delta_time`` is ignored."""
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_dense_decoder_transformer_tflos)
-        return func(tokens_sum, batch_seqlens, delta_time=delta_time, forward_only=forward_only)
+        tflos = func(tokens_sum, batch_seqlens, delta_time=delta_time, forward_only=forward_only)
+        adapter_multiplier = 2 if forward_only else self.trainable_flops_multiplier
+        return tflos + adapter_multiplier * self.lora_params * tokens_sum / 1e12
 
 
 def _deepseek_v4_flops_terms(config) -> tuple[float, float, float]:
@@ -478,3 +485,139 @@ def _glm5_next_flops_terms(config) -> tuple[float, float, float]:
 
     span = n_sparse * heads * value * config.index_topk
     return activated, span, n_indexer * index_heads * index_dim
+
+
+# Each layout is (module name, in_features, out_features, modules per token)
+# for the Linear layers a LoRA ``target_modules`` entry can match.
+def _decoder_linears(config) -> list[tuple[str, int, int, int]]:
+    hidden = config.hidden_size
+    heads = config.num_attention_heads
+    head_dim = getattr(config, "head_dim", hidden // heads)
+    kv = config.num_key_value_heads * head_dim
+    layers = config.num_hidden_layers
+    inter = config.intermediate_size
+    return [
+        ("q_proj", hidden, heads * head_dim, layers),
+        ("k_proj", hidden, kv, layers),
+        ("v_proj", hidden, kv, layers),
+        ("o_proj", heads * head_dim, hidden, layers),
+        ("gate_proj", hidden, inter, layers),
+        ("up_proj", hidden, inter, layers),
+        ("down_proj", inter, hidden, layers),
+    ]
+
+
+def _qwen3_5_linears(config) -> list[tuple[str, int, int, int]]:
+    hidden = config.hidden_size
+    heads = config.num_attention_heads
+    head_dim = getattr(config, "head_dim", hidden // heads)
+    kv = config.num_key_value_heads * head_dim
+    layers = config.num_hidden_layers
+    n_full = layers // getattr(config, "full_attention_interval", 1)
+    n_linear = layers - n_full
+    gate = 2 if getattr(config, "attn_output_gate", False) else 1
+    qk = config.linear_key_head_dim * config.linear_num_key_heads
+    v = config.linear_value_head_dim * config.linear_num_value_heads
+    value_heads = config.linear_num_value_heads
+    inter = config.intermediate_size
+    return [
+        ("q_proj", hidden, gate * heads * head_dim, n_full),
+        ("k_proj", hidden, kv, n_full),
+        ("v_proj", hidden, kv, n_full),
+        ("o_proj", heads * head_dim, hidden, n_full),
+        ("in_proj_qkv", hidden, 2 * qk + v, n_linear),
+        ("in_proj_z", hidden, v, n_linear),
+        ("in_proj_a", hidden, value_heads, n_linear),
+        ("in_proj_b", hidden, value_heads, n_linear),
+        ("out_proj", v, hidden, n_linear),
+        ("gate_proj", hidden, inter, layers),
+        ("up_proj", hidden, inter, layers),
+        ("down_proj", inter, hidden, layers),
+    ]
+
+
+def _glm5_next_linears(config) -> list[tuple[str, int, int, int]]:
+    """Routed experts are 3D parameters, which ``target_modules`` does not adapt."""
+    hidden = config.hidden_size
+    heads = config.num_attention_heads
+    layers = list(config.layer_types)
+    sparse = "deepseek_sparse_attention"
+    n_sparse = sum(layer == sparse for layer in layers)
+    n_linear = sum(layer == "linear_attention" for layer in layers)
+    indexer_types = list(getattr(config, "indexer_types", None) or [])
+    n_indexer = sum(
+        layer == sparse and (indexer_types[i] if i < len(indexer_types) else "full") != "shared"
+        for i, layer in enumerate(layers)
+    )
+    mlp_types = list(getattr(config, "mlp_layer_types", None) or [])
+    if mlp_types:
+        n_dense = sum(kind == "dense" for kind in mlp_types)
+    else:
+        n_dense = min(config.first_k_dense_replace, len(layers))
+    n_moe = len(layers) - n_dense
+    q_lora = config.q_lora_rank
+    rope = config.qk_rope_head_dim
+    nope = config.qk_nope_head_dim
+    value = config.v_head_dim
+    kv_rank = config.kv_lora_rank
+    index_heads = config.index_n_heads
+    index_dim = config.index_head_dim
+    linear_dim = config.linear_head_dim
+    qkv = linear_dim * config.linear_num_heads
+    inter = config.intermediate_size
+    shared = config.n_shared_experts * config.moe_intermediate_size
+    return [
+        ("q_a_proj", hidden, q_lora, n_sparse),
+        ("q_b_proj", q_lora, heads * (nope + rope), n_sparse),
+        ("kv_a_proj_with_mqa", hidden, kv_rank + rope, n_sparse),
+        ("kv_b_proj", kv_rank, heads * (nope + value), n_sparse),
+        ("o_proj", heads * value, hidden, n_sparse),
+        ("wq_b", q_lora, index_heads * index_dim, n_indexer),
+        ("wk", hidden, index_dim, n_indexer),
+        ("weights_proj", hidden, index_heads, n_indexer),
+        ("q_proj", hidden, qkv, n_linear),
+        ("k_proj", hidden, qkv, n_linear),
+        ("v_proj", hidden, qkv, n_linear),
+        ("o_proj", qkv, hidden, n_linear),
+        ("b_proj", hidden, config.linear_num_heads, n_linear),
+        ("f_a_proj", hidden, linear_dim, n_linear),
+        ("f_b_proj", linear_dim, qkv, n_linear),
+        ("g_a_proj", hidden, linear_dim, n_linear),
+        ("g_b_proj", linear_dim, qkv, n_linear),
+        ("gate_proj", hidden, inter, n_dense),
+        ("up_proj", hidden, inter, n_dense),
+        ("down_proj", inter, hidden, n_dense),
+        ("gate_proj", hidden, shared, n_moe),
+        ("up_proj", hidden, shared, n_moe),
+        ("down_proj", shared, hidden, n_moe),
+    ]
+
+
+_LORA_LINEARS = {
+    "llama": _decoder_linears,
+    "qwen2": _decoder_linears,
+    "qwen3": _decoder_linears,
+    "qwen3_5": _qwen3_5_linears,
+    "qwen3_5_text": _qwen3_5_linears,
+    "glm5_next": _glm5_next_linears,
+    "glm5_next_text": _glm5_next_linears,
+}
+
+
+def _lora_adapter_params(config, peft_config: dict[str, Any]) -> int:
+    """Adapter parameters used per token: ``r * (in + out)`` for each targeted Linear."""
+    layout = _LORA_LINEARS.get(config.model_type)
+    if layout is None:
+        raise ValueError(f"no LoRA module layout for model_type {config.model_type!r}")
+    targets = peft_config.get("target_modules") or []
+    if isinstance(targets, str):
+        raise ValueError("regex target_modules are not supported; list the module names")
+    if peft_config.get("target_parameters"):
+        raise ValueError("target_parameters adapters are not counted")
+    linears = layout(config)
+    known = {name for name, *_ in linears}
+    unknown = sorted(set(targets) - known)
+    if unknown:
+        raise ValueError(f"target_modules {unknown} match no {config.model_type} Linear; known: {sorted(known)}")
+    rank = peft_config.get("r", PEFT_LORA_DEFAULT_R)
+    return sum(rank * (fan_in + fan_out) * count for name, fan_in, fan_out, count in linears if name in targets)
