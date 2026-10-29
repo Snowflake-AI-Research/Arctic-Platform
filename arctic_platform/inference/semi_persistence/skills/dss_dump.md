@@ -660,7 +660,7 @@ Concrete values, so they can be argued with rather than rediscovered:
 
 - **Projection.** Drops `extra_engine_kwargs` and re-merges it flat; drops
   `_NON_VLLM_ENGINE_KEYS = {ray_num_gpus, router_replay_max_cache_bytes,
-  router_replay_cache_device}`;
+  router_replay_cache_device, router_replay_staging_bytes}`;
   requires `model`; adds no `worker_cls`.
 - **Rejected keys.** `_strip_kwargs_vllm_rejects` loops on
   `AsyncEngineArgs(**probe)`, pulling the key named by each

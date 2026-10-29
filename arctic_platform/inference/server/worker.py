@@ -52,6 +52,7 @@ _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
 _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY = "router_replay_cache_device"
 _ROUTER_REPLAY_CACHE_DEVICES = ("cuda", "cpu")
+_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY = "router_replay_staging_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
@@ -480,7 +481,11 @@ def _create_async_engine_args(
 
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for key in (_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY, _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY):
+    for key in (
+        _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
+        _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY,
+        _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY,
+    ):
         if key in engine_kwargs:
             out[key] = engine_kwargs.pop(key)
     device = out.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY)
@@ -488,6 +493,13 @@ def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str,
         raise ValueError(
             f"{_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY} must be one of "
             f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
+        )
+    staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
+    if staging_bytes is not None and (
+        isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0
+    ):
+        raise ValueError(
+            f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
         )
     return out
 
@@ -835,6 +847,7 @@ class InferenceWorker(StreamingWorkerMixin):
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
         self._router_replay_tx_on_host = False
+        self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
         self._router_replay_shm_entry: dict[str, Any] | None = None
@@ -1185,6 +1198,9 @@ class InferenceWorker(StreamingWorkerMixin):
         self._router_replay_tx_on_host = (
             router_replay_engine_kwargs.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY, "cuda") == "cpu"
         )
+        self._router_replay_staging_bytes = router_replay_engine_kwargs.get(
+            _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY
+        )
         if self._router_replay_tx_on_host:
             tx_device = torch.device("cpu")
         elif _ray_blanked_cuda_visible_devices():
@@ -1502,6 +1518,7 @@ class InferenceWorker(StreamingWorkerMixin):
             master_port=master_port,
             device=tx_device,
             is_server=is_server,
+            staging_bytes=self._router_replay_staging_bytes,
         )
         return {"status": "ok", "rank": rank, "world_size": world_size}
 

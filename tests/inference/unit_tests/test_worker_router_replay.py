@@ -158,6 +158,15 @@ def test_router_replay_cache_device_is_popped_and_validated_before_engine_start(
         _pop_router_replay_engine_kwargs({"router_replay_cache_device": "gpu"})
 
 
+@pytest.mark.parametrize("staging_bytes", [0, -1, True, "8MiB"])
+def test_router_replay_staging_bytes_must_be_a_positive_integer(staging_bytes):
+    assert _pop_router_replay_engine_kwargs({"router_replay_staging_bytes": 1 << 23}) == {
+        "router_replay_staging_bytes": 1 << 23,
+    }
+    with pytest.raises(ValueError, match="router_replay_staging_bytes must be a positive integer"):
+        _pop_router_replay_engine_kwargs({"router_replay_staging_bytes": staging_bytes})
+
+
 @pytest.mark.parametrize("cache_device,expected", [(None, "cuda:0"), ("cuda", "cuda:0"), ("cpu", "cpu")])
 def test_tx_cache_is_placed_on_the_configured_device(monkeypatch, cache_device, expected):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -165,12 +174,14 @@ def test_tx_cache_is_placed_on_the_configured_device(monkeypatch, cache_device, 
     router_kwargs = {"router_replay_max_cache_bytes": 1 << 20}
     if cache_device is not None:
         router_kwargs["router_replay_cache_device"] = cache_device
+        router_kwargs["router_replay_staging_bytes"] = 1 << 23
 
     worker._maybe_init_router_replay_tx({"enable_return_routed_experts": True}, router_kwargs)
 
     assert worker._router_replay_tx.device == torch.device(expected)
     assert worker._router_replay_tx.max_bytes == 1 << 20
     assert worker._router_replay_tx_on_host is (cache_device == "cpu")
+    assert worker._router_replay_staging_bytes == (None if cache_device is None else 1 << 23)
 
 
 def test_nccl_init_keeps_a_host_tx_cache_and_its_entries(monkeypatch):
@@ -183,6 +194,7 @@ def test_nccl_init_keeps_a_host_tx_cache_and_its_entries(monkeypatch):
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker._router_replay_tx = tx
     worker._router_replay_tx_on_host = True
+    worker._router_replay_staging_bytes = 1 << 23
     worker._router_replay_group = None
 
     result = asyncio.run(worker.init_router_replay("127.0.0.1", 1, rank=2, world_size=3))
@@ -190,6 +202,7 @@ def test_nccl_init_keeps_a_host_tx_cache_and_its_entries(monkeypatch):
     assert result["status"] == "ok"
     assert worker._router_replay_tx is tx and "rr1:a" in tx
     assert groups[0]["device"] == torch.device("cuda:0")
+    assert groups[0]["staging_bytes"] == 1 << 23
     assert worker._router_replay_group == "group"
 
 

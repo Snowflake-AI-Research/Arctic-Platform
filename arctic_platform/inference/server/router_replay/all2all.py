@@ -526,6 +526,7 @@ def init_router_replay_group(
     world_size: int,
     device: torch.device | int | str,
     is_server: bool | None = None,
+    staging_bytes: int | None = None,
 ) -> RouterReplayGroup:
     """Bootstrap a per-joint-job NCCL communicator + stateless PG.
 
@@ -563,4 +564,5 @@ def init_router_replay_group(
         pg=pg,
         nccl=nccl,
         device=device_t,
+        staging_bytes=staging_bytes,
     )
