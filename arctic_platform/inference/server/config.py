@@ -4,7 +4,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 
@@ -27,6 +27,9 @@ class ModelConfig(BaseModel):
     Field names match AsyncEngineArgs where possible so to_engine_kwargs()
     can pass them through directly.
     """
+
+    # A key that is not a field would otherwise be dropped without an error; other engine args go in extra_engine_kwargs.
+    model_config = ConfigDict(extra="forbid")
 
     model: str = Field(description="Model name, HuggingFace ID, or local path")
     tensor_parallel_size: int = 1
