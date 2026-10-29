@@ -185,3 +185,30 @@ def test_qsa_backward_sums_key_and_value_gradients_exactly():
     expected_key = torch.tensor([queries, -queries], dtype=torch.float32)[None, :, None, None].expand_as(key)
     torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
     torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA FlexAttention entry requires CUDA")
+def test_qsa_cuda_entry_sums_key_and_value_gradients_exactly():
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    # The production entry only accepts CUDA bf16. Its scatter_add_ rounds every atomic add, so a bf16
+    # accumulator stops at 256 here; the returned totals are exact bf16 values once the sum is fp32.
+    queries = 300 * qsa._QSA_ATTENTION_CHUNK_ROWS
+    query = torch.ones(1, queries, 1, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros(1, 2, 1, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    value = (
+        torch.tensor([1.0, -1.0], device="cuda", dtype=torch.bfloat16)[None, :, None, None]
+        .repeat(1, 1, 1, 2)
+        .requires_grad_()
+    )
+    routes = torch.tensor([0, 1], device="cuda", dtype=torch.int32).expand(1, queries, 2).contiguous()
+
+    output = qsa.flex_sparse_gqa_attention(query, key, value, routes, softmax_scale=1.0)
+    output.backward(torch.ones_like(output))
+
+    assert key.grad.dtype == value.grad.dtype == torch.bfloat16
+    expected_key = torch.tensor([queries, -queries], device="cuda", dtype=torch.float32)[None, :, None, None].expand_as(
+        key
+    )
+    torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2, device="cuda"), rtol=0, atol=0)
