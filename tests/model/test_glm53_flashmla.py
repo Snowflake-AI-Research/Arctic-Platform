@@ -236,17 +236,19 @@ def _dispatch_attention(kv_lora_rank=512, rope_width=0):
 
 
 @pytest.mark.parametrize(
-    "installed,requested,expect_infer",
+    "installed,fused,requested,expect_infer",
     [
-        (False, "sparse_mla", False),
-        (True, "sparse_mla", True),
-        (False, "flashmla", False),
-        (True, "flashmla", False),
-        (True, "flashinfer", True),
+        (False, False, "sparse_mla", False),
+        (True, False, "sparse_mla", True),
+        # With the fused TileLang backward, sparse_mla takes FlashMLA over FlashInfer's reference backward.
+        (True, True, "sparse_mla", False),
+        (False, False, "flashmla", False),
+        (True, True, "flashmla", False),
+        (True, True, "flashinfer", True),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, requested, expect_infer, dtype):
+def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, fused, requested, expect_infer, dtype):
     attention = _dispatch_attention().to(dtype=dtype)
     attention._ap_sparse_mla_backend = requested
     hidden_states = torch.zeros(1, 4, 16, dtype=dtype)
@@ -258,9 +260,10 @@ def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, req
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
     monkeypatch.setattr(context_parallel, "_cuda_device_major", lambda _device: 9)
     monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: installed)
+    monkeypatch.setattr(context_parallel, "_fused_sparse_mla_backward_available", lambda: fused)
     monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: True)
     monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
-    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_fused_apply", flashmla)
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
     with torch.no_grad():
         for _ in range(2):
@@ -301,9 +304,10 @@ def test_installed_flashinfer_failure_propagates_without_fallback(monkeypatch, e
     reference = Mock()
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
     monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
+    monkeypatch.setattr(context_parallel, "_fused_sparse_mla_backward_available", lambda: False)
     monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
     monkeypatch.setattr(context_parallel, "_use_flashmla", flashmla_guard)
-    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_fused_apply", flashmla)
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
     with pytest.raises(type(error)) as raised:
         context_parallel._sparse_attention_forward(
@@ -343,6 +347,7 @@ def test_sparse_backend_selection_respects_explicit_request(
     monkeypatch, requested, infer_available, mla_available, expected
 ):
     monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_args: infer_available)
+    monkeypatch.setattr(context_parallel, "_fused_sparse_mla_backward_available", lambda: False)
     monkeypatch.setattr(context_parallel, "_use_flashmla", lambda *_args: mla_available)
     if expected is None:
         with pytest.raises(RuntimeError, match="requires an installed kernel"):
@@ -361,7 +366,7 @@ def test_missing_optional_kernels_use_reference(monkeypatch):
     reference = Mock(wraps=context_parallel._reference_sparse_mla)
     flashmla = Mock(side_effect=AssertionError("Missing FlashMLA was selected"))
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
-    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_fused_apply", flashmla)
     output, _, _ = context_parallel._sparse_attention_forward(
         attention, hidden_states, None, prev_topk_indices=indices
     )

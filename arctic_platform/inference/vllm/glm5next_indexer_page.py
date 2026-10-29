@@ -20,10 +20,11 @@ For GLM-5.3-Flash that block is 640 tokens. The indexer stores one state per
 ``index_kpool`` tokens (4), so a 640-token block contains 160 states. CUDA-graph
 capture then dies in ``get_paged_mqa_logits_metadata``.
 
-The DeepGEMM pinned with vLLM 0.31 asserts ``block_kv == 64``, and allows 32
-only when ``arch_major == 10``. H200 is Hopper, so a 32-state page fails the
-same way 160 does. The legal kernel page is ``index_kpool * 64`` tokens (256
-for GLM-5.3-Flash). Advertising only that page makes vLLM's aligner round the
+vLLM 0.32's ``get_paged_mqa_page_sizes`` still returns ``(32, 64)`` off SM120.
+The DeepGEMM pinned with vLLM 0.31 rejects a 32-state page on Hopper (it allows
+32 only when ``arch_major == 10``), so a 32-state page fails the same way 160
+does. The legal kernel page is ``index_kpool * 64`` tokens (256 for
+GLM-5.3-Flash). Advertising only that page makes vLLM's aligner round the
 640-token block up to 768, which splits into three 256-token pages of 64 states.
 
 Remove this once the pinned vLLM contains
@@ -34,7 +35,7 @@ from dataclasses import replace
 
 from arctic_platform.inference.patching import ArcticPatch
 
-# The DeepGEMM in the vLLM 0.31 image accepts 64 states on every arch it runs,
+# The DeepGEMM in the vLLM image accepts 64 states on every arch it runs,
 # and 32 only on Blackwell. Hopper rejects 32, so this holdover advertises the
 # 64-state page alone. ``sm120`` stays in the signature so the call sites match
 # the platform check they already make.
