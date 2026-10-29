@@ -35,7 +35,7 @@ if "ray" not in sys.modules:
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.31.0"
+    vllm_module.__version__ = "0.32.0"
     config_module = types.ModuleType("vllm.config")
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
     loggers_module = types.ModuleType("vllm.v1.metrics.loggers")
@@ -467,6 +467,54 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
         caplog.records[-1]
     ]
     assert "skipped 1/2" in caplog.records[-1].getMessage()
+
+
+def test_hf_sync_of_declared_export_buffers_passes_loaded_destination_check(monkeypatch):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    def ngram_model():
+        # Qwen3.8 shape: a trained parameter beside constant int64 hash tables that
+        # Qwen4ExpTextNGramEmbeddingPrimeRL declares in _dss_weight_export_buffers.
+        model = nn.Module()
+        model.model = nn.Module()
+        model.model.layers = nn.ModuleList([nn.Module()])
+        ngram = model.model.layers[0].ngram_embedding = nn.Module()
+        ngram._dss_weight_export_buffers = frozenset({"layer_multipliers"})
+        ngram.weight = nn.Parameter(torch.zeros(2))
+        ngram.register_buffer("layer_multipliers", torch.tensor([23703573157769, 8052911324071]))
+        return model
+
+    class Trainer(nn.Module):
+        @staticmethod
+        def convert_layer_to_hf(layer_state, layer_index):
+            return layer_state
+
+    class Sampler(nn.Module):
+        def load_weights(self, weights):
+            # vLLM's loaders also place persistent buffers and report them as loaded.
+            state = self.state_dict(keep_vars=True)
+            for name, tensor in weights:
+                state[name].data.copy_(tensor)
+            return {name for name, _ in weights}
+
+    trainer, sampler = Trainer(), Sampler()
+    trainer.model = ngram_model().model
+    sampler.model = ngram_model().model
+    trainer.model.layers[0].ngram_embedding.weight.data.copy_(torch.tensor([3.0, 4.0]))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        sampler,
+        _FakeEngine(list(build_iter_full_hf_weights(trainer)())),
+    )
+    _, loaded_l2_sq, _, _ = _model_parameter_l2(
+        sampler, torch.device("cpu"), _loaded_destination_names(mappings)
+    )
+
+    assert torch.equal(sampler.model.layers[0].ngram_embedding.weight, torch.tensor([3.0, 4.0]))
+    assert recv_l2_sq == applied_l2_sq == loaded_l2_sq == 25.0
+    assert skipped == []
 
 
 def test_load_direct_still_rejects_orphan_sources(monkeypatch):
@@ -929,6 +977,121 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
     assert result["skipped_source_count"] == 1
     assert result["skipped_source_names"] == ["receiver_only.bias"]
     assert result["loaded_destination_trace_collected"] is True
+
+
+def _ipc_tensor(*args):
+    return torch.ones(1)
+
+
+def _ipc_payload(names):
+    import base64
+    import pickle
+
+    handles = [{"gpu0": (_ipc_tensor, [None] * 7)} for _ in names]
+    return {"names": names, "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles))}
+
+
+def _run_sync_entry_point(entry_point, extension, tmp_path):
+    if entry_point in ("sync_weights", "sync_weights_broadcast", "sync_spec_weights"):
+        return getattr(WeightSyncExtension, entry_point)(extension, "127.0.0.1", 1234, 1, 2)
+    if entry_point == "load_weights_cuda_ipc":
+        return WeightSyncExtension.load_weights_cuda_ipc(extension, _ipc_payload(["w"]))
+    if entry_point == "load_weights_cuda_ipc_chunk":
+        first = WeightSyncExtension.load_weights_cuda_ipc_chunk(extension, _ipc_payload(["w"]))
+        assert "cached_weight_copies_refreshed" not in first
+        return WeightSyncExtension.load_weights_cuda_ipc_chunk(extension, _ipc_payload(["w"]), validate_names=["w"])
+    path = tmp_path / "weights.pt"
+    torch.save([("w", torch.ones(1))], path)
+    return WeightSyncExtension.load_weights_from_shm_path(extension, str(path))
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [
+        "sync_weights",
+        "sync_weights_broadcast",
+        "sync_spec_weights",
+        "load_weights_cuda_ipc",
+        "load_weights_cuda_ipc_chunk",
+        "load_weights_from_shm_path",
+    ],
+)
+def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point):
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 2
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
+
+    # vLLM 0.31.0 Glm5NextLinearAttention: fp32 [C, 1, 4] q/k/v conv weights, and the
+    # merged weight its first forward caches under inference mode (kda.py:505-515).
+    kda = nn.Module()
+    convs = []
+    for i, name in enumerate(("q_conv1d", "k_conv1d", "v_conv1d")):
+        conv = nn.Module()
+        conv.weight = nn.Parameter(torch.arange(12.0).view(3, 1, 4) + 100 * i, requires_grad=False)
+        setattr(kda, name, conv)
+        convs.append(conv)
+
+    def merged():
+        return torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]).contiguous()
+
+    # Glm5NextIndexer: bf16 wk_weights_proj (head_dim key rows, then the head-gate rows), and the
+    # fp32 transpose of the head-gate rows its first forward caches (attention.py:338-344).
+    indexer = nn.Module()
+    indexer.head_dim = 2
+    indexer.wk_weights_proj = nn.Module()
+    indexer.wk_weights_proj.weight = nn.Parameter(torch.arange(15.0).view(5, 3).bfloat16(), requires_grad=False)
+
+    def head_gate():
+        return indexer.wk_weights_proj.weight.data[indexer.head_dim :, :].t().contiguous().float()
+
+    with torch.inference_mode():
+        kda._merged_conv_weight = merged()
+        indexer._wp_fp32 = head_gate()
+    cache_address = kda._merged_conv_weight.data_ptr()
+    head_gate_address = indexer._wp_fp32.data_ptr()
+
+    def update_in_place():  # ColumnParallelLinear.weight_loader: param.data.copy_
+        for param in (*(conv.weight for conv in convs), indexer.wk_weights_proj.weight):
+            param.data.add_(1.0)
+
+    class Model(nn.ModuleDict):
+        def load_weights(self, weights):
+            names = {name for name, _ in weights}
+            update_in_place()
+            return names
+
+    def load_batched(model, engine):
+        update_in_place()
+        return 4, 0.0, 0.0, {}, []
+
+    model = Model({"kda": kda, "indexer": indexer})
+    extension = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_runner=SimpleNamespace(model=model, drafter=SimpleNamespace(model=model)),
+        model_config=SimpleNamespace(quantization=None),
+        _get_or_create_engine=lambda *args, **kwargs: _FakeEngine([("w", torch.ones(1))]),
+        _get_or_create_broadcast_engine=lambda *args: object(),
+        _load_batched=load_batched,
+        _build_result=lambda *args: {"status": "done"},
+        _validate_weight_sync_names=lambda *args, **kwargs: None,
+    )
+    extension._load_cpu_weights_into_model = lambda weights: WeightSyncExtension._load_cpu_weights_into_model(
+        extension, weights
+    )
+
+    result = _run_sync_entry_point(entry_point, extension, tmp_path)
+
+    assert result["cached_weight_copies_refreshed"] == 2
+    assert torch.equal(kda._merged_conv_weight, merged()), "sampler still convolves with pre-sync conv weights"
+    assert kda._merged_conv_weight.data_ptr() == cache_address
+    assert torch.equal(indexer._wp_fp32, head_gate()), "sparse indexer still gates with pre-sync weights"
+    assert indexer._wp_fp32.data_ptr() == head_gate_address
 
 
 async def _noop_abort_all_streams():

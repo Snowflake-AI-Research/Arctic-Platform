@@ -24,6 +24,10 @@ Per model, up to four jobs on the same backend image:
   on_miss      semi_p forced to cold-start and dump (published images off)
   off_matched  plain vLLM given semi_p's collective setup (TP >= 2, one pod)
 
+Before submitting a model's jobs it waits until the node cache has verified the
+published skeleton and weights on every node (see verify.py), since on_hit
+cannot restore from a node that has not.
+
 on_hit and off_default run copies x the published layout and are compared for
 throughput and latency; that runs first, while on_miss may still be dumping.
 Then every check sends the same requests to every job: on_miss and off_matched
@@ -58,6 +62,10 @@ Arguments (``key=value``):
   log_files_on / log_files_off   saved GPU pod logs of on_hit / off_default (files
                    or directories); they add the per-step restore breakdown
   timeout_s        how long to wait for the jobs to run (default 3600)
+  publish_dir      where publish wrote <image_tag>/summary.json, which names each
+                   model's skeleton and weights (default <out_dir>/publish)
+  verify_timeout_s how long to wait for them to be verified on every node
+                   (default 3600)
   pre_cancel_hook  shell command run for each job just before it is cancelled,
                    with {job_id}, {variant} and {miss_image_cache} (the on_miss
                    job's cache directory, else empty) filled in; e.g. to delete
@@ -93,6 +101,7 @@ from arctic_platform.inference.semi_persistence.onboarding import correctness
 from arctic_platform.inference.semi_persistence.onboarding import perf
 from arctic_platform.inference.semi_persistence.onboarding import report
 from arctic_platform.inference.semi_persistence.onboarding import startup
+from arctic_platform.inference.semi_persistence.onboarding import verify
 from arctic_platform.inference.semi_persistence.onboarding.common import Pair
 from arctic_platform.inference.semi_persistence.onboarding.common import as_bool
 from arctic_platform.inference.semi_persistence.onboarding.common import parse_kv_args
@@ -143,6 +152,8 @@ class Runner:
         self.keep_jobs = as_bool(args.get("keep_jobs", "false"))
         self.out_dir = args.get("out_dir", "onboarding_reports")
         self.timeout_s = float(args.get("timeout_s", "3600"))
+        self.publish_dir = args.get("publish_dir") or str(Path(self.out_dir) / "publish")
+        self.verify_timeout_s = float(args.get("verify_timeout_s", "3600"))
         self.copies = int(args["copies"]) if args.get("copies") else None
         self.miss_image_cache = args.get("miss_image_cache") or None
         self.max_gpus = int(args["max_gpus"]) if args.get("max_gpus") else None
@@ -240,6 +251,13 @@ class Runner:
             miss_cache = (f"{self.miss_image_cache.rstrip('/')}/{report.stem(result)}"
                           if self.miss_image_cache else None)
             bodies = build_variant_bodies(spec, image_tag, variants, copies, miss_cache)
+            if not attached and "on_hit" in variants:
+                summary = Path(self.publish_dir).expanduser() / image_tag / "summary.json"
+                result["published_image"] = verify.wait_verified(
+                    verify.published_dirs(summary, spec.name), self.verify_timeout_s, spec.name)
+                checked = not result["published_image"].startswith("not checked")
+                logger.log(logging.INFO if checked else logging.WARNING, "%s: published image %s",
+                           spec.name, result["published_image"])
             if not (attached or capacity_checked):
                 self.wait_for_capacity(self.footprint(spec)[0], spec.name)
             for v in variants:
