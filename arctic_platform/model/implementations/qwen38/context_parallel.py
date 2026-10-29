@@ -105,7 +105,7 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         value = value.view(batch_size, local_sequence_length, num_value_heads, int(self.head_v_dim))
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
-        beta = b.sigmoid()
+        beta = b.float().sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
         if num_value_heads // num_key_heads > 1:
             replication = num_value_heads // num_key_heads
