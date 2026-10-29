@@ -92,6 +92,7 @@ arctic_inference = "arctic_platform.inference.vllm.plugin:arctic_inference_plugi
 all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
+    "arctic_platform[correctness]",
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "arctic_platform[tinker]",
@@ -125,6 +126,17 @@ testing = [
 formatting = [
     "pre-commit",
     "autoflake",
+]
+
+# Correctness onboarding, HF references, target execution, and CPU selftests.
+# Sampling and model-specific attention kernels are installed separately.
+correctness = [
+    "arctic_platform[cortex]",
+    "arctic_platform[sft]",
+    "huggingface-hub",
+    "pytest",
+    "pytest-instafail",
+    "tqdm",
 ]
 
 # qwen3.5 and other models that use GDN attention layers need this for much better perf

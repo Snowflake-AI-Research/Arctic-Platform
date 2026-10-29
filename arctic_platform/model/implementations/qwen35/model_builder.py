@@ -36,6 +36,8 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
+from arctic_platform.debug.lora import maybe_observe_checkpoint_reader
+from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
@@ -501,6 +503,8 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    model.__dict__.pop("_ap_preserved_mtp_weights", None)
+    model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
@@ -523,13 +527,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         return
 
     if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
+        # DCP needs tensor shards and their index, not uncached Hub documentation.
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=config.name,
+                repo_type="model",
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
     else:
         logger.info(
             f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
             f"please remove the directory {config.name} and run again"
         )
         snapshot_path = Path(config.name)
+
+    maybe_capture_reduced_fixture_mtp(model, snapshot_path, config)
 
     # Dynamically convert between different weight formats if needed.
     conversion = None
@@ -545,6 +558,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
             if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
                 # Packed and dequantized conversions of one checkpoint must not share a cache.
                 fmt = "prime-dequantized"
@@ -568,6 +582,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                     stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
@@ -581,6 +596,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    convert_checkpoint_fn=convert_checkpoint_fn,
                     stream_convert_fn=stream_convert_fn,
                 )
 
@@ -602,7 +618,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         del state_dict["lm_head.weight"]
     dcp_load(
         state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        storage_reader=maybe_observe_checkpoint_reader(
+            HuggingFaceStorageReader(path=snapshot_path.as_posix()), model, state_dict, config, parallel_dims
+        ),
     )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:

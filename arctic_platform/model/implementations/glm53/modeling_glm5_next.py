@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import Tensor
 from torch import nn
@@ -28,7 +30,9 @@ from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
+from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
 
+from .converting_glm5_next import checkpoint_conversion_groups
 from .converting_glm5_next import convert_hf_layer_to_prime
 from .converting_glm5_next import convert_hf_to_prime
 from .converting_glm5_next import convert_prime_layer_to_hf
@@ -190,7 +194,11 @@ class Glm5NextForConditionalGenerationPrimeRL(
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any(".mlp.experts.0.gate_proj.weight" in name for name in state_dict)
+        return any(
+            ".mlp.experts.0.gate_proj.weight" in name
+            or name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.gate_up_proj.weight"))
+            for name in state_dict
+        )
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
@@ -203,6 +211,14 @@ class Glm5NextForConditionalGenerationPrimeRL(
     @classmethod
     def convert_to_prime(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         return convert_hf_to_prime(state_dict)
+
+    @classmethod
+    def convert_to_hf_checkpoint(cls, source_dir: Path, save_dir: Path) -> None:
+        convert_safetensor_checkpoint(source_dir, save_dir, cls.convert_to_hf, checkpoint_conversion_groups)
+
+    @classmethod
+    def convert_to_prime_checkpoint(cls, source_dir: Path, save_dir: Path) -> None:
+        convert_safetensor_checkpoint(source_dir, save_dir, cls.convert_to_prime, checkpoint_conversion_groups)
 
     @classmethod
     def convert_layer_to_hf(

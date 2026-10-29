@@ -56,6 +56,15 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.common.utils.weight_sync import received_checksums
+from arctic_platform.common.weight_checksum import compare_weight_checksums
+from arctic_platform.debug.lora import maybe_lora_max_param_bytes
+from arctic_platform.debug.lora import maybe_lora_replica_pool
+from arctic_platform.debug.lora import maybe_lora_sync_result
+from arctic_platform.debug.lora import maybe_prepare_lora_training
+from arctic_platform.debug.lora import maybe_project_lora_transfer_schedule
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -66,7 +75,7 @@ def _replica_pool_cls():
     require_any_dep_group("rl")
     from arctic_platform.inference.server.replica_pool import ReplicaPool
 
-    return ReplicaPool
+    return maybe_lora_replica_pool(ReplicaPool)
 
 
 def _transfer_schedule_cls():
@@ -864,6 +873,34 @@ class ArcticRLRayServer:
         """Await sampler refs. A sampler failure does not latch training workers."""
         return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
 
+    async def _await_weight_sync_refs(self, receive_task, send_tasks):
+        """Run send and receive together, cancelling a peer on transfer failure."""
+        training_await = asyncio.ensure_future(self._await_training_refs(lambda: send_tasks, check_failed=False))
+        sampling_await = asyncio.ensure_future(self._await_sampling_refs(lambda: [receive_task]))
+        try:
+            done, _pending = await asyncio.wait({training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION)
+            sampling_error = _finished_task_error(sampling_await) if sampling_await in done else None
+            training_error = _finished_task_error(training_await) if training_await in done else None
+            if training_error is not None:
+                if not sampling_await.done():
+                    sampling_await.cancel()
+                raise training_error
+            if sampling_error is not None:
+                if not training_await.done():
+                    training_await.cancel()
+                    try:
+                        await training_await
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise sampling_error
+            sent = await training_await
+            received = (await sampling_await)[0]
+            return received, sent
+        finally:
+            for pending_await in (training_await, sampling_await):
+                if not pending_await.done():
+                    pending_await.cancel()
+
     async def _gather_training_refs(self, submit_refs):
         """Submit and await worker ObjectRefs without blocking the transport loop.
 
@@ -889,6 +926,21 @@ class ArcticRLRayServer:
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+
+    def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
+        worker_sp_info = None
+        if sp_size > 1:
+            _, _, meta, processing = unpack_batch(batch)
+            validate_sequence_parallel_grpo(meta, processing, backward=backward)
+            worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
+        shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+        return shards, reorder, worker_sp_info
+
+    @staticmethod
+    def _logical_model_results(results, worker_sp_info, *, sp_size: int):
+        if worker_sp_info is None:
+            return results
+        return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
 
     async def shutdown(self) -> None:
         """Release state-owned resources, then terminate the state actor."""
@@ -929,7 +981,10 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
+        sp_size = self.jobs[job_id]["sp_size"]
+        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=True
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
@@ -958,6 +1013,7 @@ class ArcticRLRayServer:
         pr0(f"[DeepSpeedWorker] fwd_bwd: {len(results)=}")
 
         tname = timers.start("xyz fwd_bwd: epilogue")
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
         if loss_object is not None:
             worker_metrics = [result.get("metrics") or {} for result in results]
@@ -1003,7 +1059,10 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        sp_size = info["sp_size"]
+        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=False
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
 
@@ -1017,6 +1076,7 @@ class ArcticRLRayServer:
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         batch = merge_dict_shards([r["batch"] for r in results])
         if reorder_indices is not None:
             batch = restore_batch_order(batch, reorder_indices)
@@ -1504,12 +1564,15 @@ class ArcticRLRayServer:
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
+        schedule = maybe_project_lora_transfer_schedule(schedule)
+        await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
         sender_ips = await self._await_training_refs(lambda: [workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
             max_param = (await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()]))[0]
+            max_param = maybe_lora_max_param_bytes(self, max_param)
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
@@ -1559,46 +1622,20 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        # Send and receive run together. A training-send failure latches the
-        # workers. A sampler-side receive error cancels any send still running,
-        # which latches as well.
-        training_await = asyncio.ensure_future(self._await_training_refs(lambda: send_tasks, check_failed=False))
-        sampling_await = asyncio.ensure_future(self._await_sampling_refs(lambda: [receive_task]))
-        try:
-            done, _pending = await asyncio.wait({training_await, sampling_await}, return_when=asyncio.FIRST_EXCEPTION)
-            sampling_error = _finished_task_error(sampling_await) if sampling_await in done else None
-            training_error = _finished_task_error(training_await) if training_await in done else None
-            if training_error is not None:
-                if not sampling_await.done():
-                    sampling_await.cancel()
-                raise training_error
-            if sampling_error is not None:
-                if not training_await.done():
-                    training_await.cancel()
-                    try:
-                        await training_await
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                raise sampling_error
-            send_results = await training_await
-            (pool_response,) = await sampling_await
-        finally:
-            for pending_await in (training_await, sampling_await):
-                if not pending_await.done():
-                    pending_await.cancel()
-        logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
-        from arctic_platform.common.utils.weight_sync import received_checksums
-        from arctic_platform.common.weight_checksum import compare_weight_checksums
-
+        pool_response, send_results = await self._await_weight_sync_refs(receive_task, send_tasks)
         workers_results = pool_response.get("workers", [])
         checksum = compare_weight_checksums(
             {
-                f"training rank {g.sender_train_rank}": r.get("sent_l2_sq")
-                for g, r in zip(schedule.groups, send_results)
+                f"training rank {group.sender_train_rank}": receipt.get("sent_l2_sq")
+                for group, receipt in zip(schedule.groups, send_results)
             },
-            received_checksums([f"sampling replica {i}" for i in range(len(workers_results))], workers_results),
+            received_checksums(
+                [f"sampling replica {index}" for index in range(len(workers_results))], workers_results
+            ),
         )
-        return {"status": "ok", **checksum}
+        results = maybe_lora_sync_result(self, {"status": "ok", **checksum}, pool_response, send_results)
+        logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
+        return results
 
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         self._verify_job(job_id, "log_prob")
@@ -1618,7 +1655,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info["sp_size"])
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

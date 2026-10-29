@@ -22,6 +22,10 @@ Hugging Face iterator.
 from __future__ import annotations
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
+from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
+from arctic_platform.model.implementations.qwen38 import QWEN38_ATTN_BACKEND
+from arctic_platform.model.implementations.qwen38 import QWEN38_NUM_EXPERTS
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -30,10 +34,12 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 
 def _matches(model_type: str):
+    model_types = {model_type, f"{model_type}_text"}
+
     def matches(ctx: LoaderContext) -> bool:
         if ctx.spec.parallelism.expert_parallel <= 1:
             return False
-        return ctx.hf_model_type == model_type or ctx.hf_text_model_type == model_type
+        return ctx.hf_model_type in model_types or ctx.hf_text_model_type in model_types
 
     return matches
 
@@ -68,9 +74,6 @@ def _validate_common(
 
 
 def _validate_glm5_next(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.glm53.context_parallel import SPARSE_MLA_BACKENDS
-    from arctic_platform.model.implementations.glm53.deepspeed_integration import GLM53_ATTN_BACKEND
-
     _validate_common(
         spec,
         "GLM-5.3-Flash",
@@ -84,9 +87,6 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
 
 
 def _validate_qwen4_exp(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_ATTN_BACKEND
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_NUM_EXPERTS
-
     _validate_common(
         spec,
         "Qwen3.8-Flash-Next",

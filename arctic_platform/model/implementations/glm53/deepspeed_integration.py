@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
 from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
@@ -30,10 +31,9 @@ from arctic_platform.model.implementations.qwen35 import deepspeed_integration a
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
+from .auxiliary_weights import iter_preserved_auxiliary_weights
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
-
-GLM53_ATTN_BACKEND = "sparse_mla"
 
 
 def _build_model_config(
@@ -74,6 +74,23 @@ def _shared_expert_forward(feed_forward: BCFeedForward, hidden_states: torch.Ten
     return BCFeedForward.forward(feed_forward, hidden_states)
 
 
+def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
+    ordinary = qwen_ds._build_iter_full_hf_weights(model)
+
+    def iterator(*, include_skipped: bool = False):
+        emitted = set()
+        for name, tensor in ordinary(include_skipped=include_skipped):
+            emitted.add(name)
+            yield name, tensor
+        if include_skipped and torch.distributed.get_rank() == 0:
+            for name, tensor in iter_preserved_auxiliary_weights(model):
+                if name in emitted:
+                    raise RuntimeError(f"GLM prediction tensor collides with a live HF weight: {name}")
+                yield name, tensor
+
+    return iterator
+
+
 def _adapter(attn_implementation: str = GLM53_ATTN_BACKEND) -> MoEDeepSpeedAdapter:
     return replace(
         qwen_ds._generic_adapter(),
@@ -82,6 +99,7 @@ def _adapter(attn_implementation: str = GLM53_ATTN_BACKEND) -> MoEDeepSpeedAdapt
         shared_expert_forward=_shared_expert_forward,
         build_model_config=_build_model_config,
         apply_sequence_parallelism=partial(_apply_sequence_parallelism, attn_implementation=attn_implementation),
+        hf_weight_export=_build_iter_full_hf_weights_with_auxiliary,
     )
 
 

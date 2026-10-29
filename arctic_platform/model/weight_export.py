@@ -23,12 +23,16 @@ import os
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from typing import Any
 from typing import Literal
 from weakref import WeakKeyDictionary
 
 import torch
 import torch.nn as nn
+
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
+from arctic_platform.debug.weight_sync import maybe_complete_broadcast_trainer_inventory
 
 WeightFormat = Literal["hf", "vllm", "lora"]
 WeightIterator = Iterator[tuple[str, torch.Tensor]]
@@ -317,7 +321,7 @@ def _gather_ep_parameter(parameter: Any, *, dim: int) -> torch.Tensor:
 
 
 def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
-    """Gather a PEFT adapter pack onto rank zero."""
+    """Gather adapter tensors with live module names for PEFT's selection."""
     adapter_parameters = [
         (name, parameter) for name, parameter in model.named_parameters() if is_peft_adapter_tensor_name(name)
     ]
@@ -335,25 +339,21 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
         with deepspeed.zero.GatheredParameters(parameters, modifier_rank=0):
             if rank != 0:
                 return {}
-            return {
-                strip_activation_checkpoint_segments(name): parameter.detach().cpu().contiguous()
-                for name, parameter in adapter_parameters
-            }
+            return {name: parameter.detach().cpu().contiguous() for name, parameter in adapter_parameters}
 
     output: dict[str, torch.Tensor] = {}
     for name, parameter in adapter_parameters:
-        export_name = strip_activation_checkpoint_segments(name)
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
             if not dist.is_initialized():
                 raise RuntimeError(f"EP-sharded LoRA parameter {name!r} needs a process group")
-            gather_dim = 1 if "lora_B" in export_name.split(".") else 0
+            gather_dim = 1 if "lora_B" in name.split(".") else 0
             gathered = _gather_ep_parameter(parameter, dim=gather_dim)
             if rank == 0:
-                output[export_name] = gathered.detach().cpu().contiguous()
+                output[name] = gathered.detach().cpu().contiguous()
         elif rank == 0:
-            output[export_name] = parameter.detach().cpu().contiguous()
+            output[name] = parameter.detach().cpu().contiguous()
     return output
 
 
@@ -370,6 +370,28 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True)
+    # PEFT must select against live wrapped names before we make the pack portable.
+    if any(strip_activation_checkpoint_segments(name) != name for name in state):
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        for adapter_name in model.peft_config:
+            output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
+            weights_path = os.path.join(output_dir, "adapter_model.safetensors")
+            with safe_open(weights_path, framework="pt") as handle:
+                metadata = handle.metadata()
+                portable = {}
+                for name in handle.keys():
+                    export_name = strip_activation_checkpoint_segments(name)
+                    if export_name in portable:
+                        raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                    portable[export_name] = handle.get_tensor(name)
+            if not portable:
+                raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
+            with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+                temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
+                save_file(portable, temporary_path, metadata=metadata)
+                os.replace(temporary_path, weights_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -593,8 +615,10 @@ def iter_model_weights(
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
+    maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     contract = weight_export_contract(model)
@@ -604,6 +628,7 @@ def iter_model_weights(
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
         iterator = builder(_family_model_for_export(model))
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     if weight_format == "vllm" and contract is not None:
@@ -615,3 +640,4 @@ def iter_model_weights(
         is_zero3=is_zero3,
         checkpoint_dir=checkpoint_dir,
     )
+    maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)

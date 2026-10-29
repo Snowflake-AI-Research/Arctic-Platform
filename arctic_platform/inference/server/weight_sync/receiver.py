@@ -30,6 +30,12 @@ import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
+from arctic_platform.debug.inference import maybe_install_inference_warmup_observer
+from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
+from arctic_platform.debug.weight_sync import maybe_begin_broadcast_load
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
+from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -72,12 +78,13 @@ def _model_parameter_l2(
             loaded_l2_sq.add_(value)
             found.add(name)
 
+    if loaded_destinations is not None:
+        found.update(name for name, _ in model.named_buffers() if name in loaded_destinations)
     missing = loaded_destinations - found if loaded_destinations is not None else set()
     if missing:
         sample = sorted(missing)[:8]
         raise RuntimeError(
-            "Weight sync resolved destination names that are not model parameters: "
-            f"{sample}"
+            f"Weight sync resolved destination names that are not model parameters or registered buffers: {sample}"
         )
 
     param_l2 = None
@@ -349,6 +356,7 @@ def _refresh_cached_weight_copies(model) -> int:
 
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
+    maybe_install_inference_warmup_observer()
 
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,
@@ -571,7 +579,6 @@ class WeightSyncExtension:
         or copies.  Requires BF16, TP=1.
         """
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
-
         writer = _DirectParamWriter(model, self.device)
         param_views: dict[str, torch.Tensor] = {}
         for name in writer.all_keys():
@@ -593,17 +600,31 @@ class WeightSyncExtension:
         self,
         model,
         engine,
+        verifier=None,
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Bucket path for TP=1 non-quantized models.
 
-        Copies from the engine's bucket buffer into pre-computed parameter views.
+        Uses the model loader for mapped names, otherwise pre-computed views.
         Returns the received count, all-byte and applied-source squared-L2
         norms, canonical destination mapping, and skipped names. Direct loading
         never skips a source: unresolved names fail after the receive completes.
         """
+        if getattr(model, "hf_to_vllm_mapper", None) is not None:
+            result = self._load_batched(model, engine, verifier=verifier)
+            loaded, _, _, _, skipped = result
+            if len(skipped) > 0:
+                sample = "\n".join(f"  - {name}" for name in skipped[:10])
+                raise AssertionError(
+                    f"Weight sync (_load_direct) received {len(skipped)}/{loaded} "
+                    "tensor(s) whose names have no destination in the model loader.\n"
+                    f"Sample orphan names:\n{sample}"
+                )
+            return result
+
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
 
         writer = _DirectParamWriter(model, self.device)
+        maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
         orphans: list[str] = []
         source_to_destinations: dict[str, list[str]] = {}
@@ -613,7 +634,8 @@ class WeightSyncExtension:
             view = writer.get_view(name)
             destination = writer.get_destination(name)
             if view is not None and destination is not None:
-                view.copy_(tensor)
+                with maybe_observe_broadcast_tensor(verifier, lambda _, value: view.copy_(value), name, tensor):
+                    view.copy_(tensor)
                 source_to_destinations[name] = [destination]
             else:
                 orphans.append(name)
@@ -645,6 +667,7 @@ class WeightSyncExtension:
         self,
         model,
         engine,
+        verifier=None,
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Batched path for TP>1 models (including FP8+TP>1) and HF-named sync.
 
@@ -659,14 +682,15 @@ class WeightSyncExtension:
         ``weight_loader`` to shard correctly.  Non-fused names fall through
         untouched, so the HF-named (``weight_format="hf"``) path is unaffected.
 
-        Returns the received count, all-byte and applied-source squared-L2
-        norms, canonical destination mapping, and skipped source names.
+        Returns the received count, all-byte and applied-parameter-source
+        squared-L2 norms, canonical destination mapping, and skipped sources.
+        Registered buffers are loaded and mapped but excluded from parameter norms.
         """
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
         )
-
         writer = _ShardAwareFusedWriter(model, self.device)
+        maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
@@ -680,10 +704,14 @@ class WeightSyncExtension:
             recv_l2_sq.add_(source_l2_sq)
             destination = writer.destination_name(name)
             if destination is not None:
-                writer.feed(name, tensor)
+                with maybe_observe_broadcast_tensor(verifier, writer.feed, name, tensor):
+                    writer.feed(name, tensor)
                 destinations = [destination]
             else:
-                loaded_names = model.load_weights([(name, tensor)])
+                with maybe_observe_broadcast_tensor(
+                    verifier, lambda source, value: model.load_weights([(source, value)]), name, tensor
+                ):
+                    loaded_names = model.load_weights([(name, tensor)])
                 if isinstance(loaded_names, str):
                     destinations = [loaded_names]
                 else:
@@ -691,7 +719,8 @@ class WeightSyncExtension:
             destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
-                applied_source_l2_sq.add_(source_l2_sq)
+                if any(destination in param_names for destination in destinations):
+                    applied_source_l2_sq.add_(source_l2_sq)
             else:
                 skipped_source_names.append(name)
             loaded += 1
@@ -765,6 +794,7 @@ class WeightSyncExtension:
             get_tensor_model_parallel_world_size,
             get_world_group,
         )
+        maybe_admit_broadcast_receiver(self, engine_only=engine_only)
 
         if weight_format not in ("vllm", "hf"):
             raise ValueError(
@@ -784,6 +814,7 @@ class WeightSyncExtension:
 
         start = time.time()
         model = self.model_runner.model
+        verifier = maybe_begin_broadcast_load(self, model, engine)
         torch.cuda.reset_peak_memory_stats(self.device)
         mem_before = torch.cuda.memory_allocated(self.device)
 
@@ -808,7 +839,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = self._load_batched(model, engine)
+            ) = self._load_batched(model, engine, verifier=verifier)
         elif self.model_config.quantization:
             path = "fp8"
             loaded, recv_l2_sq = self._load_fp8(model, engine)
@@ -820,7 +851,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = self._load_direct(model, engine)
+            ) = self._load_direct(model, engine, verifier=verifier)
         else:
             path = "batched"
             (
@@ -829,7 +860,7 @@ class WeightSyncExtension:
                 applied_source_l2_sq,
                 source_to_destinations,
                 skipped_source_names,
-            ) = self._load_batched(model, engine)
+            ) = self._load_batched(model, engine, verifier=verifier)
         refreshed = _refresh_cached_weight_copies(model)
 
         if (
@@ -870,7 +901,7 @@ class WeightSyncExtension:
             and skipped_source_names is not None
         )
 
-        result = self._build_result(start, mem_before, path, loaded)
+        result = maybe_broadcast_receiver_result(self._build_result(start, mem_before, path, loaded), verifier, rank=rank)
         result["cached_weight_copies_refreshed"] = refreshed
         result["weight_format"] = weight_format
         result["model_l2_sq_before"] = model_l2_sq_before
