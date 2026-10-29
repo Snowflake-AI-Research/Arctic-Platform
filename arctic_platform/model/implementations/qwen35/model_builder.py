@@ -608,6 +608,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        process_group=_dcp_planning_group(),
     )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
@@ -616,6 +617,20 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     _move_buffers_to_cuda(model, config)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+
+
+_DCP_PLANNING_GROUP = None
+
+
+def _dcp_planning_group():
+    """A gloo group for DCP's load planning, whose collectives exchange only Python objects. Over the NCCL world group
+    they hung or failed the model load on 8-node EFA jobs: ranks stuck in different planning collectives
+    (``scatter_object_list`` against ``all_gather_object``), and one run's scatter raised NCCL "unhandled system
+    error". On gloo they run over the host network, apart from the NCCL communicators."""
+    global _DCP_PLANNING_GROUP
+    if _DCP_PLANNING_GROUP is None:
+        _DCP_PLANNING_GROUP = torch.distributed.new_group(backend="gloo")
+    return _DCP_PLANNING_GROUP
 
 
 _RANDOM_INIT_BASE_SEED = 1234567
