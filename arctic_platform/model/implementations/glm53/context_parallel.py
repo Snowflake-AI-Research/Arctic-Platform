@@ -28,8 +28,14 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    fused_sparse_mla_backward_available,
+)
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    sparse_mla_flashmla_fused_apply,
+)
+from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
-from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
@@ -44,6 +50,8 @@ _GLOBAL_CU_SEQLENS = "_ap_glm53_global_cu_seqlens"
 # Bound one fp32 gathered-key tile while recomputing reference sparse-MLA backward.
 _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
+# Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
+_SCORE_BUDGET_BYTES = 1 << 30
 SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
 
 
@@ -93,6 +101,65 @@ def _normalize_cu_seqlens(
     return cu_seqlens
 
 
+def _unpadded_segment_indices(
+    indexer: nn.Module,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    segment_states: torch.Tensor,
+    query_positions: torch.Tensor,
+    output_width: int,
+) -> torch.Tensor:
+    """``_select_sparse_indices`` for one segment without padding, minus its dense intermediates.
+
+    The general path builds ``[queries, heads, pools]`` FP32 scores and a ``[queries, keys]``
+    visibility mask -- hundreds of GB at 256K. With every key valid, pool ``i`` is visible to the query
+    at segment position ``t`` exactly when ``i < (t + 1) // kpool``, and the tail is the query's own
+    incomplete pool, so each query chunk is scored by the fused indexer kernel and picks its top-k
+    there. ``query`` is ``[queries, heads, dim]`` and ``weights`` ``[queries, heads]``; returns
+    segment-relative token indices in the general path's column layout, ``-1`` where unused.
+    """
+    kpool = indexer.index_kpool
+    pool_keys = indexer.get_pooled_states(packed_states=segment_states)[0][0].contiguous()
+    pools = pool_keys.shape[0]
+    select_k = min(indexer.index_topk // kpool, pools)
+    visible_pools = torch.div(query_positions + 1, kpool, rounding_mode="floor").clamp(max=pools).to(torch.int32)
+    # relu(scale * s) == scale * relu(s): the softmax scale folds into the head weights.
+    head_weights = (weights * indexer.softmax_scale).contiguous()
+    query_by_head = query.permute(1, 0, 2)
+    unit_key_scales = torch.ones(pools, dtype=torch.float32, device=query.device)
+    first_keys = torch.zeros_like(visible_pools)
+    pool_offsets = torch.arange(kpool, device=query.device)
+    tail_offsets = torch.arange(kpool - 1, device=query.device)
+
+    out = torch.full((query.shape[0], output_width), -1, dtype=torch.int32, device=query.device)
+    rows = max(1, _SCORE_BUDGET_BYTES // (4 * max(pools, 1)))
+    for start in range(0, query.shape[0], rows):
+        stop = min(start + rows, query.shape[0])
+        visible = visible_pools[start:stop]
+        width = max(int(visible.max()), 1)
+        scores = fp8_indexer.weighted_relu_scores(
+            query_by_head[:, start:stop],
+            pool_keys,
+            unit_key_scales,
+            head_weights[start:stop],
+            first_keys[start:stop],
+            visible,
+            width,
+        )
+        chosen = fp8_indexer.topk_indices(scores, min(select_k, width))
+        tokens = chosen[..., None] * kpool + pool_offsets
+        tokens = tokens.masked_fill((chosen >= visible[:, None])[..., None], -1).flatten(1)
+        pieces = [F.pad(tokens, (0, select_k * kpool - tokens.shape[1]), value=-1)]
+        if indexer.index_kpool_always_select_tail:
+            seen = query_positions[start:stop] + 1
+            tail_count = seen % kpool
+            tail = (seen - tail_count)[:, None] + tail_offsets
+            pieces.append(tail.masked_fill(tail_offsets >= tail_count[:, None], -1))
+        segment = torch.cat(pieces, dim=1)[:, :output_width]
+        out[start:stop, : segment.shape[1]] = segment.to(torch.int32)
+    return out
+
+
 @torch.no_grad()
 def _select_sparse_indices(
     indexer: nn.Module,
@@ -138,6 +205,26 @@ def _select_sparse_indices(
         segment_states = packed_states[:, start:end]
         valid_keys = segment_states[..., -1].bool()
         segment_length = end - start
+        segment_queries = slice(local_start - query_offset, local_end - query_offset)
+        if (
+            batch_size == 1
+            and hidden_states.is_cuda
+            # The fused scorer's tensor-core dot runs over a power-of-two head dim of at least 16.
+            and indexer.head_dim >= 16
+            and indexer.head_dim & (indexer.head_dim - 1) == 0
+            and bool(valid_keys.all())
+            and bool(attention_mask[:, segment_queries].all())
+        ):
+            segment_topk = _unpadded_segment_indices(
+                indexer,
+                query[0, segment_queries],
+                weights[0, segment_queries],
+                segment_states,
+                torch.arange(local_start - start, local_end - start, device=hidden_states.device),
+                output_width,
+            )
+            topk_indices[0, segment_queries] = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
+            continue
         key_positions = torch.arange(segment_length, device=hidden_states.device)
         pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
         pool_keys_transposed = pool_keys.transpose(-1, -2).float().unsqueeze(1)
@@ -270,6 +357,10 @@ def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
     )
 
 
+def _fused_sparse_mla_backward_available() -> bool:
+    return fused_sparse_mla_backward_available()
+
+
 def _use_flashmla(query: torch.Tensor, value_dim: int) -> bool:
     # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x.
     return (
@@ -284,6 +375,10 @@ def _select_sparse_mla_backend(requested: str, query: torch.Tensor, key_value: t
     if requested not in SPARSE_MLA_BACKENDS:
         raise ValueError(f"Unknown GLM-5.3 sparse attention backend {requested!r}; expected {SPARSE_MLA_BACKENDS}")
     if requested in ("sparse_mla", "flashinfer"):
+        # FlashInfer's forward pairs with the tiled reference backward; with the fused TileLang backward
+        # installed, FlashMLA's forward and that backward are the faster sparse_mla choice on Hopper too.
+        if requested == "sparse_mla" and _fused_sparse_mla_backward_available() and _use_flashmla(query, value_dim):
+            return "flashmla"
         if value_dim == 512 and _use_flashinfer(query, key_value):
             return "flashinfer"
         if requested == "flashinfer":
@@ -565,15 +660,18 @@ def _sparse_attention_forward(
         if padding:
             sparse_query = F.pad(sparse_query, (0, padding))
             sparse_kv = F.pad(sparse_kv, (0, padding))
-        absorbed_output = sparse_mla_flashmla_apply(
+        # The fused TileLang backward reads unused slots as the sentinel (last, zero) row, not -1;
+        # the FlashMLA forward maps them back to -1.
+        sentinel_indices = kernel_indices.masked_fill(kernel_indices < 0, sparse_kv.shape[1] - 1)
+        absorbed_output = sparse_mla_flashmla_fused_apply(
             sparse_query,
             sparse_kv,
-            kernel_indices.unsqueeze(2),
+            sentinel_indices.unsqueeze(2),
             self.scaling,
         )
         if not getattr(self, "_ap_flashmla_dispatch_reported", False):
             get_logger().info(
-                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=reference",
+                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=fused",
                 dist.get_rank() if dist.is_initialized() else 0,
                 576 - padding,
             )
@@ -610,6 +708,11 @@ def _report_convolution_fallback(error: str) -> None:
     get_logger().info("GLM53_KDA_CONVOLUTION_FALLBACK causal_conv1d unavailable (%s); using unfused F.conv1d", error)
 
 
+def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    logits = self.b_proj(hidden_states)
+    return torch.sigmoid(logits.float() if getattr(self, "_fp32_parity", True) else logits)
+
+
 def _linear_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -633,7 +736,7 @@ def _linear_attention_forward(
     key = self.k_proj(hidden_states).view(shape)
     value = self.v_proj(hidden_states).view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = _kda_beta(self, hidden_states)
     exchanged = _pack_and_exchange_head_tensors(
         {
             "query": query,
@@ -776,7 +879,7 @@ def _local_linear_attention_forward(
     key = key.view(shape)
     value = value.view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = _kda_beta(self, hidden_states)
 
     from fla.ops.kda import chunk_kda
 
@@ -879,6 +982,7 @@ def apply_context_parallelism(
             parallel_modules.append(attention)
             sparse_layers += 1
         elif layer.block_type == "linear_attention":
+            attention._fp32_parity = getattr(model.config, "fp32_parity", True)
             if attention.num_heads % cp_world_size:
                 raise ValueError(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"

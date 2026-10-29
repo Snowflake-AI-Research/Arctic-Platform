@@ -167,11 +167,12 @@ class CallbackRunner:
 
 # MEAN divides at each leaf (inside _combine's recursion), not on the merged
 # structure afterward -- the merged value may be a nested dict/list, which a
-# bare "/ len(values)" can't divide.
-_COMBINE = {
-    Reduce.SUM: sum,
-    Reduce.MAX: max,
-    Reduce.MIN: min,
+# bare "/ len(values)" can't divide. Builtin ``sum``/``max``/``min`` are wrapped
+# so mypy sees ``Callable[[List[Any]], Any]`` rather than a bare function type.
+_COMBINE: Dict[Reduce, Callable[[List[Any]], Any]] = {
+    Reduce.SUM: lambda values: sum(values),
+    Reduce.MAX: lambda values: max(values),
+    Reduce.MIN: lambda values: min(values),
     Reduce.MEAN: lambda values: sum(values) / len(values),
 }
 
