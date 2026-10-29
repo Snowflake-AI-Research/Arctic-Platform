@@ -57,7 +57,7 @@ class Qwen3_5MoeOptions(BaseModel):
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
     moe_use_sonicmoe: bool = Field(
-        True,
+        False,
         description="Run BF16 routed experts through SonicMoE on the EP receive buffer when that kernel applies.",
     )
     fused_cross_entropy: bool | Literal["liger"] = Field("liger", description="LM-head fused CE backend.")

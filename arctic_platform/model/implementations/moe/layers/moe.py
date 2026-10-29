@@ -96,8 +96,8 @@ class MoEArgs:
     # token-choice
     top_k: int = 1
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
-    # BF16 DeepEP/UCCL experts take SonicMoE when the kernel applies. False keeps the grouped GEMM path.
-    use_sonicmoe: bool = True
+    # BF16 DeepEP/UCCL experts take SonicMoE when the kernel applies. False (the default) keeps the grouped GEMM path.
+    use_sonicmoe: bool = False
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""

@@ -102,19 +102,23 @@ def test_sonicmoe_option_reaches_each_moe(monkeypatch, builder, config_cls):
     monkeypatch.setattr(ep_backend, "get_ep_comm_module", fake_ep_module)
     monkeypatch.setattr(builder, "get_ep_comm_module", fake_ep_module, raising=False)
     model, moe = _language_model_with_moe()
+    assert moe.use_sonicmoe is False
+
+    builder.configure_moe_ep_backend(model, config_cls(moe_use_sonicmoe=True))
+
     assert moe.use_sonicmoe is True
 
-    builder.configure_moe_ep_backend(model, config_cls(moe_use_sonicmoe=False))
+    builder.configure_moe_ep_backend(model, config_cls())
 
     assert moe.use_sonicmoe is False
 
 
 @pytest.mark.parametrize("apply_ac", [glm52_builder.apply_ac, qwen35_builder.apply_ac], ids=["glm52", "qwen35"])
-def test_full_checkpointing_installs_combine_replay_unless_disabled(apply_ac):
+def test_full_checkpointing_installs_combine_replay_only_when_enabled(apply_ac):
     model, moe = _language_model_with_moe()
     apply_ac(model, ActivationCheckpointConfig(mode="full", router_replay_recompute=False))
-    assert isinstance(moe.combine_replay, CombineReplay)
+    assert moe.combine_replay is None
 
     model, moe = _language_model_with_moe()
-    apply_ac(model, ActivationCheckpointConfig(mode="full", combine_replay=False, router_replay_recompute=False))
-    assert moe.combine_replay is None
+    apply_ac(model, ActivationCheckpointConfig(mode="full", combine_replay=True, router_replay_recompute=False))
+    assert isinstance(moe.combine_replay, CombineReplay)

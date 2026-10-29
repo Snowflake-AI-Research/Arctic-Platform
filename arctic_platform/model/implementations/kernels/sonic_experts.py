@@ -41,7 +41,7 @@ _sonicmoe_import_warned = False
 
 
 def _warn_sonicmoe_import_failed(exc: BaseException) -> None:
-    """One warning when the default path cannot import SonicMoE and grouped GEMM is used instead."""
+    """One warning when SonicMoE is enabled but cannot be imported and grouped GEMM is used instead."""
     global _sonicmoe_import_warned
     if _sonicmoe_import_warned:
         return

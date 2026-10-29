@@ -111,14 +111,14 @@ def test_family_defaults_remain_distinct():
     assert (qwen_config.attn, qwen_config.moe_use_grouped_mm, qwen_config.moe_use_sonicmoe) == (
         "flash_attention_3",
         True,
-        True,
+        False,
     )
     assert (
         glm_config.attn,
         glm_config.moe_use_grouped_mm,
         glm_config.moe_use_sonicmoe,
         glm_config.sparse_mla_backend,
-    ) == ("flash_attention_2", False, True, "ref")
+    ) == ("flash_attention_2", False, False, "ref")
 
 
 def test_qwen_adapter_keeps_sp_and_vllm_export(monkeypatch):

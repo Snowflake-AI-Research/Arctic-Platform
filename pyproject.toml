@@ -134,8 +134,8 @@ gdn = [
     "causal-conv1d",
 ]
 
-# BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults on. The floor is the one
-# Dao-AILab/sonic-moe declares. quack-kernels depends on nvidia-cutlass-dsl (the cutlass module);
+# BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults off; turning it on needs this extra.
+# The floor is the one Dao-AILab/sonic-moe declares. quack-kernels depends on nvidia-cutlass-dsl (the cutlass module);
 # nvidia-cutlass-dsl-libs-base depends on cuda-bindings, which provides cuda.bindings.
 sonicmoe = [
     "quack-kernels>=0.4.0",
