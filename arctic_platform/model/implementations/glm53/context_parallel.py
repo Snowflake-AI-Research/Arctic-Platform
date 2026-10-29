@@ -742,6 +742,11 @@ def _report_convolution_fallback(error: str) -> None:
     get_logger().info("GLM53_KDA_CONVOLUTION_FALLBACK causal_conv1d unavailable (%s); using unfused F.conv1d", error)
 
 
+def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    logits = self.b_proj(hidden_states)
+    return torch.sigmoid(logits.float() if getattr(self, "_fp32_parity", True) else logits)
+
+
 def _linear_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -765,7 +770,7 @@ def _linear_attention_forward(
     key = self.k_proj(hidden_states).view(shape)
     value = self.v_proj(hidden_states).view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = _kda_beta(self, hidden_states)
     exchanged = _pack_and_exchange_head_tensors(
         {
             "query": query,
@@ -908,7 +913,7 @@ def _local_linear_attention_forward(
     key = key.view(shape)
     value = value.view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = _kda_beta(self, hidden_states)
 
     from fla.ops.kda import chunk_kda
 
@@ -1011,6 +1016,7 @@ def apply_context_parallelism(
             parallel_modules.append(attention)
             sparse_layers += 1
         elif layer.block_type == "linear_attention":
+            attention._fp32_parity = getattr(model.config, "fp32_parity", True)
             if attention.num_heads % cp_world_size:
                 raise ValueError(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"
