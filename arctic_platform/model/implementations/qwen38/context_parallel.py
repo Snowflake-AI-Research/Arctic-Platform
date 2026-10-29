@@ -59,7 +59,7 @@ def _install_finite_check(module: nn.Module, name: str) -> None:
     module.register_forward_hook(check)
 
 
-def _adapt_linear_attention(module: nn.Module, process_group) -> None:
+def _adapt_linear_attention(module: nn.Module, process_group, *, fp32_parity: bool = True) -> None:
     from fla.modules.conv import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
@@ -105,7 +105,7 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         value = value.view(batch_size, local_sequence_length, num_value_heads, int(self.head_v_dim))
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
-        beta = b.sigmoid()
+        beta = b.float().sigmoid() if fp32_parity else b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
         if num_value_heads // num_key_heads > 1:
             replication = num_value_heads // num_key_heads
@@ -294,7 +294,9 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
     for layer_idx, layer in enumerate(backbone.layers):
         if getattr(layer, "layer_type", None) == "linear_attention":
             linear_attention = layer.linear_attn
-            _adapt_linear_attention(linear_attention, model_cp_group)
+            _adapt_linear_attention(
+                linear_attention, model_cp_group, fp32_parity=getattr(model.config, "fp32_parity", True)
+            )
             linear_modules.append(linear_attention)
             if check_finite:
                 _install_finite_check(linear_attention, f"layer {layer_idx} GatedDeltaNet")

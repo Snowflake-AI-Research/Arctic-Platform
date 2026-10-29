@@ -15,8 +15,9 @@
 
 """Profile of the ``qwen4_exp`` loader (Qwen3.8-Flash-Next).
 
-The loader registers ``GenericMoeOptions``, so it extends the ``generic_moe`` profile and overrides only what
-differs.
+The loader registers ``FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity``), so it extends the
+``generic_moe`` profile and overrides only what differs: it supports ``numerics.fp32_parity``, which evaluates the
+QSA rotary embedding, softmax probabilities, P·V product and output gate in fp32, as vLLM does.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ def register(registry: Registry) -> None:
     register_profile(
         "qwen4_exp",
         extends="generic_moe",
+        supports=["numerics.fp32_parity"],
         not_applicable={
             "attention.sparse_mla": "Qwen3.8-Flash-Next uses QSA attention, not sparse MLA",
         },
