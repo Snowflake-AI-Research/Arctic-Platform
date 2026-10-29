@@ -14,20 +14,22 @@ from arctic_platform.inference.server.router_replay.all2all import (
     _compute_plan,
     _missing_is_tolerated,
     _PerRankManifest,
+    _plan_rounds,
 )
 
 
-def _sender(rank, held, shape=(4, 2, 2), supports_allow_missing=True):
+def _sender(rank, held, shape=(4, 2, 2), supports_allow_missing=True, staging_bytes=None):
     return _PerRankManifest(
         role="sender", rank=rank, held=list(held), shapes={sid: list(shape) for sid in held},
         supports_allow_missing=supports_allow_missing,
+        staging_bytes=staging_bytes, supports_staged_rounds=True,
     )
 
 
 def _receiver(rank, needed, allow_missing=False, supports_allow_missing=True):
     return _PerRankManifest(
         role="receiver", rank=rank, needed=list(needed), allow_missing=allow_missing,
-        supports_allow_missing=supports_allow_missing,
+        supports_allow_missing=supports_allow_missing, supports_staged_rounds=True,
     )
 
 
@@ -35,6 +37,13 @@ def _legacy(manifest):
     """The manifest as a rank on the pre-``allow_missing`` planner sends it: no handshake field."""
     del manifest.__dict__["allow_missing"]
     del manifest.__dict__["supports_allow_missing"]
+    return _pre_rounds(manifest)
+
+
+def _pre_rounds(manifest):
+    """The manifest as a rank whose planner predates staged rounds sends it."""
+    del manifest.__dict__["staging_bytes"]
+    del manifest.__dict__["supports_staged_rounds"]
     return pickle.loads(pickle.dumps(manifest))
 
 
@@ -55,28 +64,33 @@ class _FakeNCCL:
         self._recv_values = list(recv_values)
         self.sent = []
         self.fuses = 0
+        self.ops_per_fuse = []
 
     def group_start(self):
         self.fuses += 1
+        self.ops_per_fuse.append([])
 
     def group_end(self):
         pass
 
     def send(self, tensor, dst):
         self.sent.append((dst, tensor.clone()))
+        self.ops_per_fuse[-1].append(("send", dst, tensor.numel()))
 
     def recv(self, tensor, src):
         tensor.copy_(self._recv_values.pop(0))
+        self.ops_per_fuse[-1].append(("recv", src, tensor.numel()))
 
 
-def _group(role, rank, peers, nccl=None):
+def _group(role, rank, peers, nccl=None, device="cpu", staging_bytes=None):
     return RouterReplayGroup(
         role=role,
         rank=rank,
         world_size=len(peers),
         pg=_FakePG(peers),
         nccl=nccl or _FakeNCCL(),
-        device=torch.device("cpu"),
+        device=torch.device(device),
+        staging_bytes=staging_bytes,
     )
 
 
@@ -245,3 +259,99 @@ def test_uint16_ids_cross_as_bytes_and_land_exact():
     assert (dst, wire.dtype) == (0, torch.uint8)
     out = rx.pop("rr1:a")
     assert out.dtype == torch.uint16 and torch.equal(out, ids)
+
+
+def _ops(rounds):
+    return [[(op.sender_rank, op.recv_rank, op.sample_id) for op in ops] for ops in rounds]
+
+
+def test_staged_rounds_cap_each_senders_bytes_and_keep_plan_order():
+    # 16-byte captures and a 40-byte budget: two of a sender's captures per round.
+    manifests = [
+        _receiver(0, ["rr1:a", "rr1:b", "rr1:c"]),
+        _receiver(1, ["rr1:d", "rr1:e"]),
+        _sender(2, ["rr1:a", "rr1:b", "rr1:c", "rr1:e"], staging_bytes=40),
+        _sender(3, ["rr1:d"]),
+    ]
+    plan, _ = _compute_plan(manifests)
+
+    assert _ops(_plan_rounds(manifests, plan)) == [
+        [(2, 0, "rr1:a"), (2, 0, "rr1:b"), (3, 1, "rr1:d")],
+        [(2, 0, "rr1:c"), (2, 1, "rr1:e")],
+    ]
+
+
+def test_staged_rounds_use_the_smallest_budget_and_send_an_oversized_capture_alone():
+    manifests = [
+        _receiver(0, ["rr1:a", "rr1:b"]),
+        _sender(1, ["rr1:a", "rr1:b"], staging_bytes=1 << 20),
+        _sender(2, [], staging_bytes=8),
+    ]
+    plan, _ = _compute_plan(manifests)
+
+    assert _ops(_plan_rounds(manifests, plan)) == [[(1, 0, "rr1:a")], [(1, 0, "rr1:b")]]
+
+
+@pytest.mark.parametrize("staging_bytes,pre_rounds_rank", [(None, None), (8, 0), (8, 2)])
+def test_plan_is_one_round_without_a_budget_or_with_a_peer_that_predates_rounds(
+    staging_bytes, pre_rounds_rank,
+):
+    manifests = [
+        _receiver(0, ["rr1:a", "rr1:b"]),
+        _sender(1, ["rr1:a"], staging_bytes=staging_bytes),
+        _sender(2, ["rr1:b"]),
+    ]
+    if pre_rounds_rank is not None:
+        manifests[pre_rounds_rank] = _pre_rounds(manifests[pre_rounds_rank])
+    plan, _ = _compute_plan(manifests)
+
+    assert _plan_rounds(manifests, plan) == [plan]
+
+
+def test_sender_advertises_staging_only_for_a_cache_off_the_nccl_device():
+    group = _group("sender", 1, [], device="cuda:0", staging_bytes=1234)
+    tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+
+    host = group._build_send_manifest(tx.snapshot(), cache_device=tx.device)
+    on_device = group._build_send_manifest(tx.snapshot(), cache_device=torch.device("cuda:0"))
+
+    assert (host.staging_bytes, on_device.staging_bytes) == (1234, None)
+    assert host.supports_staged_rounds and on_device.supports_staged_rounds
+
+
+def test_staged_exchange_runs_one_fuse_per_round_on_both_sides_and_lands_exact():
+    captures = {f"rr1:{i}": torch.full((4, 2, 2), i, dtype=torch.uint8) for i in range(5)}
+    tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    for sid, capture in captures.items():
+        tx.put(sid, capture)
+    needed = list(captures)
+    # A host-memory peer's 40-byte budget sets the rounds for every rank: two 16-byte captures each.
+    budget_peer = _sender(2, [], staging_bytes=40)
+    sender = _group("sender", 1, [_receiver(0, needed), _sender(1, []), budget_peer])
+    sender_manifest = sender._build_send_manifest(tx.snapshot(), cache_device=tx.device)
+
+    assert sender.send(tx) == {"tensors_sent": 5}
+
+    receiver = _group(
+        "receiver", 0, [_receiver(0, needed), sender_manifest, budget_peer],
+        _FakeNCCL([wire for _, wire in sender.nccl.sent]),
+    )
+    rx = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1 << 20)
+    assert receiver.recv(rx, needed_sample_ids=needed) == {"tensors_recv": 5, "dropped_sample_ids": []}
+
+    sent = [[(dst, n) for _, dst, n in ops] for ops in sender.nccl.ops_per_fuse]
+    received = [[(src, n) for _, src, n in ops] for ops in receiver.nccl.ops_per_fuse]
+    assert sent == [[(0, 16), (0, 16)], [(0, 16), (0, 16)], [(0, 16)]]
+    assert received == [[(1, 16), (1, 16)], [(1, 16), (1, 16)], [(1, 16)]]
+    assert sender.stats()["n_rounds"] == receiver.stats()["n_rounds"] == 3
+    for sid, capture in captures.items():
+        assert torch.equal(rx.pop(sid), capture)
+    assert len(tx) == 0
+
+
+def test_staging_budget_reads_the_environment_and_must_be_positive(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_STAGING_BYTES", "4096")
+    assert _group("sender", 1, []).staging_bytes == 4096
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _group("sender", 1, [], staging_bytes=0)

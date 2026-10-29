@@ -1,12 +1,17 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import arctic_platform.inference.server.worker as worker_module
+from arctic_platform.inference.server import router_replay
 from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
 from arctic_platform.inference.server.worker import (
+    InferenceWorker,
     _has_string_stop,
     _normalize_stop_token_sequences,
+    _pop_router_replay_engine_kwargs,
     _result_from_output,
 )
 
@@ -139,6 +144,53 @@ def test_result_from_output_rejects_capture_length_mismatch_before_cache_write()
 
     assert cache.puts == []
     assert cache.put_news == []
+
+
+def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():
+    kwargs = {"model": "m", "router_replay_max_cache_bytes": 1234, "router_replay_cache_device": "cpu"}
+
+    assert _pop_router_replay_engine_kwargs(kwargs) == {
+        "router_replay_max_cache_bytes": 1234,
+        "router_replay_cache_device": "cpu",
+    }
+    assert kwargs == {"model": "m"}
+    with pytest.raises(ValueError, match="router_replay_cache_device must be one of"):
+        _pop_router_replay_engine_kwargs({"router_replay_cache_device": "gpu"})
+
+
+@pytest.mark.parametrize("cache_device,expected", [(None, "cuda:0"), ("cuda", "cuda:0"), ("cpu", "cpu")])
+def test_tx_cache_is_placed_on_the_configured_device(monkeypatch, cache_device, expected):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+    router_kwargs = {"router_replay_max_cache_bytes": 1 << 20}
+    if cache_device is not None:
+        router_kwargs["router_replay_cache_device"] = cache_device
+
+    worker._maybe_init_router_replay_tx({"enable_return_routed_experts": True}, router_kwargs)
+
+    assert worker._router_replay_tx.device == torch.device(expected)
+    assert worker._router_replay_tx.max_bytes == 1 << 20
+    assert worker._router_replay_tx_on_host is (cache_device == "cpu")
+
+
+def test_nccl_init_keeps_a_host_tx_cache_and_its_entries(monkeypatch):
+    groups = []
+    monkeypatch.setattr(worker_module, "_clear_ray_blanked_cuda_visible_devices", lambda: False)
+    monkeypatch.setattr(torch._C, "_cuda_getDeviceCount", lambda: 1, raising=False)
+    monkeypatch.setattr(router_replay, "init_router_replay_group", lambda **kw: groups.append(kw) or "group")
+    tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    tx.put("rr1:a", torch.ones(4, 2, 2, dtype=torch.uint8))
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+    worker._router_replay_tx = tx
+    worker._router_replay_tx_on_host = True
+    worker._router_replay_group = None
+
+    result = asyncio.run(worker.init_router_replay("127.0.0.1", 1, rank=2, world_size=3))
+
+    assert result["status"] == "ok"
+    assert worker._router_replay_tx is tx and "rr1:a" in tx
+    assert groups[0]["device"] == torch.device("cuda:0")
+    assert worker._router_replay_group == "group"
 
 
 def test_router_replay_stop_token_sequence_normalization():

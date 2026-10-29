@@ -62,6 +62,7 @@ class RestoredEngine(NamedTuple):
 _NON_VLLM_ENGINE_KEYS = frozenset({
     "ray_num_gpus",
     "router_replay_max_cache_bytes",
+    "router_replay_cache_device",
 })
 
 # Values meaning "the operator did not ask for this". A ModelConfig default
