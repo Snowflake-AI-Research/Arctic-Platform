@@ -77,12 +77,12 @@ def test_glm53_fp32_parameters_survive_deepspeed_and_train(single_rank_group):
     parameters = dict(engine.module.named_parameters())
     assert parameters["lm_head.weight"].dtype == torch.bfloat16
     for name, value in exact.items():
-        torch_assert_equal(parameters[name], value, msg=lambda default, name=name: f"{name}: {default}")
+        torch_assert_equal(parameters[name].cpu(), value, msg=lambda default, name=name: f"{name}: {default}")
 
     engine.backward(sum(parameter.float().sum() for parameter in engine.module.parameters()))
     engine.step()
 
     for name, value in exact.items():  # Adam's first step with a unit gradient is -LR
         torch_assert_close(
-            parameters[name], value - LR, rtol=0, atol=1e-6, msg=lambda default, name=name: f"{name}: {default}"
+            parameters[name].cpu(), value - LR, rtol=0, atol=1e-6, msg=lambda default, name=name: f"{name}: {default}"
         )
