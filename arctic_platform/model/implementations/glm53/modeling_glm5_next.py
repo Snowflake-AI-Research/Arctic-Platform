@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import types
+
 import torch
 from torch import Tensor
 from torch import nn
@@ -22,6 +24,7 @@ from transformers.cache_utils import Cache
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
 
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
@@ -76,6 +79,13 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
                 device=module.weight.device,
             ),
         )
+
+
+def _rms_norm_rounded_once(self, hidden_states: Tensor) -> Tensor:
+    """``Glm5NextTextRMSNorm`` rounded once, with the weight multiplied in fp32, as every vLLM GLM-5.3 norm kernel does."""
+    normed = hidden_states.float()
+    normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+    return (normed * self.weight.float()).to(hidden_states.dtype)
 
 
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
@@ -174,6 +184,9 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
+        for module in self.modules():
+            if type(module) is Glm5NextTextRMSNorm:
+                module.forward = types.MethodType(_rms_norm_rounded_once, module)
         self._is_vlm = True
 
     @classmethod

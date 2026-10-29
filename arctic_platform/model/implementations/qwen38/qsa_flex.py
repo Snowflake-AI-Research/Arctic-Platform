@@ -36,6 +36,8 @@ from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 
+from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
+
 _BACKEND = "qsa_flex"
 _QSA_SCORE_BUDGET_BYTES = 256 * 1024 * 1024
 _QSA_ATTENTION_CHUNK_ROWS = 128
@@ -386,15 +388,15 @@ def _sparse_gqa_from_selected(
     scores.masked_fill_(~valid[:, :, None, None], -torch.inf)
     empty = ~valid.any(dim=-1)
     scores.masked_fill_(empty[:, :, None, None, None], 0)
-    probabilities = torch.softmax(scores, dim=-1).to(selected_value.dtype)
-    probabilities.masked_fill_(~valid[:, :, None, None], 0)
+    # fp32 probabilities and PV, one rounding; vLLM's split-K kernel never rounds the normalized probabilities.
+    probabilities = torch.softmax(scores, dim=-1).masked_fill(~valid[:, :, None, None], 0)
     output = torch.einsum(
         "bqhgr,bqrhd->bqhgd",
         probabilities,
-        selected_value,
+        selected_value.float(),
     ).reshape(batch_size, query_length, num_query_heads, head_dim)
     output.masked_fill_(empty[:, :, None, None], 0)
-    return output
+    return output.to(selected_value.dtype)
 
 
 def _sparse_gqa_chunk(
@@ -521,7 +523,6 @@ def _qsa_attention_forward(
 ):
     if self.training and self.attention_dropout:
         raise ValueError("Qwen3.8 QSA FlexAttention does not support attention dropout")
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
     # Packed-row boundaries from the caller's varlen metadata, when given, outrank boundaries inferred from positions.
     selected_token_ids = self.indexer(
@@ -544,11 +545,9 @@ def _qsa_attention_forward(
     query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-    query_states, key_states = apply_rotary_pos_emb(
-        query_states,
-        key_states,
-        *position_embeddings,
-    )
+    # vLLM rotates in fp32 and rounds once; the transformers expression rounds each product and the sum to bf16.
+    query_states = rope_rotary_slice_fp32(query_states, *position_embeddings)
+    key_states = rope_rotary_slice_fp32(key_states, *position_embeddings)
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
     cp_group, _, _ = _cp_info(self)
@@ -562,7 +561,7 @@ def _qsa_attention_forward(
         softmax_scale=self.scaling,
     )
     attention_output = attention_output.reshape(*input_shape, -1).contiguous()
-    attention_output = attention_output * torch.sigmoid(gate)
+    attention_output = (attention_output.float() * torch.sigmoid(gate.float())).to(gate.dtype)
     return self.o_proj(attention_output), None
 
 
