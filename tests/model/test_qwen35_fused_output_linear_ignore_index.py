@@ -206,7 +206,9 @@ def test_fused_logprob_backward_matches_dense_and_skips_a_frozen_weight(device, 
 
     ref_hidden = hidden.detach().clone().requires_grad_(True)
     ref_weight = weight.detach().clone().requires_grad_(True)
-    dense = torch.log_softmax((ref_hidden @ ref_weight.T) * inv_t[:, None], dim=-1).gather(1, labels[:, None]).squeeze(1)
+    dense = (
+        torch.log_softmax((ref_hidden @ ref_weight.T) * inv_t[:, None], dim=-1).gather(1, labels[:, None]).squeeze(1)
+    )
     (dense * upstream).sum().backward()
 
     torch.testing.assert_close(logprobs.detach(), dense.detach(), rtol=1e-4, atol=1e-4)

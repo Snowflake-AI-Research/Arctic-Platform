@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
@@ -12,23 +27,25 @@ import torch
 import torch.nn.functional as F
 from quack.autotuner import AutotuneConfig
 from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm, gemm_act, gemm_tuned
+from quack.gemm_interface import gemm
+from quack.gemm_interface import gemm_act
+from quack.gemm_interface import gemm_tuned
 
-from ..enums import ActivationType, is_glu
-from .backward import (
-    _down_projection_backward_act,
-    _token_broadcast_backward,
-    _topk_softmax_bwd,
-    _up_projection_backward_act,
-)
-from .forward import _router_forward, _topk_softmax_fwd
-from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
-
-
+from ..enums import ActivationType
+from ..enums import is_glu
+from .backward import _down_projection_backward_act
+from .backward import _token_broadcast_backward
+from .backward import _topk_softmax_bwd
+from .backward import _up_projection_backward_act
+from .forward import _router_forward
+from .forward import _topk_softmax_fwd
+from .triton_kernels import TC_topk_router_metadata_triton
+from .triton_kernels import general_routing_router_metadata_triton
 
 # QuACK autotuning accelerators, applied at import. QuACK sweeps its whole config space
 # per problem key, and MoE keys move every step (M = routed tokens), so we shrink the
 # space and let nearby M share a cache entry. Search only; the math is unchanged.
+
 
 def _fast_sm90_configs(epilogue: str | None = None, tune_coop: bool = True) -> list[GemmConfig]:
     """Reduced SM90 (Hopper) config space — drop-in for quack.gemm_config._get_sm90_configs.
@@ -168,7 +185,9 @@ def _autotuner_call_with_M_buckets(self, *args, **kwargs):
 
     # First call with this GEMM structure: let QuACK tune for real, under its own exact-shape key ...
     if len(self.configs) > 1:
-        logging.getLogger(__name__).warning("SonicMoE autotuning %s for %s", getattr(self.fn, "__name__", self.fn), bucket_key)
+        logging.getLogger(__name__).warning(
+            "SonicMoE autotuning %s for %s", getattr(self.fn, "__name__", self.fn), bucket_key
+        )
     ret = _orig_autotuner_call(self, *args, **kwargs)
 
     # ... then alias that winner onto the bucket key, for every later M in the bucket.
@@ -285,9 +304,7 @@ class _UpProjection(torch.autograd.Function):
             store_preact=(not is_inference_mode_enabled),
             bias=b1,
             concat_layout=(
-                (("B", "bias") if b1 is not None else ("B",))
-                if concat_layout and is_glu_activation
-                else None
+                (("B", "bias") if b1 is not None else ("B",)) if concat_layout and is_glu_activation else None
             ),
         )
 
@@ -296,7 +313,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.E = E
         ctx.K = K
         ctx.H = H
-        ctx.I = I
+        ctx.I = I  # noqa: E741
         ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout and is_glu_activation
@@ -459,7 +476,7 @@ class _DownProjection(torch.autograd.Function):
         db2 = None if b2 is None else torch.empty_like(b2)
         dh = torch.empty_like(h)
 
-        I = w2.size(1)
+        I = w2.size(1)  # noqa: E741
         TK = x_gather_idx.size(0)
 
         a_prime = torch.empty(TK, I, dtype=h.dtype, device=h.device)
@@ -537,7 +554,7 @@ def moe_TC_softmax_topk_layer(
         topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
     )
 
-    if type(activation_type) == str:
+    if type(activation_type) is str:
         activation_type = ActivationType(activation_type)
 
     a, h = _UpProjection.apply(

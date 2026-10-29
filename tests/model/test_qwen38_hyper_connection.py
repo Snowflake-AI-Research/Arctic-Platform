@@ -59,7 +59,10 @@ def test_fused_hyper_connection_matches_hugging_face(tokens):
         return hyper_input + (out.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
 
     results = {}
-    for name, mix, inject in (("hf", lambda m, h: m(h), reference_inject), ("fused", qwen38._mix_streams, qwen38._inject)):
+    for name, mix, inject in (
+        ("hf", lambda m, h: m(h), reference_inject),
+        ("fused", qwen38._mix_streams, qwen38._inject),
+    ):
         leaf = x.clone().requires_grad_(True)
         y, mixed, inj = _sublayer(mix, inject, module, leaf, out_weight)
         y.backward(grad)

@@ -35,7 +35,9 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _quantized(*shape: int) -> tuple[torch.Tensor, torch.Tensor]:
-    pairs = [fp8.quantize_to_fp8_blockwise(torch.randn(*shape[1:], device="cuda") * 0.02, 128) for _ in range(shape[0])]
+    pairs = [
+        fp8.quantize_to_fp8_blockwise(torch.randn(*shape[1:], device="cuda") * 0.02, 128) for _ in range(shape[0])
+    ]
     return torch.stack([p[0] for p in pairs]), torch.stack([p[1] for p in pairs])
 
 
@@ -49,7 +51,11 @@ def _experts(fp8_block_size: int | None) -> moe_module.GroupedExperts:
             param.data = (torch.randn(param.shape, device="cuda") * 0.02).bfloat16()
             param.requires_grad_(False)
     else:
-        for name, shape in (("w1", (_EXPERTS, _HIDDEN, _DIM)), ("w2", (_EXPERTS, _DIM, _HIDDEN)), ("w3", (_EXPERTS, _HIDDEN, _DIM))):
+        for name, shape in (
+            ("w1", (_EXPERTS, _HIDDEN, _DIM)),
+            ("w2", (_EXPERTS, _DIM, _HIDDEN)),
+            ("w3", (_EXPERTS, _HIDDEN, _DIM)),
+        ):
             weight, scale = _quantized(*shape)
             getattr(experts, name).data = weight
             getattr(experts, f"{name}_scale_inv").data = scale

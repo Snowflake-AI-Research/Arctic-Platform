@@ -30,9 +30,35 @@ import triton.language as tl
 
 
 @triton.jit
-def _qsa_fwd_kernel(q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr, lse_ptr, S, S_KV, R, scale,
-                    sq_b, sq_s, sq_h, sk_b, sk_s, sk_h, si_b, si_s, so_b, so_s, so_h, sl_b, sl_s,
-                    G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
+def _qsa_fwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    idx_ptr,
+    o_ptr,
+    lse_ptr,
+    S,
+    S_KV,
+    R,
+    scale,
+    sq_b,
+    sq_s,
+    sq_h,
+    sk_b,
+    sk_s,
+    sk_h,
+    si_b,
+    si_s,
+    so_b,
+    so_s,
+    so_h,
+    sl_b,
+    sl_s,
+    G: tl.constexpr,
+    GP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
     tok = tl.program_id(0)
     kvh = tl.program_id(1)
     b = tl.program_id(2)
@@ -42,7 +68,7 @@ def _qsa_fwd_kernel(q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr, lse_ptr, S, S_KV, R, sc
     q_base = q_ptr + b.to(tl.int64) * sq_b + tok.to(tl.int64) * sq_s + (kvh * G) * sq_h
     q = tl.load(q_base + heads[:, None] * sq_h + dims[None, :], mask=hmask[:, None], other=0.0)
     m = tl.full([GP], -float("inf"), tl.float32)
-    l = tl.zeros([GP], tl.float32)
+    denom = tl.zeros([GP], tl.float32)
     acc = tl.zeros([GP, D], tl.float32)
     kv_base = b.to(tl.int64) * sk_b + kvh * sk_h
     idx_base = idx_ptr + b.to(tl.int64) * si_b + tok.to(tl.int64) * si_s
@@ -58,22 +84,51 @@ def _qsa_fwd_kernel(q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr, lse_ptr, S, S_KV, R, sc
         m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
         alpha = tl.exp(m - m_safe)
         p = tl.exp(s - m_safe[:, None])
-        l = l * alpha + tl.sum(p, axis=1)
+        denom = denom * alpha + tl.sum(p, axis=1)
         v = tl.load(v_ptr + kv_base + rows[:, None] * sk_s + dims[None, :], mask=valid[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m = m_new
-    out = tl.where(l[:, None] > 0, acc / tl.where(l > 0, l, 1.0)[:, None], 0.0)
+    out = tl.where(denom[:, None] > 0, acc / tl.where(denom > 0, denom, 1.0)[:, None], 0.0)
     o_base = o_ptr + b.to(tl.int64) * so_b + tok.to(tl.int64) * so_s + (kvh * G) * so_h
     tl.store(o_base + heads[:, None] * so_h + dims[None, :], out.to(o_ptr.dtype.element_ty), mask=hmask[:, None])
-    lse = tl.where(l > 0, m + tl.log(tl.where(l > 0, l, 1.0)), float("inf"))
+    lse = tl.where(denom > 0, m + tl.log(tl.where(denom > 0, denom, 1.0)), float("inf"))
     tl.store(lse_ptr + b.to(tl.int64) * sl_b + tok.to(tl.int64) * sl_s + kvh * G + heads, lse, mask=hmask)
 
 
 @triton.jit
-def _qsa_bwd_kernel(q_ptr, k_ptr, v_ptr, idx_ptr, do_ptr, lse_ptr, delta_ptr, dq_ptr, dk_ptr, dv_ptr,
-                    S, S_KV, R, scale,
-                    sq_b, sq_s, sq_h, sk_b, sk_s, sk_h, si_b, si_s, sl_b, sl_s, sdk_b, sdk_s, sdk_h,
-                    G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
+def _qsa_bwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    idx_ptr,
+    do_ptr,
+    lse_ptr,
+    delta_ptr,
+    dq_ptr,
+    dk_ptr,
+    dv_ptr,
+    S,
+    S_KV,
+    R,
+    scale,
+    sq_b,
+    sq_s,
+    sq_h,
+    sk_b,
+    sk_s,
+    sk_h,
+    si_b,
+    si_s,
+    sl_b,
+    sl_s,
+    sdk_b,
+    sdk_s,
+    sdk_h,
+    G: tl.constexpr,
+    GP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
     tok = tl.program_id(0)
     kvh = tl.program_id(1)
     b = tl.program_id(2)
@@ -124,10 +179,37 @@ def _qsa_fwd(q, k, v, idx, scale):
     o = torch.empty_like(q)
     lse = torch.empty(B, S, HQ, device=q.device, dtype=torch.float32)
     grid = (S, HKV, B)
-    _qsa_fwd_kernel[grid](q, k, v, idx, o, lse, S, k.shape[1], idx.shape[2], scale,
-                          q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
-                          idx.stride(0), idx.stride(1), o.stride(0), o.stride(1), o.stride(2), lse.stride(0), lse.stride(1),
-                          G=G, GP=max(16, triton.next_power_of_2(G)), D=D, BLOCK_N=_BLOCK_N, num_warps=8, num_stages=2)
+    _qsa_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        idx,
+        o,
+        lse,
+        S,
+        k.shape[1],
+        idx.shape[2],
+        scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        idx.stride(0),
+        idx.stride(1),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        G=G,
+        GP=max(16, triton.next_power_of_2(G)),
+        D=D,
+        BLOCK_N=_BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
     return o, lse
 
 
@@ -140,10 +222,41 @@ def _qsa_bwd(q, k, v, idx, o, lse, do, scale):
     dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
     dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
     grid = (S, HKV, B)
-    _qsa_bwd_kernel[grid](q, k, v, idx, do.contiguous(), lse, delta, dq, dk, dv, S, k.shape[1], idx.shape[2], scale,
-                          q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
-                          idx.stride(0), idx.stride(1), lse.stride(0), lse.stride(1), dk.stride(0), dk.stride(1), dk.stride(2),
-                          G=G, GP=max(16, triton.next_power_of_2(G)), D=D, BLOCK_N=_BLOCK_N, num_warps=8, num_stages=1)
+    _qsa_bwd_kernel[grid](
+        q,
+        k,
+        v,
+        idx,
+        do.contiguous(),
+        lse,
+        delta,
+        dq,
+        dk,
+        dv,
+        S,
+        k.shape[1],
+        idx.shape[2],
+        scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        idx.stride(0),
+        idx.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        G=G,
+        GP=max(16, triton.next_power_of_2(G)),
+        D=D,
+        BLOCK_N=_BLOCK_N,
+        num_warps=8,
+        num_stages=1,
+    )
     return dq, dk.to(k.dtype), dv.to(v.dtype)
 
 
