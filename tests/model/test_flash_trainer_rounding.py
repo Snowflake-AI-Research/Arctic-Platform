@@ -356,3 +356,22 @@ def test_weighted_down_projection_keeps_the_fp32_accumulator_under_autocast():
     with torch.autocast("cpu", dtype=torch.bfloat16):
         actual = weighted_down_projection(*inputs)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_weighted_experts_with_fp32_parameters_under_bf16_autocast():
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    torch.manual_seed(0)
+    experts = GroupedExperts(16, 32, 2, use_grouped_mm=False)
+    experts.init_weights(0.2)
+    hidden, scores = torch.randn(8, 16, requires_grad=True), torch.rand(8, requires_grad=True)
+    counts = torch.tensor([4, 4])
+    results = []
+    for dtype in (torch.float32, torch.bfloat16):
+        experts.to(dtype)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = experts(hidden, counts, scores)
+        grads = torch.autograd.grad(output.float().square().sum(), (hidden, scores, *experts.parameters()))
+        results.append((output, *(grad.float() for grad in grads)))
+    for actual, expected in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

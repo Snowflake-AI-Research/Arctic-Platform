@@ -263,7 +263,7 @@ def _run_experts_for_loop_impl(
     out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
     if scores is not None:
         offsets = torch.cumsum(torch.tensor(num_tokens_per_expert, device=out.device), dim=0, dtype=torch.int32)
-        out = weighted_down_projection(out, w2, offsets, scores)
+        out = weighted_down_projection(out, w2.to(out.dtype), offsets, scores)
 
     return out
 
