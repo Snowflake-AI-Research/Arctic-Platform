@@ -131,9 +131,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 ### Gradient Accumulation Precision
 
-**AP no longer inserts an FP32 gradient-accumulation default into `ds_config`.** Explicit `data_types.grad_accum_dtype` values are preserved; when the field is omitted, DeepSpeed selects the accumulation dtype. For BF16 jobs using ZeRO, omission now selects BF16 accumulation instead of the FP32 accumulation previously inserted by AP. This is a training-numerics default change, not just a change to configuration forwarding.
+**The AP DeepSpeed worker retains FP32 gradient accumulation when `data_types` is absent.** `DeepSpeedWorker.ds_training_config()` supplies `data_types={"grad_accum_dtype": "fp32"}` only when the entire `data_types` block is missing. An explicitly supplied block is preserved without filling in missing fields, including an empty `{}` block.
 
-**Set `data_types.grad_accum_dtype` to `"fp32"` to retain the previous AP accumulation precision.** Include this block in the supplied `ds_config`, alongside the existing BF16 and ZeRO settings:
+**Set `data_types.grad_accum_dtype` explicitly to select accumulation precision.** For FP32 accumulation, include this block in the supplied `ds_config`, alongside the existing BF16 and ZeRO settings:
 
 ```json
 {
@@ -143,9 +143,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 }
 ```
 
-**BF16 model precision and gradient-accumulation precision are separate choices.** The override above does not change BF16 model weights to FP32. Omitting the override can change accumulated gradients, gradient norms and training trajectories, even when an individual loss measurement matches.
+**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is also preserved. If a supplied `data_types` block omits `grad_accum_dtype`, or a caller initializes DeepSpeed without going through the AP worker, DeepSpeed defaults to the model dtype for gradient accumulation.
 
-**The small-model control does not validate large-model convergence.** A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four observed matching losses and gradient norms for the former default, omission and explicit FP32. Large-model adoption of BF16 accumulation still needs explicit model-owner sign-off and representative loss and gradient-norm validation; the small control does not establish that approval or numerical equivalence.
+**Regression coverage verifies the existing default, not a numerical-default change.** Worker tests cover both the absent `data_types` block and preserved supplied blocks. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
 
 ### GLM-5.3 Sparse Attention
 
