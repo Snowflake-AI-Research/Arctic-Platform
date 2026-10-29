@@ -416,3 +416,26 @@ def test_a_peer_without_token_ranges_sends_whole_captures_to_every_rank():
 
     assert result["capture_slices"] == {}
     assert torch.equal(cache.pop("rr1:a"), capture)
+
+
+@pytest.mark.parametrize("legacy_role", ["sender", "receiver"])
+def test_empty_whole_capture_keeps_legacy_nccl_schedule(legacy_role):
+    capture = torch.empty((0, 2, 2), dtype=torch.uint8)
+    peers = [_receiver(0, ["rr1:a"], token_ranges={"rr1:a": (0, 0)}), _sender(1, ["rr1:a"], shape=capture.shape)]
+    legacy_rank = 1 if legacy_role == "sender" else 0
+    peers[legacy_rank] = _legacy(peers[legacy_rank], fields=("token_ranges", "supports_token_ranges"))
+    # The old planner enqueues even zero-byte whole captures. The new peer
+    # must retain that operation when slicing is disabled by the handshake.
+    if legacy_role == "receiver":
+        tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1)
+        tx.put("rr1:a", capture)
+        sender = _group("sender", 1, peers)
+        sender.send(tx)
+        assert len(sender.nccl.sent) == 1
+    else:
+        nccl = _FakeNCCL([capture])
+        receiver = _group("receiver", 0, peers, nccl)
+        rx = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1)
+        result = receiver.recv(rx, needed_sample_ids=["rr1:a"], token_ranges={"rr1:a": (0, 0)})
+        assert result["capture_slices"] == {}
+        assert nccl._recv_values == []
