@@ -55,12 +55,14 @@ class SemipNodeAgent:
 
     def __init__(self) -> None:
         from arctic_platform.inference.server.semip_engine import (
-            _UNPRIVILEGED_ENV)
+            _UNPRIVILEGED_ENV, _tee_tree_to_ray)
         # The leader sets this default in its own process only, and the mode
         # has to match across node-partitions: it decides the capability level
         # each node-partition's child records at init and the flags its CRIU runs with. As
         # there, a job's extra_env (this actor's runtime_env) overrides it.
         os.environ.setdefault(_UNPRIVILEGED_ENV, "1")
+        # This pod's ranks log here, not through the leader.
+        _tee_tree_to_ray()
         self._inst = None
         self._model_dir: str | None = None
         self._node_rank: int | None = None

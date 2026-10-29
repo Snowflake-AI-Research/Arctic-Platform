@@ -192,8 +192,6 @@ mb = int(0.9 * min(pinned, allotment - pinned))
 > torch's cached block -> CUDA OOM. `plan_restore_weights()` bounds the
 > staging buffer so enough free driver memory remains for the KV wake-up.
 > Always call `plan_restore_weights()` before `restore_weights()`.
-> Pass an explicit `max_buffer_bytes` for images dumped before the
-> `empty_cache()` fix.
 
 ### 3.8 Result bookkeeping
 
