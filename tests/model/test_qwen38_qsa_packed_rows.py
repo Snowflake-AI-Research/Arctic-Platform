@@ -22,37 +22,13 @@ pytest.importorskip("transformers.models.qwen4_exp")
 # Row-B positions restart at 0, restart at an offset, or continue row A (only varlen metadata can split it).
 @pytest.mark.parametrize("layout", ["zero", "offset", "continuous_with_cu_seqlens"])
 def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
 
     from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
 
     torch.set_num_threads(1)
     torch.manual_seed(19)
-    config = Qwen4ExpTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=4,
-        moe_intermediate_size=8,
-        shared_expert_intermediate_size=8,
-        num_experts=2,
-        num_experts_per_tok=1,
-        hc_count=2,
-        hc_lowrank=4,
-        layer_types=["qwen_sparse_attention"],
-        indexer_n_heads=1,
-        indexer_kv_heads=1,
-        indexer_head_dim=4,
-        indexer_budget=2,
-        indexer_compress_ratio=2,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000, "mrope_section": [1, 1, 0]},
-    )
-    qsa.register_qsa_flex_backend()
-    config._attn_implementation = "qsa_flex"
-    model = Qwen4ExpForCausalLM(config).to(torch.bfloat16).eval()
+    model = Qwen4ExpForCausalLM(_config("qsa_flex")).to(torch.bfloat16).eval()
     qsa.apply_qsa_flex(model)
     # Exercise the real attention implementation on CPU; replace only its CUDA/BF16 entry guard.
     monkeypatch.setattr(
@@ -98,6 +74,71 @@ def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
         explicit = model(input_ids=ids, position_ids=torch.arange(3)[None].expand(2, -1), use_cache=False).logits
         torch.testing.assert_close(implicit, explicit)
         torch.testing.assert_close(broadcast, explicit)
+
+
+def _config(attn_implementation, **overrides):
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    fields = dict(
+        vocab_size=32,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+        hc_count=2,
+        hc_lowrank=4,
+        layer_types=["qwen_sparse_attention"],
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=4,
+        indexer_budget=2,
+        indexer_compress_ratio=2,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000, "mrope_section": [1, 1, 0]},
+    )
+    config = Qwen4ExpTextConfig(**(fields | overrides))
+    qsa.register_qsa_flex_backend()
+    config._attn_implementation = attn_implementation
+    return config
+
+
+def test_qsa_gradients_match_transformers_at_sp1(monkeypatch):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    torch.set_num_threads(1)
+    torch.manual_seed(23)
+    # Two KV heads: with one, K transposed out of RoPE's (B, H, T, D) output is still contiguous.
+    models = []
+    for attn_implementation in ("eager", "qsa_flex"):
+        config = _config(attn_implementation, num_attention_heads=4, num_key_value_heads=2, indexer_budget=8)
+        config._experts_implementation = "eager"  # CPU grouped_mm has no float64 kernel
+        models.append(Qwen4ExpForCausalLM(config).double())
+    reference, model = models
+    model.load_state_dict(reference.state_dict())
+    qsa.apply_qsa_flex(model)
+    monkeypatch.setattr(
+        qsa,
+        "flex_sparse_gqa_attention",
+        lambda q, k, v, ids, softmax_scale: qsa._SparseGQAAttention.apply(q, k, v, ids, softmax_scale, 128),
+    )
+
+    ids = torch.arange(6)[None] + 1
+    for each in models:
+        each(input_ids=ids, use_cache=False).logits.square().sum().backward()
+
+    for (name, actual), expected in zip(model.named_parameters(), reference.parameters(), strict=True):
+        if actual.grad is None:
+            assert expected.grad is None or not expected.grad.any(), name
+            continue
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-8, msg=lambda m: f"{name}: {m}")
 
 
 def test_qwen38_packed_boundaries_isolate_padded_tail():

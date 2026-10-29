@@ -442,8 +442,9 @@ class _SparseGQAAttention(torch.autograd.Function):
     def backward(ctx, grad_output):
         query, key, value, selected_token_ids = ctx.saved_tensors
         grad_query = torch.empty_like(query)
-        grad_key = torch.zeros_like(key)
-        grad_value = torch.zeros_like(value)
+        # Contiguous so that flatten(2) below is a view: at sp 1, K arrives as a transpose of RoPE's output.
+        grad_key = torch.zeros_like(key, memory_format=torch.contiguous_format)
+        grad_value = torch.zeros_like(value, memory_format=torch.contiguous_format)
         flattened_grad_key = grad_key.flatten(2)
         flattened_grad_value = grad_value.flatten(2)
         kv_width = flattened_grad_key.shape[-1]
