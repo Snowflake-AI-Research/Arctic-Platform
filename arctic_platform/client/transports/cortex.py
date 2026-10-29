@@ -510,6 +510,14 @@ def _response_error_code(body: Any) -> str | None:
     return None
 
 
+def _response_error_message(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return None
+
+
 async def _raise_for_status(resp: Any) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
@@ -893,11 +901,3 @@ def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
     if "metrics" in result:
         decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
     return decoded
-
-
-def _response_error_message(body: Any) -> str | None:
-    for candidate in _iter_error_dicts(body):
-        message = candidate.get("message")
-        if isinstance(message, str) and message.strip():
-            return message
-    return None
