@@ -5,7 +5,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
-from arctic_platform.inference.vllm.dflash2_nan_fix import (
+from arctic_platform.inference.vllm.hybrid_state_fixes import (
     KVBlockZeroerPatch,
     MambaManagerPatch,
     SingleTypeKVCacheManagerPatch,

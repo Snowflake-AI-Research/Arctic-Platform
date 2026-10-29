@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility fixes for DFlash2 with GDN-backed hybrid models.
+"""Fixes for stale recurrent state on GDN/KDA-backed hybrid models.
 
 Remove these patches after both upstream fixes are included in the pinned
 vLLM release:
 
-* https://github.com/vllm-project/vllm/pull/51508
-* https://github.com/vllm-project/vllm/pull/56524
+* https://github.com/vllm-project/vllm/pull/51508: stale zero-accept
+  speculative rows
+* https://github.com/vllm-project/vllm/pull/56524: reallocated Mamba state
+  blocks are not zeroed
 """
 
 from itertools import product as iprod
@@ -259,7 +261,7 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
 _PATCHED = False
 
 
-def apply_dflash2_nan_fixes() -> None:
+def apply_hybrid_state_fixes() -> None:
     global _PATCHED
     if _PATCHED:
         return
