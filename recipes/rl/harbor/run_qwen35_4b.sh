@@ -4,17 +4,21 @@
 # Only two task inputs are needed:
 #   1. TRAIN_HARBOR_TASKS=/path/to/train_harbor_tasks
 #   2. EVAL_HARBOR_TASKS=/path/to/eval_harbor_tasks  (defaults to TRAIN_HARBOR_TASKS)
-# plus optional:
+# plus where the tasks run:
+#   - HARBOR_ENV=snowflake (default; Snowflake Cortex Sandboxes), docker, modal, daytona, ...
+#     or host, which runs tasks on this machine and also needs HARBOR_ALLOW_HOST_EXEC=1
+#   - HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}'
+#     (a JSON object passed to the environment, like `harbor run --ek`)
+# and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
 #   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or any Harbor BaseAgent)
-#   - HARBOR_ENV=arctic_platform.integrations.harbor.env:HostEnvironment (or harbor_snowflake_sandbox:SnowflakeSandboxEnvironment, docker, modal, ...)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AP_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 LOCALIZATION_DIR="${AP_ROOT}/recipes/rl/openhands/code_localization"
-ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex,harbor]}"
 OPENHANDS_REV="${OPENHANDS_REV:-85ecfd9333d2d2cc4404dd460fd38868d9b978e2}"
 OPENHANDS_SPEC="openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-sdk"
 OPENHANDS_TOOLS_SPEC="openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-tools"
@@ -68,8 +72,16 @@ LOGGER="${LOGGER:-console}"
 RUN_NAME="${RUN_NAME:-qwen35-4b-harbor-rl}"
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${RUN_NAME}}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-3600}"
+# The Cortex training image ships FlashAttention 3 (Hopper, e.g. H200), not
+# SkyRL's default FA2. Set flash_attention_2 or sdpa for other GPUs.
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_3}"
+WEIGHT_SYNC_BACKEND="${WEIGHT_SYNC_BACKEND:-nccl}"
 mkdir -p "${CKPT_DIR}"
 
+# Cortex returns a logprob and an entropy per token, about 18 bytes, and caps
+# a response at 128 MiB. It reports an overrun only after provisioning the GPUs
+# and running a full step, so check here. 8 x 8 sequences at 32768 tokens is
+# about 38 MiB.
 _CAP_BYTES=134217728
 _SEQS=$(( BATCH_SIZE * N_ROLLOUTS ))
 _EST=$(( _SEQS * MAX_CONTEXT_LENGTH * 18 ))
@@ -109,10 +121,14 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export OPENHANDS_WORKSPACE="${OPENHANDS_WORKSPACE:-/tmp/testbed}"
 export HARBOR_AGENT="${HARBOR_AGENT:-harbor_rl.agent:OpenHandsHarborAgent}"
-export HARBOR_ENV="${HARBOR_ENV:-arctic_platform.integrations.harbor.env:HostEnvironment}"
+export HARBOR_ENV="${HARBOR_ENV:-snowflake}"
+export HARBOR_ENV_KWARGS="${HARBOR_ENV_KWARGS:-}"
 export HARBOR_SKILL="${HARBOR_SKILL:-}"
 export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-harbor rl ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 
+# run_engines_locally=false requires one external_server_url per engine. These
+# are placeholders: generation goes through the Cortex client, which never
+# dials them.
 ENGINE_URLS="$(printf 'http://cortex-managed,%.0s' $(seq "${NUM_SAMPLING_ENGINES}"))"
 ENGINE_URLS="[${ENGINE_URLS%,}]"
 
@@ -129,7 +145,6 @@ trap stop_driver INT TERM
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
     --with "${ARCTIC_PLATFORM_SPEC}" \
-    --with harbor \
     --with "${OPENHANDS_SPEC}" \
     --with "${OPENHANDS_TOOLS_SPEC}" \
     --with "${OPENHANDS_WORKSPACE_SPEC}" \
@@ -140,7 +155,7 @@ uv run --isolated --extra skyrl-train \
     trainer.arctic_rl.use_zorro=false \
     trainer.arctic_rl.use_liger=false \
     trainer.arctic_rl.zero_stage=2 \
-    trainer.arctic_rl.attn_implementation=flash_attention_3 \
+    trainer.arctic_rl.attn_implementation="${ATTN_IMPLEMENTATION}" \
     trainer.arctic_rl.vllm_max_model_len="${MAX_CONTEXT_LENGTH}" \
     trainer.arctic_rl.startup_timeout="${STARTUP_TIMEOUT}" \
     trainer.algorithm.advantage_estimator=grpo \
@@ -164,7 +179,7 @@ uv run --isolated --extra skyrl-train \
     generator.inference_engine.run_engines_locally=false \
     "generator.inference_engine.external_server_urls=${ENGINE_URLS}" \
     generator.sampling_params.logprobs=null \
-    generator.inference_engine.weight_sync_backend=nccl \
+    generator.inference_engine.weight_sync_backend="${WEIGHT_SYNC_BACKEND}" \
     generator.inference_engine.enable_ray_prometheus_stats=false \
     generator.batched=false \
     generator.n_samples_per_prompt="${N_ROLLOUTS}" \

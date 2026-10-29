@@ -25,10 +25,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
+from openhands_localization import reward as localization_reward_module
 from openhands_localization.config import validate_openhands_cfg
 from openhands_localization.events import last_step_is_one_tool_call
 from openhands_localization.trainer import openhands_trainer_cls
@@ -36,6 +40,8 @@ from openhands_localization.trainer import openhands_trainer_cls
 from arctic_platform.integrations.harbor.adapter import DEFAULT_HARBOR_ENV
 from arctic_platform.integrations.harbor.adapter import HarborTrialAdapter
 from arctic_platform.integrations.harbor.adapter import grade_harbor
+from arctic_platform.integrations.harbor.adapter import resolve_env
+from arctic_platform.integrations.harbor.env import contained_path
 from arctic_platform.integrations.harness.generator import Grade
 from arctic_platform.integrations.harness.generator import HarnessGenerator
 from arctic_platform.integrations.harness.proxy import ChatCompletionsProxy
@@ -56,13 +62,27 @@ def _to_jsonable(value: Any) -> Any:
     return str(value)
 
 
+_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+_COMMIT = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _require(pattern: re.Pattern[str], value: str, field: str) -> str:
+    if not pattern.fullmatch(value):
+        raise ValueError(f"Dataset row has an invalid {field}: {value!r}")
+    return value
+
+
 _LOCALIZATION_VERIFIER_SH = """#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p /logs/verifier
 python3 - <<'PY'
 import json
 import pathlib
-from openhands_localization.reward import localization_reward
+import sys
+
+sys.path.insert(0, "/tests")
+from localization_reward import localization_reward
 
 sub = pathlib.Path("/logs/agent/localization_submission.json")
 truth = pathlib.Path("/tests/ground_truth.json")
@@ -76,11 +96,23 @@ PY
 
 
 def materialize_harbor_task_from_row(instance: dict[str, Any], tasks_root: Path) -> Path:
-    """Materialize a Harbor task directory for a SWE-smith code localization row on demand."""
-    instance_id = str(instance["instance_id"])
-    task_dir = tasks_root / instance_id
+    """Materialize a Harbor task directory for a SWE-smith code localization row on demand.
+
+    ``instance_id``, ``repo``, and ``base_commit`` come from the dataset, so they
+    are validated before they name a directory or reach a Dockerfile line.
+    """
+    instance_id = _require(_INSTANCE_ID, str(instance["instance_id"]), "instance_id")
+    repo = _require(_REPO, str(instance["repo"]), "repo")
+    base_commit = instance.get("base_commit")
+    if base_commit is not None and str(base_commit) in ("None", "nan", ""):
+        base_commit = None
+    if base_commit is not None:
+        base_commit = _require(_COMMIT, str(base_commit), "base_commit")
+
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    task_dir = contained_path(tasks_root, tasks_root / instance_id, "Task directory")
     test_sh = task_dir / "tests" / "test.sh"
-    if test_sh.is_file() and (task_dir / "instruction.md").is_file():
+    if all(p.is_file() for p in (test_sh, task_dir / "instruction.md", task_dir / "tests" / "localization_reward.py")):
         return task_dir
 
     env_dir = task_dir / "environment"
@@ -88,10 +120,6 @@ def materialize_harbor_task_from_row(instance: dict[str, Any], tasks_root: Path)
     env_dir.mkdir(parents=True, exist_ok=True)
     tests_dir.mkdir(parents=True, exist_ok=True)
 
-    repo = str(instance["repo"])
-    base_commit = instance.get("base_commit")
-    if base_commit is not None and str(base_commit) in ("None", "nan", ""):
-        base_commit = None
     use_patch = bool(instance.get("use_patch", True))
     patch_text = str(instance.get("patch") or "") if use_patch else ""
     problem = str(instance.get("problem_statement") or "")
@@ -108,12 +136,13 @@ def materialize_harbor_task_from_row(instance: dict[str, Any], tasks_root: Path)
     repo_dir = f"{repo.replace('/', '_')}_{instance_id}"
     df_lines = [
         "FROM python:3.11-slim",
+        "RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*",
         "WORKDIR /app",
-        f"RUN git clone https://github.com/{repo}.git /app/{repo_dir}",
+        f"RUN git clone {shlex.quote(f'https://github.com/{repo}.git')} {shlex.quote(f'/app/{repo_dir}')}",
         f"WORKDIR /app/{repo_dir}",
     ]
     if base_commit:
-        df_lines.append(f"RUN git checkout {base_commit}")
+        df_lines.append(f"RUN git checkout {shlex.quote(base_commit)}")
     if patch_text:
         (env_dir / "bug.patch").write_text(patch_text, encoding="utf-8")
         df_lines.append("COPY bug.patch /app/bug.patch")
@@ -124,9 +153,21 @@ def materialize_harbor_task_from_row(instance: dict[str, Any], tasks_root: Path)
         json.dumps(dict(instance_id=instance_id, file_changes=file_changes)),
         encoding="utf-8",
     )
+    shutil.copyfile(localization_reward_module.__file__, tests_dir / "localization_reward.py")
     test_sh.write_text(_LOCALIZATION_VERIFIER_SH, encoding="utf-8")
     test_sh.chmod(0o755)
     return task_dir
+
+
+def harbor_env_kwargs() -> dict[str, Any]:
+    """``HARBOR_ENV_KWARGS`` (a JSON object), passed to the Harbor environment like ``harbor run --ek``."""
+    raw = os.environ.get("HARBOR_ENV_KWARGS", "").strip()
+    if not raw:
+        return {}
+    kwargs = json.loads(raw)
+    if not isinstance(kwargs, dict):
+        raise ValueError(f"HARBOR_ENV_KWARGS must be a JSON object, got {raw!r}")
+    return kwargs
 
 
 def _max_model_len(cfg: Any) -> int:
@@ -175,7 +216,7 @@ def _experiment_cls():
             max_turns = int(cfg.generator.max_turns)
             workspace = os.environ.get("OPENHANDS_WORKSPACE", "/tmp/testbed")
             harbor_agent = os.environ.get("HARBOR_AGENT", DEFAULT_HARBOR_AGENT)
-            harbor_env = os.environ.get("HARBOR_ENV", DEFAULT_HARBOR_ENV)
+            harbor_env = resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV)
             skill_env = os.environ.get("HARBOR_SKILL", "")
             skills = [s.strip() for s in skill_env.split(":") if s.strip()] if skill_env else []
 
@@ -186,6 +227,7 @@ def _experiment_cls():
                 trials_root=workspace,
                 max_turns=max_turns,
                 skills=skills,
+                env_kwargs=harbor_env_kwargs(),
                 prepare_task_fn=materialize_harbor_task_from_row,
             )
 
@@ -251,6 +293,27 @@ def _require_source_checkout() -> None:
         )
 
 
+def check_harbor_env() -> None:
+    """Fail on the driver, before any GPUs are provisioned, if ``HARBOR_ENV`` can't run tasks."""
+    from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
+    from arctic_platform.integrations.harbor.adapter import SNOWFLAKE_HARBOR_ENV
+    from arctic_platform.integrations.harbor.env import ALLOW_HOST_EXEC_VAR
+    from arctic_platform.integrations.harbor.env import host_exec_allowed
+
+    env = resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV)
+    kwargs = harbor_env_kwargs()
+    if env == SNOWFLAKE_HARBOR_ENV and not (kwargs.get("image_repo") or kwargs.get("prebuilt_image")):
+        raise SystemExit(
+            "ERROR: HARBOR_ENV=snowflake needs somewhere to mirror task images. Set, for example,\n        "
+            ' HARBOR_ENV_KWARGS=\'{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}\''
+        )
+    if env == HOST_HARBOR_ENV and not host_exec_allowed(kwargs.get("allow_host_exec")):
+        raise SystemExit(
+            "ERROR: HARBOR_ENV=host runs task and agent commands on this machine without isolation.\n"
+            f"       Use a sandbox, or set {ALLOW_HOST_EXEC_VAR}=1 if every task is trusted."
+        )
+
+
 def main() -> None:
     from integrations.arctic_rl.config import ArcticRLTrainerConfig
     from integrations.arctic_rl.config import ArcticSkyRLConfig
@@ -259,6 +322,7 @@ def main() -> None:
     from arctic_platform.integrations.skyrl.entrypoint import launch_driver
 
     _require_source_checkout()
+    check_harbor_env()
 
     argv = [arg for arg in sys.argv[1:] if not arg.startswith("trainer.override_entrypoint=")]
     cfg = ArcticSkyRLConfig.from_cli_overrides(argv)

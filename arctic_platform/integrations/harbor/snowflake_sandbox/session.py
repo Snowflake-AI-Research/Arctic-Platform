@@ -12,12 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One Snowflake session per (connection, role), shared by every trial."""
+"""One Snowflake session per (connection, role), shared by every trial.
+
+The cache is guarded by thread locks rather than asyncio locks, so trials on
+different event loops (or threads) share one session without binding a lock
+to whichever loop touched it first.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any
 
 from snowflake.sandbox.config import Config
@@ -28,7 +34,8 @@ logger = logging.getLogger(__name__)
 LOGIN_TIMEOUT_S = 300
 
 _configs: dict[tuple[str | None, str | None], Config] = {}
-_locks: dict[tuple[str | None, str | None], asyncio.Lock] = {}
+_locks: dict[tuple[str | None, str | None], threading.Lock] = {}
+_locks_guard = threading.Lock()
 
 
 def _connect(connection: str | None, role: str | None) -> Config:
@@ -47,14 +54,22 @@ def _connect(connection: str | None, role: str | None) -> Config:
     return resolve_config(connection=conn)
 
 
+def _get_or_connect(connection: str | None, role: str | None) -> Config:
+    key = (connection, role)
+    with _locks_guard:
+        lock = _locks.setdefault(key, threading.Lock())
+    with lock:
+        if key not in _configs:
+            _configs[key] = _connect(connection, role)
+        return _configs[key]
+
+
 async def get_config(connection: str | None, role: str | None) -> Config:
     """Return the shared sandbox ``Config`` backed by one live connector session."""
-    key = (connection, role)
-    lock = _locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        if key not in _configs:
-            _configs[key] = await asyncio.to_thread(_connect, connection, role)
-        return _configs[key]
+    cached = _configs.get((connection, role))
+    if cached is not None:
+        return cached
+    return await asyncio.to_thread(_get_or_connect, connection, role)
 
 
 async def get_connector(connection: str | None, role: str | None) -> Any:

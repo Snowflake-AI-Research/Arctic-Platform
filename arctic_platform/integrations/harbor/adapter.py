@@ -26,11 +26,17 @@ orchestrator:
    produced by Harbor's ``Verifier`` (``tests/test.sh`` -> ``reward.txt`` /
    ``reward.json``), and ``grade_harbor`` converts them into a
    :class:`arctic_platform.integrations.harness.generator.Grade`.
+
+Every rollout of an adapter runs on one persistent event loop, so asyncio
+locks and semaphores that environments share across trials (Snowflake
+sessions, image registries, live-sandbox caps) are only ever used from the
+loop they were created on.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import shutil
@@ -42,7 +48,23 @@ from typing import Any
 from arctic_platform.integrations.harness.generator import Grade
 from arctic_platform.integrations.harness.generator import RolloutRequest
 
-DEFAULT_HARBOR_ENV = "arctic_platform.integrations.harbor.env:HostEnvironment"
+HOST_HARBOR_ENV = "arctic_platform.integrations.harbor.env:HostEnvironment"
+SNOWFLAKE_HARBOR_ENV = "arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment"
+DEFAULT_HARBOR_ENV = SNOWFLAKE_HARBOR_ENV
+ENV_ALIASES = {"host": HOST_HARBOR_ENV, "snowflake": SNOWFLAKE_HARBOR_ENV}
+
+
+def resolve_env(env: str) -> str:
+    """Map ``host`` and ``snowflake`` to their import paths; pass anything else through."""
+    return ENV_ALIASES.get(env.strip().lower(), env.strip())
+
+
+def require_task_dir(path: Path) -> Path:
+    """``path`` resolved, if it is a Harbor task directory (``instruction.md`` and ``tests/test.sh``)."""
+    task_dir = path.expanduser().resolve()
+    if not (task_dir / "instruction.md").is_file() or not (task_dir / "tests" / "test.sh").is_file():
+        raise ValueError(f"{path} is not a Harbor task directory (needs instruction.md and tests/test.sh)")
+    return task_dir
 
 
 def _build_trial_config(
@@ -73,6 +95,7 @@ def _build_trial_config(
     else:
         agent_name = agent
 
+    env = resolve_env(env)
     env_type: EnvironmentType | None = None
     env_import_path: str | None = None
     if ":" in env:
@@ -179,6 +202,20 @@ async def run_harbor_trial(
         shutil.rmtree(trial_dir, ignore_errors=True)
 
 
+class _LoopThread:
+    """An event loop running forever on a daemon thread."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.loop.set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="harbor-io")
+        )
+        threading.Thread(target=self.loop.run_forever, name="harbor-loop", daemon=True).start()
+
+    def submit(self, coro: Any) -> concurrent.futures.Future:
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+
 class HarborTrialAdapter:
     """``HarnessAdapter`` that runs each rollout through Harbor's ``Trial``."""
 
@@ -194,69 +231,81 @@ class HarborTrialAdapter:
         agent_kwargs: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
         prepare_task_fn: Any | None = None,
+        max_concurrency: int = 256,
     ) -> None:
         self._model_name = model_name
         self._agent = agent
-        self._env = env
+        self._env = resolve_env(env)
         self._trials_root = Path(trials_root)
         self._max_turns = max_turns
         self._skills = list(skills or [])
         self._agent_kwargs = dict(agent_kwargs or {})
         self._env_kwargs = dict(env_kwargs or {})
         self._prepare_task_fn = prepare_task_fn
+        self._max_concurrency = int(max_concurrency)
         self._lock = threading.Lock()
         self._runs: dict[str, dict[str, Any]] = {}
+        self._loop_thread: _LoopThread | None = None
+
+    def _loop(self) -> _LoopThread:
+        with self._lock:
+            if self._loop_thread is None:
+                # Each rollout holds one worker thread for its whole agent conversation.
+                self._loop_thread = _LoopThread(self._max_concurrency)
+            return self._loop_thread
 
     def submit(self, request: RolloutRequest) -> str:
         rollout_id = request.routing_key
         with self._lock:
             self._runs[rollout_id] = dict(status="running", artifacts=None)
-
-        def work() -> None:
-            try:
-                instance = request.env_extra
-                if "harbor_task_dir" in instance and instance["harbor_task_dir"]:
-                    task_dir = Path(str(instance["harbor_task_dir"]))
-                elif self._prepare_task_fn is not None:
-                    task_dir = Path(self._prepare_task_fn(instance, self._trials_root / "tasks"))
-                else:
-                    raise ValueError("Dataset row is missing 'harbor_task_dir'")
-
-                kw = dict(self._agent_kwargs)
-                kw.setdefault("max_turns", self._max_turns)
-                kw.setdefault("training_phase", request.phase)
-                kw["instance"] = instance
-
-                trial_name = f"trial-{rollout_id}-{os.urandom(3).hex()}"
-                artifacts = asyncio.run(
-                    run_harbor_trial(
-                        task_dir=task_dir,
-                        trials_dir=self._trials_root,
-                        trial_name=trial_name,
-                        agent=self._agent,
-                        env=self._env,
-                        model_name=self._model_name,
-                        base_url=request.base_url,
-                        api_key=request.api_key,
-                        skills=self._skills,
-                        agent_kwargs=kw,
-                        env_kwargs=self._env_kwargs,
-                    )
-                )
-            except Exception:
-                artifacts = dict(
-                    error=traceback.format_exc(),
-                    reward=0.0,
-                    reward_detail=dict(reward=0.0),
-                    exhausted=False,
-                    messages=[],
-                )
-                self._store(rollout_id, "errored", artifacts)
-                return
-            self._store(rollout_id, "completed", artifacts)
-
-        threading.Thread(target=work, name=f"harbor-{rollout_id}", daemon=True).start()
+        future = self._loop().submit(self._run_rollout(rollout_id, request))
+        future.add_done_callback(lambda f: self._finish(rollout_id, f))
         return rollout_id
+
+    def _task_dir(self, instance: dict[str, Any]) -> Path:
+        if instance.get("harbor_task_dir"):
+            return require_task_dir(Path(str(instance["harbor_task_dir"])))
+        if self._prepare_task_fn is not None:
+            return require_task_dir(Path(self._prepare_task_fn(instance, self._trials_root / "tasks")))
+        raise ValueError("Dataset row is missing 'harbor_task_dir'")
+
+    async def _run_rollout(self, rollout_id: str, request: RolloutRequest) -> dict[str, Any]:
+        instance = request.env_extra
+        task_dir = await asyncio.to_thread(self._task_dir, instance)
+        kw = dict(self._agent_kwargs)
+        kw.setdefault("max_turns", self._max_turns)
+        kw.setdefault("training_phase", request.phase)
+        kw["instance"] = instance
+        return await run_harbor_trial(
+            task_dir=task_dir,
+            trials_dir=self._trials_root,
+            trial_name=f"trial-{rollout_id}-{os.urandom(3).hex()}",
+            agent=self._agent,
+            env=self._env,
+            model_name=self._model_name,
+            base_url=request.base_url,
+            api_key=request.api_key,
+            skills=self._skills,
+            agent_kwargs=kw,
+            env_kwargs=self._env_kwargs,
+        )
+
+    def _finish(self, rollout_id: str, future: concurrent.futures.Future) -> None:
+        exc = future.exception()
+        if exc is None:
+            self._store(rollout_id, "completed", future.result())
+            return
+        self._store(
+            rollout_id,
+            "errored",
+            dict(
+                error="".join(traceback.format_exception(exc)),
+                reward=0.0,
+                reward_detail=dict(reward=0.0),
+                exhausted=False,
+                messages=[],
+            ),
+        )
 
     def _store(self, rollout_id: str, status: str, artifacts: dict[str, Any]) -> None:
         with self._lock:

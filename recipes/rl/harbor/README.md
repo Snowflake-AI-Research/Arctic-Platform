@@ -18,11 +18,21 @@ Every Harbor task already defines `instruction.md`, `environment/`, and `tests/t
 ```bash
 export TRAIN_HARBOR_TASKS=/path/to/train_harbor_tasks
 export EVAL_HARBOR_TASKS=/path/to/eval_harbor_tasks
+export HARBOR_ENV=snowflake             # default: each rollout runs in its own Snowflake Cortex Sandbox
+export HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}'
 export HARBOR_SKILL=/path/to/SKILL.md   # optional: ":"-separated SKILL.md paths
 export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor rl"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
+
+`HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`.
+
+### Where Rollouts Run
+
+The agent's `terminal` tool and the verifier both run through the selected Harbor environment, so the agent works in the same filesystem that `tests/test.sh` grades, on every backend. Each command runs to completion in a fresh shell: the working directory carries over between commands, but exported variables and background jobs do not. `file_editor` is not available because it would edit the training driver's filesystem instead.
+
+`HARBOR_ENV=host` runs tasks as subprocesses on the driver machine with no isolation. Task `RUN` lines, verifiers, and agent commands can read anything the driver's user can, so it is only for tasks you trust. It needs `HARBOR_ALLOW_HOST_EXEC=1`. Host commands get an allowlisted environment (`PATH`, locale, `TERM`, `TMPDIR`, plus any names in `HARBOR_HOST_ENV_PASSTHROUGH`), never the driver's `ARCTIC_*`, `WANDB_*`, or other credentials. All task paths are resolved and must stay inside the trial directory or the task's `environment/`.
 
 ### 2. SWE-smith Code Localization via Harbor
 
@@ -33,6 +43,7 @@ uv run recipes/rl/harbor/prepare_data.py \
 
 export TRAIN_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/train
 export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
+export HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "egress_eai": "GITHUB_ACCESS"}'
 export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor localization"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
@@ -56,12 +67,13 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | :--- | :--- | :--- | :--- |
 | **Task datasets** | `TRAIN_HARBOR_TASKS`, `EVAL_HARBOR_TASKS` | — | `~/tasks/train`, `~/tasks/eval` |
 | **Agent skill (`SKILL.md`)** | `HARBOR_SKILL` | — | `~/skills/debug/SKILL.md:~/skills/git/SKILL.md` |
-| **Agent tools** | `OPENHANDS_TOOLS` | `terminal` (+ finish tool) | `terminal,file_editor,task_tracker` |
+| **Agent tools** | `OPENHANDS_TOOLS` | `terminal` (+ finish tool) | `terminal,task_tracker` |
 | **Agent system prompt** | `OPENHANDS_SYSTEM_PROMPT_FILE` | built-in prompt | `~/prompts/custom_agent.j2` |
 | **Harbor agent class** | `HARBOR_AGENT` | `harbor_rl.agent:OpenHandsHarborAgent` | `openhands-sdk`, `mini-swe-agent`, `my_pkg:MyAgent` |
-| **Harbor sandbox (`--env`)** | `HARBOR_ENV` | `arctic_platform.integrations.harbor.env:HostEnvironment` | `snowflake`, `docker`, `modal`, `daytona`, `e2b` |
+| **Harbor sandbox (`--env`)** | `HARBOR_ENV` / `HARBOR_ENV_KWARGS` | `snowflake` / — | `docker`, `modal`, `daytona`, `e2b`, `host` (trusted tasks only) |
 | **Base model** | `MODEL` | `Qwen/Qwen3.5-4B` | `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-Coder-7B-Instruct` |
 | **GPU allocation (train / sample)** | `NUM_TRAIN_GPUS` / `NUM_SAMPLING_ENGINES` | `4` / `4` | `8` / `8` |
 | **Rollout concurrency** | `BATCH_SIZE` $\times$ `N_ROLLOUTS` | `8` $\times$ `8` (`64`/step) | `16` $\times$ `8` (`128`/step) |
 | **Horizon & context length** | `MAX_TURNS` / `MAX_CONTEXT_LENGTH` | `10` / `32768` | `20` / `32768` |
 | **Learning rate & RL loss** | `LR` / Hydra CLI args | `1.0e-6` (`gspo`) | `LR=5e-7 trainer.algorithm.policy_loss_type=grpo` |
+| **Attention & weight sync** | `ATTN_IMPLEMENTATION` / `WEIGHT_SYNC_BACKEND` | `flash_attention_3` / `nccl` | `flash_attention_2` (non-Hopper GPUs) |

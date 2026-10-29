@@ -20,6 +20,15 @@ Runs Harbor trials as host subprocesses under a per-trial root directory
 rewritten to that per-trial root, and single-stage Dockerfile ``WORKDIR``,
 ``COPY``, and ``RUN`` directives are replayed on ``start()`` so Harbor tasks
 and ``tests/test.sh`` verifiers execute identically on hosts without Docker.
+
+This is not a sandbox: task ``RUN`` lines, verifiers, and agent commands run
+as the current user and can read anything that user can. It is meant for
+trusted tasks only, so ``start()`` refuses to run unless
+``HARBOR_ALLOW_HOST_EXEC=1`` (or ``allow_host_exec=True``) is set. Commands get
+an allowlisted environment (``HOST_ENV_ALLOWLIST`` plus any names in
+``HARBOR_HOST_ENV_PASSTHROUGH``), never the caller's full ``os.environ``, and
+every file path is resolved and must stay inside the trial root or, for
+Dockerfile ``COPY`` sources, inside the task's ``environment/`` directory.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 try:
     from harbor.environments.base import BaseEnvironment
@@ -39,7 +49,8 @@ except ImportError:  # pragma: no cover - allows importing helper functions with
     BaseEnvironment = object  # type: ignore[assignment,misc]
     ExecResult = None  # type: ignore[assignment,misc]
 
-_ROOTED_PREFIXES = ("/app", "/workspace", "/tests", "/solution", "/logs", "/harbor")
+HOST_ENV_ALLOWLIST = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "SHELL")
+ALLOW_HOST_EXEC_VAR = "HARBOR_ALLOW_HOST_EXEC"
 _ABS_PATH_TOKEN = re.compile(r"(?<![\w/])(/app|/workspace|/tests|/solution|/logs|/harbor)(?=/|$|[\s'\"\\])")
 _REWRITE_SUFFIXES = (".sh", ".py", ".bash", ".zsh", ".txt")
 
@@ -49,6 +60,27 @@ def rewrite_harbor_paths(text: str, root: Path) -> str:
     if not text:
         return text
     return _ABS_PATH_TOKEN.sub(lambda m: f"{root}{m.group(1)}", text)
+
+
+class PathEscapeError(ValueError):
+    """A task-supplied path resolves outside the directory it must stay in."""
+
+
+def contained_path(root: Path, candidate: Path, what: str) -> Path:
+    """``candidate`` resolved (symlinks included), or ``PathEscapeError`` if it leaves ``root``."""
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise PathEscapeError(f"{what} {candidate} resolves outside {root}")
+    return resolved
+
+
+def host_exec_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The allowlisted subset of ``os.environ`` that host commands may see, plus ``extra``."""
+    names = set(HOST_ENV_ALLOWLIST)
+    names.update(n.strip() for n in os.environ.get("HARBOR_HOST_ENV_PASSTHROUGH", "").split(",") if n.strip())
+    env = {name: os.environ[name] for name in names if name in os.environ}
+    env.update(extra or {})
+    return env
 
 
 def _parse_dockerfile_lines(dockerfile: Path) -> list[str]:
@@ -102,8 +134,17 @@ def _install_shims(bin_dir: Path) -> None:
     uvx_shim.chmod(0o755)
 
 
+def host_exec_allowed(flag: bool | str | None) -> bool:
+    value = os.environ.get(ALLOW_HOST_EXEC_VAR, "") if flag is None else flag
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class HostEnvironment(BaseEnvironment):
-    """Runs Harbor trials as host subprocesses under a per-trial root dir."""
+    """Runs trusted Harbor trials as host subprocesses under a per-trial root dir."""
+
+    def __init__(self, *args: Any, allow_host_exec: bool | str | None = None, **kwargs: Any) -> None:
+        self._allow_host_exec = allow_host_exec
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def type() -> str:
@@ -124,7 +165,13 @@ class HostEnvironment(BaseEnvironment):
         return self._workdir
 
     async def start(self, force_build: bool) -> None:  # noqa: ARG002
-        self._root = Path(str(self.trial_paths.trial_dir)) / "host_env"
+        if not host_exec_allowed(self._allow_host_exec):
+            raise RuntimeError(
+                "HostEnvironment runs task and agent commands on this machine without isolation. "
+                "Use a sandbox (HARBOR_ENV=snowflake, docker, modal, ...), or set "
+                f"{ALLOW_HOST_EXEC_VAR}=1 if every task is trusted."
+            )
+        self._root = (Path(str(self.trial_paths.trial_dir)) / "host_env").resolve()
         for sub in (
             "app",
             "workspace",
@@ -144,16 +191,13 @@ class HostEnvironment(BaseEnvironment):
         await asyncio.to_thread(self._replay_environment_dir)
 
     def _replay_environment_dir(self) -> None:
-        env_dir = self.environment_dir
-        if not env_dir or not env_dir.exists():
+        if not self.environment_dir or not self.environment_dir.exists():
             return
+        env_dir = self.environment_dir.resolve()
         dockerfile = env_dir / "Dockerfile"
         lines = _parse_dockerfile_lines(dockerfile)
 
-        env = os.environ.copy()
-        env["PATH"] = f"{self._root / 'bin'}:{env.get('PATH', '')}"
-        env["HOME"] = str(self._root)
-        env["HARBOR_HOST_ROOT"] = str(self._root)
+        env = self._command_env()
         (self._root / ".local" / "bin").mkdir(parents=True, exist_ok=True)
         (self._root / ".local" / "bin" / "env").write_text(
             f'export PATH="{self._root / "bin"}:$PATH"\n', encoding="utf-8"
@@ -164,9 +208,10 @@ class HostEnvironment(BaseEnvironment):
             for item in env_dir.iterdir():
                 if item.name == "Dockerfile":
                     continue
+                contained_path(env_dir, item, "Build-context entry")
                 target = self._workdir / item.name
                 if item.is_dir():
-                    self._copytree_rewriting(item, target)
+                    self._copytree_rewriting(item, target, boundary=env_dir)
                 else:
                     self._copy_rewriting(item, target)
 
@@ -185,12 +230,16 @@ class HostEnvironment(BaseEnvironment):
                     clean = src_rel.rstrip("/")
                     if clean.endswith("/."):
                         clean = clean[:-2]
-                    src_path = env_dir / clean if clean not in ("", ".", "./") else env_dir
+                    if clean.startswith("/"):
+                        raise PathEscapeError(f"COPY source {src_rel} is absolute; it must be inside {env_dir}")
+                    src_path = contained_path(
+                        env_dir, env_dir / clean if clean not in ("", ".", "./") else env_dir, "COPY source"
+                    )
                     if not src_path.exists():
                         continue
                     if src_path.is_dir():
                         dst_path.mkdir(parents=True, exist_ok=True)
-                        self._copytree_rewriting(src_path, dst_path)
+                        self._copytree_rewriting(src_path, dst_path, boundary=env_dir)
                     elif dst_raw.endswith("/") or dst_raw in (".", "./") or dst_path.is_dir():
                         dst_path.mkdir(parents=True, exist_ok=True)
                         self._copy_rewriting(src_path, dst_path / src_path.name)
@@ -216,12 +265,20 @@ class HostEnvironment(BaseEnvironment):
 
     def _to_host(self, container_path: str) -> Path:
         p = container_path.strip()
-        for pref in _ROOTED_PREFIXES:
-            if p == pref or p.startswith(pref + "/"):
-                return self._root / p.lstrip("/")
-        if p.startswith("/"):
-            return self._root / p.lstrip("/")
-        return self._workdir / p
+        if p.startswith("/") and Path(p).resolve().is_relative_to(self._root):
+            candidate = Path(p)
+        elif p.startswith("/"):
+            candidate = self._root / p.lstrip("/")
+        else:
+            candidate = self._workdir / p
+        return contained_path(self._root, candidate, "Path")
+
+    def _command_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        env = host_exec_env(extra)
+        env["PATH"] = f"{self._root / 'bin'}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+        env["HOME"] = str(self._root)
+        env["HARBOR_HOST_ROOT"] = str(self._root)
+        return env
 
     def _copy_rewriting(self, src: Path, dst: Path) -> None:
         if src.suffix.lower() in _REWRITE_SUFFIXES:
@@ -244,12 +301,13 @@ class HostEnvironment(BaseEnvironment):
         else:
             shutil.copy2(str(src), str(dst))
 
-    def _copytree_rewriting(self, src: Path, dst: Path) -> None:
+    def _copytree_rewriting(self, src: Path, dst: Path, *, boundary: Path) -> None:
         dst.mkdir(parents=True, exist_ok=True)
         for item in src.iterdir():
+            contained_path(boundary, item, "Copied entry")
             target = dst / item.name
             if item.is_dir():
-                self._copytree_rewriting(item, target)
+                self._copytree_rewriting(item, target, boundary=boundary)
             else:
                 self._copy_rewriting(item, target)
 
@@ -259,32 +317,38 @@ class HostEnvironment(BaseEnvironment):
         self._copy_rewriting(Path(source_path), dst)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        source = Path(source_dir).resolve()
         dst = self._to_host(str(target_dir))
         dst.mkdir(parents=True, exist_ok=True)
-        for item in Path(source_dir).iterdir():
+        for item in source.iterdir():
+            contained_path(source, item, "Uploaded entry")
             target = dst / item.name
             if item.is_dir():
-                self._copytree_rewriting(item, target)
+                self._copytree_rewriting(item, target, boundary=source)
             else:
                 self._copy_rewriting(item, target)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         src = self._to_host(str(source_path))
         Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-        if src.exists():
+        if src.is_file():
             shutil.copy2(str(src), str(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         src = self._to_host(str(source_dir))
         Path(target_dir).mkdir(parents=True, exist_ok=True)
-        if not src.exists():
+        if not src.is_dir():
             return
+        self._copytree_contained(src, Path(target_dir))
+
+    def _copytree_contained(self, src: Path, dst: Path) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
         for item in src.iterdir():
-            dst_item = Path(target_dir) / item.name
-            if item.is_dir():
-                shutil.copytree(str(item), str(dst_item), dirs_exist_ok=True)
+            resolved = contained_path(self._root, item, "Downloaded entry")
+            if resolved.is_dir():
+                self._copytree_contained(resolved, dst / item.name)
             else:
-                shutil.copy2(str(item), str(dst_item))
+                shutil.copy2(str(resolved), str(dst / item.name))
 
     async def exec(
         self,
@@ -298,13 +362,7 @@ class HostEnvironment(BaseEnvironment):
         cwd_host = str(self._to_host(cwd)) if cwd else str(self._workdir)
         Path(cwd_host).mkdir(parents=True, exist_ok=True)
 
-        merged_env = os.environ.copy()
-        merged = self._merge_env(env)
-        if merged:
-            merged_env.update(merged)
-        merged_env["PATH"] = f"{self._root / 'bin'}:{merged_env.get('PATH', '')}"
-        merged_env["HOME"] = str(self._root)
-        merged_env["HARBOR_HOST_ROOT"] = str(self._root)
+        merged_env = self._command_env(self._merge_env(env))
 
         proc = await asyncio.create_subprocess_shell(
             rewritten,

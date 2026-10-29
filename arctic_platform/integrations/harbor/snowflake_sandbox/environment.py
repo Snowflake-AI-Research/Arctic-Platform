@@ -34,8 +34,10 @@ import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -63,6 +65,7 @@ from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay imp
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import base_image
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import is_archive_file
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import plan_from_dockerfile
+from arctic_platform.integrations.harbor.snowflake_sandbox.images import DEFAULT_PLATFORM
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import ImageRegistry
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import get_registry
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import LOST_EXIT
@@ -110,7 +113,12 @@ _DEFAULT_EXEC_TIMEOUT_S = 7200
 # after the exec stream drops.
 _STREAM_SLACK_S = 120
 _MAX_REATTACH = 5
-_LIVE_SLOTS: dict[int, asyncio.Semaphore] = {}
+# Keyed by event loop: an asyncio.Semaphore binds to the loop that first waits
+# on it, so trials on another loop get their own cap instead of a RuntimeError.
+_LIVE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]] = (
+    weakref.WeakKeyDictionary()
+)
+_LIVE_SLOTS_GUARD = threading.Lock()
 _warned: set[str] = set()
 
 # Sandbox root has no capabilities, so apt can't drop privileges to `_apt` or
@@ -234,6 +242,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         exec_timeout_sec: int | str = _DEFAULT_EXEC_TIMEOUT_S,
         idle_suspend: str = "24h",
         run_entrypoint: bool | str = True,
+        image_platform: str = DEFAULT_PLATFORM,
         **kwargs: Any,
     ) -> None:
         """
@@ -257,6 +266,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             exec_timeout_sec: Exec budget when Harbor passes no timeout.
             idle_suspend: Sandbox idle-suspend timeout (platform default is 10m).
             run_entrypoint: Start the image ENTRYPOINT at startup, as Docker does.
+            image_platform: Platform of the task images to mirror (``linux/amd64``).
         """
         if not _HAS_SDK:
             self.preflight()
@@ -290,6 +300,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         self._max_live = int(max_live)
         self._exec_timeout_sec = int(exec_timeout_sec)
         self._idle_suspend = idle_suspend
+        self._image_platform = image_platform
 
         self._sandbox: AsyncSandbox | None = None
         self._slot_held = False
@@ -349,7 +360,10 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         return self._sandbox
 
     def _slots(self) -> asyncio.Semaphore:
-        return _LIVE_SLOTS.setdefault(self._max_live, asyncio.Semaphore(self._max_live))
+        loop = asyncio.get_running_loop()
+        with _LIVE_SLOTS_GUARD:
+            per_loop = _LIVE_SLOTS.setdefault(loop, {})
+            return per_loop.setdefault(self._max_live, asyncio.Semaphore(self._max_live))
 
     def _egress(self) -> Egress:
         assert self.network_policy is not None
@@ -368,8 +382,13 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             raise ValueError(
                 f"Task image {ref!r} must be mirrored into Snowflake: pass --ek image_repo=DATABASE.SCHEMA.REPOSITORY"
             )
-        registry = get_registry(self._image_repo, connection=self._connection, role=self._role)
-        return await registry.ensure_image(ref, force_build=force_build)
+        return await self._registry().ensure_image(ref, force_build=force_build)
+
+    def _registry(self) -> ImageRegistry:
+        assert self._image_repo is not None
+        return get_registry(
+            self._image_repo, connection=self._connection, role=self._role, platform=self._image_platform
+        )
 
     async def _resolve_image(self, force_build: bool) -> tuple[str, ReplayPlan | None]:
         """Return the sandbox image path and, for Dockerfile tasks, the replay plan."""
@@ -413,9 +432,8 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         """WORKDIR, USER, ENTRYPOINT and ENV baked into ``image``, so exec matches Docker."""
         if not self._image_repo:
             return None, None, None, {}
-        registry = get_registry(self._image_repo, connection=self._connection, role=self._role)
         try:
-            config = await registry.image_config(image)
+            config = await self._registry().image_config(image)
         except Exception as e:  # noqa: BLE001 - metadata only; don't fail the trial over it
             logger.warning("Couldn't read image config for %s: %s", image, e)
             return None, None, None, {}

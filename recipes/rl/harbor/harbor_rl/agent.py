@@ -22,6 +22,12 @@ Supports both:
   task's ``tests/test.sh`` verifier grades the workspace directly).
 Also loads any OpenHands ``SKILL.md`` files passed via ``HARBOR_SKILL`` or
 Harbor's ``--skill`` flag.
+
+The ``terminal`` tool runs every command through the trial's Harbor
+environment (:mod:`harbor_rl.terminal`), so the agent works in the same
+filesystem the verifier grades, whichever backend ``HARBOR_ENV`` selects.
+``file_editor`` is not offered: it edits the training driver's filesystem
+rather than the environment's.
 """
 
 from __future__ import annotations
@@ -148,25 +154,19 @@ def _build_harbor_finish_tool() -> Any:
     return HarborFinishTool
 
 
-def _build_openhands_tools(finish_tool_name: str) -> list[Any]:
+def _build_openhands_tools(finish_tool_name: str, terminal: Any) -> list[Any]:
     from openhands.sdk import Tool
     from openhands.tools.terminal import TerminalTool
 
     raw_tools = os.environ.get("OPENHANDS_TOOLS", "").strip()
     if not raw_tools:
-        return [Tool(name=TerminalTool.name), Tool(name=finish_tool_name)]
+        return [terminal, Tool(name=finish_tool_name)]
 
-    tool_Map: dict[str, str] = {"terminal": TerminalTool.name}
-    try:
-        from openhands.tools.file_editor import FileEditorTool
-
-        tool_Map["file_editor"] = FileEditorTool.name
-    except ImportError:
-        pass
+    tool_map: dict[str, str] = {"terminal": TerminalTool.name}
     try:
         from openhands.tools.task_tracker import TaskTrackerTool
 
-        tool_Map["task_tracker"] = TaskTrackerTool.name
+        tool_map["task_tracker"] = TaskTrackerTool.name
     except ImportError:
         pass
 
@@ -176,10 +176,15 @@ def _build_openhands_tools(finish_tool_name: str) -> list[Any]:
         key = item.strip()
         if not key:
             continue
-        resolved = tool_Map.get(key, key)
+        if key in ("file_editor", "str_replace_editor"):
+            raise ValueError(
+                f"OPENHANDS_TOOLS={raw_tools!r}: {key} edits the training driver's filesystem, not the "
+                "Harbor environment's. Use terminal (it runs in the environment) instead."
+            )
+        resolved = tool_map.get(key, key)
         if resolved not in seen:
             seen.add(resolved)
-            tools.append(Tool(name=resolved))
+            tools.append(terminal if resolved == TerminalTool.name else Tool(name=resolved))
     if finish_tool_name and finish_tool_name not in seen:
         tools.append(Tool(name=finish_tool_name))
     return tools
@@ -195,10 +200,18 @@ GENERAL_HARBOR_SYSTEM_PROMPT = (
 )
 
 
-def _run_openhands_sync(
+def _run_openhands_sync(*, terminal_executor: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], Any, int]:
+    from harbor_rl.terminal import terminal_tool
+
+    with terminal_tool(terminal_executor) as terminal:
+        return _converse(terminal=terminal, **kwargs)
+
+
+def _converse(
     *,
     instruction: str,
-    working_dir: Path,
+    working_dir: str,
+    terminal: Any,
     logs_dir: Path,
     model_name: str,
     base_url: str,
@@ -227,7 +240,7 @@ def _run_openhands_sync(
         _ensure_tool_registered("localization_finish", LocalizationFinishTool)
         finish_tool_name = "localization_finish"
         problem = str(instance.get("problem_statement") or instruction)
-        user_prompt = render_user_prompt({"problem_statement": problem}, str(working_dir))
+        user_prompt = render_user_prompt({"problem_statement": problem}, working_dir)
     else:
         finish_locations = None
         system_path.write_text(GENERAL_HARBOR_SYSTEM_PROMPT.format(max_turns=max_turns), encoding="utf-8")
@@ -258,18 +271,21 @@ def _run_openhands_sync(
                 chat_template_kwargs=dict(add_generation_prompt=True, enable_thinking=False),
             ),
         ),
-        tools=_build_openhands_tools(finish_tool_name),
+        tools=_build_openhands_tools(finish_tool_name, terminal),
         system_prompt_filename=str(system_path),
     )
     if agent_context is not None:
         agent_kwargs["agent_context"] = agent_context
 
     agent = Agent(**agent_kwargs)
+    # Local scratch space for the conversation's own state; commands run in the environment.
+    scratch = logs_dir / "openhands"
+    scratch.mkdir(parents=True, exist_ok=True)
     conversation = Conversation(
         agent=agent,
         max_iteration_per_run=max_turns,
         visualizer=None,
-        workspace=str(working_dir),
+        workspace=str(scratch),
     )
     try:
         conversation.send_message(user_prompt)
@@ -309,6 +325,7 @@ class OpenHandsHarborAgent(BaseAgent):
         instance: dict[str, Any] | None = None,
         skill_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
+        terminal_timeout_sec: int = 180,
         **kwargs: Any,
     ) -> None:
         forward = {k: v for k, v in kwargs.items() if k in ("logger", "mcp_servers", "skills_dir")}
@@ -331,6 +348,7 @@ class OpenHandsHarborAgent(BaseAgent):
             or "harbor"
         )
         self._max_turns = int(max_turns)
+        self._terminal_timeout_sec = int(terminal_timeout_sec)
         self._training_phase = str(training_phase)
         self._instance = dict(instance or {})
         env_skill = os.environ.get("HARBOR_SKILL", "")
@@ -354,20 +372,26 @@ class OpenHandsHarborAgent(BaseAgent):
         environment: BaseEnvironment,
         context: HarborAgentContext,  # noqa: ARG002
     ) -> None:
-        working_dir = getattr(environment, "working_dir", None)
-        host_root = getattr(environment, "host_root", None)
-        if working_dir is None:
-            working_dir = Path(str(environment.trial_paths.trial_dir)) / "workspace"
-            working_dir.mkdir(parents=True, exist_ok=True)
+        from harbor_rl.terminal import HarborTerminalExecutor
 
-        truth_exists = (host_root is not None and (Path(host_root) / "tests" / "ground_truth.json").exists()) or bool(
-            self._instance.get("file_changes") is not None or self._instance.get("target") is not None
+        pwd = await environment.exec("pwd")
+        working_dir = (pwd.stdout or "").strip().splitlines()[-1] if pwd.return_code == 0 and pwd.stdout else ""
+        if not working_dir:
+            raise RuntimeError(f"Couldn't read the environment's working directory: {pwd.stderr or pwd.stdout!r}")
+        executor = HarborTerminalExecutor(
+            environment,
+            asyncio.get_running_loop(),
+            working_dir,
+            default_timeout_s=self._terminal_timeout_sec,
         )
+
+        truth_exists = self._instance.get("file_changes") is not None or self._instance.get("target") is not None
 
         messages, locations, n_turns = await asyncio.to_thread(
             _run_openhands_sync,
             instruction=instruction,
-            working_dir=Path(working_dir),
+            working_dir=working_dir,
+            terminal_executor=executor,
             logs_dir=self.logs_dir,
             model_name=self.model_name or "Qwen/Qwen3.5-4B",
             base_url=self._base_url,
