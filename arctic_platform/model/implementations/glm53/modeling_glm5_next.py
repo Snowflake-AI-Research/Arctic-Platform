@@ -46,7 +46,7 @@ def _fp8_modules_to_skip(config) -> set[str]:
 
 
 def _rms_norm_rounded_once(self, hidden_states: Tensor) -> Tensor:
-    """``Glm5NextTextRMSNorm`` rounded once, with the weight multiplied in fp32, as every vLLM GLM-5.3 norm kernel does."""
+    """``Glm5NextTextRMSNorm`` rounded once, the weight multiplied in fp32, as vLLM's GLM-5.3 norm kernels do."""
     normed = hidden_states.float()
     normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
     return (normed * self.weight.float()).to(hidden_states.dtype)

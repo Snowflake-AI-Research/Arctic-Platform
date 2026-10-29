@@ -25,7 +25,7 @@ from tests.model.test_glm5_next import _tiny_config as _glm_tiny_config
 
 
 def _assert_rounded_once(actual: torch.Tensor, reference: torch.Tensor) -> None:
-    """``actual`` equals ``reference`` (fp64) rounded once, except where fp32 arithmetic noise could flip that rounding."""
+    """``actual`` is ``reference`` (fp64) rounded once, except where fp32 noise could flip that rounding."""
     expected = reference.to(actual.dtype)
     ambiguous = (reference * (1 - 1e-5)).to(actual.dtype) != (reference * (1 + 1e-5)).to(actual.dtype)
     assert ambiguous.double().mean() < 0.01
