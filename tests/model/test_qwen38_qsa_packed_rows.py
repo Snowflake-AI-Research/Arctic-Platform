@@ -134,11 +134,12 @@ def test_qsa_gradients_match_transformers_at_sp1(monkeypatch):
     for each in models:
         each(input_ids=ids, use_cache=False).logits.square().sum().backward()
 
-    for (name, actual), expected in zip(model.named_parameters(), reference.parameters(), strict=True):
-        if actual.grad is None:
-            assert expected.grad is None or not expected.grad.any(), name
-            continue
-        torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-8, msg=lambda m: f"{name}: {m}")
+    def grads(module):
+        return {name: torch.zeros_like(p) if p.grad is None else p.grad for name, p in module.named_parameters()}
+
+    expected = grads(reference)
+    mismatched = [name for name, grad in grads(model).items() if not torch.allclose(grad, expected[name], 1e-5, 1e-8)]
+    assert not mismatched, f"gradients differ from transformers: {mismatched}"
 
 
 def test_qwen38_packed_boundaries_isolate_padded_tail():
