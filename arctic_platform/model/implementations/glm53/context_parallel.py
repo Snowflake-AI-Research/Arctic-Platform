@@ -691,7 +691,7 @@ def _linear_attention_forward(
             weight=conv_weight,
             bias=conv_bias,
             activation=self.activation,
-            seq_idx=_packed_sequence_indices(global_cu_seqlens),
+            seq_idx=_packed_sequence_indices(global_cu_seqlens, global_length),
         )
     mixed_qkv = mixed_qkv.transpose(1, 2)
     local_width = local_heads * self.head_dim
@@ -769,7 +769,7 @@ def _local_linear_attention_forward(
         weight=self.conv1d.weight.squeeze(1),
         bias=self.conv1d.bias,
         activation=self.activation,
-        seq_idx=_packed_sequence_indices(global_cu_seqlens),
+        seq_idx=_packed_sequence_indices(global_cu_seqlens, sequence_length),
     ).transpose(1, 2)
     query, key, value = torch.split(mixed_qkv, [self.qkv_dim] * 3, dim=-1)
     query = query.view(shape)

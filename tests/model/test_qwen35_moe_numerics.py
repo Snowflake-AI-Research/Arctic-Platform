@@ -596,6 +596,15 @@ def test_stock_qwen3_5_gated_delta_net_through_the_wrapper_follows_its_argument(
     torch_assert_equal(captured["beta"].reshape(b.shape), expected)
 
 
+def test_packed_sequence_indices_reads_nothing_back_from_the_device():
+    cu_seqlens = torch.tensor([0, 5, 9, 9, 20], dtype=torch.int32)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        indices = sp_gated_delta_net._packed_sequence_indices(cu_seqlens, 20)
+    # Each scalar read is a device-to-host copy and a stream synchronization on CUDA.
+    assert [event.name for event in profile.events() if event.name == "aten::_local_scalar_dense"] == []
+    torch_assert_equal(indices, torch.tensor([[0] * 5 + [1] * 4 + [3] * 11], dtype=torch.int32))
+
+
 def test_head_parallel_gated_delta_net_requires_fp32_beta():
     # No default: a caller that does not say which beta gate it wants fails instead of getting one silently.
     tensor = torch.zeros(1)
