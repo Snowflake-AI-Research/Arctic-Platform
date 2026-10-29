@@ -155,6 +155,9 @@ class Glm5NextForConditionalGenerationPrimeRL(
         if getattr(config, "quantization_config", None) and fp8_block_size is None:
             raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
+        for module in self.modules():
+            if type(module) is Glm5NextTextRMSNorm:
+                module.forward = types.MethodType(_rms_norm_rounded_once, module)
         text_config = config.text_config
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
@@ -184,9 +187,6 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
-        for module in self.modules():
-            if type(module) is Glm5NextTextRMSNorm:
-                module.forward = types.MethodType(_rms_norm_rounded_once, module)
         self._is_vlm = True
 
     @classmethod
