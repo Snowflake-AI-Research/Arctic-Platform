@@ -44,6 +44,7 @@ class GlmMoeDsaDebugOptions(BaseModel):
     hidden_size: int | None = Field(None, gt=0)
     intermediate_size: int | None = Field(None, gt=0)
     moe_intermediate_size: int | None = Field(None, gt=0)
+    full_determinism: bool = False
 
 
 class GlmMoeDsaOptions(BaseModel):
