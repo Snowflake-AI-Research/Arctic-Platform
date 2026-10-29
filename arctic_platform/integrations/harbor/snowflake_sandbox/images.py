@@ -116,7 +116,7 @@ class ImageRegistry:
         self.role = role
         self.platform = platform
         self._host: str | None = None
-        self._logged_in_at = 0.0
+        self._logged_in_at: float | None = None
         self._login_guard = threading.RLock()
         self._image_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
             weakref.WeakKeyDictionary()
@@ -146,7 +146,7 @@ class ImageRegistry:
                     shutil.rmtree(path, ignore_errors=True)
             self._docker_config = None
             self._ca_tar = None
-            self._logged_in_at = 0.0
+            self._logged_in_at = None
 
     def _image_lock(self, tag: str) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
@@ -194,15 +194,20 @@ class ImageRegistry:
     def sandbox_prefix(self) -> str:
         return f"/{self.database}/{self.schema}/{self.repo}".lower()
 
+    def _login_fresh(self) -> bool:
+        # time.monotonic() counts from boot, so an epoch of 0.0 would read as
+        # "just logged in" on a host that has been up for less than the TTL.
+        return self._logged_in_at is not None and time.monotonic() - self._logged_in_at < _LOGIN_TTL_S
+
     async def _login(self) -> None:
-        if time.monotonic() - self._logged_in_at < _LOGIN_TTL_S:
+        if self._login_fresh():
             return
         host = await self._registry_host()
         await asyncio.to_thread(self._login_sync, host)
 
     def _login_sync(self, host: str) -> None:
         with self._login_guard:
-            if time.monotonic() - self._logged_in_at < _LOGIN_TTL_S:
+            if self._login_fresh():
                 return
             proc = subprocess.run(
                 ["crane", "auth", "login", host, "-u", "0sessiontoken", "--password-stdin"],

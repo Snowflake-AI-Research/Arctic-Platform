@@ -370,6 +370,23 @@ def test_registry_login_never_touches_the_users_docker_config(tmp_path, monkeypa
     assert not private.exists()
 
 
+def test_registry_logs_in_on_a_freshly_booted_host(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    logins: list[str] = []
+    monkeypatch.setattr(images.time, "monotonic", lambda: 5.0)
+    registry = images.ImageRegistry("DB.SCHEMA.REPO", connection=None, role=None)
+    monkeypatch.setattr(registry, "_login_sync", logins.append)
+
+    async def fake_host() -> str:
+        return "org-acct.registry.snowflakecomputing.com"
+
+    monkeypatch.setattr(registry, "_registry_host", fake_host)
+    asyncio.run(registry._login())
+    assert logins == ["org-acct.registry.snowflakecomputing.com"]
+
+
 def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
