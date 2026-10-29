@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GLM-5.3-Flash computes in fp32 where its reference and the vLLM sampler do, with bf16 (DeepSpeed-cast) parameters.
+"""GLM-5.3-Flash computes in fp32 where the vLLM sampler does, with bf16 (DeepSpeed-cast) parameters.
 
-Router logits (``moe_router_dtype: float32``), the mHC remix (vLLM ``mhc_post``: fp32, one rounding), the KDA beta gate
-and Qwen3.8-Flash-Next's context-parallel GatedDeltaNet beta gate (vLLM sigmoids the bf16 logit in fp32), and the
-router-score gradient through the EP dispatch backward.
+Router logits (``moe_router_dtype: float32``; transformers' reference also uses fp32), the mHC remix (vLLM ``mhc_post``:
+fp32, one rounding), the KDA beta gate and Qwen3.8-Flash-Next's context-parallel GatedDeltaNet beta gate (vLLM sigmoids
+the bf16 logit in fp32), and the router-score gradient through the EP dispatch backward.
 """
 
 import importlib
