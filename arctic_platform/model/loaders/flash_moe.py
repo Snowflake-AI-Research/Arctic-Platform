@@ -21,6 +21,8 @@ Hugging Face iterator.
 
 from __future__ import annotations
 
+from pydantic import Field
+
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
 from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
@@ -31,6 +33,19 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+
+class FlashMoeOptions(GenericMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash and Qwen3.8-Flash-Next."""
+
+    fp32_parity: bool = Field(
+        True,
+        description=(
+            "Round once where vLLM does: GLM-5.3-Flash's RMSNorms multiply the weight in fp32 before rounding, and "
+            "Qwen3.8-Flash-Next's QSA rotary embedding, softmax probabilities, P·V product and output gate run in "
+            "fp32. False keeps the transformers order, which rounds each of them to the input dtype."
+        ),
+    )
 
 
 def _matches(model_type: str):
@@ -130,7 +145,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=GenericMoeOptions,
+    options=FlashMoeOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
@@ -142,7 +157,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
 @register_loader(
     "qwen4_exp",
     matches=_matches("qwen4_exp"),
-    options=GenericMoeOptions,
+    options=FlashMoeOptions,
     validate_spec=_validate_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
