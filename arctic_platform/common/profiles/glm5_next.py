@@ -15,9 +15,10 @@
 
 """Profile of the ``glm5_next`` loader (GLM-5.3-Flash).
 
-The loader registers ``GenericMoeOptions``, so it extends the ``generic_moe`` profile and overrides only what
-differs: it supports ``attention.sparse_mla`` through ``ModelSpec.attn_implementation``, which the loader requires
-to name a sparse MLA backend.
+The loader registers ``FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity``), so it extends the
+``generic_moe`` profile and overrides only what differs: it supports ``attention.sparse_mla`` through
+``ModelSpec.attn_implementation``, which the loader requires to name a sparse MLA backend, and
+``numerics.fp32_parity``, which rounds the RMSNorms once after the weight multiply, as vLLM does.
 """
 
 from __future__ import annotations
@@ -31,6 +32,6 @@ def register(registry: Registry) -> None:
     register_profile(
         "glm5_next",
         extends="generic_moe",
-        supports=["attention.sparse_mla"],
+        supports=["attention.sparse_mla", "numerics.fp32_parity"],
         registry=registry,
     )
