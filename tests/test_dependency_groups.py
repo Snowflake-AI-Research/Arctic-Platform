@@ -158,18 +158,19 @@ class TestExtraNamesResolve:
         for extra, deps in optional.items():
             for dep in deps:
                 if dep.startswith("arctic_platform["):
-                    ref = dep.split("[")[1].rstrip("]")
-                    assert ref in optional, f"[{extra}] references undefined [{ref}]"
+                    refs = dep.split("[", 1)[1].rstrip("]").split(",")
+                    missing = [ref.strip() for ref in refs if ref.strip() not in optional]
+                    assert not missing, f"[{extra}] references undefined {missing}"
 
     def test_cortex_install_does_not_pull_the_inference_extra(self):
-        """[cortex] and [sft] do not select [inference]. [rl] keeps published arctic-inference."""
+        """[cortex] and [sft] do not select [inference]. [rl] selects the in-tree sampler."""
         with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
             project = tomllib.load(f)
         include = project["tool"]["hatch"]["build"]["include"]
         assert "arctic_platform" in include
         optional = project["project"]["optional-dependencies"]
-        assert "arctic-inference[server,vllm]>=0.3.0" in optional["rl"]
-        assert "arctic_platform[inference]" not in optional["rl"]
+        assert optional["rl"] == ["arctic_platform[sft,inference]"]
+        assert not any("arctic-inference" in dep for dep in optional["rl"])
         hook = project["tool"]["hatch"]["build"]["hooks"]["custom"]
         assert hook["path"] == "hatch_build.py"
         for extra in ("cortex", "sft"):

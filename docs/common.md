@@ -129,6 +129,24 @@ Forwarded in the `initialize` payload (`JobConfig`):
 `build_model_config()` merges `vllm_config` with ArcticInference signals from
 `arctic_inference_config` (e.g. `zorro_inference.enable` → `use_fca=True`).
 
+### Gradient Accumulation Precision
+
+**The AP DeepSpeed worker retains FP32 gradient accumulation when `data_types` is absent.** `DeepSpeedWorker.ds_training_config()` supplies `data_types={"grad_accum_dtype": "fp32"}` only when the entire `data_types` block is missing. An explicitly supplied block is preserved without filling in missing fields, including an empty `{}` block.
+
+**Set `data_types.grad_accum_dtype` explicitly to select accumulation precision.** For FP32 accumulation, include this block in the supplied `ds_config`, alongside the existing BF16 and ZeRO settings:
+
+```json
+{
+  "data_types": {
+    "grad_accum_dtype": "fp32"
+  }
+}
+```
+
+**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is also preserved. If a supplied `data_types` block omits `grad_accum_dtype`, or a caller initializes DeepSpeed without going through the AP worker, DeepSpeed defaults to the model dtype for gradient accumulation.
+
+**Regression coverage verifies the existing default, not a numerical-default change.** Worker tests cover both the absent `data_types` block and preserved supplied blocks. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
+
 ### GLM-5.3 Sparse Attention
 
 **The GLM-5.3 loader's `attn_implementation` selects automatic or forced sparse attention.** The selection reaches every sparse layer, including with sequence parallelism disabled (SP1):
