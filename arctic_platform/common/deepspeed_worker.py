@@ -43,7 +43,6 @@ from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
-from arctic_platform.common.utils.tiled_logits import fill_logits_opt_from_worker_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
@@ -391,7 +390,6 @@ class DeepSpeedWorker:
 
         loss_object = _pop_loss_object(batch)
         args, batch_data, meta_data, processing = unpack_batch(batch)
-        meta_data = fill_logits_opt_from_worker_config(meta_data, getattr(self, "ds_worker_config", None))
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
                 batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
