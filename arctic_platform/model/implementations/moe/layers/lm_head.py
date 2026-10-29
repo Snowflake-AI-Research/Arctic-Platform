@@ -447,15 +447,17 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                     grad_logits = grad_logits * inv_t_chunk
 
                 if need_hidden:
+                    assert grad_hidden is not None
                     grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
                     grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
                 if need_weight:
+                    assert grad_weight is not None
                     grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
                     grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
 
         return (
-            grad_hidden.to(hidden.dtype) if need_hidden else None,
-            grad_weight.to(weight.dtype) if need_weight else None,
+            grad_hidden.to(hidden.dtype) if grad_hidden is not None else None,
+            grad_weight.to(weight.dtype) if grad_weight is not None else None,
             None,
             None,
             None,

@@ -51,6 +51,7 @@ class ModelConfig:
     optimization_dtype: Literal["bfloat16", "float32"] = "float32"
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
+    moe_use_sonicmoe: bool = True
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False

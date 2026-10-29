@@ -32,7 +32,7 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import (
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
 )
-from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
 from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
@@ -71,6 +71,8 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
     for transformer_block in language_model.layers:
         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
             continue
+        if isinstance(transformer_block.mlp, MoE):
+            transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
         transformer_block.mlp.set_ep_comm_backend(backend)
         transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
 
@@ -396,6 +398,9 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
             # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
             # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
+            # The recompute then repeats the EP all-to-all. Replay keeps the forward's combined output instead.
+            if ac_config.combine_replay:
+                install_combine_replay(transformer_block)
             transformer_block = checkpoint_wrapper(
                 transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
             )
@@ -425,5 +430,6 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     logger.info(
         f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
+        f"combine_replay={ac_config.combine_replay}, "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )

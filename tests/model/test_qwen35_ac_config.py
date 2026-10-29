@@ -30,6 +30,7 @@ def test_defaults_nest_a_default_offload_config():
 
     assert ac.mode == "full"
     assert ac.freq == 1
+    assert ac.combine_replay is True
     assert isinstance(ac.offload_config, ActivationOffloadConfig)
     assert ac.offload_config.enabled is False
     assert ac.offload_config.keep_last_n == 1

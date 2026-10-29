@@ -96,6 +96,8 @@ class MoEArgs:
     # token-choice
     top_k: int = 1
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
+    # BF16 DeepEP/UCCL experts take SonicMoE when the kernel applies. False keeps the grouped GEMM path.
+    use_sonicmoe: bool = True
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
@@ -735,6 +737,7 @@ class MoE(nn.Module):
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
+        self.use_sonicmoe = moe_args.use_sonicmoe
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -786,6 +789,9 @@ class MoE(nn.Module):
     def set_deepep_token_chunk_size(self, chunk_size: int | None) -> None:
         self.deepep_token_chunk_size = chunk_size
 
+    def set_use_sonicmoe(self, enabled: bool) -> None:
+        self.use_sonicmoe = enabled
+
     def _run_local_routed_experts(
         self,
         x: torch.Tensor,
@@ -835,10 +841,11 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
-        # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py), called through self.experts
-        # so that PEFT merges any expert LoRA into the weights they read.
+        # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
+        # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
         use_sonic = (
-            not self.score_before_experts
+            self.use_sonicmoe
+            and not self.score_before_experts
             and hasattr(ep_comm, "finalize_dispatch_rows")
             and sonic_routed_experts_applicable(experts)
         )
@@ -990,6 +997,17 @@ class MoE(nn.Module):
             self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
             if self.load_balance_coeff is not None:
                 self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+
+
+def install_combine_replay(block: nn.Module) -> None:
+    """Give each ``MoE`` in ``block`` a :class:`CombineReplay`.
+
+    A full-checkpoint recompute that runs to the end of the block repeats the expert-parallel combine. The replay
+    returns the forward's combined output instead and releases the recompute's dispatch handle.
+    """
+    for module in block.modules():
+        if isinstance(module, MoE):
+            module.combine_replay = CombineReplay()
 
 
 def relu2(x: torch.Tensor) -> torch.Tensor:

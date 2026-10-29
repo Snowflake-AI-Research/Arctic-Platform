@@ -182,21 +182,26 @@ def build_iter_full_hf_weights(model: nn.Module):
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
-            full = None
             if is_master:
                 full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
-            dist.gather(local, list(full.chunk(world, dim=0)) if is_master else None, dst=0, group=ep_group)
+                gather_list = list(full.chunk(world, dim=0))
+            else:
+                full = None
+                gather_list = None
+            dist.gather(local, gather_list, dst=0, group=ep_group)
             return full
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
-        full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
-        buffer = None
         if is_master:
+            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
             buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+        else:
+            full = None
+            buffer = None
         for start in range(0, rows, step):
             n = min(step, rows - start)
-            outputs = [buffer[r, :n] for r in range(world)] if is_master else None
+            outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
             dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
-            if is_master:
+            if full is not None and buffer is not None:
                 for r in range(world):
                     full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
         return full

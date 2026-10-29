@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
@@ -12,7 +27,8 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
-from .topk import Softmax_Over_TopK, TopK_Over_Softmax
+from .topk import Softmax_Over_TopK
+from .topk import TopK_Over_Softmax
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_topk_fwd", mutates_args={"values", "indices"})
@@ -35,22 +51,22 @@ def _topk_fwd(
 
     input_dtype = torch2cute_dtype_map[x.dtype]
     output_dtype = torch2cute_dtype_map[values.dtype]
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-    )
+
+    def convert_from_dlpack(tensor):
+        return from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if is_softmax_over_topk:
         compile_key = (input_dtype, output_dtype, N, k, True)
     else:
-        compile_key = (input_dtype, output_dtype, N, k, False, norm_topk_probs)
+        compile_key = (input_dtype, output_dtype, N, k, False, norm_topk_probs)  # type: ignore[assignment]
 
     if compile_key not in _topk_fwd.compile_cache:
         if is_softmax_over_topk:
             topk_op = Softmax_Over_TopK(input_dtype, output_dtype, N, k)
         else:
-            topk_op = TopK_Over_Softmax(input_dtype, output_dtype, N, k, norm_topk_probs)
+            topk_op = TopK_Over_Softmax(input_dtype, output_dtype, N, k, norm_topk_probs)  # type: ignore[assignment]
 
         _topk_fwd.compile_cache[compile_key] = cute.compile(
             topk_op, x_tensor, values_tensor, indices_tensor, current_stream

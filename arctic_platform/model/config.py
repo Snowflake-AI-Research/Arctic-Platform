@@ -94,6 +94,14 @@ class ActivationCheckpointConfig(BaseModel):
         default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
     )
     router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+    combine_replay: bool = Field(
+        True,
+        description=(
+            "On a fully checkpointed block, keep the MoE combine output and return it to the recompute instead of "
+            "repeating the expert-parallel all-to-all. Costs one local-tokens-by-hidden tensor per checkpointed "
+            "layer until that layer's backward."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:

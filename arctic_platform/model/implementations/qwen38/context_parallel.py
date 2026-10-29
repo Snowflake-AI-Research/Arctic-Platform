@@ -63,6 +63,8 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
     from fla.modules.conv import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
+
     check_finite = os.environ.get("ARCTIC_QWEN38_CP_CHECK_FINITE") == "1"
 
     num_key_heads = int(module.num_k_heads)
@@ -107,9 +109,9 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         a = self.in_proj_a(hidden_states)
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        # q/k stay at the 16 key heads: FLA's chunk rule applies grouped value attention for HV > H, reading key
-        # head hv // (HV // H) for value head hv, the assignment repeat_interleave would build. Its fp32 dq/dk sum over
-        # the value heads of a key head replaces the BF16 RepeatInterleaveBackward sum.
+        query, key = repeat_query_key_for_value_heads(
+            query, key, num_key_heads, num_value_heads, chunk_gated_delta_rule
+        )
         if check_finite:
             for name, tensor in (
                 ("query", query),

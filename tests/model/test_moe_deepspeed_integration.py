@@ -108,15 +108,17 @@ def test_family_defaults_remain_distinct():
     qwen_config = qwen._build_model_config("qwen", 2, 4, "bfloat16", "flash_attention_3", Qwen3_5MoeOptions())
     glm_config = glm._build_model_config("glm", 2, 4, "bfloat16", "flash_attention_2", GlmMoeDsaOptions())
 
-    assert (qwen_config.attn, qwen_config.moe_use_grouped_mm) == (
+    assert (qwen_config.attn, qwen_config.moe_use_grouped_mm, qwen_config.moe_use_sonicmoe) == (
         "flash_attention_3",
+        True,
         True,
     )
     assert (
         glm_config.attn,
         glm_config.moe_use_grouped_mm,
+        glm_config.moe_use_sonicmoe,
         glm_config.sparse_mla_backend,
-    ) == ("flash_attention_2", False, "ref")
+    ) == ("flash_attention_2", False, True, "ref")
 
 
 def test_qwen_adapter_keeps_sp_and_vllm_export(monkeypatch):

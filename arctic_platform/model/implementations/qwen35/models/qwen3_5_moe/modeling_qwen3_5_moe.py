@@ -23,6 +23,7 @@ from arctic_platform.model.implementations.gpu.action_masks import slice_action_
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNorm as _FusedAddRMSNorm
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32 as _rope_rotary_slice_fp32
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
@@ -353,10 +354,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             # low-precision ``b`` would round the gate before the kernel reads it.
             beta = b.float().sigmoid() if self.fp32_parity else b.sigmoid()
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-            if self.num_v_heads // self.num_k_heads > 1:
-                replication = self.num_v_heads // self.num_k_heads
-                query = query.repeat_interleave(replication, dim=2)
-                key = key.repeat_interleave(replication, dim=2)
+            query, key = repeat_query_key_for_value_heads(
+                query, key, self.num_k_heads, self.num_v_heads, self._chunk_gated_delta_rule
+            )
             core_attn_out, _ = self._chunk_gated_delta_rule(
                 query,
                 key,

@@ -24,6 +24,9 @@ from torch import nn
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.glm52 import model_builder as glm52_builder
+from arctic_platform.model.implementations.moe.distributed.combine_replay import CombineReplay
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 from arctic_platform.model.implementations.qwen35 import model_builder as qwen35_builder
 
 
@@ -64,3 +67,54 @@ def test_listed_layers_are_the_only_checkpointed_blocks(apply_ac):
     assert wrapped == [False, True, False, True]
     with pytest.raises(ValueError, match="past the model"):
         apply_ac(model, ActivationCheckpointConfig(mode="full", layers=[4], router_replay_recompute=False))
+
+
+def _language_model_with_moe() -> tuple[nn.Module, MoE]:
+    moe = MoE(
+        MoEArgs(num_experts=2, num_shared_experts=0, top_k=1, use_grouped_mm=False, load_balance_coeff=None),
+        dim=4,
+        hidden_dim=8,
+    )
+    block = nn.Module()
+    block.mlp = moe
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([block])
+    return model, moe
+
+
+@pytest.mark.parametrize(
+    ("builder", "config_cls"),
+    [
+        (qwen35_builder, qwen35_builder.ModelConfig),
+        (glm52_builder, glm52_builder.ModelConfig),
+    ],
+    ids=["qwen35", "glm52"],
+)
+def test_sonicmoe_option_reaches_each_moe(monkeypatch, builder, config_cls):
+    from types import SimpleNamespace
+
+    import arctic_platform.model.implementations.moe.distributed.ep_backend as ep_backend
+
+    def fake_ep_module(_backend):
+        return SimpleNamespace(configure_num_sms=lambda _num_sms: None)
+
+    monkeypatch.setattr(ep_backend, "get_ep_comm_module", fake_ep_module)
+    monkeypatch.setattr(builder, "get_ep_comm_module", fake_ep_module, raising=False)
+    model, moe = _language_model_with_moe()
+    assert moe.use_sonicmoe is True
+
+    builder.configure_moe_ep_backend(model, config_cls(moe_use_sonicmoe=False))
+
+    assert moe.use_sonicmoe is False
+
+
+@pytest.mark.parametrize("apply_ac", [glm52_builder.apply_ac, qwen35_builder.apply_ac], ids=["glm52", "qwen35"])
+def test_full_checkpointing_installs_combine_replay_unless_disabled(apply_ac):
+    model, moe = _language_model_with_moe()
+    apply_ac(model, ActivationCheckpointConfig(mode="full", router_replay_recompute=False))
+    assert isinstance(moe.combine_replay, CombineReplay)
+
+    model, moe = _language_model_with_moe()
+    apply_ac(model, ActivationCheckpointConfig(mode="full", combine_replay=False, router_replay_recompute=False))
+    assert moe.combine_replay is None
