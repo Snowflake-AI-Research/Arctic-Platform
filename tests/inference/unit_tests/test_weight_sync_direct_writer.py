@@ -931,14 +931,53 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
     assert result["loaded_destination_trace_collected"] is True
 
 
-@pytest.mark.parametrize("entry_point", ["sync_weights", "sync_weights_broadcast"])
-def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, entry_point):
+def _ipc_tensor(*args):
+    return torch.ones(1)
+
+
+def _ipc_payload(names):
+    import base64
+    import pickle
+
+    handles = [{"gpu0": (_ipc_tensor, [None] * 7)} for _ in names]
+    return {"names": names, "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles))}
+
+
+def _run_sync_entry_point(entry_point, extension, tmp_path):
+    if entry_point in ("sync_weights", "sync_weights_broadcast", "sync_spec_weights"):
+        return getattr(WeightSyncExtension, entry_point)(extension, "127.0.0.1", 1234, 1, 2)
+    if entry_point == "load_weights_cuda_ipc":
+        return WeightSyncExtension.load_weights_cuda_ipc(extension, _ipc_payload(["w"]))
+    if entry_point == "load_weights_cuda_ipc_chunk":
+        first = WeightSyncExtension.load_weights_cuda_ipc_chunk(extension, _ipc_payload(["w"]))
+        assert "cached_weight_copies_refreshed" not in first
+        return WeightSyncExtension.load_weights_cuda_ipc_chunk(extension, _ipc_payload(["w"]), validate_names=["w"])
+    path = tmp_path / "weights.pt"
+    torch.save([("w", torch.ones(1))], path)
+    return WeightSyncExtension.load_weights_from_shm_path(extension, str(path))
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [
+        "sync_weights",
+        "sync_weights_broadcast",
+        "sync_spec_weights",
+        "load_weights_cuda_ipc",
+        "load_weights_cuda_ipc_chunk",
+        "load_weights_from_shm_path",
+    ],
+)
+def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
     monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
 
     # vLLM 0.31.0 Glm5NextLinearAttention: fp32 [C, 1, 4] q/k/v conv weights, and the
     # merged weight its first forward caches under inference mode (kda.py:505-515).
@@ -969,23 +1008,38 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, entry_point):
     cache_address = kda._merged_conv_weight.data_ptr()
     head_gate_address = indexer._wp_fp32.data_ptr()
 
-    def load_in_place(model, engine):  # ColumnParallelLinear.weight_loader: param.data.copy_
+    def update_in_place():  # ColumnParallelLinear.weight_loader: param.data.copy_
         for param in (*(conv.weight for conv in convs), indexer.wk_weights_proj.weight):
             param.data.add_(1.0)
+
+    class Model(nn.ModuleDict):
+        def load_weights(self, weights):
+            names = {name for name, _ in weights}
+            update_in_place()
+            return names
+
+    def load_batched(model, engine):
+        update_in_place()
         return 4, 0.0, 0.0, {}, []
 
+    model = Model({"kda": kda, "indexer": indexer})
     extension = SimpleNamespace(
         device=torch.device("cpu"),
-        model_runner=SimpleNamespace(model=nn.ModuleDict({"kda": kda, "indexer": indexer})),
+        model_runner=SimpleNamespace(model=model, drafter=SimpleNamespace(model=model)),
         model_config=SimpleNamespace(quantization=None),
-        _get_or_create_engine=lambda *args, **kwargs: object(),
+        _get_or_create_engine=lambda *args, **kwargs: _FakeEngine([("w", torch.ones(1))]),
         _get_or_create_broadcast_engine=lambda *args: object(),
-        _load_batched=load_in_place,
+        _load_batched=load_batched,
         _build_result=lambda *args: {"status": "done"},
+        _validate_weight_sync_names=lambda *args, **kwargs: None,
+    )
+    extension._load_cpu_weights_into_model = lambda weights: WeightSyncExtension._load_cpu_weights_into_model(
+        extension, weights
     )
 
-    getattr(WeightSyncExtension, entry_point)(extension, "127.0.0.1", 1234, 1, 2)
+    result = _run_sync_entry_point(entry_point, extension, tmp_path)
 
+    assert result["cached_weight_copies_refreshed"] == 2
     assert torch.equal(kda._merged_conv_weight, merged()), "sampler still convolves with pre-sync conv weights"
     assert kda._merged_conv_weight.data_ptr() == cache_address
     assert torch.equal(indexer._wp_fp32, head_gate()), "sparse indexer still gates with pre-sync weights"
