@@ -18,7 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AP_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 LOCALIZATION_DIR="${AP_ROOT}/recipes/rl/openhands/code_localization"
-ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex,harbor]}"
+# Sampling runs on Cortex, so the driver needs [sft] rather than [rl], whose
+# in-tree sampler (vLLM, kvcached) only builds where torch is preinstalled.
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[sft,cortex,harbor]}"
 OPENHANDS_REV="${OPENHANDS_REV:-85ecfd9333d2d2cc4404dd460fd38868d9b978e2}"
 OPENHANDS_SPEC="openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-sdk"
 OPENHANDS_TOOLS_SPEC="openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-tools"
