@@ -2,6 +2,7 @@ from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
+from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
@@ -48,6 +49,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_dflash_max_position_patch",
         lambda: calls.append("dflash_max_position"),
     )
+    monkeypatch.setattr(glm5next_lora, "ensure_glm5next_lora", lambda: calls.append("glm5next_lora"))
     monkeypatch.setattr(
         kv_group_size,
         "ensure_kv_group_size_patch",
@@ -74,6 +76,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "spec_decode_grammar",
         "dflash2",
         "glm5next_indexer_page",
+        "glm5next_lora",
         "kv_group_size",
         "dflash_max_position",
         "mrope_yarn",
