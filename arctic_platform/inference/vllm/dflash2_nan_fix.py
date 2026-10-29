@@ -180,6 +180,9 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
                 for kv in kvs:
                     if not isinstance(kv, torch.Tensor):
                         continue
+                    if group.kernel_block_stride:
+                        kv = group.map_kv_cache_to_manager_blocks(
+                            kv, num_blocks)
                     if kv.device.type != self.device.type:
                         continue
                     data_ptr = kv.data_ptr()

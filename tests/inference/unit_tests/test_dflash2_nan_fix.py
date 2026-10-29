@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from arctic_platform.inference.vllm.dflash2_nan_fix import (
     KVBlockZeroerPatch,
@@ -138,6 +139,7 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
         kv_cache_spec=spec,
         kv_cache_group_id=0,
         layer_names=[layer_name],
+        kernel_block_stride=0,
     )
     zeroer = SimpleNamespace()
 
@@ -156,3 +158,42 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
     assert zeroer._meta is not None
     addresses = set(zeroer._meta[0].tolist())
     assert addresses == {conv_state.data_ptr(), recurrent_state.data_ptr()}
+
+
+def test_packed_cache_bound_to_kernel_blocks_matches_upstream_zeroer():
+    device = torch.device("cpu")
+    num_blocks = 5
+    spec = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float32,
+        tokens_per_state=2,
+    )
+    layer_name = "model.layers.3.self_attn.indexer.k_cache"
+    group = AttentionGroup(
+        backend=None,
+        layer_names=[layer_name],
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        kernel_block_size=4,
+    )
+    # Two other layers' pages sit between this layer's blocks.
+    packed = torch.zeros((num_blocks, 3, 4, 16), dtype=torch.float32)
+    kv_cache = group.map_kv_cache_to_kernel_blocks(packed[:, :1])
+    assert group.kernel_block_stride
+    assert kv_cache.shape[0] % num_blocks != 0
+    static_forward_context = {layer_name: SimpleNamespace(kv_cache=kv_cache)}
+
+    expected = KVBlockZeroer(device, [group], [8], static_forward_context,
+                             num_blocks)
+    zeroer = SimpleNamespace()
+    KVBlockZeroerPatch.__init__(zeroer, device, [group], [8],
+                                static_forward_context, num_blocks)
+
+    assert zeroer._meta is not None
+    for actual, reference in zip(zeroer._meta, expected._meta):
+        if isinstance(reference, torch.Tensor):
+            torch.testing.assert_close(actual, reference)
+        else:
+            assert actual == reference
