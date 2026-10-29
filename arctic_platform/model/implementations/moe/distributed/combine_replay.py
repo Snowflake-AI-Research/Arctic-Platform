@@ -25,6 +25,7 @@ frame's recompute. A later forward does not discard an earlier one that has not 
 
 from __future__ import annotations
 
+import logging
 import weakref
 from collections import deque
 from typing import Callable
@@ -34,7 +35,39 @@ import torch
 from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
 from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
 
+logger = logging.getLogger(__name__)
 _OUTSIDE = object()
+_frame_lookup_failed = False
+_frame_miss_warned = False
+
+
+def _warn_checkpoint_frame_missing() -> None:
+    """One warning when the private checkpoint-frame lookup misses and forwards share one queue."""
+    global _frame_miss_warned
+    if _frame_miss_warned:
+        return
+    _frame_miss_warned = True
+    logger.warning(
+        "combine replay could not find the checkpoint frame in PyTorch's saved-tensor hooks. One checkpointed "
+        "forward still replays its combine. A second forward before that backward is refused, because those "
+        "forwards can no longer be told apart."
+    )
+
+
+def _saved_tensor_hooks_active() -> bool:
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if top is None:
+        return False
+    try:
+        hooks = top(False)
+    except (AttributeError, TypeError):
+        return False
+    return bool(hooks)
+
+
+def _mark_frame_lookup_failed() -> None:
+    global _frame_lookup_failed
+    _frame_lookup_failed = True
 
 
 def _checkpoint_frame() -> object | None:
@@ -45,14 +78,19 @@ def _checkpoint_frame() -> object | None:
     """
     top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
     if top is None:
+        _mark_frame_lookup_failed()
         return None
     try:
         hooks = top(False)
     except (AttributeError, TypeError):
+        _mark_frame_lookup_failed()
         return None
     if not hooks:
         return None
-    return _frame_in_closure(hooks[0], set())
+    frame = _frame_in_closure(hooks[0], set())
+    if frame is None:
+        _mark_frame_lookup_failed()
+    return frame
 
 
 def _frame_in_closure(fn: object, seen: set[int]) -> object | None:
@@ -94,6 +132,13 @@ class CombineReplay:
         frame = _checkpoint_frame()
         bucket: deque[tuple[torch.Tensor, int]] = deque()
         if frame is None:
+            if _frame_lookup_failed or _saved_tensor_hooks_active():
+                _warn_checkpoint_frame_missing()
+            if self._outside:
+                raise RuntimeError(
+                    "combine replay: the checkpoint frame was not found, so this forward cannot be kept "
+                    "apart from an earlier one that has not been recomputed"
+                )
             self._outside = bucket
             self._writing = _OUTSIDE
             return
@@ -118,6 +163,8 @@ class CombineReplay:
         """``combine()`` on a forward, keeping its output when the forward builds a graph; on the recompute,
         ``replayed(output)``: a node that stands in for the combine without communicating."""
         if _in_recompute():
+            if _checkpoint_frame() is None and (_frame_lookup_failed or _saved_tensor_hooks_active()):
+                _warn_checkpoint_frame_missing()
             queue = self._queue(reading=True)
             if not queue:
                 raise RuntimeError("combine replay: a recompute found no combined output from its forward")

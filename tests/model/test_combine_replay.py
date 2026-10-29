@@ -14,6 +14,8 @@
 # limitations under the License.
 """A checkpointed block's recompute replays its combine instead of communicating again, with unchanged gradients."""
 
+import logging
+
 import pytest
 import torch
 from torch import nn
@@ -136,6 +138,24 @@ def test_a_forward_with_no_backward_does_not_feed_the_next_forward():
     with set_checkpoint_early_stop(False):
         checkpoint(reference, x2_ref, use_reentrant=False).sum().backward()
     torch.testing.assert_close(x2.grad, x2_ref.grad, rtol=0, atol=0)
+
+
+def test_missing_checkpoint_frame_warns_and_refuses_a_second_forward(monkeypatch, caplog):
+    import arctic_platform.model.implementations.moe.distributed.combine_replay as replay_mod
+
+    monkeypatch.setattr(replay_mod, "_checkpoint_frame", lambda: None)
+    monkeypatch.setattr(replay_mod, "_frame_miss_warned", False)
+    monkeypatch.setattr(replay_mod, "_frame_lookup_failed", False)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    with caplog.at_level(logging.WARNING, logger=replay_mod.__name__):
+        with set_checkpoint_early_stop(False):
+            checkpoint(block, x1, use_reentrant=False)
+            with pytest.raises(RuntimeError, match="checkpoint frame was not found"):
+                checkpoint(block, x2, use_reentrant=False)
+    assert "could not find the checkpoint frame" in caplog.text
 
 
 def test_an_in_place_write_to_the_kept_output_is_refused():
