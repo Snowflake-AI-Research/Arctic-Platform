@@ -170,19 +170,25 @@ def _worker(rank: int, rendezvous: str, out_dir: str) -> None:
     table_bytes = table.numel() * table.element_size()
     assert model.get_parameter(_NGRAM).shape[0] * _EP == table.shape[0]
 
-    # The call dss-platform's ExpertParallelCheckpointer.save_weights_only makes on every rank.
+    expected = dict(iter_model_weights(reference, "hf", is_master=True, is_zero3=False, include_skipped=True))
+    exported_names = []
+    table_ref = None
+    # Consume as the streaming checkpointer does, releasing each tensor after writing it.
     with _PeakAllocatedBytes() as memory:
-        exported = list(iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True))
-
-    if rank == 0:
-        expected = list(iter_model_weights(reference, "hf", is_master=True, is_zero3=False, include_skipped=True))
-        assert [name for name, _ in exported] == [name for name, _ in expected]
-        for (name, actual), (_, wanted) in zip(exported, expected):
+        for name, actual in iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True):
+            exported_names.append(name)
+            wanted = expected[name]
             assert actual.dtype == wanted.dtype and actual.shape == wanted.shape, name
             assert torch.equal(actual.view(torch.uint8), wanted.contiguous().view(torch.uint8)), name
-        assert _NGRAM in dict(exported)
+            if name == _NGRAM:
+                table_ref = weakref.ref(actual)
+            elif table_ref is not None and ".layers.1." in name:
+                assert table_ref() is None, "export iterator retained the previous layer's n-gram table"
+    if rank == 0:
+        assert exported_names == list(expected)
+        assert _NGRAM in exported_names
     else:
-        assert exported == []
+        assert exported_names == []
     # Rank 0's exported table is the output; anything else is transient.
     transient = memory.peak - (table_bytes if rank == 0 else 0)
     with open(os.path.join(out_dir, f"rank{rank}.json"), "w") as f:

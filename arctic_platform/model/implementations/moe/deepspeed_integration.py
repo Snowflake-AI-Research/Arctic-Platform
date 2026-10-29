@@ -225,6 +225,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                         full = _gather_ep_shards_to_rank0_host(local, ep_group)
                         if is_master:
                             layer_state[name] = full
+                        del full
                         continue
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
                     dist.all_gather(shards, local, group=ep_group)
