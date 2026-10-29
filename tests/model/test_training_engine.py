@@ -227,6 +227,66 @@ def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
     assert captured["kwargs"] == {"lr": 3e-4, "betas": (0.8, 0.95), "eps": 1e-6, "adam_w_mode": True}
 
 
+def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
+    pytest.importorskip("transformers.models.qwen4_exp")
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
+    # A GatedDeltaNet layer with PLE and a QSA layer: every RMSNorm the model family has.
+    model = Qwen4ExpForCausalLM(
+        Qwen4ExpTextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_conv_kernel_dim=2,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            layer_types=["linear_attention", "full_attention"],
+            hc_count=2,
+            hc_lowrank=4,
+            ple_layer_ids=[1],
+            ple_embed_dim=8,
+            ple_conv_kernel_size=2,
+            ngram_size=3,
+            heads_per_ngram=1,
+            ngram_vocab_size_base=11,
+            make_ngram_vocab_size_divisible_by=4,
+            split_ngram_parts=2,
+            indexer_n_heads=1,
+            indexer_kv_heads=1,
+            indexer_head_dim=4,
+            indexer_budget=4,
+            indexer_compress_ratio=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.5},
+        )
+    )
+
+    optimizer = build_training_optimizer(
+        model, OptimizerSettings(name="torch_adamw", weight_decay=0.1), _ZERO2, fused=False
+    )
+
+    decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
+    decayed_norms = [
+        name
+        for module_name, module in model.named_modules()
+        if "Norm" in type(module).__name__
+        for name, param in module.named_parameters(prefix=module_name, recurse=False)
+        if id(param) in decayed
+    ]
+    assert not decayed_norms, f"norm weights in the weight-decay group: {decayed_norms}"
+
+
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
     sentinel = object()
     calls = {}
