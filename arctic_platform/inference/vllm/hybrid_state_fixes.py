@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility fixes for DFlash2 with GDN-backed hybrid models.
+"""Fixes for stale recurrent state on GDN/KDA-backed hybrid models.
 
 Remove these patches after both upstream fixes are included in the pinned
 vLLM release:
 
-* https://github.com/vllm-project/vllm/pull/51508
-* https://github.com/vllm-project/vllm/pull/56524
+* https://github.com/vllm-project/vllm/pull/51508: stale zero-accept
+  speculative rows
+* https://github.com/vllm-project/vllm/pull/56524: reallocated Mamba state
+  blocks are not zeroed
 """
 
 from itertools import product as iprod
@@ -169,27 +171,18 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
                 for kv in kvs:
                     if not isinstance(kv, torch.Tensor):
                         continue
+                    if group.kernel_block_stride:
+                        kv = group.map_kv_cache_to_manager_blocks(
+                            kv, num_blocks)
                     if kv.device.type != self.device.type:
                         continue
                     data_ptr = kv.data_ptr()
 
-                    if group.kernel_block_stride != 0:
-                        assert isinstance(spec, AttentionSpec)
-                        manager_rows = spec.get_num_kernel_states(spec.block_size)
-                        assert manager_rows % kv.shape[-2] == 0
-                        ratio = manager_rows // kv.shape[-2]
-                        logical_stride = group.kernel_block_stride
-                        assert 0 < ratio <= logical_stride
-                        assert (num_blocks - 1) * logical_stride + ratio <= kv.shape[
-                            0
-                        ], f"{layer_name}: packed cache does not cover {num_blocks} logical blocks"
-                    else:
-                        assert kv.shape[0] % num_blocks == 0, (
-                            f"{layer_name}: {kv.shape[0]} kernel blocks is not "
-                            f"a multiple of {num_blocks} logical blocks"
-                        )
-                        ratio = kv.shape[0] // num_blocks
-                        logical_stride = ratio
+                    assert kv.shape[0] % num_blocks == 0, (
+                        f"{layer_name}: {kv.shape[0]} kernel blocks is not "
+                        f"a multiple of {num_blocks} logical blocks"
+                    )
+                    ratio = kv.shape[0] // num_blocks
 
                     element_size = kv.element_size()
                     block_stride_bytes = kv.stride(0) * element_size
@@ -203,25 +196,21 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
                         (kv.shape[dim] - 1) * kv.stride(dim) * element_size for dim in inner_dims
                     )
                     assert kernel_page_bytes % 4 == 0
-                    logical_block_stride_bytes = block_stride_bytes * logical_stride
-                    # Adjacent pages of this layer can share a zeroing segment;
-                    # the manager stride still skips other layers' packed pages.
-                    pages_per_segment = ratio if kernel_page_bytes == block_stride_bytes else 1
-                    segment_page_bytes = kernel_page_bytes * pages_per_segment
+                    logical_block_stride_bytes = block_stride_bytes * ratio
                     ranges = (range(kv.shape[dim]) for dim in outer_dims)
                     for outer in iprod(*ranges):
                         offset_bytes = sum(index * stride for index, stride in zip(outer, outer_strides))
                         assert (data_ptr + offset_bytes) % 4 == 0
-                        for virtual_index in range(0, ratio, pages_per_segment):
+                        for virtual_index in range(ratio):
                             address = data_ptr + offset_bytes + virtual_index * block_stride_bytes
                             if (index := seen_ptrs.get(address)) is not None:
                                 assert seg_block_strides[index] == (logical_block_stride_bytes // 4)
-                                seg_page_sizes[index] = max(seg_page_sizes[index], segment_page_bytes // 4)
+                                seg_page_sizes[index] = max(seg_page_sizes[index], kernel_page_bytes // 4)
                                 continue
                             seen_ptrs[address] = len(seg_addrs)
                             seg_addrs.append(address)
                             seg_block_strides.append(logical_block_stride_bytes // 4)
-                            seg_page_sizes.append(segment_page_bytes // 4)
+                            seg_page_sizes.append(kernel_page_bytes // 4)
 
         if not seg_addrs:
             self._meta = None
@@ -242,7 +231,7 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
 _PATCHED = False
 
 
-def apply_dflash2_nan_fixes() -> None:
+def apply_hybrid_state_fixes() -> None:
     global _PATCHED
     if _PATCHED:
         return
