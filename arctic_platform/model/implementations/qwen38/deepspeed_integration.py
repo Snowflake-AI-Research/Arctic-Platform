@@ -22,6 +22,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
@@ -159,3 +160,8 @@ def load_qwen4_exp_model(
     )
     qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
     return model
+
+
+def prepare_qwen4_exp_weights(**kwargs):
+    """Fill the converted-weight cache ``load_qwen4_exp_model`` loads from; see ``prepare_moe_weights``."""
+    return prepare_moe_weights(_adapter(), **kwargs)

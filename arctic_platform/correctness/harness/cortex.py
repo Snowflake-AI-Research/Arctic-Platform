@@ -495,6 +495,11 @@ class CorrectnessCortexTransport(CortexTransport):
                     "local native forward requires newly created, owned child jobs; reconnect is unsupported"
                 )
             self._validate_native_api(client_config)
+        if self._is_local_gateway() and not JobHandles.from_config(client_config).any_set:
+            from arctic_platform.correctness.harness.weight_cache import maybe_prepare_allocation_weights
+
+            # A cold conversion inside the job would spend DSS's training creation deadline before it is ready.
+            maybe_prepare_allocation_weights(client_config)
         jobs = super().initialize(client_config)
         if self._native_children:
             for role, gateway_role in _NATIVE_ROLES.items():

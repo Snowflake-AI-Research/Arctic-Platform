@@ -49,6 +49,10 @@ class MoEDeepSpeedAdapter:
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
     hf_weight_export: Callable[[nn.Module], Callable] | None = None
+    # ``(config) -> source dir`` and ``(model, config, source, *, rank, local_rank) -> cache dir | None``: the
+    # conversion half of ``load_dcp_from_hf``, callable without a process group.
+    resolve_weight_source: Callable[[Any], Path] | None = None
+    prepare_weight_conversion: Callable[..., Path | None] | None = None
 
 
 def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
@@ -534,6 +538,47 @@ def load_moe_model_for_deepspeed(
         ),
     )
     return model
+
+
+def prepare_moe_weights(
+    adapter: MoEDeepSpeedAdapter,
+    *,
+    model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
+    ep_size: int,
+    world_size: int,
+    options: Any,
+    rank: int,
+    local_rank: int,
+) -> Path | None:
+    """Fill the converted-weight cache that ``load_moe_model`` with the same arguments loads from.
+
+    Runs without a process group, on a meta-device model, so one process per node can convert before the training
+    job starts and the distributed load then finds a ready cache. Returns the cache path, or None when the family
+    has no conversion step, the checkpoint already matches the model's format, or the model is randomly initialized.
+    """
+    if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
+        return None
+    if world_size % ep_size:
+        raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+    model_config = adapter.build_model_config(
+        model_name,
+        ep_size,
+        world_size // ep_size,
+        optimization_dtype,
+        attn_implementation,
+        options,
+    )
+    if model_config.debug.random_init:
+        return None
+    model = adapter.get_model(
+        model_config,
+        device=torch.device("meta"),
+        dtype=adapter.dtype_map[model_config.optimization_dtype],
+    )
+    source_path = adapter.resolve_weight_source(model_config)
+    return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
 
 def load_moe_model(

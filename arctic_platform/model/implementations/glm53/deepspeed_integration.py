@@ -25,6 +25,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
 from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
@@ -155,3 +156,8 @@ def load_glm5_next_model(
     )
     qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
     return model
+
+
+def prepare_glm5_next_weights(**kwargs):
+    """Fill the converted-weight cache ``load_glm5_next_model`` loads from; see ``prepare_moe_weights``."""
+    return prepare_moe_weights(_adapter(), **kwargs)

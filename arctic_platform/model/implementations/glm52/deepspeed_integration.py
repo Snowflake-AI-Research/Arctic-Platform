@@ -7,33 +7,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import load_moe_model as _load_moe_model
 from arctic_platform.model.implementations.moe.deepspeed_integration import (
-    MoEDeepSpeedAdapter,
-    load_moe_model as _load_moe_model,
     load_moe_model_for_deepspeed as _load_moe_model_for_deepspeed,
-    patch_deepspeed_moe_detection,
-    setup_model_local_no_train,
 )
+from arctic_platform.model.implementations.moe.deepspeed_integration import patch_deepspeed_moe_detection
+from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights as _prepare_moe_weights
+from arctic_platform.model.implementations.moe.deepspeed_integration import setup_model_local_no_train
 from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 
-from .config import DebugModelConfig, ModelConfig
-from .model_builder import (
-    DTYPE_MAP,
-    _reset_runtime_moe_buffers,
-    apply_ac,
-    configure_moe_ep_backend,
-    configure_sparse_mla_backend,
-    get_model,
-    load_dcp_from_hf,
-)
+from .config import DebugModelConfig
+from .config import ModelConfig
+from .model_builder import DTYPE_MAP
+from .model_builder import _reset_runtime_moe_buffers
+from .model_builder import apply_ac
+from .model_builder import configure_moe_ep_backend
+from .model_builder import configure_sparse_mla_backend
+from .model_builder import get_model
+from .model_builder import load_dcp_from_hf
+from .model_builder import prepare_weight_conversion
+from .model_builder import resolve_weight_source
 
 
-def shared_expert_bc_mlp_forward(
-    feed_forward: BCFeedForward, hidden_states: torch.Tensor
-) -> torch.Tensor:
+def shared_expert_bc_mlp_forward(feed_forward: BCFeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
     gate = torch.matmul(hidden_states, feed_forward.w1.T)
     up = torch.matmul(hidden_states, feed_forward.w3.T)
     return torch.matmul(F.silu(gate) * up, feed_forward.w2.T)
@@ -97,6 +97,8 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_type=BCFeedForward,
         shared_expert_forward=shared_expert_bc_mlp_forward,
         build_model_config=_build_model_config,
+        resolve_weight_source=resolve_weight_source,
+        prepare_weight_conversion=prepare_weight_conversion,
     )
 
 
@@ -169,3 +171,8 @@ def load_glm_moe_dsa_model(
         patch_moe_detection=patch_deepspeed_moe_detection,
         device_mesh_type=DeviceMesh,
     )
+
+
+def prepare_glm_moe_dsa_weights(**kwargs):
+    """Fill the converted-weight cache ``load_glm_moe_dsa_model`` loads from; see ``prepare_moe_weights``."""
+    return _prepare_moe_weights(_adapter(), **kwargs)

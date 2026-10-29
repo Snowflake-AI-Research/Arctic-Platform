@@ -33,54 +33,55 @@ from torch import Tensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
-from torch.distributed.tensor import DTensor, distribute_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import distribute_tensor
+from transformers import AutoConfig
+from transformers import AutoModelForCausalLM
+from transformers import GenerationConfig
+from transformers import PretrainedConfig
 
 from arctic_platform.debug.lora import maybe_observe_checkpoint_reader
 from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
-from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
+from arctic_platform.model.implementations.moe.conversion_cache import WEIGHT_CONVERSION_CACHE_SCOPE_ENV
+from arctic_platform.model.implementations.moe.conversion_cache import _write_conversion_cache
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
+from arctic_platform.model.implementations.moe.conversion_cache import ensure_node_local_conversion_cache
+from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
+from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module
+from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
+from arctic_platform.model.implementations.moe.layers.checkpointing import get_supported_targets
+from arctic_platform.model.implementations.moe.layers.checkpointing import set_selective_activation_checkpointing
+from arctic_platform.model.implementations.moe.layers.checkpointing import supports_selective_activation_checkpointing
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.logging_utils import get_logger
+from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
+from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.moe.vlm import is_vlm_architecture
 from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+from arctic_platform.model.implementations.moe.weights import load_state_dict
+from arctic_platform.model.implementations.moe.weights import load_state_dict_keys
+from arctic_platform.model.implementations.moe.weights import save_state_dict
+from arctic_platform.model.implementations.moe.world import get_world
 
 from .config import ModelConfig
-from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
-from arctic_platform.model.implementations.moe.conversion_cache import (
-    WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
-    conversion_cache_is_node_local,
-    conversion_cache_ready,
-    ensure_node_local_conversion_cache,
-    resolve_conversion_cache_path,
-    _write_conversion_cache,
-)
-from arctic_platform.model.implementations.moe.logging_utils import get_logger
-from .models import (
-    AutoModelForCausalLMPrimeRL,
-    PreTrainedModelPrimeRL,
-    get_custom_impl_import_error,
-    get_custom_vlm_cls,
-    supports_custom_impl,
-)
-from arctic_platform.model.implementations.moe.layers.checkpointing import (
-    get_supported_targets,
-    set_selective_activation_checkpointing,
-    supports_selective_activation_checkpointing,
-)
-from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE
-from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
-from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
-from arctic_platform.model.implementations.moe.world import get_world
+from .models import AutoModelForCausalLMPrimeRL
+from .models import PreTrainedModelPrimeRL
+from .models import get_custom_impl_import_error
+from .models import get_custom_vlm_cls
+from .models import supports_custom_impl
 
 
 def _patch_qwen3_5_moe_conversion_mapping():
     """Fix Qwen3.5 MoE conversion mapping incorrectly applying qwen2_moe expert weight splitting."""
-    from transformers.conversion_mapping import (
-        get_checkpoint_conversion_mapping,
-        register_checkpoint_conversion_mapping,
-    )
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+    from transformers.conversion_mapping import register_checkpoint_conversion_mapping
 
     qwen3_5_text_mapping = get_checkpoint_conversion_mapping("qwen3_5_text")
     if qwen3_5_text_mapping is not None:
@@ -93,8 +94,10 @@ def _patch_qwen3_5_text_position_ids():
     """Fix Qwen3.5 passing 3D MRoPE position_ids to decoder layers instead of 2D text_position_ids."""
     import inspect
 
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5TextModel
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextModel
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTextModel
 
     for text_model_cls, decoder_layer_cls in [
         (Qwen3_5TextModel, Qwen3_5DecoderLayer),
@@ -121,12 +124,10 @@ def _patch_qwen3_5_linear_attn_varlen():
     """Thread cu_seqlens through Qwen3.5 GatedDeltaNet so packed batches don't
     leak conv/SSM state across sequences."""
     import torch.nn.functional as F
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        Qwen3_5DecoderLayer,
-        Qwen3_5GatedDeltaNet,
-        Qwen3_5TextModel,
-        apply_mask_to_padding_states,
-    )
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
     if getattr(Qwen3_5GatedDeltaNet.forward, "_prl_varlen_patched", False):
         return
@@ -386,7 +387,11 @@ def get_model(
         pad_token_id = next(
             (
                 v
-                for v in [gen_config.pad_token_id, gen_config.eos_token_id, getattr(model_config, "eos_token_id", None)]
+                for v in [
+                    gen_config.pad_token_id,
+                    gen_config.eos_token_id,
+                    getattr(model_config, "eos_token_id", None),
+                ]
                 if v is not None
             ),
             None,
@@ -455,9 +460,9 @@ def get_model(
             )
         logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
 
-    assert model.lm_head.weight.dtype == dtype, (
-        f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
-    )
+    assert (
+        model.lm_head.weight.dtype == dtype
+    ), f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
     return model
 
 
@@ -502,6 +507,85 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
+def resolve_weight_source(config: ModelConfig) -> Path:
+    """Return the local checkpoint directory ``config.name`` loads from, downloading only tensor shards."""
+    if not Path(config.name).exists():
+        # DCP needs tensor shards and their index, not uncached Hub documentation.
+        return Path(
+            snapshot_download(
+                repo_id=config.name,
+                repo_type="model",
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
+    get_logger().info(
+        f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
+        f"please remove the directory {config.name} and run again"
+    )
+    return Path(config.name)
+
+
+def prepare_weight_conversion(
+    model: nn.Module, config: ModelConfig, source_path: Path, *, rank: int, local_rank: int
+) -> Path | None:
+    """Fill the converted-weight cache ``model`` loads from and return its path, or None when no conversion applies.
+
+    The distributed load and the per-node preparation that may run before it both call this, so they resolve the
+    same cache path. ``rank`` 0 writes a shared (not node-local) cache; ``local_rank`` 0 writes a node-local one.
+    """
+    if not isinstance(model, PreTrainedModelPrimeRL):
+        return None
+    snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
+    model_keys = dict.fromkeys(model.state_dict().keys())
+    if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "prime", model.convert_to_prime, "HF", "PrimeRL"
+    elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "hf", model.convert_to_hf, "PrimeRL", "HF"
+    else:
+        return None
+
+    convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
+    if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
+        # Packed and dequantized conversions of one checkpoint must not share a cache.
+        fmt = "prime-dequantized"
+    get_logger().warning(
+        f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
+        "state dict. Trying to auto-convert..."
+    )
+    snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
+    # Models whose snapshot cannot sit in host memory convert shard by shard.
+    stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
+    if conversion_cache_is_node_local(snapshot_path):
+        ensure_node_local_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+            convert_checkpoint_fn=convert_checkpoint_fn,
+            stream_convert_fn=stream_convert_fn,
+        )
+    elif not conversion_cache_ready(snapshot_path) and rank == 0:
+        _write_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+            convert_checkpoint_fn=convert_checkpoint_fn,
+            stream_convert_fn=stream_convert_fn,
+        )
+    return snapshot_path
+
+
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     model.__dict__.pop("_ap_preserved_mtp_weights", None)
     model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
@@ -526,89 +610,24 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         _move_buffers_to_cuda(model, config)
         return
 
-    if not Path(config.name).exists():
-        # DCP needs tensor shards and their index, not uncached Hub documentation.
-        snapshot_path = Path(
-            snapshot_download(
-                repo_id=config.name,
-                repo_type="model",
-                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
-            )
-        )
-    else:
-        logger.info(
-            f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
-            f"please remove the directory {config.name} and run again"
-        )
-        snapshot_path = Path(config.name)
-
+    snapshot_path = resolve_weight_source(config)
     maybe_capture_reduced_fixture_mtp(model, snapshot_path, config)
 
-    # Dynamically convert between different weight formats if needed.
-    conversion = None
-    if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
-
-        source_path = snapshot_path
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
-            conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
-            conversion = ("hf", model.convert_to_hf, "PrimeRL", "HF")
-
-        if conversion is not None:
-            fmt, convert_fn, src_fmt, dst_fmt = conversion
-            convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
-            if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
-                # Packed and dequantized conversions of one checkpoint must not share a cache.
-                fmt = "prime-dequantized"
-            logger.warning(
-                f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
-                "state dict. Trying to auto-convert..."
-            )
-            snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
-            node_local_cache = conversion_cache_is_node_local(snapshot_path)
-            world = get_world()
-            # Models whose snapshot cannot sit in host memory convert shard by shard.
-            stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
-            if node_local_cache:
-                ensure_node_local_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                    convert_checkpoint_fn=convert_checkpoint_fn,
-                    stream_convert_fn=stream_convert_fn,
-                )
-            elif not conversion_cache_ready(snapshot_path) and world.is_master:
-                _write_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                    convert_checkpoint_fn=convert_checkpoint_fn,
-                    stream_convert_fn=stream_convert_fn,
-                )
+    world = get_world()
+    converted_path = prepare_weight_conversion(
+        model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
+    )
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
-    if conversion is not None and not conversion_cache_ready(snapshot_path):
-        world = get_world()
+    if converted_path is not None and not conversion_cache_ready(converted_path):
         raise FileNotFoundError(
             "Converted weight cache is missing or incomplete after conversion barrier: "
-            f"path={snapshot_path}, rank={world.rank}, local_rank={world.local_rank}, "
+            f"path={converted_path}, rank={world.rank}, local_rank={world.local_rank}, "
             f"scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')}"
         )
+    if converted_path is not None:
+        snapshot_path = converted_path
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
@@ -658,9 +677,7 @@ def _random_init_deterministic(model: nn.Module, config: ModelConfig) -> None:
             generator.manual_seed(_name_seed(name))
             if is_dtensor:
                 # Same full tensor on every rank -> deterministic per-rank shard.
-                full_tensor = torch.empty(
-                    tuple(param.shape), dtype=local_tensor.dtype, device=local_tensor.device
-                )
+                full_tensor = torch.empty(tuple(param.shape), dtype=local_tensor.dtype, device=local_tensor.device)
                 full_tensor.normal_(mean=0.0, std=init_std, generator=generator)
                 sharded_tensor = distribute_tensor(full_tensor, param.device_mesh, param.placements)
                 local_tensor.copy_(sharded_tensor.to_local())

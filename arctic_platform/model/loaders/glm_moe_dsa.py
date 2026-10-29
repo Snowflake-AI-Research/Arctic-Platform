@@ -106,11 +106,28 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("glm_moe_dsa uses loader_options.ac_config and does not support generic forward patches")
 
 
+def _prepare_weights(spec: ModelSpec, *, world_size: int, rank: int, local_rank: int):
+    from arctic_platform.model.implementations.glm52.deepspeed_integration import prepare_glm_moe_dsa_weights
+
+    assert spec.attn_implementation is not None
+    return prepare_glm_moe_dsa_weights(
+        model_name=spec.model_path_or_name,
+        optimization_dtype=spec.dtype,
+        attn_implementation=spec.attn_implementation,
+        ep_size=spec.parallelism.expert_parallel,
+        world_size=world_size,
+        options=GlmMoeDsaOptions.model_validate(spec.loader_options),
+        rank=rank,
+        local_rank=local_rank,
+    )
+
+
 @register_loader(
     "glm_moe_dsa",
     matches=_matches,
     options=GlmMoeDsaOptions,
     validate_spec=_validate_spec,
+    prepare_weights=_prepare_weights,
 )
 def load_glm_moe_dsa(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
