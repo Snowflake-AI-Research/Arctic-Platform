@@ -101,6 +101,35 @@ def _normalize_cu_seqlens(
     return cu_seqlens
 
 
+def _hadamard_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's ``fwht128_quant_fp8``: bf16 input, fp32 Hadamard butterflies, bf16 rounding, then FP8 e4m3 with one
+    power-of-two scale per vector. Returns the FP8 values and their ``[..., 1]`` fp32 scales."""
+    width = x.shape[-1]
+    x = x.to(torch.bfloat16).float()
+    stride = 1
+    while stride < width:
+        pairs = x.unflatten(-1, (width // (2 * stride), 2, stride))
+        x = torch.stack((pairs[..., 0, :] + pairs[..., 1, :], pairs[..., 0, :] - pairs[..., 1, :]), dim=-2).flatten(-3)
+        stride *= 2
+    x = (x * width**-0.5).to(torch.bfloat16).float()
+    scales = torch.exp2(torch.ceil(torch.log2(x.abs().amax(-1, keepdim=True).clamp_min(1e-4) * (1.0 / 448.0))))
+    return (x / scales).clamp(-448.0, 448.0).to(torch.float8_e4m3fn), scales
+
+
+def _sampler_pooled_keys(
+    indexer: nn.Module, segment_states: torch.Tensor, pool_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's kpool compression (``_kpool_softmax_rotate_write_cache_kernel``): per-dimension softmax(gate + ape) over a
+    pool's tokens in fp32, then ``_hadamard_fp8``. Incomplete pools hold junk; they are never selectable."""
+    keys, gates, _ = segment_states.split([indexer.head_dim, indexer.head_dim, 1], dim=-1)
+    batch = torch.arange(keys.shape[0], device=keys.device)[:, None, None]
+    tokens = pool_indices.clamp(0, keys.shape[1] - 1)
+    logits = gates[batch, tokens].to(torch.bfloat16).float() + indexer.index_kpool_compress_ape.float()
+    probabilities = torch.exp(logits - logits.amax(dim=-2, keepdim=True))
+    pooled = (keys[batch, tokens].to(torch.bfloat16).float() * probabilities).sum(-2) / probabilities.sum(-2)
+    return _hadamard_fp8(pooled)
+
+
 def _unpadded_segment_indices(
     indexer: nn.Module,
     query: torch.Tensor,
@@ -181,9 +210,10 @@ def _select_sparse_indices(
         dim=-1,
     )
     packed_states = _gather_sequence_no_grad(packed_local, cp_group)
-    weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (
-        indexer.n_heads**-0.5
-    )
+    # Score as the vLLM sampler does (glm5next Indexer.forward): fp32 head gate, Hadamard + FP8 query and pooled keys.
+    # Scored in bf16 instead, ~1.8 % of the selected pools differ from the sampler's at 8K tokens.
+    weights = hidden_states.float() @ indexer.weights_proj.weight.float().t()
+    weights *= indexer.softmax_scale * indexer.n_heads**-0.5
     output_width = indexer.index_topk
     if indexer.index_kpool_always_select_tail:
         output_width += indexer.index_kpool - 1
@@ -226,8 +256,10 @@ def _select_sparse_indices(
             topk_indices[0, segment_queries] = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
             continue
         key_positions = torch.arange(segment_length, device=hidden_states.device)
-        pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
+        _, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
+        pool_keys, pool_scales = _sampler_pooled_keys(indexer, segment_states, pool_indices)
         pool_keys_transposed = pool_keys.transpose(-1, -2).float().unsqueeze(1)
+        pool_scales = pool_scales.transpose(-1, -2).unsqueeze(1)
         pool_end = pool_indices[..., -1].clamp(0, segment_length - 1)
         batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
 
@@ -239,9 +271,11 @@ def _select_sparse_indices(
             query_slice = slice(chunk_start - query_offset, chunk_end - query_offset)
             query_positions = torch.arange(chunk_start - start, chunk_end - start, device=hidden_states.device)
             visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None]
-            scores = torch.matmul(query[:, query_slice].float(), pool_keys_transposed)
-            scores.mul_(indexer.softmax_scale).relu_()
-            index_scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
+            query_fp8, query_scales = _hadamard_fp8(query[:, query_slice])
+            scores = torch.matmul(query_fp8.float(), pool_keys_transposed)
+            scores.relu_().mul_(pool_scales)
+            head_weights = weights[:, query_slice] * query_scales.squeeze(-1)
+            index_scores = torch.matmul(head_weights.unsqueeze(-2), scores).squeeze(-2)
             del scores
 
             pool_visible = visible_tokens.gather(

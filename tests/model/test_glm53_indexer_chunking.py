@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Check bounded selection against the original eager FP32 indexer."""
+"""Check bounded selection against an unchunked eager indexer with the same numerics."""
 
 from unittest.mock import patch
 
@@ -31,8 +31,8 @@ from arctic_platform.testing_utils import torch_assert_equal
 def _eager_reference(indexer, hidden, residual, mask, boundaries, *, packed, rank):
     batch, length = hidden.shape[:2]
     query = indexer.wq_b(residual).view(batch, length, -1, indexer.head_dim)
-    weights = indexer.weights_proj(hidden.to(indexer.weights_proj.weight.dtype)).float()
-    weights *= indexer.n_heads**-0.5
+    weights = hidden.float() @ indexer.weights_proj.weight.float().t()
+    weights *= indexer.softmax_scale * indexer.n_heads**-0.5
     width = indexer.index_topk + (indexer.index_kpool - 1 if indexer.index_kpool_always_select_tail else 0)
     output = torch.full((batch, length, width), -1, device=hidden.device, dtype=torch.int32)
     offset = rank * length
@@ -47,10 +47,12 @@ def _eager_reference(indexer, hidden, residual, mask, boundaries, *, packed, ran
             torch.arange(end - start, device=hidden.device)[None, None]
             <= torch.arange(lo - start, hi - start, device=hidden.device)[None, :, None]
         ) & valid_keys[:, None]
-        keys, indices, valid = indexer.get_pooled_states(packed_states=states)
-        scores = torch.matmul(query[:, query_slice].float(), keys.transpose(-1, -2).float().unsqueeze(1))
-        scores = F.relu(scores * indexer.softmax_scale)
-        scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
+        _, indices, valid = indexer.get_pooled_states(packed_states=states)
+        keys, key_scales = cp._sampler_pooled_keys(indexer, states, indices)
+        query_fp8, query_scales = cp._hadamard_fp8(query[:, query_slice])
+        scores = torch.matmul(query_fp8.float(), keys.transpose(-1, -2).float().unsqueeze(1))
+        scores = F.relu(scores) * key_scales.transpose(-1, -2).unsqueeze(1)
+        scores = torch.matmul((weights[:, query_slice] * query_scales.squeeze(-1)).unsqueeze(-2), scores).squeeze(-2)
         pool_end = indices[..., -1].clamp(0, end - start - 1)
         candidates = visible.gather(-1, pool_end[:, None].expand(batch, hi - lo, -1)) & valid[:, None]
         scores.masked_fill_(~candidates, torch.finfo(scores.dtype).min)
