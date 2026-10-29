@@ -160,6 +160,9 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
 
 
 class Qwen4ExpTextNGramEmbeddingPrimeRL(Qwen4ExpTextNGramEmbedding):
+    # The sampler rebuilds these hash buffers from config and its receiver only accepts parameters,
+    # so they ship in checkpoints but not in live weight sync.
+    _dss_skip_weight_sync = True
     _dss_weight_export_buffers = frozenset(
         {
             "layer_multipliers",

@@ -404,14 +404,20 @@ def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
 
     model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    ngram_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
+    ple_prefix = "model.language_model.layers.0.ple.ple_embedding"
+    frozen_names = {
+        f"{ple_prefix}.ngram_embedding.weight",
+        f"{ple_prefix}.layer_multipliers",
+        f"{ple_prefix}.ngram_heads_vocab_sizes",
+        f"{ple_prefix}.ngram_heads_offsets",
+    }
 
     iterator = build_iter_full_hf_weights(model)
     sync_names = {name for name, _ in iterator()}
     checkpoint_names = {name for name, _ in iterator(include_skipped=True)}
 
-    assert ngram_name not in sync_names
-    assert ngram_name in checkpoint_names
+    assert not frozen_names & sync_names
+    assert frozen_names <= checkpoint_names
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in sync_names
 
 

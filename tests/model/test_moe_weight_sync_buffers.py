@@ -241,3 +241,36 @@ def test_export_iterators_include_persistent_buffers_without_casting(monkeypatch
         assert actual_tensor.device == expected_tensor.device
         assert actual_tensor.data_ptr() == expected_tensor.data_ptr()
         assert actual_tensor.tolist() == expected_tensor.tolist()
+
+
+def test_hf_sync_skips_buffers_of_skipped_modules_but_checkpoint_keeps_them(monkeypatch):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    class ExportableModel(nn.Module):
+        @staticmethod
+        def convert_layer_to_hf(layer_state, layer_index):
+            del layer_index
+            return layer_state
+
+    model = ExportableModel()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].ngram_embedding = _ngram_module()
+    model.model.layers[0].ngram_embedding._dss_skip_weight_sync = True
+    model.model.layers[0].kept = _ngram_module()
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    iterator = build_iter_full_hf_weights(model)
+    sync_names = [name for name, _ in iterator()]
+    checkpoint_names = [name for name, _ in iterator(include_skipped=True)]
+
+    def names(module_name, tensor_names):
+        return [f"model.layers.0.{module_name}.{name}" for name in tensor_names]
+
+    assert sync_names == names("kept", ("weight", *_BUFFER_NAMES))
+    assert checkpoint_names == [
+        *names("ngram_embedding", ("weight",)),
+        *names("kept", ("weight",)),
+        *names("ngram_embedding", _BUFFER_NAMES),
+        *names("kept", _BUFFER_NAMES),
+    ]

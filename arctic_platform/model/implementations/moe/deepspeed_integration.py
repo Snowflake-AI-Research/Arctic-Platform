@@ -175,17 +175,17 @@ def build_iter_full_hf_weights(model: nn.Module):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
-        skipped_parameter_ids = {
-            id(parameter)
+        skipped_tensor_ids = {
+            id(tensor)
             for module in model.modules()
             if getattr(module, "_dss_skip_weight_sync", False)
-            for parameter in module.parameters(recurse=False)
+            for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False))
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model):
             if not include_skipped and (
                 getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
+                or id(tensor) in skipped_tensor_ids
             ):
                 continue
             hf_name = hf_export_param_name(name)
