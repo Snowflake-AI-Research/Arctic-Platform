@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,7 @@ from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flash
     flash_mla_available,
     sparse_mla_backend,
     sparse_mla_flashmla_apply,
+    sparse_mla_flashmla_fwd_interface,
     sparse_mla_ref_apply,
 )
 from arctic_platform.model.implementations.glm52.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
@@ -94,11 +96,16 @@ class SparseMlaAttentionArgs:
 
 
 class _SparseMLATilelang(torch.autograd.Function):
-    """Autograd wrapper for TileLang sparse MLA forward/backward kernels."""
+    """Sparse MLA with a TileLang (or FlashMLA) forward and the fused TileLang backward."""
 
     @staticmethod
-    def forward(ctx, q, kv, indices, sm_scale):
-        out, lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=sm_scale)
+    def forward(ctx, q, kv, indices, sm_scale, flashmla_forward=False):
+        if flashmla_forward:
+            out, lse = sparse_mla_flashmla_fwd_interface(q, kv, indices, sm_scale)
+            # The fused backward reads the base-2 LSE the TileLang forward returns.
+            lse = (lse * math.log2(math.e)).contiguous()
+        else:
+            out, lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=sm_scale)
         ctx.save_for_backward(q, kv, out, indices, lse)
         ctx.sm_scale = sm_scale
         return out
@@ -107,7 +114,22 @@ class _SparseMLATilelang(torch.autograd.Function):
     def backward(ctx, do):
         q, kv, out, indices, lse = ctx.saved_tensors
         dq, dkv = sparse_mla_bwd(q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale)
-        return dq, dkv, None, None
+        return dq, dkv, None, None, None
+
+
+def fused_sparse_mla_backward_available() -> bool:
+    """Whether the TileLang sparse-MLA backward kernels are installed."""
+    return sparse_mla_bwd is not None
+
+
+def sparse_mla_flashmla_fused_apply(q, kv, indices, sm_scale):
+    """FlashMLA forward with the fused TileLang backward, or FlashMLA's reference backward without TileLang.
+
+    ``indices`` are global key positions; masked slots hold the sentinel (the last, zero KV row).
+    """
+    if sparse_mla_bwd is not None and q.is_cuda:
+        return _SparseMLATilelang.apply(q, kv, indices, sm_scale, True)
+    return sparse_mla_flashmla_apply(q, kv, indices, sm_scale)
 
 
 def sparse_mla_apply(q, kv, indices, sm_scale):
