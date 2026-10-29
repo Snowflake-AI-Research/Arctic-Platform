@@ -324,12 +324,13 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
     return added, activated
 
 
-def _refresh_merged_conv_weights(model) -> None:
-    """Rebuild vLLM GLM-5.3 KDA's cached q|k|v short-conv weight from the synced parameters.
+def _refresh_cached_weight_copies(model) -> None:
+    """Rebuild the weight copies vLLM GLM-5.3 caches on its first forward from the synced parameters.
 
     ``Glm5NextLinearAttention._forward`` (vLLM 0.31/0.32 ``glm5next/common/kda.py``) concatenates
-    the three conv weights once and reuses that copy, so a sync never reaches the convolution.
-    Copied in place under inference mode: CUDA graphs may hold its address, and it is an inference tensor.
+    the three conv weights once and reuses that copy, so a sync never reaches the convolution; the
+    sparse indexer (``glm5next/common/attention.py``) keeps an fp32 transpose of its head-gate rows.
+    Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
     """
     with torch.inference_mode():
         for module in model.modules():
@@ -337,6 +338,9 @@ def _refresh_merged_conv_weights(model) -> None:
             if merged is not None:
                 convs = (module.q_conv1d, module.k_conv1d, module.v_conv1d)
                 merged.copy_(torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]))
+            head_gate = getattr(module, "_wp_fp32", None)
+            if head_gate is not None:
+                head_gate.copy_(module.wk_weights_proj.weight[module.head_dim :].t())
 
 
 def _ensure_engine_process_vllm_patches() -> None:
@@ -496,7 +500,7 @@ class WeightSyncExtension:
         else:
             path = "batched"
             loaded, _, _, _, _ = self._load_batched(model, engine)
-        _refresh_merged_conv_weights(model)
+        _refresh_cached_weight_copies(model)
 
         return self._build_result(start, mem_before, path, loaded)
 
@@ -795,7 +799,7 @@ class WeightSyncExtension:
                 source_to_destinations,
                 skipped_source_names,
             ) = self._load_batched(model, engine)
-        _refresh_merged_conv_weights(model)
+        _refresh_cached_weight_copies(model)
 
         if (
             loaded_destination_validation_applicable

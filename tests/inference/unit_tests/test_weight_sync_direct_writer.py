@@ -932,7 +932,7 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
 
 
 @pytest.mark.parametrize("entry_point", ["sync_weights", "sync_weights_broadcast"])
-def test_sync_refreshes_glm5next_kda_merged_conv_weight(monkeypatch, entry_point):
+def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, entry_point):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
@@ -953,18 +953,30 @@ def test_sync_refreshes_glm5next_kda_merged_conv_weight(monkeypatch, entry_point
     def merged():
         return torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]).contiguous()
 
+    # Glm5NextIndexer: bf16 wk_weights_proj (head_dim key rows, then the head-gate rows), and the
+    # fp32 transpose of the head-gate rows its first forward caches (attention.py:338-344).
+    indexer = nn.Module()
+    indexer.head_dim = 2
+    indexer.wk_weights_proj = nn.Module()
+    indexer.wk_weights_proj.weight = nn.Parameter(torch.arange(15.0).view(5, 3).bfloat16(), requires_grad=False)
+
+    def head_gate():
+        return indexer.wk_weights_proj.weight.data[indexer.head_dim :, :].t().contiguous().float()
+
     with torch.inference_mode():
         kda._merged_conv_weight = merged()
+        indexer._wp_fp32 = head_gate()
     cache_address = kda._merged_conv_weight.data_ptr()
+    head_gate_address = indexer._wp_fp32.data_ptr()
 
     def load_in_place(model, engine):  # ColumnParallelLinear.weight_loader: param.data.copy_
-        for conv in convs:
-            conv.weight.data.add_(1.0)
-        return 3, 0.0, 0.0, {}, []
+        for param in (*(conv.weight for conv in convs), indexer.wk_weights_proj.weight):
+            param.data.add_(1.0)
+        return 4, 0.0, 0.0, {}, []
 
     extension = SimpleNamespace(
         device=torch.device("cpu"),
-        model_runner=SimpleNamespace(model=nn.ModuleDict({"kda": kda})),
+        model_runner=SimpleNamespace(model=nn.ModuleDict({"kda": kda, "indexer": indexer})),
         model_config=SimpleNamespace(quantization=None),
         _get_or_create_engine=lambda *args, **kwargs: object(),
         _get_or_create_broadcast_engine=lambda *args: object(),
@@ -976,6 +988,8 @@ def test_sync_refreshes_glm5next_kda_merged_conv_weight(monkeypatch, entry_point
 
     assert torch.equal(kda._merged_conv_weight, merged()), "sampler still convolves with pre-sync conv weights"
     assert kda._merged_conv_weight.data_ptr() == cache_address
+    assert torch.equal(indexer._wp_fp32, head_gate()), "sparse indexer still gates with pre-sync weights"
+    assert indexer._wp_fp32.data_ptr() == head_gate_address
 
 
 async def _noop_abort_all_streams():
