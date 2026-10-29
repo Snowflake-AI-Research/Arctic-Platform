@@ -1285,8 +1285,8 @@ class ReplicaPool:
             )
         if not reset_ok:
             logger.warning(
-                "Prefix-cache reset did not fully complete after pause-mode weight sync; "
-                "continuing because keep mode can retain running request KV blocks. "
+                "Prefix-cache reset did not fully complete after weight sync; continuing "
+                "because keep-mode pause and hotswap can retain running request KV blocks. "
                 "reset_result=%s",
                 payload,
             )
@@ -1479,9 +1479,10 @@ class ReplicaPool:
 
           - **pause**: pause scheduler admission, pause vLLM generation,
             sync, reset prefix cache, resume.
-          - **drain**: pause scheduler, wait for in-flight to finish, sync, resume.
-          - **skip**: mark workers unavailable, cancel in-flight, sync, re-enable.
-          - **hotswap**: sync while serving continues. Unsafe during active generation.
+          - **drain**: pause scheduler, wait for in-flight to finish, sync, reset prefix cache, resume.
+          - **skip**: mark workers unavailable, cancel in-flight, sync, reset prefix cache, re-enable.
+          - **hotswap**: sync while serving continues, then try to reset the prefix cache once.
+            Unsafe during active generation.
 
         With **pause** and ``pause_mode="keep"``, the pause also clears the
         prefix cache when ``clear_cache`` is true or the run's
@@ -1592,9 +1593,11 @@ class ReplicaPool:
                         f"Weight sync failed on workers {failed_workers}: "
                         f"{_worker_error_messages(results, failed_workers)}"
                     )
-                if effective_strategy == "pause":
+                if not engine_only:
+                    # Only keep-mode pause and hotswap can leave requests running; any other sync must reset.
                     prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
-                        require_success=pause_mode == "abort",
+                        require_success=effective_strategy != "hotswap"
+                        and (effective_strategy != "pause" or pause_mode == "abort"),
                     )
                 update_succeeded = True
             finally:
@@ -1715,9 +1718,11 @@ class ReplicaPool:
                         f"{fail_label} failed on workers {failed_workers}: "
                         f"{_worker_error_messages(results, failed_workers)}"
                     )
-                if effective_strategy == "pause":
+                if not engine_only:
+                    # Only keep-mode pause and hotswap can leave requests running; any other sync must reset.
                     prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
-                        require_success=pause_mode == "abort",
+                        require_success=effective_strategy != "hotswap"
+                        and (effective_strategy != "pause" or pause_mode == "abort"),
                     )
                 update_succeeded = True
             finally:

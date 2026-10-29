@@ -400,6 +400,36 @@ def test_non_pause_syncs_issue_no_pause_and_report_no_clear(path, kwargs):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("path", SYNC_PATHS)
+@pytest.mark.parametrize(
+    "kwargs,reset",
+    [
+        ({"strategy": "drain"}, "reset_prefix_cache:30.0"),
+        ({"strategy": "skip"}, "reset_prefix_cache:30.0"),
+        ({"strategy": "hotswap"}, "reset_prefix_cache:0.0"),
+        ({"strategy": "pause", "engine_only": True}, None),
+    ],
+)
+def test_every_weight_load_resets_the_prefix_cache(path, kwargs, reset):
+    async def run():
+        events: list[str] = []
+        out = await _run_sync(_pool(events), path, **kwargs)
+        assert [e for e in events if e.startswith("reset_prefix_cache")] == ([reset] if reset else [])
+        if reset:
+            loaded = max(i for i, e in enumerate(events) if e.startswith("sync_"))
+            assert events.index(reset) > loaded
+            assert out["prefix_cache_reset"]["reset_ok"] is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", SYNC_PATHS)
+@pytest.mark.parametrize("strategy", ["drain", "skip"])
+def test_drain_and_skip_refuse_to_resume_with_stale_prefix_blocks(path, strategy):
+    with pytest.raises(RuntimeError, match="refusing to resume generation with stale prefix blocks"):
+        asyncio.run(_run_sync(_pool([], reset_ok=False), path, strategy=strategy))
+
+
 @pytest.mark.parametrize("value", [True, False])
 def test_initialize_logs_clear_cache_on_weight_sync(value, caplog):
     async def noop(*args, **kwargs):
