@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 
+from arctic_platform.common.zero_grad_accum import patch_zero2_grad_accum_dtype
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 
@@ -128,6 +129,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
     _require_fp32_gradient_reduction(ds_config)
+    _accumulate_fp32_master_gradients_in_fp32(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
         ds_config.get("bf16"),
@@ -193,6 +195,7 @@ def initialize_training_engine(
         )
     import deepspeed
 
+    patch_zero2_grad_accum_dtype()
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
         engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
@@ -323,6 +326,22 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     if not isinstance(zero_config, dict):
         return False
     return bool(zero_config.get("offload_optimizer"))
+
+
+def _accumulate_fp32_master_gradients_in_fp32(ds_config: dict[str, Any]) -> None:
+    """Sum a step's model calls in fp32 when ZeRO-2 keeps fp32 masters for bf16 parameters.
+
+    DeepSpeed's default accumulation dtype is the parameter dtype, so the fp32 master gradient would be a bf16
+    running sum of every model call of the step (``zero_grad_accum``). At stage 1 the same key would switch
+    DeepSpeed to BF16_Optimizer and its full-size fp32 gradient buffer, so only stage 2 is set here.
+    """
+    bf16_config = ds_config["bf16"]
+    if (
+        bf16_config.get("enabled")
+        and not bf16_config.get("bf16_master_weights_and_grads")
+        and ds_config["zero_optimization"].get("stage") == 2
+    ):
+        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
