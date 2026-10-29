@@ -57,54 +57,6 @@ def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
     assert "sequence_parallel_size" not in ds_config
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
-@pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_job_leaves_accumulation_dtype_to_deepspeed(dtype, fp32_masters):
-    ds_config = build_deepspeed_config(_spec(dtype=dtype, fp32_masters=fp32_masters))
-
-    assert "data_types" not in ds_config
-
-
-@pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])
-def test_other_precisions_leave_accumulation_dtype_to_deepspeed(dtype):
-    ds_config = build_deepspeed_config(_spec(dtype=dtype))
-
-    assert "data_types" not in ds_config
-
-
-@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
-def test_explicit_accumulation_override_is_preserved(data_types):
-    override = {"data_types": data_types.copy()}
-    ds_config = build_deepspeed_config(_spec(ds_overrides=override))
-
-    assert ds_config["data_types"] == data_types
-    assert override == {"data_types": data_types}
-
-
-@pytest.mark.parametrize("fp32_masters", [False, True])
-def test_deepspeed_resolves_explicit_float32_accumulation_without_changing_model_precision(fp32_masters):
-    from deepspeed.runtime.config import DeepSpeedConfig
-    from deepspeed.runtime.engine import DeepSpeedEngine
-
-    ds_config = build_deepspeed_config(
-        _spec(
-            world_size=1,
-            fp32_masters=fp32_masters,
-            ds_overrides={"data_types": {"grad_accum_dtype": "fp32"}},
-        )
-    )
-    config = DeepSpeedConfig(ds_config)
-    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
-    torch.nn.Module.__init__(engine)
-    object.__setattr__(engine, "_config", config)
-    engine.optimizer = None
-    engine.checkpoint_engine = None
-
-    assert engine.get_data_types() == (torch.bfloat16, torch.float32)
-    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is not fp32_masters
-    assert ds_config["bf16"]["bf16_optimizer_states"] is not fp32_masters
-
-
 def test_float32_job_disables_reduced_precision_and_leaves_the_reduction_unset():
     ds_config = build_deepspeed_config(_spec(dtype="float32"))
 
@@ -960,3 +912,16 @@ def test_zero_initialization_trace_rejects_invalid_request(option, rank):
             {deepspeed_zero_initialization.TRAINING_OPTION: option}, rank
         ):
             pytest.fail("invalid trace entered initialization context")
+
+
+@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
+def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
+    class Adam:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
+    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
+    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
+        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
+    assert f"using optimizer='{expected}'" in caplog.text

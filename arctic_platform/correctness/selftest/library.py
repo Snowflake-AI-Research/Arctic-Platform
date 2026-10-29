@@ -39635,8 +39635,8 @@ def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
 
     payload = {"training_config": {"n_gpus": 1}, "model_name": "read-only-model"}
     monkeypatch.setattr(Path, "mkdir", side_effect)
-    monkeypatch.setattr(dss_driver.shutil, "rmtree", side_effect)
-    monkeypatch.setattr(dss_driver.shutil, "copytree", side_effect)
+    monkeypatch.setattr(shutil, "rmtree", side_effect)
+    monkeypatch.setattr(shutil, "copytree", side_effect)
     monkeypatch.setattr(dss_driver, "_gateway_runtime", side_effect)
     monkeypatch.setattr(dss_driver, "ArcticClient", side_effect)
     client = SimpleNamespace(save_checkpoint=side_effect)

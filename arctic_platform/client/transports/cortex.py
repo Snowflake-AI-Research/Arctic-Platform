@@ -517,6 +517,9 @@ async def _raise_for_status(resp: Any) -> None:
     line, which turns an actionable rejection into a guessing game. Stays a
     `ClientResponseError` (carrying `status`) so `_is_transient` keeps classifying
     it. A chunk-group error raises `_ChunkGroupError` instead.
+
+    The error also carries the body's ``error_code`` and ``error_message``, so a
+    caller can report the server's explanation without the request URL.
     """
     import aiohttp
 
@@ -533,6 +536,7 @@ async def _raise_for_status(resp: Any) -> None:
         headers=resp.headers,
     )
     error.error_code = _response_error_code(body)
+    error.error_message = _response_error_message(body)
     raise error
 
 
@@ -889,3 +893,11 @@ def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
     if "metrics" in result:
         decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
     return decoded
+
+
+def _response_error_message(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return None

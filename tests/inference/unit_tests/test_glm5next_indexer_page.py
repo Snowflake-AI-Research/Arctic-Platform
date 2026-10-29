@@ -5,7 +5,6 @@ import pytest
 
 from arctic_platform.inference.vllm import glm5next_indexer_page
 from arctic_platform.inference.vllm.glm5next_indexer_page import build_with_deepgemm_page
-from arctic_platform.inference.vllm.glm5next_indexer_page import has_legal_storage_page
 from arctic_platform.inference.vllm.glm5next_indexer_page import indexer_kernel_block_sizes
 from arctic_platform.inference.vllm.glm5next_indexer_page import metadata_block_size
 from arctic_platform.inference.vllm.glm5next_indexer_page import paged_mqa_page_sizes
@@ -113,7 +112,7 @@ def test_build_restores_the_spec_when_metadata_build_fails():
 
 @pytest.mark.parametrize("block_size", [256, 512, 768])
 def test_storage_page_is_64_compressed_states(block_size):
-    assert has_legal_storage_page(_Spec(block_size, _KPOOL, 256), _PAGES)
+    assert glm5next_indexer_page.has_legal_storage_page(_Spec(block_size, _KPOOL, 256), _PAGES)
 
 
 @pytest.mark.parametrize(
@@ -134,7 +133,7 @@ def test_storage_page_is_64_compressed_states(block_size):
     ],
 )
 def test_missing_or_invalid_storage_page_keeps_legacy_behavior(spec):
-    assert not has_legal_storage_page(spec, _PAGES)
+    assert not glm5next_indexer_page.has_legal_storage_page(spec, _PAGES)
 
 
 @pytest.mark.parametrize("fails", [False, True])
