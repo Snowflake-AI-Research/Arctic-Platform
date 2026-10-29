@@ -73,12 +73,14 @@ def _perf_status(check: dict) -> str:
 
 
 def replica_table(sp: dict, min_step_s: float = 0.5) -> list[str]:
-    """One row per semi_p engine: where it restored from, copy / restore / key-to-ready
-    times, then every restore step that took at least ``min_step_s`` on some engine."""
+    """One row per semi_p engine: where it restored from, copy / restore / attach /
+    key-to-ready times, then every restore step that took at least ``min_step_s``
+    on some engine. Attach is ``serve_core`` plus the ``AsyncLLM`` build; ``-`` in
+    logs from before the AsyncLLM front end."""
     reps = sp["replicas"]
     steps = [s for s in dict.fromkeys(n for info in reps.values() for n in info.get("steps", {}))
              if max(info.get("steps", {}).get(s, 0.0) for info in reps.values()) >= min_step_s]
-    head = ["replica", "source", "copy", "restore", "key to ready"] + steps
+    head = ["replica", "source", "copy", "restore", "attach", "key to ready"] + steps
     out = [f"semi_p replicas, seconds (restore steps from {sp.get('steps_source', 'logs')}):", "",
            "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for rep, info in reps.items():
@@ -89,7 +91,7 @@ def replica_table(sp: dict, min_step_s: float = 0.5) -> list[str]:
         else:
             source = "cache miss" if info.get("cache_miss") else "?"
         cells = [rep, source, _num(info.get("materialize_s"), 1), _num(info.get("restore_s"), 1),
-                 _num(info.get("key_to_ready_s"), 1)]
+                 _num(info.get("attach_s"), 1), _num(info.get("key_to_ready_s"), 1)]
         cells += [_num(info.get("steps", {}).get(s), 1) for s in steps]
         failed = info.get("failed_steps") or []
         out.append("| " + " | ".join(cells) + " |" + (f" FAILED: {', '.join(failed)}" if failed else ""))
@@ -144,6 +146,12 @@ def markdown(result: dict) -> str:
     lines = [f"# Onboarding: {spec['name']}", "",
              f"**Verdict: {v}**", ""]
     lines += [f"- {r}" for r in reasons] + ([""] if reasons else [])
+    settings = ((result.get("perf") or {}).get("breakdown") or {}).get("settings")
+    if settings:
+        lines += [f"Degradation from semi_p's collective settings alone (plain matched / plain), not counted "
+                  f"against semi_p: TTFT x{_num(settings.get('ttft_ratio'))}, TPOT x{_num(settings.get('tpot_ratio'))}, "
+                  f"server p50 latency median x{_num(settings.get('median_latency_ratio'))}, engine throughput "
+                  f"median x{_num(settings.get('median_throughput_ratio'))}.", ""]
     lines += [
         "| | |", "|---|---|",
         f"| Model | `{spec['model_name']}` |",
@@ -151,6 +159,7 @@ def markdown(result: dict) -> str:
         f"| Tested as | {spec.get('copies', 1)} copies: {spec.get('test_n_gpus', spec['n_gpus'])} GPUs, "
         f"{spec.get('test_replicas', spec['replicas'])} replica(s) per job |",
         f"| Image tag | `{result.get('image_tag') or 'default'}` |",
+        *([f"| Published image | {result['published_image']} |"] if result.get("published_image") else []),
         f"| Run | {result.get('started_at')} to {result.get('finished_at')} UTC |",
         "",
     ]
