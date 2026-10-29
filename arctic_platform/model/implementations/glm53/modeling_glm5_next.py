@@ -78,6 +78,10 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
+# mHC base/scale and KDA decay parameters: F32 in the checkpoint and in vLLM, and too small a step for bf16 at RL lrs.
+_FP32_PARAMETERS = ("_hc.base", "_hc.scale", ".A_log", ".dt_bias")
+
+
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
     def forward(
         self,
@@ -174,7 +178,16 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
+        # The checkpoint stores these in FP32 and the sampler serves them in FP32; the load copies into each
+        # parameter's dtype, so they have to be FP32 before it, whatever dtype the model is built in.
+        for name, param in self.named_parameters():
+            if self.keeps_fp32_parameter(name):
+                param.data = param.data.float()
         self._is_vlm = True
+
+    @classmethod
+    def keeps_fp32_parameter(cls, name: str) -> bool:
+        return name.endswith(_FP32_PARAMETERS)
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
