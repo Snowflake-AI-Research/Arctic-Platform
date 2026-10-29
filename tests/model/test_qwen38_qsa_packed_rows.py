@@ -170,8 +170,7 @@ def test_qwen38_cp_uses_explicit_global_packed_boundaries(monkeypatch):
 def test_qsa_backward_sums_key_and_value_gradients_exactly():
     from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
 
-    # Every query selects keys 0 and 1 with equal scores, so each adds +1/-1 to their dK and 0.5 to their dV.
-    # The totals are exact in bf16, but 300 chunks of 128 queries overflow a bf16 running sum's 8-bit significand.
+    # Exact bf16 totals (dK=+/-38,400, dV=19,200) expose contributions lost by repeated bf16 rounding.
     queries = 300 * 128
     query = torch.ones(1, queries, 1, 2, dtype=torch.bfloat16, requires_grad=True)
     key = torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16, requires_grad=True)
