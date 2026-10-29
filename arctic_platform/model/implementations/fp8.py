@@ -102,7 +102,8 @@ def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
     if original is None:
         return False
 
-    def _cast_module_mixed_precision(self, param_dtype, buffer_dtype, is_zero_init_model):
+    # DeepSpeed 0.19.8 adds ``keep_pattern`` (fp32 buffers), which the original still has to apply.
+    def _cast_module_mixed_precision(self, param_dtype, buffer_dtype, is_zero_init_model, *args, **kwargs):
         if param_dtype is not None and not is_zero_init_model:
             for param in self.module.parameters(recurse=True):
                 if (
@@ -111,8 +112,7 @@ def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
                     and not _keeps_source_dtype(param, fp8_dtypes)
                 ):
                     param.data = param.data.to(param_dtype)
-        if buffer_dtype is not None:
-            original(self, None, buffer_dtype, is_zero_init_model)
+        original(self, None, buffer_dtype, is_zero_init_model, *args, **kwargs)
 
     DeepSpeedEngine._cast_module_mixed_precision = _cast_module_mixed_precision
     DeepSpeedEngine._ap_fp8_param_cast_guard = True
