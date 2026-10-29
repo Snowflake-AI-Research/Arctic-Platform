@@ -2,6 +2,7 @@ from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import dflash2_nan_fix
 from arctic_platform.inference.vllm import glm5next_indexer_page
+from arctic_platform.inference.vllm import mamba_replay_boundary_stop
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
@@ -45,6 +46,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_dflash_max_position_patch",
         lambda: calls.append("dflash_max_position"),
     )
+    monkeypatch.setattr(
+        mamba_replay_boundary_stop,
+        "ensure_mamba_replay_boundary_stop",
+        lambda: calls.append("mamba_replay_boundary_stop"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -56,4 +62,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dflash2",
         "glm5next_indexer_page",
         "dflash_max_position",
+        "mamba_replay_boundary_stop",
     ]
