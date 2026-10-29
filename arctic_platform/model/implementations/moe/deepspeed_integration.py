@@ -182,7 +182,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             for parameter in module.parameters(recurse=False)
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
                 getattr(tensor, "_dss_skip_weight_sync", False)
                 or id(tensor) in skipped_parameter_ids
