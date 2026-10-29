@@ -495,12 +495,15 @@ def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str,
             f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
         )
     staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
-    if staging_bytes is not None and (
-        isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0
-    ):
-        raise ValueError(
-            f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
-        )
+    if staging_bytes is not None:
+        # JSON transports (Cortex Training among them) can deliver an integer as a whole float.
+        if isinstance(staging_bytes, float) and staging_bytes.is_integer():
+            staging_bytes = int(staging_bytes)
+        if isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0:
+            raise ValueError(
+                f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
+            )
+        out[_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY] = staging_bytes
     return out
 
 

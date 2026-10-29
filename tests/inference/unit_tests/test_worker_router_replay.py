@@ -158,11 +158,14 @@ def test_router_replay_cache_device_is_popped_and_validated_before_engine_start(
         _pop_router_replay_engine_kwargs({"router_replay_cache_device": "gpu"})
 
 
-@pytest.mark.parametrize("staging_bytes", [0, -1, True, "8MiB"])
+@pytest.mark.parametrize("staging_bytes", [0, -1, True, "8MiB", 1.5])
 def test_router_replay_staging_bytes_must_be_a_positive_integer(staging_bytes):
     assert _pop_router_replay_engine_kwargs({"router_replay_staging_bytes": 1 << 23}) == {
         "router_replay_staging_bytes": 1 << 23,
     }
+    whole_float = _pop_router_replay_engine_kwargs({"router_replay_staging_bytes": float(1 << 23)})
+    assert whole_float == {"router_replay_staging_bytes": 1 << 23}
+    assert type(whole_float["router_replay_staging_bytes"]) is int
     with pytest.raises(ValueError, match="router_replay_staging_bytes must be a positive integer"):
         _pop_router_replay_engine_kwargs({"router_replay_staging_bytes": staging_bytes})
 
