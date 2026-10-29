@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -69,6 +69,9 @@ class _PerRankManifest:
     ``staging_bytes`` is set by a sender whose TX cache is not on the NCCL
     device: the GPU bytes it can stage per round. ``supports_staged_rounds``
     is that field's handshake.
+    ``token_ranges`` lets a receiver ask for one ``[start, end)`` slice of a
+    capture's token axis per sid (a sid it omits arrives whole), and
+    ``supports_token_ranges`` is that field's handshake.
     """
 
     role: Role
@@ -82,6 +85,8 @@ class _PerRankManifest:
     supports_allow_missing: bool = False
     staging_bytes: int | None = None
     supports_staged_rounds: bool = False
+    token_ranges: dict[str, tuple[int, int]] | None = None
+    supports_token_ranges: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,11 +97,19 @@ class _TransferOp:
     shape: tuple[int, ...]
     discard: bool = True
     dtype: torch.dtype = _ROUTED_EXPERTS_DTYPE
+    # The [start, end) of the capture's token axis this op moves; ``None`` moves the whole ``shape``.
+    token_range: tuple[int, int] | None = None
+
+    @property
+    def transfer_shape(self) -> tuple[int, ...]:
+        if self.token_range is None:
+            return self.shape
+        return (self.token_range[1] - self.token_range[0], *self.shape[1:])
 
     @property
     def nbytes(self) -> int:
         n = self.dtype.itemsize
-        for dim in self.shape:
+        for dim in self.transfer_shape:
             n *= int(dim)
         return n
 
@@ -110,7 +123,10 @@ def _compute_plan(
     all_gather_obj), so the plan is computed locally without coordination.
     Exact replay ids must have one owner. Legacy ids retain deterministic
     lowest-rank selection for compatibility, with an explicit warning.
+    Token ranges are honoured only when every rank supports them, since a
+    sender on an older planner would send whole captures.
     """
+    slicing = all(m.supports_token_ranges for m in manifests)
     owner: dict[str, int] = {}
     owners: dict[str, list[int]] = {}
     shape_by_sid: dict[str, tuple[int, ...]] = {}
@@ -158,14 +174,20 @@ def _compute_plan(
             if sender_rank is None:
                 missing.add(sid)
                 continue
+            shape = shape_by_sid[sid]
+            token_range = None
+            if slicing and m.token_ranges is not None and sid in m.token_ranges:
+                start = min(max(int(m.token_ranges[sid][0]), 0), shape[0])
+                token_range = (start, min(max(int(m.token_ranges[sid][1]), start), shape[0]))
             plan.append(
                 _TransferOp(
                     sender_rank=sender_rank,
                     recv_rank=m.rank,
                     sample_id=sid,
-                    shape=shape_by_sid[sid],
+                    shape=shape,
                     discard=m.discard,
                     dtype=dtype_by_sid[sid],
+                    token_range=token_range,
                 )
             )
     return plan, missing
@@ -304,6 +326,7 @@ class RouterReplayGroup:
         needed_sample_ids: Sequence[str],
         discard: bool = True,
         allow_missing: bool = False,
+        token_ranges: Mapping[str, tuple[int, int]] | None = None,
     ) -> dict[str, Any]:
         """Receiver-side per-step call; pairs with :meth:`send`.
 
@@ -320,6 +343,12 @@ class RouterReplayGroup:
         without those sids and they are returned as ``dropped_sample_ids``
         (this rank's, in ``needed_sample_ids`` order) instead of raising
         :class:`RouterReplayMissingError`.
+
+        ``token_ranges`` asks for only the ``[start, end)`` slice of a sid's
+        capture along its token axis (e.g. a sequence-parallel rank's window).
+        The result's ``capture_slices`` then maps each sid that arrived as a
+        slice to ``(start, whole capture length)``; it is empty when a peer
+        predates slicing, and every capture arrives whole.
         """
         if self._closed:
             raise RuntimeError("RouterReplayGroup is closed")
@@ -332,10 +361,10 @@ class RouterReplayGroup:
                 "(prior step likely crashed between recv and fwd_bwd)", stale,
             )
         manifest = self._build_recv_manifest(
-            needed_sample_ids, discard=discard, allow_missing=allow_missing,
+            needed_sample_ids, discard=discard, allow_missing=allow_missing, token_ranges=token_ranges,
         )
         try:
-            _, missing, rounds = self._exchange_manifest(manifest)
+            plan, missing, rounds = self._exchange_manifest(manifest)
         except RouterReplayMissingError:
             self._n_missing_raises += 1
             raise
@@ -349,7 +378,14 @@ class RouterReplayGroup:
         n_recv = self._run_data_exchange_recv(rounds, cache_rx)
         self._n_exchanges += 1
         self._n_tensors_recv += n_recv
-        return {"tensors_recv": n_recv, "dropped_sample_ids": dropped}
+        result = {"tensors_recv": n_recv, "dropped_sample_ids": dropped}
+        if token_ranges is not None:
+            result["capture_slices"] = {
+                op.sample_id: (op.token_range[0], op.shape[0])
+                for op in plan
+                if op.recv_rank == self.rank and op.token_range is not None
+            }
+        return result
 
     def close(self) -> None:
         """Tear down the NCCL comm + stateless PG. Idempotent.
@@ -403,6 +439,7 @@ class RouterReplayGroup:
             supports_allow_missing=True,
             staging_bytes=self.staging_bytes if stages else None,
             supports_staged_rounds=True,
+            supports_token_ranges=True,
         )
 
     def _build_recv_manifest(
@@ -411,6 +448,7 @@ class RouterReplayGroup:
         *,
         discard: bool = True,
         allow_missing: bool = False,
+        token_ranges: Mapping[str, tuple[int, int]] | None = None,
     ) -> _PerRankManifest:
         return _PerRankManifest(
             role="receiver",
@@ -420,6 +458,8 @@ class RouterReplayGroup:
             allow_missing=allow_missing,
             supports_allow_missing=True,
             supports_staged_rounds=True,
+            token_ranges=None if token_ranges is None else dict(token_ranges),
+            supports_token_ranges=True,
         )
 
     def _exchange_manifest(
@@ -470,15 +510,19 @@ class RouterReplayGroup:
         for ops in my_rounds:
             # Host-memory TX tensors are copied onto the NCCL device one round
             # at a time; each round's copies must stay alive until its sync.
-            staged = [
-                (op, snapshot[op.sample_id].to(self.device).contiguous().view(torch.uint8))
-                for op in ops
-            ]
+            staged = []
+            for op in ops:
+                t = snapshot[op.sample_id]
+                if op.token_range is not None:
+                    t = t[op.token_range[0] : op.token_range[1]]
+                staged.append((op, t.to(self.device).contiguous().view(torch.uint8)))
             # An empty group_start/group_end keeps every rank in step with the
             # NCCL barrier (PyNccl tolerates empty fuses).
             self.nccl.group_start()
             for op, t in staged:
-                self.nccl.send(t, dst=op.recv_rank)
+                # Only negotiated slices may skip NCCL; older peers enqueue empty whole captures.
+                if op.token_range is None or t.numel() > 0:
+                    self.nccl.send(t, dst=op.recv_rank)
             self.nccl.group_end()
             if staged and self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
@@ -499,13 +543,14 @@ class RouterReplayGroup:
         n_recv = 0
         for ops in rounds:
             dests = [
-                (op, torch.empty(op.shape, dtype=op.dtype, device=self.device))
+                (op, torch.empty(op.transfer_shape, dtype=op.dtype, device=self.device))
                 for op in ops
                 if op.recv_rank == self.rank
             ]
             self.nccl.group_start()
             for op, dest in dests:
-                self.nccl.recv(dest.view(torch.uint8), src=op.sender_rank)
+                if op.token_range is None or dest.numel() > 0:
+                    self.nccl.recv(dest.view(torch.uint8), src=op.sender_rank)
             self.nccl.group_end()
             if dests:
                 # Sync so subsequent cache.put copies observe fully-landed data.
