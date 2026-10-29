@@ -298,6 +298,40 @@ def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
     assert captured["kwargs"] == {"lr": 3e-4, "betas": (0.8, 0.95), "eps": 1e-6, "adam_w_mode": True}
 
 
+def test_parameters_kept_in_fp32_get_their_own_optimizer_groups(monkeypatch):
+    from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+
+    captured = {}
+
+    class _Adam:
+        def __init__(self, param_groups, **kwargs):
+            captured["param_groups"] = param_groups
+
+    monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+            self.scale = torch.nn.Parameter(torch.ones(2, 2))
+            self.norm = torch.nn.LayerNorm(2, dtype=torch.bfloat16)
+
+        @classmethod
+        def keeps_fp32_parameter(cls, name):
+            return name == "scale"
+
+    model = _Model()
+    assert preserve_fp8_params_through_ds_cast(model) == (0, 1)
+
+    build_training_optimizer(model, OptimizerSettings(weight_decay=0.1), _ZERO2, fused=True)
+
+    groups = [
+        (group["weight_decay"], {param.dtype for param in group["params"]}, len(group["params"]))
+        for group in captured["param_groups"]
+    ]
+    assert groups == [(0.1, {torch.bfloat16}, 1), (0.1, {torch.float32}, 1), (0.0, {torch.bfloat16}, 2)]
+
+
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
     sentinel = object()
     calls = {}

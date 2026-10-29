@@ -36,6 +36,7 @@ from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_configure_broadcast_training
 from arctic_platform.debug.deepspeed_zero_initialization import maybe_initialize_with_zero_allocation_trace
 from arctic_platform.debug.router_replay_trace import maybe_configure_router_replay_trace
+from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 
@@ -164,6 +165,8 @@ def initialize_training_engine(
     ds_config = maybe_configure_router_replay_trace(ds_config, model, rank)
     built = None
     choice = None
+    # Marks first: the optimizer groups split on them.
+    preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
         fused = optimizer.fused
         if fused is None:
@@ -172,16 +175,15 @@ def initialize_training_engine(
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
             built.param_groups[:] = split_expert_param_groups(list(built.param_groups))
-    preserved, marked_scales = preserve_fp8_params_through_ds_cast(model)
-    if preserved:
+    if preserved or marked_fp32:
         from deepspeed.runtime.engine import DeepSpeedEngine
 
         logger.info(
-            "rank=%d preserving %d FP8 parameters and %d FP32 block scales through the "
+            "rank=%d preserving %d FP8 parameters and %d FP32 parameters through the "
             "DeepSpeed dtype cast (deepspeed_param_cast_guard=%d)",
             rank,
             preserved,
-            marked_scales,
+            marked_fp32,
             int(bool(getattr(DeepSpeedEngine, "_ap_fp8_param_cast_guard", False))),
         )
     import deepspeed
@@ -280,9 +282,12 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         for name, param in model.named_parameters()
         if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
     ]
+    # ZeRO flattens each group into one buffer of its first parameter's dtype, so
+    # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [
-        {"params": decay_params, "weight_decay": optimizer.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": [param for param in params if keeps_fp32(param) == fp32], "weight_decay": decay}
+        for params, decay in ((decay_params, optimizer.weight_decay), (no_decay_params, 0.0))
+        for fp32 in (False, True)
     ]
     param_groups = [group for group in param_groups if group["params"]]
     betas = (optimizer.betas[0], optimizer.betas[1])

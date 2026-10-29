@@ -18,7 +18,7 @@ Two independent vLLM defects combine to produce the corruption:
   request.
 
 The ArcticInference plugin applies both mitigations at startup for its pinned
-vLLM 0.31.0 release, including when ``ARCTIC_INFERENCE_ENABLED=0`` leaves the
+vLLM 0.32.0 release, including when ``ARCTIC_INFERENCE_ENABLED=0`` leaves the
 rest of the Arctic optimization stack disabled. Stale GDN rows have their
 state slots replaced with ``NULL_BLOCK_ID`` and their accepted count clamped to
 one, preventing state reads or writes for the discarded step. Newly allocated
@@ -36,7 +36,8 @@ Upstream status
 vLLM 0.31.0 includes `PR #51565
 <https://github.com/vllm-project/vllm/pull/51565>`__, which prevents a
 stateless one-token first chunk from being classified as decode and consuming
-recycled GDN state. The remaining permanent fixes are under review:
+recycled GDN state. vLLM 0.32.0 still does not include the remaining permanent
+fixes:
 
 * `vLLM PR #51508 <https://github.com/vllm-project/vllm/pull/51508>`__ fixes
   stale zero-accept GDN and KDA speculative rows.

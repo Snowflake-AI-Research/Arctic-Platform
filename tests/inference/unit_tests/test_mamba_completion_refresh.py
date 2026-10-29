@@ -1,6 +1,6 @@
 """CPU completion ordering; real vLLM methods, synthetic storage, no GPU kernels.
 
-VLLM_SOURCE_ROOT may name a vLLM 0.31.0 checkout on CPU-only test hosts.
+VLLM_SOURCE_ROOT may name a vLLM 0.32.0 checkout on CPU-only test hosts.
 Otherwise read the installed vLLM package without importing its GPU runtime.
 """
 
@@ -77,7 +77,7 @@ def manager_methods(monkeypatch):
     target.MambaManager = ns["Manager"]
     monkeypatch.setitem(sys.modules, target.__name__, target)
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.31.0"
+    vllm.__version__ = "0.32.0"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
     from arctic_platform.inference.vllm import required_patches
