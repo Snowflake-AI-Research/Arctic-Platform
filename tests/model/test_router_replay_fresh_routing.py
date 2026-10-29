@@ -261,6 +261,22 @@ def test_aborted_forward_does_not_leak_experts_into_the_next_step():
     assert len(block.router._self_replay_queue) == 0
 
 
+@pytest.mark.parametrize("aborted_tokens", [12, 8])
+def test_aborted_forward_without_replay_does_not_leak_experts_into_the_next_call(aborted_tokens):
+    """The same on the replay-off path a call without captured routing takes; a shorter aborted call crashed it."""
+    block = _DriftingBlock()
+    assert install_self_router_replay(block) == 1
+    x = torch.randn(aborted_tokens, 16, requires_grad=True)
+    ckpt.checkpoint(block, x, None, use_reentrant=False)  # forward only: the call aborts before backward
+    assert len(block.router._self_replay_queue) == 1
+
+    _backward_through_checkpoint(block, None).sum().backward()
+
+    (_, _, forward_idx), (_, _, recompute_idx) = block.router.calls[-2:]
+    torch_assert_equal(recompute_idx, forward_idx)
+    assert len(block.router._self_replay_queue) == 0
+
+
 def test_install_sets_the_wrapped_marker_trainers_check():
     block = _DriftingBlock()
     assert not getattr(block.router, "_self_replay_wrapped", False)
