@@ -666,6 +666,18 @@ def test_image_platform_reaches_every_crane_call(monkeypatch):
     registry.close()
 
 
+def test_the_snowflake_sandbox_can_replay_the_recipes_task_dockerfile(tmp_path):
+    from harbor_rl.entrypoint import materialize_harbor_task_from_row
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import plan_from_dockerfile
+
+    task = materialize_harbor_task_from_row(_row(), tmp_path / "tasks")
+    plan = plan_from_dockerfile(task / "environment" / "Dockerfile")
+    assert plan.base_image == "python:3.11-slim"
+    assert plan.workdir.startswith("/app/")
+    assert any("git clone" in str(step) for step in plan.steps)
+
+
 def test_the_harbor_extra_is_pinned_and_installed_by_the_launcher():
     import tomllib
 
