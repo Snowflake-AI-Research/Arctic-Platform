@@ -17,7 +17,8 @@
 DeepSpeed 0.19.7 ignores that dtype at stage 2. Without optimizer offload the first call's bf16 gradient partition
 becomes the running sum; with CPU offload a bf16 host buffer per parameter does. Either way fp32 master weights
 receive a bf16 sum of every model call of the step. This applies the change proposed for DeepSpeed itself
-(DSS-Issue-Tracker issue b20d5655, ``fix/deepspeed-0.19.7-zero2-grad-accum-dtype.patch``) until DeepSpeed ships it.
+(DSS-Issue-Tracker issue b20d5655, ``fix/deepspeed-0.19.7-zero2-grad-accum-dtype.patch``) on 0.19.7 only;
+0.19.8 uses its native fp32 partition accumulator.
 It changes nothing unless the accumulation dtype differs from the parameter dtype.
 """
 
@@ -29,6 +30,15 @@ _PATCHED = False
 
 
 def patch_zero2_grad_accum_dtype() -> None:
+    import deepspeed
+
+    if deepspeed.__version__ == "0.19.8":
+        return  # Native fp32 compact partition accumulation replaces this workaround.
+    if deepspeed.__version__ != "0.19.7":
+        raise RuntimeError(
+            f"ZeRO-2 accumulation support is verified for DeepSpeed 0.19.7 and 0.19.8, got {deepspeed.__version__}; "
+            "validate the new version and remove or update the 0.19.7 workaround before training."
+        )
     global _PATCHED
     if _PATCHED:
         return
@@ -91,8 +101,11 @@ def patch_zero2_grad_accum_dtype() -> None:
             for param in group:
                 if param.requires_grad and zero.get_param_id(param) in zero._offload_accumulated_param_ids:
                     master_grad = master_grad_partition_of(zero, param)
-                    zero.norm_for_param_grads[zero.get_param_id(param)] = master_grad.to(get_norm_dtype()).norm(2)
-                    zero.update_offload_overflow_tracker(master_grad)
+                    # Order the read after the nonblocking D2H copy on the same stream.
+                    accumulator = zero.temp_grad_buffer_for_gpu_offload.narrow(0, 0, master_grad.numel())
+                    accumulator.copy_(master_grad, non_blocking=True)
+                    zero.norm_for_param_grads[zero.get_param_id(param)] = accumulator.to(get_norm_dtype()).norm(2)
+                    zero.update_offload_overflow_tracker(accumulator)
 
     Zero.independent_gradient_partition_epilogue = independent_gradient_partition_epilogue
     Zero.copy_grads_in_partition = accumulate_grad_in_master_partition

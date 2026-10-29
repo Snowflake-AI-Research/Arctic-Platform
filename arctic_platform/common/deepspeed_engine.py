@@ -332,7 +332,7 @@ def _accumulate_fp32_master_gradients_in_fp32(ds_config: dict[str, Any]) -> None
         and not bf16_config.get("bf16_master_weights_and_grads")
         and ds_config["zero_optimization"].get("stage") == 2
     ):
-        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+        ds_config.setdefault("data_types", {}).setdefault("grad_accum_dtype", "fp32")
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
