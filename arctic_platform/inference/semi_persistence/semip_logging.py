@@ -30,6 +30,12 @@ directly.  CRIU dumps that fd as an external pipe; the restore hands the new
 pod's pipe back with ``--inherit-fd`` (see ``worker._worker_criu_save``), so a
 restored tree keeps logging with no rebinding step.
 
+In a Ray actor, :func:`tee_tree_to_ray` puts a pipe of the actor's own in
+between: the tree writes to it, and a thread in the actor copies each line to
+the pod log and to the actor's stdout, which is the file Ray forwards to the
+driver (``ct tui``, ``ct download-log``).  It is still a pipe, so dump and
+restore are unchanged.
+
 Several replicas share one pod log, so every line carries ``r<K>`` (the
 replica slot from ``SEMIP_REPLICA_ID``) and the role of the process.
 """
@@ -37,6 +43,8 @@ import logging
 import os
 import stat
 import sys
+import threading
+import time
 
 _FMT = ("%(asctime)s.%(msecs)03d [r%(replica)s %(role)s] %(levelname)-4s "
         "%(loc)s pid=%(pidn)d %(message)s")
@@ -47,6 +55,9 @@ _DATEFMT = "%H:%M:%S"
 # by hand can point the tree at its own terminal pipe instead.
 _POD_LOG_ENV = "SEMIP_LOG_TARGET"
 _POD_LOG_DEFAULT = "/proc/1/fd/1"
+
+# "0" keeps the tree's output out of the Ray actor's stdout (tee_tree_to_ray).
+_TO_RAY_ENV = "SEMIP_LOG_TO_RAY"
 
 _REPLICA_ENV = "SEMIP_REPLICA_ID"
 
@@ -83,6 +94,12 @@ _root_handler: logging.StreamHandler | None = None
 # and a fresh fd each time would leak one per restore.
 _pod_log_stream = None
 _warned_target = False
+
+# Set once by tee_tree_to_ray: the write end the tree opens through /proc (held
+# open for the actor's life, or the path stops resolving), and the real pod log.
+_tee_write_fd = None
+_tee_pod_log_fd = None
+_direct_stream = None
 
 
 def init_process(level: int = logging.INFO, role: str | None = None) -> None:
@@ -193,6 +210,113 @@ def redirect_stdio_to_pod_log() -> str:
         return "?"
 
 
+def _write_all(fd, data) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _copy_lines(read_fd, dest_fds) -> None:
+    """Copy *read_fd* to every fd in *dest_fds*, line by line, until EOF.
+
+    One write per line, so a line up to ``PIPE_BUF`` (4 KiB) lands whole in a
+    pod log other replicas write to as well.  The read is capped so a line that
+    never ends (a ``\\r`` progress bar) is still passed on.  A destination that
+    fails is dropped and the others keep going.  Nothing else ends the loop:
+    if it stopped reading, the pipe would fill and every writer in the tree
+    would block.
+    """
+    src = os.fdopen(read_fd, "rb", buffering=1 << 20)
+    live = list(dest_fds)
+    while True:
+        try:
+            line = src.readline(1 << 16)
+            if not line:
+                return
+            for fd in list(live):
+                try:
+                    _write_all(fd, line)
+                except OSError as exc:
+                    live.remove(fd)
+                    note = (f"[semip] WARNING: log copy to fd {fd} failed "
+                            f"({exc.strerror}); dropped it\n").encode()
+                    for other in live:
+                        try:
+                            _write_all(other, note)
+                        except OSError:
+                            pass
+        except Exception:  # noqa: BLE001
+            time.sleep(0.1)
+
+
+def _set_pipe_size(fd, size) -> None:
+    import fcntl
+    op = getattr(fcntl, "F_SETPIPE_SZ", None)  # Linux only
+    if op is None:
+        return
+    try:
+        fcntl.fcntl(fd, op, size)
+    except OSError:
+        pass
+
+
+def tee_tree_to_ray(ray_fd: int = 1) -> None:
+    """Make the tree's output reach this Ray actor's stdout as well as the pod log.
+
+    For the Ray actor, before it creates its first ``Instance``.  The actor's
+    stdout (``ray_fd``) is the file Ray forwards to the driver; the tree's fd 1
+    and 2 point at the pod log instead, so without this none of the worker's,
+    the child's or the TP ranks' lines reach ``ct tui``.  The tree cannot write
+    to Ray's file itself: CRIU reopens a regular file by its path, and that
+    path differs in every job.
+
+    So the actor makes a pipe and points ``SEMIP_LOG_TARGET`` at its write end
+    through ``/proc``.  Everything that opens the pod log -- the worker, the
+    child at startup, ``_stdout_inherit`` at restore, and the ``semip.*``
+    handlers :func:`attach_pod_log` adds -- then gets this pipe, and a thread
+    copies each line to both the real pod log and Ray's file.
+
+    Idempotent.  Does nothing if ``SEMIP_LOG_TO_RAY=0``.  Never raises: on any
+    failure the target is left alone and the tree logs to the pod log only,
+    as before.
+    """
+    global _tee_write_fd, _tee_pod_log_fd
+    if _tee_write_fd is not None or os.environ.get(_TO_RAY_ENV) == "0":
+        return
+    opened = []
+    try:
+        pod = open_pod_log()
+        opened.append(pod)
+        ray = os.dup(ray_fd)
+        opened.append(ray)
+        r, w = os.pipe()
+        opened += [r, w]
+        _set_pipe_size(w, 1 << 20)
+        threading.Thread(target=_copy_lines, args=(r, [ray, pod]),
+                         name="semip-log-tee", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        print(f"[semip] WARNING: could not send the tree's output to Ray: "
+              f"{exc!r}", file=sys.stderr, flush=True)
+        return
+    _tee_write_fd, _tee_pod_log_fd = w, pod
+    os.environ[_POD_LOG_ENV] = f"/proc/{os.getpid()}/fd/{w}"
+
+
+def _direct_pod_log_stream():
+    """The pod log itself, bypassing the tee when there is one."""
+    global _direct_stream
+    if _tee_pod_log_fd is None:
+        return _pod_log_stream
+    if _direct_stream is None:
+        _direct_stream = os.fdopen(os.dup(_tee_pod_log_fd), "w", buffering=1)
+    return _direct_stream
+
+
 def attach_pod_log(logger_names) -> None:
     """Send the named loggers to the pod log from this (parent) process.
 
@@ -201,6 +325,11 @@ def attach_pod_log(logger_names) -> None:
     since the actor's root logger has no sink of its own; any other logger keeps
     propagating, so a sink it already has (``arctic_platform.inference``'s, which Ray
     forwards to the driver) still sees the record.
+
+    With :func:`tee_tree_to_ray` active, which has to run first, ``semip.*``
+    records go through the tee and so reach Ray too.  Other loggers write to
+    the pod log directly: they reach Ray already, by propagating, and through
+    the tee they would show up there twice.
 
     Idempotent per logger.  Never raises: losing the log costs evidence, not
     correctness, and this runs in ``Instance.__init__``.
@@ -213,7 +342,8 @@ def attach_pod_log(logger_names) -> None:
             logger = logging.getLogger(name)
             if any(getattr(h, "_semip_pod_log", False) for h in logger.handlers):
                 continue
-            h = logging.StreamHandler(_pod_log_stream)
+            h = logging.StreamHandler(_pod_log_stream if name.startswith("semip")
+                                      else _direct_pod_log_stream())
             h._semip_pod_log = True
             h.setFormatter(_FORMATTER)
             h.addFilter(_FILTER)

@@ -8,32 +8,32 @@ that the loader accepts. `no` means the loader offers no way to set it, and `n/a
 rules the option out. Restrictions that depend on the platform, the parallelism or the value stay in
 each loader's own validation. The reasons follow the table.
 
-| Option | Runs in | Goal | `deepseek_v4` | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `qwen3_5_moe` | `qwen4_exp` |
-|---|---|---|---|---|---|---|---|---|---|
-| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes | yes |
-| `attention.sparse_mla` | trainer | speed | n/a | n/a | yes | yes | no | n/a | n/a |
-| `checkpointing.freq` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
-| `checkpointing.mode` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
-| `checkpointing.offload` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
-| `checkpointing.targets` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
-| `compile.fullgraph` | trainer | speed | no | no | no | no | yes | no | no |
-| `liger` | trainer | speed | no | no | no | no | yes | no | no |
-| `lm_head.cross_entropy` | trainer | memory | yes | yes | yes | yes | no | yes | yes |
-| `lm_head.fp32` | both | parity | yes | yes | yes | yes | yes | yes | yes |
-| `lm_head.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
-| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | yes | no | no |
-| `moe.comm_backend` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_sms` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_token_chunk` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
-| `moe.grouped_mm` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
-| `moe.sonicmoe` | trainer | speed | yes | yes | yes | yes | n/a | yes | yes |
-| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | yes | no |
-| `numerics.fp32_residual` | trainer | parity | no | no | no | no | yes | no | no |
-| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | no | yes | yes |
-| `numerics.reduce_dtype` | trainer | parity | yes | yes | yes | yes | no | yes | yes |
-| `peft` | trainer | mode | no | no | no | no | yes | no | no |
-| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | yes | yes | yes | yes | yes |
-| `zorro_train` | trainer | mode | no | no | no | no | yes | no | no |
+| Option | Runs in | Goal | `deepseek_v4` | `deepseek_v41` | `dflash2` | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `qwen3_5_moe` | `qwen4_exp` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| `attention.sparse_mla` | trainer | speed | n/a | n/a | n/a | n/a | yes | yes | no | n/a | n/a |
+| `checkpointing.freq` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `checkpointing.mode` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
+| `checkpointing.offload` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `checkpointing.targets` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
+| `compile.fullgraph` | trainer | speed | no | no | no | no | no | no | yes | no | no |
+| `liger` | trainer | speed | no | no | no | no | no | no | yes | no | no |
+| `lm_head.cross_entropy` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
+| `lm_head.fp32` | both | parity | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `lm_head.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | no | no | yes | no | no |
+| `moe.comm_backend` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.comm_sms` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `numerics.fp32_parity` | trainer | parity | no | no | no | no | no | no | yes | yes | no |
+| `numerics.fp32_residual` | trainer | parity | no | no | no | no | no | no | yes | no | no |
+| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes |
+| `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
+| `peft` | trainer | mode | no | no | no | no | no | no | yes | no | no |
+| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `zorro_train` | trainer | mode | no | no | no | no | no | no | yes | no | no |
 
 ## Options
 
@@ -75,6 +75,48 @@ Extends `generic_moe`.
 - `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `zorro_train` (no): the loader rejects `patches.zorro_train`
+
+## `deepseek_v41`
+
+Extends `generic_moe`.
+
+7 of 24 options unsupported.
+
+- `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
+- `compile.fullgraph` (no): the loader rejects `patches.compile`
+- `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
+- `lm_head.vocab_chunk_size` (no): no equivalent option
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
+- `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `zorro_train` (no): the loader rejects `patches.zorro_train`
+
+## `dflash2`
+
+16 of 24 options unsupported.
+
+- `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
+- `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
+- `checkpointing.mode` (no): the loader has no activation checkpointing; it rejects `patches.gradient_checkpointing`
+- `checkpointing.offload` (no): the loader rejects `patches.activation_offload`
+- `checkpointing.targets` (no): the loader has no activation checkpointing
+- `compile.fullgraph` (no): the loader rejects `patches.compile`
+- `liger` (no): the loader rejects `patches.liger`
+- `lm_head.cross_entropy` (no): the draft objective computes its own cross-entropy
+- `lm_head.fp32` (no): the draft objective reads the target's own LM head; the loader rejects `patches.lm_head`
+- `lm_head.token_chunk_size` (no): the loader rejects `patches.lm_head`; `loader_options.objective_chunk_blocks` bounds memory
+- `lm_head.vocab_chunk_size` (no): the loader rejects `patches.lm_head`; `loader_options.objective_chunk_blocks` bounds memory
+- `moe.comm_backend` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.comm_sms` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.comm_token_chunk` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.grouped_mm` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.sonicmoe` (n/a): the loader rejects expert parallelism and has no expert options
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option
+- `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
+- `numerics.reduce_dtype` (no): no equivalent option
+- `peft` (no): the loader rejects `patches.peft`: the draft is trained in full
+- `tiled_mlp.token_chunk_size` (no): the loader rejects `patches.tiled_mlp`
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `generic_moe`
