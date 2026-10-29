@@ -362,6 +362,7 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     if not is_peft_model(model):
         return
     import torch.distributed as dist
+    from safetensors.torch import save_file
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3)
@@ -370,6 +371,10 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True)
+    # PEFT 0.21 keeps only keys under the live module paths, which still carry the activation-checkpoint segment the
+    # gather stripped, so under AC its tensor file is empty: write the gathered tensors over it.
+    tensors = {_peft_lora_parameter_to_vllm_name(name): tensor for name, tensor in state.items()}
+    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -419,6 +424,8 @@ def _peft_lora_parameter_to_vllm_name(name: str) -> str:
     parts = strip_activation_checkpoint_segments(name).split(".")
     if len(parts) >= 3 and parts[-1] == "weight" and parts[-3] in ("lora_A", "lora_B"):
         parts = parts[:-2] + parts[-1:]
+    elif len(parts) >= 2 and parts[-2] in ("lora_embedding_A", "lora_embedding_B"):
+        parts = parts[:-1]
     return ".".join(parts)
 
 
