@@ -351,8 +351,9 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         vocab = weight.shape[0]
         vocab_chunk_size = min(vocab, 8192)
 
-        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype)
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype)
+        # Sum the tiles in fp32 even when the projection runs in bf16: a bf16 running sum rounds once per tile.
+        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
