@@ -405,6 +405,65 @@ def test_dump_records_a_null_floor_when_none_was_placed():
          se.time) = saved
 
 
+class _FailingInstance(_FakeInstance):
+    """A dump whose ``wait`` raises once ``fail_after`` has run, as a failed command does."""
+
+    def __init__(self, log, model_dir, fail_after):
+        super().__init__(log)
+        self.model_dir = model_dir
+        self.fail_after = fail_after
+
+    def criu_dump(self, filename=None, meta_extra=None):
+        super().criu_dump(filename, meta_extra)
+        image = os.path.join(self.model_dir, se._IMAGE_DIR)
+        os.makedirs(image, exist_ok=True)
+        with open(os.path.join(image, "meta.json"), "w") as handle:
+            handle.write("{}")
+
+    def wait(self):
+        self.log.append("wait")
+        if self.fail_after in self.log:
+            raise RuntimeError(f"{self.fail_after} failed")
+
+
+def _failing_dump(fail_after):
+    import tempfile
+    model_dir = tempfile.mkdtemp()
+    log = []
+    saved = (se.Instance, se._raise_pid_floor, se._record_env_files, se.time)
+    se.Instance = lambda vllm_config, md: _FailingInstance(log, model_dir, fail_after)
+    se._raise_pid_floor = lambda: None
+    se._record_env_files = lambda md: None
+    se.time = types.SimpleNamespace(perf_counter=saved[3].perf_counter,
+                                    sleep=lambda seconds: None)
+    try:
+        try:
+            se._dump({}, model_dir, [0], image_ref="img@sha256:abc",
+                     driver_version="580.159.03")
+        except RuntimeError as exc:
+            assert f"{fail_after} failed" in str(exc)
+        else:
+            raise AssertionError("the dump did not fail")
+    finally:
+        (se.Instance, se._raise_pid_floor, se._record_env_files,
+         se.time) = saved
+    meta = os.path.join(model_dir, se._IMAGE_DIR, "meta.json")
+    return log, os.path.exists(meta)
+
+
+def test_dump_stops_at_a_failed_sleep():
+    """An engine that did not sleep still holds its GPU memory; it is never checkpointed."""
+    log, hit = _failing_dump("sleep")
+    assert "cuda_checkpoint" not in log and "criu_dump" not in log, log
+    assert not hit
+
+
+def test_a_dump_that_fails_after_criu_dump_leaves_no_cache_hit():
+    log, hit = _failing_dump("criu_dump")
+    assert "criu_dump" in log, log
+    assert not hit
+
+
 if __name__ == "__main__":
     tests = [
         test_env_int_takes_the_override,
@@ -422,6 +481,8 @@ if __name__ == "__main__":
         test_burn_source_stops_at_its_limit,
         test_dump_places_the_floor_before_the_instance_and_records_it,
         test_dump_records_a_null_floor_when_none_was_placed,
+        test_dump_stops_at_a_failed_sleep,
+        test_a_dump_that_fails_after_criu_dump_leaves_no_cache_hit,
     ]
     failures = 0
     for fn in tests:

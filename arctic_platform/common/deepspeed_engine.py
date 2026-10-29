@@ -31,9 +31,10 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
-from pydantic import Field
 
+from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.common.zero_grad_accum import patch_zero2_grad_accum_dtype
+from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
 
@@ -50,20 +51,6 @@ _OPTIMIZER_ALIASES = {
     "cpuadam": "deepspeed_cpu_adam",
     "deep_speed_cpu_adam": "deepspeed_cpu_adam",
 }
-
-
-class OptimizerSettings(BaseModel):
-    """Optimizer block handed to DeepSpeed after the caller has resolved aliases."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = "AdamW"
-    lr: float = 1e-5
-    weight_decay: float = 0.0
-    betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
-    eps: float = 1e-8
-    # ``None`` lets the model family decide. GLM-MoE leaves FusedAdam off.
-    fused: bool | None = None
 
 
 class TrainingEngineSpec(BaseModel):
@@ -173,6 +160,8 @@ def initialize_training_engine(
     """
     built = None
     choice = None
+    # Marks first: the optimizer groups split on them.
+    preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
         fused = optimizer.fused
         if fused is None:
@@ -181,16 +170,15 @@ def initialize_training_engine(
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
             built.param_groups[:] = split_expert_param_groups(list(built.param_groups))
-    preserved, marked_scales = preserve_fp8_params_through_ds_cast(model)
-    if preserved:
+    if preserved or marked_fp32:
         from deepspeed.runtime.engine import DeepSpeedEngine
 
         logger.info(
-            "rank=%d preserving %d FP8 parameters and %d FP32 block scales through the "
+            "rank=%d preserving %d FP8 parameters and %d FP32 parameters through the "
             "DeepSpeed dtype cast (deepspeed_param_cast_guard=%d)",
             rank,
             preserved,
-            marked_scales,
+            marked_fp32,
             int(bool(getattr(DeepSpeedEngine, "_ap_fp8_param_cast_guard", False))),
         )
     import deepspeed
@@ -277,9 +265,12 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         for name, param in model.named_parameters()
         if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
     ]
+    # ZeRO flattens each group into one buffer of its first parameter's dtype, so
+    # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [
-        {"params": decay_params, "weight_decay": optimizer.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": [param for param in params if keeps_fp32(param) == fp32], "weight_decay": decay}
+        for params, decay in ((decay_params, optimizer.weight_decay), (no_decay_params, 0.0))
+        for fp32 in (False, True)
     ]
     param_groups = [group for group in param_groups if group["params"]]
     betas = (optimizer.betas[0], optimizer.betas[1])
