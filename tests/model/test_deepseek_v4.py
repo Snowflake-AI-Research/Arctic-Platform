@@ -31,6 +31,13 @@ def _checkpoint(tmp_path, *, n_routed_experts: int | None = None) -> str:
     return str(path)
 
 
+def _requires_sparse_attention_kernel():
+    from arctic_platform.model.implementations.deepseek_v4 import attention
+
+    if attention.dsv4_sparse_attn is None:
+        pytest.skip("building the attention needs the tilelang sparse-attention kernel")
+
+
 def _tiny_config():
     from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4Config
 
@@ -151,6 +158,169 @@ def test_published_expert_names_convert_to_platform_parameters():
     assert converted["model.embed_tokens.weight"].shape == (32, 64)
 
 
+def test_checkpoint_fp32_parameters_are_built_in_fp32():
+    _requires_sparse_attention_kernel()
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+    model = DeepseekV4ForCausalLM._from_config(_tiny_config(), dtype=torch.bfloat16)
+    dtypes = {name: param.dtype for name, param in model.named_parameters()}
+    fp32 = sorted(name for name, dtype in dtypes.items() if dtype == torch.float32)
+    assert fp32 == sorted(name for name in dtypes if DeepseekV4ForCausalLM.keeps_fp32_parameter(name))
+    assert "model.layers.0.attn_hc.fn" in fp32
+    assert "model.layers.1.self_attn.sinks" in fp32
+    assert "model.layers.1.self_attn.compressor.position_bias" in fp32
+    assert "model.hc_head.hc_scale" in fp32
+    assert dtypes["model.layers.0.input_layernorm.weight"] == torch.bfloat16
+    assert dtypes["model.layers.0.self_attn.q_a_proj.weight"] == torch.bfloat16
+
+
+def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
+    _requires_sparse_attention_kernel()
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    model = DeepseekV4ForCausalLM(_tiny_config())
+    model.model.layers[0].mlp.router.tid2eid.copy_(torch.arange(64).view(32, 2) % 4)
+
+    exported = dict(build_iter_full_hf_weights(model)())
+    assert not [name for name in exported if name.startswith("model.")]
+    assert "layers.1.attn.indexer.compressor.wkv.weight" in exported
+    assert "layers.1.ffn.gate.bias" in exported
+    assert "layers.0.ffn.gate.bias" not in exported
+
+    expected = dict(named_weight_sync_tensors(model))
+    expected["model.layers.0.mlp.router.tid2eid"] = model.model.layers[0].mlp.router.tid2eid
+    loaded = apply_hf_to_prime(dict(exported), model.conversion_chain(model.config))
+    assert sorted(loaded) == sorted(expected)
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor), name
+
+
+def test_official_fp8_checkpoint_keeps_packed_expert_weights():
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import conversion_chain
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import decode_e8m0_scales_
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import encode_e8m0_scales_
+    from arctic_platform.model.implementations.deepseek_v4.moe import DeepseekV4MoE
+
+    config = _tiny_config()
+    config.moe_intermediate_size = 64
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    scale = torch.ones(8, 2, dtype=torch.float8_e8m0fnu)
+    state = {
+        "layers.1.ffn.experts.0.w1.weight": torch.ones(64, 32, dtype=torch.int8),
+        "layers.1.ffn.experts.1.w1.weight": torch.full((64, 32), 2, dtype=torch.int8),
+        "layers.1.ffn.experts.0.w1.scale": scale.clone(),
+        "layers.1.ffn.experts.1.w1.scale": scale.clone(),
+        "layers.1.attn.wq_a.weight": torch.zeros(32, 64, dtype=torch.float8_e4m3fn),
+        "layers.1.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.float8_e8m0fnu),
+    }
+    converted = apply_hf_to_prime(dict(state), conversion_chain(config))
+    decode_e8m0_scales_(converted)
+    experts = converted["model.layers.1.mlp.experts.w1"]
+    assert experts.dtype == torch.int8
+    assert experts.shape == (2, 64, 32)
+    assert converted["model.layers.1.mlp.experts.w1_scale_inv"].dtype == torch.float32
+    assert converted["model.layers.1.self_attn.q_a_proj.weight"].dtype == torch.float8_e4m3fn
+    assert converted["model.layers.1.self_attn.q_a_proj.weight_scale_inv"].dtype == torch.float32
+
+    encode_e8m0_scales_(converted)
+    assert converted["model.layers.1.mlp.experts.w1_scale_inv"].dtype == torch.float8_e8m0fnu
+
+    moe = DeepseekV4MoE(config, 1)
+    assert moe.experts.mxfp4
+    assert moe.experts.w1.dtype == torch.int8
+    assert moe.experts.w1.shape == (4, 64, 32)
+    assert moe.shared_expert.w1.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("peft", [None, {"peft_type": "Lora", "r": 8}])
+def test_only_lora_keeps_the_official_checkpoint_packed(tmp_path, monkeypatch, peft):
+    from arctic_platform.model.implementations.deepseek_v4 import deepspeed_integration
+    from arctic_platform.model.loader import LoaderContext
+    from arctic_platform.model.loaders.deepseek_v4 import load_deepseek_v4
+
+    calls = []
+    monkeypatch.setattr(deepspeed_integration, "load_deepseek_v4_model", lambda **kwargs: calls.append(kwargs))
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=8),
+        patches={"peft": peft},
+    )
+    load_deepseek_v4(LoaderContext(spec=spec, parallel_groups={"ep_group": object()}))
+    assert calls[0]["dequantize_checkpoint"] is (peft is None)
+
+
+def test_dequantize_checkpoint_builds_bf16_modules_from_the_official_checkpoint(tmp_path):
+    _requires_sparse_attention_kernel()
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.qwen35.config import ModelConfig
+    from arctic_platform.model.implementations.qwen35.model_builder import get_model
+
+    config = _tiny_config()
+    config.moe_intermediate_size = 64
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    config.save_pretrained(tmp_path)
+    model = get_model(
+        ModelConfig(name=str(tmp_path), attn="eager", impl="custom", dequantize_checkpoint=True),
+        device=torch.device("meta"),
+        dtype=torch.bfloat16,
+    )
+    assert not hasattr(model.config, "quantization_config")
+    layer = model.model.layers[1]
+    assert not isinstance(layer.mlp.experts, Mxfp4GroupedExperts)
+    assert layer.mlp.experts.w1.dtype == torch.bfloat16
+    assert layer.self_attn.q_a_proj.weight.dtype == torch.bfloat16
+
+    state = {
+        "layers.1.ffn.experts.0.w1.weight": torch.full((64, 32), 0x22, dtype=torch.int8),
+        "layers.1.ffn.experts.1.w1.weight": torch.full((64, 32), 0x22, dtype=torch.int8),
+        "layers.1.ffn.experts.0.w1.scale": torch.ones(64, 2, dtype=torch.float8_e8m0fnu),
+        "layers.1.ffn.experts.1.w1.scale": torch.ones(64, 2, dtype=torch.float8_e8m0fnu),
+        "layers.1.attn.wq_a.weight": torch.ones(32, 64, dtype=torch.float8_e4m3fn),
+        "layers.1.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.float8_e8m0fnu),
+    }
+    converted = model.convert_to_prime(state)
+    assert not [name for name in converted if name.endswith("_scale_inv")]
+    experts = converted["model.layers.1.mlp.experts.w1"]
+    assert experts.dtype == torch.bfloat16
+    assert experts.shape == (2, 64, 64)
+    assert torch.all(experts == 1.0)
+    assert torch.all(converted["model.layers.1.self_attn.q_a_proj.weight"] == 1.0)
+
+
+def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
+
+    torch.manual_seed(0)
+    experts = Mxfp4GroupedExperts(dim=64, hidden_dim=64, num_experts=2, swiglu_limit=10.0)
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            weight = getattr(experts, name)
+            weight.copy_(torch.randint(-7, 8, weight.shape, dtype=torch.int8))
+            getattr(experts, f"{name}_scale_inv").fill_(1.0)
+    x = torch.randn(4, 64, requires_grad=True)
+    counts = torch.tensor([2, 2], dtype=torch.int32)
+    output = experts(x, counts)
+    reference = _run_experts_for_loop_impl(
+        dequantize_mxfp4(experts.w1, experts.w1_scale_inv),
+        dequantize_mxfp4(experts.w2, experts.w2_scale_inv),
+        dequantize_mxfp4(experts.w3, experts.w3_scale_inv),
+        x.detach().bfloat16(),
+        counts,
+        10.0,
+    )
+    assert torch.allclose(output, reference.float())
+    output.sum().backward()
+    assert x.grad is not None
+    assert experts.w1.grad is None
+
+
 def test_sqrtsoftplus_scores_match_softplus_sqrt():
     if not torch.cuda.is_available():
         pytest.skip("router histc on integer indices is CUDA-only")
@@ -170,3 +340,29 @@ def test_sqrtsoftplus_scores_match_softplus_sqrt():
     expected = torch.nn.functional.softplus(torch.tensor([2.0], device="cuda")).sqrt()
     assert indices.item() == 0
     assert torch.allclose(scores, expected)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (
+            "base_model.model.model.layers.3.self_attn.q_a_proj.lora_A.weight",
+            "base_model.model.layers.3.attn.wq_a.lora_A.weight",
+        ),
+        (
+            "base_model.model.model.layers.0.self_attn.kv_proj.lora_B.weight",
+            "base_model.model.layers.0.attn.wkv.lora_B.weight",
+        ),
+        ("model.layers.12.self_attn.q_b_proj.lora_A.weight", "layers.12.attn.wq_b.lora_A.weight"),
+        ("model.layers.12.self_attn.o_b_proj.lora_B.weight", "layers.12.attn.wo_b.lora_B.weight"),
+        ("model.layers.1.self_attn.o_a_proj.lora_A.weight", "model.layers.1.self_attn.o_a_proj.lora_A.weight"),
+    ],
+)
+def test_lora_sync_uses_published_attention_names(name, expected):
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
+    from arctic_platform.model.implementations.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from arctic_platform.model.implementations.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+
+    assert vllm_lora_name(name) == expected
+    assert DeepseekV4ForCausalLM.vllm_lora_name(name) == expected
+    assert DeepseekV41ForCausalLM.vllm_lora_name(name) == expected

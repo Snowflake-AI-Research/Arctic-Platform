@@ -33,6 +33,10 @@ from .converting_glm5_next import convert_hf_layer_to_prime
 from .converting_glm5_next import convert_hf_to_prime
 from .converting_glm5_next import convert_prime_layer_to_hf
 from .converting_glm5_next import convert_prime_to_hf
+from .fused_norms import fuse_glm5_next_norms
+from .hyper_connections import fused_hyper_connection_applies
+from .hyper_connections import hyper_connection
+from .hyper_connections import mix_streams
 
 
 def _fp8_modules_to_skip(config) -> set[str]:
@@ -78,15 +82,17 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
-def _remix(post: Tensor, comb: Tensor, output: Tensor, residual: Tensor) -> Tensor:
-    """``post * output + comb^T @ residual`` as fp32 FMAs over the hc streams, rounded once, as vLLM's ``mhc_post``.
+def _remix(fused: bool, post, comb, sublayer_out, streams) -> torch.Tensor:
+    """``post * sublayer_out + comb^T @ streams`` as fp32 FMAs over the hc streams, rounded once, as vLLM's ``mhc_post``.
 
     Elementwise rather than a matmul so a TF32 matmul precision never rounds ``comb``.
     """
-    mixed = post.unsqueeze(-1) * output.unsqueeze(-2)
-    for weights, stream in zip(comb.unbind(-2), residual.unbind(-2)):
+    if fused:
+        return mix_streams(post, comb, sublayer_out, streams)
+    mixed = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
+    for weights, stream in zip(comb.unbind(-2), streams.unbind(-2)):
         mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
-    return mixed.to(residual.dtype)
+    return mixed.to(streams.dtype)
 
 
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
@@ -102,8 +108,10 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
         routed_experts: Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The fused kernels make one pass over the streams where the reference makes several FP32 ones.
+        fused_hc = fused_hyper_connection_applies(self.attn_hc, hidden_states)
         residual = hidden_states
-        post, comb, hidden_states = self.attn_hc(hidden_states)
+        post, comb, hidden_states = hyper_connection(self.attn_hc, residual) if fused_hc else self.attn_hc(residual)
         # Self attn
         hidden_states = self.input_layernorm(hidden_states)
         topk_indices = None
@@ -125,10 +133,10 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
                 prev_topk_indices=prev_topk_indices,
                 **kwargs,
             )
-        hidden_states = _remix(post, comb, hidden_states, residual)
+        hidden_states = _remix(fused_hc, post, comb, hidden_states, residual)
 
         residual = hidden_states
-        post, comb, hidden_states = self.ffn_hc(hidden_states)
+        post, comb, hidden_states = hyper_connection(self.ffn_hc, residual) if fused_hc else self.ffn_hc(residual)
         # Feed forward
         hidden_states = self.post_attention_layernorm(hidden_states)
         if isinstance(self.mlp, MoE):
@@ -136,7 +144,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
             hidden_states = self.mlp(hidden_states, routed_experts=routes)
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states = _remix(post, comb, hidden_states, residual)
+        hidden_states = _remix(fused_hc, post, comb, hidden_states, residual)
 
         return hidden_states, topk_indices
 
@@ -180,6 +188,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
+        fuse_glm5_next_norms(self)
         self._is_vlm = True
 
     @classmethod

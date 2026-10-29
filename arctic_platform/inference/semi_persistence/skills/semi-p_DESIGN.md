@@ -48,9 +48,9 @@ deterministic, colocated with the weights, human-readable, needs no
 hashing, and gives CRIU a stable absolute path for the recorded JIT
 mappings.
 
-The serving adapter takes a stricter line, and for a reason worth knowing
+The serving restore takes a stricter line, and for a reason worth knowing
 before you copy the convention above: a path that is merely *stable* still
-lets two different configurations share a directory.  `restore_and_wrap`
+lets two different configurations share a directory.  `restore_engine`
 therefore derives `model_dir` from a hash of the config and of the
 environment (`$SEMIP_IMAGE_CACHE/<cfg>_<env>`), which makes the directory
 name the cache key rather than a label attached to one.  See
@@ -239,8 +239,11 @@ a target node with `sudo criu check --unprivileged`.
 
 ## 5. Known gaps
 
-- **Weight sync is not implemented.** The RL weight-update path is
-  deliberately deferred.
+- **Weight sync is not yet exercised by a trainer.** Since the `AsyncLLM`
+  front end (2026-10-24) the weight-sync RPCs reach the restored workers as on
+  a plain engine, and a sync marks the host copy stale so the next sleep
+  restages it; see [`dss_integration.md`](dss_integration.md), Sections 5
+  and 8. No RL run has driven it on GPU yet.
 - **Multiplexing more than one job per GPU with semi-persistence is
   unvalidated.**
 - **Config compatibility is exact, not semantic.** The flat dict equality
@@ -248,5 +251,6 @@ a target node with `sudo criu check --unprivileged`.
   or harmless keys. A richer model — bake the full effective engine
   config at dump time and validate a meaningful subset — is the eventual
   fix.
-- **`logprobs` are surfaced by the child** but not plumbed through every
-  adapter path.
+- **`logprobs`** were surfaced by the child but not plumbed through every
+  path of the old `_SemiPEngine` wrapper. Resolved by the `AsyncLLM` front
+  end, which returns them as a plain engine does.

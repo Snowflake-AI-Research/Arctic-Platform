@@ -35,6 +35,8 @@ from arctic_platform.model.loader import register_loader
 
 
 class DebugModelOptions(BaseModel):
+    """Loader debug options (provider ``DebugModelConfig`` fields only)."""
+
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     random_init: bool = False

@@ -162,6 +162,10 @@ def test_runtime_config_is_derived_from_validated_options():
                 "pin_memory_max_size_gib": 0,
             },
         },
+        debug={
+            "num_layers": 4,
+            "random_init": True,
+        },
     )
     config = _build_model_config(
         "local",
@@ -181,6 +185,8 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac is options.ac_config
     assert config.ac.offload_config.enabled is True
     assert config.ac.offload_config.keep_last_n == 3
+    assert config.debug.num_layers == 4
+    assert config.debug.random_init is True
 
 
 def test_legacy_qwen_types_are_shared():

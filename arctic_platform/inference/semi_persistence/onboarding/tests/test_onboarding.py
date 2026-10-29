@@ -7,6 +7,7 @@ repository root::
     python -m pytest arctic_platform/inference/semi_persistence/onboarding/tests
 """
 
+import base64
 import json
 
 import pytest
@@ -124,6 +125,20 @@ def test_parse_semi_p_restore():
     assert startup.generate_counts({"zone-device-manager-abcde.log": RESTORE_LOG}) == {"abcde r0": 1}
 
 
+def test_parse_semi_p_counts_the_attach_in_key_to_ready():
+    log = RESTORE_LOG[:-1] + [
+        "00:00:21.500 [r0 child] INFO c.py:1 pid=3 <<< serve_core OK (0.400s)",
+        "00:00:24.000 [r0 engine] INFO x.py:1 pid=1 semi_p: front end attached in 3.00s "
+        "(serve_core 0.45s, AsyncLLM 2.50s)",
+        RESTORE_LOG[-1],
+    ]
+    r = startup.parse_semi_p(log)
+    rep = r["replicas"]["r0"]
+    assert rep["attach_s"] == 3.0 and rep["restore_s"] == 17.3 and rep["key_to_ready_s"] == 23.0
+    assert r["slowest_replica_steps"] == {"criu_restore": 3.3, "load_weights": 2.0, "serve_core": 0.4}
+    assert "| r0 | published image | 2.5 | 17.3 | 3.0 | 23.0 |" in "\n".join(report.replica_table(r))
+
+
 def test_restore_report_prefers_pod_logs_and_labels_each_pod():
     agent = ["00:00:05.000 [r0 worker] INFO w.py:1 pid=9 <<< criu_restore OK (4.000s)",
              "00:00:20.000 [r0 worker] INFO w.py:1 pid=9 <<< cuda_restore OK (15.000s)",
@@ -137,6 +152,37 @@ def test_restore_report_prefers_pod_logs_and_labels_each_pod():
     table = "\n".join(report.replica_table(r))
     assert "| bbbbb r0 | node-partition agent |" in table and "cuda_restore" in table
     assert startup.restore_report({"sub-job.log": RESTORE_LOG}, {})["steps_source"].startswith("sub-job log")
+
+
+class _LogService:
+    """``tail_logs`` as the service pages it: no cursor gives the newest
+    ``max_lines``; a cursor (base64 timestamp) gives the lines after it."""
+
+    def __init__(self, n, created_at="2026-01-01T00:00:00Z"):
+        self.lines = [f"line {i}" for i in range(n)]
+        self.created_at, self.cursors = created_at, []
+
+    def get_job(self, job_id):
+        return {"created_at": self.created_at}
+
+    def tail_logs(self, job_id, cursor=None, max_lines=1000, sub_job_type=None):
+        self.cursors.append(cursor)
+        if cursor is None:
+            start = max(0, len(self.lines) - max_lines)
+        elif cursor.startswith("at:"):
+            start = int(cursor[3:])
+        else:
+            assert base64.b64decode(cursor + "=" * (-len(cursor) % 4)).decode() == self.created_at
+            start = 0
+        end = min(start + max_lines, len(self.lines))
+        return {"entries": [{"_raw": x} for x in self.lines[start:end]], "next_cursor": f"at:{end}"}
+
+
+def test_sub_job_log_is_read_from_the_job_start():
+    svc = _LogService(2500)
+    assert startup.read_sub_job_log(svc, "J") == svc.lines
+    svc = _LogService(2500, created_at=None)
+    assert startup.read_sub_job_log(svc, "J") == svc.lines[-1000:] and svc.cursors[0] is None
 
 
 def test_parse_semi_p_sub_job_log_format_two_pods():
@@ -340,6 +386,83 @@ def test_perf_score_gates_engine_throughput_and_reports_client():
     assert report._perf_status(client) == "info (below)"
 
 
+def test_perf_score_passes_a_gap_plain_matched_shows_too():
+    def c(srv, tok):
+        return {"concurrency": 2, "prompt": 16, "output": 96, "server_p50": srv, "tok_s": tok,
+                "client_p50": srv + 0.2, "errors": 0, "zero_id_responses": 0}
+
+    rows = [{"on": c(1.10, 170), "off": c(1.00, 190), "matched": c(1.10, 170)}]
+    lat = {s: {"ttft_short_s": 0.05, "ttft_long_s": 0.05, "tpot_s": t, "errors": 0}
+           for s, t in (("on", 0.0110), ("off", 0.0098), ("matched", 0.0112))}
+    tpot = {x["name"]: x for x in perf.score(rows, lat, 1, {})["checks"]}["TPOT ratio"]
+    assert tpot["passed"] and "passes against plain matched" in tpot["limit"]
+    del rows[0]["matched"], lat["matched"]
+    assert not {x["name"]: x for x in perf.score(rows, lat, 1, {})["checks"]}["TPOT ratio"]["passed"]
+
+
+def _scripted_perf(monkeypatch, on_grid_p50s):
+    """perf.run against fake jobs: the grid cell's semi_p p50 follows ``on_grid_p50s``
+    one measurement at a time; plain is always 0.200 s."""
+    from types import SimpleNamespace
+
+    on_p50s, salts = iter(on_grid_p50s), []
+
+    def cell(_make_client, job, concurrency, prompt_len, out_len, *_a):
+        if concurrency == 1:
+            srv = 0.05 + 0.004 * (out_len - 1)
+        else:
+            salts.append(_a[1])
+            srv = next(on_p50s) if job == "on" else 0.200
+        return {"concurrency": concurrency, "prompt": prompt_len, "output": out_len, "requests": 16,
+                "errors": 0, "first_error": "", "server_p50": srv, "server_p90": srv, "client_p50": srv + 0.2,
+                "client_p90": srv + 0.2, "tok_s": concurrency * out_len / srv, "zero_id_responses": 0}
+
+    monkeypatch.setattr(perf, "cell", cell)
+    pair = SimpleNamespace(on="on", off="off", max_seq_len=128, replicas=1)
+    result = perf.run(lambda: None, pair, {"shapes": [[16, 16]], "concurrency": [8]})
+    return result, {x["name"]: x for x in result["checks"]}["worst server p50 latency ratio"], salts
+
+
+def test_perf_remeasures_a_cell_over_the_latency_limit(monkeypatch):
+    # One repeat brings the cell within the limit, so it stops there.
+    result, check, salts = _scripted_perf(monkeypatch, [0.236, 0.205])
+    row = result["rows"][0]
+    assert [m["on"] for m in row["remeasured"]] == [0.236, 0.205]
+    assert row["on"]["server_p50"] == 0.205 and check["passed"]
+    assert len(set(salts)) == 2  # the repeat uses fresh prompts
+    # Still over after one repeat: a third measurement, and the median of three.
+    result, check, _ = _scripted_perf(monkeypatch, [0.236, 0.240, 0.210])
+    assert result["rows"][0]["on"]["server_p50"] == 0.236 and not check["passed"]
+
+
+def test_perf_fails_a_slowdown_that_repeats(monkeypatch):
+    result, check, _ = _scripted_perf(monkeypatch, [0.236, 0.240, 0.238])
+    assert len(result["rows"][0]["remeasured"]) == 3 and not check["passed"]
+    assert check["value"] == pytest.approx(0.238 / 0.200)
+
+
+def test_perf_does_not_remeasure_a_cell_within_the_limit(monkeypatch):
+    result, check, _ = _scripted_perf(monkeypatch, [0.210])
+    assert "remeasured" not in result["rows"][0] and check["passed"]
+
+
+def test_guided_json_that_does_not_parse_passes_only_when_plain_matched_agrees():
+    from arctic_platform.inference.semi_persistence.onboarding import correctness
+
+    def check(**variants):
+        return {"passed": True, "detail": "",
+                "variants": {v: {"passed": ok, "detail": "", "gated": True} for v, ok in variants.items()}}
+
+    agrees, differs, absent = check(off_matched=True), check(off_matched=False), check(on_miss=True)
+    for c in (agrees, differs, absent):
+        correctness.apply_guided_parse_rule(c, parses=False)
+    assert agrees["passed"] and not differs["passed"] and not absent["passed"]
+    assert "no off_matched job" in absent["detail"]
+    parsed = check(on_miss=True)
+    correctness.apply_guided_parse_rule(parsed, parses=True)
+    assert parsed["passed"]
+
+
 def test_publish_body_asks_a_miss_to_dump_and_publish():
     from arctic_platform.inference.semi_persistence.onboarding import publish
 
@@ -400,6 +523,54 @@ def test_publish_outcome_needs_nothing_for_a_restore_from_the_mirror():
                         f"materialized {_KEY} from /mnt/x: 3 file(s)",
                         f"restore complete model_dir={_KEY} gpus=[0]")
     assert publish.publish_outcome(lines)["status"].startswith("already published")
+
+
+def _fake_kubectl(ready_after):
+    """kubectl that reports 3 cache nodes, and each label ready once polled ``ready_after`` times."""
+    from types import SimpleNamespace
+
+    polls = {}
+
+    def run(argv, **_kwargs):
+        selector = argv[argv.index("-l") + 1]
+        if "=ready" not in selector:
+            return SimpleNamespace(stdout="node/a\nnode/b\nnode/c\n")
+        polls[selector] = polls.get(selector, 0) + 1
+        return SimpleNamespace(stdout="node/a\nnode/b\nnode/c\n" if polls[selector] > ready_after else "node/a\n")
+
+    return run
+
+
+def test_published_dirs_come_from_the_publish_summary(tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"m": {"status": "published", "slug": "Org-Model", "skeleton": "aaa_bbb_ccc",
+                                         "weight_hash": "ccc"}, "failed": {"status": "FAILED: x"}}))
+    assert verify.published_dirs(summary, "m") == ["image-cache/Org-Model/skeleton/aaa_bbb_ccc",
+                                                   "image-cache/Org-Model/weight/ccc"]
+    assert verify.published_dirs(summary, "failed") == []
+    assert verify.published_dirs(tmp_path / "missing.json", "m") == []
+
+
+def test_wait_verified_waits_for_every_node_then_reports():
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    dirs = ["image-cache/M/skeleton/k", "image-cache/M/weight/w"]
+    slept = []
+    note = verify.wait_verified(dirs, 600, "m", run=_fake_kubectl(ready_after=2), sleep=slept.append,
+                                clock=lambda: 0.0)
+    assert note == "skeleton and weights verified on 3/3 nodes" and len(slept) == 2
+    assert verify.wait_verified([], 600, "m").startswith("not checked")
+
+
+def test_wait_verified_gives_up_after_its_timeout():
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    ticks = iter(range(0, 10_000, 100))
+    with pytest.raises(RuntimeError, match="not verified on every node after 300s"):
+        verify.wait_verified(["image-cache/M/skeleton/k"], 300, "m", run=_fake_kubectl(ready_after=99),
+                             sleep=lambda _s: None, clock=lambda: float(next(ticks)))
 
 
 def test_cli_helpers():
