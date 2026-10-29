@@ -148,14 +148,13 @@ def _unpadded_segment_indices(
     segment-relative token indices in the general path's column layout, ``-1`` where unused.
     """
     kpool = indexer.index_kpool
-    pool_keys = indexer.get_pooled_states(packed_states=segment_states)[0][0].contiguous()
+    _, pool_indices, _ = indexer.get_pooled_states(packed_states=segment_states)
+    pool_keys, pool_scales = _sampler_pooled_keys(indexer, segment_states, pool_indices)
+    pool_keys = pool_keys[0].contiguous()
+    pool_scales = pool_scales[0, :, 0].contiguous()
     pools = pool_keys.shape[0]
     select_k = min(indexer.index_topk // kpool, pools)
     visible_pools = torch.div(query_positions + 1, kpool, rounding_mode="floor").clamp(max=pools).to(torch.int32)
-    # relu(scale * s) == scale * relu(s): the softmax scale folds into the head weights.
-    head_weights = (weights * indexer.softmax_scale).contiguous()
-    query_by_head = query.permute(1, 0, 2)
-    unit_key_scales = torch.ones(pools, dtype=torch.float32, device=query.device)
     first_keys = torch.zeros_like(visible_pools)
     pool_offsets = torch.arange(kpool, device=query.device)
     tail_offsets = torch.arange(kpool - 1, device=query.device)
@@ -166,11 +165,12 @@ def _unpadded_segment_indices(
         stop = min(start + rows, query.shape[0])
         visible = visible_pools[start:stop]
         width = max(int(visible.max()), 1)
+        query_fp8, query_scales = _hadamard_fp8(query[start:stop])
         scores = fp8_indexer.weighted_relu_scores(
-            query_by_head[:, start:stop],
+            query_fp8.permute(1, 0, 2),
             pool_keys,
-            unit_key_scales,
-            head_weights[start:stop],
+            pool_scales,
+            (weights[start:stop] * query_scales.squeeze(-1)).contiguous(),
             first_keys[start:stop],
             visible,
             width,

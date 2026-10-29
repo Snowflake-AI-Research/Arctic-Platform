@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The trainer must attend to the tokens the vLLM 0.31 sampler's GLM-5.3 indexer selected for the same input."""
+"""The trainer must attend to the tokens the vLLM 0.32 sampler's GLM-5.3 indexer selected for the same input."""
+
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -59,7 +61,7 @@ def _indexer():
 def _vllm_tokens(indexer, hidden, q_resid):
     """Per query of one row, the token set vLLM's glm5next indexer attends to (common/attention.py Indexer.forward,
     nvidia/ops/kpool_compress.py, DeepGEMM fp8 MQA logits, top-k over complete visible pools plus the raw tail)."""
-    hadamard = torch.ones(1, 1, dtype=torch.float64)
+    hadamard = torch.ones(1, 1, dtype=torch.float64, device=hidden.device)
     while hadamard.shape[0] < HEAD_DIM:
         hadamard = torch.cat((torch.cat((hadamard, hadamard), 1), torch.cat((hadamard, -hadamard), 1)))
 
@@ -93,23 +95,30 @@ def _token_sets(indices):
     return [{int(token) for token in row if token >= 0} for row in indices]
 
 
-def test_trainer_selects_the_samplers_tokens_in_packed_rows():
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"))],
+)
+def test_trainer_selects_the_samplers_tokens_in_packed_rows(device):
     torch.manual_seed(0)
-    indexer = _indexer()
+    indexer = _indexer().to(device)
     length = sum(ROWS)
-    hidden = torch.randn(1, length, 64, dtype=torch.bfloat16)
-    q_resid = torch.randn(1, length, 32, dtype=torch.bfloat16)
-    boundaries = torch.tensor([0, *torch.tensor(ROWS).cumsum(0).tolist()], dtype=torch.int32)
+    hidden = torch.randn(1, length, 64, dtype=torch.bfloat16).to(device)
+    q_resid = torch.randn(1, length, 32, dtype=torch.bfloat16).to(device)
+    boundaries = torch.tensor([0, *torch.tensor(ROWS).cumsum(0).tolist()], dtype=torch.int32, device=device)
 
-    trainer = cp._select_sparse_indices(
-        indexer,
-        hidden,
-        q_resid,
-        torch.ones(1, length, dtype=torch.bool),
-        boundaries,
-        cp_group=None,
-        cp_rank=0,
-    )[0]
+    # Unpadded packed rows take the fused scorer on CUDA and the general path on CPU.
+    with patch.object(cp, "_unpadded_segment_indices", wraps=cp._unpadded_segment_indices) as fused:
+        trainer = cp._select_sparse_indices(
+            indexer,
+            hidden,
+            q_resid,
+            torch.ones(1, length, dtype=torch.bool, device=device),
+            boundaries,
+            cp_group=None,
+            cp_rank=0,
+        )[0]
+    assert fused.call_count == (len(ROWS) if device == "cuda" else 0)
 
     expected = []
     for start, end in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
@@ -122,5 +131,7 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
 
     # The data separates the two numerics: the unquantized bf16 scoring of the HF indexer picks other tokens.
     row = slice(0, ROWS[0])
-    unquantized = indexer(hidden[:, row], q_resid[:, row], torch.ones(1, ROWS[0], dtype=torch.bool), None)[0]
+    unquantized = indexer(
+        hidden[:, row], q_resid[:, row], torch.ones(1, ROWS[0], dtype=torch.bool, device=device), None
+    )[0]
     assert _token_sets(unquantized) != expected[row]
