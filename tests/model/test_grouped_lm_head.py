@@ -285,3 +285,22 @@ def test_moe_output_cast_preserves_group_log_probs():
     )
     assert output["group_log_probs"].dtype == torch.float32
     assert output["group_log_probs"].is_contiguous()
+
+
+@pytest.mark.parametrize("kind,chunks", [("moe", (2, None)), ("dense", (2, 5000))])
+@pytest.mark.parametrize("width", [0, 4])
+def test_near_certain_bucket_keeps_its_log_probability(kind, chunks, width):
+    """Near-certain candidate and tail buckets retain their tiny negative log-probabilities."""
+    weight = torch.zeros(VOCAB, 2)
+    weight[8192, 0] = 30.0
+    weight[VOCAB - 1, 1] = 20.0
+    hidden = torch.eye(2)[None]
+    labels = torch.tensor([[8192, VOCAB - 1]])
+    token_ids = torch.tensor([[[8192, 5, 8192, -1], [5, 6, 7, 8]]], dtype=torch.int32)[..., :width]
+
+    output = _head(kind, hidden, weight, labels, token_ids, chunks)
+    groups = output["group_log_probs"] if kind == "moe" else output[1]
+
+    expected = _dense_groups((hidden @ weight.T).double(), token_ids)
+    # Float64's own relative error is 2.2e-16 * exp(margin), with margins up to 20.3 nats.
+    torch_assert_close(groups.double(), expected, rtol=1e-5, atol=0)
