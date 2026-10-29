@@ -78,6 +78,17 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
+def _remix(post: Tensor, comb: Tensor, output: Tensor, residual: Tensor) -> Tensor:
+    """``post * output + comb^T @ residual`` in fp32, rounded once, as vLLM's ``mhc_post`` kernel computes it.
+
+    Elementwise over the hc streams so a TF32 matmul precision never rounds ``comb``.
+    """
+    mixed = post.unsqueeze(-1) * output.unsqueeze(-2)
+    for weights, stream in zip(comb.unbind(-2), residual.unbind(-2)):
+        mixed = mixed + weights.unsqueeze(-1) * stream.unsqueeze(-2)
+    return mixed.to(residual.dtype)
+
+
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
     def forward(
         self,
@@ -91,8 +102,6 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
         routed_experts: Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        dtype = hidden_states.dtype
-
         residual = hidden_states
         post, comb, hidden_states = self.attn_hc(hidden_states)
         # Self attn
@@ -116,9 +125,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
                 prev_topk_indices=prev_topk_indices,
                 **kwargs,
             )
-        hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        hidden_states = _remix(post, comb, hidden_states, residual)
 
         residual = hidden_states
         post, comb, hidden_states = self.ffn_hc(hidden_states)
@@ -129,9 +136,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
             hidden_states = self.mlp(hidden_states, routed_experts=routes)
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        hidden_states = _remix(post, comb, hidden_states, residual)
 
         return hidden_states, topk_indices
 
@@ -159,6 +164,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
                     route_norm=text_config.norm_topk_prob,
                     route_scale=text_config.routed_scaling_factor,
                     score_before_experts=False,
+                    fp32_router_logits=True,
                     top_k=text_config.num_experts_per_tok,
                     load_balance_coeff=getattr(
                         text_config,
