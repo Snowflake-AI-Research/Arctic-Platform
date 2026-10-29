@@ -731,7 +731,7 @@ def _linear_attention_forward(
     key = self.k_proj(hidden_states).view(shape)
     value = self.v_proj(hidden_states).view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = torch.sigmoid(self.b_proj(hidden_states).float())
     exchanged = _pack_and_exchange_head_tensors(
         {
             "query": query,
@@ -874,7 +874,7 @@ def _local_linear_attention_forward(
     key = key.view(shape)
     value = value.view(shape)
     decay = self.forget_gate(hidden_states)
-    beta = torch.sigmoid(self.b_proj(hidden_states))
+    beta = torch.sigmoid(self.b_proj(hidden_states).float())
 
     from fla.ops.kda import chunk_kda
 
