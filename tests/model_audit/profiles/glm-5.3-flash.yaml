@@ -1,0 +1,97 @@
+# GLM-5.3-Flash RL. Launch target: bf16 full fine-tune at 262144 tokens, EP8 x SP8 trainer, TP8 sampler.
+name: glm-5.3-flash
+checkpoint: zai-org/GLM-5.3-Flash-BF16
+
+launch:
+  dtype: bfloat16
+  max_seq_len: 262144
+  trainer:
+    loader: glm5_next
+    attn_implementation: sparse_mla
+    parallelism: {expert_parallel: 8, sequence_parallel: 8}
+    loader_options:
+      seq_len: 262144
+      ep_comm_backend: deepep
+      fused_cross_entropy: false
+      fused_lm_head_token_chunk_size: 4096
+      reduce_dtype: float32
+  # TrainingEngineSpec fields (arctic_platform.common.deepspeed_engine).
+  engine: {gradient_clipping: 0.0, fp32_masters: false}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 262144
+    enable_prefix_caching: true
+  optimizer: {lr: 1.0e-6, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+
+probe:
+  # The prime MoE head takes next-token labels and returns per-token logprobs.
+  pass_labels: true
+  # DSS ships GLM-5.3 as "vllm" names over NCCL direct copy. The probe's file transport goes through vLLM's HF
+  # loader and its strict name check, so neither format exercises the production sync here.
+  sync_formats: []
+
+tiny:
+  # Attention, indexer and KDA head dims stay real: the sparse-MLA, DeepGEMM and FLA kernels constrain them. The KDA
+  # head count stays real too: its state size sets the hybrid KV block alignment the sampler's indexer pages assume.
+  experts: 16
+  text_overrides:
+    hidden_size: 1024
+    intermediate_size: 1024
+    moe_intermediate_size: 256
+    q_lora_rank: 256
+    num_nextn_predict_layers: 0
+  config_overrides:
+    vision_config: {hidden_size: 256, intermediate_size: 512, num_heads: 8, out_hidden_size: 1024}
+  max_row_len: 4224
+  thresholds:
+    - {name: sparse_indexer_topk, position: 2048, reason: "queries past index_topk keys attend to a selected subset of key pools"}
+  trainer:
+    # The baseline layout. flash_moe loaders only build at EP > 1, so EP2 is the smallest real one.
+    parallelism: {expert_parallel: 2, sequence_parallel: 1}
+    loader_options: {seq_len: 8192}
+  # Smaller instances of the launch layout's kinds; world_size defaults to max(EP, SP).
+  parallel:
+    - {expert_parallel: 2, sequence_parallel: 2, world_size: 4}
+    - {expert_parallel: 4, sequence_parallel: 1}
+    - {expert_parallel: 2, sequence_parallel: 1, world_size: 4}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 8192
+    gpu_memory_utilization: 0.5
+
+expect:
+  loader: glm5_next
+  # Parameters that legitimately receive no gradient in training.
+  no_grad_params:
+    - {pattern: "visual\\.", reason: "text-only RL does not run the vision tower"}
+    - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
+
+known_issues:
+  trainer.head_gradient_matches_unfused:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/367
+    summary: >-
+      fp32_lm_head=False chunked heads accumulate the hidden and weight gradients in bf16 across chunks; the final
+      norm weight gradient is 23% off
+  trainer.short_rows_supported:
+    issue: pending
+    summary: >-
+      a packed sample of 2-3 tokens (under one index_kpool) asks FlashInfer top-k for k=0 and crashes the fused
+      indexer (fix: branch abkulkarni/glm53-topk-zero-k)
+  trainer.deterministic:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
+    summary: "MoE dispatch/combine is nondeterministic on identical inputs; routing amplifies it to ~0.2 log-prob"
+  optimizer.update_lands_at_launch_lr:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
+  sampler.tensor_parallel_matches_reference[tp1]:
+    issue: pending
+    summary: >-
+      vLLM 0.32: at TP1 with PIECEWISE CUDA graphs a single short request scores 0.5-0.8 mean log-prob off
+      the reference (eager, FULL and TP2+ are exact; reproduces without the Arctic plugin)
+  sampler.repeatable:
+    issue: pending
+    summary: >-
+      once a row's index pools exceed index_topk / index_kpool the indexer's selection varies between
+      identical runs (first differing position is exactly that point; ~0.01 log-prob)
+
+not_applicable: {}

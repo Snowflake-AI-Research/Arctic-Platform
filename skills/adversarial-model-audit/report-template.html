@@ -1,0 +1,124 @@
+<!doctype html>
+<!--
+  Model audit report. Copy per audit; edit only the AUDIT object below and rewrite the file after every experiment.
+  Self-contained: no network, opens from disk.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Model audit</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; color: #1d2330; background: #f6f7f9; }
+  header { background: #1d2330; color: #fff; padding: 16px 24px; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header .meta { opacity: .8; font-size: 12px; }
+  nav { display: flex; gap: 4px; padding: 0 24px; background: #262d3d; }
+  nav button { background: none; border: 0; color: #cfd6e4; padding: 10px 14px; cursor: pointer; font: inherit; }
+  nav button.active { color: #fff; border-bottom: 3px solid #5aa9ff; }
+  main { padding: 20px 24px; }
+  section { display: none; } section.active { display: block; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border-bottom: 1px solid #e3e6ec; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eef1f6; position: sticky; top: 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .critical, .failed, .error { background: #fde2e1; color: #a1150f; }
+  .high, .xfail { background: #fff0d6; color: #8a5300; }
+  .medium, .running, .xpass { background: #fff8c5; color: #6b5800; }
+  .low, .skipped, .todo { background: #eceff3; color: #4a5468; }
+  .passed, .done, .ruled-out { background: #dff5e3; color: #1b6b2c; }
+  .cards { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .card { background: #fff; border-radius: 6px; padding: 12px 16px; min-width: 120px; box-shadow: 0 1px 2px #0001; }
+  .card b { display: block; font-size: 22px; }
+  details pre { white-space: pre-wrap; font-size: 12px; background: #f1f3f7; padding: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="meta" id="meta"></div>
+</header>
+<nav id="tabs"></nav>
+<main>
+  <section id="plan"></section>
+  <section id="findings"></section>
+  <section id="suite"></section>
+  <section id="log"></section>
+</main>
+<script>
+const AUDIT = {
+  model: "<model>",
+  claim: "RL training for <model> works correctly everywhere, every layer, every attention, in trainer AND sampler, optimizer, every stage of the pipeline",
+  launch: "<dtype>, <context>, trainer <parallelism>, sampler <engine args>",
+  code: {main: "<sha>", release: "<release name> / <sha>"},
+  updated: "<timestamp>",
+  // status: todo | running | done | ruled-out ; priority: lower runs first
+  plan: [
+    {priority: 1, hypothesis: "Regression suite at tiny scale", experiment: "pytest tests/model_audit --audit-model <model>", cost: "minutes", status: "todo", evidence: ""},
+  ],
+  // severity: critical | high | medium | low
+  findings: [
+    // {id: "F1", title: "", severity: "critical", stage: "", configs: "", sha: "", issue: "https://github.com/Snowflake-AI-Research/DSS-Issue-Tracker/blob/main/issues/<folder>/ISSUE.md", diagram: "", repro: "", pr: "", codex: "", check: "", status: "filed"},
+  ],
+  // rows of $AP_MODEL_AUDIT_DIR/results/<session>.jsonl
+  suite: [],
+  log: [
+    // {time: "", entry: "", job: ""},
+  ],
+};
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const link = (url, text) => url ? `<a href="${esc(url)}">${esc(text || "link")}</a>` : "";
+const pill = s => `<span class="pill ${esc(s)}">${esc(s)}</span>`;
+const table = (cols, rows) => `<table><tr>${cols.map(c => `<th>${c[0]}</th>`).join("")}</tr>${
+  rows.map(r => `<tr>${cols.map(c => `<td>${c[1](r)}</td>`).join("")}</tr>`).join("")}</table>`;
+const count = (rows, key, value) => rows.filter(r => r[key] === value).length;
+
+document.getElementById("title").textContent = `Model audit: ${AUDIT.model}`;
+document.getElementById("meta").innerHTML =
+  `Claim under attack: ${esc(AUDIT.claim)}<br>Launch: ${esc(AUDIT.launch)} &middot; main ${esc(AUDIT.code.main)} &middot; ` +
+  `release ${esc(AUDIT.code.release)} &middot; updated ${esc(AUDIT.updated)}`;
+
+document.getElementById("plan").innerHTML = table([
+  ["#", r => r.priority], ["Hypothesis", r => esc(r.hypothesis)], ["Smallest experiment", r => esc(r.experiment)],
+  ["Cost", r => esc(r.cost)], ["Status", r => pill(r.status)], ["Evidence", r => esc(r.evidence)],
+], [...AUDIT.plan].sort((a, b) => a.priority - b.priority));
+
+const sev = ["critical", "high", "medium", "low"];
+document.getElementById("findings").innerHTML =
+  `<div class="cards">${sev.map(s => `<div class="card"><b>${count(AUDIT.findings, "severity", s)}</b>${s}</div>`).join("")}</div>` +
+  table([
+    ["ID", r => esc(r.id)], ["Finding", r => esc(r.title)], ["Severity", r => pill(r.severity)], ["Stage", r => esc(r.stage)],
+    ["Configs", r => esc(r.configs)], ["SHA", r => esc(r.sha)], ["ISSUE.md", r => link(r.issue, "ISSUE.md")],
+    ["Diagram", r => link(r.diagram, "svg")], ["Repro", r => link(r.repro, "repro")], ["Fix PR", r => link(r.pr, "PR")],
+    ["Codex", r => esc(r.codex)], ["Check", r => `<code>${esc(r.check)}</code>`], ["Status", r => pill(r.status)],
+  ], [...AUDIT.findings].sort((a, b) => sev.indexOf(a.severity) - sev.indexOf(b.severity)));
+
+const outcomes = ["passed", "failed", "error", "xfail", "xpass", "skipped"];
+document.getElementById("suite").innerHTML =
+  `<div class="cards">${outcomes.map(o => `<div class="card"><b>${count(AUDIT.suite, "outcome", o)}</b>${o}</div>`).join("")}</div>` +
+  table([
+    ["Model", r => esc(r.model)], ["Check", r => `<code>${esc(r.check)}</code>`], ["Claim", r => esc(r.claim)],
+    ["Outcome", r => pill(r.outcome)], ["Issue", r => link(r.issue, "issue")], ["Seconds", r => esc(r.seconds)],
+    ["Evidence", r => (r.details || r.message) ? `<details><summary>show</summary><pre>${esc(
+      JSON.stringify(r.details, null, 1) + "\n" + (r.message || ""))}</pre></details>` : ""],
+  ], AUDIT.suite);
+
+document.getElementById("log").innerHTML = table([
+  ["Time", r => esc(r.time)], ["Entry", r => esc(r.entry)], ["Job", r => esc(r.job)],
+], [...AUDIT.log].reverse());
+
+const tabs = [["plan", "Plan"], ["findings", "Findings"], ["suite", "Suite"], ["log", "Log"]];
+const nav = document.getElementById("tabs");
+const show = id => {
+  tabs.forEach(([t]) => document.getElementById(t).classList.toggle("active", t === id));
+  [...nav.children].forEach(b => b.classList.toggle("active", b.dataset.tab === id));
+  history.replaceState(null, "", "#" + id);
+};
+tabs.forEach(([id, label]) => {
+  const b = document.createElement("button");
+  b.textContent = label; b.dataset.tab = id; b.onclick = () => show(id); nav.appendChild(b);
+});
+show((location.hash || "#plan").slice(1));
+</script>
+</body>
+</html>
