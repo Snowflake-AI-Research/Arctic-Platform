@@ -36,6 +36,8 @@ from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 
+from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
+
 _BACKEND = "qsa_flex"
 _QSA_SCORE_BUDGET_BYTES = 256 * 1024 * 1024
 _QSA_ATTENTION_CHUNK_ROWS = 128
@@ -369,6 +371,7 @@ def _sparse_gqa_from_selected(
     selected_value: torch.Tensor,
     valid: torch.Tensor,
     softmax_scale: float,
+    fp32_parity: bool,
 ) -> torch.Tensor:
     batch_size, query_length, num_query_heads, head_dim = query.shape
     num_kv_heads = selected_key.shape[3]
@@ -377,24 +380,37 @@ def _sparse_gqa_from_selected(
 
     groups = num_query_heads // num_kv_heads
     grouped_query = query.view(batch_size, query_length, num_kv_heads, groups, head_dim)
-    scores = torch.einsum(
-        "bqhgd,bqrhd->bqhgr",
-        grouped_query.float(),
-        selected_key.float(),
-    )
+    # Explicit float() operands alone do not keep einsum in fp32 under DeepSpeed autocast.
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        scores = torch.einsum(
+            "bqhgd,bqrhd->bqhgr",
+            grouped_query.float(),
+            selected_key.float(),
+        )
     scores.mul_(softmax_scale)
     scores.masked_fill_(~valid[:, :, None, None], -torch.inf)
     empty = ~valid.any(dim=-1)
     scores.masked_fill_(empty[:, :, None, None, None], 0)
-    probabilities = torch.softmax(scores, dim=-1).to(selected_value.dtype)
-    probabilities.masked_fill_(~valid[:, :, None, None], 0)
-    output = torch.einsum(
-        "bqhgr,bqrhd->bqhgd",
-        probabilities,
-        selected_value,
-    ).reshape(batch_size, query_length, num_query_heads, head_dim)
+    if not fp32_parity:
+        probabilities = torch.softmax(scores, dim=-1).to(selected_value.dtype)
+        probabilities.masked_fill_(~valid[:, :, None, None], 0)
+        output = torch.einsum(
+            "bqhgr,bqrhd->bqhgd",
+            probabilities,
+            selected_value,
+        ).reshape(batch_size, query_length, num_query_heads, head_dim)
+        output.masked_fill_(empty[:, :, None, None], 0)
+        return output
+    # fp32 probabilities and PV, one rounding; vLLM's split-K kernel never rounds the normalized probabilities.
+    probabilities = torch.softmax(scores, dim=-1).masked_fill(~valid[:, :, None, None], 0)
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        output = torch.einsum(
+            "bqhgr,bqrhd->bqhgd",
+            probabilities,
+            selected_value.float(),
+        ).reshape(batch_size, query_length, num_query_heads, head_dim)
     output.masked_fill_(empty[:, :, None, None], 0)
-    return output
+    return output.to(selected_value.dtype)
 
 
 def _sparse_gqa_chunk(
@@ -403,6 +419,7 @@ def _sparse_gqa_chunk(
     value: torch.Tensor,
     selected_token_ids: torch.Tensor,
     softmax_scale: float,
+    fp32_parity: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     valid = (selected_token_ids >= 0) & (selected_token_ids < key.shape[1])
     safe_ids = selected_token_ids.long().clamp(min=0, max=key.shape[1] - 1)
@@ -415,15 +432,17 @@ def _sparse_gqa_chunk(
         selected_value,
         valid,
         softmax_scale,
+        fp32_parity,
     )
     return output, safe_ids, selected_key, selected_value
 
 
 class _SparseGQAAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, selected_token_ids, softmax_scale, chunk_rows):
+    def forward(ctx, query, key, value, selected_token_ids, softmax_scale, chunk_rows, fp32_parity):
         ctx.softmax_scale = float(softmax_scale)
         ctx.chunk_rows = int(chunk_rows)
+        ctx.fp32_parity = bool(fp32_parity)
         ctx.save_for_backward(query, key, value, selected_token_ids)
         outputs = []
         for start in range(0, query.shape[1], ctx.chunk_rows):
@@ -434,6 +453,7 @@ class _SparseGQAAttention(torch.autograd.Function):
                 value,
                 selected_token_ids[:, start:stop],
                 ctx.softmax_scale,
+                ctx.fp32_parity,
             )
             outputs.append(output)
         return torch.cat(outputs, dim=1)
@@ -468,6 +488,7 @@ class _SparseGQAAttention(torch.autograd.Function):
                     selected_value,
                     valid,
                     ctx.softmax_scale,
+                    ctx.fp32_parity,
                 )
                 local_grad_query, local_grad_key, local_grad_value = torch.autograd.grad(
                     output,
@@ -489,7 +510,7 @@ class _SparseGQAAttention(torch.autograd.Function):
                 local_grad_value.to(accumulate_dtype).mul_(valid_values).reshape(safe_ids.shape[0], -1, kv_width),
             )
 
-        return grad_query, grad_key.to(key.dtype), grad_value.to(value.dtype), None, None, None
+        return grad_query, grad_key.to(key.dtype), grad_value.to(value.dtype), None, None, None, None
 
 
 def flex_sparse_gqa_attention(
@@ -499,6 +520,7 @@ def flex_sparse_gqa_attention(
     selected_token_ids: torch.Tensor,
     *,
     softmax_scale: float,
+    fp32_parity: bool = True,
 ) -> torch.Tensor:
     if not query.is_cuda or any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise RuntimeError("Qwen3.8 QSA FlexAttention requires CUDA BF16 Q/K/V tensors")
@@ -509,6 +531,7 @@ def flex_sparse_gqa_attention(
         selected_token_ids,
         softmax_scale,
         _QSA_ATTENTION_CHUNK_ROWS,
+        fp32_parity,
     )
 
 
@@ -523,7 +546,6 @@ def _qsa_attention_forward(
 ):
     if self.training and self.attention_dropout:
         raise ValueError("Qwen3.8 QSA FlexAttention does not support attention dropout")
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
     # Packed-row boundaries from the caller's varlen metadata, when given, outrank boundaries inferred from positions.
     selected_token_ids = self.indexer(
@@ -546,11 +568,14 @@ def _qsa_attention_forward(
     query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-    query_states, key_states = apply_rotary_pos_emb(
-        query_states,
-        key_states,
-        *position_embeddings,
-    )
+    if self._qsa_fp32_parity:
+        # vLLM rotates in fp32 and rounds once; the transformers expression rounds each product and the sum to bf16.
+        query_states = rope_rotary_slice_fp32(query_states, *position_embeddings)
+        key_states = rope_rotary_slice_fp32(key_states, *position_embeddings)
+    else:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *position_embeddings)
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
     cp_group, _, _ = _cp_info(self)
@@ -562,13 +587,18 @@ def _qsa_attention_forward(
         value_states,
         selected_token_ids,
         softmax_scale=self.scaling,
+        fp32_parity=self._qsa_fp32_parity,
     )
     attention_output = attention_output.reshape(*input_shape, -1).contiguous()
-    attention_output = attention_output * torch.sigmoid(gate)
+    if self._qsa_fp32_parity:
+        attention_output = (attention_output.float() * torch.sigmoid(gate.float())).to(gate.dtype)
+    else:
+        attention_output = attention_output * torch.sigmoid(gate)
     return self.o_proj(attention_output), None
 
 
-def apply_qsa_flex(model: nn.Module) -> None:
+def apply_qsa_flex(model: nn.Module, *, fp32_parity: bool = True) -> None:
+    """Route every QSA layer through FlexAttention; ``fp32_parity`` rounds rotary, P·V and the gate as vLLM does."""
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextAttention
 
     from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -597,6 +627,7 @@ def apply_qsa_flex(model: nn.Module) -> None:
         module.indexer.requires_grad_(False)
         module.indexer.forward = types.MethodType(_qsa_indexer_forward, module.indexer)
         module.forward = types.MethodType(_qsa_attention_forward, module)
+        module._qsa_fp32_parity = fp32_parity
         patched += 1
     if not patched:
         raise TypeError("Qwen3.8 model exposes no QSA attention layers")

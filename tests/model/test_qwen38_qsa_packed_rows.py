@@ -58,7 +58,9 @@ def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
     monkeypatch.setattr(
         qsa,
         "flex_sparse_gqa_attention",
-        lambda q, k, v, ids, softmax_scale: qsa._SparseGQAAttention.apply(q, k, v, ids, softmax_scale, 128),
+        lambda q, k, v, ids, softmax_scale, fp32_parity: qsa._SparseGQAAttention.apply(
+            q, k, v, ids, softmax_scale, 128, fp32_parity
+        ),
     )
 
     for lengths in ((2, 4), (3, 5), (1, 3)):
@@ -178,7 +180,7 @@ def test_qsa_backward_sums_key_and_value_gradients_exactly():
     value = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)[None, :, None, None].repeat(1, 1, 1, 2).requires_grad_()
     routes = torch.tensor([0, 1], dtype=torch.int32).expand(1, queries, 2).contiguous()
 
-    output = qsa._SparseGQAAttention.apply(query, key, value, routes, 1.0, 128)
+    output = qsa._SparseGQAAttention.apply(query, key, value, routes, 1.0, 128, True)
     output.backward(torch.ones_like(output))
 
     assert key.grad.dtype == value.grad.dtype == torch.bfloat16
