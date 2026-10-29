@@ -450,7 +450,8 @@ class RouterReplayGroup:
             tensors_by_op.append((op, t.contiguous().view(torch.uint8)))
         self.nccl.group_start()
         for op, t in tensors_by_op:
-            if t.numel() > 0:  # an empty slice moves nothing; its receiver skips it too
+            # Only negotiated slices may skip NCCL; older peers enqueue empty whole captures.
+            if op.token_range is None or t.numel() > 0:
                 self.nccl.send(t, dst=op.recv_rank)
         self.nccl.group_end()
         if self.device.type == "cuda":
@@ -475,7 +476,7 @@ class RouterReplayGroup:
             dests.append((op, dest))
         self.nccl.group_start()
         for op, dest in dests:
-            if dest.numel() > 0:
+            if op.token_range is None or dest.numel() > 0:
                 self.nccl.recv(dest.view(torch.uint8), src=op.sender_rank)
         self.nccl.group_end()
         # Sync so subsequent cache.put copies observe fully-landed data.
