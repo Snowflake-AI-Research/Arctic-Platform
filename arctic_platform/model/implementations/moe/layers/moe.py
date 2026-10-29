@@ -557,7 +557,12 @@ class TokenChoiceTopKRouter(nn.Module):
         assert (
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
-        scores = F.linear(x.float(), self.gate.weight.float()) if self.fp32_logits else self.gate(x)
+        if self.fp32_logits:
+            # Autocast would run the GEMM in bf16 despite the fp32 operands.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                scores = F.linear(x.float(), self.gate.weight.float())
+        else:
+            scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":

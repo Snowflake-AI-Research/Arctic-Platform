@@ -82,17 +82,24 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
-def _remix(fused: bool, post, comb, sublayer_out, streams) -> torch.Tensor:
-    """``post * sublayer_out + comb^T @ streams`` as fp32 FMAs over the hc streams, rounded once, as vLLM's ``mhc_post``.
+def _remix(fused: bool, fp32: bool, post, comb, sublayer_out, streams) -> torch.Tensor:
+    """``post * sublayer_out + comb^T @ streams``: the residual streams after a hyper-connection site.
 
-    Elementwise rather than a matmul so a TF32 matmul precision never rounds ``comb``.
+    With ``fp32``, computed in fp32 and rounded once, as vLLM's ``mhc_post``: the fused kernel on CUDA (it has
+    ``post`` and ``comb`` gradients), else elementwise FMAs so a TF32 matmul precision never rounds ``comb``.
     """
-    if fused:
+    if fused or (fp32 and streams.is_cuda and streams.shape[-2] == 4):
         return mix_streams(post, comb, sublayer_out, streams)
-    mixed = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
-    for weights, stream in zip(comb.unbind(-2), streams.unbind(-2)):
-        mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
-    return mixed.to(streams.dtype)
+    if fp32:
+        # Under autocast ``post`` can arrive in bf16; the buffer must still accumulate in fp32.
+        mixed = post.float().unsqueeze(-1) * sublayer_out.unsqueeze(-2)
+        for weights, stream in zip(comb.float().unbind(-2), streams.unbind(-2)):
+            mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
+        return mixed.to(streams.dtype)
+    dtype = streams.dtype
+    return post.to(dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2) + torch.matmul(
+        comb.to(dtype).transpose(-1, -2), streams
+    )
 
 
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
@@ -133,7 +140,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
                 prev_topk_indices=prev_topk_indices,
                 **kwargs,
             )
-        hidden_states = _remix(fused_hc, post, comb, hidden_states, residual)
+        hidden_states = _remix(fused_hc, self._fp32_parity, post, comb, hidden_states, residual)
 
         residual = hidden_states
         post, comb, hidden_states = hyper_connection(self.ffn_hc, residual) if fused_hc else self.ffn_hc(residual)
@@ -144,7 +151,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
             hidden_states = self.mlp(hidden_states, routed_experts=routes)
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states = _remix(fused_hc, post, comb, hidden_states, residual)
+        hidden_states = _remix(fused_hc, self._fp32_parity, post, comb, hidden_states, residual)
 
         return hidden_states, topk_indices
 
@@ -159,9 +166,11 @@ class Glm5NextForConditionalGenerationPrimeRL(
             raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
         text_config = config.text_config
+        fp32_parity = getattr(config, "fp32_parity", True)
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
+            layer._fp32_parity = fp32_parity
             if not isinstance(layer.mlp, Glm5NextTextMoE):
                 continue
             layer.mlp = MoE(
@@ -172,7 +181,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
                     route_norm=text_config.norm_topk_prob,
                     route_scale=text_config.routed_scaling_factor,
                     score_before_experts=False,
-                    fp32_router_logits=True,
+                    fp32_router_logits=fp32_parity,
                     top_k=text_config.num_experts_per_tok,
                     load_balance_coeff=getattr(
                         text_config,
