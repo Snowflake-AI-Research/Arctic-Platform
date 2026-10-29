@@ -616,3 +616,64 @@ def test_the_default_backend_is_a_sandbox_and_host_is_an_explicit_alias():
     assert resolve_env("host") == HOST_HARBOR_ENV
     assert resolve_env("snowflake") == SNOWFLAKE_HARBOR_ENV
     assert resolve_env("docker") == "docker"
+
+
+def test_env_kwargs_are_passed_to_the_selected_environment(tmp_path):
+    from arctic_platform.integrations.harbor.adapter import SNOWFLAKE_HARBOR_ENV
+    from arctic_platform.integrations.harbor.adapter import _build_trial_config
+
+    kwargs = dict(image_repo="DB.SCHEMA.REPO", connection="CONN", role="ROLE", image_platform="linux/arm64")
+    config = _build_trial_config(
+        _task(tmp_path),
+        tmp_path / "trials",
+        "trial",
+        agent="harbor_rl.agent:OpenHandsHarborAgent",
+        env="snowflake",
+        model_name="m",
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        env_kwargs=kwargs,
+    )
+    assert config.environment.import_path == SNOWFLAKE_HARBOR_ENV
+    assert config.environment.kwargs == kwargs
+
+
+def test_image_platform_reaches_every_crane_call(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    calls: list[list[str]] = []
+
+    async def fake_run(*argv, env=None, **kwargs):
+        calls.append(list(argv))
+        return "sha256:abc"
+
+    async def fake_login() -> None:
+        return None
+
+    async def fake_host() -> str:
+        return "org-acct.registry.snowflakecomputing.com"
+
+    monkeypatch.setattr(images, "_run", fake_run)
+    registry = images.ImageRegistry("DB.SCHEMA.REPO", connection=None, role=None, platform="linux/arm64")
+    monkeypatch.setattr(registry, "_login", fake_login)
+    monkeypatch.setattr(registry, "_registry_host", fake_host)
+    monkeypatch.setattr(registry, "_ca_layer", lambda: Path("/dev/null"))
+    asyncio.run(registry.ensure_image("python:3.12-slim", force_build=True))
+
+    platform_calls = [c for c in calls if c[1] in ("digest", "append") and "--platform" in c]
+    assert platform_calls and all(c[c.index("--platform") + 1] == "linux/arm64" for c in platform_calls)
+    registry.close()
+
+
+def test_the_harbor_extra_is_pinned_and_installed_by_the_launcher():
+    import tomllib
+
+    root = Path(__file__).resolve().parents[3]
+    extras = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["optional-dependencies"]
+    assert "harbor==0.25.0" in extras["harbor"]
+    assert any(dep.startswith("snowflake-sandbox-python==") for dep in extras["harbor"])
+
+    launcher = (root / "recipes" / "rl" / "harbor" / "run_qwen35_4b.sh").read_text(encoding="utf-8")
+    assert "[sft,cortex,harbor]" in launcher
+    assert "--with harbor " not in launcher
