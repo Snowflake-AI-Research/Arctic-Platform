@@ -66,6 +66,7 @@ from .groups import token_budget_groups
 from .groups import token_budget_microbatch_groups
 from .groups import token_validity_mask
 from .pack import IGNORE_INDEX
+from .pack import ROW_BROADCAST_KEYS
 from .pack import PackMetadata
 from .pack import pack_microbatch
 from .pack import packed_token_index
@@ -86,6 +87,7 @@ __all__ = [
     "IGNORE_INDEX",
     "MicrobatchSplit",
     "PackMetadata",
+    "ROW_BROADCAST_KEYS",
     "batch_input_ids",
     "batch_num_rows",
     "batch_position_ids",
