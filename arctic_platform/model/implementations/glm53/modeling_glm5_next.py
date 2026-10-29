@@ -197,7 +197,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
-        fuse_glm5_next_norms(self)
+        fuse_glm5_next_norms(self, fp32_parity=getattr(config, "fp32_parity", True))
         self._is_vlm = True
 
     @classmethod
