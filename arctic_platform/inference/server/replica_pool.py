@@ -1594,7 +1594,6 @@ class ReplicaPool:
                         f"{_worker_error_messages(results, failed_workers)}"
                     )
                 if not engine_only:
-                    # Only keep-mode pause and hotswap can leave requests running; any other sync must reset.
                     prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
                         require_success=effective_strategy != "hotswap"
                         and (effective_strategy != "pause" or pause_mode == "abort"),
@@ -1719,7 +1718,6 @@ class ReplicaPool:
                         f"{_worker_error_messages(results, failed_workers)}"
                     )
                 if not engine_only:
-                    # Only keep-mode pause and hotswap can leave requests running; any other sync must reset.
                     prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
                         require_success=effective_strategy != "hotswap"
                         and (effective_strategy != "pause" or pause_mode == "abort"),

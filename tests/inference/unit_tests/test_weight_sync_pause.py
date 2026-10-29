@@ -413,12 +413,13 @@ def test_non_pause_syncs_issue_no_pause_and_report_no_clear(path, kwargs):
 def test_every_weight_load_resets_the_prefix_cache(path, kwargs, reset):
     async def run():
         events: list[str] = []
-        out = await _run_sync(_pool(events), path, **kwargs)
+        reset_ok = kwargs["strategy"] != "hotswap"
+        out = await _run_sync(_pool(events, reset_ok=reset_ok), path, **kwargs)
         assert [e for e in events if e.startswith("reset_prefix_cache")] == ([reset] if reset else [])
         if reset:
             loaded = max(i for i, e in enumerate(events) if e.startswith("sync_"))
             assert events.index(reset) > loaded
-            assert out["prefix_cache_reset"]["reset_ok"] is True
+            assert out["prefix_cache_reset"]["reset_ok"] is reset_ok
 
     asyncio.run(run())
 
@@ -426,8 +427,14 @@ def test_every_weight_load_resets_the_prefix_cache(path, kwargs, reset):
 @pytest.mark.parametrize("path", SYNC_PATHS)
 @pytest.mark.parametrize("strategy", ["drain", "skip"])
 def test_drain_and_skip_refuse_to_resume_with_stale_prefix_blocks(path, strategy):
+    events: list[str] = []
+    pool = _pool(events, reset_ok=False)
     with pytest.raises(RuntimeError, match="refusing to resume generation with stale prefix blocks"):
-        asyncio.run(_run_sync(_pool([], reset_ok=False), path, strategy=strategy))
+        asyncio.run(_run_sync(pool, path, strategy=strategy))
+    assert pool._scheduler.paused is (strategy == "drain")
+    assert "scheduler.resume" not in events
+    assert "scheduler.mark_available:0" not in events
+    assert not pool._updating_workers
 
 
 @pytest.mark.parametrize("value", [True, False])
