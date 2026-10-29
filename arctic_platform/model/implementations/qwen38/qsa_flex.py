@@ -442,8 +442,10 @@ class _SparseGQAAttention(torch.autograd.Function):
     def backward(ctx, grad_output):
         query, key, value, selected_token_ids = ctx.saved_tensors
         grad_query = torch.empty_like(query)
-        grad_key = torch.zeros_like(key)
-        grad_value = torch.zeros_like(value)
+        # Sum in at least fp32: a key selected by N queries gets N scatter-adds, and bf16 atomics round after each.
+        accumulate_dtype = torch.promote_types(key.dtype, torch.float32)
+        grad_key = torch.zeros_like(key, dtype=accumulate_dtype)
+        grad_value = torch.zeros_like(value, dtype=accumulate_dtype)
         flattened_grad_key = grad_key.flatten(2)
         flattened_grad_value = grad_value.flatten(2)
         kv_width = flattened_grad_key.shape[-1]
@@ -479,15 +481,15 @@ class _SparseGQAAttention(torch.autograd.Function):
             flattened_grad_key.scatter_add_(
                 1,
                 scatter_indices,
-                (local_grad_key * valid_values).reshape(safe_ids.shape[0], -1, kv_width),
+                local_grad_key.to(accumulate_dtype).mul_(valid_values).reshape(safe_ids.shape[0], -1, kv_width),
             )
             flattened_grad_value.scatter_add_(
                 1,
                 scatter_indices,
-                (local_grad_value * valid_values).reshape(safe_ids.shape[0], -1, kv_width),
+                local_grad_value.to(accumulate_dtype).mul_(valid_values).reshape(safe_ids.shape[0], -1, kv_width),
             )
 
-        return grad_query, grad_key, grad_value, None, None, None
+        return grad_query, grad_key.to(key.dtype), grad_value.to(value.dtype), None, None, None
 
 
 def flex_sparse_gqa_attention(
