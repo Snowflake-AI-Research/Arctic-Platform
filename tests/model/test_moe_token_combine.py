@@ -159,6 +159,9 @@ def test_gather_token_rows_gradient_sums_each_tokens_rows_deterministically():
     expected.index_add_(0, token_indices, grad.double())
     assert torch.equal(rows, hidden_states.detach().index_select(0, token_indices))
     assert type(rows.grad_fn).__name__ == "_GatherTokenRowsBackward"
-    torch.testing.assert_close(first.double(), expected, rtol=1e-2, atol=1e-2)
+    # The CUDA fold sums each token's rows in fp32 and stores bf16. The reference sums the same bf16
+    # addends in fp64, so the gap is one bf16 ulp of the largest sum.
+    span = expected.abs().max().item()
+    torch.testing.assert_close(first.double(), expected, rtol=0, atol=torch.finfo(torch.bfloat16).eps * max(span, 1.0))
     assert (first[num_tokens - 20 :] == 0).all()
     assert torch.equal(first, hidden_states.grad)

@@ -94,6 +94,50 @@ def test_recompute_replays_the_combine_and_keeps_the_gradients():
     assert calls == {"forward": 8, "backward": 4}  # without replay each recompute combines again
 
 
+def test_two_forwards_before_the_first_backward_replay_that_forward():
+    torch.manual_seed(0)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    calls.update(forward=0, backward=0)
+    with set_checkpoint_early_stop(False):
+        y1 = checkpoint(block, x1, use_reentrant=False)
+        y2 = checkpoint(block, x2, use_reentrant=False)
+    y1.sum().backward()
+    assert calls == {"forward": 4, "backward": 2}  # both forwards combined; the first recompute did not
+    assert y2.grad_fn is not None  # the second graph is still waiting
+
+    reference = _Block(None)
+    reference.load_state_dict(block.state_dict())
+    x1_ref = x1.detach().requires_grad_(True)
+    with set_checkpoint_early_stop(False):
+        checkpoint(reference, x1_ref, use_reentrant=False).sum().backward()
+    torch.testing.assert_close(x1.grad, x1_ref.grad, rtol=0, atol=0)
+
+
+def test_a_forward_with_no_backward_does_not_feed_the_next_forward():
+    torch.manual_seed(0)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    calls.update(forward=0, backward=0)
+    with set_checkpoint_early_stop(False):
+        y1 = checkpoint(block, x1, use_reentrant=False)
+        y2 = checkpoint(block, x2, use_reentrant=False)
+    y2.sum().backward()
+    assert calls == {"forward": 4, "backward": 2}
+    assert y1.grad_fn is not None
+
+    reference = _Block(None)
+    reference.load_state_dict(block.state_dict())
+    x2_ref = x2.detach().requires_grad_(True)
+    with set_checkpoint_early_stop(False):
+        checkpoint(reference, x2_ref, use_reentrant=False).sum().backward()
+    torch.testing.assert_close(x2.grad, x2_ref.grad, rtol=0, atol=0)
+
+
 def test_an_in_place_write_to_the_kept_output_is_refused():
     import torch.utils.checkpoint as ckpt
 

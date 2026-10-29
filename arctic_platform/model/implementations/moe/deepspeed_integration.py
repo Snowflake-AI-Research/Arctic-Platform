@@ -47,6 +47,7 @@ class MoEDeepSpeedAdapter:
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
 _EXPORT_GATHER_BYTES = 1 << 30
 
+
 def patch_deepspeed_moe_detection() -> None:
     import deepspeed.runtime.engine as ds_engine
 

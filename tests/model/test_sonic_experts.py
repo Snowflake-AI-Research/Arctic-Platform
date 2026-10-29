@@ -1,11 +1,53 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
 from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9, reason="SonicMoE needs SM90+"
-)
+_SONIC_REASON = "SonicMoE needs SM90+ and the quack, cutlass, and cuda.bindings packages"
+
+
+def _require_sonicmoe() -> None:
+    pytest.importorskip("quack")
+    pytest.importorskip("cutlass")
+    pytest.importorskip("cuda.bindings")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip(_SONIC_REASON)
+
+
+def test_stacked_gate_up_rebuilds_when_the_up_projection_is_replaced():
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.kernels.sonic_experts import _stacked_gate_up
+
+    experts = SimpleNamespace(
+        w1=torch.nn.Parameter(torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)),
+        w3=torch.nn.Parameter(torch.arange(24, 48, dtype=torch.float32).reshape(2, 4, 3)),
+    )
+    first = _stacked_gate_up(experts)
+    assert torch.equal(first[:, :4], experts.w1) and torch.equal(first[:, 4:], experts.w3)
+    replacement = torch.arange(100, 124, dtype=torch.float32).reshape(2, 4, 3)
+    experts.w3.data = replacement
+    rebuilt = _stacked_gate_up(experts)
+    assert rebuilt.data_ptr() != first.data_ptr()
+    assert torch.equal(rebuilt[:, :4], torch.arange(24, dtype=torch.float32).reshape(2, 4, 3))
+    assert torch.equal(rebuilt[:, 4:], replacement)
+    assert experts.w1.data_ptr() == rebuilt.data_ptr()
+    assert experts.w3.data_ptr() == rebuilt[:, 4:].data_ptr()
 
 
 def _reference(x, idx, scores, w1, w2, w3):
@@ -23,6 +65,7 @@ def _reference(x, idx, scores, w1, w2, w3):
 
 
 def test_sonic_routed_experts_match_fp32_reference_and_keep_weights():
+    _require_sonicmoe()
     from arctic_platform.model.implementations.kernels.sonic_experts import sonic_routed_experts
     from arctic_platform.model.implementations.kernels.sonic_experts import sonic_routed_experts_applicable
 
@@ -63,6 +106,7 @@ def test_sonic_routed_experts_match_fp32_reference_and_keep_weights():
 
 
 def test_sonic_routed_experts_train_the_expert_weights():
+    _require_sonicmoe()
     from arctic_platform.model.implementations.kernels.sonic_experts import sonic_routed_experts
 
     torch.manual_seed(0)
@@ -95,6 +139,7 @@ def test_sonic_routed_experts_train_the_expert_weights():
 
 def test_sonic_routed_experts_carry_peft_expert_lora():
     """Called through PEFT's wrappers, SonicMoE sees the LoRA-merged weights and trains A and B like the grouped path."""
+    _require_sonicmoe()
     from peft import LoraConfig
     from peft import get_peft_model
 
@@ -114,7 +159,9 @@ def test_sonic_routed_experts_carry_peft_expert_lora():
 
     model = get_peft_model(
         Tiny(),
-        LoraConfig(r=8, lora_alpha=16, target_modules=[], target_parameters=["experts.w1", "experts.w2", "experts.w3"]),
+        LoraConfig(
+            r=8, lora_alpha=16, target_modules=[], target_parameters=["experts.w1", "experts.w2", "experts.w3"]
+        ),
     ).cuda()
     lora = {name: p for name, p in model.named_parameters() if "lora_" in name}
     with torch.no_grad():

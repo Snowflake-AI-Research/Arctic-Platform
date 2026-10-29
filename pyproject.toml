@@ -133,6 +133,13 @@ gdn = [
     "causal-conv1d",
 ]
 
+# BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults on and falls back to grouped
+# GEMM when these are missing. quack-kernels provides quack and depends on nvidia-cutlass-dsl (cutlass)
+# and the cuda.bindings package the vendored kernels import.
+sonicmoe = [
+    "quack-kernels>=0.4.0",
+]
+
 # The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
 cortex = [
     "aiohttp",

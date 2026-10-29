@@ -31,8 +31,26 @@ returns their weight gradients.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
+_sonicmoe_import_warned = False
+
+
+def _warn_sonicmoe_import_failed(exc: BaseException) -> None:
+    """One warning when the default path cannot import SonicMoE and grouped GEMM is used instead."""
+    global _sonicmoe_import_warned
+    if _sonicmoe_import_warned:
+        return
+    _sonicmoe_import_warned = True
+    logger.warning(
+        "moe_use_sonicmoe is enabled, but SonicMoE could not be imported (%s). BF16 routed experts are using "
+        "grouped GEMM. Install the sonicmoe extra for quack, cutlass, and cuda.bindings.",
+        exc,
+    )
 
 
 def sonic_routed_experts_applicable(experts: nn.Module) -> bool:
@@ -52,19 +70,24 @@ def sonic_routed_experts_applicable(experts: nn.Module) -> bool:
         return False
     try:
         from arctic_platform.model.implementations.kernels import sonicmoe  # noqa: F401
-    except ImportError:
+    except ImportError as exc:
+        _warn_sonicmoe_import_failed(exc)
         return False
     return True
 
 
 @torch.no_grad()
 def _stacked_gate_up(experts: nn.Module) -> torch.Tensor:
-    """The ``[E, 2I, H]`` gate|up stack that ``w1`` / ``w3`` are views of, built once on first use."""
+    """The ``[E, 2I, H]`` gate|up stack that ``w1`` / ``w3`` are views of, rebuilt when either storage changes."""
     w1, w3 = experts.w1, experts.w3
     stacked = getattr(experts, "_arl_gate_up", None)
-    if stacked is not None and w1.data.data_ptr() == stacked.data_ptr():
-        return stacked
     inter = w1.shape[1]
+    if (
+        stacked is not None
+        and w1.data.data_ptr() == stacked.data_ptr()
+        and w3.data.data_ptr() == stacked[:, inter:].data_ptr()
+    ):
+        return stacked
     stacked = torch.empty((w1.shape[0], 2 * inter, w1.shape[2]), dtype=w1.dtype, device=w1.device)
     stacked[:, :inter].copy_(w1.data)
     stacked[:, inter:].copy_(w3.data)
