@@ -967,3 +967,70 @@ def test_worker_gathers_full_and_loaded_parameter_traces(monkeypatch):
     assert result["all_rank_loaded_param_l2"] == [{"weight": 4.0}]
     assert "param_l2" not in result
     assert "loaded_param_l2" not in result
+
+
+def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
+    """Each rank rebuilds a tensor larger than the bucket whole; no earlier rebuild may still be alive then.
+
+    Flash-Next's 3,355,443,200-byte ``gate_up_proj`` above a 2 GiB bucket measured +2x that on sampler GPU 0.
+    The stream covers both ways a previous rebuild stays referenced: a small tensor between two rebuilds
+    (``big_a`` -> ``big_b``) and two rebuilds back to back (``big_b`` -> ``big_c``, as GLM's w13 -> w2).
+    """
+    import weakref
+
+    from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
+
+    class Stream:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(torch.cuda, "Event", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: Stream())
+
+    def chunk(name, shape, tensor_offset, nbytes, total):
+        return dict(
+            name=name, shape=shape, dtype="torch.uint8", offset=0, nbytes=nbytes,
+            tensor_offset=tensor_offset, tensor_nbytes=total,
+        )
+
+    small = dict(name="small", shape=[2], dtype="torch.uint8", offset=4, nbytes=2)
+    buckets = [
+        [chunk("big_a", [8], 0, 4, 8)],
+        [chunk("big_a", [8], 4, 4, 8), small],
+        [chunk("big_b", [6], 0, 4, 6)],
+        [chunk("big_b", [6], 4, 2, 6)],
+        [chunk("big_c", [6], 0, 4, 6)],
+        [chunk("big_c", [6], 4, 2, 6)],
+    ]
+    receiver = NCCLEngine.__new__(NCCLEngine)
+    receiver.is_sender = False
+    receiver.device = torch.device("cpu")
+    receiver._nccl_stream = Stream()
+    receiver._data_bufs = [torch.zeros(8, dtype=torch.uint8), torch.zeros(8, dtype=torch.uint8)]
+    receiver.ensure_staging_buffers = lambda: None
+    metas = {}
+
+    def recv_pair(idx, stream):
+        metas[idx] = dict(tensors=buckets.pop(0), is_last=not buckets)
+
+    receiver._recv_pair = recv_pair
+    receiver._parse_meta = metas.__getitem__
+
+    real_empty, rebuilt, peaks = torch.empty, [], []
+
+    def tracked_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        rebuilt.append((weakref.ref(tensor.untyped_storage()), tensor.nbytes))
+        peaks.append(sum(nbytes for ref, nbytes in rebuilt if ref() is not None))
+        return tensor
+
+    class Model(nn.Module):
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr(torch, "empty", tracked_empty)
+    loaded = WeightSyncExtension._load_batched(SimpleNamespace(device=receiver.device), Model(), receiver)[0]
+    monkeypatch.undo()
+
+    assert loaded == 4
+    assert peaks == [8, 6, 6]

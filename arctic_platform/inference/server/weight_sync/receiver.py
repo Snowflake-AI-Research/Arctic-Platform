@@ -506,6 +506,7 @@ class WeightSyncExtension:
                     f"{tuple(tensor.shape)} and dtype {tensor.dtype}"
                 ) from exc
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if updater.pending:
             logger.warning(
                 "FP8 updater has %d incomplete modules", updater.pending,
@@ -567,6 +568,7 @@ class WeightSyncExtension:
             else:
                 orphans.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
 
         if orphans:
             sample = "\n".join(f"  - {n}" for n in orphans[:10])
@@ -644,6 +646,7 @@ class WeightSyncExtension:
             else:
                 skipped_source_names.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
