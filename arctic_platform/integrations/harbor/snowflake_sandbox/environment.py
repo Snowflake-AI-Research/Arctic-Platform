@@ -67,6 +67,7 @@ from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay imp
 from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import plan_from_dockerfile
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import DEFAULT_PLATFORM
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import ImageRegistry
+from arctic_platform.integrations.harbor.snowflake_sandbox.images import close_registries
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import get_registry
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import LOST_EXIT
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import TIMED_OUT_MARKER
@@ -79,6 +80,7 @@ try:
     from snowflake.sandbox.exceptions import SandboxExecError
     from snowflake.sandbox.exceptions import SandboxTransportError
 
+    from arctic_platform.integrations.harbor.snowflake_sandbox.session import close_sessions
     from arctic_platform.integrations.harbor.snowflake_sandbox.session import get_config
 
     _HAS_SDK = True
@@ -223,6 +225,13 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 "  uv tool install 'harbor[snowflake]'"
             )
         ImageRegistry.preflight()
+
+    @classmethod
+    def close_shared_resources(cls) -> None:
+        """Delete every registry's private token config, then close the shared Snowflake sessions."""
+        close_registries()
+        if _HAS_SDK:
+            close_sessions()
 
     def __init__(
         self,

@@ -72,6 +72,20 @@ async def get_config(connection: str | None, role: str | None) -> Config:
     return await asyncio.to_thread(_get_or_connect, connection, role)
 
 
+def close_sessions() -> None:
+    """Close every cached connector session; the next trial logs in again."""
+    with _locks_guard:
+        configs = list(_configs.values())
+        _configs.clear()
+    for config in configs:
+        if config.connection is None:
+            continue
+        try:
+            config.connection.close()
+        except Exception as exc:
+            logger.warning("Closing a Snowflake session failed: %s", exc)
+
+
 async def get_connector(connection: str | None, role: str | None) -> Any:
     """Return the live ``snowflake.connector`` connection behind the shared session."""
     config = await get_config(connection, role)

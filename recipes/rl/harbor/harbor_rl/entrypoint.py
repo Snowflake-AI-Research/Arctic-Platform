@@ -230,6 +230,7 @@ def _experiment_cls():
                 env_kwargs=harbor_env_kwargs(),
                 prepare_task_fn=materialize_harbor_task_from_row,
             )
+            self.harbor_adapter = adapter
 
             def grader(episodes, artifacts, request):
                 grade = grade_harbor(episodes, artifacts, request, error_detail=_ERROR_DETAIL)
@@ -276,7 +277,13 @@ def _run_remote(remote_cfg: Any, reconnect_config: Any) -> None:
 
     patch_upstream()
     experiment = _experiment_cls()(remote_cfg, reconnect_config=reconnect_config)
-    experiment.run()
+    try:
+        experiment.run()
+    finally:
+        # Ray raises SystemExit on SIGTERM, so this also runs when the job is stopped.
+        adapter = getattr(experiment, "harbor_adapter", None)
+        if adapter is not None:
+            adapter.close()
 
 
 def _require_source_checkout() -> None:
@@ -295,6 +302,9 @@ def _require_source_checkout() -> None:
 
 def check_harbor_env() -> None:
     """Fail on the driver, before any GPUs are provisioned, if ``HARBOR_ENV`` can't run tasks."""
+    from harbor.environments.factory import EnvironmentFactory
+    from harbor.models.environment_type import EnvironmentType
+
     from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
     from arctic_platform.integrations.harbor.adapter import SNOWFLAKE_HARBOR_ENV
     from arctic_platform.integrations.harbor.env import ALLOW_HOST_EXEC_VAR
@@ -312,6 +322,11 @@ def check_harbor_env() -> None:
             "ERROR: HARBOR_ENV=host runs task and agent commands on this machine without isolation.\n"
             f"       Use a sandbox, or set {ALLOW_HOST_EXEC_VAR}=1 if every task is trusted."
         )
+    # Rollouts build Trials directly, which skips the preflight `harbor run` does.
+    if ":" in env:
+        EnvironmentFactory.run_preflight(None, import_path=env)
+    else:
+        EnvironmentFactory.run_preflight(EnvironmentType(env))
 
 
 def main() -> None:

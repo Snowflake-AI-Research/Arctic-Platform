@@ -38,8 +38,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import shutil
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -47,6 +49,10 @@ from typing import Any
 
 from arctic_platform.integrations.harness.generator import Grade
 from arctic_platform.integrations.harness.generator import RolloutRequest
+
+logger = logging.getLogger(__name__)
+
+CLOSE_TIMEOUT_S = 120
 
 HOST_HARBOR_ENV = "arctic_platform.integrations.harbor.env:HostEnvironment"
 SNOWFLAKE_HARBOR_ENV = "arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment"
@@ -82,6 +88,7 @@ def _build_trial_config(
     env_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     from harbor.agents.factory import AgentFactory
+    from harbor.agents.installed.base import BaseInstalledAgent
     from harbor.models.environment_type import EnvironmentType
     from harbor.models.trial.config import AgentConfig
     from harbor.models.trial.config import EnvironmentConfig
@@ -103,13 +110,17 @@ def _build_trial_config(
     else:
         env_type = EnvironmentType(env)
 
+    agent_cls = AgentFactory.get_agent_class_from_config(AgentConfig(name=agent_name, import_path=agent_import_path))
     merged_agent_env = {
         "OPENAI_BASE_URL": base_url,
-        "OPENAI_API_KEY": api_key,
         "LLM_BASE_URL": base_url,
-        "LLM_API_KEY": api_key,
         "LLM_MODEL": model_name,
     }
+    # Harbor exports AgentConfig.env into every command the agent runs, so the
+    # rollout key goes there only for agents installed inside the environment,
+    # which read it from there. Agents running on the driver get it as a kwarg.
+    if issubclass(agent_cls, BaseInstalledAgent):
+        merged_agent_env.update(OPENAI_API_KEY=api_key, LLM_API_KEY=api_key)
     kw = dict(agent_kwargs or {})
     kw.setdefault("api_key", api_key)
     if agent_import_path is not None:
@@ -123,11 +134,8 @@ def _build_trial_config(
         kwargs=kw,
         env=merged_agent_env,
     )
-    if "base_url" in AgentConfig.model_fields and hasattr(AgentFactory, "get_agent_class_from_config"):
-        probe_cfg = AgentConfig(name=agent_name, import_path=agent_import_path)
-        agent_cls = AgentFactory.get_agent_class_from_config(probe_cfg)
-        if getattr(agent_cls, "MODEL_CONNECTION", None) is not None:
-            agent_cfg_kwargs["base_url"] = base_url
+    if getattr(agent_cls, "MODEL_CONNECTION", None) is not None:
+        agent_cfg_kwargs["base_url"] = base_url
 
     return TrialConfig(
         task=TaskConfig(path=task_dir),
@@ -203,17 +211,40 @@ async def run_harbor_trial(
 
 
 class _LoopThread:
-    """An event loop running forever on a daemon thread."""
+    """An event loop running on a daemon thread until :meth:`close`."""
 
     def __init__(self, max_workers: int) -> None:
         self.loop = asyncio.new_event_loop()
-        self.loop.set_default_executor(
-            concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="harbor-io")
-        )
-        threading.Thread(target=self.loop.run_forever, name="harbor-loop", daemon=True).start()
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="harbor-io")
+        self.loop.set_default_executor(self._executor)
+        self._thread = threading.Thread(target=self.loop.run_forever, name="harbor-loop", daemon=True)
+        self._thread.start()
 
     def submit(self, coro: Any) -> concurrent.futures.Future:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> None:
+        """Cancel every pending rollout, wait for their cleanup, then stop and close the loop."""
+
+        async def cancel_pending() -> None:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(cancel_pending(), self.loop).result(timeout_s)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "Harbor rollouts did not finish cleaning up within %ss; stopping the loop anyway", timeout_s
+            )
+        finally:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self._thread.join(timeout_s)
+            # Agent conversations block worker threads that can't be interrupted.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            if not self._thread.is_alive():
+                self.loop.close()
 
 
 class HarborTrialAdapter:
@@ -290,8 +321,26 @@ class HarborTrialAdapter:
             env_kwargs=self._env_kwargs,
         )
 
+    def close(self) -> None:
+        """Cancel in-flight rollouts, stop the rollout loop, and release what the environment shares across trials.
+
+        Environments loaded by import path may define a ``close_shared_resources()``
+        classmethod for state that outlives a single trial (sessions, credentials).
+        """
+        with self._lock:
+            loop_thread, self._loop_thread = self._loop_thread, None
+        try:
+            if loop_thread is not None:
+                loop_thread.close()
+        finally:
+            module_name, _, class_name = self._env.partition(":")
+            env_cls = getattr(sys.modules.get(module_name), class_name, None) if class_name else None
+            close_shared = getattr(env_cls, "close_shared_resources", None)
+            if close_shared is not None:
+                close_shared()
+
     def _finish(self, rollout_id: str, future: concurrent.futures.Future) -> None:
-        exc = future.exception()
+        exc = asyncio.CancelledError("Harbor adapter closed") if future.cancelled() else future.exception()
         if exc is None:
             self._store(rollout_id, "completed", future.result())
             return
