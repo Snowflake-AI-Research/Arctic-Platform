@@ -197,6 +197,9 @@ class ReplicaPool:
         self._cached_weights_info: list[dict] | None = None
         self._cached_spec_weights_info: list[dict] | None = None
         self._sleeping = False
+        # Set by a weights-only wake: the workers hold mapped weights while the
+        # pool stays asleep, so ``sleep`` still has engine memory to free.
+        self._weights_staged = False
         self._synced_lora_name: str | None = None
         # Cross-node placement group for a pod-spanning engine, built and
         # owned by the caller (dss-platform) and threaded in via initialize().
@@ -206,6 +209,26 @@ class ReplicaPool:
         # single-node path (the pool reserves ``world_size`` GPUs on one actor).
         # The pool does NOT create or remove this PG; lifetime is the caller's.
         self._engine_pg: Any | None = None
+        # Per-replica placement groups for colocated RL (fractional GPU share
+        # with a training actor on the same bundle). Distinct from _engine_pg,
+        # which is one cross-node group for a single pod-spanning engine.
+        self._colocate_pgs: list[Any] | None = None
+        self._colocate_bundles: list[int] | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The driver pulls this pool back across Ray. Locks and tasks are local
+        # to the actor that created them.
+        state = self.__dict__.copy()
+        state["_lock"] = None
+        state["_health_task"] = None
+        state["_scale_task"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = asyncio.Lock()
+        self._health_task = None
+        self._scale_task = None
 
     @property
     def config(self) -> ModelConfig:
@@ -321,8 +344,32 @@ class ReplicaPool:
             for k in range(1, self._nnodes())
         ]
 
-    def _make_worker(self) -> ray.actor.ActorHandle:
+    def _colocate_worker_options(self, replica_idx: int) -> dict[str, Any]:
+        """Pin one colocated replica onto its training bundle."""
+        opts: dict[str, Any] = {"max_concurrency": 2048}
+        groups = self._colocate_pgs or []
+        pg = groups[replica_idx % len(groups)]
+        bundles = self._colocate_bundles
+        if bundles is not None and replica_idx < len(bundles):
+            if self.tp_size > 1:
+                opts["num_gpus"] = 0
+                actor_bundle = bundles[replica_idx] * self.tp_size
+            else:
+                opts["num_gpus"] = self._ray_num_gpus
+                actor_bundle = bundles[replica_idx]
+            opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=actor_bundle,
+            )
+        else:
+            opts["num_gpus"] = self._ray_num_gpus
+        return opts
+
+    def _make_worker(self, replica_idx: int | None = None) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
+
+        Colocated RL passes per-replica placement groups; that path reserves a
+        fractional GPU on the training bundle instead of a whole engine.
 
         Single-node: the actor reserves ``tp_size`` GPUs and runs an mp-backed
         vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
@@ -336,6 +383,10 @@ class ReplicaPool:
         owns the other pod's. So the leader reserves ``world_size / nnodes``
         GPUs in bundle 0 and keeps the mp backend.
         """
+        if self._colocate_pgs and replica_idx is not None:
+            return self._worker_cls.options(
+                **self._colocate_worker_options(replica_idx)
+            ).remote()
         if self._is_semip_per_node():
             return self._worker_cls.options(
                 **self._node_bundle_options(0, self._local_gpus())
@@ -510,11 +561,14 @@ class ReplicaPool:
         # The engine PG is owned by the caller (dss-platform); we only drop our
         # reference to it here and never remove it.
         self._engine_pg = None
+        self._colocate_pgs = None
+        self._colocate_bundles = None
         self._config = None
         self._model_id = None
         self._cached_weights_info = None
         self._cached_spec_weights_info = None
         self._sleeping = False
+        self._weights_staged = False
         self._synced_lora_name = None
 
     async def _cleanup_failed_initialize(self) -> None:
@@ -611,6 +665,7 @@ class ReplicaPool:
         slot: int,
         count: int,
         extra_env: dict[str, str] | None,
+        replica_idx: int | None = None,
     ) -> dict[str, str]:
         """The env one worker initializes with, for its pod-local ``slot``.
 
@@ -630,6 +685,18 @@ class ReplicaPool:
             worker_env["VLLM_PORT"] = str(port_base + slot * port_stride)
         worker_env["SEMIP_REPLICA_ID"] = str(slot)
         worker_env["SEMIP_NUM_REPLICAS"] = str(count)
+        bundles = self._colocate_bundles
+        if (
+            replica_idx is not None
+            and bundles is not None
+            and replica_idx < len(bundles)
+            and self.tp_size > 1
+            and "VLLM_RAY_PER_WORKER_GPUS" in worker_env
+        ):
+            group = bundles[replica_idx]
+            worker_env["VLLM_RAY_BUNDLE_INDICES"] = ",".join(
+                str(group * self.tp_size + rank) for rank in range(self.tp_size)
+            )
         return worker_env
 
     async def _place_new_worker(
@@ -692,7 +759,7 @@ class ReplicaPool:
                 slot, count = slots[worker_idx]
                 logger.info("Initializing worker %d/%d (slot %d of %d in its "
                             "pod)", worker_idx + 1, n, slot, count)
-                worker_env = self._worker_env(slot, count, extra_env)
+                worker_env = self._worker_env(slot, count, extra_env, replica_idx=worker_idx)
                 refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
@@ -704,6 +771,10 @@ class ReplicaPool:
         model_id: str | None = None,
         num_replicas: int | None = None,
         placement_group: Any | None = None,
+        ray_num_gpus: float | int | None = None,
+        placement_groups: list[Any] | None = None,
+        bundle_indices: list[int] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> int:
         """Set configuration, create worker actors, start scheduler.
 
@@ -722,11 +793,40 @@ class ReplicaPool:
                 capture_child_tasks. The pool does not create or remove the PG.
                 ``None`` keeps the single-node path (the pool reserves
                 ``world_size`` GPUs on one actor).
+            ray_num_gpus: ``num_gpus`` for each worker actor. A fraction lets
+                a sampling replica share a physical GPU with training.
+            placement_groups: Per-replica Ray placement groups for colocated
+                RL. Length 1 shares one group; length ``num_replicas`` gives
+                each replica its own. Paired with ``bundle_indices``.
+            bundle_indices: TP-group index of each replica inside its group.
+                For TP>1 the vLLM workers occupy bundles
+                ``[bundle_indices[r]*tp .. *tp+tp-1]``.
+            extra_env: Env merged into ``config.extra_env`` before workers
+                start. Colocated TP>1 sets ``VLLM_RAY_PER_WORKER_GPUS`` here.
 
         Returns the number of workers created.
         """
         if self._config is not None:
             raise RuntimeError("Already initialized. Call shutdown() first.")
+
+        if placement_groups is not None and placement_group is not None:
+            raise ValueError("pass placement_group or placement_groups, not both")
+        if ray_num_gpus is not None:
+            if placement_group is not None:
+                raise ValueError(
+                    "ray_num_gpus cannot be combined with a caller-provided placement group"
+                )
+            if int(config.tensor_parallel_size) > 1 and not placement_groups:
+                raise ValueError(
+                    f"ray_num_gpus={ray_num_gpus} is not supported with "
+                    f"tensor_parallel_size={config.tensor_parallel_size}. "
+                    "Fractional GPU colocation requires a placement group for TP>1."
+                )
+            config.ray_num_gpus = float(ray_num_gpus)
+        if extra_env:
+            merged = {k: str(v) for k, v in (config.extra_env or {}).items()}
+            merged.update({k: str(v) for k, v in extra_env.items()})
+            config.extra_env = merged
 
         if placement_group is not None:
             if num_replicas not in (None, 1):
@@ -742,6 +842,8 @@ class ReplicaPool:
         self._config = config
         self._model_id = model_id
         self._engine_pg = placement_group
+        self._colocate_pgs = placement_groups
+        self._colocate_bundles = bundle_indices
 
         if self._engine_pg is not None:
             # A pod-spanning engine occupies its whole PG as a single replica;
@@ -758,6 +860,16 @@ class ReplicaPool:
                 )
 
         n = num_replicas
+        if bundle_indices is not None and len(bundle_indices) != n:
+            raise ValueError(
+                f"bundle_indices length ({len(bundle_indices)}) must match "
+                f"num_replicas ({n})"
+            )
+        if placement_groups is not None and len(placement_groups) not in (1, n):
+            raise ValueError(
+                f"placement_groups length ({len(placement_groups)}) must be "
+                f"either 1 (shared) or num_replicas ({n})"
+            )
         multi_node = self._is_multi_node()
         per_node = self._is_semip_per_node()
         if per_node:
@@ -785,8 +897,8 @@ class ReplicaPool:
                 # Created before the leader initializes: its restore_and_wrap
                 # drives them, so they have to exist by the time it runs.
                 self._semip_agents = self._make_semip_agents()
-            for _ in range(n):
-                self._workers.append(self._make_worker())
+            for replica_idx in range(n):
+                self._workers.append(self._make_worker(replica_idx))
             await self._initialize_workers(engine_kwargs, extra_env)
         except asyncio.CancelledError:
             logger.info(
@@ -1019,12 +1131,13 @@ class ReplicaPool:
             extra_env = self._config.extra_env or None
 
             while len(self._workers) < target_count:
-                worker = self._make_worker()
+                replica_idx = len(self._workers)
+                worker = self._make_worker(replica_idx)
                 try:
                     node, slot, count = await self._place_new_worker(worker)
                     await worker.initialize.remote(
                         engine_kwargs,
-                        self._worker_env(slot, count, extra_env),
+                        self._worker_env(slot, count, extra_env, replica_idx=replica_idx),
                         self._model_id,
                     )
                 except asyncio.CancelledError:
@@ -1070,11 +1183,17 @@ class ReplicaPool:
         return self._sleeping
 
     async def sleep(self, model_id: str | None = None, level: int = 1) -> dict[str, Any]:
-        """Drain requests, then free GPU memory on every worker."""
+        """Drain requests, then free GPU memory on every worker.
+
+        A pool whose weights stage landed but whose KV wake never arrived (the
+        weight load failed in between) is still ``_sleeping`` while the workers
+        hold mapped weights, so that case sleeps the workers rather than
+        reporting ``already_sleeping`` and leaving the memory resident.
+        """
         self._check_model_id(model_id)
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
-        if self._sleeping:
+        if self._sleeping and not self._weights_staged:
             return {"status": "already_sleeping", "level": level}
 
         async with self._stream_lifecycle():
@@ -1093,6 +1212,7 @@ class ReplicaPool:
                 return_exceptions=True,
             )
             self._sleeping = True
+            self._weights_staged = False
 
             per_worker = [
                 {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
@@ -1101,28 +1221,70 @@ class ReplicaPool:
             logger.info("ReplicaPool sleeping (%d workers, level=%d)", len(self._workers), level)
             return {"status": "sleeping", "level": level, "workers": per_worker}
 
+    @staticmethod
+    def _wake_finalize(tags: list[str] | None) -> bool:
+        """True when generate() may run after this wake (KV cache restored)."""
+        if tags is None:
+            return True
+        return "kv_cache" in tags
+
+    @staticmethod
+    def _check_wake_worker_results(results: list, tags: list[str] | None) -> None:
+        """Raise when any worker failed to wake.
+
+        A swallowed weights-stage failure is the dangerous one: the colocated
+        sync goes on to load weights into a worker whose parameter storage is
+        still unmapped, and a swallowed KV failure resumes scheduling onto a
+        worker that has no cache.
+        """
+        errors = [r for r in results if isinstance(r, Exception)]
+        if not errors:
+            return
+        raise RuntimeError(f"wake_up(tags={tags!r}) failed on {len(errors)} worker(s): {errors[0]}") from errors[0]
+
     async def wake_up(self, model_id: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
-        """Restore GPU memory on every worker, then resume scheduling."""
+        """Restore GPU memory on every worker.
+
+        ``tags=["weights"]`` keeps the pool asleep and the scheduler paused so
+        a colocated sync can load weights before ``tags=["kv_cache"]`` allocates
+        the cache and resumes scheduling. Clearing ``_sleeping`` on the weights
+        call makes the KV wake return ``already_ready`` without restoring the cache.
+        """
         self._check_model_id(model_id)
         if self._scheduler is None:
             raise RuntimeError("ReplicaPool not initialized")
         if not self._sleeping:
             return {"status": "already_ready"}
 
+        finalize = self._wake_finalize(tags)
         async with self._stream_lifecycle():
             results = await asyncio.gather(
                 *[w.wake_up.remote(tags=tags) for w in self._workers],
                 return_exceptions=True,
             )
-            self._sleeping = False
-            self._scheduler.resume()
-
+            self._check_wake_worker_results(results, tags)
             per_worker = [
                 {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
                 for r in results
             ]
-            logger.info("ReplicaPool awake (%d workers)", len(self._workers))
-            return {"status": "ready", "workers": per_worker}
+            if finalize:
+                self._sleeping = False
+                self._weights_staged = False
+                self._scheduler.resume()
+                logger.info(
+                    "ReplicaPool awake (%d workers, tags=%s)",
+                    len(self._workers),
+                    tags,
+                )
+                return {"status": "ready", "tags": tags, "workers": per_worker}
+
+            self._weights_staged = True
+            logger.info(
+                "ReplicaPool weights stage (%d workers, tags=%s); KV wake pending",
+                len(self._workers),
+                tags,
+            )
+            return {"status": "weights_ready", "tags": tags, "workers": per_worker}
 
     # ------------------------------------------------------------------
     # Status
@@ -2061,13 +2223,13 @@ class ReplicaPool:
                 ray.kill(old)
             except Exception:
                 pass
-            new_worker = self._make_worker()
+            new_worker = self._make_worker(idx)
             try:
                 node, slot, count = await self._place_new_worker(
                     new_worker, preferred=preferred, replacing=idx)
                 await new_worker.initialize.remote(
                     engine_kwargs,
-                    self._worker_env(slot, count, extra_env),
+                    self._worker_env(slot, count, extra_env, replica_idx=idx),
                     self._model_id,
                 )
             except BaseException:

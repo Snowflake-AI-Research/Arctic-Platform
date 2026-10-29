@@ -143,8 +143,7 @@ def _dispatch_backward(
     _finish_backward_event(after_event)
 
     grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
-    return grad_x, None, grad_topk_weights, None, None, None, None
+    return grad_x, None, grad_scores, None, None, None, None
 
 
 class _UcclEPCombine(torch.autograd.Function):
