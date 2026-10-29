@@ -151,3 +151,22 @@ def test_qwen38_qsa_output_gate_rounds_once(monkeypatch):
     gate = sites["query_and_gate"].view(batch, length, heads, 2 * head_dim)[..., head_dim:].reshape(batch, length, -1)
     attention = sites["attention"].reshape(batch, length, -1)
     _assert_rounded_once(sites["gated"], attention.double() * torch.sigmoid(gate.double()))
+
+
+def test_qwen38_qsa_fp32_math_survives_autocast():
+    from transformers import set_seed
+
+    from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
+
+    set_seed(13)
+    inputs = [torch.randn(1, 8, heads, 16).bfloat16() for heads in (4, 2, 2)]
+    ids = torch.arange(8, dtype=torch.int32)[None, None].expand(1, 8, 8)
+    grad = torch.randn_like(inputs[0])
+    results = []
+    for enabled in (False, True):
+        leaves = [x.detach().requires_grad_(True) for x in inputs]
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=enabled):
+            output = _SparseGQAAttention.apply(*leaves, ids, 0.25, 4)
+        results.append((output, *torch.autograd.grad(output, leaves, grad)))
+    for actual, expected in zip(results[1], results[0]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

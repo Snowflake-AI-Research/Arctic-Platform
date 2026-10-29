@@ -379,22 +379,25 @@ def _sparse_gqa_from_selected(
 
     groups = num_query_heads // num_kv_heads
     grouped_query = query.view(batch_size, query_length, num_kv_heads, groups, head_dim)
-    scores = torch.einsum(
-        "bqhgd,bqrhd->bqhgr",
-        grouped_query.float(),
-        selected_key.float(),
-    )
+    # Explicit float() operands alone do not keep einsum in fp32 under DeepSpeed autocast.
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        scores = torch.einsum(
+            "bqhgd,bqrhd->bqhgr",
+            grouped_query.float(),
+            selected_key.float(),
+        )
     scores.mul_(softmax_scale)
     scores.masked_fill_(~valid[:, :, None, None], -torch.inf)
     empty = ~valid.any(dim=-1)
     scores.masked_fill_(empty[:, :, None, None, None], 0)
     # fp32 probabilities and PV, one rounding; vLLM's split-K kernel never rounds the normalized probabilities.
     probabilities = torch.softmax(scores, dim=-1).masked_fill(~valid[:, :, None, None], 0)
-    output = torch.einsum(
-        "bqhgr,bqrhd->bqhgd",
-        probabilities,
-        selected_value.float(),
-    ).reshape(batch_size, query_length, num_query_heads, head_dim)
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        output = torch.einsum(
+            "bqhgr,bqrhd->bqhgd",
+            probabilities,
+            selected_value.float(),
+        ).reshape(batch_size, query_length, num_query_heads, head_dim)
     output.masked_fill_(empty[:, :, None, None], 0)
     return output.to(selected_value.dtype)
 
