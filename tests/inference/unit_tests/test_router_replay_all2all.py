@@ -20,21 +20,21 @@ from arctic_platform.inference.server.router_replay.all2all import (
 def _sender(rank, held, shape=(4, 2, 2), supports_allow_missing=True):
     return _PerRankManifest(
         role="sender", rank=rank, held=list(held), shapes={sid: list(shape) for sid in held},
-        supports_allow_missing=supports_allow_missing,
+        supports_allow_missing=supports_allow_missing, supports_token_ranges=True,
     )
 
 
-def _receiver(rank, needed, allow_missing=False, supports_allow_missing=True):
+def _receiver(rank, needed, allow_missing=False, supports_allow_missing=True, token_ranges=None):
     return _PerRankManifest(
         role="receiver", rank=rank, needed=list(needed), allow_missing=allow_missing,
-        supports_allow_missing=supports_allow_missing,
+        supports_allow_missing=supports_allow_missing, token_ranges=token_ranges, supports_token_ranges=True,
     )
 
 
-def _legacy(manifest):
-    """The manifest as a rank on the pre-``allow_missing`` planner sends it: no handshake field."""
-    del manifest.__dict__["allow_missing"]
-    del manifest.__dict__["supports_allow_missing"]
+def _legacy(manifest, fields=("allow_missing", "supports_allow_missing", "token_ranges", "supports_token_ranges")):
+    """The manifest as a rank on an older planner sends it: by default the pre-``allow_missing`` one."""
+    for name in fields:
+        del manifest.__dict__[name]
     return pickle.loads(pickle.dumps(manifest))
 
 
@@ -245,3 +245,44 @@ def test_uint16_ids_cross_as_bytes_and_land_exact():
     assert (dst, wire.dtype) == (0, torch.uint8)
     out = rx.pop("rr1:a")
     assert out.dtype == torch.uint16 and torch.equal(out, ids)
+
+
+def test_token_ranges_move_only_each_receivers_slice():
+    capture = torch.arange(24, dtype=torch.uint8).reshape(6, 2, 2)
+    other = capture + 100
+    peers = [
+        _receiver(0, ["rr1:a", "rr1:b"], token_ranges={"rr1:a": (0, 4)}),
+        _receiver(1, ["rr1:a", "rr1:b"], token_ranges={"rr1:a": (4, 9), "rr1:b": (6, 6)}),
+        _sender(2, ["rr1:a", "rr1:b"], shape=(6, 2, 2)),
+    ]
+    tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    tx.put("rr1:a", capture)
+    tx.put("rr1:b", other)
+    sender = _group("sender", 2, peers)
+    sender.send(tx)
+    # A range past the capture is clipped to it; an empty one moves nothing.
+    assert [(dst, sent.tolist()) for dst, sent in sender.nccl.sent] == [
+        (0, capture[:4].tolist()), (0, other.tolist()), (1, capture[4:].tolist()),
+    ]
+
+    receiver = _group("receiver", 1, peers, _FakeNCCL([capture[4:]]))
+    cache = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1 << 20)
+    result = receiver.recv(
+        cache, needed_sample_ids=["rr1:a", "rr1:b"], token_ranges={"rr1:a": (4, 9), "rr1:b": (6, 6)},
+    )
+    assert result["capture_slices"] == {"rr1:a": (4, 6), "rr1:b": (6, 6)}  # (start, whole capture length)
+    assert torch.equal(cache.pop("rr1:a"), capture[4:])
+    assert cache.pop("rr1:b").shape == (0, 2, 2)
+
+
+def test_a_peer_without_token_ranges_sends_whole_captures_to_every_rank():
+    capture = torch.arange(24, dtype=torch.uint8).reshape(6, 2, 2)
+    older_sender = _legacy(_sender(1, ["rr1:a"], shape=(6, 2, 2)), fields=("token_ranges", "supports_token_ranges"))
+    peers = [_receiver(0, ["rr1:a"], token_ranges={"rr1:a": (2, 4)}), older_sender]
+    receiver = _group("receiver", 0, peers, _FakeNCCL([capture]))
+    cache = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1 << 20)
+
+    result = receiver.recv(cache, needed_sample_ids=["rr1:a"], token_ranges={"rr1:a": (2, 4)})
+
+    assert result["capture_slices"] == {}
+    assert torch.equal(cache.pop("rr1:a"), capture)
