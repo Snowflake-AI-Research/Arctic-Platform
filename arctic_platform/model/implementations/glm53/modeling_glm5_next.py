@@ -83,15 +83,15 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
 
 
 def _remix(fused: bool, post: Tensor, comb: Tensor, sublayer_out: Tensor, streams: Tensor) -> Tensor:
-    """``post * sublayer_out + comb^T @ streams`` in fp32, rounded once, as vLLM's ``mhc_post`` kernel computes it.
+    """``post * sublayer_out + comb^T @ streams``: fp32 FMAs over the hc streams, rounded once, as vLLM's ``mhc_post``.
 
-    Elementwise over the hc streams so a TF32 matmul precision never rounds ``comb``.
+    Elementwise rather than a matmul so a TF32 matmul precision never rounds ``comb``.
     """
     if fused:
         return mix_streams(post, comb, sublayer_out, streams)
     mixed = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
     for weights, stream in zip(comb.unbind(-2), streams.unbind(-2)):
-        mixed = mixed + weights.unsqueeze(-1) * stream.unsqueeze(-2)
+        mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
     return mixed.to(streams.dtype)
 
 
