@@ -165,3 +165,23 @@ def test_qwen38_cp_uses_explicit_global_packed_boundaries(monkeypatch):
 
     assert observed["global_cu_seqlens"] is boundaries
     assert getattr(linear, context_parallel._GLOBAL_CU_SEQLENS) is boundaries
+
+
+def test_qsa_backward_sums_key_and_value_gradients_exactly():
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    # Every query selects keys 0 and 1 with equal scores, so each adds +1/-1 to their dK and 0.5 to their dV.
+    # The totals are exact in bf16, but 300 chunks of 128 queries overflow a bf16 running sum's 8-bit significand.
+    queries = 300 * 128
+    query = torch.ones(1, queries, 1, 2, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)[None, :, None, None].repeat(1, 1, 1, 2).requires_grad_()
+    routes = torch.tensor([0, 1], dtype=torch.int32).expand(1, queries, 2).contiguous()
+
+    output = qsa._SparseGQAAttention.apply(query, key, value, routes, 1.0, 128)
+    output.backward(torch.ones_like(output))
+
+    assert key.grad.dtype == value.grad.dtype == torch.bfloat16
+    expected_key = torch.tensor([queries, -queries], dtype=torch.float32)[None, :, None, None].expand_as(key)
+    torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2), rtol=0, atol=0)
