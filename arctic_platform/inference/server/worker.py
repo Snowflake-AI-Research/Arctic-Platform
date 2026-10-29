@@ -476,6 +476,30 @@ def _create_async_engine_args(
         )
 
 
+def _validate_mla_lora_targets(model_config: Any, peft_config: dict[str, Any] | None) -> None:
+    if not peft_config:
+        return
+    # GLM5Next always constructs MLA attention, even when VLLM_MLA_DISABLE is set.
+    glm5next = model_config.architecture == "Glm5NextForConditionalGeneration"
+    if not (glm5next or model_config.use_mla):
+        return
+    targets = peft_config.get("target_modules", [])
+    if isinstance(targets, str):
+        prefix = "model.language_model" if glm5next else "model"
+        targets_kv_b = targets == "all-linear" or any(
+            re.fullmatch(targets, f"{prefix}.layers.{layer}.self_attn.kv_b_proj")
+            for layer in range(model_config.hf_text_config.num_hidden_layers)
+            if not glm5next or model_config.hf_text_config.layer_types[layer] != "linear_attention"
+        )
+    else:
+        targets_kv_b = any(target.rsplit(".", 1)[-1] == "kv_b_proj" for target in targets)
+    if targets_kv_b:
+        raise ValueError(
+            "LoRA target kv_b_proj is absorbed into MLA attention weights and cannot be served; "
+            "remove it from the training and sampling LoRA targets and retrain the adapter."
+        )
+
+
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
@@ -889,6 +913,12 @@ class InferenceWorker(StreamingWorkerMixin):
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+        lora_peft_config = engine_kwargs.pop("lora_peft_config", None)
+        checkpoint_peft_config = None
+        if lora_adapter_path:
+            import json
+            with open(os.path.join(lora_adapter_path, "adapter_config.json")) as adapter_file:
+                checkpoint_peft_config = json.load(adapter_file)
 
         # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
         # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
@@ -905,9 +935,9 @@ class InferenceWorker(StreamingWorkerMixin):
         if semi_p:
             # A restored engine has neither, and serving without them returns
             # plausible output that is wrong, so refuse before restoring.
-            if lora_adapter_path:
+            if lora_adapter_path or lora_peft_config:
                 raise ValueError(
-                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
+                    "semi_p cannot serve LoRA adapters: "
                     "a restored engine serves the base weights it was dumped "
                     "with. Disable semi_p for this job.")
             if engine_kwargs.get("enable_return_routed_experts"):
@@ -989,6 +1019,8 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                _validate_mla_lora_targets(vllm_config.model_config, lora_peft_config)
+                _validate_mla_lora_targets(vllm_config.model_config, checkpoint_peft_config)
                 self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
                     vllm_config, chat_reasoning_parser, tool_call_parser
                 )
