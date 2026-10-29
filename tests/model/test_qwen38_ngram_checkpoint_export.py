@@ -199,9 +199,10 @@ def _worker(rank: int, rendezvous: str, out_dir: str) -> None:
 def test_ngram_table_export_is_exact_and_rank_memory_is_bounded() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mp.spawn(_worker, args=(f"file://{tmp}/rendezvous", tmp), nprocs=_WORLD, join=True)
-        transient = [
-            json.load(open(os.path.join(tmp, f"rank{rank}.json")))["transient_tables"] for rank in range(_WORLD)
-        ]
+        transient = []
+        for rank in range(_WORLD):
+            with open(os.path.join(tmp, f"rank{rank}.json")) as f:
+                transient.append(json.load(f)["transient_tables"])
     report = ", ".join(f"rank {rank} {value:.2f}" for rank, value in enumerate(transient))
     # Rank 0 may hold one EP shard of the table beyond the exported table; the others only keep their own shard.
     assert transient[0] <= 1.1 / _EP and max(transient[1:]) <= 0.1, f"transient memory in tables: {report}"
