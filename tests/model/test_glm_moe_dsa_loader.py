@@ -169,7 +169,10 @@ def test_runtime_config_is_derived_from_validated_options():
         ep_comm_backend="uccl",
         sparse_mla_backend="flashmla",
         ac_config={"freq": 2},
-        debug={"num_layers": 6, "random_init": True},
+        debug={
+            "num_layers": 6,
+            "random_init": True,
+        },
     )
     config = _build_model_config(
         "local",
