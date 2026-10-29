@@ -53,7 +53,6 @@ def patch_zero2_offload_boundary_window() -> None:
     def save_every_backward(zero, param, *args, **kwargs):
         if zero.micro_step_id == 0 and zero.is_gradient_accumulation_boundary() and uses_host_buffer(zero, param):
             zero.async_accumulate_grad_in_cpu_via_gpu(param)  # the stock path skips this save for a lone backward
-            zero._offload_accumulated_param_ids.add(zero.get_param_id(param))
         return copy_grads_in_partition(zero, param, *args, **kwargs)
 
     Zero.copy_grads_in_partition = save_every_backward
