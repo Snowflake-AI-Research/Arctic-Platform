@@ -149,6 +149,28 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
+    """Gather an EP-sharded tensor to rank 0's host memory; rank 0 needs one shard of buffers, other ranks none."""
+    import torch.distributed as dist
+
+    if 0 not in dist.get_process_group_ranks(ep_group):
+        return None
+    is_master = dist.get_rank() == 0
+    world, rows = dist.get_world_size(group=ep_group), local.shape[0]
+    pieces = local.tensor_split(world)
+    full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+    buffers = [torch.empty_like(pieces[0]) for _ in range(world)] if is_master else None
+    start = 0
+    for piece in pieces:
+        received = [buffer[: len(piece)] for buffer in buffers] if is_master else None
+        dist.gather(piece, received, dst=0, group=ep_group)
+        if is_master:
+            for rank, part in enumerate(received):
+                full[rank * rows + start : rank * rows + start + len(piece)].copy_(part)
+        start += len(piece)
+    return full
+
+
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
     convert_layer_to_hf = getattr(model_type, "convert_layer_to_hf", None)
@@ -198,6 +220,12 @@ def build_iter_full_hf_weights(model: nn.Module):
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     local = tensor.data.contiguous()
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
+                        full = _gather_ep_shards_to_rank0_host(local, ep_group)
+                        if is_master:
+                            layer_state[name] = full
+                        continue
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
                     dist.all_gather(shards, local, group=ep_group)
                     if is_master:
