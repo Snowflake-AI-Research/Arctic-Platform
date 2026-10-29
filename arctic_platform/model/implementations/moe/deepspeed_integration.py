@@ -165,12 +165,12 @@ def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tens
     for piece in pieces:
         for group_rank, rank in enumerate(ranks):
             if rank == 0:
-                if is_master:
+                if full is not None:
                     full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
                 continue
             buffer = piece if dist.get_rank() == rank else received[: len(piece)]
             dist.broadcast(buffer, src=rank, group=ep_group)
-            if is_master:
+            if full is not None:
                 full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
         start += len(piece)
     return full
