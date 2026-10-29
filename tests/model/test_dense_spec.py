@@ -209,3 +209,30 @@ def test_ds_worker_config_selects_liger_provider_zorro_train_and_debug():
     assert spec.patches.zorro_train.rollout_n == 4
     assert spec.patches.zorro_train.use_unpad is True
     assert spec.debug == {"gpu_mem_preallocate_gib": 2}
+
+
+def test_ds_worker_config_requires_attn_implementation():
+    with pytest.raises(ValueError, match="requires attn_implementation"):
+        ds_worker_dense_model_spec("Qwen/Qwen3-8B", {}, dtype="bfloat16", sequence_parallel=1)
+
+
+def test_ds_worker_config_rejects_zorro_train_with_sdpa():
+    with pytest.raises(ValueError, match="ZoRRo Train does not support attn_implementation='sdpa'"):
+        ds_worker_dense_model_spec(
+            "Qwen/Qwen3-8B",
+            {"attn_implementation": "sdpa", "zorro_train_enable": True},
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+
+
+def test_ds_worker_config_accepts_zorro_train_with_eager():
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B",
+        {"attn_implementation": "eager", "zorro_train_enable": True},
+        dtype="bfloat16",
+        sequence_parallel=1,
+    )
+
+    assert spec.attn_implementation == "eager"
+    assert spec.patches.zorro_train is not None

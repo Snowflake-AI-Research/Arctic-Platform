@@ -127,15 +127,21 @@ def ds_worker_dense_model_spec(
     ZoRRo Train keys.
     """
     cfg = ds_worker_config or {}
+    attn_implementation = cfg.get("attn_implementation")
+    if attn_implementation is None:
+        raise ValueError("ds_worker_config requires attn_implementation")
     training_options = {key: value for key, value in cfg.items() if key not in _LOADER_OPTION_KEYS_IN_TRAINING}
     training_options["activation_checkpointing"] = cfg.get("enable_gradient_checkpointing", True)
     zorro_train = None
     if cfg.get("zorro_train_enable", False):
+        # The ZoRRo Train attention patcher handles eager and flash attention only.
+        if attn_implementation == "sdpa":
+            raise ValueError("ZoRRo Train does not support attn_implementation='sdpa'; use eager or flash attention")
         zorro_train = {key: cfg[key] for key in _ZORRO_TRAIN_KEYS if key in cfg}
     return dense_model_spec(
         model_path=model_name,
         dtype=dtype,
-        attn_implementation=cfg.get("attn_implementation"),
+        attn_implementation=attn_implementation,
         sequence_parallel=sequence_parallel,
         liger=cfg.get("model_provider") == "liger" or bool(cfg.get("use_liger")),
         training_options=training_options,

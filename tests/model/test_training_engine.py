@@ -154,7 +154,28 @@ def test_existing_torch_adam_config_selects_torch_optimizer():
         weight_decay=0.1,
         fused=False,
     )
-    assert spec.adam_w_mode is False
+    assert spec.adam_w_mode is True
+
+
+@pytest.mark.parametrize(
+    "optimizer_type, adam_w_mode, expected",
+    [("AdamW", False, True), ("Adam", False, False), ("Adam", True, True), ("AdamW", True, True)],
+)
+def test_deepspeed_adam_w_mode_matches_deepspeed(optimizer_type, adam_w_mode, expected):
+    spec = TrainingEngineSpec.from_deepspeed_config(
+        {"optimizer": {"type": optimizer_type, "params": {"lr": 1e-4, "adam_w_mode": adam_w_mode}}},
+        dtype="bfloat16",
+        world_size=1,
+    )
+
+    assert spec.adam_w_mode is expected
+
+
+def test_deepspeed_optimizer_requires_lr():
+    with pytest.raises(ValueError, match="must set lr"):
+        TrainingEngineSpec.from_deepspeed_config(
+            {"optimizer": {"type": "AdamW", "params": {"weight_decay": 0.1}}}, dtype="bfloat16", world_size=1
+        )
 
 
 def test_sequence_parallel_must_divide_the_world():

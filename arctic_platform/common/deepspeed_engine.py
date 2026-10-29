@@ -376,11 +376,13 @@ def _optimizer_settings_from_deepspeed(config: Any) -> OptimizerSettings | None:
     params = config.get("params") or {}
     if not isinstance(params, dict):
         raise ValueError("DeepSpeed optimizer params must be a dictionary")
+    if params.get("lr") is None:
+        raise ValueError("DeepSpeed optimizer params must set lr")
     betas = params.get("betas", [params.get("beta1", 0.9), params.get("beta2", 0.999)])
     torch_adam = bool(params.get("torch_adam", False))
     return OptimizerSettings(
         name="torch_adamw" if torch_adam else "AdamW",
-        lr=float(params.get("lr", 1e-5)),
+        lr=float(params["lr"]),
         weight_decay=float(params.get("weight_decay", 0.0)),
         betas=list(betas),
         eps=float(params.get("eps", 1e-8)),
@@ -389,8 +391,11 @@ def _optimizer_settings_from_deepspeed(config: Any) -> OptimizerSettings | None:
 
 
 def _adam_w_mode_from_deepspeed(config: Any) -> bool:
-    params = config.get("params") if isinstance(config, dict) else None
-    return bool(params.get("adam_w_mode", True)) if isinstance(params, dict) else True
+    if not isinstance(config, dict):
+        return True
+    params = config.get("params") or {}
+    # DeepSpeed runs AdamW for type AdamW whatever adam_w_mode says.
+    return str(config.get("type") or "AdamW").lower() == "adamw" or bool(params.get("adam_w_mode", True))
 
 
 def _data_parallel_size(world_size: int, sequence_parallel: int) -> int:
