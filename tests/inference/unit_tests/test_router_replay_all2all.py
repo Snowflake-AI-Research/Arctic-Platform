@@ -319,7 +319,8 @@ def test_sender_advertises_staging_only_for_a_cache_off_the_nccl_device():
     assert host.supports_staged_rounds and on_device.supports_staged_rounds
 
 
-def test_staged_exchange_runs_one_fuse_per_round_on_both_sides_and_lands_exact():
+def test_staged_exchange_runs_one_fuse_per_round_on_both_sides_and_lands_exact(caplog):
+    caplog.set_level(logging.INFO, logger="arctic_platform.inference.server.router_replay.all2all")
     captures = {f"rr1:{i}": torch.full((4, 2, 2), i, dtype=torch.uint8) for i in range(5)}
     tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     for sid, capture in captures.items():
@@ -331,6 +332,7 @@ def test_staged_exchange_runs_one_fuse_per_round_on_both_sides_and_lands_exact()
     sender_manifest = sender._build_send_manifest(tx.snapshot(), cache_device=tx.device)
 
     assert sender.send(tx) == {"tensors_sent": 5}
+    assert "sent 5 tensor(s) in 3 staged round(s)" in caplog.text
 
     receiver = _group(
         "receiver", 0, [_receiver(0, needed), sender_manifest, budget_peer],

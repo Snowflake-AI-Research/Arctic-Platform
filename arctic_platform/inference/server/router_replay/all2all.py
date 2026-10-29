@@ -484,6 +484,11 @@ class RouterReplayGroup:
                 torch.cuda.current_stream(self.device).synchronize()
             n_sent += len(staged)
         self._n_rounds += len(rounds)
+        if len(rounds) > 1:
+            logger.info(
+                "router-replay: sent %d tensor(s) in %d staged round(s) staging_bytes=%d",
+                n_sent, len(rounds), self.staging_bytes,
+            )
         return n_sent
 
     def _run_data_exchange_recv(
