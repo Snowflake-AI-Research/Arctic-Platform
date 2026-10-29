@@ -22,6 +22,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from arctic_platform.common.packing import ROW_BROADCAST_KEYS
+
 N_TOKENS_PER_PAGE = 256
 
 
@@ -47,7 +49,9 @@ def pack_sequences(data: dict[str, Any]) -> dict[str, Any]:
     for key, value in data.items():
         if key == "attention_mask":
             continue
-        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[0] == B and value.shape[1] == S:
+        if key in ROW_BROADCAST_KEYS and torch.is_tensor(value) and tuple(value.shape) == (B,):
+            packed[key] = torch.repeat_interleave(value, lens.to(value.device)).unsqueeze(0)
+        elif torch.is_tensor(value) and value.ndim >= 2 and value.shape[0] == B and value.shape[1] == S:
             packed_tensor = torch.empty((T, *value.shape[2:]), dtype=value.dtype, device=value.device)
             for i in range(B):
                 start = cu_seqlens[i].item()

@@ -870,6 +870,25 @@ recorded `cap_bnd` whether or not it is already absent here, so "the
 child's cap-drop left `cap_bnd` equal to the pod's" is the reason it
 fires ~39 times, not the reason it is skipped.
 
+**Concurrent dumps share the same budget.** Every pod's criu on a node
+runs as one uid, and each dump holds 8 page pipes of 1 MiB (2048 pages)
+for about 2 s. Page pipes degrade gracefully when they cannot grow, but
+the pipe-data steal for a pipe inside the tree does not: it sizes its
+copy with `F_SETPIPE_SZ(64 KiB)`, and once the uid is over 16384 pages
+the dump fails. Measured 2026-10-24 at TP=1×8, eight replicas dumping
+at once on top of a ~5300-page baseline:
+
+```
+Error (criu/pipes.c:436): Unable to set a pipe size: Operation not permitted
+```
+
+The failing fd was multiprocessing's spawn pipe; the 1 MiB pod-log tee
+pipes only add to the baseline. `_dump_slot` in `worker.py` holds an
+flock on one of `SEMIP_CONCURRENT_DUMPS` (default 2) files in the pod's
+`/data-fast/.semip-dump-slots` around `criu dump`. Pods sharing a node do
+not share slots. The kernel exempts a caller with `CAP_SYS_RESOURCE` or
+`CAP_SYS_ADMIN`, so a privileged pod never hits this.
+
 **Supported configurations: `root -> root` and `unprivileged ->
 unprivileged`. The mix is out of scope and is rejected.** Everything
 above is about criu matching *its target's* uid within one dump. The
@@ -2117,7 +2136,7 @@ claim thousands of captures at a batch size that never ran.
 | Privileged-only CRIU | dump + restore need `CAP_SYS_ADMIN` (netns kerndat probe; restore PID namespace) | `--unprivileged` (`SEMIP_UNPRIVILEGED=1`) skips the netns probe; caps shed in the child before `import torch` | lowcap path: `criu restore -d --unprivileged` in the host PID ns (no `unshare`), with a snapshot-verified teardown kill (Complication 13) |
 | Cross-uid dump | A root `criu` cannot dump an unprivileged child: `ptrace_may_access` needs `CAP_SYS_PTRACE` and `prlimit()` needs `CAP_SYS_RESOURCE`, the latter outside a cap-prod bounding set (`cr-dump.c:389`) | `_worker_criu_save` runs `criu` at the worker's own uid (no `sudo`), so it matches its own child by construction; unprivileged workers need `setcap cap_sys_ptrace,cap_checkpoint_restore,cap_setpcap,cap_setgid+eip /usr/sbin/criu` | The last two are for the restore, not the dump |
 | Cross-uid restore | The restored child keeps the image's uid, so a parent of a different uid collides with it on `<model_dir>/compilation` and `image/`; no file mode reconciles them | Out of scope: only `root -> root` and `unprivileged -> unprivileged` are supported. `meta.json` records the dumping `uid`; `Instance.criu_restore` raises on a mismatch before spawning a worker | Pre-`uid` images are unchecked — re-dump if unsure |
-| Pipe capacity | `F_SETPIPE_SZ` needs `CAP_SYS_RESOURCE` once the *creating uid* is over `fs.pipe-user-pages-soft`; the budget is per uid, and uid 0 pools every root-run tree on the node (`criu/pipes.c:165`) | `_worker_criu_load_lowcap` restores at the worker's own uid (no `sudo`), which is also the image's uid | Killing stale root trees frees the budget, but only until the next root run |
+| Pipe capacity | `F_SETPIPE_SZ` needs `CAP_SYS_RESOURCE` once the *creating uid* is over `fs.pipe-user-pages-soft`; the budget is per uid, and uid 0 pools every root-run tree on the node (`criu/pipes.c:165`). Concurrent dumps share it too: eight at once fail one with "Unable to set a pipe size" (`criu/pipes.c:436`) | `_dump_slot` caps `criu dump`s per pod at `SEMIP_CONCURRENT_DUMPS` (default 2); `_worker_criu_load_lowcap` restores at the worker's own uid (no `sudo`), which is also the image's uid | Killing stale root trees frees the budget, but only until the next root run |
 | Ghost remap race   | `(deleted)` .so → ghost race        | Destructive dump + sem deletion    | `--link-remap`                       |
 | Teardown scoping   | No namespace to collapse on the lowcap path, and `-d` reparents tasks off the root; a `kill -9 -<pid>` meant as a group kill becomes `kill(-1)` in procps-ng | — | Snapshot task ids + start times at restore (`_tree_identity`); kill only verified positive pids, never a negative one |
 | Recorded ephemeral listeners | **At TP=1 only.** torch's TCPStore/Gloo listeners sit on kernel-assigned ephemeral ports and survive `destroy_process_group()` as fds, so the keep-list preserves all 7 into the image; criu rebinds each on every restore and a live occupant fails the whole thing. `SO_REUSEADDR` does not help against a live `LISTEN`, and retrying never clears it. **At TP>1 it does not arise** — torch retires its own before the dump (28 → 2 measured across 2 ranks) and both survivors are NCCL RAS's | `_close_loopback_listeners` closes listening loopback `AF_INET`/`AF_INET6` sockets whose port is inside `ip_local_port_range`, reached **only from the TP=1 driver path** in `prepare_criu_dump`, where the 7 are torch's and NCCL starts no RAS subsystem for a single rank. `_prepare_worker_dump` (TP>1) censuses via `_loopback_listeners` and closes nothing: RAS holds one fixed (`::1:28028`) **and** one ephemeral listener per rank, both behind a thread no teardown stops, and closing either spins `accept()` on `EBADF` after restore at ~143 MB/s while the job reports `RUNNING`. Nothing reuses the TP=1 ports, since `reinit_nccl` rebuilds the rendezvous on fresh ones. **Re-dump required** | `_is_port_collision` + `_port_collision_report` name the holding pid and state that a retry cannot help (Complication 15) |
