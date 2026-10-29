@@ -150,23 +150,28 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
 
 
 def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
-    """Gather an EP-sharded tensor to rank 0's host memory; rank 0 needs one shard of buffers, other ranks none."""
+    """Gather an EP-sharded tensor to rank 0's host memory with one GPU piece buffer per rank."""
     import torch.distributed as dist
 
-    if 0 not in dist.get_process_group_ranks(ep_group):
+    ranks = dist.get_process_group_ranks(ep_group)
+    if 0 not in ranks:
         return None
     is_master = dist.get_rank() == 0
     world, rows = dist.get_world_size(group=ep_group), local.shape[0]
     pieces = local.tensor_split(world)
     full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
-    buffers = [torch.empty_like(pieces[0]) for _ in range(world)] if is_master else None
+    received = torch.empty_like(pieces[0])
     start = 0
     for piece in pieces:
-        received = [buffer[: len(piece)] for buffer in buffers] if is_master else None
-        dist.gather(piece, received, dst=0, group=ep_group)
-        if is_master:
-            for rank, part in enumerate(received):
-                full[rank * rows + start : rank * rows + start + len(piece)].copy_(part)
+        for group_rank, rank in enumerate(ranks):
+            if rank == 0:
+                if is_master:
+                    full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
+                continue
+            buffer = piece if dist.get_rank() == rank else received[: len(piece)]
+            dist.broadcast(buffer, src=rank, group=ep_group)
+            if is_master:
+                full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
         start += len(piece)
     return full
 
