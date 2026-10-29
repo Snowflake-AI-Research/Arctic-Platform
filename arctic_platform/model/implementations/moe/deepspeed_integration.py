@@ -173,9 +173,10 @@ def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tens
 
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
-    convert_layer_to_hf = getattr(model_type, "convert_layer_to_hf", None)
-    if convert_layer_to_hf is None:
+    if getattr(model_type, "convert_layer_to_hf", None) is None:
         raise RuntimeError(f"build_iter_full_hf_weights requires {model_type.__name__}.convert_layer_to_hf")
+    # Bound from the instance so a family whose layer mapping depends on its config can read it.
+    convert_layer_to_hf = model.convert_layer_to_hf
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
@@ -203,7 +204,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             for parameter in module.parameters(recurse=False)
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
                 getattr(tensor, "_dss_skip_weight_sync", False)
                 or id(tensor) in skipped_parameter_ids
