@@ -324,15 +324,17 @@ def _accumulate_fp32_master_gradients_in_fp32(ds_config: dict[str, Any]) -> None
 
     DeepSpeed's default accumulation dtype is the parameter dtype, so the fp32 master gradient would be a bf16
     running sum of every model call of the step (``zero_grad_accum``). At stage 1 the same key would switch
-    DeepSpeed to BF16_Optimizer and its full-size fp32 gradient buffer, so only stage 2 is set here.
+    DeepSpeed to BF16_Optimizer and its full-size fp32 gradient buffer, so only stage 2 is set here. A supplied
+    ``data_types`` block is kept as given, as ``DeepSpeedWorker.ds_training_config`` does (docs/common.md).
     """
     bf16_config = ds_config["bf16"]
     if (
-        bf16_config.get("enabled")
+        "data_types" not in ds_config
+        and bf16_config.get("enabled")
         and not bf16_config.get("bf16_master_weights_and_grads")
         and ds_config["zero_optimization"].get("stage") == 2
     ):
-        ds_config.setdefault("data_types", {}).setdefault("grad_accum_dtype", "fp32")
+        ds_config["data_types"] = {"grad_accum_dtype": "fp32"}
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:

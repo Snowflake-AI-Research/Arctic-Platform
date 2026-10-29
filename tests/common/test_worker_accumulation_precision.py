@@ -54,9 +54,10 @@ def test_explicit_accumulation_precision_is_preserved(worker, data_types):
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
 @pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_config_builder_does_not_insert_worker_accumulation_default(dtype, fp32_masters):
+def test_bfloat16_config_builder_inserts_fp32_accumulation_only_for_fp32_masters(dtype, fp32_masters):
+    # The DSS server builds its config here, not through DeepSpeedWorker.ds_training_config.
     ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=4, dtype=dtype, fp32_masters=fp32_masters))
-    assert "data_types" not in ds_config
+    assert ds_config.get("data_types") == ({"grad_accum_dtype": "fp32"} if fp32_masters else None)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])

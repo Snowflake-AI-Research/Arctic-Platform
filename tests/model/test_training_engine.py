@@ -74,9 +74,10 @@ def test_fp32_masters_disable_bf16_master_weights():
     assert ds_config["bf16"]["bf16_optimizer_states"] is False
 
 
-def test_fp32_accumulation_default_with_an_existing_data_types_block():
-    ds_config = build_deepspeed_config(_spec(fp32_masters=True, ds_overrides={"data_types": {}}))
-    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}])
+def test_fp32_masters_keep_a_supplied_data_types_block(data_types):
+    ds_config = build_deepspeed_config(_spec(fp32_masters=True, ds_overrides={"data_types": dict(data_types)}))
+    assert ds_config["data_types"] == data_types
 
 
 def test_sequence_parallel_shrinks_the_data_parallel_batch():
