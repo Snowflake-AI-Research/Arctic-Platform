@@ -37,9 +37,10 @@ class FlashMoeOptions(GenericMoeOptions):
     fp32_parity: bool = Field(
         True,
         description=(
-            "Round once where vLLM does: GLM-5.3-Flash's RMSNorms multiply the weight in fp32 before rounding, and "
+            "Round once where vLLM does: GLM-5.3-Flash's RMSNorms multiply the weight in fp32 before rounding, "
             "Qwen3.8-Flash-Next's QSA rotary embedding, softmax probabilities, P·V product and output gate run in "
-            "fp32. False keeps the transformers order, which rounds each of them to the input dtype."
+            "fp32, and both models' BF16 experts multiply the down projection's fp32 accumulator by the routing "
+            "weight before rounding. False rounds each of them to the input dtype first, in the transformers order."
         ),
     )
 

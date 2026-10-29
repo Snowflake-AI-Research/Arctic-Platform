@@ -12,12 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GLM-5.3-Flash norms and Qwen3.8-Flash-Next QSA attention round to bf16 once, from fp32, as vLLM's kernels do.
+"""GLM-5.3-Flash norms, Qwen3.8-Flash-Next QSA attention and both models' routed experts round to bf16 once, from
+fp32, as vLLM's kernels do.
 
 Each test runs the trainer's own modules with bf16 parameters (DeepSpeed's cast) and checks one site against the
 fp64 value of the same formula from the same bf16 inputs, rounded once. With ``fp32_parity`` off, the sites keep
 the transformers order.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -216,3 +219,140 @@ def test_qwen38_qsa_fp32_math_survives_autocast():
         results.append((output, *torch.autograd.grad(output, leaves, grad)))
     for actual, expected in zip(results[1], results[0]):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class _OneRankDispatch:
+    """DeepEP/UCCL dispatch and combine with every expert on this rank; records what each combine receives."""
+
+    def __init__(self):
+        self.received: list[SimpleNamespace] = []
+
+    @staticmethod
+    def dispatch_tokens_async(hidden, indices, scores, num_experts, group, *, score_before_experts):
+        assert not score_before_experts
+        return hidden, indices.masked_fill(scores == 0, -1), scores.float(), num_experts
+
+    @staticmethod
+    def finalize_dispatch_tokens(pending):
+        from arctic_platform.model.implementations.moe.distributed.token_permute import permute_tokens
+
+        hidden, indices, scores, num_experts = pending
+        rows, row_scores, row_tokens, counts = permute_tokens(hidden, indices, scores, num_experts)
+        state = SimpleNamespace(permuted_scores=row_scores, permuted_indices=row_tokens, num_recv_tokens=len(hidden))
+        state.dispatched_scores, state.counts = row_scores, counts
+        return rows, counts, state
+
+    def combine_tokens(self, rows, state):
+        from arctic_platform.model.implementations.moe.distributed.token_permute import unpermute_tokens
+        from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
+
+        if state.permuted_scores is not None:  # as deepep.combine_tokens and ucclep.combine_tokens
+            rows = apply_routing_weights(rows, state.permuted_scores)
+        self.received.append(SimpleNamespace(rows=rows, scores=state.dispatched_scores, counts=state.counts))
+        return unpermute_tokens(rows, state.permuted_indices, state.num_recv_tokens)
+
+    @staticmethod
+    def sync_combine():
+        pass
+
+
+def _flash_moe(model: str, fp32_parity: bool, use_grouped_mm: bool):
+    from arctic_platform.model.implementations.moe.layers.moe import MoE
+
+    if model == "glm5_next":
+        from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
+            Glm5NextForConditionalGenerationPrimeRL as model_cls,
+        )
+
+        config = _glm_tiny_config()
+    else:
+        from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
+            Qwen4ExpForConditionalGenerationPrimeRL as model_cls,
+        )
+        from tests.model.test_qwen4_exp import _tiny_config as _qwen_tiny_config
+
+        config = _qwen_tiny_config()
+    config.use_grouped_mm = use_grouped_mm
+    config.fp32_parity = fp32_parity
+    torch.manual_seed(0)
+    layer = next(module for module in model_cls(config).modules() if isinstance(module, MoE)).to(torch.bfloat16)
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.normal_(std=0.5)
+    return layer
+
+
+@pytest.mark.parametrize("fp32_parity", [True, False])
+@pytest.mark.parametrize("use_grouped_mm", [True, False])
+@pytest.mark.parametrize("model", ["glm5_next", "qwen4_exp"])
+def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
+    monkeypatch, model, use_grouped_mm, fp32_parity
+):
+    """The routed rows reaching the expert-parallel combine are ``score * (h @ w2.T)`` rounded once, as vLLM's
+    fused MoE kernel stores them, through the production dispatch path with only the cross-rank exchange replaced."""
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+    from arctic_platform.model.implementations.moe.layers import moe
+
+    layer = _flash_moe(model, fp32_parity, use_grouped_mm)
+    dispatch = _OneRankDispatch()
+    hidden = []
+    swiglu = moe._apply_swiglu
+
+    def routed_hidden(gate, up, limit):  # the down projection's input; shared experts run after the combine
+        output = swiglu(gate, up, limit)
+        if not dispatch.received:
+            hidden.append(output)
+        return output
+
+    histc = torch.histc
+    monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
+    monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
+    monkeypatch.setattr(moe, "_apply_swiglu", routed_hidden)
+
+    output = layer(torch.randn(1, 512, layer.experts.w2.shape[1]).to(torch.bfloat16))
+    (received,) = dispatch.received
+    h, w2 = torch.cat(hidden).double(), layer.experts.w2.detach().double()
+    expert = torch.repeat_interleave(torch.arange(len(received.counts)), received.counts)
+    reference = torch.einsum("ri,rhi->rh", h, w2[expert]) * received.scores.detach().double()[:, None]
+    if fp32_parity:
+        _assert_rounded_once(received.rows, reference)
+    else:
+        with pytest.raises(AssertionError, match="rounded more than once"):
+            _assert_rounded_once(received.rows, reference)
+    output.float().square().sum().backward()
+    assert layer.router.gate.weight.grad.abs().sum() > 0
+    assert layer.experts.w2.grad.abs().sum() > 0
+
+
+def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
+    from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    torch.manual_seed(0)
+    offsets = torch.tensor([37, 37, 96], dtype=torch.int32)  # the second expert has no rows
+    inputs = [torch.randn(96, 32).bfloat16(), torch.randn(3, 48, 32).bfloat16(), 2.5 * torch.rand(96)]
+    grad = torch.randn(96, 48).bfloat16()
+    gradients = []
+    for weighted_first in (True, False):
+        hidden, weight, scores = (tensor.clone().requires_grad_(True) for tensor in inputs)
+        if weighted_first:
+            output = weighted_down_projection(hidden, weight, offsets, scores)
+        else:
+            output = apply_routing_weights(torch._grouped_mm(hidden, weight.transpose(-2, -1), offs=offsets), scores)
+        gradients.append(torch.autograd.grad(output, (hidden, weight, scores), grad))
+    for actual, expected in zip(*gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_weighted_down_projection_keeps_the_fp32_accumulator_under_autocast():
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    torch.manual_seed(0)
+    offsets = torch.tensor([40, 100], dtype=torch.int32)
+    inputs = (torch.randn(100, 64).bfloat16(), torch.randn(2, 96, 64).bfloat16(), offsets, 2.5 * torch.rand(100))
+    expected = weighted_down_projection(*inputs)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = weighted_down_projection(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

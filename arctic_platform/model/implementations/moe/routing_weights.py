@@ -128,3 +128,59 @@ def apply_routing_weights(
     gradient and the per-row score gradient (an FP32 dot), are each one Triton pass over the rows.
     """
     return _ApplyRoutingWeights.apply(hidden_states, scores, hidden_states.dtype if out_dtype is None else out_dtype)
+
+
+class _WeightedDownProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, scores: torch.Tensor):
+        counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).tolist()
+        ctx.rows = sum(counts)
+        out = hidden.new_empty(hidden.shape[0], weight.shape[1])
+        unweighted = torch.empty_like(out) if ctx.needs_input_grad[3] else None
+        start = 0
+        # Explicit float() operands alone do not keep the product in FP32 under bf16 autocast.
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            for expert, count in enumerate(counts):
+                span = slice(start, start + count)
+                # torch._grouped_mm has no FP32 output for BF16 inputs; mm's out_dtype is CUDA-only.
+                if hidden.is_cuda:
+                    acc = torch.mm(hidden[span], weight[expert].t(), out_dtype=torch.float32)
+                else:
+                    acc = hidden[span].float() @ weight[expert].float().t()
+                if unweighted is not None:
+                    unweighted[span] = acc
+                torch.mul(acc, scores[span, None], out=out[span])
+                start += count
+        out[ctx.rows :].zero_()
+        if unweighted is not None:
+            unweighted[ctx.rows :].zero_()
+        ctx.save_for_backward(hidden, weight, offsets, scores, unweighted)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        hidden, weight, offsets, scores, unweighted = ctx.saved_tensors
+        # The BF16 grouped GEMM followed by apply_routing_weights has this backward, on the same saved tensors.
+        weighted = (grad_output.float() * scores.float().reshape(-1, 1)).to(hidden.dtype)
+        grad_hidden = grad_weight = grad_scores = None
+        if ctx.needs_input_grad[0]:
+            grad_hidden = torch._grouped_mm(weighted, weight, offs=offsets)
+            grad_hidden[ctx.rows :].zero_()
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch._grouped_mm(weighted.t(), hidden, offs=offsets)
+        if ctx.needs_input_grad[3]:
+            grad_scores = (grad_output.float() * unweighted.float()).sum(dim=1).to(scores.dtype)
+        return grad_hidden, grad_weight, None, grad_scores
+
+
+def weighted_down_projection(
+    hidden: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, scores: torch.Tensor
+) -> torch.Tensor:
+    """``scores * (hidden_e @ weight[e].T)`` for the rows of each expert, rounded once from the FP32 accumulator.
+
+    This is vLLM's fused MoE epilogue: the second GEMM's FP32 accumulator times the routing weight, one cast.
+    ``hidden`` holds each expert's rows in turn, ``offsets`` is the cumulative row count per expert (int32) and
+    ``weight`` is ``[experts, out, in]``. Rows past ``offsets[-1]`` are zero. The FP32 accumulator exists for one
+    expert's rows at a time.
+    """
+    return _WeightedDownProjection.apply(hidden, weight, offsets, scores)

@@ -178,7 +178,8 @@ def register(registry: Registry) -> None:
             " second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the"
             " end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on"
             " Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product and"
-            " output gate in fp32."
+            " output gate in fp32; on both, BF16 experts multiply the down projection's fp32 accumulator by the"
+            " routing weight before rounding."
         ),
         remove_when="no job needs the residual adds, rotary embedding and beta gate in the input dtype",
         source="`loader_options.fp32_parity`",
