@@ -28,6 +28,14 @@ bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 
 `HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`.
 
+`HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`:
+
+```bash
+harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
+  --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
+  --ek image_repo=DB.SCHEMA.REPO --ek connection=MY_CONN --ek role=MY_ROLE
+```
+
 ### Where Rollouts Run
 
 The agent's `terminal` tool and the verifier both run through the selected Harbor environment, so the agent works in the same filesystem that `tests/test.sh` grades, on every backend. Each command runs to completion in a fresh shell: the working directory carries over between commands, but exported variables and background jobs do not. `file_editor` is not available because it would edit the training driver's filesystem instead.
