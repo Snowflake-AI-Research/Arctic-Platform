@@ -207,8 +207,7 @@ def test_qsa_cuda_entry_sums_key_and_value_gradients_exactly():
     output.backward(torch.ones_like(output))
 
     assert key.grad.dtype == value.grad.dtype == torch.bfloat16
-    expected_key = torch.tensor([queries, -queries], device="cuda", dtype=torch.float32)[None, :, None, None].expand_as(
-        key
-    )
+    key_totals = torch.tensor([queries, -queries], device="cuda", dtype=torch.float32)
+    expected_key = key_totals[None, :, None, None].expand_as(key)
     torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
     torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2, device="cuda"), rtol=0, atol=0)
