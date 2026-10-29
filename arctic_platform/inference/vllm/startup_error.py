@@ -36,7 +36,7 @@ MAX_CHARS = 2000
 
 logger = logging.getLogger(__name__)
 
-# What vLLM 0.31 logs, with the exception, when an EngineCore or a worker dies
+# What vLLM 0.32 logs, with the exception, when an EngineCore or a worker dies
 # before it is ready (core.py run_engine_core, multiproc_executor.py worker_main).
 _STARTUP_FAILURES = frozenset({"EngineCore failed to start.", "WorkerProc failed to start."})
 
