@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-import types
-
 import torch
 from torch import Tensor
 from torch import nn
@@ -24,7 +22,6 @@ from transformers.cache_utils import Cache
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
 
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
@@ -47,13 +44,6 @@ def _fp8_modules_to_skip(config) -> set[str]:
     if isinstance(quantization_config, dict):
         return set(quantization_config.get("modules_to_not_convert") or ())
     return set(getattr(quantization_config, "modules_to_not_convert", None) or ())
-
-
-def _rms_norm_rounded_once(self, hidden_states: Tensor) -> Tensor:
-    """``Glm5NextTextRMSNorm`` rounded once, the weight multiplied in fp32, as vLLM's GLM-5.3 norm kernels do."""
-    normed = hidden_states.float()
-    normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-    return (normed * self.weight.float()).to(hidden_states.dtype)
 
 
 def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> None:
@@ -166,9 +156,6 @@ class Glm5NextForConditionalGenerationPrimeRL(
         if getattr(config, "quantization_config", None) and fp8_block_size is None:
             raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
-        for module in self.modules():
-            if type(module) is Glm5NextTextRMSNorm:
-                module.forward = types.MethodType(_rms_norm_rounded_once, module)
         text_config = config.text_config
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Glm5NextTextDecoderLayerPrimeRL

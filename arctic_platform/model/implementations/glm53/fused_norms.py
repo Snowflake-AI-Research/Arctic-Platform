@@ -16,29 +16,31 @@
 
 The reference norms run every step as separate FP32 elementwise passes. On CUDA inputs:
 
-- ``Glm5NextTextRMSNorm`` (layer, latent and final norms) runs Liger's kernel in ``llama`` casting
-  mode: FP32 statistics, the normalized value cast to the input dtype, then the weight -- the
-  reference's own order.
+- ``Glm5NextTextRMSNorm`` (layer, latent and final norms) runs Liger's kernel in ``gemma`` casting
+  mode with offset 0: FP32 statistics and weight, one rounding, as vLLM's GLM-5.3 norm kernels.
 - ``Glm5NextTextRMSNormGated`` (the KDA output norm, ``weight * norm(x) * sigmoid(gate)`` in FP32)
   runs FLA's fused gated norm.
 
-CPU inputs keep the reference forward.
+CPU inputs run the same arithmetic in torch (the gated norm keeps the reference forward).
 """
 
 from __future__ import annotations
 
 import types
 
+import torch
 from torch import Tensor
 from torch import nn
 
 
 def _rms_norm_forward(self, hidden_states: Tensor) -> Tensor:
     if not hidden_states.is_cuda:
-        return type(self).forward(self, hidden_states)
+        normed = hidden_states.float()
+        normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        return (normed * self.weight.float()).to(hidden_states.dtype)
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
 
-    return LigerRMSNormFunction.apply(hidden_states, self.weight, self.variance_epsilon, 0.0, "llama", False)
+    return LigerRMSNormFunction.apply(hidden_states, self.weight, self.variance_epsilon, 0.0, "gemma", False)
 
 
 def _rms_norm_gated_forward(self, hidden_states: Tensor, gate: Tensor | None = None) -> Tensor:
