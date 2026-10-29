@@ -15,7 +15,7 @@
 
 """A bf16 chunked LM head returns the same gradient however many tiles it cuts the call into.
 
-Each fixture makes every tile contribute exactly +1 to one gradient element, so the exact sum is the tile count.
+Each fixture makes every nonzero tile contribution exactly +1, so the exact sum counts those contributions.
 bf16 holds every integer up to 256 but not 257, so a bf16 running sum stops growing at 256 while an fp32 sum
 reaches the count; the result is then rounded to bf16 once, as a single-tile call is.
 """
@@ -65,7 +65,7 @@ def test_bf16_head_sums_token_tiles_in_fp32(weight_grad):
 def test_bf16_dense_head_sums_vocab_tiles_in_fp32():
     # Zero hidden states make every logit 0, so p = 1/1024 for each of 1024 tokens and each non-target logit
     # gradient is -2**-10. A weight of -1024 then makes each one-token vocabulary tile add exactly 1 to the
-    # hidden gradient: 1023 tiles in all, the target's own weight being 0.
+    # hidden gradient: 1023 nonzero contributions across 1024 tiles, the target's own weight being 0.
     vocab = 1024
     hidden = torch.zeros(1, 1, 1, dtype=torch.bfloat16, requires_grad=True)
     weight = torch.full((vocab, 1), -float(vocab), dtype=torch.bfloat16)
