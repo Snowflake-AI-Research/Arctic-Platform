@@ -34,6 +34,7 @@ from .compute_logprobs import compute_logprobs_post
 from .cortex_grpo import cortex_grpo_echo_v1_loss
 from .cortex_grpo import cortex_grpo_loss
 from .cortex_grpo import cortex_grpo_mixed_v1_loss
+from .dflash2 import DFlash2Loss
 
 # Functional math
 from .functional import _compute_sequence_level_ratio_and_advantages
@@ -212,6 +213,7 @@ __all__ = [
     "grpo_echo_v1_loss",
     "cortex_grpo_loss",
     "cortex_grpo_mixed_v1_loss",
+    "DFlash2Loss",
     "cortex_grpo_echo_v1_loss",
     "sft_loss",
     "sft_ce_loss",

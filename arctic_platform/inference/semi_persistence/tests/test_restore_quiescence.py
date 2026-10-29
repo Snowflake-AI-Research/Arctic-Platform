@@ -254,6 +254,24 @@ def test_reinit_timeout_is_separately_tunable():
         _env(w._REINIT_TIMEOUT_ENV, None)
 
 
+def test_the_job_nccl_env_is_this_jobs_nccl_ofi_and_fi_settings():
+    keys = {"NCCL_SOCKET_IFNAME": "^lo", "OFI_NCCL_FORCE_NUM_RAILS": "2",
+            "FI_PROVIDER": "efa", "NCCL_DEBUG_FILE": "/tmp/nccl.%h",
+            "NCCL_NVLS_ENABLE": "1", "NCCL_TOPO_FILE": "/proc/self/fd/7",
+            "VLLM_HOST_IP": "10.0.0.1"}
+    saved = {k: os.environ.get(k) for k in keys}
+    for k, v in keys.items():
+        _env(k, v)
+    try:
+        got = w._job_nccl_env()
+    finally:
+        for k, v in saved.items():
+            _env(k, v)
+    assert {k: got[k] for k in got if k in keys} == {
+        "NCCL_SOCKET_IFNAME": "^lo", "OFI_NCCL_FORCE_NUM_RAILS": "2",
+        "FI_PROVIDER": "efa"}
+
+
 # --------------------------------------------------------------------------
 # _visible_device_nodes
 # --------------------------------------------------------------------------
