@@ -55,6 +55,25 @@ def _spec(ep=8, sp=8):
     return SimpleNamespace(parallelism=SimpleNamespace(expert_parallel=ep, sequence_parallel=sp))
 
 
+@pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
+def test_worker_training_config_does_not_insert_accumulation_precision(runtime, job_config):
+    config = {}
+
+    result = runtime.worker.ds_training_config(job_config, config, {})
+
+    assert result is config
+    assert "data_types" not in result
+
+
+@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
+def test_worker_training_config_preserves_explicit_accumulation_precision(runtime, data_types):
+    config = {"data_types": deepcopy(data_types)}
+
+    result = runtime.worker.ds_training_config({}, config, {})
+
+    assert result["data_types"] == data_types
+
+
 def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):
     config = {"zero_optimization": {"stage": 2}}
     result = runtime.worker._setup_model_parallel_groups(_spec(), config, {"ep_group_layout": "packed"})
@@ -64,9 +83,12 @@ def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):
     assert config["sequence_parallel_size"] == 8
 
 
-def test_worker_groups_ep_only_uses_replicated_setup(runtime):
-    result = runtime.worker._setup_model_parallel_groups(_spec(sp=1), {}, {})
-    assert runtime.calls == [(1, 8, {"world_size": 16, "gpus_per_node": None, "ep_group_layout": "auto"})]
+@pytest.mark.parametrize("worker_config", [{}, {"ep_group_layout": "auto"}, {"ep_group_layout": "packed"}])
+def test_worker_groups_ep_only_uses_replicated_setup(runtime, worker_config):
+    original = deepcopy(worker_config)
+    result = runtime.worker._setup_model_parallel_groups(_spec(sp=1), {}, worker_config)
+    assert runtime.calls == [(1, 8, {"world_size": 16, "gpus_per_node": None, **worker_config})]
+    assert worker_config == original
     assert result == {"ep_group": runtime.ep, "sp_group": None}
     assert runtime.worker.mpu is None
 

@@ -7,18 +7,17 @@
 | `__main__.py`, `api.py` | Operator CLI, external config discovery, selection, and shared Python run interface. |
 | `checks/fwd_bwd.py` | `single-step-grads` comparison. |
 | `checks/fwd_bwd_step.py`, `checks/optimizer_state.py` | `single-step-optimizer` and optimizer artifact/norm validation. |
-| `harness/config.py`, `harness/batches.py` | Reviewed specs, placement arms, and reproducible synthetic input tensors. |
+| `harness/config.py`, `harness/sft.py` | Reviewed specs, placement arms, reproducible synthetic inputs, and configured training data. |
 | `harness/runner.py`, `harness/execution.py` | Prepared-reference regression, sequencing, and CLI/report dispatch. |
-| `harness/dss_driver.py`, `harness/transport.py` | Supervised training lifecycle, payloads, packing, and cleanup. |
-| `harness/cortex.py`, `harness/hosted.py` | Reviewed fixture admission, training transport, public save/catalog identity helpers. |
-| `harness/inference_export.py`, `harness/cortex_optimizer.py`, `harness/optimizer_capture.py` | Test2 resumable checkpoint export, safe decoding, and local optimizer capture. The export module's historical filename does not register an inference check. |
-| `harness/shared_lora_adapter.py` | Upstream PEFT reference adapter generation and content verification; retained internal Ray worker loading is not an admitted Cortex-training target route. |
-| `harness/lora.py` | Canonical tensor-name validation shared by the adapter checks. No retired deterministic recipes or SAVE0 execution. |
-| `harness/participation.py` | Versioned parameter participation and complete gradient coverage. |
-| `harness/reference_records.py`, `harness/storage.py`, `harness/report.py`, `harness/names.py` | Compact record identity, fast scratch containment, reports, and parameter-name alignment. |
+| `harness/gateway.py` | Supervised training lifecycle, payloads, save/catalog identity helpers, gateway ownership, and cleanup. |
+| `harness/cortex.py` | Reviewed fixture admission, training transport contracts, and explicitly requested microbatch packing. |
+| `harness/inference.py`, `harness/optimizer.py` | Test2 checkpoint export, safe decoding, native optimizer capture, tensor-name alignment, and complete participation coverage. No inference check is registered. |
+| `harness/lora.py` | Upstream PEFT reference adapters, content verification, and retained native loading. Internal Ray loading is not an admitted Cortex-training target route. No deterministic recipes or SAVE0 execution. |
+| `harness/storage.py`, `harness/report.py` | Compact reference records, checkpoint ownership, fast scratch containment, and reports. |
 | `reference/` | Independent single-GPU reference, one-step AdamW, model features, process determinism, and Qwen4 loading. |
 | `onboarding/` | Explicit sizing, calibration, fixture publication, and reference preparation. |
-| `selftest/` | Synthetic CPU coverage for the retained checks and shared interfaces. No bundled real recipe dependencies. |
+| `selftest/library.py`, `selftest/check_suite.py` | Synthetic CPU coverage in one library, collected by one driver with each section's original fixture boundaries. No bundled real recipe dependencies. |
+| `../debug/lora.py`, `../debug/weight_sync.py`, `../debug/inference.py`, `../debug/training.py`, `../debug/deepspeed_zero_initialization.py` | Opt-in debug integrations grouped by responsibility; disabled integrations preserve ordinary production behavior. |
 | `diagnostics/` | `lm_head_chunking` and its stdlib dispatcher; altered-workload diagnostic only. |
 
 **Configs, specs, and compact records are operator inputs, not bundled assets.** Explicit single-config runs accept `--test-spec`; multi-config runs use locally generated matching default specs. Heavyweight scratch and model assets remain under `/data-fast`.

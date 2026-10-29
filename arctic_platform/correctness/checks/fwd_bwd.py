@@ -37,10 +37,11 @@ import math
 from pathlib import Path
 from typing import List
 
+from arctic_platform.correctness.harness.optimizer import active_gradient_norms
+from arctic_platform.correctness.harness.optimizer import align
+from arctic_platform.correctness.harness.optimizer import compare_participation
+
 from ..harness.config import tolerance_text
-from ..harness.names import align
-from ..harness.participation import active_gradient_norms
-from ..harness.participation import compare_participation
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult

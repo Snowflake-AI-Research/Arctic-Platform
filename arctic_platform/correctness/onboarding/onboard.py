@@ -192,7 +192,7 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
     configured = any(
         getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
@@ -219,10 +219,10 @@ def _validation_gateway(args: argparse.Namespace):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
-    from arctic_platform.correctness.harness.dss_driver import local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
-    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.correctness_participation") as url:
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.training") as url:
         yield url
 
 
@@ -340,7 +340,7 @@ def _resume_setup(args: argparse.Namespace) -> None:
     """Bind retained phase results to this config, options, sources and Python environment."""
     if not hasattr(args, "_resume_root"):
         return
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
 
     root = Path(__file__).resolve().parents[1]
     options = {
@@ -412,7 +412,7 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
     """Reuse only completed phases whose input specification and retained artifacts still match."""
     if not hasattr(args, "_resume_dir"):
         return operation()
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
 
     checkpoint = args._resume_dir / f"{phase}.json"
     input_spec = _checkpoint_file_identity(args.test_spec) if args.test_spec.exists() else None
@@ -456,7 +456,7 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
     if isinstance(result, dict) and result.get("model_path"):
         models[result["model_path"]] = model_identity(result["model_path"])
     if phase in {"references", "calibration", "validation"}:
-        from arctic_platform.correctness.harness.reference_records import DEFAULT_RECORDS_DIR
+        from arctic_platform.correctness.harness.storage import DEFAULT_RECORDS_DIR
 
         records = Path(args.reference_records_dir or DEFAULT_RECORDS_DIR) / args.test_spec.stem
         files.update({str(path): _checkpoint_file_identity(path) for path in records.rglob("*.json")})
@@ -520,8 +520,8 @@ def _select_source_checkpoint(override: str | None, config) -> str:
 def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str] | None = None) -> None:
     """Fail before fixture creation, sizing, calibration or adapter generation."""
     from arctic_platform.correctness.harness import storage
-    from arctic_platform.correctness.harness.dss_driver import _allocation_hostfile
-    from arctic_platform.correctness.harness.dss_driver import recover_local_cortex_gateway
+    from arctic_platform.correctness.harness.gateway import _allocation_hostfile
+    from arctic_platform.correctness.harness.gateway import recover_local_cortex_gateway
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
 
@@ -533,6 +533,21 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         ]
     if not selection:
         return
+    if not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection):
+        ds_config = config.training.get("ds_config") or {}
+        dtype = str(config.sub_job.get("dtype") or config.training.get("dtype") or "bfloat16").lower()
+        bf16 = ds_config.get("bf16")
+        bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
+        if bf16_enabled:
+            data_types = ds_config.get("data_types")
+            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else None
+            if accumulation != "fp32":
+                raise ValueError(
+                    f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "
+                    'Set data_types.grad_accum_dtype to "fp32" in the supplied configuration\'s training.ds_config '
+                    "(training_config.ds_config for Cortex recipes) before onboarding; "
+                    f"got {accumulation!r}. Onboarding does not change this setting."
+                )
     _configure_fixture_target(args, config, selection)
     if getattr(args, "_prerequisites_checked", False):
         return
@@ -627,7 +642,7 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         raise ValueError("onboarding prerequisites failed before model work:\n  " + "\n  ".join(failures))
     required_gpus = config.n_gpus
     if target_local and config.is_rl:
-        from arctic_platform.correctness.harness.dss_driver import rl_gpu_count
+        from arctic_platform.correctness.harness.gateway import rl_gpu_count
 
         required_gpus = rl_gpu_count(config)
     capacity = local["gpu_count"]
@@ -757,16 +772,16 @@ def _sizing_request(args: argparse.Namespace, layers: int) -> dict:
     import torch
     import transformers
 
-    from arctic_platform.correctness.harness.batches import SEED
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.reference_records import file_identity
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.storage import file_identity
 
     config = load_config(args.config)
     root = Path(__file__).resolve().parents[1]
     sources = [
         *sorted((root / "reference").glob("*.py")),
         root / "onboarding" / "synth_model.py",
-        *(root / "harness" / name for name in ("config.py", "batches.py", "sft.py", "names.py")),
+        *(root / "harness" / name for name in ("config.py", "sft.py", "sft.py", "optimizer.py")),
     ]
     return {
         "config_sha256": file_identity(args.config)["sha256"],
@@ -805,7 +820,7 @@ def _reuse_sizing(args: argparse.Namespace, layers: int) -> dict:
     from transformers import AutoConfig
 
     from arctic_platform.correctness.harness.config import hash_directory
-    from arctic_platform.correctness.harness.reference_records import model_identity
+    from arctic_platform.correctness.harness.storage import model_identity
     from arctic_platform.correctness.onboarding.synth_model import count_parameters
 
     receipt = _read_sizing_json(args.reuse_sizing, args.reuse_sizing_sha256)
@@ -876,9 +891,9 @@ def _probe_worker(args: argparse.Namespace) -> int:
     import torch
     from transformers import AutoConfig
 
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.reference.hf_single_gpu import run as run_reference
 
@@ -942,10 +957,10 @@ def _probe_worker(args: argparse.Namespace) -> int:
 
 def _spec_arms(cfg, arm_defs, vocab_size: int):
     """Describe the same generated comparison cases for reduced and full-source specifications."""
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
     from arctic_platform.correctness.harness.config import ArmSpec
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 
     arms = []
     for definition in arm_defs:
@@ -1056,7 +1071,7 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
 
 
 def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
-    from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+    from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
     path = getattr(args, "peft_adapter", None)
     if not config.training.get("peft_config"):
@@ -1064,7 +1079,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
             raise ValueError("--peft-adapter requires a LoRA training config")
         return None
     if path is None:
-        from arctic_platform.correctness.harness.shared_lora_adapter import generate_adapter
+        from arctic_platform.correctness.harness.lora import generate_adapter
 
         if model_path is None:
             return None
@@ -1139,15 +1154,15 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from transformers import AutoConfig
 
     from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import build_batch
-    from arctic_platform.correctness.harness.batches import save
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.report import reference_progress
     from arctic_platform.correctness.harness.runner import run_reference
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
+    from arctic_platform.correctness.harness.sft import save
 
     config = load_config(args.config)
     spec = TestSpec.read(args.test_spec)
@@ -1546,21 +1561,21 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
     """Publish fresh per-arm scalar-norm references, never a legacy full-tensor gate."""
     from transformers import AutoConfig
 
-    from arctic_platform.correctness.harness.batches import SEED
-    from arctic_platform.correctness.harness.batches import load as load_batch
     from arctic_platform.correctness.harness.config import ArmDefinition
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.reference_records import CRITERIA
-    from arctic_platform.correctness.harness.reference_records import batch_identity
-    from arctic_platform.correctness.harness.reference_records import file_identity
-    from arctic_platform.correctness.harness.reference_records import load_record
-    from arctic_platform.correctness.harness.reference_records import model_identity
-    from arctic_platform.correctness.harness.reference_records import publish_record_set
-    from arctic_platform.correctness.harness.reference_records import require_git_records_dir
-    from arctic_platform.correctness.harness.reference_records import workload_identity
     from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
     from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import load as load_batch
+    from arctic_platform.correctness.harness.storage import CRITERIA
+    from arctic_platform.correctness.harness.storage import batch_identity
+    from arctic_platform.correctness.harness.storage import file_identity
+    from arctic_platform.correctness.harness.storage import load_record
+    from arctic_platform.correctness.harness.storage import model_identity
+    from arctic_platform.correctness.harness.storage import publish_record_set
+    from arctic_platform.correctness.harness.storage import require_git_records_dir
+    from arctic_platform.correctness.harness.storage import workload_identity
     from arctic_platform.correctness.reference.model_features import uses_mixer_packing
 
     test_id = "single-step-optimizer"
@@ -1617,7 +1632,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         expected_model = model_identity(args.optimizer_model_path)
         initialization = "external-model"
         if config.training.get("peft_config"):
-            from arctic_platform.correctness.harness.shared_lora_adapter import adapter_identity
+            from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
             initialization = adapter_identity(_shared_adapter(args, config, args.optimizer_model_path))
         training = config.effective_training
@@ -1825,7 +1840,7 @@ def _parent(args: argparse.Namespace) -> int:
 
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import validate_against_host
-    from arctic_platform.correctness.harness.dss_driver import available_gpus
+    from arctic_platform.correctness.harness.gateway import available_gpus
     from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
 
     config = load_config(args.config)
@@ -1844,7 +1859,7 @@ def _parent(args: argparse.Namespace) -> int:
         raise ValueError("local Cortex fixture onboarding requires supervised Cortex gradients or optimizer")
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.execution import _client_backend
-        from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
         if not local_fixture:
             raise ValueError("Cortex onboarding requires an explicit local Cortex fixture")
@@ -2083,8 +2098,8 @@ def _prepare_references(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.execution import _client_backend
-    from arctic_platform.correctness.harness.reference_records import require_git_records_dir
     from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.storage import require_git_records_dir
 
     selection = args.reference_tests or [args.test_id]
     if any(test_id not in CALIBRATED_TEST_IDS for test_id in selection):
@@ -2200,11 +2215,11 @@ def run(args: argparse.Namespace) -> int:
 def _onboard_configuration(args: argparse.Namespace) -> int:
     """Resolve a config-only onboarding request and retain each check's actual result."""
     from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.dss_driver import UnsafeCleanupError
-    from arctic_platform.correctness.harness.reference_records import CRITERIA
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
     from arctic_platform.correctness.harness.report import total_duration
+    from arctic_platform.correctness.harness.storage import CRITERIA
 
     if not hasattr(args, "_onboarding_times"):
         args._onboarding_times = {}

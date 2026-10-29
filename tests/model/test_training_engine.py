@@ -57,45 +57,6 @@ def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
     assert "sequence_parallel_size" not in ds_config
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
-@pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_job_accumulates_gradients_in_float32(dtype, fp32_masters):
-    ds_config = build_deepspeed_config(_spec(dtype=dtype, fp32_masters=fp32_masters))
-
-    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
-
-
-@pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])
-def test_other_precisions_leave_accumulation_dtype_to_deepspeed(dtype):
-    ds_config = build_deepspeed_config(_spec(dtype=dtype))
-
-    assert "data_types" not in ds_config
-
-
-@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
-def test_explicit_accumulation_override_is_preserved(data_types):
-    override = {"data_types": data_types.copy()}
-    ds_config = build_deepspeed_config(_spec(ds_overrides=override))
-
-    assert ds_config["data_types"] == data_types
-    assert override == {"data_types": data_types}
-
-
-@pytest.mark.parametrize("fp32_masters", [False, True])
-def test_deepspeed_resolves_float32_accumulation_without_changing_model_precision(fp32_masters):
-    from deepspeed.runtime.config import DeepSpeedConfig
-    from deepspeed.runtime.engine import DeepSpeedEngine
-
-    ds_config = build_deepspeed_config(_spec(world_size=1, fp32_masters=fp32_masters))
-    config = DeepSpeedConfig(ds_config)
-    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
-    object.__setattr__(engine, "_config", config)
-
-    assert engine.get_data_types() == (torch.bfloat16, torch.float32)
-    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is not fp32_masters
-    assert ds_config["bf16"]["bf16_optimizer_states"] is not fp32_masters
-
-
 def test_float32_job_disables_reduced_precision_and_leaves_the_reduction_unset():
     ds_config = build_deepspeed_config(_spec(dtype="float32"))
 
@@ -177,6 +138,44 @@ def test_nonfused_generic_offload_names_select_standard_cpu_arithmetic():
         assert resolve_optimizer_name(name, _OFFLOAD, fused=False) == "torch_cpu_adamw"
     assert resolve_optimizer_name("torch_adamw", _OFFLOAD) == "torch_cpu_adamw"
     assert resolve_optimizer_name("cpu_adam", _OFFLOAD, fused=False) == "deepspeed_cpu_adam"
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("name", ["", " ", "adam", " AdamW "])
+def test_default_optimizer_resolution_preserves_offload_and_fused_policy(name, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if not cpu_offload:
+        expected = "fused_adam"
+    elif fused:
+        expected = "deepspeed_cpu_adam"
+    else:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("fusedadam", "fused_adam"),
+        (" Fused-Adam ", "fused_adam"),
+        ("torch_adamw", "torch_adamw"),
+        (" Torch-AdamW ", "torch_adamw"),
+        ("deepspeed_cpu_adam", "deepspeed_cpu_adam"),
+        ("deepspeedcpuadam", "deepspeed_cpu_adam"),
+        ("cpu_adam", "deepspeed_cpu_adam"),
+        ("cpuadam", "deepspeed_cpu_adam"),
+        ("deep_speed_cpu_adam", "deepspeed_cpu_adam"),
+        (" Deep-Speed-CPU-Adam ", "deepspeed_cpu_adam"),
+    ],
+)
+def test_explicit_optimizer_aliases_preserve_selection_and_cpu_placement(name, expected, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if expected == "torch_adamw" and cpu_offload:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
 
 
 def test_unknown_optimizer_names_are_rejected():
@@ -440,10 +439,11 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 def test_initialize_glm_cpu_offload_honors_nonfused_policy(monkeypatch, force_cpu_optimizer):
     calls = {}
 
-    class _CPUAdam:
+    class _CPUAdam(torch.optim.Optimizer):
         def __init__(self, param_groups, **kwargs):
-            self.param_groups = param_groups
+            super().__init__(param_groups, {})
             self.adam_w_mode = kwargs["adamw_mode"]
+            self.fp32_optimizer_states = kwargs["fp32_optimizer_states"]
             self.ds_opt_adam = object()
 
     def _initialize(*, model, config, **kwargs):
@@ -622,6 +622,62 @@ def test_nonfused_cpu_adam_native_counter_and_checkpoint_resume(parameter_dtype,
                 torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
 
 
+def test_cpu_adam_checkpoint_hooks_preserve_mixed_groups_without_aliasing_saved_moments():
+    from copy import deepcopy
+
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameters = [
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.float32)),
+    ]
+    optimizer = torch.optim.AdamW([{"params": [parameter]} for parameter in parameters])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    for parameter in parameters:
+        optimizer.state[parameter] = {
+            "step": torch.tensor(2.0),
+            "exp_avg": torch.tensor([0.123456, 0.234567, 0.345678]),
+            "exp_avg_sq": torch.tensor([0.012345, 0.023456, 0.034567]),
+        }
+    checkpoint = deepcopy(optimizer.state_dict())
+    for _ in range(2):
+        optimizer.load_state_dict(checkpoint)
+        assert checkpoint_state.moments == []
+        for index, parameter in enumerate(parameters):
+            for name in ("exp_avg", "exp_avg_sq"):
+                assert optimizer.state[parameter][name].dtype == torch.float32
+                torch.testing.assert_close(
+                    optimizer.state[parameter][name], checkpoint["state"][index][name], rtol=0, atol=0
+                )
+        saved_moment = checkpoint["state"][0]["exp_avg"].clone()
+        optimizer.state[parameters[0]]["exp_avg"].add_(1)
+        torch.testing.assert_close(checkpoint["state"][0]["exp_avg"], saved_moment, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid_groups", [None, [], [{"params": []}]])
+def test_cpu_adam_checkpoint_hooks_keep_empty_state_and_native_group_validation(invalid_groups):
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameter = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    optimizer = torch.optim.AdamW([parameter])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    checkpoint = optimizer.state_dict()
+    if invalid_groups is None:
+        optimizer.load_state_dict(checkpoint)
+    else:
+        checkpoint["param_groups"] = invalid_groups
+        with pytest.raises(ValueError, match="parameter group"):
+            optimizer.load_state_dict(checkpoint)
+    assert not optimizer.state
+    assert checkpoint_state.moments == []
+
+
 class _ZeroInitializationFixture:
     def __init__(self):
         self.partition_size = [4, 2]
@@ -698,22 +754,44 @@ def test_zero_initialization_trace_disabled_keeps_config_identity(monkeypatch):
         deepspeed_zero_initialization, "zero_optimizer_class", lambda: pytest.fail("disabled trace imported ZeRO")
     )
     config = {"zero_optimization": {"stage": 2}}
-    assert deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
-        lambda **kwargs: kwargs, config, 0, model="model"
-    ) == {"config": config, "model": "model"}
+    with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+        assert init_config is config
+
+
+def test_zero_initialization_trace_rejects_missing_source_before_opening_trace(monkeypatch):
+    import inspect
+
+    from arctic_platform.debug import deepspeed_zero_initialization
+
+    original = _ZeroInitializationFixture.initialize_optimizer_states
+    monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
+    monkeypatch.setattr(inspect, "getsourcefile", lambda method: None)
+    monkeypatch.setattr(
+        deepspeed_zero_initialization, "open_trace", lambda *args: pytest.fail("unidentified source opened a trace")
+    )
+    config = {
+        deepspeed_zero_initialization.TRAINING_OPTION: {
+            "request_id": "missing-source",
+            "output_dir": "/data-fast/tmp/zero-test",
+        }
+    }
+    with pytest.raises(RuntimeError, match="inspectable optimizer source"):
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0):
+            pytest.fail("unidentified source entered initialization context")
+    assert _ZeroInitializationFixture.initialize_optimizer_states is original
+    assert deepspeed_zero_initialization.TRAINING_OPTION in config
 
 
 @pytest.mark.parametrize("fail_before_method", [False, True])
 def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatch, fail_before_method):
     import io
     import json
-    from contextlib import nullcontext
 
     from arctic_platform.debug import deepspeed_zero_initialization
 
     stream = io.StringIO()
     monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
-    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: nullcontext(stream))
+    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: stream)
     original = _ZeroInitializationFixture.initialize_optimizer_states
     config = {
         deepspeed_zero_initialization.TRAINING_OPTION: {
@@ -723,25 +801,98 @@ def test_zero_initialization_trace_removes_option_and_restores_method(monkeypatc
         "zero_optimization": {"stage": 2},
     }
 
-    def initialize(**kwargs):
-        assert deepspeed_zero_initialization.TRAINING_OPTION not in kwargs["config"]
+    def initialize():
         if fail_before_method:
             raise RuntimeError("engine failed before optimizer")
         return _ZeroInitializationFixture().initialize_optimizer_states()
 
     if fail_before_method:
         with pytest.raises(RuntimeError, match="engine failed before optimizer"):
-            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
+            with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+                assert init_config == {"zero_optimization": {"stage": 2}}
+                initialize()
     else:
-        assert (
-            deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(initialize, config, 0)
-            == "initialized"
-        )
-        rows = [json.loads(line) for line in stream.getvalue().splitlines()]
-        assert rows[0]["request_id"] == "test"
-        assert rows[-1]["event"] == "INITIALIZATION_COMPLETE"
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(config, 0) as init_config:
+            assert init_config == {"zero_optimization": {"stage": 2}}
+            assert initialize() == "initialized"
+            rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+            assert rows[0]["request_id"] == "test"
+            assert rows[-1]["event"] == "INITIALIZATION_COMPLETE"
+    assert stream.closed
     assert _ZeroInitializationFixture.initialize_optimizer_states is original
     assert deepspeed_zero_initialization.TRAINING_OPTION in config
+
+
+@pytest.mark.parametrize("with_optimizer", [False, True])
+@pytest.mark.parametrize("trace_enabled", [False, True])
+@pytest.mark.parametrize("fail_initialize", [False, True])
+def test_engine_initializes_once_inside_optional_trace(monkeypatch, with_optimizer, trace_enabled, fail_initialize):
+    import io
+
+    from arctic_platform.debug import deepspeed_zero_initialization
+
+    stream = io.StringIO()
+    original = _ZeroInitializationFixture.initialize_optimizer_states
+    monkeypatch.setattr(deepspeed_zero_initialization, "zero_optimizer_class", lambda: _ZeroInitializationFixture)
+    monkeypatch.setattr(deepspeed_zero_initialization, "open_trace", lambda directory, rank: stream)
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    built = object()
+    monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: built)
+    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
+    ds_config = {"zero_optimization": {"stage": 2}}
+    if trace_enabled:
+        ds_config[deepspeed_zero_initialization.TRAINING_OPTION] = {
+            "request_id": "engine-test",
+            "output_dir": "/data-fast/tmp/zero-test",
+        }
+    model = torch.nn.Linear(1, 1)
+    mpu = object()
+    calls = []
+    failure = RuntimeError("engine initialization failed")
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        assert (_ZeroInitializationFixture.initialize_optimizer_states is not original) is trace_enabled
+        assert kwargs["config"] == {"zero_optimization": {"stage": 2}}
+        if not trace_enabled:
+            assert kwargs["config"] is ds_config
+        assert kwargs["model"] is model
+        assert kwargs["mpu"] is mpu
+        if with_optimizer:
+            assert kwargs["optimizer"] is built
+        else:
+            assert "optimizer" not in kwargs
+        if fail_initialize:
+            raise failure
+        assert _ZeroInitializationFixture().initialize_optimizer_states() == "initialized"
+        return "engine", kwargs.get("optimizer"), None, None
+
+    monkeypatch.setattr("deepspeed.initialize", initialize)
+
+    def run():
+        return initialize_training_engine(
+            model,
+            ds_config,
+            optimizer=OptimizerSettings() if with_optimizer else None,
+            ep_size=1,
+            mpu=mpu,
+            model_path="unused",
+            rank=0,
+        )
+
+    if fail_initialize:
+        with pytest.raises(RuntimeError) as caught:
+            run()
+        assert caught.value is failure
+    else:
+        engine, optimizer, choice = run()
+        assert engine == "engine"
+        assert optimizer is (built if with_optimizer else None)
+        assert (choice is not None) is with_optimizer
+    assert len(calls) == 1
+    assert _ZeroInitializationFixture.initialize_optimizer_states is original
+    assert stream.closed is trace_enabled
+    assert (deepspeed_zero_initialization.TRAINING_OPTION in ds_config) is trace_enabled
 
 
 @pytest.mark.parametrize(
@@ -757,8 +908,59 @@ def test_zero_initialization_trace_rejects_invalid_request(option, rank):
     from arctic_platform.debug import deepspeed_zero_initialization
 
     with pytest.raises(ValueError):
-        deepspeed_zero_initialization.maybe_initialize_with_zero_allocation_trace(
-            lambda **kwargs: pytest.fail("invalid trace initialized engine"),
-            {deepspeed_zero_initialization.TRAINING_OPTION: option},
-            rank,
-        )
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(
+            {deepspeed_zero_initialization.TRAINING_OPTION: option}, rank
+        ):
+            pytest.fail("invalid trace entered initialization context")
+
+
+@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
+def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
+    class Adam:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
+    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
+    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
+        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
+    assert f"using optimizer='{expected}'" in caplog.text
+
+
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_deepspeed_resolves_float32_accumulation_without_changing_model_precision(fp32_masters):
+    from deepspeed.runtime.config import DeepSpeedConfig
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    ds_config = build_deepspeed_config(_spec(world_size=1, fp32_masters=fp32_masters))
+    config = DeepSpeedConfig(ds_config)
+    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
+    object.__setattr__(engine, "_config", config)
+
+    assert engine.get_data_types() == (torch.bfloat16, torch.float32)
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is not fp32_masters
+    assert ds_config["bf16"]["bf16_optimizer_states"] is not fp32_masters
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_bfloat16_job_accumulates_gradients_in_float32(dtype, fp32_masters):
+    ds_config = build_deepspeed_config(_spec(dtype=dtype, fp32_masters=fp32_masters))
+
+    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+
+
+@pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])
+def test_other_precisions_leave_accumulation_dtype_to_deepspeed(dtype):
+    ds_config = build_deepspeed_config(_spec(dtype=dtype))
+
+    assert "data_types" not in ds_config
+
+
+@pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
+def test_explicit_accumulation_override_is_preserved(data_types):
+    override = {"data_types": data_types.copy()}
+    ds_config = build_deepspeed_config(_spec(ds_overrides=override))
+
+    assert ds_config["data_types"] == data_types
+    assert override == {"data_types": data_types}

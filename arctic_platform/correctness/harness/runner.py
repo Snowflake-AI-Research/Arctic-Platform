@@ -39,14 +39,25 @@ from typing import Optional
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
-from arctic_platform.debug.reduced_fixture_mtp import maybe_bind_reduced_fixture_mtp
+from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import build_payload
+from arctic_platform.correctness.harness.gateway import (
+    dss_driver_copy_checkpoint_peft_adapter as copy_checkpoint_peft_adapter,
+)
+from arctic_platform.correctness.harness.gateway import fwd_bwd_step
+from arctic_platform.correctness.harness.gateway import gateway
+from arctic_platform.correctness.harness.gateway import pack
+from arctic_platform.correctness.harness.gateway import running_job
+from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
+from arctic_platform.correctness.harness.sft import save
+from arctic_platform.correctness.harness.storage import correctness_workdir
+from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..reference.model_features import uses_mixer_packing
 from . import report as console
-from .batches import SEED
-from .batches import build_batch
-from .batches import save
 from .config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from .config import ArmDefinition
 from .config import ArmSpec
@@ -54,18 +65,9 @@ from .config import LoadedConfig
 from .config import TestSpec
 from .config import correctness_microbatch_tokens
 from .config import reference_calibration_worker_count
-from .dss_driver import UnsafeCleanupError
-from .dss_driver import build_payload
-from .dss_driver import copy_checkpoint_peft_adapter
-from .dss_driver import fwd_bwd_step
-from .dss_driver import gateway
-from .dss_driver import pack
-from .dss_driver import running_job
 from .registry import TestOutcome
 from .registry import TestResult
 from .registry import registered_tests
-from .storage import correctness_workdir
-from .storage import require_data_fast_path
 
 
 @dataclass
@@ -88,7 +90,6 @@ class RunContext:
     prepare_references: bool = False
     reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
     reference_record_paths: Dict[str, str] = field(default_factory=dict)
-    reference_record_provenance: Dict[str, dict] = field(default_factory=dict)
     _reference: Dict[str, dict] = field(default_factory=dict)
     _reference_by_check: Dict[str, Dict[str, dict]] = field(default_factory=dict)
     _target: Dict[str, object] = field(default_factory=dict)
@@ -210,8 +211,8 @@ def run_reference(
         # One reference per GPU lets independent runs proceed concurrently; the run itself is single-GPU
         # either way, so pinning changes only which device it lands on.
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-    from .storage import CORRECTNESS_LOGDIR_ENV
-    from .storage import correctness_logdir
+    from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
+    from arctic_platform.correctness.harness.storage import correctness_logdir
 
     if os.environ.get(CORRECTNESS_LOGDIR_ENV):
         log_dir = correctness_logdir("hf-reference-")
@@ -255,7 +256,7 @@ def materialize_dss_peft_adapter(
     cfg = cfg.at_gpu_width(cfg.n_gpus)
     backend = None
     if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
-        from .hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
         if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
             raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
@@ -285,7 +286,7 @@ def materialize_dss_peft_adapter(
     with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
         with running_job(session, payload) as job:
             if backend is not None:
-                from .hosted import _local_checkpoint_metadata
+                from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
 
                 # The native EP checkpointer writes the unmerged adapter under global_step0/default.
                 saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
@@ -400,7 +401,6 @@ def execute(
     prepare_references: bool = False,
     reference_records_dir: Path | None = None,
     peft_adapter: Path | None = None,
-    historical_gradient_references: dict | None = None,
     reference_calibration_runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS,
     reference_calibration_workers: int | None = None,
     native_optimizer_scope=None,
@@ -417,19 +417,6 @@ def execute(
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
-    if historical_gradient_references is not None:
-        if (
-            select != ["single-step-grads"]
-            or prepare_references
-            or cfg.is_rl
-            or not isinstance(historical_gradient_references, dict)
-            or not historical_gradient_references
-            or set(historical_gradient_references) != {arm.name for arm in arm_defs}
-        ):
-            raise ValueError(
-                "historical gradient references require only single-step-grads and exactly the selected SFT arms"
-            )
-        historical_gradient_references = deepcopy(historical_gradient_references)
     if prepare_references and (not select or not set(select) <= {"single-step-grads", "single-step-optimizer"}):
         raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
@@ -444,7 +431,7 @@ def execute(
         raise ValueError("deterministic LoRA SAVE0 execution is retired; use --peft-adapter on-prem")
     shared_adapter_identity = None
     if peft_adapter is not None:
-        from .shared_lora_adapter import adapter_identity
+        from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
         if (
             cfg.is_rl
@@ -464,8 +451,8 @@ def execute(
         peft_adapter = require_data_fast_path(peft_adapter, label="shared PEFT adapter").resolve(strict=True)
         shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
     if dense_checkpoint_allocation is not None:
-        from .cortex_optimizer import validate_dense_checkpoint_allocation
-        from .hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.optimizer import validate_dense_checkpoint_allocation
 
         ds_config = cfg.training.get("ds_config") or {}
         expert = ds_config.get("expert_parallel") or {}
@@ -501,8 +488,8 @@ def execute(
         or native_optimizer_scope_source is not None
         or native_optimizer_supplier_source is not None
     ):
-        from .cortex_optimizer import verify_native_callback
-        from .hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.optimizer import verify_native_callback
 
         if (
             not local_cortex_fixture
@@ -522,7 +509,7 @@ def execute(
     results: List[TestResult] = []
     published_fixture = None
     if local_cortex_fixture and not prepare_references:
-        from .cortex import load_local_fixture
+        from arctic_platform.correctness.harness.cortex import load_local_fixture
 
         if not isinstance(client_backend, CortexConfig) or cortex_fixture is not None:
             raise ValueError("local Cortex fixture requires CortexConfig without a publication receipt")
@@ -545,7 +532,7 @@ def execute(
                 cfg.n_gpus,
             )
     if cortex_fixture is not None:
-        from .cortex import load_fixture
+        from arctic_platform.correctness.harness.cortex import load_fixture
 
         if not isinstance(client_backend, CortexConfig):
             raise ValueError("--cortex-fixture requires --backend cortex")
@@ -681,8 +668,8 @@ def execute(
                 payload["hardware"] = cfg.gpu_type.upper()
         if context.reference_adapter_path is not None:
             if native_first_two_adapter:
-                from .lora import bind_payload
-                from .shared_lora_adapter import adapter_identity
+                from arctic_platform.correctness.harness.lora import bind_payload
+                from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
                 if adapter_identity(context.reference_adapter_path) != shared_adapter_identity:
                     raise ValueError("shared adapter changed before native target binding")
@@ -700,7 +687,7 @@ def execute(
     def measure_target(session, job, arm: ArmSpec):
         body = body_for(arm)
         if stepping and isinstance(client_backend, CortexConfig):
-            from .cortex_optimizer import capture_optimizer_step
+            from arctic_platform.correctness.harness.optimizer import capture_optimizer_step
 
             def capture(supplier=None):
                 return capture_optimizer_step(
@@ -729,7 +716,7 @@ def execute(
 
             if native_optimizer_scope is None:
                 return capture()
-            from .cortex_optimizer import verify_native_callback
+            from arctic_platform.correctness.harness.optimizer import verify_native_callback
 
             supplier_source = (
                 native_optimizer_scope_source
@@ -767,8 +754,8 @@ def execute(
     reference_training = cfg.effective_training
     if per_arm_tests and cfg.training.get("peft_config"):
         if peft_adapter is None:
-            from .shared_lora_adapter import adapter_identity
-            from .shared_lora_adapter import generate_adapter
+            from arctic_platform.correctness.harness.lora import generate_adapter
+            from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
             if (
                 not prepare_references
@@ -795,7 +782,7 @@ def execute(
         # Reject an unsupported native pack before reading references or allocating target resources.
         payload_for(arm_specs[0])
 
-    from .batches import load as load_batch
+    from arctic_platform.correctness.harness.sft import load as load_batch
 
     def measure_reference(
         arm: ArmSpec,
@@ -819,7 +806,7 @@ def execute(
             optimizer_output_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
             if reference_adapter_path is not None:
-                from .shared_lora_adapter import adapter_identity
+                from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
                 if adapter_identity(reference_adapter_path) != shared_adapter_identity:
                     raise ValueError("shared adapter changed before HF reference execution")
@@ -868,12 +855,12 @@ def execute(
         context._timing.setdefault(arm.name, {})["reference"] = elapsed
         return ref
 
-    from .reference_records import ReferencePrerequisiteError
-    from .reference_records import batch_identity
-    from .reference_records import load_record
-    from .reference_records import model_identity
-    from .reference_records import publish_record_set
-    from .reference_records import workload_identity
+    from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
+    from arctic_platform.correctness.harness.storage import batch_identity
+    from arctic_platform.correctness.harness.storage import load_record
+    from arctic_platform.correctness.harness.storage import model_identity
+    from arctic_platform.correctness.harness.storage import publish_record_set
+    from arctic_platform.correctness.harness.storage import workload_identity
 
     def reference_identity(test_id: str, arm: ArmSpec) -> dict:
         batch = load_batch(batch_paths[arm.name])
@@ -924,16 +911,7 @@ def execute(
         records = {}
         for test_id, identity in identities.items():
             try:
-                if historical_gradient_references is not None:
-                    records[test_id] = load_record(
-                        context, identity, historical_binding=historical_gradient_references[arm.name]
-                    )
-                    (tmp / "reference-record-provenance.json").write_text(
-                        json.dumps(context.reference_record_provenance, indent=2, sort_keys=True, allow_nan=False)
-                        + "\n"
-                    )
-                else:
-                    records[test_id] = load_record(context, identity)
+                records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
                 if not prepare_references or not any(
                     message in str(exc)

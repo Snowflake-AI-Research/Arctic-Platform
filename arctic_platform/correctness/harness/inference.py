@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"Inference tensor schemas and bounded checkpoint export."
+"""Inference exports and router-replay receipts."""
 
 from __future__ import annotations
 
@@ -41,9 +41,10 @@ from urllib.parse import urlsplit
 import requests
 
 from arctic_platform.client.requests import export_checkpoint_request
+from arctic_platform.correctness.harness.storage import parse_hostfile
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-from .storage import parse_hostfile
-from .storage import require_data_fast_path
+# Inference Export
 
 FAMILIES = {
     "qwen3_5": ("Qwen3_5ForConditionalGeneration", "qwen3_5_text", "Qwen3_5ForCausalLM"),
@@ -196,7 +197,7 @@ def validate_qwen4_full_schema(source_schema, export_schema):
 
 def validate_qwen4_local_export(source_config_path, source_index_path, weights_dir):
     """Retain an exact, generation-bound mismatch receipt without reading tensor payloads."""
-    from .storage import correctness_logdir
+    from arctic_platform.correctness.harness.storage import correctness_logdir
 
     source_config_path, source_index_path, weights_dir = map(
         Path, (source_config_path, source_index_path, weights_dir)
@@ -811,20 +812,16 @@ def _stop_local_children(children):
 
 def _local_worker_argv(python, role, request):
     source_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    from . import storage
+    from arctic_platform.correctness.harness import storage
 
     storage_sha = hashlib.sha256(Path(storage.__file__).read_bytes()).hexdigest()
     source_root = Path(__file__).resolve().parents[3]
     # SSH does not inherit PYTHONPATH. Bind the released source before importing the receiver.
     code = (
-        "import hashlib,pathlib,sys;"
-        f"root=pathlib.Path({str(source_root)!r});sys.path.insert(0,str(root));"
-        "assert hashlib.sha256((root/'arctic_platform/correctness/harness/inference_export.py').read_bytes())"
-        f".hexdigest()=={source_sha!r};"
-        "assert hashlib.sha256((root/'arctic_platform/correctness/harness/storage.py').read_bytes())"
-        f".hexdigest()=={storage_sha!r};"
-        "from arctic_platform.correctness.harness import inference_export as m;"
-        f"m._local_worker({role!r},{request!r})"
+        f"import hashlib,pathlib,sys;root=pathlib.Path({str(source_root)!r});sys.path.insert(0,str(root));assert"
+        f" hashlib.sha256((root/'arctic_platform/correctness/harness/inference.py').read_bytes()).hexdigest()=={source_sha!r};assert"
+        f" hashlib.sha256((root/'arctic_platform/correctness/harness/storage.py').read_bytes()).hexdigest()=={storage_sha!r};from"
+        f" arctic_platform.correctness.harness import inference as m;m._local_worker({role!r},{request!r})"
     )
     return [python, "-B", "-c", code]
 
@@ -1313,7 +1310,7 @@ def require_local_inference_export_locality(ctx, root):
         raise ValueError("trained export inventory changed after locality publication")
 
 
-_CHUNK_BYTES = 1024 * 1024
+INFERENCE_EXPORT_CHUNK_BYTES = 1024 * 1024
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _RECEIPT_NAME = "export_receipt.json"
 _OPTIMIZER_NAME = re.compile(r"(bf16_)?zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_00_optim_states\.pt")
@@ -1508,7 +1505,7 @@ def _download_file(session: requests.Session, root: Path, entry: dict, deadline:
             # iter_content which can wait for a full chunk despite a slow trickle.
             while count < expected or length is None:
                 settimeout(min(60.0, _remaining(deadline)))
-                limit = min(_CHUNK_BYTES, expected - count + 1)
+                limit = min(INFERENCE_EXPORT_CHUNK_BYTES, expected - count + 1)
                 chunk = read1(limit, decode_content=False)
                 _remaining(deadline)
                 if not isinstance(chunk, bytes) or len(chunk) > limit:

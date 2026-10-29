@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"Local gateway optimizer snapshots and source-bound ZeRO2 decoding."
+"""Parameter alignment, participation, and optimizer capture."""
 
 from __future__ import annotations
 
@@ -42,20 +42,1214 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from tempfile import TemporaryDirectory
 from tempfile import TemporaryFile
+from typing import Any
+from typing import Dict
+from typing import Iterable
+from typing import Iterator
+from typing import List
+from typing import Optional
+from typing import Tuple
 
 import torch
+import torch.distributed as dist
 
 from arctic_platform.client import CortexConfig
+from arctic_platform.correctness.harness.cortex import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import ArcticJob
+from arctic_platform.correctness.harness.gateway import GatewaySession
+from arctic_platform.correctness.harness.gateway import StepResult
+from arctic_platform.correctness.harness.gateway import fwd_bwd_step
+from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
+from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import merge_worker_receipts
 
-from .dss_driver import ArcticJob
-from .dss_driver import GatewaySession
-from .dss_driver import StepResult
-from .dss_driver import fwd_bwd_step
-from .hosted import require_local_cortex_gateway
-from .hosted import save_and_resolve_checkpoint_id
-from .optimizer_capture import tensor_digest
-from .storage import require_data_fast_path
-from .transport import UnsafeCleanupError
+# Names
+
+_CONTAINER_SEGMENTS = frozenset(
+    {
+        "module",
+        "_forward_module",
+        "_orig_mod",
+        "_checkpoint_wrapped_module",
+        "model",
+        "language_model",
+        "text_model",
+        "base_model",
+        "transformer",
+    }
+)
+
+_ROUTED_EXPERT = re.compile(r"^(?P<prefix>.*\.mlp\.experts)\.(?P<weight>w[123])$")
+_SHARED_EXPERT = re.compile(
+    r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?(?:qwen_)?shared_expert\.(?P<weight>w[123])\.weight$"
+)
+_BARE_SHARED_EXPERT = re.compile(r"^(?P<layer>(?:.*\.)?layers\.\d+)\.mlp\.shared_expert\.(?P<weight>w[123])$")
+_SHARED_NAMES = {
+    "w1": "gate_proj.weight",
+    "w2": "down_proj.weight",
+    "w3": "up_proj.weight",
+}
+
+
+@dataclass
+class _Entry:
+    originals: List[str]
+    value: float
+
+
+def normalize(name: str) -> str:
+    return ".".join(part for part in name.split(".") if part not in _CONTAINER_SEGMENTS)
+
+
+def _shared_expert_name(name: str) -> Optional[str]:
+    match = _SHARED_EXPERT.match(name)
+    container = "shared_expert"
+    if match is None:
+        # GLM-5.3 uses bare Prime projections and a plural HF shared-experts container.
+        match = _BARE_SHARED_EXPERT.match(name)
+        container = "shared_experts"
+    if match is None:
+        return None
+    return f"{match.group('layer')}.mlp.{container}.{_SHARED_NAMES[match.group('weight')]}"
+
+
+def _insert(entries: Dict[str, _Entry], key: str, original: str, value: float) -> None:
+    existing = entries.get(key)
+    if existing is None:
+        entries[key] = _Entry([original], float(value))
+        return
+    if existing.value == float(value):
+        existing.originals.append(original)
+        return
+    # Do not let normalization silently overwrite two different gradients. The synthetic key cannot match
+    # anything on the other side and therefore turns the collision into an explicit coverage failure.
+    entries[f"{key}::alias::{original}"] = _Entry([original], float(value))
+
+
+def _normalized(values: Dict[str, float]) -> Dict[str, _Entry]:
+    entries: Dict[str, _Entry] = {}
+    for original, value in values.items():
+        _insert(entries, normalize(original), original, float(value))
+    return entries
+
+
+def _canonical_dss(values: Dict[str, float]) -> Dict[str, _Entry]:
+    source = _normalized(values)
+    canonical: Dict[str, _Entry] = {}
+    routed: Dict[str, Dict[str, _Entry]] = {}
+
+    for key, entry in source.items():
+        match = _ROUTED_EXPERT.match(key)
+        if match:
+            weight = match.group("weight")
+            prefix = match.group("prefix")
+            if weight in {"w1", "w3"}:
+                routed.setdefault(prefix, {})[weight] = entry
+                continue
+            _insert(canonical, f"{prefix}.down_proj", entry.originals[0], entry.value)
+            canonical[f"{prefix}.down_proj"].originals.extend(entry.originals[1:])
+            continue
+
+        mapped = _shared_expert_name(key)
+        if mapped is not None:
+            _insert(canonical, mapped, entry.originals[0], entry.value)
+            canonical[mapped].originals.extend(entry.originals[1:])
+            continue
+
+        if ".mlp.router.gate.weight" in key:
+            mapped = key.replace(".mlp.router.gate.weight", ".mlp.gate.weight")
+        elif ".shared_expert_gate.weight" in key and ".mlp.shared_expert_gate.weight" not in key:
+            mapped = key.replace(".shared_expert_gate.weight", ".mlp.shared_expert_gate.weight")
+        else:
+            mapped = key
+        _insert(canonical, mapped, entry.originals[0], entry.value)
+        canonical[mapped].originals.extend(entry.originals[1:])
+
+    for prefix, pieces in routed.items():
+        if set(pieces) == {"w1", "w3"}:
+            w1, w3 = pieces["w1"], pieces["w3"]
+            key = f"{prefix}.gate_up_proj"
+            canonical[key] = _Entry(w1.originals + w3.originals, math.hypot(w1.value, w3.value))
+        else:
+            for weight, entry in pieces.items():
+                canonical[f"{prefix}.{weight}"] = entry
+    return canonical
+
+
+@dataclass(frozen=True)
+class CanonicalTensorGroup:
+    """Raw Arctic Platform tensor names that form one Hugging Face semantic parameter."""
+
+    originals: Tuple[str, ...]
+    concatenate_dim: Optional[int] = None
+
+
+def canonical_dss_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
+    """Group Arctic Platform tensor names by their Hugging Face parameter representation."""
+    canonical: Dict[str, CanonicalTensorGroup] = {}
+    routed: Dict[str, Dict[str, str]] = {}
+
+    for original in names:
+        key = normalize(original)
+        match = _ROUTED_EXPERT.match(key)
+        if match:
+            weight = match.group("weight")
+            prefix = match.group("prefix")
+            if weight in {"w1", "w3"}:
+                routed.setdefault(prefix, {})[weight] = key
+            else:
+                canonical[f"{prefix}.down_proj"] = CanonicalTensorGroup((key,))
+            continue
+
+        mapped = _shared_expert_name(key)
+        if mapped is not None:
+            canonical[mapped] = CanonicalTensorGroup((original,))
+            continue
+
+        if ".mlp.router.gate.weight" in key:
+            mapped = key.replace(".mlp.router.gate.weight", ".mlp.gate.weight")
+        elif ".shared_expert_gate.weight" in key and ".mlp.shared_expert_gate.weight" not in key:
+            mapped = key.replace(".shared_expert_gate.weight", ".mlp.shared_expert_gate.weight")
+        else:
+            mapped = key
+        canonical[mapped] = CanonicalTensorGroup((key,))
+
+    for prefix, pieces in routed.items():
+        if set(pieces) == {"w1", "w3"}:
+            canonical[f"{prefix}.gate_up_proj"] = CanonicalTensorGroup(
+                (pieces["w1"], pieces["w3"]),
+                concatenate_dim=1,
+            )
+        else:
+            for weight, original in pieces.items():
+                canonical[f"{prefix}.{weight}"] = CanonicalTensorGroup((original,))
+    return canonical
+
+
+def _originals(entries: Dict[str, _Entry], keys: set[str]) -> List[str]:
+    return sorted(original for key in keys for original in entries[key].originals)
+
+
+def align(
+    dss: Dict[str, float], reference: Dict[str, float]
+) -> Tuple[List[Tuple[str, float, float]], List[str], List[str]]:
+    """Pair every semantic tensor and return pairs plus uncovered raw names on either side."""
+    dss_by_key = _canonical_dss(dss)
+    ref_by_key = _normalized(reference)
+    shared = sorted(set(dss_by_key) & set(ref_by_key))
+    pairs = [(key, dss_by_key[key].value, ref_by_key[key].value) for key in shared]
+    only_dss_keys = set(dss_by_key) - set(ref_by_key)
+    only_ref_keys = set(ref_by_key) - set(dss_by_key)
+    return pairs, _originals(dss_by_key, only_dss_keys), _originals(ref_by_key, only_ref_keys)
+
+
+STATE_KEYS = ("parameter_update", "exp_avg", "exp_avg_sq")
+COMPARISON_STATE_KEYS = ("parameter_update_residual", "exp_avg", "exp_avg_sq")
+OPTIMIZER_NORM_CRITERION = "optimizer-state-l2-norm-v1"
+
+
+def validate_optimizer_norm_summary(summary: dict) -> dict:
+    """Return the canonical parameter mapping after validating the complete step-one norm schema."""
+    if not isinstance(summary, dict) or summary.get("criterion") != OPTIMIZER_NORM_CRITERION:
+        raise ValueError(f"optimizer norms require criterion {OPTIMIZER_NORM_CRITERION}")
+    if type(summary.get("step")) is not int or summary["step"] != 1:
+        raise ValueError("optimizer norms must describe step 1")
+    if summary.get("state_keys") != list(COMPARISON_STATE_KEYS):
+        raise ValueError("optimizer norms have incomplete or incompatible state coverage")
+    parameters = summary.get("parameters")
+    if not isinstance(parameters, dict) or not parameters:
+        raise ValueError("optimizer norms have no parameter coverage")
+    counts = {
+        "parameter_count": len(parameters),
+        "optimizer_values_count": len(parameters) * len(COMPARISON_STATE_KEYS),
+    }
+    for key, expected in counts.items():
+        if type(summary.get(key)) is not int or summary[key] != expected:
+            raise ValueError(f"optimizer norms have inconsistent {key}")
+    for name, values in parameters.items():
+        if not isinstance(name, str) or not name or normalize(name) != name:
+            raise ValueError("optimizer norms require nonempty canonical parameter names")
+        if not isinstance(values, dict) or set(values) != {"shape", *COMPARISON_STATE_KEYS}:
+            raise ValueError(f"optimizer norms for {name} have incomplete or incompatible state coverage")
+        shape = values["shape"]
+        if not isinstance(shape, list) or any(type(size) is not int or size < 0 for size in shape):
+            raise ValueError(f"optimizer norms for {name} have an invalid shape")
+        for state in COMPARISON_STATE_KEYS:
+            value = values[state]
+            if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+                raise ValueError(f"optimizer norm for {name}::{state} must be finite and nonnegative")
+    return parameters
+
+
+# Optimizer Capture
+
+
+def tensor_digest(tensor: torch.Tensor, *, chunk_bytes: int = 8 * 1024 * 1024) -> str:
+    if chunk_bytes < tensor.element_size():
+        raise ValueError("chunk_bytes must hold at least one tensor element")
+    digest = hashlib.sha256()
+
+    def update(value):
+        if value.numel() * value.element_size() <= chunk_bytes:
+            raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+            digest.update(memoryview(raw))
+            return
+        # Split by logical dimensions to bound copies even for noncontiguous tensors.
+        dimension = next(index for index, size in enumerate(value.shape) if size > 1)
+        midpoint = value.shape[dimension] // 2
+        update(value.narrow(dimension, 0, midpoint))
+        update(value.narrow(dimension, midpoint, value.shape[dimension] - midpoint))
+
+    update(tensor)
+    return digest.hexdigest()
+
+
+def model_state_manifest(engine, rank: int) -> dict:
+    model = engine.module
+    persistent_buffers = {
+        f"{prefix}.{name}" if prefix else name
+        for prefix, module in model.named_modules()
+        for name in module._buffers
+        if name not in module._non_persistent_buffers_set
+    }
+    entries = []
+    for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
+        for name, tensor in sorted(tensors):
+            entry = {
+                "name": name,
+                "kind": kind,
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "requires_grad": bool(tensor.requires_grad),
+                "group_name": getattr(tensor, "group_name", None),
+                "allreduce": getattr(tensor, "allreduce", True),
+                "sha256": tensor_digest(tensor),
+            }
+            if kind == "buffer":
+                entry["persistent"] = name in persistent_buffers
+            entries.append(entry)
+    return {
+        "rank": int(rank),
+        "engine": {
+            "global_steps": int(engine.global_steps),
+            "has_moe_layers": bool(engine.has_moe_layers),
+            "num_experts": list(engine.num_experts),
+        },
+        "tensors": entries,
+    }
+
+
+class ModelStateCaptureMixin:
+    """Record local tensors immediately before save and after load when opted in."""
+
+    _model_state_output_dir = None
+
+    def _capture_model_state(self, phase: str) -> None:
+        if self._model_state_output_dir is None:
+            return
+        import deepspeed
+
+        manifest = model_state_manifest(self.engine, self.rank)
+        manifest["deepspeed_version"] = deepspeed.__version__
+        directory = Path(self._model_state_output_dir) / phase
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"rank-{self.rank:05d}.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        print(
+            f"MODEL_STATE phase={phase} rank={self.rank} tensors={len(manifest['tensors'])} "
+            f"has_moe_layers={manifest['engine']['has_moe_layers']} "
+            f"step={manifest['engine']['global_steps']} deepspeed={manifest['deepspeed_version']}",
+            flush=True,
+        )
+
+    def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
+        self._capture_model_state("before-save")
+        return super().save_checkpoint(path, export_hf=export_hf)
+
+    def load_checkpoint(self, path: str) -> int:
+        restored_step = super().load_checkpoint(path)
+        self._capture_model_state("after-load")
+        return restored_step
+
+
+_OPTIMIZER_CAPTURE_WORKER: Any | None = None
+
+
+def _optimizer_capture_debug_config(job_config: dict) -> dict[str, Any]:
+    debug_config: dict[str, Any] = {}
+    for section in ("training_config", "ds_worker_config"):
+        config = job_config.get(section)
+        if config is None:
+            continue
+        if not isinstance(config, dict):
+            raise TypeError(f"{section} must be a dict")
+        debug = config.get("debug")
+        if debug is None:
+            continue
+        if not isinstance(debug, dict):
+            raise TypeError(f"{section}.debug must be a dict")
+        debug_config.update(debug)
+    return debug_config
+
+
+def _publish_optimizer_capture(workers: list[Any], manifest: str) -> None:
+    import ray
+
+    path = Path(manifest)
+    if not path.is_absolute():
+        raise ValueError("optimizer-state manifest must be an absolute path")
+    if not workers:
+        raise RuntimeError("optimizer-state capture has no training workers")
+    hosts = list(
+        dict.fromkeys(
+            node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive") and node.get("NodeManagerAddress")
+        )
+    )
+    addresses = ray.get([worker.routable_ip.remote() for worker in workers])
+    unknown = sorted(set(addresses) - set(hosts))
+    if unknown:
+        raise RuntimeError(f"worker addresses {unknown} are outside the Ray node addresses {hosts}")
+    representatives = {}
+    for worker, address in zip(workers, addresses):
+        representatives.setdefault(address, worker)
+    # Training workers are rank-ordered; only rank zero writes these captures.
+    peers = [host for host in hosts if host != addresses[0]]
+    files = ray.get(workers[0].export_node_checkpoint.remote(str(path.parent), peers))
+    if path.name not in files:
+        raise FileNotFoundError(f"optimizer-state manifest was not exported: {path}")
+    ray.get([worker.require_checkpoint_files.remote(str(path.parent), files) for worker in representatives.values()])
+
+
+def _optimizer_capture_worker_class() -> Any:
+    global _OPTIMIZER_CAPTURE_WORKER
+    if _OPTIMIZER_CAPTURE_WORKER is not None:
+        return _OPTIMIZER_CAPTURE_WORKER
+
+    import ray
+
+    from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
+
+    base_worker = deepspeed_worker_module.DeepSpeedWorker.__ray_metadata__.modified_class
+
+    @ray.remote
+    class OptimizerCaptureDeepSpeedWorker(ModelStateCaptureMixin, base_worker):
+        """Add optimizer-state artifact capture for correctness harness jobs only."""
+
+        def initialize(self, master_addr: str, job_config: dict) -> bool:
+            self._optimizer_participation_capture = None
+            debug_config = _optimizer_capture_debug_config(job_config)
+            optimizer_state_output_dir = debug_config.get("optimizer_state_output_dir")
+            if optimizer_state_output_dir is not None:
+                optimizer_state_output_dir = os.fspath(optimizer_state_output_dir)
+                if not os.path.isabs(optimizer_state_output_dir):
+                    raise ValueError("debug.optimizer_state_output_dir must be an absolute path")
+            self._optimizer_state_output_dir = optimizer_state_output_dir
+            model_state_output_dir = debug_config.get("model_state_output_dir")
+            if model_state_output_dir is not None:
+                model_state_output_dir = os.fspath(model_state_output_dir)
+                if not os.path.isabs(model_state_output_dir):
+                    raise ValueError("debug.model_state_output_dir must be an absolute path")
+            self._model_state_output_dir = model_state_output_dir
+            adapter = debug_config.get("shared_peft_adapter")
+            if adapter is None:
+                return super().initialize(master_addr, job_config)
+            from arctic_platform.correctness.harness.lora import worker_adapter_scope
+
+            with worker_adapter_scope(adapter["object_ref"], adapter["identity"]):
+                return super().initialize(master_addr, job_config)
+
+        def _arm_optimizer_participation(self) -> None:
+            if (
+                self._optimizer_state_output_dir is None
+                or getattr(self, "_optimizer_participation_capture", None) is not None
+            ):
+                return
+
+            if self.engine.global_steps != 0:
+                raise ValueError("optimizer participation must be armed before the first backward")
+            model = self.engine.module
+            decoder_getter = getattr(model, "get_decoder", None)
+            head_getter = getattr(model, "get_output_embeddings", None)
+            decoder = decoder_getter() if callable(decoder_getter) else None
+            head = head_getter() if callable(head_getter) else getattr(model, "lm_head", None)
+            capture = ParticipationCapture(model, decoder=decoder, head=head)
+            try:
+                self._optimizer_participation_before = {
+                    "participation": capture.result(),
+                    "candidate_weights": {
+                        name: weight_identity(capture.parameters[name].detach()) for name in capture.candidates
+                    },
+                }
+            except BaseException:
+                capture.close()
+                raise
+            self._optimizer_participation_capture = capture
+
+        def _close_optimizer_participation(self) -> None:
+            capture = getattr(self, "_optimizer_participation_capture", None)
+            if capture is not None:
+                capture.close()
+                self._optimizer_participation_capture = None
+
+        def forward_backward(self, batch: dict) -> dict:
+            try:
+                if self._optimizer_state_output_dir is not None:
+                    self._optimizer_collective_check(self._arm_optimizer_participation)
+                return super().forward_backward(batch)
+            except BaseException:
+                self._close_optimizer_participation()
+                raise
+
+        def _optimizer_collective_check(self, callback, *, rank_zero: bool = False):
+            # Share local validation and file errors before peers enter another collective.
+            result, error = None, None
+            try:
+                if not rank_zero or self.rank == 0:
+                    result = callback()
+            except Exception as caught:
+                error = caught
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, None if error is None else f"{type(error).__name__}: {error}")
+            if error is not None:
+                raise error
+            for rank, message in enumerate(errors):
+                if message is not None:
+                    raise RuntimeError(f"optimizer capture failed on rank {rank}: {message}")
+            return result
+
+        def _optimizer_participation(self) -> tuple[dict, dict]:
+
+            def observe():
+                capture = getattr(self, "_optimizer_participation_capture", None)
+                if capture is None:
+                    raise ValueError("optimizer capture requires genuine pre-backward participation")
+                return {
+                    "participation": capture.result(),
+                    "candidate_weights": {
+                        name: weight_identity(capture.parameters[name].detach()) for name in capture.candidates
+                    },
+                }
+
+            observed = self._optimizer_collective_check(observe)
+            capture = self._optimizer_participation_capture
+            rows = [None] * dist.get_world_size()
+            dist.all_gather_object(rows, {"before": self._optimizer_participation_before, "after": observed})
+
+            def merge():
+                shapes, routes = {}, {}
+                for name, parameter in capture.parameters.items():
+                    shapes[name] = list(parameter.shape)
+                    width = 1
+                    group_name = getattr(parameter, "group_name", None)
+                    if (
+                        group_name is not None
+                        and getattr(parameter, "allreduce", True) is False
+                        and parameter.dim() >= 2
+                    ):
+                        import deepspeed.utils.groups as ds_groups
+
+                        width = dist.get_world_size(group=ds_groups._get_expert_parallel_group(group_name))
+                    routes[name] = [None] * width
+                return merge_rank_participation(
+                    [row["before"] for row in rows], [row["after"] for row in rows], shapes, routes
+                )
+
+            return self._optimizer_collective_check(merge)
+
+        def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
+            group_name = getattr(param, "group_name", None)
+            if group_name is None or getattr(param, "allreduce", True) is not False or tensor.dim() < 2:
+                return tensor
+
+            import deepspeed.utils.groups as ds_groups
+
+            local = tensor.contiguous()
+            ep_group = ds_groups._get_expert_parallel_group(group_name)
+            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
+            dist.all_gather(shards, local, group=ep_group)
+            return torch.cat(shards, dim=0)
+
+        def _optimizer_step_values(self) -> list[int]:
+            values: set[int] = set()
+            optimizer = getattr(self.engine, "optimizer", None)
+            seen: set[int] = set()
+            while optimizer is not None and id(optimizer) not in seen:
+                seen.add(id(optimizer))
+                state = getattr(optimizer, "state", None)
+                if isinstance(state, dict):
+                    for entry in state.values():
+                        if not isinstance(entry, dict) or "step" not in entry:
+                            continue
+                        step = entry["step"]
+                        values.add(int(step.item() if torch.is_tensor(step) else step))
+                optimizer = getattr(optimizer, "optimizer", None)
+            return sorted(values)
+
+        def _full_adam_moments(self, param: torch.nn.Parameter) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+            from deepspeed.utils import safe_get_full_optimizer_state
+
+            if hasattr(param, "_hp_mapping"):
+                mapping = param._hp_mapping
+                fragments = getattr(mapping, "optim_fragment", None) or {}
+                initialized = torch.tensor(
+                    int(mapping is not None and "exp_avg" in fragments and "exp_avg_sq" in fragments),
+                    device=param.device,
+                )
+                dist.all_reduce(initialized, op=dist.ReduceOp.MAX, group=param._dp_group)
+                if not bool(initialized.item()):
+                    return None, None
+                return safe_get_full_optimizer_state(param, "exp_avg"), safe_get_full_optimizer_state(
+                    param, "exp_avg_sq"
+                )
+            try:
+                return safe_get_full_optimizer_state(param, "exp_avg"), safe_get_full_optimizer_state(
+                    param, "exp_avg_sq"
+                )
+            except ValueError as error:
+                if "not found in optimizer state fragment" not in str(error):
+                    raise
+                return None, None
+
+        def _relink_optimizer_state(self) -> None:
+            optimizer = getattr(self.engine, "optimizer", None)
+            relink = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
+            if callable(relink):
+                optimizer._hp_optimizer_states_linked = False
+                relink()
+
+        def _snapshot_optimizer_state_parameters(self) -> None:
+            if self._optimizer_state_output_dir is None:
+                return
+
+            from deepspeed.utils import safe_get_full_fp32_param
+            from deepspeed.utils import safe_get_full_grad
+
+            output_dir = Path(self._optimizer_state_output_dir)
+            before_dir = output_dir / "before"
+            self._optimizer_collective_check(self._relink_optimizer_state)
+
+            def prepare_directory():
+                shutil.rmtree(output_dir, ignore_errors=True)
+                before_dir.mkdir(parents=True)
+
+            self._optimizer_collective_check(prepare_directory, rank_zero=True)
+            model = self.engine.module if hasattr(self.engine, "module") else self.engine
+            accumulated_gradients = self._optimizer_collective_check(self._bf16_accumulated_gradients)
+            participation, _ = self._optimizer_participation()
+            self._optimizer_step_participation = participation
+            for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
+                if not param.requires_grad:
+                    continue
+                full_parameter = safe_get_full_fp32_param(param)
+
+                def validate_master():
+                    if full_parameter is None:
+                        raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
+
+                self._optimizer_collective_check(validate_master)
+                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                gradient = (
+                    accumulated_gradients.get(id(param))
+                    if accumulated_gradients is not None
+                    else safe_get_full_grad(param)
+                )
+                inactive = participation["parameters"][name]["state"] == "inactive"
+
+                def validate_gradient():
+                    if gradient is None and not inactive:
+                        raise RuntimeError(f"optimizer-state capture found no reduced gradient for {name}")
+                    if (
+                        gradient is not None
+                        and inactive
+                        and (not bool(gradient.isfinite().all()) or bool(torch.count_nonzero(gradient)))
+                    ):
+                        raise ValueError(f"inactive parameter {name} has a nonzero or nonfinite gradient")
+
+                self._optimizer_collective_check(validate_gradient)
+                if gradient is not None:
+                    gradient = self._globalize_expert_optimizer_tensor(param, gradient)
+                exp_avg, exp_avg_sq = self._full_adam_moments(param)
+
+                def validate_moments():
+                    if (exp_avg is None) != (exp_avg_sq is None):
+                        raise RuntimeError(f"optimizer-state capture found incomplete Adam moments for {name}")
+
+                self._optimizer_collective_check(validate_moments)
+                if exp_avg is not None:
+                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+
+                def save_before():
+                    torch.save(
+                        {
+                            "name": name,
+                            "parameter": param.detach().cpu(),
+                            "fp32_master": full_parameter.detach().cpu(),
+                            "gradient": None if gradient is None else gradient.detach().cpu(),
+                            "exp_avg": None if exp_avg is None else exp_avg.detach().cpu(),
+                            "exp_avg_sq": None if exp_avg_sq is None else exp_avg_sq.detach().cpu(),
+                        },
+                        before_dir / f"{index:06d}.pt",
+                    )
+
+                self._optimizer_collective_check(save_before, rank_zero=True)
+
+            def save_before_state():
+                (before_dir / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "engine_global_step": int(self.engine.global_steps),
+                            "optimizer_steps": self._optimizer_step_values(),
+                            "learning_rates": [float(value) for value in self.engine.get_lr()],
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+
+            self._optimizer_collective_check(save_before_state, rank_zero=True)
+
+        def _optimizer_state_artifact_metrics(self) -> dict[str, Any]:
+            if self._optimizer_state_output_dir is None:
+                return {}
+
+            from deepspeed.utils import safe_get_full_fp32_param
+
+            output_dir = Path(self._optimizer_state_output_dir)
+            before_dir = output_dir / "before"
+            self._optimizer_collective_check(self._relink_optimizer_state)
+            model = self.engine.module if hasattr(self.engine, "module") else self.engine
+
+            participation, inactive_weights = self._optimizer_participation()
+
+            def validate_step_participation():
+                if participation != self._optimizer_step_participation:
+                    raise ValueError("optimizer participation changed during step")
+
+            self._optimizer_collective_check(validate_step_participation)
+            entries = []
+            for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
+                if not param.requires_grad:
+                    continue
+                full_parameter = safe_get_full_fp32_param(param)
+
+                def validate_master():
+                    if full_parameter is None:
+                        raise RuntimeError(f"optimizer-state capture found no post-step FP32 master for {name}")
+
+                self._optimizer_collective_check(validate_master)
+                exp_avg, exp_avg_sq = self._full_adam_moments(param)
+                inactive = name in inactive_weights
+
+                def validate_moments():
+                    if (exp_avg is None) != (exp_avg_sq is None) or (
+                        not inactive and (exp_avg is None or exp_avg_sq is None)
+                    ):
+                        raise RuntimeError(f"active optimizer parameter {name} has no post-step Adam moments")
+
+                self._optimizer_collective_check(validate_moments)
+                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                if exp_avg is not None:
+                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                if exp_avg_sq is not None:
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+
+                def save_after():
+                    before = torch.load(before_dir / f"{index:06d}.pt", map_location="cpu", weights_only=True)
+                    if inactive:
+                        inactive_weights[name]["master"] = {
+                            "before": weight_identity(before["fp32_master"]),
+                            "after": weight_identity(full_parameter),
+                        }
+                        for value in (before["exp_avg"], before["exp_avg_sq"], exp_avg, exp_avg_sq):
+                            if value is not None and (
+                                not bool(value.isfinite().all()) or bool(torch.count_nonzero(value))
+                            ):
+                                raise ValueError(
+                                    f"inactive optimizer parameter {name} has nonzero or nonfinite moments"
+                                )
+                        (before_dir / f"{index:06d}.pt").unlink()
+                        return
+                    filename = f"{index:06d}.pt"
+                    torch.save(
+                        {
+                            "parameter": before["parameter"],
+                            "fp32_master": before["fp32_master"],
+                            "gradient": before["gradient"],
+                            "exp_avg_before": before["exp_avg"],
+                            "exp_avg_sq_before": before["exp_avg_sq"],
+                            "parameter_update": full_parameter.detach().cpu() - before["fp32_master"],
+                            "exp_avg": exp_avg.detach().cpu(),
+                            "exp_avg_sq": exp_avg_sq.detach().cpu(),
+                        },
+                        output_dir / filename,
+                    )
+                    entries.append({"name": name, "file": filename, "shape": list(full_parameter.shape)})
+                    (before_dir / f"{index:06d}.pt").unlink()
+
+                self._optimizer_collective_check(save_after, rank_zero=True)
+
+            def publish_manifest():
+                validate_inactive_weights(participation, inactive_weights)
+                before_state = json.loads((before_dir / "state.json").read_text())
+                (before_dir / "state.json").unlink()
+                before_dir.rmdir()
+                manifest_path = output_dir / "manifest.json"
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "step": self.engine.global_steps,
+                            "before": before_state,
+                            "after": {
+                                "engine_global_step": int(self.engine.global_steps),
+                                "optimizer_steps": self._optimizer_step_values(),
+                                "learning_rates": [float(value) for value in self.engine.get_lr()],
+                            },
+                            "parameters": entries,
+                            "participation": participation,
+                            "inactive_weights": inactive_weights,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                return {"optimizer_state_manifest": str(manifest_path)}
+
+            return self._optimizer_collective_check(publish_manifest, rank_zero=True) or {}
+
+        def step(self, learning_rate: float | None = None) -> dict:
+            try:
+                self._snapshot_optimizer_state_parameters()
+                result = super().step() if learning_rate is None else super().step(learning_rate=learning_rate)
+                result.setdefault("metrics", {}).update(self._optimizer_state_artifact_metrics())
+                return result
+            finally:
+                self._close_optimizer_participation()
+
+    _OPTIMIZER_CAPTURE_WORKER = OptimizerCaptureDeepSpeedWorker
+    return _OPTIMIZER_CAPTURE_WORKER
+
+
+@contextlib.contextmanager
+def _patched_deepspeed_worker_bindings(capture_worker: Any) -> Iterator[None]:
+    from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
+
+    modules = [deepspeed_worker_module]
+    for module_name in ("arctic_platform.common.ray_server", "arctic_platform.rl.ray_server"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "DeepSpeedWorker"):
+            modules.append(module)
+
+    originals = [(module, module.DeepSpeedWorker) for module in modules]
+    for module, _ in originals:
+        module.DeepSpeedWorker = capture_worker
+    try:
+        yield
+    finally:
+        for module, original in reversed(originals):
+            module.DeepSpeedWorker = original
+
+
+@contextlib.contextmanager
+def optimizer_capture_worker() -> Iterator[None]:
+    """Install the correctness worker overlay for jobs created inside the context."""
+    from arctic_platform.common import ray_server
+
+    # Load the compatibility re-export before patching so lazy clients cannot retain an overlay.
+    compatibility_server = importlib.import_module("arctic_platform.rl.ray_server")
+    server_modules = [ray_server, compatibility_server]
+    originals = [(module, module.ArcticRLRayServerState, module.ArcticRLRayServer) for module in server_modules]
+    capture_worker = _optimizer_capture_worker_class()
+    original_server_state = ray_server.ArcticRLRayServerState
+    original_server = ray_server.ArcticRLRayServer
+
+    class OptimizerCaptureServerState(original_server_state):
+        async def initialize(self, job_config_dict):
+            # Ray imports the product server by reference in a fresh actor process.
+            with _patched_deepspeed_worker_bindings(_optimizer_capture_worker_class()):
+                return await super().initialize(job_config_dict)
+
+    class OptimizerCaptureServer(original_server):
+        async def step(self, job_id, body=None):
+            result = await super().step(job_id, body)
+            manifests = result.get("metrics", {}).get("optimizer_state_manifest", [])
+            if isinstance(manifests, str):
+                manifests = [manifests]
+            for manifest in dict.fromkeys(manifests):
+                _publish_optimizer_capture(self.training_workers, manifest)
+            return result
+
+    with _patched_deepspeed_worker_bindings(capture_worker):
+        for module in server_modules:
+            module.ArcticRLRayServerState = OptimizerCaptureServerState
+            module.ArcticRLRayServer = OptimizerCaptureServer
+        try:
+            yield
+        finally:
+            for module, server_state, server in reversed(originals):
+                module.ArcticRLRayServer = server
+                module.ArcticRLRayServerState = server_state
+
+
+# Participation
+
+PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
+
+
+def validate_participation(record: dict) -> dict:
+    if not isinstance(record, dict) or record.get("schema") != PARTICIPATION_SCHEMA:
+        raise ValueError("gradient coverage requires a versioned participation inventory")
+    parameters = record.get("parameters")
+    if not isinstance(parameters, dict) or not parameters:
+        raise ValueError("participation inventory has no trainable parameters")
+    for name, entry in parameters.items():
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            raise ValueError("participation inventory has an invalid parameter")
+        shape = entry.get("shape")
+        if not isinstance(shape, list) or any(type(size) is not int or size < 0 for size in shape):
+            raise ValueError(f"participation shape is invalid for {name}")
+        state = entry.get("state")
+        if state not in {"active", "inactive"}:
+            raise ValueError(f"unexpected missing gradient for {name}")
+        if state == "inactive":
+            evidence = entry.get("evidence")
+            if not isinstance(evidence, dict):
+                raise ValueError(f"inactive parameter {name} has no independent evidence")
+            if not isinstance(evidence.get("module"), str) or not evidence["module"]:
+                raise ValueError(f"inactive parameter {name} has invalid independent evidence")
+            kind = evidence.get("kind")
+            if kind == "text-decoder-bypass":
+                valid = (
+                    type(evidence.get("calls")) is int
+                    and evidence["calls"] == 0
+                    and evidence.get("outside_decoder_and_head") is True
+                    and normalize(evidence["module"]) == "visual"
+                )
+            elif kind == "integer-selector":
+                valid = (
+                    type(evidence.get("calls")) is int
+                    and evidence["calls"] > 0
+                    and evidence.get("integer_outputs_only") is True
+                    and evidence.get("module_class") == "Glm5NextTextIndexer"
+                )
+            else:
+                valid = False
+            digest = evidence.get("forward_sha256")
+            if (
+                not valid
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or not isinstance(evidence.get("module"), str)
+                or not evidence["module"]
+                or not normalize(name).startswith(normalize(evidence["module"]) + ".")
+            ):
+                raise ValueError(f"inactive parameter {name} has invalid independent evidence")
+    return parameters
+
+
+def canonical_participation(record: dict, *, backend: str) -> dict:
+    if backend not in {"dss", "reference"}:
+        raise ValueError(f"unknown participation backend: {backend}")
+    parameters = validate_participation(record)
+    normalized = {}
+    for name, entry in parameters.items():
+        key = normalize(name)
+        if key in normalized:
+            raise ValueError(f"participation inventory has duplicate canonical name {key}")
+        normalized[key] = entry
+    groups = canonical_dss_tensor_groups(normalized) if backend == "dss" else {name: None for name in normalized}
+    covered = [name for group in groups.values() for name in group.originals] if backend == "dss" else list(groups)
+    if sorted(covered) != sorted(normalized):
+        raise ValueError("participation inventory has a canonical name collision")
+    result = {}
+    for name, group in groups.items():
+        pieces = [normalized[original] for original in group.originals] if group else [normalized[name]]
+        if len({entry["state"] for entry in pieces}) != 1:
+            raise ValueError(f"participation disagreement within fused parameter {name}")
+        shape = list(pieces[0]["shape"])
+        if group and group.concatenate_dim is not None:
+            dimension = group.concatenate_dim
+            if any(
+                len(entry["shape"]) != len(shape)
+                or any(size != shape[index] for index, size in enumerate(entry["shape"]) if index != dimension)
+                for entry in pieces
+            ) or dimension >= len(shape):
+                raise ValueError(f"participation fused shape mismatch for {name}")
+            shape[dimension] = sum(entry["shape"][dimension] for entry in pieces)
+        result[name] = {"shape": shape, "state": pieces[0]["state"]}
+    return result
+
+
+def compare_participation(target: dict, reference: dict) -> tuple[int, int]:
+    actual = canonical_participation(target, backend="dss")
+    expected = canonical_participation(reference, backend="reference")
+    if set(actual) != set(expected):
+        raise ValueError(
+            "incomplete trainable inventory: "
+            f"target-only={sorted(set(actual) - set(expected))[:4]}, "
+            f"reference-only={sorted(set(expected) - set(actual))[:4]}"
+        )
+    for name in expected:
+        if actual[name] != expected[name]:
+            raise ValueError(f"gradient participation or shape disagreement for {name}")
+    active = sum(entry["state"] == "active" for entry in expected.values())
+    return active, len(expected) - active
+
+
+def active_gradient_norms(record: dict, norms: dict) -> dict:
+    parameters = validate_participation(record)
+    if set(norms) - set(parameters):
+        raise ValueError("gradient norms contain parameters outside the trainable inventory")
+    active = {}
+    for name, entry in parameters.items():
+        value = norms.get(name)
+        if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+            raise ValueError(f"gradient norm for {name} must be finite and nonnegative")
+        if entry["state"] == "active":
+            if name not in norms or value is None:
+                raise ValueError(f"active parameter {name} has no reduced gradient norm")
+            active[name] = value
+        elif name in norms and value != 0:
+            raise ValueError(f"inactive parameter {name} has a nonzero gradient")
+    return active
+
+
+def weight_identity(tensor) -> dict:
+
+    if not bool(tensor.isfinite().all()):
+        raise ValueError("inactive weight witness contains nonfinite values")
+    return {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "sha256": tensor_digest(tensor)}
+
+
+def validate_inactive_weights(record: dict, witnesses: dict) -> None:
+    parameters = validate_participation(record)
+    inactive = {name for name, entry in parameters.items() if entry["state"] == "inactive"}
+    if not isinstance(witnesses, dict) or set(witnesses) != inactive:
+        raise ValueError("inactive optimizer weights have incomplete coverage")
+    for name, witness in witnesses.items():
+        if not isinstance(witness, dict) or set(witness) != {"parameter", "master"}:
+            raise ValueError(f"inactive optimizer weight witness is incomplete for {name}")
+        for kind, values in witness.items():
+            if not isinstance(values, dict) or set(values) != {"before", "after"}:
+                raise ValueError(f"inactive {kind} weight witness is incomplete for {name}")
+            for identity in values.values():
+                digest = identity.get("sha256") if isinstance(identity, dict) else None
+                if (
+                    not isinstance(identity, dict)
+                    or set(identity) != {"shape", "dtype", "sha256"}
+                    or identity["shape"] != parameters[name]["shape"]
+                    or not isinstance(identity["dtype"], str)
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                ):
+                    raise ValueError(f"inactive {kind} weight identity is invalid for {name}")
+            if values["before"] != values["after"]:
+                raise ValueError(f"inactive {kind} weights changed for {name}")
+
+
+def validate_optimizer_participation(summary: dict, *, backend: str) -> dict | None:
+    record = summary.get("participation")
+    if record is None:
+        if "inactive_weights" in summary:
+            raise ValueError("inactive optimizer weights require participation evidence")
+        return None
+    validate_inactive_weights(record, summary.get("inactive_weights"))
+    canonical = canonical_participation(record, backend=backend)
+    active = {name: entry for name, entry in canonical.items() if entry["state"] == "active"}
+    norms = summary["parameters"]
+    if set(norms) != set(active):
+        raise ValueError("optimizer norms do not cover exactly the active trainable inventory")
+    for name, entry in active.items():
+        if norms[name]["shape"] != entry["shape"]:
+            raise ValueError(f"optimizer participation shape mismatch for {name}")
+    return canonical
+
+
+def merge_rank_participation(before: list[dict], after: list[dict], shapes: dict, routes: dict) -> tuple[dict, dict]:
+    """Union observed backward use across actual ranks, never infer it from zero storage."""
+    if not before or len(before) != len(after):
+        raise ValueError("participation capture requires every before/after rank")
+    entries, witnesses = {}, {}
+    for rank, (left, right) in enumerate(zip(before, after, strict=True)):
+        initial = left.get("participation", {}).get("parameters")
+        observed = right.get("participation", {}).get("parameters")
+        if (
+            left.get("participation", {}).get("schema") != PARTICIPATION_SCHEMA
+            or right.get("participation", {}).get("schema") != PARTICIPATION_SCHEMA
+            or not isinstance(initial, dict)
+            or not isinstance(observed, dict)
+            or set(initial) != set(shapes)
+            or set(observed) != set(shapes)
+        ):
+            raise ValueError(f"rank {rank} participation inventory is incomplete")
+        for name, shape in shapes.items():
+            if initial[name]["shape"] != list(shape) or observed[name]["shape"] != list(shape):
+                raise ValueError(f"rank {rank} participation shape drift for {name}")
+            if initial[name]["state"] == "active":
+                raise ValueError("participation must be armed before the first backward")
+            state = observed[name]["state"]
+            if state not in {"active", "inactive", "missing"}:
+                raise ValueError(f"invalid rank participation for {name}")
+            if state == "inactive":
+                validate_participation({"schema": PARTICIPATION_SCHEMA, "parameters": {name: observed[name]}})
+    for name, shape in shapes.items():
+        observed = [row["participation"]["parameters"][name] for row in after]
+        global_shape = list(shape)
+        if len(routes[name]) > 1:
+            if not global_shape:
+                raise ValueError("expert participation requires a nonscalar parameter")
+            global_shape[0] *= len(routes[name])
+        if any(entry["state"] == "active" for entry in observed):
+            entries[name] = {"shape": global_shape, "state": "active", "evidence": None}
+            continue
+        if any(entry["state"] != "inactive" for entry in observed):
+            raise ValueError(f"unexpected missing gradient for {name} on every rank")
+        if len(routes[name]) != 1:
+            raise ValueError(f"inactive expert weights require global witnesses for {name}")
+        identities = []
+        for left, right in zip(before, after, strict=True):
+            initial = left.get("candidate_weights", {}).get(name)
+            final = right.get("candidate_weights", {}).get(name)
+            if initial is None or final is None:
+                raise ValueError(f"inactive parameter weight witness is incomplete for {name}")
+            identities.append({"before": initial, "after": final})
+        if any(value != identities[0] for value in identities):
+            raise ValueError(f"inactive replicated parameter witnesses disagree for {name}")
+        entries[name] = {**observed[0], "shape": global_shape}
+        witnesses[name] = {"parameter": identities[0]}
+    record = {"schema": PARTICIPATION_SCHEMA, "parameters": entries}
+    validate_participation(record)
+    return record, witnesses
+
+
+class ParticipationCapture:
+    """Observe actual autograd use; zero storage and Adam moments are not evidence."""
+
+    def __init__(self, model, *, decoder=None, head=None):
+        self.model = model
+        self.parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+        self.shapes = {name: list(parameter.shape) for name, parameter in self.parameters.items()}
+        self.active = set()
+        self.handles = []
+        self.candidates = {}
+        self.source_digests = {}
+        self.forwards = []
+        try:
+            self._arm(model, decoder=decoder, head=head)
+        except BaseException:
+            self.close()
+            raise
+
+    def _arm(self, model, *, decoder, head):
+        import torch
+
+        reachable = (
+            {id(parameter) for module in (decoder, head) for parameter in module.parameters()}
+            if decoder is not None and head is not None
+            else None
+        )
+        for name, parameter in self.parameters.items():
+            self.handles.append(parameter.register_hook(self._backward_hook(name)))
+        for name, module in model.named_modules():
+            kind = None
+            if type(module).__name__ == "Glm5NextTextIndexer":
+                kind = "integer-selector"
+            elif reachable is not None and normalize(name) == "visual":
+                kind = "text-decoder-bypass"
+            if kind is None:
+                continue
+            owned = {id(parameter) for parameter in module.parameters()}
+            names = [parameter_name for parameter_name, parameter in self.parameters.items() if id(parameter) in owned]
+            if kind == "text-decoder-bypass" and any(id(self.parameters[key]) in reachable for key in names):
+                continue
+            forward = inspect.unwrap(getattr(module.forward, "__func__", module.forward))
+            source = inspect.getsourcefile(forward)
+            if source is None:
+                continue
+            if source not in self.source_digests:
+                self.source_digests[source] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+            self.forwards.append((module, forward))
+            evidence = {
+                "kind": kind,
+                "module": name,
+                "module_class": type(module).__name__,
+                "forward_sha256": self.source_digests[source],
+                "calls": 0,
+                "integer_outputs_only": True,
+                "outside_decoder_and_head": kind == "text-decoder-bypass",
+            }
+
+            def observe(_module, _inputs, output, *, evidence=evidence):
+                evidence["calls"] += 1
+
+                def integer_only(value):
+                    if isinstance(value, torch.Tensor):
+                        return not value.is_floating_point() and not value.is_complex() and not value.requires_grad
+                    if isinstance(value, (tuple, list)):
+                        return bool(value) and all(integer_only(item) for item in value)
+                    return False
+
+                evidence["integer_outputs_only"] &= integer_only(output)
+
+            self.handles.append(module.register_forward_hook(observe))
+            for parameter_name in names:
+                self.candidates[parameter_name] = evidence
+
+    def _backward_hook(self, name):
+        def record(gradient):
+            self.active.add(name)
+            return gradient
+
+        return record
+
+    def result(self) -> dict:
+        current = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
+        if set(current) != set(self.parameters) or any(
+            current[name] is not parameter or list(parameter.shape) != self.shapes[name]
+            for name, parameter in self.parameters.items()
+        ):
+            raise ValueError("trainable participation inventory changed during capture")
+        for source, digest in self.source_digests.items():
+            if hashlib.sha256(Path(source).read_bytes()).hexdigest() != digest:
+                raise ValueError("participation forward source drift")
+        if any(
+            inspect.unwrap(getattr(module.forward, "__func__", module.forward)) is not forward
+            for module, forward in self.forwards
+        ):
+            raise ValueError("participation forward implementation changed during capture")
+        entries = {}
+        for name, parameter in self.parameters.items():
+            evidence = self.candidates.get(name)
+            justified = evidence is not None and (
+                (evidence["kind"] == "text-decoder-bypass" and evidence["calls"] == 0)
+                or (
+                    evidence["kind"] == "integer-selector"
+                    and evidence["calls"] > 0
+                    and evidence["integer_outputs_only"]
+                )
+            )
+            entries[name] = {
+                "shape": list(parameter.shape),
+                "state": "active" if name in self.active else "inactive" if justified else "missing",
+                "evidence": dict(evidence) if justified and name not in self.active else None,
+            }
+        return {"schema": PARTICIPATION_SCHEMA, "parameters": entries}
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exception):
+        self.close()
+
+
+# Cortex Optimizer
 
 # Only these upstream checkpoint schema classes may extend torch's restricted loader.
 _SCHEMA_GLOBALS = {
@@ -423,8 +1617,6 @@ def arm_native_optimizer_collector(
     nonce = uuid.uuid4().hex if nonce is None else nonce
     if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
         raise ValueError("native collector requires an exact hexadecimal nonce")
-    from .participation import ParticipationCapture
-    from .participation import weight_identity
 
     if engine.global_steps != 0:
         raise ValueError("native participation must be armed before the first backward")
@@ -1948,9 +3140,6 @@ def decode_optimizer_capture(
         _native_sources(native)
     participation, inactive_weights = None, {}
     if participation_receipts is not None:
-        from arctic_platform.debug.correctness_participation import merge_worker_receipts
-
-        from .participation import merge_rank_participation
 
         if native is not None:
             raise ValueError("ordinary participation receipts cannot replace native collector evidence")
@@ -1971,7 +3160,6 @@ def decode_optimizer_capture(
             {name: [0] for name in shapes},
         )
     if native is not None:
-        from .participation import merge_rank_participation
 
         receipts = [
             [
@@ -2002,7 +3190,6 @@ def decode_optimizer_capture(
                 master_before = _parameter(before, group_index, name, "fp32_master")
                 master_after = _parameter(after, group_index, name, "fp32_master")
                 if name in inactive_weights:
-                    from .participation import weight_identity
 
                     inactive_weights[name]["master"] = {
                         "before": weight_identity(master_before),
@@ -2027,7 +3214,6 @@ def decode_optimizer_capture(
         manifest = output_dir / "manifest.json"
         provenance = {}
         if participation is not None:
-            from .participation import validate_inactive_weights
 
             validate_inactive_weights(participation, inactive_weights)
             provenance.update(participation=participation, inactive_weights=inactive_weights)
@@ -2086,7 +3272,7 @@ _DENSE_RECEIPT = ".correctness-dense-optimizer-collection.json"
 
 def validate_dense_checkpoint_allocation(admission, *, expected_dp_world_size):
     """Validate supplied same-allocation identities, not discovered or replacement nodes."""
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     nodes = transfer.validate_local_inference_allocation(admission)
     if type(expected_dp_world_size) is not int or sum(node["slots"] for node in nodes) != expected_dp_world_size:
@@ -2140,8 +3326,8 @@ def _dense_check_root(request):
 
 
 def _dense_node_admission(request, deadline):
-    from . import inference_export as transfer
-    from .storage import parse_hostfile
+    from arctic_platform.correctness.harness import inference as transfer
+    from arctic_platform.correctness.harness.storage import parse_hostfile
 
     admission = request["allocation"]
     content = admission.get("hostfile_content")
@@ -2192,7 +3378,7 @@ def _dense_node_admission(request, deadline):
 
 
 def _dense_manifest(request, deadline):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     root, identity = _dense_check_root(request)
     tag = root / request["binding"]["tag"]
@@ -2223,9 +3409,9 @@ def _dense_manifest(request, deadline):
 
 
 def _dense_sources():
-    from . import inference_export as transfer
-    from . import storage
-    from . import transport
+    from arctic_platform.correctness.harness import cortex as transport
+    from arctic_platform.correctness.harness import inference as transfer
+    from arctic_platform.correctness.harness import storage
 
     return {
         role: {"path": str(Path(path).resolve()), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
@@ -2252,16 +3438,15 @@ def _dense_worker_argv(python, role, request):
         for row in request["source_files"].values()
     )
     code = (
-        f"import hashlib,pathlib,sys\nsys.path.insert(0,{str(root)!r})\n{checks}"
-        "from arctic_platform.correctness.harness import cortex_optimizer as m\n"
-        f"m._dense_worker({role!r},{request!r})"
+        f"import hashlib,pathlib,sys\nsys.path.insert(0,{str(root)!r})\n{checks}from"
+        f" arctic_platform.correctness.harness import optimizer as m\nm._dense_worker({role!r},{request!r})"
     )
     return [python, "-B", "-c", code]
 
 
 @contextlib.contextmanager
 def _dense_argv(admission, node, role, request, deadline):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     command = _dense_worker_argv(node["python"], role, request)
     if node == admission["nodes"][0]:
@@ -2274,7 +3459,7 @@ def _dense_argv(admission, node, role, request, deadline):
 
 @contextlib.contextmanager
 def _dense_owned_processes():
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     children = []
     primary = None
@@ -2298,7 +3483,7 @@ def _dense_owned_processes():
 
 
 def _dense_call(admission, node, role, request, deadline):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     with _dense_argv(admission, node, role, request, deadline) as argv, _dense_owned_processes() as children:
         child = subprocess.Popen(
@@ -2318,7 +3503,7 @@ def _dense_call(admission, node, role, request, deadline):
 
 
 def _dense_worker(role, request):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     deadline = time.monotonic() + min(request["timeout_s"], request["deadline_epoch"] - time.time())
     transfer._local_remaining(deadline)
@@ -2433,7 +3618,7 @@ def _dense_validate_manifests(binding, nodes, manifests, expected_dp_world_size)
 
 
 def _dense_receive(request, deadline):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     root, _ = _dense_check_root(request)
     manifest = json.loads(
@@ -2473,7 +3658,7 @@ def _dense_receive(request, deadline):
 
 
 def _dense_copy_peer(admission, node, request, head_request, deadline):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     with TemporaryFile() as errors:
         with _dense_argv(admission, node, "send", request, deadline) as argv, _dense_owned_processes() as children:
@@ -2510,7 +3695,7 @@ def _dense_copy_peer(admission, node, request, head_request, deadline):
 
 @contextlib.contextmanager
 def _dense_snapshot_collection(root, admission, *, step, expected_dp_world_size, parent_job_id, training_child_id):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     admission = json.loads(json.dumps(admission, allow_nan=False))
     nodes = validate_dense_checkpoint_allocation(admission, expected_dp_world_size=expected_dp_world_size)
@@ -2652,7 +3837,7 @@ def _dense_snapshot_collection(root, admission, *, step, expected_dp_world_size,
 
 
 def _dense_verified_receipt(root, admission, *, step, parent_job_id, training_child_id, source_files):
-    from . import inference_export as transfer
+    from arctic_platform.correctness.harness import inference as transfer
 
     proof = transfer.read_export_json(root / _DENSE_RECEIPT)
     binding = proof.get("binding")
@@ -2797,7 +3982,7 @@ def _save_local_snapshot_files(
 
 
 def _dense_training_child(transport, selector):
-    from .cortex import CorrectnessCortexTransport
+    from arctic_platform.correctness.harness.cortex import CorrectnessCortexTransport
 
     if not isinstance(transport, CorrectnessCortexTransport) or not isinstance(selector, str) or not selector:
         raise ValueError("dense optimizer requires its owned native training child binding")
@@ -2996,7 +4181,7 @@ def capture_optimizer_step(
             if native is not None and (transport.job_id != job_id or job.client.jobs.training != training_selector):
                 raise ValueError("native optimizer parent/training child changed")
         else:
-            from .inference_export import export_checkpoint
+            from arctic_platform.correctness.harness.inference import export_checkpoint
 
             before_id = save_and_resolve_checkpoint_id(job.client, job_id, "resumable")
             result = fwd_bwd_step(session, job, body, learning_rate=learning_rate)
@@ -3110,3 +4295,41 @@ def capture_optimizer_step(
         relative_manifest = manifest.relative_to(decoded)
         decoded.rename(destination)
     return replace(result, optimizer_state_manifest=str(destination / relative_manifest))
+
+
+def compare_model_state(left: Path, right: Path, *, ranks: int) -> dict:
+    expected = {f"rank-{rank:05d}.json" for rank in range(ranks)}
+    for directory in (left, right):
+        if {path.name for path in directory.glob("rank-*.json")} != expected:
+            raise RuntimeError(f"incomplete model-state rank coverage in {directory}")
+    differences = []
+    compared_tensors = 0
+    engines = []
+    for rank in range(ranks):
+        filename = f"rank-{rank:05d}.json"
+        before, after = (json.loads((directory / filename).read_text()) for directory in (left, right))
+        if before["rank"] != rank or after["rank"] != rank:
+            raise RuntimeError(f"model-state rank mismatch in {filename}")
+        engines.append({"rank": rank, "before": before["engine"], "after": after["engine"]})
+        for field in ("engine", "deepspeed_version"):
+            if before.get(field) != after.get(field):
+                differences.append({"rank": rank, "kind": "metadata", "name": field, "fields": [field]})
+        before_entries, after_entries = (
+            {(entry["kind"], entry["name"]): entry for entry in manifest["tensors"]} for manifest in (before, after)
+        )
+        for kind, name in sorted(before_entries.keys() | after_entries.keys()):
+            first, second = before_entries.get((kind, name)), after_entries.get((kind, name))
+            compared_tensors += 1
+            if first is None or second is None:
+                fields = ["missing"]
+            else:
+                fields = sorted(key for key in first.keys() | second.keys() if first.get(key) != second.get(key))
+            if fields:
+                differences.append({"rank": rank, "kind": kind, "name": name, "fields": fields})
+    return {
+        "exact": not differences,
+        "ranks": ranks,
+        "compared_tensors": compared_tensors,
+        "engines": engines,
+        "differences": differences,
+    }

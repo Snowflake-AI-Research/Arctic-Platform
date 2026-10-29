@@ -70,8 +70,6 @@ class RunOptions:
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
     test_spec: Path | None = None
-    historical_gradient_references: Path | None = None
-    historical_gradient_references_sha256: str | None = None
     dense_checkpoint_allocation: Path | None = None
     dense_checkpoint_allocation_sha256: str | None = None
 
@@ -201,7 +199,6 @@ def options_from_args(args: Namespace) -> RunOptions:
 def run(request: RunRequest, options: RunOptions | None = None, *, executor: Callable | None = None) -> BatchResult:
     """Run selected cases sequentially with short output and complete saved logs."""
     from .harness.execution import _load_dense_checkpoint_allocation
-    from .harness.execution import _load_historical_gradient_references
     from .harness.execution import run_batch
 
     options = options or RunOptions()
@@ -209,7 +206,6 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
         raise ValueError("--test-spec requires one explicit --config")
     args = _namespace(request, options)
     _load_dense_checkpoint_allocation(args)
-    _load_historical_gradient_references(args)
     selected = select(request)
     return run_batch(args, selected=selected, executor=executor)
 

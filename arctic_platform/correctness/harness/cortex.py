@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"Correctness gateway client, fixture admission, and checkpoint transport."
+"""Correctness client and runtime transport contracts."""
 
 from __future__ import annotations
 
@@ -29,7 +29,11 @@ import tempfile
 import time
 import traceback
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
+from typing import ContextManager
+from typing import Optional
+from typing import Protocol
 from urllib.parse import urlencode
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -51,12 +55,98 @@ from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _raise_for_status
 from arctic_platform.client.transports.cortex import _Route
 from arctic_platform.client.transports.cortex import _SendPolicy
+from arctic_platform.correctness.harness.config import ReviewedClientConfig
+from arctic_platform.correctness.harness.config import TestSpec
+from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-from .config import ReviewedClientConfig
-from .config import TestSpec
-from .config import hash_directory
-from .storage import require_data_fast_path
-from .transport import UnsafeCleanupError
+# Transport
+
+
+class UnsafeCleanupError(RuntimeError):
+    """Owned resources may remain; do not start another correctness workload."""
+
+    def __init__(self, message, *, owned_parent=None, owned_children=None, shutdown_error=None):
+        super().__init__(message)
+        self.owned_parent = owned_parent
+        self.owned_children = dict(owned_children or {})
+        self.shutdown_error = shutdown_error
+        self.workload_error = None
+
+    def preserve_workload(self, error):
+        self.workload_error = error
+        self.args = (f"Original workload failed: {type(error).__name__}: {error}; {self}",)
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """A saved checkpoint and the job that wrote it, in whatever spelling the issuing transport uses."""
+
+    reference: str
+    source_job: str
+
+
+class TrainingJob(Protocol):
+    """A running training job, reduced to the two operations a loss trajectory needs."""
+
+    def fwd_bwd_step(self, body: bytes, *, learning_rate: float) -> float:
+        """Run one request's forward-backward and then one optimizer step, and return the request's loss.
+
+        ``body`` is a DSSST1 frame. The loss is the one the forward-backward reported, so it is measured
+        before the step that follows it changes any parameter.
+        """
+
+    def save_resumable(self) -> Checkpoint:
+        """Save model weights, optimizer moments and LR-scheduler position, and return what identifies them."""
+
+
+class Transport(Protocol):
+    """Somewhere jobs can be created, held open for as long as a check needs to create them."""
+
+    def __enter__(self) -> "Transport": ...
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None: ...
+
+    def job(self, *, resume_from: Optional[Checkpoint] = None) -> ContextManager[TrainingJob]:
+        """One job running the config this transport was built for, and destroyed when the block exits.
+
+        With ``resume_from`` the job initializes its weights, optimizer moments and scheduler position from
+        that checkpoint instead of from the base model.
+        """
+
+
+def pack_microbatches(
+    batch,
+    microbatches: int,
+    *,
+    model_provider: str = "huggingface",
+    loss_fn: str = "sft",
+    processing_config=None,
+) -> dict:
+    """Pack an explicitly requested number of microbatches without changing the input config."""
+    from arctic_platform.correctness.harness.gateway import pack
+
+    body = pack(batch, model_provider=model_provider)
+    body["processing"] = {"loss_fn": loss_fn}
+    if processing_config is not None:
+        body["processing"]["config"] = deepcopy(processing_config)
+    if microbatches <= 1:
+        return body
+    if batch.rows < microbatches:
+        raise ValueError(f"cannot split {batch.rows} row(s) into {microbatches} microbatches")
+    base_rows, extra_rows = divmod(batch.rows, microbatches)
+    tensors = body["batch"]
+    splits = []
+    start = 0
+    for index in range(microbatches):
+        end = start + base_rows + (index < extra_rows)
+        splits.append({key: value[start:end].contiguous() for key, value in tensors.items()})
+        start = end
+    body["batch"] = splits
+    return body
+
+
+# Cortex
 
 
 class CortexTrainingConfig(ReviewedClientConfig):
@@ -81,8 +171,8 @@ class CortexTrainingConfig(ReviewedClientConfig):
     @model_validator(mode="after")
     def _check_source(self) -> Self:
         if self.initial_training_model_dir is not None:
-            from .hosted import require_local_cortex_gateway
-            from .inference_export import validate_initial_training_model_dir
+            from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+            from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
 
             if (
                 not isinstance(self.backend, CortexConfig)
@@ -377,7 +467,7 @@ class _LocalLoadRoute(_Route):
             if not isinstance(request_id, str) or not request_id:
                 raise RuntimeError("local checkpoint load returned no valid request_id")
             return request_id
-        from .hosted import _local_load_metadata
+        from arctic_platform.correctness.harness.gateway import _local_load_metadata
 
         _local_load_metadata(reply, request.body["checkpoint_id"])
         return reply
@@ -397,7 +487,7 @@ class CorrectnessCortexTransport(CortexTransport):
         self._local_shutdown_parent = None
         self._local_shutdown_children = {}
         if self._native_gateway or self._native_checkpoint_bridge:
-            from .hosted import require_local_cortex_gateway
+            from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
             if JobHandles.from_config(client_config).any_set:
@@ -506,7 +596,7 @@ class CorrectnessCortexTransport(CortexTransport):
 
     def _native_request(self, request):
         if request.op in {"save", "load-checkpoint"}:
-            from .hosted import require_local_cortex_gateway
+            from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
             require_local_cortex_gateway(self.config)
         binding = self._native_bindings.get(str(request.job_id))
@@ -534,7 +624,7 @@ class CorrectnessCortexTransport(CortexTransport):
             url = f"{self.config.base_url.rstrip('/')}/{route}?{urlencode({'job_id': child})}"
             return url, {"json": {"path": str(root), "checkpoint_type": body["checkpoint_type"]}}
         if request.op == "load-checkpoint":
-            from .hosted import require_local_checkpoint_id
+            from arctic_platform.correctness.harness.gateway import require_local_checkpoint_id
 
             body = request.body
             if request.binary or not isinstance(body, dict) or set(body) - {"checkpoint_id", "stage_info"}:
@@ -558,8 +648,8 @@ class CorrectnessCortexTransport(CortexTransport):
         if "job_id" in result and result["job_id"] != child:
             raise ValueError("local native gateway response names a different child job")
         if request.op == "load-checkpoint":
-            from .gateway import NATIVE_STORE_SCHEMA
-            from .hosted import _local_load_metadata
+            from arctic_platform.correctness.harness.gateway import NATIVE_STORE_SCHEMA
+            from arctic_platform.correctness.harness.gateway import _local_load_metadata
 
             if result.get("correctness_native_store") != NATIVE_STORE_SCHEMA:
                 raise RuntimeError("native checkpoint load returned no owned store identity")
@@ -611,10 +701,10 @@ class CorrectnessCortexTransport(CortexTransport):
     def _submit(self, request, route=None):
         if request.op != "load-checkpoint" or not self._is_local_gateway():
             return super()._submit(request, route)
-        from .hosted import _local_load_metadata
-        from .hosted import _local_stage_info
-        from .hosted import require_local_checkpoint_id
-        from .hosted import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import _local_load_metadata
+        from arctic_platform.correctness.harness.gateway import _local_stage_info
+        from arctic_platform.correctness.harness.gateway import require_local_checkpoint_id
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 
         require_local_cortex_gateway(self.config)
         parent = getattr(self, "_local_shutdown_parent", None)

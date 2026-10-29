@@ -40,6 +40,15 @@ from pydantic import SecretStr
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.correctness.harness.gateway import available_gpus
+from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import read_pat
+from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.storage import correctness_logdir
+from arctic_platform.correctness.harness.storage import correctness_workdir
+from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
+from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 from . import report as console
 from .config import ArmDefinition
@@ -53,11 +62,6 @@ from .config import local_gpu_type
 from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
-from .dss_driver import available_gpus
-from .dss_driver import local_cortex_gateway
-from .hosted import is_local_cortex_gateway
-from .hosted import read_pat
-from .hosted import require_local_cortex_gateway
 from .registry import RL_INAPPLICABLE_REASON
 from .registry import TestOutcome
 from .registry import TestResult
@@ -67,10 +71,6 @@ from .report import write as write_report
 from .runner import assert_applicable_tests_registered
 from .runner import cortex_unavailable_reason
 from .runner import execute
-from .storage import correctness_logdir
-from .storage import correctness_workdir
-from .storage import ensure_no_interrupted_builds
-from .storage import require_data_fast_path
 
 CORRECTNESS_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -316,74 +316,6 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     return backend
 
 
-def _load_historical_gradient_references(args) -> dict | None:
-    """Load explicit raw-pinned bindings before batch grouping can narrow a selection."""
-    path = getattr(args, "historical_gradient_references", None)
-    expected = getattr(args, "historical_gradient_references_sha256", None)
-    if (path is None) != (expected is None):
-        raise ValueError(
-            "--historical-gradient-references and --historical-gradient-references-sha256 are required together"
-        )
-    if path is None:
-        return None
-    if (
-        not getattr(args, "config", None)
-        or getattr(args, "all_configs", False)
-        or getattr(args, "test", None) != ["single-step-grads"]
-        or getattr(args, "prepare_references", False)
-        or getattr(args, "probe_layers", None) is not None
-    ):
-        raise ValueError("historical gradient references require one explicit config and only single-step-grads")
-    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
-        raise ValueError("historical gradient references require a full lowercase SHA256")
-    descriptor = Path(path).resolve()
-    with descriptor.open("rb") as stream:
-        raw = stream.read(1024 * 1024 + 1)
-    if len(raw) > 1024 * 1024:
-        raise ValueError("historical gradient references descriptor exceeds 1 MiB")
-    if hashlib.sha256(raw).hexdigest() != expected:
-        raise ValueError("historical gradient references descriptor SHA256 mismatch")
-
-    def unique_object(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate historical gradient references key: {key}")
-            result[key] = value
-        return result
-
-    value = json.loads(raw, object_pairs_hook=unique_object)
-    json.dumps(value, allow_nan=False)
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"schema", "records"}
-        or value["schema"] != "reviewed-gradient-references-v1"
-        or not isinstance(value["records"], dict)
-        or not value["records"]
-    ):
-        raise ValueError("invalid historical gradient references descriptor schema")
-    bindings = {}
-    for arm, binding in value["records"].items():
-        if (
-            not arm
-            or not isinstance(binding, dict)
-            or set(binding) != {"record_path", "record_sha256", "review"}
-            or not isinstance(binding["record_path"], str)
-            or not binding["record_path"]
-            or not isinstance(binding["record_sha256"], str)
-            or len(binding["record_sha256"]) != 64
-            or any(c not in "0123456789abcdef" for c in binding["record_sha256"])
-            or not isinstance(binding["review"], str)
-            or not binding["review"].strip()
-        ):
-            raise ValueError(f"invalid historical gradient reference binding for arm {arm}")
-        record_path = Path(binding["record_path"])
-        if not record_path.is_absolute():
-            record_path = descriptor.parent / record_path
-        bindings[arm] = {**binding, "record_path": str(record_path.resolve())}
-    return bindings
-
-
 def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None = None) -> int:
     from transformers import AutoConfig
 
@@ -434,7 +366,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
     args = _configure_regression_target(args)
     dense_checkpoint_allocation = _load_dense_checkpoint_allocation(args)
-    historical_gradient_references = _load_historical_gradient_references(args)
     test_spec = getattr(args, "test_spec", None)
     if test_spec is not None and (not args.config or args.all_configs):
         raise SystemExit("--test-spec requires one explicit --config")
@@ -442,7 +373,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         args.out = correctness_logdir("ap-correctness-run-")
     backend = _client_backend(args)
     if getattr(args, "reference_records_dir", None) is not None:
-        from .reference_records import require_git_records_dir
+        from arctic_platform.correctness.harness.storage import require_git_records_dir
 
         args.reference_records_dir = require_git_records_dir(args.reference_records_dir)
     remote = isinstance(backend, CortexConfig)
@@ -480,8 +411,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     for path in config_paths:
         try:
             cfg = load_config(path)
-            if historical_gradient_references is not None and cfg.is_rl:
-                raise ValueError("historical gradient references require a supervised config")
             execution[cfg.config_id] = {
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
@@ -495,11 +424,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             # Both are read from the config as written. The cases belong to the reviewed spec and do not
             # move with the placement, so every width measures the same work on a different topology.
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = (
-                [cfg.n_gpus]
-                if local_fixture or historical_gradient_references is not None
-                else placement_widths(cfg.n_gpus, pool)
-            )
+            widths = [cfg.n_gpus] if local_fixture else placement_widths(cfg.n_gpus, pool)
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -543,7 +468,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         spec, selected_cases = prepared
         published_fixture = None
         if fixture_path is not None:
-            from .cortex import load_fixture
+            from arctic_platform.correctness.harness.cortex import load_fixture
 
             try:
                 published_fixture = load_fixture(fixture_path, spec)
@@ -565,7 +490,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
         managed_gateway = (
-            local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.correctness_participation")
+            local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.training")
             if getattr(args, "_automatic_cortex_gateway", False)
             else nullcontext(None)
         )
@@ -574,7 +499,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 backend.base_url = gateway_url
                 execution[cfg.config_id]["gateway_url"] = gateway_url
             if local_fixture:
-                from .cortex import load_local_fixture
+                from arctic_platform.correctness.harness.cortex import load_local_fixture
 
                 try:
                     published_fixture = load_local_fixture(backend, spec)
@@ -636,11 +561,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         **(
                             {"peft_adapter": Path(args.peft_adapter)}
                             if getattr(args, "peft_adapter", None) is not None
-                            else {}
-                        ),
-                        **(
-                            {"historical_gradient_references": historical_gradient_references}
-                            if historical_gradient_references is not None
                             else {}
                         ),
                         **(
@@ -713,13 +633,13 @@ def _saved_output(log):
 
 def run_batch(args, *, selected, executor=None):
     """Orchestrate independent groups without replacing the numerical runner."""
+    from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
+
     from ..api import BatchResult
     from ..api import aggregate_exit_code
-    from .reference_records import ReferencePrerequisiteError
 
     started = time.monotonic()
     _load_dense_checkpoint_allocation(args)
-    _load_historical_gradient_references(args)
     out = Path(args.out) if args.out is not None else correctness_logdir("ap-correctness-run-")
     out.mkdir(parents=True, exist_ok=True)
     specs = {}
@@ -882,13 +802,12 @@ def cmd_onboard(args) -> int:
 def cmd_selftest(args) -> int:
     """Run the harness's own checks.
 
-    They live in the package rather than in the repository's test tree, and are named ``check_*.py``, so a
-    unit-test run cannot collect a correctness check. Supplying the collection pattern is therefore this
-    command's job.
+    The shared library lives in the package and is collected through one explicit driver, so default
+    repository pytest collection does not include these checks.
     """
     import pytest
 
-    selftest_dir = CORRECTNESS_DIR / "selftest"
+    selftest_driver = CORRECTNESS_DIR / "selftest" / "check_suite.py"
     runner_args = list(args.runner_args)
     has_basetemp = False
     for index, argument in enumerate(runner_args):
@@ -902,7 +821,7 @@ def cmd_selftest(args) -> int:
             has_basetemp = True
     if not has_basetemp:
         runner_args.extend(["--basetemp", str(correctness_workdir("ap-correctness-selftest-") / "pytest")])
-    return pytest.main(["-sv", "--instafail", "-o", "python_files=check_*.py", str(selftest_dir), *runner_args])
+    return pytest.main(["-sv", "--instafail", str(selftest_driver), *runner_args])
 
 
 def cmd_publish_fixture(args) -> int:
@@ -1016,10 +935,6 @@ def parse_args(argv=None):
         type=Path,
         help="prepared HF records; missing records require explicit onboarding",
     )
-    r.add_argument(
-        "--historical-gradient-references", type=Path, help="explicit reviewed historical gradient bindings JSON"
-    )
-    r.add_argument("--historical-gradient-references-sha256", help="full SHA256 of the historical bindings JSON bytes")
     r.add_argument(
         "--peft-adapter",
         type=Path,

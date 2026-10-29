@@ -21,11 +21,12 @@ import json
 import subprocess
 from pathlib import Path
 
+from arctic_platform.correctness.harness.cortex import MANIFEST
+from arctic_platform.correctness.harness.cortex import describe_fixture
+from arctic_platform.correctness.harness.cortex import prepare_fixture
+from arctic_platform.correctness.harness.cortex import validate_publication
+
 from ..harness.config import TestSpec
-from ..harness.cortex import MANIFEST
-from ..harness.cortex import describe_fixture
-from ..harness.cortex import prepare_fixture
-from ..harness.cortex import validate_publication
 
 
 def publish_fixture(

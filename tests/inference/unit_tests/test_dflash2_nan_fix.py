@@ -3,31 +3,30 @@ from types import SimpleNamespace
 import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import KVBlockZeroer
 
-from arctic_platform.inference.vllm.dflash2_nan_fix import (
-    KVBlockZeroerPatch,
-    MambaManagerPatch,
-    SingleTypeKVCacheManagerPatch,
-    _sanitize_stale_gdn_metadata,
-)
+from arctic_platform.inference.vllm.dflash2_nan_fix import KVBlockZeroerPatch
+from arctic_platform.inference.vllm.dflash2_nan_fix import MambaManagerPatch
+from arctic_platform.inference.vllm.dflash2_nan_fix import SingleTypeKVCacheManagerPatch
+from arctic_platform.inference.vllm.dflash2_nan_fix import _sanitize_stale_gdn_metadata
+from arctic_platform.testing_utils import require_torch_gpu
 
 
 def test_stale_gdn_rows_are_nulled_and_clamped():
     metadata = SimpleNamespace(
         num_accepted_tokens=torch.tensor([0, 2], dtype=torch.int32),
-        spec_state_indices_tensor=torch.tensor(
-            [[11, 12, 13], [21, 22, 23]], dtype=torch.int32),
+        spec_state_indices_tensor=torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32),
     )
 
     result = _sanitize_stale_gdn_metadata(metadata)
 
     assert result is metadata
-    torch.testing.assert_close(metadata.num_accepted_tokens,
-                               torch.tensor([1, 2], dtype=torch.int32))
+    torch.testing.assert_close(metadata.num_accepted_tokens, torch.tensor([1, 2], dtype=torch.int32))
     torch.testing.assert_close(
         metadata.spec_state_indices_tensor,
-        torch.tensor(
-            [[NULL_BLOCK_ID] * 3, [21, 22, 23]], dtype=torch.int32),
+        torch.tensor([[NULL_BLOCK_ID] * 3, [21, 22, 23]], dtype=torch.int32),
     )
 
 
@@ -65,8 +64,7 @@ def test_align_mode_without_zeroing_delegates_without_recording():
         manager._record_new_block_ids = False
 
     manager._orig_init = original_init
-    manager._orig_allocate_new_blocks = (
-        lambda request_id, num_tokens, num_tokens_main_model: ["delegated"])
+    manager._orig_allocate_new_blocks = lambda request_id, num_tokens, num_tokens_main_model: ["delegated"]
     spec = MambaSpec(
         block_size=4,
         shapes=((1, 1),),
@@ -97,10 +95,7 @@ def test_align_mode_records_only_physical_allocations():
             self.next_id = 7
 
         def get_new_blocks(self, count):
-            blocks = [
-                SimpleNamespace(block_id=block_id)
-                for block_id in range(self.next_id, self.next_id + count)
-            ]
+            blocks = [SimpleNamespace(block_id=block_id) for block_id in range(self.next_id, self.next_id + count)]
             self.next_id += count
             return blocks
 
@@ -112,9 +107,10 @@ def test_align_mode_records_only_physical_allocations():
         new_block_ids=[],
     )
     relocated_block = SimpleNamespace(block_id=3)
-    manager._orig_allocate_new_blocks = (
-        lambda request_id, num_tokens, num_tokens_main_model:
-        [relocated_block, *pool.get_new_blocks(2)])
+    manager._orig_allocate_new_blocks = lambda request_id, num_tokens, num_tokens_main_model: [
+        relocated_block,
+        *pool.get_new_blocks(2),
+    ]
 
     result = MambaManagerPatch.allocate_new_blocks(manager, "request", 8, 8)
 
@@ -138,6 +134,7 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
         kv_cache_spec=spec,
         kv_cache_group_id=0,
         layer_names=[layer_name],
+        kernel_block_stride=0,
     )
     zeroer = SimpleNamespace()
 
@@ -146,13 +143,60 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
         device,
         [group],
         [2],
-        {
-            layer_name:
-            SimpleNamespace(kv_cache=[conv_state, recurrent_state])
-        },
+        {layer_name: SimpleNamespace(kv_cache=[conv_state, recurrent_state])},
         num_blocks=4,
     )
 
     assert zeroer._meta is not None
     addresses = set(zeroer._meta[0].tolist())
     assert addresses == {conv_state.data_ptr(), recurrent_state.data_ptr()}
+
+
+def _packed_attention_zeroer(device):
+    cache = torch.ones((9, 1, 2), dtype=torch.float32, device=device)
+    spec = MLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    layer_name = "indexer.k_cache"
+    group = AttentionGroup(
+        backend=None,
+        layer_names=[layer_name],
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        kernel_block_stride=5,
+    )
+    zeroer = SimpleNamespace()
+    KVBlockZeroerPatch.__init__(
+        zeroer,
+        device,
+        [group],
+        [2],
+        {layer_name: SimpleNamespace(kv_cache=cache)},
+        num_blocks=2,
+    )
+    return zeroer, cache
+
+
+def test_packed_attention_uses_manager_blocks_for_zeroing_metadata():
+    zeroer, cache = _packed_attention_zeroer(torch.device("cpu"))
+
+    addresses, strides, pages, _, _, count = zeroer._meta
+    assert addresses.tolist() == [cache.data_ptr()]
+    assert strides.tolist() == [10]
+    assert pages.tolist() == [4]
+    assert count == 1
+
+
+@require_torch_gpu
+def test_packed_attention_zeroes_only_selected_manager_block():
+    zeroer, cache = _packed_attention_zeroer(torch.device("cuda"))
+
+    KVBlockZeroer.zero_block_ids(zeroer, [1])
+    torch.cuda.synchronize()
+
+    expected = torch.ones_like(cache)
+    expected[5:7] = 0
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)

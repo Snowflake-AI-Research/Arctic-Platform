@@ -33,9 +33,9 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 
 from arctic_platform.common.optimizer import OptimizerSettings
-from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_configure_broadcast_training
-from arctic_platform.debug.deepspeed_zero_initialization import maybe_initialize_with_zero_allocation_trace
-from arctic_platform.debug.router_replay_trace import maybe_configure_router_replay_trace
+from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
@@ -105,8 +105,6 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         # NCCL bf16 all-reduce is not accumulated in fp32 internally.
         "communication_data_type": "fp32" if is_bf16 else None,
     }
-    if is_bf16:
-        ds_config["data_types"] = {"grad_accum_dtype": "fp32"}
     if spec.seed is not None:
         ds_config["seed"] = int(spec.seed)
     if spec.sequence_parallel > 1:
@@ -189,32 +187,35 @@ def initialize_training_engine(
     import deepspeed
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
-    if built is not None:
-        engine, built, _, _ = maybe_initialize_with_zero_allocation_trace(
-            deepspeed.initialize, ds_config, rank, model=model, optimizer=built, **init_kwargs
-        )
-    else:
-        engine, *_ = maybe_initialize_with_zero_allocation_trace(
-            deepspeed.initialize, ds_config, rank, model=model, **init_kwargs
-        )
-        built = None
+    with maybe_trace_zero_initialization(ds_config, rank) as init_config:
+        if built is not None:
+            engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=init_config, **init_kwargs)
+        else:
+            engine, *_ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
+            built = None
     return engine, built, choice
 
 
 def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) -> str:
-    """Map a caller optimizer name onto the implementation DeepSpeed will run."""
-    resolved = name.strip().lower().replace("-", "_")
-    if resolved in {"", "adam", "adamw"}:
-        if _optimizer_cpu_offload_enabled(ds_config):
-            return "deepspeed_cpu_adam" if fused else "torch_cpu_adamw"
-        return "fused_adam"
-    if resolved not in _OPTIMIZER_ALIASES:
+    """Resolve defaults by offload policy, while preserving explicit optimizer choices."""
+    normalized_name = name.strip().lower().replace("-", "_")
+    cpu_offload = _optimizer_cpu_offload_enabled(ds_config)
+
+    if normalized_name in {"", "adam", "adamw"}:
+        if not cpu_offload:
+            return "fused_adam"
+        elif fused:
+            return "deepspeed_cpu_adam"
+        else:
+            return "torch_cpu_adamw"
+
+    optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
+    if optimizer_name is None:
         supported = ", ".join(sorted(set(_OPTIMIZER_ALIASES.values())))
         raise ValueError(f"Unsupported optimizer {name!r}; supported values: {supported}")
-    selected = _OPTIMIZER_ALIASES[resolved]
-    if selected == "torch_adamw" and _optimizer_cpu_offload_enabled(ds_config):
+    if optimizer_name == "torch_adamw" and cpu_offload:
         return "torch_cpu_adamw"
-    return selected
+    return optimizer_name
 
 
 def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
@@ -269,8 +270,8 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
     optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
     if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name in ("deepspeed_cpu_adam", "torch_cpu_adamw"):
         logger.info(
-            "training_config.ds_config.zero_optimization.offload_optimizer is configured; "
-            "using optimizer='deepspeed_cpu_adam'"
+            "training_config.ds_config.zero_optimization.offload_optimizer is configured; using optimizer=%r",
+            optimizer_name,
         )
     decay_params = [
         param

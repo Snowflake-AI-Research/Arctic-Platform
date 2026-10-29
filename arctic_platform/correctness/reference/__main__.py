@@ -94,7 +94,8 @@ def main() -> None:
 
         pin_reduction_order(args.model, args.attn)
 
-    from ..harness.batches import load
+    from arctic_platform.correctness.harness.sft import load
+
     from .hf_single_gpu import run
 
     batch = load(Path(args.batch))

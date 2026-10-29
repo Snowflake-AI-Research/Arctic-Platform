@@ -680,6 +680,18 @@ class TestUnifiedConfigDoesNotReadEnv:
 
 
 class TestCortexModelOptions:
+    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+        cfg = ArcticClientConfig(
+            model_name="model",
+            training_gpus=1,
+            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+        )
+        before = cfg.model_dump()
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
     def test_training_options_use_the_supported_server_channel(self):
         from arctic_platform.client import CortexConfig
 

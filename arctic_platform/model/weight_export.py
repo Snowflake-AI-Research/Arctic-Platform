@@ -23,12 +23,16 @@ import os
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from typing import Any
 from typing import Literal
 from weakref import WeakKeyDictionary
 
 import torch
 import torch.nn as nn
+
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
+from arctic_platform.debug.weight_sync import maybe_complete_broadcast_trainer_inventory
 
 WeightFormat = Literal["hf", "vllm", "lora"]
 WeightIterator = Iterator[tuple[str, torch.Tensor]]
@@ -384,7 +388,10 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
                     portable[export_name] = handle.get_tensor(name)
             if not portable:
                 raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
-            save_file(portable, weights_path, metadata=metadata)
+            with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+                temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
+                save_file(portable, temporary_path, metadata=metadata)
+                os.replace(temporary_path, weights_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -608,11 +615,10 @@ def iter_model_weights(
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
-    from arctic_platform.debug.broadcast_weight_sync_evidence import maybe_bind_broadcast_trainer_inventory
-
     maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     contract = weight_export_contract(model)
@@ -622,6 +628,7 @@ def iter_model_weights(
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
         iterator = builder(_family_model_for_export(model))
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     if weight_format == "vllm" and contract is not None:
@@ -633,3 +640,4 @@ def iter_model_weights(
         is_zero3=is_zero3,
         checkpoint_dir=checkpoint_dir,
     )
+    maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)

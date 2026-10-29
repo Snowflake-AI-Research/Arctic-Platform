@@ -36,8 +36,8 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
-from arctic_platform.debug.lora_sync_hooks import maybe_observe_checkpoint_reader
-from arctic_platform.debug.reduced_fixture_mtp import maybe_capture_reduced_fixture_mtp
+from arctic_platform.debug.lora import maybe_observe_checkpoint_reader
+from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids

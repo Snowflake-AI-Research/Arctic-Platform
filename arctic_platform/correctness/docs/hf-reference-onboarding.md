@@ -31,23 +31,28 @@ python -m arctic_platform.correctness onboard \
 
 ## Record Identity
 
-**Records bind measurements to the exact workload.** Identity includes configuration checksum, check and arm, model asset contents, reference source and dependency identities, adapter initialization where applicable, input tensor semantics, and check-specific settings. Records are compact JSON at `<records>/<config-id>/<check-id>/<identity-sha256>.json`; they do not contain model or optimizer tensors.
+**Records bind measurements to the exact workload.** Identity includes configuration checksum, check and arm, model asset contents, reference source and dependency identities, adapter initialization where applicable, input tensor semantics, and check-specific settings. Records use readable arm filenames; integrity hashes remain inside each compact JSON record. They do not contain model or optimizer tensors.
+
+**Each workload folder retains only its latest complete reference set.** Publication stages and validates the complete replacement, renames the previous set aside, installs the new set, and removes the previous directory. Failed publication restores the previous complete set; regression never replaces references. The maintained layout is:
+
+```text
+<config-id>/single-step-grads/gradients-only/gas1.json
+<config-id>/single-step-grads/gradients-only/gas4.json
+<config-id>/single-step-grads/with-optimizer/gas1.json
+<config-id>/single-step-grads/with-optimizer/gas4.json
+<config-id>/single-step-optimizer/gas1.json
+<config-id>/single-step-optimizer/gas4.json
+```
 
 **Compact records are generated local artifacts, not files to commit.** They default to the Git-ignored `arctic_platform/correctness/reference_data` directory. Retain them for later regression; regression cannot regenerate missing HF measurements. The publisher validates containment under the executing library's Git root, not Git tracking or merely the shell's current directory. An unrelated sibling records directory is rejected. No measurements are bundled. To override the default, pass the same `--reference-records-dir` inside the checkout to preparation and regression. Model weights and adapter tensors do not belong in this directory or in Git.
 
-**Publication is immutable.** Identical records can be reused. Corrupt records, conflicting measurements, changed sources, changed assets, or changed workloads require explicit resolution and reviewed preparation; regression cannot replace or recalibrate them.
+**A repeated identity cannot acquire different measurements.** Identical records can be reused. Corrupt records or conflicting measurements require explicit resolution. Changed sources, assets, or workloads require explicit onboarding and reviewed preparation; regression cannot replace or recalibrate them.
 
 **New single-step measurements also record the implementation and configuration used by HF.** The [reference engine](../reference/hf_single_gpu.py) captures the loaded model and decoder class identities, Python `forward` code digests, source-file content hashes, and effective configurations, including the attention backend that HF configuration serialization can omit. The engine compares these observations before and after execution and rejects a changed implementation, source file or configuration. The [reference CLI](../reference/__main__.py) retains these observations in `reference_execution`; compact-record publication and loading preserve that field without rerunning HF. This limited observation does not capture every transitive kernel or prove native target execution. Historical records without this field remain historical: neither regression nor this change reconstructs their original execution evidence.
 
-### Reviewed Historical Gradients
+### Historical Records
 
-**New-model onboarding does not need historical-reference options.** The optional `run --historical-gradient-references <descriptor.json> --historical-gradient-references-sha256 <full-sha256>` pair is for maintainers who already hold reviewed, original gradient records. An identity mismatch alone does not authorize reuse. This branch includes no historical measurements or ready-made descriptor.
-
-**Only the reviewed DSS shared-expert alias change is accepted.** The [loader](../harness/reference_records.py) permits `harness/names.py` to change from SHA-256 `a5c941eb9592fabe042c8f48a28bfe7e650f5b65d3b8b7a6fd3824397c63ba09` (9,905 bytes) to `4d6cd215ef4639ab2d85f5928ca2df83954012878c39366c74e29207cc92725c` (10,294 bytes). Every other workload field must match exactly, including HF sources, dependencies, model files, input tensors, initialization, config, parameter-name map and gradient tolerance. The installed naming source must match the current pin. Reuse does not exclude tensors, widen a tolerance or rerun HF measurements.
-
-**The descriptor binds every selected arm to its original record bytes.** The JSON object has exactly two fields: `schema`, whose value is `"reviewed-gradient-references-v1"`, and `records`. Each key in `records` names a selected arm, such as `gas1` or `gas4`. Each arm has exactly `record_path` (the original JSON filename), `record_sha256` (64 lowercase hexadecimal characters hashing the entire original file) and `review` (a nonempty string identifying the source review). Relative record paths resolve against the descriptor's directory. The record filename must remain its historical workload-identity digest; renaming the record to the current lookup key is rejected. The second CLI option separately pins the descriptor's complete bytes.
-
-**Reuse supports one explicit supervised-fine-tuning config and only `single-step-grads`.** Optimizer or mixed selections, all-config runs, reference preparation, reinforcement-learning configs, and unknown or missing arm bindings are rejected. The [runner](../harness/runner.py) writes `reference-record-provenance.json` in the run's work directory before target work, retaining both complete identities, the original record path and raw hash, and the review string. A rejected binding never falls back to another record or fresh HF computation. Historical gradient reuse does not admit optimizer references or establish a model pass.
+**The old naming-source exception is retired.** The removed `--historical-gradient-references` options admitted only one reviewed change to the former `harness/names.py`. Consolidation into `harness/optimizer.py` changes the bound source and does not satisfy those original pins. Current regression requires an exact workload identity; use explicit onboarding to prepare compatible records. Frozen historical records and their original reports remain evidence, not compatible current references.
 
 ## Optimizer Criterion
 
@@ -62,7 +67,7 @@ python -m arctic_platform.correctness onboard \
 
 **Calibration automatically uses the visible GPUs on one node, capped at eight workers.** Each worker runs an independent single-GPU HF process. Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, including when sixteen GPUs are visible. Fewer local GPUs require more waves. `--reference-calibration-workers` preserves an explicit override from one to eight; the operator must make those GPUs available. Gradient and optimizer calibration use this policy independently of the target's GPU count.
 
-**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Eight repeats plus a deterministic baseline for each of GAS1 and GAS4 means eighteen processes for the optimizer check; concurrent workers overlap repeats, not the two GAS arms or their baselines. The progress bar measures complete reference runs, including this overhead; its ETA appears after a completion.
+**Independent process startup and optimizer capture can dominate tiny-model calibration.** Every HF repeat loads the fixture in a new process and writes optimizer-state artifacts before exiting. Eight repeats plus a deterministic baseline for each of GAS1 and GAS4 means eighteen processes for the optimizer check; concurrent workers overlap repeats, not the two GAS arms or their baselines. Progress counts successful worker completions and reports unfinished run IDs and wave elapsed time, with a waiting update every 30 seconds and no sequential ETA.
 
 **TODO: Use every available GPU within one allocation for calibration.** Multi-node support must handle remote worker launches, node-local model and input staging, unique GPU assignments, and result and failure collection before removing the one-node limit.
 
@@ -82,7 +87,7 @@ python -m arctic_platform.correctness onboard \
 
 **This integration is an internal Python callback interface, not a new CLI flag or automatic runtime discovery.** Pass `native_optimizer_scope`, `native_optimizer_scope_source`, and optionally `native_optimizer_supplier_source` to `runner.execute(...)`. A source descriptor has exactly `{"path": "/absolute/loaded/source.py", "sha256": "<full-file-sha256>"}` and must describe the callback's actual loaded source. If scope and supplier come from different files, provide both descriptors; otherwise the supplier uses the scope descriptor.
 
-**The scope owns collection and cleanup for one target arm.** `native_optimizer_scope(session, job)` returns a context manager whose entered value is a callable `supplier(checkpoint_root, *, step)`. The [capture helper](../harness/cortex_optimizer.py) invokes that supplier after each existing save, at step zero and step one. The supplier gathers the already-saved rank files and returns the validated native layout with the actual parent, training child and worker bindings. It must not initiate another optimizer step or substitute expert sidefiles for optimizer tensors. Context exit must restore owned hooks and finish owned cleanup before the training child is released.
+**The scope owns collection and cleanup for one target arm.** `native_optimizer_scope(session, job)` returns a context manager whose entered value is a callable `supplier(checkpoint_root, *, step)`. The [capture helper](../harness/optimizer.py) invokes that supplier after each existing save, at step zero and step one. The supplier gathers the already-saved rank files and returns the validated native layout with the actual parent, training child and worker bindings. It must not initiate another optimizer step or substitute expert sidefiles for optimizer tensors. Context exit must restore owned hooks and finish owned cleanup before the training child is released.
 
 **Admission remains explicit and narrow.** The runner requires target execution with a loopback `CortexConfig`, `local_cortex_fixture=True`, and an explicit selection containing `single-step-optimizer` and no checks beyond the first two supervised-reference checks. Reference preparation and reinforcement-learning configs cannot use this callback. Existing model identity, parameter coverage, dtype, partition ordering, snapshot integrity and numerical gates still apply. Installing these hooks or passing CPU controls does not establish a live worker route, a complete checkpoint, successful resource cleanup or a numerical pass.
 

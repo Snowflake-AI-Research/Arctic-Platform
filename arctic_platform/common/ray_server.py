@@ -56,6 +56,15 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.common.utils.weight_sync import received_checksums
+from arctic_platform.common.weight_checksum import compare_weight_checksums
+from arctic_platform.debug.lora import maybe_lora_max_param_bytes
+from arctic_platform.debug.lora import maybe_lora_replica_pool
+from arctic_platform.debug.lora import maybe_lora_sync_result
+from arctic_platform.debug.lora import maybe_prepare_lora_training
+from arctic_platform.debug.lora import maybe_project_lora_transfer_schedule
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -64,7 +73,6 @@ if TYPE_CHECKING:
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need Arctic Inference / vLLM."""
     require_any_dep_group("rl")
-    from arctic_platform.debug.lora_replica_pool_routing import maybe_lora_replica_pool
     from arctic_platform.inference.server.replica_pool import ReplicaPool
 
     return maybe_lora_replica_pool(ReplicaPool)
@@ -922,8 +930,6 @@ class ArcticRLRayServer:
     def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
         worker_sp_info = None
         if sp_size > 1:
-            from arctic_platform.common.utils.sequence_parallel import validate_sequence_parallel_grpo
-
             _, _, meta, processing = unpack_batch(batch)
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
             worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
@@ -934,8 +940,6 @@ class ArcticRLRayServer:
     def _logical_model_results(results, worker_sp_info, *, sp_size: int):
         if worker_sp_info is None:
             return results
-        from arctic_platform.common.utils.sequence_parallel import collect_sequence_parallel_results
-
         return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
 
     async def shutdown(self) -> None:
@@ -977,7 +981,7 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        sp_size = self.jobs[job_id].get("sp_size", 1)
+        sp_size = self.jobs[job_id]["sp_size"]
         shards, reorder_indices, worker_sp_info = self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=True
         )
@@ -1055,7 +1059,7 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        sp_size = info.get("sp_size", 1)
+        sp_size = info["sp_size"]
         shards, reorder_indices, worker_sp_info = self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=False
         )
@@ -1554,26 +1558,21 @@ class ArcticRLRayServer:
     async def _sync_weights_nccl(self, workers, pool: ReplicaPool) -> dict:
         """Non-colocated weight sync via NCCL (original path)."""
         await self.arctic_rl_ray_server_state.wake_inference.remote()
-        from arctic_platform.debug.lora_sync_hooks import maybe_lora_transfer_schedule
-
-        schedule = maybe_lora_transfer_schedule(
-            _transfer_schedule_cls(),
+        schedule = _transfer_schedule_cls().build(
             training_sharding="dp",
             training_gpus=len(workers),
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
-        from arctic_platform.debug.lora_sync_hooks import maybe_prepare_lora_training
-
+        schedule = maybe_project_lora_transfer_schedule(schedule)
         await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
         sender_ips = await self._await_training_refs(lambda: [workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
-            from arctic_platform.debug.lora_sync_hooks import maybe_lora_max_param_bytes
-
-            max_param = await maybe_lora_max_param_bytes(self, workers[0])
+            max_param = (await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()]))[0]
+            max_param = maybe_lora_max_param_bytes(self, max_param)
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
@@ -1623,9 +1622,18 @@ class ArcticRLRayServer:
         )
 
         t0 = time.monotonic()
-        from arctic_platform.debug.lora_sync_hooks import maybe_collect_lora_sync
-
-        results = await maybe_collect_lora_sync(self, receive_task, send_tasks, schedule=schedule)
+        pool_response, send_results = await self._await_weight_sync_refs(receive_task, send_tasks)
+        workers_results = pool_response.get("workers", [])
+        checksum = compare_weight_checksums(
+            {
+                f"training rank {group.sender_train_rank}": receipt.get("sent_l2_sq")
+                for group, receipt in zip(schedule.groups, send_results)
+            },
+            received_checksums(
+                [f"sampling replica {index}" for index in range(len(workers_results))], workers_results
+            ),
+        )
+        results = maybe_lora_sync_result(self, {"status": "ok", **checksum}, pool_response, send_results)
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         return results
 
@@ -1647,7 +1655,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info["sp_size"])
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

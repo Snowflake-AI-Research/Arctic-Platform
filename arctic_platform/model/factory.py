@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform.debug.lora import maybe_admit_model_construction
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.debug.gpu_memory import allocate_gpu_mem_preallocation
 from arctic_platform.model.loader import LoadedModel
@@ -29,8 +30,6 @@ from arctic_platform.model.patch import apply_patches
 
 def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
     """Run the spec's resolved loader, apply its patches, and return the result."""
-    from arctic_platform.debug.lora_sync_hooks import maybe_admit_model_construction
-
     maybe_admit_model_construction(spec, parallel_groups)
     allocation = allocate_gpu_mem_preallocation(spec.debug)
     ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)

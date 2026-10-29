@@ -191,7 +191,7 @@ def test_runtime_config_is_derived_from_validated_options():
 
 
 def test_reduced_fixture_mtp_roundtrips_prime_rl_worker_options_to_qwen_runtime_config(tmp_path):
-    from arctic_platform.debug.reduced_fixture_mtp import ReducedFixtureMTP
+    from arctic_platform.debug.training import ReducedFixtureMTP
     from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
 
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe_text"}))
