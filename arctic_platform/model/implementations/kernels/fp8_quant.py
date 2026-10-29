@@ -144,7 +144,17 @@ def per_token_group_quant_fp8_mn_major(x: torch.Tensor, group_size: int = 128) -
     if rows:
         block_m = 32
         _per_token_group_quant_fp8_mn_major[(triton.cdiv(rows, block_m), groups)](
-            x, x_q, x_s, rows, x.stride(0), x_s.stride(0), FP8_EPS, FP8_MIN, FP8_MAX,
-            GROUP=group_size, BLOCK_M=block_m, num_warps=4,
+            x,
+            x_q,
+            x_s,
+            rows,
+            x.stride(0),
+            x_s.stride(0),
+            FP8_EPS,
+            FP8_MIN,
+            FP8_MAX,
+            GROUP=group_size,
+            BLOCK_M=block_m,
+            num_warps=4,
         )
     return x_q, x_s[:, :rows].t()

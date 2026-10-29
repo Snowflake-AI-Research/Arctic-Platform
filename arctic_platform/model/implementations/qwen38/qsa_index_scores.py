@@ -38,9 +38,23 @@ except ImportError:  # pragma: no cover - FlashInfer is optional
 
 
 @triton.jit
-def _qsa_index_scores_kernel(q_ptr, k_ptr, visible_ptr, out_ptr, R, P, sqrt_d, stride_qr, stride_qh, stride_kp,
-                             stride_or, H: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
-                             BLOCK_P: tl.constexpr):
+def _qsa_index_scores_kernel(
+    q_ptr,
+    k_ptr,
+    visible_ptr,
+    out_ptr,
+    R,
+    P,
+    sqrt_d,
+    stride_qr,
+    stride_qh,
+    stride_kp,
+    stride_or,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     cols = tl.program_id(1) * BLOCK_P + tl.arange(0, BLOCK_P)
     dims = tl.arange(0, D)
@@ -49,14 +63,20 @@ def _qsa_index_scores_kernel(q_ptr, k_ptr, visible_ptr, out_ptr, R, P, sqrt_d, s
     k = tl.load(k_ptr + cols[:, None].to(tl.int64) * stride_kp + dims[None, :], mask=col_mask[:, None], other=0.0)
     acc = tl.zeros([BLOCK_R, BLOCK_P], tl.float32)
     for h in tl.static_range(H):
-        q = tl.load(q_ptr + rows[:, None].to(tl.int64) * stride_qr + h * stride_qh + dims[None, :],
-                    mask=row_mask[:, None], other=0.0)
+        q = tl.load(
+            q_ptr + rows[:, None].to(tl.int64) * stride_qr + h * stride_qh + dims[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
         acc += tl.maximum(tl.dot(q, tl.trans(k)), 0.0)
     acc = acc / sqrt_d
     visible = tl.load(visible_ptr + rows, mask=row_mask, other=0)
     acc = tl.where(cols[None, :] < visible[:, None], acc, -float("inf"))
-    tl.store(out_ptr + rows[:, None].to(tl.int64) * stride_or + cols[None, :], acc,
-             mask=row_mask[:, None] & col_mask[None, :])
+    tl.store(
+        out_ptr + rows[:, None].to(tl.int64) * stride_or + cols[None, :],
+        acc,
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
 
 
 def fused_index_scores_supported(queries: torch.Tensor) -> bool:
@@ -77,9 +97,23 @@ def qsa_index_scores(queries: torch.Tensor, keys: torch.Tensor, visible_blocks: 
     block_r, block_p = 64, 128
     grid = (triton.cdiv(rows, block_r), triton.cdiv(blocks, block_p))
     _qsa_index_scores_kernel[grid](
-        queries, keys, visible_blocks.to(torch.int32).contiguous(), out, rows, blocks, math.sqrt(head_dim),
-        queries.stride(0), queries.stride(1), keys.stride(0), out.stride(0),
-        H=heads, D=head_dim, BLOCK_R=block_r, BLOCK_P=block_p, num_warps=4, num_stages=2,
+        queries,
+        keys,
+        visible_blocks.to(torch.int32).contiguous(),
+        out,
+        rows,
+        blocks,
+        math.sqrt(head_dim),
+        queries.stride(0),
+        queries.stride(1),
+        keys.stride(0),
+        out.stride(0),
+        H=heads,
+        D=head_dim,
+        BLOCK_R=block_r,
+        BLOCK_P=block_p,
+        num_warps=4,
+        num_stages=2,
     )
     return out
 
