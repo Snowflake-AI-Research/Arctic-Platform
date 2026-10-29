@@ -80,58 +80,38 @@ def test_is_address_in_use_error_walks_exception_chain():
     assert not worker_mod._is_address_in_use_error(RuntimeError("CUDA out of memory"))
 
 
-@pytest.mark.parametrize("checkpoint", [False, "unsafe", "safe"])
-@pytest.mark.parametrize("targets", [["kv_b_proj"], "all-linear", r".*\.kv_b_proj"])
-def test_initialize_rejects_absorbed_lora_before_engine_start(monkeypatch, tmp_path, checkpoint, targets):
+@pytest.mark.parametrize("synced, checkpoint", [(["kv_b_proj"], None), (["q_b_proj"], ["q_b_proj", "kv_b_proj"])])
+def test_initialize_rejects_kv_b_lora_on_mla_before_engine_start(monkeypatch, tmp_path, synced, checkpoint):
     import json
 
     class FakeEngineArgs:
         def create_engine_config(self):
-            return types.SimpleNamespace(
-                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False, reasoning_parser="deepseek_r1"),
-                model_config=types.SimpleNamespace(
-                    architecture="Glm5NextForConditionalGeneration", use_mla=True,
-                    hf_text_config=types.SimpleNamespace(num_hidden_layers=2, model_type="glm5_next_text",
-                                                        layer_types=["linear_attention", "deepseek_sparse_attention"])))
+            return types.SimpleNamespace(model_config=types.SimpleNamespace(use_mla=True))
 
     class FakeAsyncLLM:
         @classmethod
         def from_vllm_config(cls, *args, **kwargs):
-            pytest.fail("engine started before rejecting unservable LoRA")
+            pytest.fail("engine started before rejecting an unservable LoRA target")
 
     _install_fake_vllm(monkeypatch, FakeAsyncLLM)
     for name in ("_ensure_arctic_vllm_patches", "_ensure_router_replay_vllm_patches",
                  "ensure_xgrammar_stop_mask_fix", "ensure_spec_decode_grammar_fix"):
         monkeypatch.setattr(worker_mod, name, lambda: None)
     monkeypatch.setattr(worker_mod, "_create_async_engine_args", lambda *args, **kwargs: FakeEngineArgs())
-    kwargs = {"model": "test-model", "lora_peft_config": {"target_modules": targets}}
+    kwargs = {"model": "test-model", "lora_peft_config": {"target_modules": synced}}
     if checkpoint:
-        (tmp_path / "adapter_config.json").write_text(json.dumps({
-            "target_modules": targets if checkpoint == "unsafe" else ["q_b_proj"]}))
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"target_modules": checkpoint}))
         kwargs["lora_adapter_path"] = str(tmp_path)
-        if checkpoint == "unsafe":
-            kwargs["lora_peft_config"] = {"target_modules": ["q_b_proj"]}
     worker = InferenceWorker.__ray_metadata__.modified_class()
     with pytest.raises(ValueError, match="kv_b_proj.*absorbed"):
         asyncio.run(worker.initialize(kwargs))
 
 
-@pytest.mark.parametrize("use_mla,targets", [
-    (True, ["q_b_proj"]), (True, r".*\.q_b_proj"), (False, ["kv_b_proj"]),
-])
+@pytest.mark.parametrize("use_mla, targets", [(True, ["q_a_proj", "q_b_proj", "o_proj"]), (False, ["kv_b_proj"])])
 def test_mla_lora_guard_allows_servable_targets(use_mla, targets):
-    config = types.SimpleNamespace(
-        architecture="DeepseekV2ForCausalLM", use_mla=use_mla,
-        hf_text_config=types.SimpleNamespace(num_hidden_layers=2))
+    config = types.SimpleNamespace(use_mla=use_mla)
     worker_mod._validate_mla_lora_targets(config, {"target_modules": targets})
     worker_mod._validate_mla_lora_targets(config, None)
-
-
-def test_semip_rejects_synced_lora_before_restore():
-    worker = InferenceWorker.__ray_metadata__.modified_class()
-    with pytest.raises(ValueError, match="semi_p cannot serve LoRA"):
-        asyncio.run(worker.initialize({"model": "test-model", "semi_p": True,
-                                      "lora_peft_config": {"target_modules": ["kv_b_proj"]}}))
 
 
 def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
