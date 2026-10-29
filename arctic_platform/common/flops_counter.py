@@ -108,6 +108,11 @@ class FlopsCounter:
     that recompute their forward. With a LoRA ``peft_config`` the frozen base
     weights skip their weight gradients (2 of the 6), and each adapted
     Linear adds ``r * (in + out)`` trainable parameters at the full count.
+
+    Two conventions overcount what runs: the Llama/Qwen2 estimator counts the
+    embedding as a matmul (ArcticTraining parity), and checkpointing counts a
+    full forward recompute, though non-reentrant ``torch.utils.checkpoint``
+    skips each block's last matmul.
     """
 
     def __init__(
@@ -268,7 +273,8 @@ class FlopsCounter:
         return self._estimate_hybrid_attention_flops(mlp_n, tokens_sum, batch_seqlens, delta_time, forward_only)
 
     def _estimate_hybrid_attention_flops(self, mlp_n, tokens_sum, batch_seqlens, delta_time, forward_only):
-        """Every ``full_attention_interval``-th layer is full attention; the rest are gated delta-net."""
+        """Full-attention layers come from ``layer_types``, else every ``full_attention_interval``-th
+        layer; the rest are gated delta-net."""
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
         num_hidden_layers = self.config.num_hidden_layers
@@ -279,8 +285,7 @@ class FlopsCounter:
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
 
-        full_attention_interval = getattr(self.config, "full_attention_interval", 1)
-        num_full_attention_layers = num_hidden_layers // full_attention_interval
+        num_full_attention_layers = _num_full_attention_layers(self.config)
         num_linear_attention_layers = num_hidden_layers - num_full_attention_layers
 
         embed_and_lm_head_n = vocab_size * hidden_size
@@ -362,6 +367,13 @@ class FlopsCounter:
         tflos = func(tokens_sum, batch_seqlens, delta_time=delta_time, forward_only=forward_only)
         adapter_multiplier = 2 if forward_only else self.trainable_flops_multiplier
         return tflos + adapter_multiplier * self.lora_params * tokens_sum / 1e12
+
+
+def _num_full_attention_layers(config) -> int:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        return sum(layer == "full_attention" for layer in layer_types)
+    return config.num_hidden_layers // getattr(config, "full_attention_interval", 1)
 
 
 def _deepseek_v4_flops_terms(config) -> tuple[float, float, float]:
@@ -513,7 +525,7 @@ def _qwen3_5_linears(config) -> list[tuple[str, int, int, int]]:
     head_dim = getattr(config, "head_dim", hidden // heads)
     kv = config.num_key_value_heads * head_dim
     layers = config.num_hidden_layers
-    n_full = layers // getattr(config, "full_attention_interval", 1)
+    n_full = _num_full_attention_layers(config)
     n_linear = layers - n_full
     gate = 2 if getattr(config, "attn_output_gate", False) else 1
     qk = config.linear_key_head_dim * config.linear_num_key_heads

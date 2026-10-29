@@ -266,6 +266,19 @@ def test_qwen3_5_dense_matches_the_hybrid_moe_count_with_one_expert():
     assert tflops_per_token(outer, 64) == tflops_per_token(dense, 64)
 
 
+def test_qwen3_5_full_attention_layers_come_from_layer_types():
+    interval = _qwen3_5_dense()
+    listed = _qwen3_5_dense()
+    del listed.full_attention_interval
+    listed.layer_types = ["linear_attention", "full_attention"] * 2
+    assert tflops_per_token(listed, 4096) == tflops_per_token(interval, 4096)
+    lora = _lora(targets=("q_proj", "out_proj"))
+    assert (
+        FlopsCounter(listed, 0, peft_config=lora).lora_params
+        == FlopsCounter(interval, 0, peft_config=lora).lora_params
+    )
+
+
 def _lora(r=8, targets=("q_proj", "o_proj", "down_proj")):
     return {"peft_type": "Lora", "r": r, "target_modules": list(targets)}
 
