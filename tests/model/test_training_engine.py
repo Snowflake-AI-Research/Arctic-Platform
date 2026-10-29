@@ -195,38 +195,6 @@ def test_optimizer_implementation_rejects_unknown_names():
         optimizer_implementation("sgd", fused=True)
 
 
-def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
-    captured = {}
-
-    class _Adam:
-        def __init__(self, param_groups, **kwargs):
-            captured["param_groups"] = param_groups
-            captured["kwargs"] = kwargs
-
-    monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
-
-    class _Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.proj = torch.nn.Linear(2, 2, bias=False)
-            self.norm = torch.nn.LayerNorm(2)
-
-    model = _Model()
-
-    optimizer = build_training_optimizer(
-        model,
-        OptimizerSettings(lr=3e-4, weight_decay=0.1, eps=1e-6, betas=[0.8, 0.95]),
-        _ZERO2,
-        fused=True,
-    )
-
-    assert isinstance(optimizer, _Adam)
-    groups = {group["weight_decay"]: [param.shape for param in group["params"]] for group in captured["param_groups"]}
-    assert groups[0.1] == [torch.Size([2, 2])]
-    assert groups[0.0] == [torch.Size([2]), torch.Size([2])]
-    assert captured["kwargs"] == {"lr": 3e-4, "betas": (0.8, 0.95), "eps": 1e-6, "adam_w_mode": True}
-
-
 def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
     pytest.importorskip("transformers.models.qwen4_exp")
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -285,6 +253,38 @@ def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
         if id(param) in decayed
     ]
     assert not decayed_norms, f"norm weights in the weight-decay group: {decayed_norms}"
+
+
+def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
+    captured = {}
+
+    class _Adam:
+        def __init__(self, param_groups, **kwargs):
+            captured["param_groups"] = param_groups
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2, bias=False)
+            self.norm = torch.nn.LayerNorm(2)
+
+    model = _Model()
+
+    optimizer = build_training_optimizer(
+        model,
+        OptimizerSettings(lr=3e-4, weight_decay=0.1, eps=1e-6, betas=[0.8, 0.95]),
+        _ZERO2,
+        fused=True,
+    )
+
+    assert isinstance(optimizer, _Adam)
+    groups = {group["weight_decay"]: [param.shape for param in group["params"]] for group in captured["param_groups"]}
+    assert groups[0.1] == [torch.Size([2, 2])]
+    assert groups[0.0] == [torch.Size([2]), torch.Size([2])]
+    assert captured["kwargs"] == {"lr": 3e-4, "betas": (0.8, 0.95), "eps": 1e-6, "adam_w_mode": True}
 
 
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
