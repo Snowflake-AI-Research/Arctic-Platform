@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import tempfile
@@ -30,8 +31,14 @@ from harbor.environments.tar_transfer import extract_dir_from_file
 from harbor.environments.tar_transfer import pack_dir_to_file
 from harbor.environments.tar_transfer import remote_pack_command
 
+try:
+    from snowflake.sandbox.exceptions import SandboxTransportError
+except ImportError:  # pragma: no cover - the SDK is part of the harbor extra
+    SandboxTransportError = OSError  # type: ignore[assignment,misc]
+
 CHUNK_BYTES = 24 * 1024 * 1024
 REMOTE_STAGING = "/var/tmp/harbor-transfer"
+TRANSFER_ATTEMPTS = 3
 
 ExecFn = Callable[[str], Awaitable[ExecResult]]
 
@@ -51,6 +58,19 @@ def remote_unpack_command(archive_path: str, target_dir: str) -> str:
         f"mkdir -p {shlex.quote(target_dir)} && "
         f"tar --no-same-owner -xzf {shlex.quote(archive_path)} -C {shlex.quote(target_dir)}"
     )
+
+
+async def _retrying(call: Callable[[], Awaitable[None]]) -> None:
+    # The SDK only retries HTTP 502; a stream can also drop mid-transfer when
+    # several sandboxes transfer at once. Every call here targets a fresh
+    # staging path or only reads, so repeating it is safe.
+    for attempt in range(1, TRANSFER_ATTEMPTS + 1):
+        try:
+            return await call()
+        except SandboxTransportError:
+            if attempt == TRANSFER_ATTEMPTS:
+                raise
+            await asyncio.sleep(attempt)
 
 
 def _check(result: ExecResult, what: str) -> ExecResult:
@@ -91,7 +111,7 @@ async def upload_path(
         _check(await exec_fn(f"mkdir -p {shlex.quote(remote_dir)}"), "mkdir")
         try:
             for part in parts:
-                await transport.upload_file(part, f"{remote_dir}/{part.name}")
+                await _retrying(lambda part=part: transport.upload_file(part, f"{remote_dir}/{part.name}"))
             dest = shlex.quote(remote)
             _check(
                 await exec_fn(
@@ -122,10 +142,10 @@ async def upload_dir(
         _check(await exec_fn(f"mkdir -p {shlex.quote(remote_dir)}"), "mkdir")
         try:
             if len(parts) == 1:
-                await transport.upload_file(parts[0], remote_archive)
+                await _retrying(lambda: transport.upload_file(parts[0], remote_archive))
             else:
                 for part in parts:
-                    await transport.upload_file(part, f"{remote_dir}/{part.name}")
+                    await _retrying(lambda part=part: transport.upload_file(part, f"{remote_dir}/{part.name}"))
                 _check(
                     await exec_fn(f"cat {shlex.quote(remote_dir)}/tree.tgz.part* > {shlex.quote(remote_archive)}"),
                     "reassemble",
@@ -153,7 +173,7 @@ async def _download_chunked(
         with tempfile.NamedTemporaryFile(prefix=".harbor-dl-", dir=str(local.parent), delete=False) as tmp_f:
             tmp_path = Path(tmp_f.name)
         try:
-            await transport.download_file(remote, tmp_path)
+            await _retrying(lambda: transport.download_file(remote, tmp_path))
             os.replace(tmp_path, local)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
@@ -178,7 +198,9 @@ async def _download_chunked(
                 with assembled.open("wb") as out:
                     for name in sorted(listing):
                         piece = Path(tmp) / name
-                        await transport.download_file(f"{remote_dir}/{name}", piece)
+                        await _retrying(
+                            lambda name=name, piece=piece: transport.download_file(f"{remote_dir}/{name}", piece)
+                        )
                         out.write(piece.read_bytes())
                 os.replace(assembled, local)
             except BaseException:

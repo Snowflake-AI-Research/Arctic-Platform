@@ -666,6 +666,39 @@ def test_image_platform_reaches_every_crane_call(monkeypatch):
     registry.close()
 
 
+def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxTransportError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import transfer
+
+    async def no_sleep(_):
+        return None
+
+    async def exec_fn(cmd: str) -> ExecResult:
+        return ExecResult(return_code=0, stdout="5", stderr="")
+
+    class FlakyTransport:
+        def __init__(self, drops: int):
+            self.drops, self.calls = drops, 0
+
+        async def download_file(self, remote, local):
+            self.calls += 1
+            if self.calls <= self.drops:
+                raise SandboxTransportError("transport error mid-download: ")
+            Path(local).write_text("reward", encoding="utf-8")
+
+    monkeypatch.setattr(transfer.asyncio, "sleep", no_sleep)
+    flaky = FlakyTransport(drops=1)
+    asyncio.run(transfer.download_path(flaky, exec_fn, "/logs/verifier/reward.txt", tmp_path / "reward.txt"))
+    assert (tmp_path / "reward.txt").read_text() == "reward" and flaky.calls == 2
+
+    dead = FlakyTransport(drops=99)
+    with pytest.raises(SandboxTransportError):
+        asyncio.run(transfer.download_path(dead, exec_fn, "/logs/verifier/reward.txt", tmp_path / "other.txt"))
+    assert dead.calls == transfer.TRANSFER_ATTEMPTS
+
+
 def test_the_snowflake_sandbox_can_replay_the_recipes_task_dockerfile(tmp_path):
     from harbor_rl.entrypoint import materialize_harbor_task_from_row
 
