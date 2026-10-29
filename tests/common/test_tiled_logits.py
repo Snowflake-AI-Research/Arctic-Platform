@@ -105,6 +105,7 @@ class TestLmHeadTemperatureLayout(TestCasePlus):
             False,
             n,
             [model.lm_head.weight],
+            True,
         )
         self.assertEqual(tuple(logprobs.shape), tuple(labels.shape))
 
@@ -142,6 +143,7 @@ class TestPerTokenLogprobParityGPU(TestCasePlus):
             False,
             num_shards,
             [model.lm_head.weight],
+            True,
         )
 
         # Same fp32 CE math across modes → float noise only (rtol=0). Widening

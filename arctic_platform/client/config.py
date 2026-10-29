@@ -392,7 +392,6 @@ class ArcticClientConfig(BaseModel):
         # flattening them onto inference_config is silently ignored (extra="allow").
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
-        vllm.pop("tensor_parallel_size", None)  # owned by n_gpus on this wire
         inference: dict[str, Any] = {
             **(self.sampling.arctic_inference_config or {}),
             "max_seq_len": self.max_seq_len,
