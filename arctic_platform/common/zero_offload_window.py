@@ -43,15 +43,17 @@ def patch_zero2_offload_boundary_window() -> None:
 
     copy_grads_in_partition = Zero.copy_grads_in_partition
 
-    def uses_host_buffer(zero, param) -> bool:
-        # With low-precision masters the buffer is the master gradient itself, which the boundary writes.
-        if not zero.cpu_offload or zero.low_precision_master_weights_and_grads:
-            return False
-        compact = getattr(zero, "_use_compact_grad_partition_buffer", None)  # 0.19.8 fp32 accumulation has no buffer
-        return compact is None or not compact(zero._get_param_group_idx(param))
+    def uses_host_buffer(zero) -> bool:
+        # With low-precision masters the buffer is the master gradient, which the boundary writes; an fp32
+        # accumulation dtype is DeepSpeed 0.19.8's native path (or #356's), which keeps no host buffer.
+        return (
+            zero.cpu_offload
+            and not zero.low_precision_master_weights_and_grads
+            and zero.gradient_accumulation_dtype == zero.dtype
+        )
 
     def save_every_backward(zero, param, *args, **kwargs):
-        if zero.micro_step_id == 0 and zero.is_gradient_accumulation_boundary() and uses_host_buffer(zero, param):
+        if zero.micro_step_id == 0 and zero.is_gradient_accumulation_boundary() and uses_host_buffer(zero):
             zero.async_accumulate_grad_in_cpu_via_gpu(param)  # the stock path skips this save for a lone backward
         return copy_grads_in_partition(zero, param, *args, **kwargs)
 
