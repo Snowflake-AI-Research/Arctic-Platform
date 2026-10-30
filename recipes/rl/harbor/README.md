@@ -28,10 +28,10 @@ bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 
 `HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`. A `prebuilt_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no `image_repo` or `crane`; any other `prebuilt_image` is mirrored, so it needs both. The launcher checks this before it provisions GPUs.
 
-`HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`:
+`HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`. From the repository root, `uv run --extra harbor` provides the pinned `harbor` CLI with that environment importable:
 
 ```bash
-harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
+uv run --extra harbor harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
   --ek image_repo=DB.SCHEMA.REPO --ek connection=MY_CONN --ek role=MY_ROLE
 ```

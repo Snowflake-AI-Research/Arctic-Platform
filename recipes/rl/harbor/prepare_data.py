@@ -126,7 +126,7 @@ def export_swe_smith_harbor_tasks(
 ) -> tuple[Path, Path]:
     """Export SWE-smith code-localization rows into ``out_dir/train`` and ``out_dir/eval`` Harbor task directories."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from harbor_rl.entrypoint import materialize_harbor_task_from_row
+    from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
 
     if source_parquet_dir is not None and (source_parquet_dir / "train.parquet").is_file():
         train_df = pd.read_parquet(source_parquet_dir / "train.parquet")
