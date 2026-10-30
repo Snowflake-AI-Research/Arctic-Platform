@@ -50,6 +50,9 @@ _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
+_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY = "router_replay_cache_device"
+_ROUTER_REPLAY_CACHE_DEVICES = ("cuda", "cpu")
+_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY = "router_replay_staging_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
@@ -478,10 +481,29 @@ def _create_async_engine_args(
 
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
-        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(
-            _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY
+    for key in (
+        _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
+        _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY,
+        _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY,
+    ):
+        if key in engine_kwargs:
+            out[key] = engine_kwargs.pop(key)
+    device = out.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY)
+    if device is not None and device not in _ROUTER_REPLAY_CACHE_DEVICES:
+        raise ValueError(
+            f"{_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY} must be one of "
+            f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
         )
+    staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
+    if staging_bytes is not None:
+        # JSON transports (Cortex Training among them) can deliver an integer as a whole float.
+        if isinstance(staging_bytes, float) and staging_bytes.is_integer():
+            staging_bytes = int(staging_bytes)
+        if isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0:
+            raise ValueError(
+                f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
+            )
+        out[_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY] = staging_bytes
     return out
 
 
@@ -827,6 +849,8 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._router_replay_tx_on_host = False
+        self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
         self._router_replay_shm_entry: dict[str, Any] | None = None
@@ -1173,8 +1197,17 @@ class InferenceWorker(StreamingWorkerMixin):
         from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
         import torch
 
-        # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
-        if _ray_blanked_cuda_visible_devices():
+        router_replay_engine_kwargs = router_replay_engine_kwargs or {}
+        self._router_replay_tx_on_host = (
+            router_replay_engine_kwargs.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY, "cuda") == "cpu"
+        )
+        self._router_replay_staging_bytes = router_replay_engine_kwargs.get(
+            _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY
+        )
+        if self._router_replay_tx_on_host:
+            tx_device = torch.device("cpu")
+        elif _ray_blanked_cuda_visible_devices():
+            # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
             tx_device = torch.device("cpu")
             logger.warning(
                 "router-replay TX cache on CPU (CUDA_VISIBLE_DEVICES=%r)",
@@ -1183,7 +1216,7 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             tx_device = torch.device("cuda:0")
         max_bytes = int(
-            (router_replay_engine_kwargs or {}).get(
+            router_replay_engine_kwargs.get(
                 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
                 16 * 1024**3,
             )
@@ -1193,7 +1226,11 @@ class InferenceWorker(StreamingWorkerMixin):
             max_bytes=max_bytes,
         )
         self._replica_label = f"pid={os.getpid()}"
-        logger.info("router-replay TX cache initialized max_bytes=%d", max_bytes)
+        logger.info(
+            "router-replay TX cache initialized max_bytes=%d device=%s",
+            max_bytes,
+            "host" if self._router_replay_tx_on_host else tx_device,
+        )
 
     def _register_router_replay_shm(
         self,
@@ -1466,7 +1503,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 f"is_available={torch.cuda.is_available()})"
             )
         tx_device = torch.device("cuda:0")
-        if self._router_replay_tx.device != tx_device:
+        if not self._router_replay_tx_on_host and self._router_replay_tx.device != tx_device:
             max_bytes = self._router_replay_tx.max_bytes
             self._router_replay_tx = RouterReplayCacheTX(
                 device=tx_device,
@@ -1484,6 +1521,7 @@ class InferenceWorker(StreamingWorkerMixin):
             master_port=master_port,
             device=tx_device,
             is_server=is_server,
+            staging_bytes=self._router_replay_staging_bytes,
         )
         return {"status": "ok", "rank": rank, "world_size": world_size}
 
