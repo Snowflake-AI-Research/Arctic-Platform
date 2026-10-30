@@ -2,7 +2,7 @@
 # Arctic RL + ZoRRo: Qwen3-8B LoongRL long-context GRPO — single node / 8 H200s.
 # Pure GRPO, no frozen reference model (use_kl_loss=false).
 #
-# Defaults to PROMPT_LEN=16384 (LoongRL's native length). With Qwen3-8B + ZeRO-3
+# Defaults to PROMPT_LEN=16384 (LoongRL's native length). With Qwen3-8B + ZeRO-2
 # this fits in 8xH200 HBM; on A100-80G drop PROMPT_LEN to 8192.
 #
 # Prereqs (see README.md):
@@ -62,7 +62,7 @@ NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
 # FA2 + OFFLOAD=true match upstream's ARL 8B example and the BIRD-8B sibling.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-ARCTIC_ZERO_STAGE=3
+ARCTIC_ZERO_STAGE=2
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 # Sizing: (MINI_BSZ * N_SAMPLES) / training_gpus must be divisible by the

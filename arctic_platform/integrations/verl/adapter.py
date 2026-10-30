@@ -28,6 +28,7 @@ this module for that side effect, and pairs it with the matching per-
 backend worker and rollout replica.
 """
 
+import math
 import os
 from copy import deepcopy
 from typing import Any
@@ -41,11 +42,15 @@ from verl.remote_backend.base import RemoteBackendRegistry
 
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
+from arctic_platform.client.config import cortex_job_packs
 from arctic_platform.common.balance_metadata import prompt_rows_for_balance
 from arctic_platform.common.balance_metadata import stamp_client_balance
+from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -57,6 +62,128 @@ _ARCTIC_METRIC_REDUCTION_FN = {
     "kl_coef": np.mean,
     "kl_loss": np.mean,
 }
+
+# Cortex step answers flat; these keys are bookkeeping, not metrics to average.
+_CORTEX_STEP_NON_METRICS = ("job_id", "global_steps", "update_successful", "bandwidth", "metrics")
+
+
+def _uses_cortex(comms_cfg) -> bool:
+    """``comms.protocol``: ``ray`` (or unset) runs on-prem; ``cortex`` or ``http`` runs on Cortex."""
+    protocol = str(comms_cfg.get("protocol", None) or "ray").lower()
+    if protocol == "ray":
+        return False
+    if protocol in ("cortex", "http"):
+        return True
+    raise ValueError(
+        f"remote_backend.comms.protocol must be 'ray' (on-prem) or 'cortex' / 'http' (Cortex), got {protocol!r}"
+    )
+
+
+def _scalar(value):
+    """A replicated meta value as a plain Python scalar. The Cortex wire drops tensor-valued meta."""
+    value = getattr(value, "data", value)
+    if torch.is_tensor(value):
+        return value.item()
+    return value
+
+
+def _positive_temperature(value) -> float:
+    """Training temperature on the Cortex wire: finite and greater than zero."""
+    value = _scalar(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"temperature must be a finite number greater than 0, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"temperature must be a finite number greater than 0, got {number!r}")
+    return number
+
+
+def _rollout_correction_enabled(algorithm) -> bool:
+    """True when VeRL will build rollout-importance weights or take the bypass path.
+
+    The default block is present with ``rollout_is`` and ``rollout_rs`` null and ``bypass_mode`` false.
+    That block is off. A set aggregation or bypass mode is what puts ``rollout_is_weights`` on the update.
+    """
+    correction = algorithm.get("rollout_correction", None) if algorithm is not None else None
+    if not correction:
+        return False
+    if correction.get("bypass_mode", False):
+        return True
+    return any(correction.get(key, None) not in (None, False, "") for key in ("rollout_is", "rollout_rs"))
+
+
+def _require_cortex_step_applied(step_response: dict) -> None:
+    """Refuse a Cortex step whose optimizer update did not apply.
+
+    DSS reports ``update_successful`` as 1 when the global grad norm is finite and 0 otherwise.
+    Dropping the flag would let a failed step look like a normal metric merge.
+    """
+    nested = step_response.get("metrics") if isinstance(step_response.get("metrics"), dict) else {}
+    if "update_successful" in step_response:
+        value = step_response["update_successful"]
+    elif "update_successful" in nested:
+        value = nested["update_successful"]
+    else:
+        raise RuntimeError(
+            "Cortex step reply has no update_successful; refusing to report the optimizer step as applied. "
+            f"got keys={sorted(step_response)}"
+        )
+    applied = value is True or (isinstance(value, (int, float)) and not isinstance(value, bool) and value == 1)
+    if not applied:
+        raise RuntimeError(
+            f"Cortex optimizer step was not applied (update_successful={value!r}); "
+            "the step reply is not merged into training metrics"
+        )
+
+
+def _cortex_logprobs(result) -> torch.Tensor:
+    logprobs = result.get("logprobs") if isinstance(result, dict) else None
+    if logprobs is None and isinstance(result, dict) and isinstance(result.get("batch"), dict):
+        logprobs = result["batch"].get("logprobs", result["batch"].get("log_probs"))
+    if logprobs is None:
+        keys = list(result) if isinstance(result, dict) else type(result).__name__
+        raise RuntimeError(f"Cortex forward returned no logprobs; got keys={keys}")
+    return torch.as_tensor(logprobs, dtype=torch.float32)
+
+
+def _left_aligned_to_client_layout(values: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Move each row's leading span back onto its attended columns.
+
+    A packed job answers on the left-aligned rows it was sent. ``make_njt`` reads row ``b`` from its first
+    attended column, and the client layout keeps each row's tokens contiguous.
+    """
+    out = torch.zeros(attention_mask.shape, dtype=values.dtype)
+    lengths = attention_mask.long().sum(dim=1)
+    starts = attention_mask.long().argmax(dim=1)
+    for b in range(attention_mask.shape[0]):
+        start, length = int(starts[b]), int(lengths[b])
+        out[b, start : start + length] = values[b, :length]
+    return out
+
+
+def _merge_cortex_update_metrics(fwd_bwd_response: dict, step_response: dict) -> dict:
+    """On-prem's merged ``step.metrics`` + ``fwd_bwd.metrics``, rebuilt from Cortex replies.
+
+    Cortex fwd_bwd answers ``{avg_loss, metrics}``; step answers flat ``{last_lr, grad_norm, ...}``.
+    Step can also carry opt-in diagnostics (``peak_memory`` dicts, gradient samples, parameter names)
+    that the per-key ``np.mean`` reduction cannot average, so only numeric step values are kept.
+    """
+    _require_cortex_step_applied(step_response)
+    metrics: dict = {}
+    if isinstance(step_response.get("metrics"), dict):
+        metrics.update({key: value for key, value in step_response["metrics"].items() if key != "update_successful"})
+    for key, value in step_response.items():
+        if key in _CORTEX_STEP_NON_METRICS or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            metrics[key] = value
+    metrics.update(fwd_bwd_response.get("metrics") or {})
+    if "loss" not in metrics:
+        loss = fwd_bwd_response.get("loss", fwd_bwd_response.get("avg_loss"))
+        if loss is None:
+            raise RuntimeError(f"Cortex fwd_bwd reply carries no loss; got keys={sorted(fwd_bwd_response)}")
+        metrics["loss"] = loss
+    return metrics
 
 
 def _no_padding_2_padding_prompt_response(tensor: torch.Tensor, data, pad_token_id):
@@ -162,13 +289,20 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.logits_compute_in_fp32 = _logits_cfg.get("compute_in_fp32", False)
         self.logits_compute_from_fp32_inputs = _logits_cfg.get("compute_from_fp32_inputs", False)
         # False keeps arrival order. True balances sample lengths, or whole ZoRRo prompt groups.
-        # ``load_balancer`` is the previous key. An explicit false still opts out.
         if _train_cfg.get("balance_batch", None) is not None:
             self.balance_batch = bool(_train_cfg.get("balance_batch"))
-        elif _train_cfg.get("load_balancer", None) is not None:
-            self.balance_batch = bool(_train_cfg.get("load_balancer"))
         else:
             self.balance_batch = True
+        # Sent as ds_worker_config.pack. A Cortex training job reads it; on-prem always runs unpacked.
+        self.pack = bool(_train_cfg.get("pack", True))
+        self.use_cortex = _uses_cortex(self._backend_config.comms)
+        # On-prem rebuilds dropped position_ids in the Ray splitter. Cortex
+        # never does, and ZoRRo dereferences the tensor, so keep it on the wire.
+        if self.use_cortex:
+            self.drop_position_ids = False
+        self._check_train_options()
+        if self.use_cortex:
+            self._check_cortex_options()
         # CUDA-IPC bypasses NCCL for weight sync; only valid when colocate=True.
         self.cuda_ipc_weight_sync = self._backend_config.weight_sync.cuda_ipc
         self.low_memory_weight_sync = self._backend_config.weight_sync.low_memory
@@ -210,10 +344,11 @@ class ArcticRLClientWrapper(RemoteBackend):
         to this same backend instance.
 
         Ray transport shares an in-process ``server_state`` actor handle.
+        Cortex reattaches by the job ids in the config alone.
         """
         return {
             "rl_client_reconnect_config": self.reconnect_config(),
-            "rl_server_state": self._client.get_server_state(),
+            "rl_server_state": None if self.use_cortex else self._client.get_server_state(),
         }
 
     # Parallelism contract --------------------------------------------- #
@@ -267,7 +402,18 @@ class ArcticRLClientWrapper(RemoteBackend):
         )
         payload = dict(batch=batch, meta=meta)
 
-        response = await (self._send_compute_ref_log_prob(payload) if ref else self._send_compute_log_prob(payload))
+        if self.use_cortex:
+            if ref:
+                raise NotImplementedError(
+                    "Cortex cannot serve reference-model log-probs: it has no reference forward, and zeros would "
+                    "silently corrupt the KL term. Set actor_rollout_ref.actor.use_kl_loss=False and "
+                    "algorithm.use_kl_in_reward=False."
+                )
+            response = await self._send_cortex_compute_log_prob(payload)
+        else:
+            response = await (
+                self._send_compute_ref_log_prob(payload) if ref else self._send_compute_log_prob(payload)
+            )
 
         model_output = {"log_probs": response["batch"]["log_probs"]}
         if calculate_entropy and "entropy" in response["batch"]:
@@ -414,6 +560,59 @@ class ArcticRLClientWrapper(RemoteBackend):
             "global_token_num": global_token_num,
         }
 
+    def _check_train_options(self) -> None:
+        # verl's own trainer.balance_batch runs on the driver with dp_size=1 (single forwarder), where it only
+        # sorts rows by length. Arrival order is then already gone before Arctic sees the batch.
+        if not self.balance_batch and self.config.trainer.get("balance_batch", False):
+            raise ValueError(
+                "remote_backend.train.balance_batch=False asks Arctic for arrival order, but "
+                "trainer.balance_batch=True has already reordered the batch on the verl driver. "
+                "Set trainer.balance_batch=False."
+            )
+        if self.logits_optimization == "memory" and not self.zorro_train_enable:
+            raise ValueError(
+                "remote_backend.train.logits.optimization=memory requires remote_backend.train.zorro_train.enable=True; "
+                "the server rejects it on the first non-ZoRRo step. Use none or compute."
+            )
+
+    def _check_cortex_options(self) -> None:
+        backend = self._backend_config
+        actor = self.config.actor_rollout_ref.actor
+        problems = []
+        if backend.get("colocate", True):
+            problems.append("remote_backend.colocate=False (Cortex runs training and sampling as separate sub-jobs)")
+        if backend.weight_sync.cuda_ipc:
+            problems.append("remote_backend.weight_sync.cuda_ipc=False (sub-jobs sync weights over NCCL)")
+        if backend.get("log_prob_gpus", 0):
+            problems.append(
+                "remote_backend.log_prob_gpus=0 (Cortex builds a vLLM log-prob sub-job, not this adapter's "
+                "DeepSpeed one)"
+            )
+        if actor.get("use_kl_loss", False) or self.config.algorithm.get("use_kl_in_reward", False):
+            problems.append(
+                "actor_rollout_ref.actor.use_kl_loss=False and algorithm.use_kl_in_reward=False (no reference model)"
+            )
+        entropy_coeff = actor.get("entropy_coeff", 0)
+        if isinstance(entropy_coeff, bool) or not isinstance(entropy_coeff, (int, float)) or float(entropy_coeff) != 0:
+            problems.append(
+                "actor_rollout_ref.actor.entropy_coeff=0 (the Cortex forward returns log-probs and no entropy)"
+            )
+        if _rollout_correction_enabled(self.config.algorithm):
+            problems.append(
+                "algorithm.rollout_correction.rollout_is=null, rollout_rs=null, and bypass_mode=False "
+                "(the Cortex verl_grpo wire carries no rollout_is_weights)"
+            )
+        rollout = backend.get("rollout", None) or {}
+        if rollout.get("zorro_inference", {}).get("enable", False) or rollout.get("speculative_decoding", {}).get(
+            "model", ""
+        ):
+            problems.append(
+                "remote_backend.rollout.zorro_inference.enable=False and speculative_decoding.model='' "
+                "(not wired for Cortex sampling)"
+            )
+        if problems:
+            raise ValueError("remote_backend.comms.protocol selects Cortex, which needs: " + "; ".join(problems))
+
     def _create_ds_config(self, n_gpus: int, training: bool = True) -> dict[str, Any]:
         # Pass the entire `remote_backend.train.deepspeed` YAML block through to the DS engine (torch_autocast/communication_data_type/data_types/zero_optimization/log_level/...) and merge in per-step batch sizing. Matches recipe/rl-correctness arctic_rl_client._create_ds_config.
         actor_cfg = self.config.actor_rollout_ref.actor
@@ -433,6 +632,18 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"actor.ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}); "
             f"got global={global_batch_size}, per-step={train_batch_size}"
         )
+        # The server cuts each rank's rows into micro-batches in order. A ZoRRo micro-batch that holds part of a
+        # prompt group fails in the response unpad with a shape mismatch.
+        if self.zorro_train_enable and micro_batch_size % rollout_n != 0:
+            raise ValueError(
+                f"ZoRRo micro-batch (actor.ppo_micro_batch_size_per_gpu={micro_batch_size}) must be a multiple of "
+                f"actor_rollout_ref.rollout.n ({rollout_n}) so each micro-batch holds whole prompt groups"
+            )
+        if train_batch_size % (micro_batch_size * n_gpus) != 0:
+            raise ValueError(
+                f"per-step batch {train_batch_size} (actor.ppo_mini_batch_size x rollout.n) must be divisible by "
+                f"actor.ppo_micro_batch_size_per_gpu ({micro_batch_size}) x {n_gpus} GPUs"
+            )
         grad_accum_steps = max(1, train_batch_size // (micro_batch_size * n_gpus))
         train_seq_parallel_size = actor_cfg.fsdp_config.get("ulysses_sequence_parallel_size", 1)
 
@@ -486,6 +697,8 @@ class ArcticRLClientWrapper(RemoteBackend):
                 logits_compute_from_fp32_inputs=self.logits_compute_from_fp32_inputs,
                 logits_compute_in_fp32=self.logits_compute_in_fp32,
             )
+        if not self.pack:
+            ds_worker_config["pack"] = False
 
         return ds_worker_config
 
@@ -617,7 +830,8 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(colocate=colocate),
+            # CortexConfig() reads ARCTIC_CORTEX_HOST / _PAT / _DATABASE / _SCHEMA / ... from the environment.
+            backend=CortexConfig() if self.use_cortex else OnPremConfig(colocate=colocate),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
@@ -628,11 +842,15 @@ class ArcticRLClientWrapper(RemoteBackend):
             ),
             sampling=SamplingConfig(
                 vllm=vllm_config,
-                arctic_inference_config=arctic_inference_config or None,
+                # Cortex spreads this block onto inference_config; _check_cortex_options has it disabled there.
+                arctic_inference_config=None if self.use_cortex else (arctic_inference_config or None),
                 log_prob_engine="deepspeed",
                 log_prob_ds_config=log_prob_ds_config,
             ),
         )
+
+        if self.use_cortex:
+            return AsyncArcticRLClient(rl_config)
 
         # AsyncArcticRLClient is constructed as a ray remote actor with num_gpus=0,
         # which causes CUDA_VISIBLE_DEVICES to be empty.
@@ -653,12 +871,29 @@ class ArcticRLClientWrapper(RemoteBackend):
 
     async def generate(self, prompt_ids, sampling_params, routing_key=None) -> list:
         # `routing_key` kept for caller-API compat; arctic_platform.rl handles routing internally.
-        prompts = [self.tokenizer.decode(prompt_ids)]
         merged_params = {**self._default_sampling_params, **sampling_params}
+        if self.use_cortex:
+            return await self._cortex_generate(prompt_ids, merged_params)
+        prompts = [self.tokenizer.decode(prompt_ids)]
         return await self._client.generate(
             prompts=prompts,
             sampling_params=merged_params,
         )
+
+    async def _cortex_generate(self, prompt_ids, sampling_params: dict) -> list:
+        # Cortex takes token-id prompts, so the sampler continues the exact ids training concatenates.
+        params = {key: value for key, value in sampling_params.items() if value is not None}
+        results = await self._client.generate(prompts=[[int(t) for t in prompt_ids]], sampling_params=params)
+        if len(results) != 1:
+            raise RuntimeError(f"asked Cortex for one completion and got {len(results)}")
+        outputs = []
+        for result in results:
+            token_ids = [int(t) for t in result.get("token_ids") or []]
+            text = result.get("text")
+            if text is None:
+                text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            outputs.append({"text": text, "token_ids": token_ids, "finish_reason": result.get("finish_reason")})
+        return outputs
 
     # ------------------------------------------------------------------ #
     # Arctic wire helpers (private; not on `RemoteBackend`)
@@ -705,10 +940,54 @@ class ArcticRLClientWrapper(RemoteBackend):
                 payload["batch"][name] = _left_pad(payload["batch"][name], seq_len)
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
 
+        if self.use_cortex:
+            return await self._send_cortex_update_actor(payload)
+
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
         step_response["metrics"].update(**fwd_bwd_response["metrics"])
         return step_response
+
+    def _cortex_job_packs(self) -> bool:
+        return cortex_job_packs(self._client.config.training.ds_worker_config)
+
+    async def _send_cortex_compute_log_prob(self, payload: dict):
+        """On-prem's ``{batch: {log_probs}}`` from a Cortex forward.
+
+        The training job's forward returns log-probs and no entropy. The key is omitted so a later
+        reduction cannot record NaN as ``actor/entropy``.
+        """
+        payload["meta"]["temperature"] = _positive_temperature(payload["meta"]["temperature"])
+        packed = self._cortex_job_packs()
+        result = await self._client.fwd_no_grad(to_cortex_fwd_payload(payload, packed=packed))
+        attention_mask = payload["batch"]["attention_mask"]
+        log_probs = _cortex_logprobs(result)
+        if tuple(log_probs.shape) != tuple(attention_mask.shape):
+            raise RuntimeError(
+                f"Cortex forward log-probs have shape {tuple(log_probs.shape)}; the client layout is "
+                f"{tuple(attention_mask.shape)}"
+            )
+        if packed:
+            log_probs = _left_aligned_to_client_layout(log_probs, attention_mask)
+        return {"batch": {"log_probs": log_probs}}
+
+    async def _send_cortex_update_actor(self, payload: dict):
+        if "rollout_is_weights" in payload["batch"] or "ref_log_prob" in payload["batch"]:
+            raise NotImplementedError(
+                "the Cortex verl_grpo wire carries no rollout_is_weights or ref_log_prob; disable rollout "
+                "correction and the KL loss"
+            )
+        meta = payload["meta"]
+        meta["temperature"] = _positive_temperature(meta["temperature"])
+        meta["batch_num_tokens"] = int(_scalar(meta["batch_num_tokens"]))
+        processing = payload.pop("processing")
+        # verl places response_mask / advantages / old_log_probs on the token they score.
+        cortex_payload = to_cortex_fwd_bwd_payload(
+            payload, processing=processing, response_aligned=True, packed=self._cortex_job_packs()
+        )
+        fwd_bwd_response = await self._client.fwd_bwd(cortex_payload)
+        step_response = await self._client.step()
+        return {"metrics": _merge_cortex_update_metrics(fwd_bwd_response, step_response)}
 
     async def save_checkpoint(self):
         return await self._client.save_checkpoint()
