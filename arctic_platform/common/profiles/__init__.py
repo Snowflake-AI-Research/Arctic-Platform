@@ -27,6 +27,7 @@ from __future__ import annotations
 from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.profiles import deepseek_v4
 from arctic_platform.common.profiles import deepseek_v41
+from arctic_platform.common.profiles import dflash2
 from arctic_platform.common.profiles import generic_moe
 from arctic_platform.common.profiles import glm5_next
 from arctic_platform.common.profiles import glm_moe_dsa
@@ -43,6 +44,7 @@ _PROFILE_MODULES = (
     qwen4_exp,
     deepseek_v4,
     deepseek_v41,
+    dflash2,
 )
 
 
