@@ -124,7 +124,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone --branch skyrl-v0.3.0 --depth 1 https://github.com/NovaSky-AI/SkyRL
 export SKYRL_HOME=$PWD/SkyRL
 
-git clone --branch karthik/openhands-cortex https://github.com/Snowflake-AI-Research/Arctic-Platform
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 cd Arctic-Platform
 ```
 
