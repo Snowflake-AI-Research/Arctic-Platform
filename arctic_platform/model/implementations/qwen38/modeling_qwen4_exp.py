@@ -40,6 +40,7 @@ from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
+from . import hyper_connections
 from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
 from .converting_qwen4_exp import convert_prime_layer_to_hf
@@ -273,22 +274,28 @@ class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
 
 
 class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
-    """The hyper-connection mix and injection weights in fp32, as vLLM's ``hc_gate_mix`` and ``hc_combine`` compute them.
+    """The hyper-connection mix and combine in fp32, rounded once, as vLLM's ``hc_gate_mix`` and ``hc_combine`` are.
 
-    The mixed block input is rounded once. The injection weights stay fp32, so the decoder's residual add rounds once.
+    ``forward`` returns the injection logits in place of the weights; ``combine`` applies them.
     """
 
     def forward(self, hyper_input: torch.Tensor):
         normed = self.hc_norm(hyper_input)
         down = self.input_mix_weight_down(normed)
         gate = self.input_mix_weight_up(F.silu(down.float() / self.hc_count).to(down.dtype))
-        streams = (self.hc_count, self.hidden_size)
-        mixed = (torch.sigmoid(gate.float()).unflatten(-1, streams) * normed.unflatten(-1, streams)).mean(dim=-2)
-        mixed = mixed.to(normed.dtype)
+        mixed = hyper_connections.gate_mix(normed, gate, self.hc_count)
         if self.block_inject_weight is None:
             return mixed
-        injection_weights = 2 * torch.sigmoid(self.block_inject_weight(normed).float() / self.hc_count)
-        return mixed, hyper_input, injection_weights
+        return mixed, hyper_input, self.block_inject_weight(normed)
+
+    def combine(self, hyper_input: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor):
+        return hyper_connections.combine(hyper_input, block_output, injection_logits, self.hc_count)
+
+
+def _combine(hyper_connection: nn.Module, hyper_input: Tensor, block_output: Tensor, injection: Tensor) -> Tensor:
+    if isinstance(hyper_connection, Qwen4ExpTextGatedResidualPrimeRL):
+        return hyper_connection.combine(hyper_input, block_output, injection)
+    return hyper_input + (block_output.unsqueeze(-2) * injection.unsqueeze(-1)).flatten(-2)
 
 
 class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
@@ -313,7 +320,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 position_ids=ple_position_ids,
             )
 
-        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = self.attn_hyper_connection(hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
@@ -327,16 +334,13 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 **kwargs,
             )
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = (hyper_input + injection.flatten(-2)).to(hyper_input.dtype)
+        hidden_states = _combine(self.attn_hyper_connection, hyper_input, hidden_states, injection)
 
-        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = self.mlp_hyper_connection(hidden_states)
         routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
         hidden_states = self.mlp(hidden_states, routed_experts=routes)
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = (hyper_input + injection.flatten(-2)).to(hyper_input.dtype)
-        return hidden_states
+        return _combine(self.mlp_hyper_connection, hyper_input, hidden_states, injection)
 
 
 class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
