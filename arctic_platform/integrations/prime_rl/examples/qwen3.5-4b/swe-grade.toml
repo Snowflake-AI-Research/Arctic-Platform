@@ -1,0 +1,72 @@
+# Qwen3.5-4B SWE on r2e-gym (batch 96, difficulty_pool sampler + a 0-variance advantage gate),
+# with the strict agentic grading policy:
+#   - env.agent.max_turns = 100: turn-count budget (down from the harness default); the framework
+#     RolloutLimits terminates the rollout at 100 turns.
+#   - [orchestrator.train.sampling].max_completion_tokens = 40960: the per-turn output budget. A turn
+#     that finishes on "length" is a per-turn-budget overrun. Generous so it only catches runaways.
+#   - env.agent.grading_policy = true: terminate the rollout AND force its reward to 0 on
+#     (a) a format-invalid turn — malformed / unknown-tool / unclosed tool call (any non-OK
+#     renderer parse status), (b) a per-turn output-budget overrun (length turn), (c) a framework
+#     limit ending the run (max_turns / token caps). Visible as the W&B metric
+#     grading_policy/disqualified. The policy is applied over the PUBLIC verifiers by this
+#     integration's bundled startup monkey-patch (_grading_startup.py, installed via a .pth so it
+#     reaches every EnvWorker) — no verifiers fork, nothing to pass at launch.
+# grading_policy is OFF by default (no behavior change); only this run opts in.
+
+seq_len = 131072
+max_steps = 300
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[monitors.wandb]
+project = "prime_rl_cortex_training"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[trainer.loss]
+type = "cispo"
+ratio_low = 0.0
+ratio_high = 3.0
+
+[orchestrator]
+batch_size = 96
+max_off_policy_steps = 1
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 40960
+
+[orchestrator.concurrency]
+initial_inflight = 256
+
+[[orchestrator.train.source]]
+name = "swe"
+env.taskset.id = "r2e-gym"
+env.agent.harness.id = "bash"
+env.agent.max_turns = 100
+env.agent.grading_policy = true
+env.agent.runtime.labels = ["qwen3.5-4b-cortex-swe", "swe"]
+curriculum.sampler = { type = "difficulty_pool" }
+curriculum.gates = { no_signal = { type = "advantage_range" } }
+
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
+language_model_only = true
