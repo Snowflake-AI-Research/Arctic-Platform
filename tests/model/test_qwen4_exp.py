@@ -415,6 +415,38 @@ def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in sync_names
 
 
+def test_qwen38_hf_checkpoint_exports_the_host_ple_table(monkeypatch):
+    """With ARL_NGRAM_TABLE_ON_HOST the EP-sharded n-gram parameter is emptied on the GPU and its rows live in pinned
+    host memory; the export has to gather the host rows, not the empty parameter."""
+    _require()
+    import deepspeed.utils.groups as ds_groups
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config()).cuda()
+    ngram_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
+    embedding = model.get_submodule("model.language_model.layers.0.ple.ple_embedding.ngram_embedding")
+    rows = embedding.weight.detach().clone()
+    embedding.weight.group_name = "ep_size_1"
+    embedding.weight.allreduce = False
+    embedding._host_weight = rows.cpu()
+    embedding.weight.data = embedding.weight.data.new_empty((0, embedding.embedding_dim))
+
+    def gather(tensor, gather_list=None, dst=0, group=None):
+        if gather_list is not None:
+            gather_list[0].copy_(tensor)
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(torch.distributed, "gather", gather)
+    monkeypatch.setattr(ds_groups, "_get_expert_parallel_group", lambda name: object())
+
+    exported = dict(build_iter_full_hf_weights(model)(include_skipped=True))
+    assert exported[ngram_name].shape == rows.shape
+    torch.testing.assert_close(exported[ngram_name].cpu(), rows.cpu())
+
+
 def test_qwen38_adapter_uses_qsa_flex_and_validates_context_parallelism():
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _build_model_config
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _validate_parallelism

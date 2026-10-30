@@ -187,14 +187,21 @@ def build_iter_full_hf_weights(model: nn.Module):
 
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
+        ``local`` may live in host memory (a table moved there by ARL_NGRAM_TABLE_ON_HOST); each slice is copied to
+        this rank's GPU for the gather.
         """
         # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
         if local.dtype != torch.uint8:
             full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master, dest)
             return None if full is None else full.view(local.dtype)
+        # NCCL gathers device tensors: a shard in host memory goes through this rank's GPU (other backends, such as
+        # the gloo of the CPU tests, gather it where it is).
+        nccl = dist.get_backend(ep_group) == "nccl"
+        device = torch.device("cuda", torch.cuda.current_device()) if nccl else local.device
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
+            local = local.to(device)
             if is_master:
                 full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
                 gather_list = list(full.chunk(world, dim=0))
@@ -210,14 +217,14 @@ def build_iter_full_hf_weights(model: nn.Module):
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
         if is_master:
             full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
-            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=device)
         else:
             full = None
             buffer = None
         for start in range(0, rows, step):
             n = min(step, rows - start)
             outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            chunk = local[start:start + n].contiguous()
+            chunk = local[start:start + n].to(device).contiguous()
             dist.gather(chunk, outputs, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(chunk)
@@ -234,6 +241,13 @@ def build_iter_full_hf_weights(model: nn.Module):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
+        # EP-sharded tables whose rows moved to pinned host memory (Qwen3.8's n-gram embedding with
+        # ARL_NGRAM_TABLE_ON_HOST): the parameter is emptied on the GPU, so export the host copy instead.
+        host_rows = {
+            id(module.weight): module._host_weight
+            for module in model.modules()
+            if getattr(module, "_host_weight", None) is not None
+        }
         skipped_parameter_ids = {
             id(parameter)
             for module in model.modules()
@@ -261,7 +275,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                     # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
-                    local = tensor.data.contiguous()
+                    local = host_rows.get(id(tensor), tensor.data).contiguous()
                     world = dist.get_world_size(group=ep_group)
                     dest = expert_export_rows(tensor, local.shape[0] * world)
                     full = _gather_to_master(local, world, ep_group, is_master, dest)
