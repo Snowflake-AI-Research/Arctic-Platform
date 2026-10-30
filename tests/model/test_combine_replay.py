@@ -14,6 +14,8 @@
 # limitations under the License.
 """A checkpointed block's recompute replays its combine instead of communicating again, with unchanged gradients."""
 
+import logging
+
 import pytest
 import torch
 from torch import nn
@@ -68,32 +70,92 @@ class _Block(nn.Module):
         return torch.tanh(self.down(torch.cat(outs)))  # saves tensors after the combine
 
 
-def _grads(replay, checkpointed, early_stop=False):
+def _grads(replay, checkpointed):
     torch.manual_seed(0)
     block = _Block(replay)
     x = torch.randn(6, 4, requires_grad=True)
     for _ in range(2):  # a second step reuses the replay
         block.zero_grad()
         x.grad = None
-        with set_checkpoint_early_stop(early_stop):
+        with set_checkpoint_early_stop(False):
             y = checkpoint(block, x, use_reentrant=False) if checkpointed else block(x)
         y.sum().backward()
     return [x.grad] + [p.grad for p in block.parameters()]
 
 
-# GLM's blocks keep torch's early stop; the tensors saved after the combine still make the recompute reach it.
-@pytest.mark.parametrize("early_stop", [False, True])
-def test_recompute_replays_the_combine_and_keeps_the_gradients(early_stop):
+def test_recompute_replays_the_combine_and_keeps_the_gradients():
     reference = _grads(None, checkpointed=False)
     calls.update(forward=0, backward=0)
-    replayed = _grads(CombineReplay(), checkpointed=True, early_stop=early_stop)
+    replayed = _grads(CombineReplay(), checkpointed=True)
     assert calls == {"forward": 4, "backward": 4}  # 2 steps x 2 chunks, none from the recomputes
     for got, want in zip(replayed, reference):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     calls.update(forward=0, backward=0)
-    _grads(None, checkpointed=True, early_stop=early_stop)
+    _grads(None, checkpointed=True)
     assert calls == {"forward": 8, "backward": 4}  # without replay each recompute combines again
+
+
+def test_two_forwards_before_the_first_backward_replay_that_forward():
+    torch.manual_seed(0)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    calls.update(forward=0, backward=0)
+    with set_checkpoint_early_stop(False):
+        y1 = checkpoint(block, x1, use_reentrant=False)
+        y2 = checkpoint(block, x2, use_reentrant=False)
+    y1.sum().backward()
+    assert calls == {"forward": 4, "backward": 2}  # both forwards combined; the first recompute did not
+    assert y2.grad_fn is not None  # the second graph is still waiting
+
+    reference = _Block(None)
+    reference.load_state_dict(block.state_dict())
+    x1_ref = x1.detach().requires_grad_(True)
+    with set_checkpoint_early_stop(False):
+        checkpoint(reference, x1_ref, use_reentrant=False).sum().backward()
+    torch.testing.assert_close(x1.grad, x1_ref.grad, rtol=0, atol=0)
+
+
+def test_a_forward_with_no_backward_does_not_feed_the_next_forward():
+    torch.manual_seed(0)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    calls.update(forward=0, backward=0)
+    with set_checkpoint_early_stop(False):
+        y1 = checkpoint(block, x1, use_reentrant=False)
+        y2 = checkpoint(block, x2, use_reentrant=False)
+    y2.sum().backward()
+    assert calls == {"forward": 4, "backward": 2}
+    assert y1.grad_fn is not None
+
+    reference = _Block(None)
+    reference.load_state_dict(block.state_dict())
+    x2_ref = x2.detach().requires_grad_(True)
+    with set_checkpoint_early_stop(False):
+        checkpoint(reference, x2_ref, use_reentrant=False).sum().backward()
+    torch.testing.assert_close(x2.grad, x2_ref.grad, rtol=0, atol=0)
+
+
+def test_missing_checkpoint_frame_warns_and_refuses_a_second_forward(monkeypatch, caplog):
+    import arctic_platform.model.implementations.moe.distributed.combine_replay as replay_mod
+
+    monkeypatch.setattr(replay_mod, "_checkpoint_frame", lambda: None)
+    monkeypatch.setattr(replay_mod, "_frame_miss_warned", False)
+    monkeypatch.setattr(replay_mod, "_frame_lookup_failed", False)
+    replay = CombineReplay()
+    block = _Block(replay)
+    x1 = torch.randn(6, 4, requires_grad=True)
+    x2 = torch.randn(6, 4, requires_grad=True)
+    with caplog.at_level(logging.WARNING, logger=replay_mod.__name__):
+        with set_checkpoint_early_stop(False):
+            checkpoint(block, x1, use_reentrant=False)
+            with pytest.raises(RuntimeError, match="checkpoint frame was not found"):
+                checkpoint(block, x2, use_reentrant=False)
+    assert "could not find the checkpoint frame" in caplog.text
 
 
 def test_an_in_place_write_to_the_kept_output_is_refused():

@@ -488,7 +488,9 @@ class _HcGatesFn(torch.autograd.Function):
         dbase = dz.sum(0).reshape(base.shape).to(base.dtype) if ctx.needs_input_grad[1] else None
         dscale = None
         if ctx.needs_input_grad[2]:
-            dscale = torch.stack([(dz[:, g] * logits[:, g]).sum() for g in groups]).reshape(scale.shape).to(scale.dtype)
+            dscale = (
+                torch.stack([(dz[:, g] * logits[:, g]).sum() for g in groups]).reshape(scale.shape).to(scale.dtype)
+            )
         return dlogits, dbase, dscale, None, None
 
 

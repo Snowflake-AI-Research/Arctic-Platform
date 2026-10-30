@@ -300,7 +300,7 @@ def _get_sequence_chunked_logprob_fn():
             ctx.grouped = grouped
             if grouped is None:
                 return logprobs
-            return logprobs, grouped.normalized_log_probs(logz)
+            return logprobs, grouped.normalized_log_probs(token_chunk_size)
 
         @staticmethod
         def backward(ctx, grad_logprobs, grad_group_log_probs=None):
@@ -316,12 +316,11 @@ def _get_sequence_chunked_logprob_fn():
             n_tokens = hidden.shape[0]
             vocab_size = weight.shape[0]
 
-            # Accumulate in fp32 when requested, otherwise in each input's
-            # native dtype; we cast back to input dtypes on return.
-            accum = torch.float32 if fp32_lm_head else None
-            grad_hidden = torch.zeros_like(hidden, dtype=accum or hidden.dtype)
-            grad_weight = torch.zeros_like(weight, dtype=accum or weight.dtype)
-            grad_bias = torch.zeros_like(bias, dtype=accum or bias.dtype) if bias is not None else None
+            # Sum the tiles in fp32 even when the projection runs in bf16: a bf16 running sum rounds once per
+            # tile. We cast back to input dtypes once on return.
+            grad_hidden = torch.zeros_like(hidden, dtype=torch.float32)
+            grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+            grad_bias = torch.zeros_like(bias, dtype=torch.float32) if bias is not None else None
 
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
@@ -382,10 +381,11 @@ def _get_sequence_chunked_logprob_fn():
                     # Chain rule for temperature scaling: scaled = logits * inv_t.
                     grad_logits = grad_logits * inv_t_chunk
 
-                    grad_hidden[start:end].add_(grad_logits.to(grad_hidden.dtype) @ w_proj)
-                    grad_weight[vocab_start:vocab_end].add_(grad_logits.to(grad_weight.dtype).t() @ h_proj)
+                    grad_logits_proj = grad_logits.to(w_proj.dtype)
+                    grad_hidden[start:end].add_(grad_logits_proj @ w_proj)
+                    grad_weight[vocab_start:vocab_end].add_(grad_logits_proj.t() @ h_proj)
                     if grad_bias is not None:
-                        grad_bias[vocab_start:vocab_end].add_(grad_logits.to(grad_bias.dtype).sum(dim=0))
+                        grad_bias[vocab_start:vocab_end].add_(grad_logits.sum(dim=0))
 
             return (
                 grad_hidden.to(hidden.dtype),

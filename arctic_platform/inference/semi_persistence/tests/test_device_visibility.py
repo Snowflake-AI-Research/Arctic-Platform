@@ -273,3 +273,37 @@ def test_a_quiescence_failure_is_not_retried():
         se._restore, se.time.sleep = saved_restore, saved_sleep
     assert "never quiesced" in str(excinfo.value)
     assert len(calls) == 1, calls        # no retry
+
+
+# --------------------------------------------------------------------------
+# _dump_placement -- each rank back on the GPU index it was dumped on
+# --------------------------------------------------------------------------
+
+
+def test_full_pod_restores_onto_the_dumped_order():
+    """The GLM-5.3 TP=16 leader: same eight GPUs, Ray's order differs."""
+    meta = {"gpus": [3, 1, 5, 6, 0, 7, 4, 2]}
+    assert se._dump_placement(meta, [3, 4, 1, 6, 2, 5, 0, 7], "/k") == [
+        3, 1, 5, 6, 0, 7, 4, 2]
+
+
+def test_partial_overlap_keeps_matching_ranks_and_fills_the_rest_in_order():
+    meta = {"gpus": [2, 3, 4, 5]}
+    assert se._dump_placement(meta, [5, 6, 2, 7], "/k") == [2, 6, 7, 5]
+
+
+def test_tp1_replica_keeps_its_assigned_gpu():
+    assert se._dump_placement({"gpus": [4]}, [6], "/k") == [6]
+    assert se._dump_placement({"gpus": [6]}, [6], "/k") == [6]
+
+
+def test_physical_gpus_come_back_in_index_order(monkeypatch):
+    """Rank k runs on the k-th id, and plain vLLM puts rank k on GPU k."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1,5,6,0,7,4,2")
+    assert se._resolve_physical_gpus() == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+def test_unusable_meta_leaves_rays_order():
+    for meta in ({}, {"gpus": [0, 1]}, {"gpus": [1, 1, 2]}):
+        assert se._dump_placement(meta, [2, 0, 1], "/k") == [2, 0, 1]

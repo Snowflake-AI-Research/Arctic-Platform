@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ..routing_weights import apply_routing_weights
+from ..token_combine import gather_token_rows
 from ..token_combine import sum_rows_by_token
 from .combine_replay import CombineReplay
 from .uccl_ep import Buffer
@@ -144,8 +145,7 @@ def _dispatch_backward(
     _finish_backward_event(after_event)
 
     grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
-    return grad_x, None, grad_topk_weights, None, None, None, None
+    return grad_x, None, grad_scores, None, None, None, None
 
 
 class _UcclEPCombine(torch.autograd.Function):
@@ -271,7 +271,7 @@ def _permute_tokens(
     permuted_indices = torch.arange(len(hidden_states), device=hidden_states.device).repeat_interleave(
         mask.sum(dim=1)
     )[sort_order]
-    permuted_hidden_states = hidden_states.index_select(0, permuted_indices)
+    permuted_hidden_states = gather_token_rows(hidden_states, permuted_indices)
     permuted_scores = valid_scores[sort_order]
     return permuted_hidden_states, permuted_scores, permuted_indices
 
@@ -373,6 +373,27 @@ def finalize_dispatch_tokens(
     return hidden_states, num_tokens_per_expert, state
 
 
+def finalize_dispatch_rows(
+    pending_state: _PendingDispatchState,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The receive buffer as delivered: each token once, its local expert ids (``-1`` elsewhere), its routing
+    weights. For expert kernels that gather and reduce the rows themselves (``combine_rows`` sends the result)."""
+    _sync_dispatch(pending_state.handle_id)
+    return pending_state.hidden_states, pending_state.dispatched_indices, pending_state.dispatched_scores
+
+
+def combine_rows(
+    hidden_states: torch.Tensor, pending_state: _PendingDispatchState, replay: CombineReplay | None = None
+) -> torch.Tensor:
+    """Combine per-received-token outputs (already summed over this rank's experts) back to their source ranks."""
+    if replay is None:
+        return _UcclEPCombine.apply(hidden_states, pending_state.handle_id)
+    return replay.run(
+        lambda: _UcclEPCombine.apply(hidden_states, pending_state.handle_id),
+        lambda combined: _UcclEPReplayedCombine.apply(hidden_states, pending_state.handle_id, combined),
+    )
+
+
 def combine_tokens(
     hidden_states: torch.Tensor, state: _DispatchState, replay: CombineReplay | None = None
 ) -> torch.Tensor:
@@ -390,9 +411,11 @@ def combine_tokens(
 register_ucclep_cuda_ops()
 
 __all__ = [
+    "combine_rows",
     "combine_tokens",
     "configure_num_sms",
     "dispatch_tokens_async",
+    "finalize_dispatch_rows",
     "finalize_dispatch_tokens",
     "sync_combine",
 ]

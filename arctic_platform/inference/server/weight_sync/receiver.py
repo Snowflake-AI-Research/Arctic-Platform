@@ -23,22 +23,20 @@ transiently.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
+from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
 
 
-def _tensor_l2_sq(value: torch.Tensor, chunk_numel: int = 1 << 20) -> torch.Tensor:
-    total = torch.zeros((), dtype=torch.float64, device=value.device)
-    # reshape (not view) so non-contiguous parameters still checksum.
-    for chunk in value.detach().reshape(-1).split(chunk_numel):
-        total.add_(chunk.float().square().sum(dtype=torch.float64))
-    return total
+def _weight_sync_names_are_strict() -> bool:
+    return os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") != "0"
 
 
 def _model_parameter_l2(
@@ -324,6 +322,31 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
     return added, activated
 
 
+def _refresh_cached_weight_copies(model) -> int:
+    """Rebuild the weight copies vLLM GLM-5.3 caches on its first forward from the synced parameters.
+
+    ``Glm5NextLinearAttention._forward`` (vLLM 0.31/0.32 ``glm5next/common/kda.py``) concatenates
+    the three conv weights once and reuses that copy, so a sync never reaches the convolution; the
+    sparse indexer (``glm5next/common/attention.py``) keeps an fp32 transpose of its head-gate rows.
+    Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
+    Returns how many caches were refreshed; a GLM-5.3 sampler reporting 0 after its first forward means
+    vLLM renamed them and the refresh no longer applies.
+    """
+    refreshed = 0
+    with torch.inference_mode():
+        for module in model.modules():
+            merged = getattr(module, "_merged_conv_weight", None)
+            if merged is not None:
+                convs = (module.q_conv1d, module.k_conv1d, module.v_conv1d)
+                merged.copy_(torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]))
+                refreshed += 1
+            head_gate = getattr(module, "_wp_fp32", None)
+            if head_gate is not None:
+                head_gate.copy_(module.wk_weights_proj.weight[module.head_dim :].t())
+                refreshed += 1
+    return refreshed
+
+
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
 
@@ -449,6 +472,11 @@ class WeightSyncExtension:
 
         If *engine_only* is True, only the NCCL rendezvous is performed.
         If *direct_mode* is True, per-weight send/recv is used (BF16 TP=1).
+
+        Every TP rank receives the full model, and ``recv_l2_sq`` is the sum of
+        squares of the full tensors this rank received. The zero-copy path
+        writes straight into (possibly padded) parameter views and does not
+        name what it received, so it reports no ``recv_l2_sq``.
         """
         from vllm.distributed.parallel_state import (
             get_tensor_model_parallel_world_size,
@@ -469,20 +497,43 @@ class WeightSyncExtension:
 
         tp = get_tensor_model_parallel_world_size()
 
+        recv_l2_sq: float | None = None
+        applied_source_l2_sq: float | None = None
+        skipped_source_names: list[str] | None = None
         if self.model_config.quantization:
             path = "fp8"
-            loaded, _ = self._load_fp8(model, engine)
+            loaded, recv_l2_sq = self._load_fp8(model, engine)
         elif tp == 1 and direct_mode:
             path = "direct_zero_copy"
             loaded = self._load_direct_zero_copy(model, engine)
         elif tp == 1:
             path = "direct"
-            loaded, _, _, _, _ = self._load_direct(model, engine)
+            (
+                loaded,
+                recv_l2_sq,
+                applied_source_l2_sq,
+                _,
+                skipped_source_names,
+            ) = self._load_direct(model, engine)
         else:
             path = "batched"
-            loaded, _, _, _, _ = self._load_batched(model, engine)
+            (
+                loaded,
+                recv_l2_sq,
+                applied_source_l2_sq,
+                _,
+                skipped_source_names,
+            ) = self._load_batched(model, engine)
+        refreshed = _refresh_cached_weight_copies(model)
 
-        return self._build_result(start, mem_before, path, loaded)
+        result = self._build_result(start, mem_before, path, loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
+        if recv_l2_sq is not None:
+            result["recv_l2_sq"] = recv_l2_sq
+        if applied_source_l2_sq is not None:
+            result["applied_source_l2_sq"] = applied_source_l2_sq
+            result["skipped_source_count"] = len(skipped_source_names or ())
+        return result
 
     # ------------------------------------------------------------------
     # Loading strategies
@@ -506,6 +557,7 @@ class WeightSyncExtension:
                     f"{tuple(tensor.shape)} and dtype {tensor.dtype}"
                 ) from exc
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if updater.pending:
             logger.warning(
                 "FP8 updater has %d incomplete modules", updater.pending,
@@ -567,6 +619,7 @@ class WeightSyncExtension:
             else:
                 orphans.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
 
         if orphans:
             sample = "\n".join(f"  - {n}" for n in orphans[:10])
@@ -644,6 +697,7 @@ class WeightSyncExtension:
             else:
                 skipped_source_names.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
@@ -779,6 +833,7 @@ class WeightSyncExtension:
                 source_to_destinations,
                 skipped_source_names,
             ) = self._load_batched(model, engine)
+        refreshed = _refresh_cached_weight_copies(model)
 
         if (
             loaded_destination_validation_applicable
@@ -819,6 +874,7 @@ class WeightSyncExtension:
         )
 
         result = self._build_result(start, mem_before, path, loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
         result["weight_format"] = weight_format
         result["model_l2_sq_before"] = model_l2_sq_before
         result["model_l2_sq_after"] = model_l2_sq_after
@@ -1024,8 +1080,238 @@ class WeightSyncExtension:
         all_weights = [(n, t.cpu()) for n, t in engine.receive_weights()]
         loaded = len(all_weights)
         spec_model.load_weights(all_weights)
+        refreshed = _refresh_cached_weight_copies(spec_model)
 
-        return self._build_result(start, mem_before, "batched", loaded)
+        result = self._build_result(start, mem_before, "batched", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
+        return result
+
+    # ------------------------------------------------------------------
+    # Colocated CUDA IPC / shared-file load, and the sampler weight norm
+    # ------------------------------------------------------------------
+
+    def _validate_weight_sync_names(self, model, sender_names, *, context: str = "") -> None:
+        """Raise when the sender's HF param names do not match this model."""
+        from arctic_platform.inference.server.weight_sync.utils import _name_is_non_synced
+        from arctic_platform.inference.server.weight_sync.utils import compute_expected_hf_param_names
+
+        sender_set = {n for n in sender_names if not _name_is_non_synced(n)}
+        ctx = f" [{context}]" if context else ""
+        try:
+            expected_set = compute_expected_hf_param_names(model)
+        except Exception as exc:
+            # A derivation failure leaves the names unchecked, so it answers to the
+            # same strict setting as a mismatch.
+            msg = f"Weight-sync name check could not derive expected param names{ctx}: {exc}"
+            if not _weight_sync_names_are_strict():
+                logger.warning("%s\n(non-strict mode: continuing unchecked)", msg)
+                return
+            raise RuntimeError(msg) from exc
+
+        unexpected = sender_set - expected_set
+        missing = expected_set - sender_set
+        if not unexpected and not missing:
+            logger.info(
+                "weight-sync names validated context=%s sender=%d expected=%d",
+                context or "?",
+                len(sender_set),
+                len(expected_set),
+            )
+            return
+
+        parts = [f"Weight-sync param name mismatch{ctx}:"]
+        if unexpected:
+            sample = sorted(unexpected)[:10]
+            extra = "" if len(unexpected) <= len(sample) else f" ... (+{len(unexpected) - len(sample)} more)"
+            parts.append(
+                f"  Sender shipped {len(unexpected)} names the model does not expect: {', '.join(sample)}{extra}"
+            )
+        if missing:
+            sample = sorted(missing)[:10]
+            extra = "" if len(missing) <= len(sample) else f" ... (+{len(missing) - len(sample)} more)"
+            parts.append(
+                f"  Model expects {len(missing)} names the sender did not ship: {', '.join(sample)}{extra}"
+            )
+        parts.append(f"  (sender_count={len(sender_set)}, expected_count={len(expected_set)})")
+        msg = "\n".join(parts)
+        if not _weight_sync_names_are_strict():
+            logger.warning("%s\n(non-strict mode: continuing despite mismatch)", msg)
+            return
+        raise RuntimeError(msg)
+
+    def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict:
+        """Load weights from CUDA IPC handles (zero-copy, same GPU).
+
+        ``recv_l2_sq`` is the sum of squares of the full tensors the handles
+        opened, taken before ``model.load_weights`` shards or quantizes them.
+        """
+        import base64
+        import pickle
+
+        start = time.time()
+        model = self.model_runner.model
+        torch.cuda.reset_peak_memory_stats(self.device)
+        mem_before = torch.cuda.memory_allocated(self.device)
+
+        names = ipc_payload["names"]
+        self._validate_weight_sync_names(model, names, context="cuda_ipc")
+        handles_list = pickle.loads(base64.b64decode(ipc_payload["ipc_handles_pickled"]))
+
+        device_index = torch.cuda.current_device()
+        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
+        self._offloaded_state = {}
+
+        loaded = 0
+        missing = []
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+        for name, handle_dict in zip(names, handles_list):
+            if physical_gpu_id not in handle_dict:
+                missing.append(name)
+                continue
+            func, args = handle_dict[physical_gpu_id]
+            args_list = list(args)
+            args_list[6] = device_index
+            src_tensor = func(*args_list)
+            recv_l2_sq.add_(_tensor_l2_sq(src_tensor))
+            model.load_weights([(name, src_tensor)])
+            loaded += 1
+
+        if loaded != len(names):
+            raise RuntimeError(
+                f"CUDA IPC weight sync incomplete on GPU {physical_gpu_id}: "
+                f"loaded {loaded}/{len(names)} tensors "
+                f"({len(missing)} had no IPC handle for this GPU, e.g. {missing[:5]}). "
+                "This usually indicates a GPU UUID / placement mismatch between sender and receiver."
+            )
+
+        refreshed = _refresh_cached_weight_copies(model)
+        torch.cuda.synchronize()
+        result = self._build_result(start, mem_before, "cuda_ipc", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
+        result["recv_l2_sq"] = recv_l2_sq.item()
+        return result
+
+    def load_weights_cuda_ipc_chunk(self, ipc_payload: dict, validate_names=None) -> dict:
+        """Load one CUDA IPC chunk. Validate the full name set only on the last chunk.
+
+        ``recv_l2_sq`` covers this chunk only. The caller streaming the chunks
+        adds them up into the sync's total.
+        """
+        import base64
+        import pickle
+
+        start = time.time()
+        model = self.model_runner.model
+        self._offloaded_state = {}
+
+        names = ipc_payload["names"]
+        handles_list = pickle.loads(base64.b64decode(ipc_payload["ipc_handles_pickled"]))
+        device_index = torch.cuda.current_device()
+        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
+
+        loaded = 0
+        missing = []
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+        for name, handle_dict in zip(names, handles_list):
+            if physical_gpu_id not in handle_dict:
+                missing.append(name)
+                continue
+            func, args = handle_dict[physical_gpu_id]
+            args_list = list(args)
+            args_list[6] = device_index
+            src_tensor = func(*args_list)
+            recv_l2_sq.add_(_tensor_l2_sq(src_tensor))
+            model.load_weights([(name, src_tensor)])
+            loaded += 1
+
+        if missing:
+            raise RuntimeError(
+                f"CUDA IPC streaming sync: {len(missing)} param(s) had no IPC handle for GPU "
+                f"{physical_gpu_id} (e.g. {missing[:5]})."
+            )
+        result = {}
+        if validate_names is not None:
+            self._validate_weight_sync_names(model, validate_names, context="cuda_ipc_stream")
+            # The caller passes validate_names with the last chunk only.
+            result["cached_weight_copies_refreshed"] = _refresh_cached_weight_copies(model)
+
+        torch.cuda.synchronize()
+        return {
+            "loaded": loaded,
+            "names": names,
+            "elapsed_s": time.time() - start,
+            "recv_l2_sq": recv_l2_sq.item(),
+            **result,
+        }
+
+    def load_weights_from_shm_path(self, path: str) -> dict:
+        """Load weights from a shared-memory file path."""
+        weights = torch.load(path, map_location="cpu", weights_only=True)
+        return self._load_cpu_weights_into_model(weights)
+
+    def _load_cpu_weights_into_model(self, weights: list) -> dict:
+        """``recv_l2_sq`` squares each full tensor on the GPU, before ``model.load_weights``."""
+        start = time.time()
+        model = self.model_runner.model
+        torch.cuda.reset_peak_memory_stats(self.device)
+        mem_before = torch.cuda.memory_allocated(self.device)
+        self._validate_weight_sync_names(model, (name for name, _ in weights), context="cpu_to_gpu")
+        self._offloaded_state = {}
+
+        loaded = 0
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+        for name, cpu_tensor in weights:
+            tensor = cpu_tensor.to(self.device)
+            recv_l2_sq.add_(_tensor_l2_sq(tensor))
+            model.load_weights([(name, tensor)])
+            loaded += 1
+
+        refreshed = _refresh_cached_weight_copies(model)
+        torch.cuda.synchronize()
+        result = self._build_result(start, mem_before, "cpu_to_gpu", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
+        result["recv_l2_sq"] = recv_l2_sq.item()
+        return result
+
+    def compute_weight_norm(self) -> dict:
+        """Partial sum of squares of this TP rank's live parameters (debug only).
+
+        Weight-sync correctness is the transport checksum (``recv_l2_sq`` against
+        the trainer's ``sent_l2_sq``), which squares the full tensors before vLLM
+        shards them. This walk is what vLLM holds after placement.
+
+        ``tp_size`` rides along so the caller that adds these up can tell whether the
+        total is a whole model. A rank's parameters carry no usable mark of whether
+        a tensor is sharded or replicated: ``BasevLLMParameter`` stamps the TP world
+        size on every parameter it builds, including ``ReplicatedLinear`` weights
+        that each rank keeps whole, and ``FusedMoE`` reports ``tp_size=1`` under
+        expert parallelism while each rank owns a different set of experts.
+        """
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+        quantization = self.model_config.quantization
+        if quantization:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    f"weight norm is not defined for a {quantization}-quantized sampler: its "
+                    "packed weights and scales do not square to the trainer's weights"
+                ),
+                "disable": True,
+            }
+        model = self.model_runner.model
+        sq_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        num_params = 0
+        for _, param in model.named_parameters():
+            # `_tensor_l2_sq` lands on the parameter's device, which is not this one
+            # once a parameter has been offloaded to the host.
+            sq_sum.add_(_tensor_l2_sq(param).to(sq_sum.device))
+            num_params += 1
+        return {
+            "sq_sum": sq_sum.item(),
+            "num_params": num_params,
+            "tp_size": get_tensor_model_parallel_world_size(),
+        }
 
     # ------------------------------------------------------------------
     # Cleanup

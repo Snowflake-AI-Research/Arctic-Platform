@@ -594,7 +594,9 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     # int32, as the model's own top-k selection returns them (the fused backward takes int32 indices).
     indices = torch.arange(4, device="cuda", dtype=torch.int32).expand(1, 4, -1)
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply) as flash:
+        with patch.object(
+            context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply
+        ) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", wraps=context_parallel._reference_sparse_mla
             ) as ref:
@@ -639,7 +641,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply) as flash:
+        with patch.object(
+            context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply
+        ) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
             ):
@@ -666,11 +670,14 @@ def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_mode
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     # With the fused TileLang backward installed, FlashMLA's forward and that backward take precedence.
-    with patch.object(context_parallel, "_fused_sparse_mla_backward_available", return_value=False), patch.object(
-        context_parallel,
-        "_flashinfer_sparse_mla_apply",
-        wraps=context_parallel._flashinfer_sparse_mla_apply,
-    ) as flashinfer:
+    with (
+        patch.object(context_parallel, "_fused_sparse_mla_backward_available", return_value=False),
+        patch.object(
+            context_parallel,
+            "_flashinfer_sparse_mla_apply",
+            wraps=context_parallel._flashinfer_sparse_mla_apply,
+        ) as flashinfer,
+    ):
         with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", side_effect=AssertionError("FlashMLA")):
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")

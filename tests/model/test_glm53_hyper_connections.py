@@ -47,7 +47,7 @@ def _site(module, streams, sublayer_weight, fused: bool):
 
     post, comb, collapsed = hc.hyper_connection(module, streams) if fused else module(streams)
     out = torch.tanh(collapsed @ sublayer_weight)
-    return _remix(fused, post, comb, out, streams, streams.dtype)
+    return _remix(fused, False, post, comb, out, streams)
 
 
 @pytest.mark.parametrize("trainable", [False, True])
@@ -66,7 +66,11 @@ def test_fused_mhc_matches_hugging_face(tokens, trainable):
     # 4K tokens and 1.9e-2 at one token).
     names = ["y", "dstreams"] + (["dfn", "dbase", "dscale"] if trainable else [])
     results = {}
-    for name, fused, dtype in (("fp32", False, streams.dtype), ("fused", True, streams.dtype), ("fp64", False, torch.float64)):
+    for name, fused, dtype in (
+        ("fp32", False, streams.dtype),
+        ("fused", True, streams.dtype),
+        ("fp64", False, torch.float64),
+    ):
         module = _module(hidden, trainable)
         assert not fused or hc.fused_hyper_connection_applies(module, streams)
         module = module.to(dtype) if dtype == torch.float64 else module
