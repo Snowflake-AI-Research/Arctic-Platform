@@ -26,7 +26,7 @@ from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import torch_assert_equal
 from tests.model.test_glm5_next import _tiny_config
 
-# Production's ZeRO-2 with the optimizer offloaded, and ZeRO-1 with fp32 gradient accumulation (DeepSpeed's
+# ZeRO-2 with the optimizer offloaded, and ZeRO-1 with fp32 gradient accumulation (DeepSpeed's
 # BF16_Optimizer); both restore masters and moments by position.
 ZERO = {
     "zero2-offload": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
