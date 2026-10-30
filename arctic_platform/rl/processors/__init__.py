@@ -132,6 +132,9 @@ from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
 
+# Signed weighted log-likelihood (importing registers weighted_cross_entropy)
+from .weighted_cross_entropy import weighted_cross_entropy_loss
+
 __all__ = [
     # pipeline
     "POST_PROCESSORS",
@@ -156,6 +159,7 @@ __all__ = [
     "resolve_packed_loss_reduction",
     "local_mean_packed_loss_reduction",
     "causal_cross_entropy_loss",
+    "weighted_cross_entropy_loss",
     "GroupedDistillationLoss",
     "GRPOGroupedDistillationLoss",
     "grouped_divergence",
