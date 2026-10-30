@@ -25,9 +25,15 @@ block output back into each stream with a per-stream weight:
 
 Hugging Face runs ~10 elementwise passes over ``[T, hc * H]`` tensors per call, most in FP32 (7.6 ms forward, 23.7 ms
 forward + backward at 32K tokens x 4 x 2560 on an H200). Here it is three Triton passes each way (norm, mix and
-inject forward; inject, mix and norm backward) around the four GEMMs, rounding to BF16 at the tensors the Hugging
-Face module rounds. When the hyper-connection weights train, their gradients come from the same backward: the GEMM
-weight gradients from the saved GEMM inputs and ``(1 + w)``'s from the normalized stream.
+inject forward; inject, mix and norm backward) around the four GEMMs. When the hyper-connection weights train,
+their gradients come from the same backward: the GEMM weight gradients from the saved GEMM inputs and ``(1 + w)``'s
+from the normalized stream.
+
+By default the fused path rounds to BF16 at the tensors the Hugging Face module rounds. With ``round_once`` it
+evaluates ``silu(a / hc)``, the mix and the injection in FP32 and rounds each once, as vLLM's ``_hc_gate_mix_kernel``
+and ``_hc_combine_kernel`` (``qwen4_exp/nvidia/ops/hc.py``) do; ``gated_residual`` then returns the injection logits
+``l`` and ``combine`` applies them. ``gate_mix`` is the vLLM mix on its own, for the hyper connections the fused path
+does not cover.
 """
 
 from __future__ import annotations
@@ -127,6 +133,85 @@ def _inject_bwd_kernel(dy_ptr, out_ptr, inj_ptr, dout_ptr, dinj_ptr, H, HC: tl.c
     tl.store(dinj_ptr + tok * HC + groups, dinj.to(dinj_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _gate_mix_fwd_kernel(x_ptr, g_ptr, out_ptr, HC_DIM, HC: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < HC_DIM
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for stream in tl.static_range(HC):
+        offsets = row * (HC * HC_DIM) + stream * HC_DIM + cols
+        g = tl.load(g_ptr + offsets, mask=mask, other=0.0)
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
+    acc /= HC
+    tl.store(out_ptr + row * HC_DIM + cols, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _gate_mix_bwd_kernel(x_ptr, g_ptr, dout_ptr, dx_ptr, dg_ptr, HC_DIM, HC: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < HC_DIM
+    dout = tl.load(dout_ptr + row * HC_DIM + cols, mask=mask, other=0.0).to(tl.float32) / HC
+    for stream in tl.static_range(HC):
+        offsets = row * (HC * HC_DIM) + stream * HC_DIM + cols
+        gate = tl.sigmoid(tl.load(g_ptr + offsets, mask=mask, other=0.0).to(tl.float32))
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        tl.store(dx_ptr + offsets, (dout * gate).to(dx_ptr.dtype.element_ty), mask=mask)
+        tl.store(dg_ptr + offsets, (dout * x * gate * (1.0 - gate)).to(dg_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _combine_fwd_kernel(
+    res_ptr, block_ptr, logit_ptr, out_ptr, HC_DIM, HC: tl.constexpr, HC_PAD: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    streams = tl.arange(0, HC_PAD)
+    offsets = row * (HC * HC_DIM) + streams[:, None] * HC_DIM + cols[None, :]
+    mask = (streams[:, None] < HC) & (cols[None, :] < HC_DIM)
+    weight = tl.load(logit_ptr + row * HC + streams, mask=streams < HC, other=0.0)
+    weight = 2.0 * tl.sigmoid(weight.to(tl.float32) / HC)
+    block = tl.load(block_ptr + row * HC_DIM + cols, mask=cols < HC_DIM, other=0.0)
+    res = tl.load(res_ptr + offsets, mask=mask, other=0.0)
+    block = block.to(tl.float32)[None, :] * weight[:, None]
+    out = res.to(tl.float32) + block.to(tl.float32)
+    tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _combine_bwd_kernel(
+    block_ptr,
+    logit_ptr,
+    dout_ptr,
+    dblock_ptr,
+    dlogit_ptr,
+    HC_DIM,
+    HC: tl.constexpr,
+    HC_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    streams = tl.arange(0, HC_PAD)
+    sigmoid = tl.load(logit_ptr + row * HC + streams, mask=streams < HC, other=0.0)
+    sigmoid = tl.sigmoid(sigmoid.to(tl.float32) / HC)
+    weight = 2.0 * sigmoid
+    dweight = tl.zeros([HC_PAD], dtype=tl.float32)
+    for start in range(0, HC_DIM, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = (streams[:, None] < HC) & (cols[None, :] < HC_DIM)
+        dout = tl.load(
+            dout_ptr + row * (HC * HC_DIM) + streams[:, None] * HC_DIM + cols[None, :], mask=mask, other=0.0
+        ).to(tl.float32)
+        block = tl.load(block_ptr + row * HC_DIM + cols, mask=cols < HC_DIM, other=0.0).to(tl.float32)
+        dblock = tl.sum(dout * weight[:, None], axis=0)
+        tl.store(dblock_ptr + row * HC_DIM + cols, dblock.to(dblock_ptr.dtype.element_ty), mask=cols < HC_DIM)
+        dweight += tl.sum(dout * block[None, :], axis=1)
+    dlogit = dweight * 2.0 * sigmoid * (1.0 - sigmoid) / HC
+    tl.store(dlogit_ptr + row * HC + streams, dlogit.to(dlogit_ptr.dtype.element_ty), mask=streams < HC)
+
+
 def _stacked_down_inject(module) -> torch.Tensor:
     """``[W_down; W_inject]``: cached on the module while its frozen weights are the same tensors, rebuilt under
     autograd every call when they train."""
@@ -143,7 +228,7 @@ def _stacked_down_inject(module) -> torch.Tensor:
 
 class _GatedResidualFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, norm_weight, w_down_inject, w_up, hc: int, eps: float):
+    def forward(ctx, x, norm_weight, w_down_inject, w_up, hc: int, eps: float, round_once: bool):
         rows, width = x.shape
         hidden = width // hc
         block = triton.next_power_of_2(hidden)
@@ -153,15 +238,20 @@ class _GatedResidualFn(torch.autograd.Function):
         _norm_fwd_kernel[(rows * hc,)](x, norm_weight, n, rstd, hidden, eps, HC=hc, BLOCK=block, num_warps=8)
         rank = w_up.shape[1]
         al = n @ w_down_inject.t()
-        a_div = al[:, :rank] / hc
-        l_div = al[:, rank:] / hc
-        b = F.silu(a_div) @ w_up.t()
+        a_div = al[:, :rank].float() / hc if round_once else al[:, :rank] / hc
+        b = F.silu(a_div).to(x.dtype) @ w_up.t()
         mixed = torch.empty(rows, hidden, dtype=x.dtype, device=x.device)
-        _mix_fwd_kernel[(rows, triton.cdiv(hidden, _BLOCK_H))](b, n, mixed, hidden, HC=hc, BLOCK_H=_BLOCK_H)
-        gate = torch.sigmoid(l_div)
+        grid = (rows, triton.cdiv(hidden, _BLOCK_H))
+        if round_once:
+            _gate_mix_fwd_kernel[grid](n, b, mixed, hidden, HC=hc, BLOCK=_BLOCK_H)
+            gate, injection = None, al[:, rank:].contiguous()
+        else:
+            _mix_fwd_kernel[grid](b, n, mixed, hidden, HC=hc, BLOCK_H=_BLOCK_H)
+            gate = torch.sigmoid(al[:, rank:] / hc)
+            injection = 2 * gate
         ctx.save_for_backward(x, rstd, n, b, a_div, gate, norm_weight, w_down_inject, w_up)
-        ctx.hc = hc
-        return mixed, 2 * gate
+        ctx.hc, ctx.round_once = hc, round_once
+        return mixed, injection
 
     @staticmethod
     def backward(ctx, dmixed, dinj):
@@ -171,14 +261,18 @@ class _GatedResidualFn(torch.autograd.Function):
         hidden = width // hc
         db = torch.empty_like(b)
         dn = torch.empty_like(n)
-        _mix_bwd_kernel[(rows, triton.cdiv(hidden, _BLOCK_H))](
-            dmixed.contiguous(), b, n, db, dn, hidden, HC=hc, BLOCK_H=_BLOCK_H
-        )
-        _, need_norm_w, need_down_inject, need_up, _, _ = ctx.needs_input_grad
-        da = torch.ops.aten.silu_backward(db @ w_up, a_div) / hc
-        dl = (2 * dinj) * gate * (1 - gate) / hc
-        dal = torch.cat([da, dl.to(da.dtype)], 1)
-        d_up = db.t().mm(F.silu(a_div)) if need_up else None
+        grid = (rows, triton.cdiv(hidden, _BLOCK_H))
+        _, need_norm_w, need_down_inject, need_up, _, _, _ = ctx.needs_input_grad
+        if ctx.round_once:
+            _gate_mix_bwd_kernel[grid](n, b, dmixed.contiguous(), dn, db, hidden, HC=hc, BLOCK=_BLOCK_H)
+            da = torch.ops.aten.silu_backward((db @ w_up).float(), a_div) / hc
+            dl = dinj
+        else:
+            _mix_bwd_kernel[grid](dmixed.contiguous(), b, n, db, dn, hidden, HC=hc, BLOCK_H=_BLOCK_H)
+            da = torch.ops.aten.silu_backward(db @ w_up, a_div) / hc
+            dl = (2 * dinj) * gate * (1 - gate) / hc
+        dal = torch.cat([da.to(dn.dtype), dl.to(dn.dtype)], 1)
+        d_up = db.t().mm(F.silu(a_div).to(db.dtype)) if need_up else None
         d_down_inject = dal.t().mm(n) if need_down_inject else None
         dn.addmm_(dal, w_down_inject)
         d_norm_w = None
@@ -190,7 +284,7 @@ class _GatedResidualFn(torch.autograd.Function):
         _norm_bwd_kernel[(rows * hc,)](
             dn, x, norm_weight, rstd, dx, hidden, HC=hc, BLOCK=triton.next_power_of_2(hidden), num_warps=8
         )
-        return dx, d_norm_w, d_down_inject, d_up, None, None
+        return dx, d_norm_w, d_down_inject, d_up, None, None, None
 
 
 class _InjectFn(torch.autograd.Function):
@@ -225,8 +319,9 @@ def fused_hyper_connection_supported(module, x: torch.Tensor) -> bool:
     return x.is_cuda and x.dtype == torch.bfloat16 and module.block_inject_weight is not None and hc & (hc - 1) == 0
 
 
-def gated_residual(module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(mixed, injection_weights)`` of ``Qwen4ExpTextGatedResidual`` (its hyper input is ``hidden_states``)."""
+def gated_residual(module, hidden_states: torch.Tensor, round_once: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(mixed, injection_weights)`` of ``Qwen4ExpTextGatedResidual`` (its hyper input is ``hidden_states``), or
+    ``(mixed, injection_logits)`` for ``combine`` with ``round_once``."""
     shape = hidden_states.shape
     mixed, inj = _GatedResidualFn.apply(
         hidden_states.reshape(-1, shape[-1]),
@@ -235,6 +330,7 @@ def gated_residual(module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, t
         module.input_mix_weight_up.weight,
         module.hc_count,
         module.hc_norm.eps,
+        round_once,
     )
     return mixed.view(*shape[:-1], -1), inj.view(*shape[:-1], -1)
 
@@ -250,3 +346,122 @@ def inject(hyper_input: torch.Tensor, block_output: torch.Tensor, injection_weig
         hc,
     )
     return y.view(shape)
+
+
+def _rows(t: torch.Tensor, width: int) -> torch.Tensor:
+    return t.reshape(-1, width).contiguous()
+
+
+def _gate_mix_reference(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+    streams = (hc_count, x.shape[-1] // hc_count)
+    return (torch.sigmoid(gate.float()).unflatten(-1, streams) * x.unflatten(-1, streams)).mean(dim=-2).to(x.dtype)
+
+
+def _combine_reference(residual: torch.Tensor, block: torch.Tensor, logits: torch.Tensor, hc_count: int):
+    weight = 2 * torch.sigmoid(logits.float() / hc_count)
+    return (residual + (block.unsqueeze(-2) * weight.unsqueeze(-1)).flatten(-2)).to(residual.dtype)
+
+
+class _GateMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+        ctx.save_for_backward(x, gate)
+        ctx.hc_count = hc_count
+        width = x.shape[-1]
+        hc_dim = width // hc_count
+        rows_x, rows_g = _rows(x, width), _rows(gate, width)
+        out = torch.empty(rows_x.shape[0], hc_dim, dtype=x.dtype, device=x.device)
+        if rows_x.shape[0]:
+            grid = (rows_x.shape[0], triton.cdiv(hc_dim, _BLOCK_H))
+            _gate_mix_fwd_kernel[grid](rows_x, rows_g, out, hc_dim, HC=hc_count, BLOCK=_BLOCK_H)
+        return out.reshape(*x.shape[:-1], hc_dim)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        x, gate = ctx.saved_tensors
+        hc_count = ctx.hc_count
+        # Double backward (create_graph) needs differentiable ops, so it keeps the PyTorch path.
+        if torch.is_grad_enabled():
+            sigmoid = torch.sigmoid(gate.float()).unflatten(-1, (hc_count, -1))
+            dout = grad.float().unsqueeze(-2) / hc_count
+            dx = (dout * sigmoid).flatten(-2).to(x.dtype)
+            dgate = (dout * x.float().unflatten(-1, (hc_count, -1)) * sigmoid * (1 - sigmoid)).flatten(-2)
+            return dx, dgate.to(gate.dtype), None
+        width = x.shape[-1]
+        hc_dim = width // hc_count
+        rows_x, rows_g = _rows(x, width), _rows(gate, width)
+        dx, dgate = torch.empty_like(rows_x), torch.empty_like(rows_g)
+        if rows_x.shape[0]:
+            grid = (rows_x.shape[0], triton.cdiv(hc_dim, _BLOCK_H))
+            _gate_mix_bwd_kernel[grid](
+                rows_x, rows_g, _rows(grad, hc_dim), dx, dgate, hc_dim, HC=hc_count, BLOCK=_BLOCK_H
+            )
+        return dx.reshape(x.shape), dgate.reshape(gate.shape), None
+
+
+class _Combine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual: torch.Tensor, block: torch.Tensor, logits: torch.Tensor, hc_count: int):
+        ctx.save_for_backward(block, logits)
+        ctx.hc_count = hc_count
+        width = residual.shape[-1]
+        hc_dim = width // hc_count
+        rows_res = _rows(residual, width)
+        out = torch.empty_like(rows_res)
+        if rows_res.shape[0]:
+            grid = (rows_res.shape[0], triton.cdiv(hc_dim, _BLOCK_H))
+            _combine_fwd_kernel[grid](
+                rows_res,
+                _rows(block, hc_dim),
+                _rows(logits, hc_count),
+                out,
+                hc_dim,
+                HC=hc_count,
+                HC_PAD=triton.next_power_of_2(hc_count),
+                BLOCK=_BLOCK_H,
+            )
+        return out.reshape(residual.shape)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        block, logits = ctx.saved_tensors
+        hc_count = ctx.hc_count
+        if torch.is_grad_enabled():
+            sigmoid = torch.sigmoid(logits.float() / hc_count)
+            dout = grad.float().unflatten(-1, (hc_count, -1))
+            dblock = (dout * (2 * sigmoid).unsqueeze(-1)).sum(-2).to(block.dtype)
+            dweight = (dout * block.float().unsqueeze(-2)).sum(-1)
+            dlogits = (dweight * 2 * sigmoid * (1 - sigmoid) / hc_count).to(logits.dtype)
+            return grad, dblock, dlogits, None
+        hc_dim = block.shape[-1]
+        rows_block, rows_logits = _rows(block, hc_dim), _rows(logits, hc_count)
+        dblock, dlogits = torch.empty_like(rows_block), torch.empty_like(rows_logits)
+        if rows_block.shape[0]:
+            _combine_bwd_kernel[(rows_block.shape[0],)](
+                rows_block,
+                rows_logits,
+                _rows(grad, hc_count * hc_dim),
+                dblock,
+                dlogits,
+                hc_dim,
+                HC=hc_count,
+                HC_PAD=triton.next_power_of_2(hc_count),
+                BLOCK=_BLOCK_H,
+            )
+        return grad, dblock.reshape(block.shape), dlogits.reshape(logits.shape), None
+
+
+def gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+    """``mean_s(sigmoid(gate_s) * x_s)`` over the ``hc_count`` streams of ``[..., hc_count * hidden]``, in fp32,
+    rounded once to ``x.dtype``."""
+    if x.is_cuda and gate.is_cuda:
+        return _GateMix.apply(x, gate, hc_count)
+    return _gate_mix_reference(x, gate, hc_count)
+
+
+def combine(residual: torch.Tensor, block: torch.Tensor, logits: torch.Tensor, hc_count: int) -> torch.Tensor:
+    """``residual_s + block * 2 * sigmoid(logits_s / hc_count)`` for every stream ``s`` of ``residual``, in fp32,
+    rounded once to ``residual.dtype``."""
+    if residual.is_cuda and block.is_cuda and logits.is_cuda:
+        return _Combine.apply(residual, block, logits, hc_count)
+    return _combine_reference(residual, block, logits, hc_count)
