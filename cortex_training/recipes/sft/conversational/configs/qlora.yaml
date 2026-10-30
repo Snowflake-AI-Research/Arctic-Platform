@@ -1,0 +1,7 @@
+# Placeholder: QLoRA execution is not implemented by the current recipe.
+model:
+  name: Qwen/Qwen3-8B
+training:
+  method: qlora
+  adapter_rank: 32
+  quantization: 4bit

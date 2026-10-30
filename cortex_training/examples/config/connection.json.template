@@ -1,0 +1,10 @@
+{
+  "host": "ACCOUNT.snowflakecomputing.com",
+  "pat": "YOUR_PROGRAMMATIC_ACCESS_TOKEN",
+  "database": "CORTEX_TRAINING_DB",
+  "schema": "PUBLIC",
+  "endpoint": "cortex-training",
+  "poll_interval": 0.5,
+  "poll_timeout": 1800.0,
+  "verify_ssl": true
+}
