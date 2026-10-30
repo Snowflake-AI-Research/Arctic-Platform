@@ -275,6 +275,34 @@ def test_build_training_optimizer_keeps_flattened_weights_16_byte_aligned():
     assert group["params"][0] is model.first.weight and group["params"][1] is model.second.weight
 
 
+def test_build_training_optimizer_aligns_each_kept_fp32_group():
+    from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+            self.odd = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+            self.second = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+            self.scale = torch.nn.Parameter(torch.ones(3))
+            self.base = torch.nn.Parameter(torch.ones(24))
+
+        @classmethod
+        def keeps_fp32_parameter(cls, name):
+            return name in ("scale", "base")
+
+    model = _Model()
+    assert preserve_fp8_params_through_ds_cast(model) == (0, 2)
+
+    optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), _ZERO2, fused=False)
+
+    groups = [[(param.dtype, param.numel()) for param in group["params"]] for group in optimizer.param_groups]
+    assert groups == [
+        [(torch.bfloat16, 256), (torch.bfloat16, 256), (torch.bfloat16, 3)],
+        [(torch.float32, 24), (torch.float32, 3)],
+    ]
+
+
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
     sentinel = object()
     calls = {}

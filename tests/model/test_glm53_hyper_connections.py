@@ -27,7 +27,7 @@ def _rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
 
 
-def _module(hidden: int, trainable: bool):
+def _module(hidden: int, trainable: bool, fn_dtype: torch.dtype = torch.float32):
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
 
@@ -37,6 +37,7 @@ def _module(hidden: int, trainable: bool):
         module.fn.normal_(0, 0.02)
         module.base.normal_(0, 0.5)
         module.scale.uniform_(0.5, 1.5)
+    module.fn.data = module.fn.data.to(fn_dtype)
     return module.requires_grad_(trainable)
 
 
@@ -50,9 +51,11 @@ def _site(module, streams, sublayer_weight, fused: bool):
     return _remix(fused, False, post, comb, out, streams)
 
 
+# Training keeps fn in BF16 and base/scale in FP32 (keeps_fp32_parameter).
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.bfloat16], ids=["fp32-fn", "bf16-fn"])
 @pytest.mark.parametrize("trainable", [False, True])
 @pytest.mark.parametrize("tokens", [1, 513])
-def test_fused_mhc_matches_hugging_face(tokens, trainable):
+def test_fused_mhc_matches_hugging_face(tokens, trainable, fn_dtype):
     from arctic_platform.model.implementations.glm53 import hyper_connections as hc
 
     hidden = 1024
@@ -71,14 +74,15 @@ def test_fused_mhc_matches_hugging_face(tokens, trainable):
         ("fused", True, streams.dtype),
         ("fp64", False, torch.float64),
     ):
-        module = _module(hidden, trainable)
+        module = _module(hidden, trainable, fn_dtype)
         assert not fused or hc.fused_hyper_connection_applies(module, streams)
         module = module.to(dtype) if dtype == torch.float64 else module
         leaf = streams.clone().to(dtype).requires_grad_(True)
         y = _site(module, leaf, sublayer_weight.to(dtype), fused)
         y.backward(grad.to(dtype))
-        params = [module.fn.grad, module.base.grad, module.scale.grad] if trainable else []
-        results[name] = [y.detach(), leaf.grad, *params]
+        params = [module.fn, module.base, module.scale] if trainable else []
+        assert all(param.grad.dtype == param.dtype for param in params), name
+        results[name] = [y.detach(), leaf.grad, *(param.grad for param in params)]
     for what, fused, fp32, exact in zip(names, results["fused"], results["fp32"], results["fp64"]):
         assert fused.shape == exact.shape, what
         bound = max(1e-2, 1.5 * _rel(fp32, exact))

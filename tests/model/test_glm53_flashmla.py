@@ -24,6 +24,9 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_a
     sparse_mla_flashmla_fused_apply,
 )
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
+from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import (
+    sparse_mla_flashmla_fwd_interface,
+)
 from arctic_platform.model.implementations.glm53 import context_parallel
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import set_seed
@@ -561,6 +564,42 @@ def test_real_flashmla_padded_width_matches_original_reference():
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         assert torch.isfinite(actual_grad).all()
         _assert_bf16_kernel_close(actual_grad, expected_grad)
+
+
+@require_torch_gpu
+def test_real_flashmla_rope_free_512_matches_the_padded_call():
+    """GLM-5.3-Flash's 512-wide latent, unpadded, against the same call zero-padded to 576."""
+    _require_flashmla_kernel()
+    if not context_parallel._fused_sparse_mla_backward_available():
+        pytest.skip("the unpadded call needs the fused TileLang sparse-MLA backward")
+    set_seed(42)
+    queries, keys, heads, topk, scale = 128, 256, 64, 128, 576**-0.5
+    query = (torch.randn(1, queries, heads, 512, device="cuda") * 0.5).bfloat16().requires_grad_()
+    kv = (torch.randn(1, keys + 1, 1, 512, device="cuda") * 0.5).bfloat16()
+    kv[:, keys] = 0
+    kv.requires_grad_()
+    # The last CP shard of the keys; slots past a query's position point at the zero sentinel row.
+    positions = torch.arange(keys - queries, keys, device="cuda")
+    indices = torch.randint(0, keys, (queries, topk), device="cuda")
+    indices = torch.where(indices <= positions[:, None], indices, keys).sort(-1).values.int()
+    indices = indices.view(1, queries, 1, topk).contiguous()
+
+    def pad(tensor):
+        return torch.nn.functional.pad(tensor, (0, 64))
+
+    unpadded = sparse_mla_flashmla_fwd_interface(query.detach(), kv.detach(), indices, scale)
+    padded = sparse_mla_flashmla_fwd_interface(pad(query.detach()), pad(kv.detach()), indices, scale)
+    for actual, expected in zip(unpadded, padded, strict=True):
+        torch_assert_equal(actual, expected)
+
+    grad = torch.randn(1, queries, heads, 512, device="cuda").bfloat16()
+    expected = torch.autograd.grad(
+        sparse_mla_flashmla_fused_apply(pad(query), pad(kv), indices, scale), (query, kv), grad
+    )
+    actual = torch.autograd.grad(sparse_mla_flashmla_fused_apply(query, kv, indices, scale), (query, kv), grad)
+    torch_assert_equal(actual[0], expected[0])
+    # dKV sums FP32 atomics in no fixed order before rounding to BF16, so elements may differ by one BF16 step.
+    _assert_bf16_kernel_close(actual[1], expected[1], atol=1e-3)
 
 
 @require_torch_gpu
