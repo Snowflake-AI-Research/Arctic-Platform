@@ -26,7 +26,7 @@ export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor rl"
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
 
-`HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`.
+`HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`. A `prebuilt_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no `image_repo` or `crane`; any other `prebuilt_image` is mirrored, so it needs both. The launcher checks this before it provisions GPUs.
 
 `HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`:
 
@@ -39,6 +39,8 @@ harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
 ### Where Rollouts Run
 
 The agent's `terminal` tool and the verifier both run through the selected Harbor environment, so the agent works in the same filesystem that `tests/test.sh` grades, on every backend. Each command runs to completion in a fresh shell: the working directory carries over between commands, but exported variables and background jobs do not. `file_editor` is not available because it would edit the training driver's filesystem instead.
+
+The agent itself runs on the driver, and only its commands go to the environment. `HARBOR_AGENT` must be such a driver-side agent: the default `harbor_rl.agent:OpenHandsHarborAgent` or your own Harbor `BaseAgent` subclass (`module:Class`), which receives the rollout's model endpoint and key as the `base_url` and `api_key` constructor arguments. Harbor's installed agents (`openhands-sdk`, `mini-swe-agent`, `claude-code`, ...) run inside the environment, where task code could read that key, so the launcher and the adapter refuse them.
 
 `HARBOR_ENV=host` runs tasks as subprocesses on the driver machine with no isolation. Task `RUN` lines, verifiers, and agent commands can read anything the driver's user can, so it is only for tasks you trust. It needs `HARBOR_ALLOW_HOST_EXEC=1`. Host commands get an allowlisted environment (`PATH`, locale, `TERM`, `TMPDIR`, plus any names in `HARBOR_HOST_ENV_PASSTHROUGH`), never the driver's `ARCTIC_*`, `WANDB_*`, or other credentials. All task paths are resolved and must stay inside the trial directory or the task's `environment/`.
 
@@ -77,7 +79,7 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | **Agent skill (`SKILL.md`)** | `HARBOR_SKILL` | — | `~/skills/debug/SKILL.md:~/skills/git/SKILL.md` |
 | **Agent tools** | `OPENHANDS_TOOLS` | `terminal` (+ finish tool) | `terminal,task_tracker` |
 | **Agent system prompt** | `OPENHANDS_SYSTEM_PROMPT_FILE` | built-in prompt | `~/prompts/custom_agent.j2` |
-| **Harbor agent class** | `HARBOR_AGENT` | `harbor_rl.agent:OpenHandsHarborAgent` | `openhands-sdk`, `mini-swe-agent`, `my_pkg:MyAgent` |
+| **Harbor agent class** | `HARBOR_AGENT` | `harbor_rl.agent:OpenHandsHarborAgent` | `my_pkg:MyAgent` (a driver-side `BaseAgent`; see [Where Rollouts Run](#where-rollouts-run)) |
 | **Harbor sandbox (`--env`)** | `HARBOR_ENV` / `HARBOR_ENV_KWARGS` | `snowflake` / — | `docker`, `modal`, `daytona`, `e2b`, `host` (trusted tasks only) |
 | **Base model** | `MODEL` | `Qwen/Qwen3.5-4B` | `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-Coder-7B-Instruct` |
 | **GPU allocation (train / sample)** | `NUM_TRAIN_GPUS` / `NUM_SAMPLING_ENGINES` | `4` / `4` | `8` / `8` |

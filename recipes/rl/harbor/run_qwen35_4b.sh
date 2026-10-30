@@ -11,7 +11,7 @@
 #     (a JSON object passed to the environment, like `harbor run --ek`)
 # and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
-#   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or any Harbor BaseAgent)
+#   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or your own driver-side Harbor BaseAgent; installed agents are refused)
 
 set -euo pipefail
 

@@ -17,8 +17,8 @@
 Drives each rollout through Harbor's own :class:`harbor.trial.trial.Trial`
 orchestrator:
 1. ``submit(request)`` builds a :class:`harbor.models.trial.config.TrialConfig`
-   pointed at ``request.base_url`` and ``request.api_key`` (plus any Harbor
-   agent, environment, and OpenHands skills) and starts ``Trial.run()`` in a
+   pointed at ``request.base_url`` and ``request.api_key`` (plus any driver-side
+   Harbor agent, environment, and OpenHands skills) and starts ``Trial.run()`` in a
    background thread.
 2. ``get_status(rollout_id)`` returns ``"running"``, ``"completed"``, or
    ``"errored"``.

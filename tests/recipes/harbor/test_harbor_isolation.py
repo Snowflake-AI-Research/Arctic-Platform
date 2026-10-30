@@ -679,6 +679,62 @@ def test_terminal_executor_tracks_cwd_and_reports_timeouts():
     assert split_cwd("no marker") == ("no marker", None)
 
 
+def test_a_stopped_terminal_runs_no_more_commands_and_abandons_the_one_in_flight():
+    pytest.importorskip("openhands.sdk")
+    from harbor_rl.terminal import HarborTerminalExecutor
+    from openhands.tools.terminal.definition import TerminalAction
+
+    started = threading.Event()
+    commands: list[str] = []
+
+    class SlowEnvironment:
+        async def exec(self, command, cwd=None, timeout_sec=None):
+            commands.append(command)
+            started.set()
+            await asyncio.sleep(60)
+
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    stopped = threading.Event()
+    try:
+        executor = HarborTerminalExecutor(SlowEnvironment(), loop, "/work", stopped=stopped)
+        threading.Thread(target=lambda: (started.wait(5), stopped.set()), daemon=True).start()
+        t0 = time.monotonic()
+        in_flight = executor(TerminalAction(command="sleep 60", timeout=60))
+        assert time.monotonic() - t0 < 5
+        assert in_flight.is_error and "stopped" in in_flight.text
+        assert executor(TerminalAction(command="echo again")).is_error
+        assert len(commands) == 1
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_stopping_a_conversation_never_blocks_the_caller():
+    from harbor_rl.agent import ConversationStop
+
+    in_step = threading.Lock()
+    in_step.acquire()
+    paused = threading.Event()
+
+    class ConversationMidStep:
+        def pause(self):
+            with in_step:
+                paused.set()
+
+    stop = ConversationStop()
+    assert stop.attach(ConversationMidStep())
+    t0 = time.monotonic()
+    stop.stop()
+    assert time.monotonic() - t0 < 1, "stop() waited for the conversation's step to end"
+    assert stop.stopped.is_set() and not paused.is_set()
+    in_step.release()
+    assert paused.wait(5)
+    assert not ConversationStop().stopped.is_set()
+    late = ConversationStop()
+    late.stop()
+    assert not late.attach(ConversationMidStep())
+
+
 def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(monkeypatch):
     from harbor.environments.factory import EnvironmentFactory
     from harbor_rl.entrypoint import check_harbor_env

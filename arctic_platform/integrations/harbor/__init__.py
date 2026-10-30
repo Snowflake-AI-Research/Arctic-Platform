@@ -15,7 +15,7 @@
 """Harbor integration for SkyRL on Cortex Training.
 
 Drives any Harbor task directory (``instruction.md``, ``environment/``,
-``tests/test.sh``) and any Harbor agent through :class:`harbor.trial.trial.Trial`
+``tests/test.sh``) and any driver-side Harbor agent through :class:`harbor.trial.trial.Trial`
 against :class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy`
 and :class:`arctic_platform.integrations.harness.generator.HarnessGenerator`.
 Import submodules directly so this package does not load ``harbor`` at import time.
