@@ -24,6 +24,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 from arctic_platform.rl.utils.debug import pr0
 
 from .module_patcher import ModuleReconstructionPatcher
@@ -635,10 +636,9 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
 
         beta = b.sigmoid()
         g = -module.A_log.float().exp() * F.softplus(a.float() + module.dt_bias)
-        if module.num_v_heads // module.num_k_heads > 1:
-            factor = module.num_v_heads // module.num_k_heads
-            query = query.repeat_interleave(factor, dim=2)
-            key = key.repeat_interleave(factor, dim=2)
+        query, key = repeat_query_key_for_value_heads(
+            query, key, module.num_k_heads, module.num_v_heads, module.chunk_gated_delta_rule
+        )
 
         core_attn_out, last_recurrent_state = module.chunk_gated_delta_rule(
             query,
