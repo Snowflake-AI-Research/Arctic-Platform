@@ -991,7 +991,51 @@ def _ipc_payload(names):
     return {"names": names, "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles))}
 
 
-def _run_sync_entry_point(entry_point, extension, tmp_path):
+_SYNC_ENTRY_POINTS = [
+    "sync_weights",
+    "sync_weights_broadcast",
+    "sync_spec_weights",
+    "load_weights_cuda_ipc",
+    "load_weights_cuda_ipc_chunk",
+    "load_weights_from_shm_path",
+]
+
+
+def _run_sync_entry_point(entry_point, monkeypatch, tmp_path, modules, write_synced_weights):
+    """Run one sync entry point on a model of ``modules`` whose loaders call ``write_synced_weights``."""
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 2
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
+
+    class Model(nn.ModuleDict):
+        def load_weights(self, weights):
+            write_synced_weights()
+            return {name for name, _ in weights}
+
+    def load_batched(model, engine):
+        write_synced_weights()
+        return 4, 0.0, 0.0, {}, []
+
+    model = Model(modules)
+    extension = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_runner=SimpleNamespace(model=model, drafter=SimpleNamespace(model=model)),
+        model_config=SimpleNamespace(quantization=None),
+        _get_or_create_engine=lambda *args, **kwargs: _FakeEngine([("w", torch.ones(1))]),
+        _get_or_create_broadcast_engine=lambda *args: object(),
+        _load_batched=load_batched,
+        _build_result=lambda *args: {"status": "done"},
+        _validate_weight_sync_names=lambda *args, **kwargs: None,
+    )
+    extension._load_cpu_weights_into_model = lambda weights: WeightSyncExtension._load_cpu_weights_into_model(
+        extension, weights
+    )
     if entry_point in ("sync_weights", "sync_weights_broadcast", "sync_spec_weights"):
         return getattr(WeightSyncExtension, entry_point)(extension, "127.0.0.1", 1234, 1, 2)
     if entry_point == "load_weights_cuda_ipc":
@@ -1005,28 +1049,8 @@ def _run_sync_entry_point(entry_point, extension, tmp_path):
     return WeightSyncExtension.load_weights_from_shm_path(extension, str(path))
 
 
-@pytest.mark.parametrize(
-    "entry_point",
-    [
-        "sync_weights",
-        "sync_weights_broadcast",
-        "sync_spec_weights",
-        "load_weights_cuda_ipc",
-        "load_weights_cuda_ipc_chunk",
-        "load_weights_from_shm_path",
-    ],
-)
+@pytest.mark.parametrize("entry_point", _SYNC_ENTRY_POINTS)
 def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point):
-    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
-    parallel_state.get_tensor_model_parallel_world_size = lambda: 2
-    parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
-    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
-
     # vLLM 0.31.0 Glm5NextLinearAttention: fp32 [C, 1, 4] q/k/v conv weights, and the
     # merged weight its first forward caches under inference mode (kda.py:505-515).
     kda = nn.Module()
@@ -1060,38 +1084,52 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, ent
         for param in (*(conv.weight for conv in convs), indexer.wk_weights_proj.weight):
             param.data.add_(1.0)
 
-    class Model(nn.ModuleDict):
-        def load_weights(self, weights):
-            names = {name for name, _ in weights}
-            update_in_place()
-            return names
-
-    def load_batched(model, engine):
-        update_in_place()
-        return 4, 0.0, 0.0, {}, []
-
-    model = Model({"kda": kda, "indexer": indexer})
-    extension = SimpleNamespace(
-        device=torch.device("cpu"),
-        model_runner=SimpleNamespace(model=model, drafter=SimpleNamespace(model=model)),
-        model_config=SimpleNamespace(quantization=None),
-        _get_or_create_engine=lambda *args, **kwargs: _FakeEngine([("w", torch.ones(1))]),
-        _get_or_create_broadcast_engine=lambda *args: object(),
-        _load_batched=load_batched,
-        _build_result=lambda *args: {"status": "done"},
-        _validate_weight_sync_names=lambda *args, **kwargs: None,
-    )
-    extension._load_cpu_weights_into_model = lambda weights: WeightSyncExtension._load_cpu_weights_into_model(
-        extension, weights
-    )
-
-    result = _run_sync_entry_point(entry_point, extension, tmp_path)
+    modules = {"kda": kda, "indexer": indexer}
+    result = _run_sync_entry_point(entry_point, monkeypatch, tmp_path, modules, update_in_place)
 
     assert result["cached_weight_copies_refreshed"] == 2
     assert torch.equal(kda._merged_conv_weight, merged()), "sampler still convolves with pre-sync conv weights"
     assert kda._merged_conv_weight.data_ptr() == cache_address
     assert torch.equal(indexer._wp_fp32, head_gate()), "sparse indexer still gates with pre-sync weights"
     assert indexer._wp_fp32.data_ptr() == head_gate_address
+
+
+@pytest.mark.parametrize("entry_point", _SYNC_ENTRY_POINTS)
+def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp_path, entry_point):
+    # vLLM 0.32.0: FlashInfer CUTLASS experts hold w13 as [up; gate] after load (oracle/unquantized.py
+    # convert_to_unquantized_kernel_format); a sync's loaders write [gate; up] (routed_experts.py _load_w13).
+    backends = SimpleNamespace(FLASHINFER_CUTLASS="FlashInfer CUTLASS", TRITON="TRITON")
+    oracle = types.ModuleType("vllm.model_executor.layers.fused_moe.oracle.unquantized")
+    oracle.UnquantizedMoeBackend = backends
+    flashinfer_utils = types.ModuleType("vllm.model_executor.layers.quantization.utils.flashinfer_utils")
+    flashinfer_utils.swap_w13_to_w31 = (  # vLLM 0.32.0's own definition
+        lambda x: x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
+    )
+    monkeypatch.setitem(sys.modules, oracle.__name__, oracle)
+    monkeypatch.setitem(sys.modules, flashinfer_utils.__name__, flashinfer_utils)
+
+    gate = torch.arange(24.0).view(2, 3, 4).bfloat16()  # [experts, rows, hidden]
+    up = gate + 24
+    layers = {}
+    for name, backend in (("cutlass", backends.FLASHINFER_CUTLASS), ("triton", backends.TRITON)):
+        layers[name] = nn.Module()
+        layers[name].quant_method = SimpleNamespace(unquantized_backend=backend)
+        layers[name].moe_config = SimpleNamespace(is_act_and_mul=True)
+        layers[name].w13_weight = nn.Parameter(torch.zeros(2, 6, 4).bfloat16(), requires_grad=False)
+    address = layers["cutlass"].w13_weight.data_ptr()
+
+    def load_checkpoint_order():
+        for layer in layers.values():
+            layer.w13_weight.data.copy_(torch.cat([gate, up], dim=1))
+
+    result = _run_sync_entry_point(entry_point, monkeypatch, tmp_path, layers, load_checkpoint_order)
+
+    cutlass = layers["cutlass"].w13_weight
+    wrong = int((cutlass != torch.cat([up, gate], dim=1)).sum())
+    assert wrong == 0, f"{wrong} of {cutlass.numel()} CUTLASS w13 elements hold the other projection after the sync"
+    assert cutlass.data_ptr() == address
+    assert torch.equal(layers["triton"].w13_weight, torch.cat([gate, up], dim=1))
+    assert result["cached_weight_copies_refreshed"] == 1
 
 
 async def _noop_abort_all_streams():

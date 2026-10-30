@@ -329,8 +329,11 @@ def _refresh_cached_weight_copies(model) -> int:
     the three conv weights once and reuses that copy, so a sync never reaches the convolution; the
     sparse indexer (``glm5next/common/attention.py``) keeps an fp32 transpose of its head-gate rows.
     Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
-    Returns how many caches were refreshed; a GLM-5.3 sampler reporting 0 after its first forward means
-    vLLM renamed them and the refresh no longer applies.
+    FlashInfer CUTLASS experts get the gate/up -> up/gate swap vLLM applies once at load
+    (``convert_to_unquantized_kernel_format``) again, since the sync's loaders write gate/up order. The swap
+    is not idempotent, so this runs once after each full-weight load.
+    Returns how many caches and CUTLASS expert weights were refreshed; a GLM-5.3 sampler reporting 0 after its
+    first forward means vLLM renamed them and the refresh no longer applies.
     """
     refreshed = 0
     with torch.inference_mode():
@@ -344,6 +347,14 @@ def _refresh_cached_weight_copies(model) -> int:
             if head_gate is not None:
                 head_gate.copy_(module.wk_weights_proj.weight[module.head_dim :].t())
                 refreshed += 1
+            moe_backend = getattr(getattr(module, "quant_method", None), "unquantized_backend", None)
+            if moe_backend is not None:
+                from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend
+                from vllm.model_executor.layers.quantization.utils.flashinfer_utils import swap_w13_to_w31
+
+                if moe_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS and module.moe_config.is_act_and_mul:
+                    module.w13_weight.copy_(swap_w13_to_w31(module.w13_weight))
+                    refreshed += 1
     return refreshed
 
 
