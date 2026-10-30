@@ -258,6 +258,19 @@ class ReplicaPool:
         return len(self._workers)
 
     @property
+    def concurrency_limit(self) -> int:
+        """Requests the scheduler dispatches at once, summed over schedulable replicas.
+
+        Each replica's limit starts at ``ARCTIC_WORKER_CONCURRENCY_LIMIT`` (128
+        by default) and, with ``ARCTIC_DYNAMIC_CONCURRENCY`` on, adapts to its
+        KV-cache use, so this is the current value, not the configured one.
+        Requests beyond it wait in the scheduler's queue. 0 before initialize.
+        """
+        if self._scheduler is None:
+            return 0
+        return self._scheduler.total_concurrency_limit
+
+    @property
     def uses_placement_group(self) -> bool:
         return self._engine_pg is not None
 
