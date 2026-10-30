@@ -21,6 +21,7 @@ from ..distributed.ep_backend import uses_dispatch_ep
 from ...kernels.sonic_experts import sonic_routed_experts
 from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
+from ..routing_weights import weighted_down_projection
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -93,6 +94,9 @@ class MoEArgs:
     route_scale: float = 1.0
     score_before_experts: bool = True
     fp32_router_logits: bool = False
+    # BF16 experts multiply each row's FP32 down-projection accumulator by its routing weight and round once, as
+    # vLLM's fused MoE kernel does; False rounds the expert output, then weights it.
+    fp32_routed_weighting: bool = False
 
     # token-choice
     top_k: int = 1
@@ -242,6 +246,7 @@ def _run_experts_for_loop_impl(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # NOTE: this would incur a synchronization between device and host
     num_tokens_per_expert = num_tokens_per_expert.tolist()
@@ -261,13 +266,17 @@ def _run_experts_for_loop_impl(
         gate = torch.matmul(x_expert, w1[expert_idx].transpose(-2, -1))
         up = torch.matmul(x_expert, w3[expert_idx].transpose(-2, -1))
         h = _apply_swiglu(gate, up, swiglu_limit)
-        h = torch.matmul(h, w2[expert_idx].transpose(-2, -1))
+        if scores is None:
+            h = torch.matmul(h, w2[expert_idx].transpose(-2, -1))
         # h shape (tokens_per_expert(varying), dim)
         out_experts_splits.append(h)
     out = torch.cat(out_experts_splits, dim=0)
 
     # side-effect code due to the usage of generate_permute_indices
     out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
+    if scores is not None:
+        offsets = torch.cumsum(torch.tensor(num_tokens_per_expert, device=out.device), dim=0, dtype=torch.int32)
+        out = weighted_down_projection(out, w2.to(out.dtype), offsets, scores)
 
     return out
 
@@ -308,6 +317,7 @@ def _run_experts_grouped_mm_impl(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
@@ -317,6 +327,8 @@ def _run_experts_grouped_mm_impl(
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
     h = _apply_swiglu(gate, up, swiglu_limit)
+    if scores is not None:
+        return weighted_down_projection(h, w2.bfloat16(), offsets, scores).type_as(x)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
     return out
@@ -362,6 +374,8 @@ class GroupedExperts(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.fp8_block_size = fp8_block_size
+        # Set by MoE: BF16 experts weight each row from the down projection's FP32 accumulator.
+        self.fp32_routed_weighting = False
         if fp8_block_size is not None:
             self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim, dtype=torch.float8_e4m3fn))
             self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim, dtype=torch.float8_e4m3fn))
@@ -477,9 +491,12 @@ class GroupedExperts(nn.Module):
     def _forward_deepep(
         self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can;
-        # the other paths scale their outputs here.
-        if scores is not None and not (self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda):
+        # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can,
+        # and so do BF16 experts with fp32_routed_weighting; the other paths scale their outputs here.
+        folds_scores = self.fp32_routed_weighting or (
+            self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda
+        )
+        if scores is not None and not folds_scores:
             return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -549,8 +566,8 @@ class GroupedExperts(nn.Module):
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
-        return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
+            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
+        return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
 
     def forward(
         self,
@@ -559,7 +576,8 @@ class GroupedExperts(nn.Module):
         scores: torch.Tensor | None = None,
         expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs.
+        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs (from
+        the down projection's FP32 accumulator with ``fp32_routed_weighting``).
 
         With ``expert_indices`` the rows are the EP receive buffer as delivered instead (one row per token, ``[tokens,
         top_k]`` local expert ids, ``-1`` elsewhere, and their scores), run through SonicMoE. Called through the PEFT
@@ -769,6 +787,10 @@ class MoE(nn.Module):
             else None
         )
         self.score_before_experts = moe_args.score_before_experts
+        if moe_args.fp32_routed_weighting and moe_args.fp8_block_size is not None:
+            raise ValueError("fp32_routed_weighting weights BF16 experts; FP8 experts weight their BF16 output")
+        self.fp32_routed_weighting = moe_args.fp32_routed_weighting
+        self.experts.fp32_routed_weighting = moe_args.fp32_routed_weighting
         self.deepep_token_chunk_size: int | None = None
 
         # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
@@ -823,6 +845,8 @@ class MoE(nn.Module):
 
         if self.score_before_experts:
             routed_input = apply_routing_weights(routed_input, top_scores_experts_sorted)
+        elif self.fp32_routed_weighting:
+            return self.experts(routed_input, num_tokens_per_expert, top_scores_experts_sorted)
 
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
@@ -856,6 +880,8 @@ class MoE(nn.Module):
         use_sonic = (
             self.use_sonicmoe
             and not self.score_before_experts
+            # SonicMoE rounds each expert row before weighting it.
+            and not self.fp32_routed_weighting
             and hasattr(ep_comm, "finalize_dispatch_rows")
             and sonic_routed_experts_applicable(experts)
         )

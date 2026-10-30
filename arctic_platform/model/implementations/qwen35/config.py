@@ -60,5 +60,7 @@ class ModelConfig:
     fp32_lm_head: bool = False
     # Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32.
     fp32_parity: bool = True
+    # BF16 experts weight the down projection's fp32 accumulator and round once (GLM-5.3-Flash, Qwen3.8-Flash-Next).
+    fp32_routed_weighting: bool = False
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)
