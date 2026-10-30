@@ -98,6 +98,7 @@ all = [
     "arctic_platform[verl]",
     "arctic_platform[prime-rl]",
     "arctic_platform[sonicmoe]",
+    "arctic_platform[harbor]",
 ]
 
 dev = [
@@ -110,8 +111,12 @@ dev = [
 # it reaches [rl] -> [inference] -> vllm, and vLLM's build needs CUDA_HOME,
 # which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
+    "arctic_platform[harbor]",
     "arctic_platform[tinker]",
     "httpx",
+    # The Harbor recipe's agent tests. The recipe itself pins a git revision.
+    "openhands-sdk==1.7.1",
+    "openhands-tools==1.7.1",
     "parameterized",
     "pytest-asyncio",
     "pytest-instafail",
@@ -222,6 +227,19 @@ prime-rl = [
     "httpx",
     "huggingface-hub",
     "orjson",
+]
+
+# Harbor RL integration (arctic_platform/integrations/harbor) and its bundled
+# Snowflake Cortex Sandboxes environment. harbor 0.25.0 is the newest release
+# with the environment APIs snowflake_sandbox uses. OpenHands is pinned by git
+# revision in recipes/rl/harbor/run_qwen35_4b.sh: package metadata can't carry
+# git URLs.
+harbor = [
+    "certifi",
+    "dockerfile-parse>=2.0.1",
+    "harbor==0.25.0",
+    "pathspec>=1.0.3",
+    "snowflake-sandbox-python==0.2.2a5",
 ]
 
 [tool.pytest.ini_options]
