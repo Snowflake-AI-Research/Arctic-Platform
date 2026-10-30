@@ -582,7 +582,10 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
             return set()
 
     result = WeightSyncExtension._load_batched(
-        SimpleNamespace(device=torch.device("cpu")),
+        SimpleNamespace(
+            device=torch.device("cpu"),
+            parallel_config=SimpleNamespace(enable_expert_parallel=True, pipeline_parallel_size=1),
+        ),
         Model(),
         _FakeEngine(
             [
@@ -602,6 +605,68 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
         caplog.records[-1]
     ]
     assert "skipped 1/2" in caplog.records[-1].getMessage()
+
+
+class _PlacesOnlyWeight(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def load_weights(self, weights):
+        name, tensor = next(iter(weights))
+        if name == "weight":
+            self.weight.data.copy_(tensor)
+            return {"weight"}
+        return set()
+
+
+@pytest.mark.parametrize(
+    "parallel_config", [None, SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1)]
+)
+def test_load_batched_rejects_sources_without_destination_under_tensor_parallelism(parallel_config):
+    receiver = SimpleNamespace(device=torch.device("cpu"), parallel_config=parallel_config)
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("model.layers.0.extra.weight", torch.tensor([3.0]))])
+
+    with pytest.raises(AssertionError, match="dropped on the floor") as raised:
+        WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert "received 1/2" in str(raised.value)
+    assert "model.layers.0.extra.weight" in str(raised.value)
+    assert "LoRA" not in str(raised.value)
+
+
+def test_load_batched_names_lora_route_for_unplaced_adapter_factors():
+    receiver = SimpleNamespace(device=torch.device("cpu"))
+    adapters = [
+        "model.layers.0.self_attn.q_a_proj.lora_A.default.weight",
+        "model.layers.0.self_attn.q_a_proj.lora_B.default.weight",
+    ]
+    engine = _FakeEngine([("weight", torch.tensor([2.0]))] + [(name, torch.ones(1)) for name in adapters])
+
+    with pytest.raises(AssertionError, match="2 of them are LoRA adapter tensors") as raised:
+        WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert "weight_format='lora'" in str(raised.value)
+    assert all(name in str(raised.value) for name in adapters)
+
+
+@pytest.mark.parametrize(
+    ("enable_expert_parallel", "pipeline_parallel_size"), [(True, 1), (False, 2)], ids=["expert", "pipeline"]
+)
+def test_load_batched_returns_rank_skips_when_the_rank_holds_part_of_the_model(
+    enable_expert_parallel, pipeline_parallel_size
+):
+    receiver = SimpleNamespace(
+        device=torch.device("cpu"),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_expert_parallel, pipeline_parallel_size=pipeline_parallel_size
+        ),
+    )
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("other_rank.weight", torch.tensor([3.0]))])
+
+    *_, skipped = WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert skipped == ["other_rank.weight"]
 
 
 def test_hf_sync_of_declared_export_buffers_passes_loaded_destination_check(monkeypatch):

@@ -4635,9 +4635,13 @@ def _onboarding_prerequisites(tmp_path, monkeypatch):
 @pytest.mark.parametrize("selection", ["all", "single-step-grads", "single-step-optimizer"])
 @pytest.mark.parametrize(
     "ds_config",
-    [{}, {"data_types": {}}, {"data_types": None}, {"data_types": {"grad_accum_dtype": "bf16"}}],
+    [
+        {"data_types": {"grad_accum_dtype": "bf16"}},
+        {"zero_optimization": {"stage": 0}},
+        {"zero_optimization": {"stage": 1, "compute_grad_norm": False}},
+    ],
 )
-def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
+def test_onboarding_refuses_bf16_accumulation_before_any_work(
     _onboarding_prerequisites, monkeypatch, selection, ds_config
 ):
     state = _onboarding_prerequisites
@@ -4654,11 +4658,11 @@ def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
         dss_driver, "recover_local_cortex_gateway", lambda: pytest.fail("precision prerequisite recovered gateway")
     )
 
-    with pytest.raises(ValueError, match="Set data_types.grad_accum_dtype") as caught:
+    with pytest.raises(ValueError, match="use FP32 HF gradient accumulation") as caught:
         state.onboard._onboard_configuration(state.args)
 
     assert str(state.args.config.resolve()) in str(caught.value)
-    assert '"fp32"' in str(caught.value)
+    assert ("zero_optimization" if "zero_optimization" in ds_config else '"fp32"') in str(caught.value)
     assert "does not change this setting" in str(caught.value)
     assert state.calls == []
     assert state.config.training == original
@@ -4668,9 +4672,20 @@ def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfloat16", "BF16"])
-def test_onboarding_accepts_explicit_fp32_accumulation_without_changing_config(_onboarding_prerequisites, dtype):
+@pytest.mark.parametrize(
+    "ds_config",
+    [
+        {"data_types": {"grad_accum_dtype": "fp32"}},
+        {},
+        {"data_types": {}},
+        {"data_types": None},
+        {"zero_optimization": {"stage": 1}},
+    ],
+)
+def test_onboarding_accepts_fp32_accumulation_without_changing_config(_onboarding_prerequisites, dtype, ds_config):
     state = _onboarding_prerequisites
     state.config.sub_job["dtype"] = dtype
+    state.config.training["ds_config"] = copy.deepcopy(ds_config)
     original = copy.deepcopy(state.config.training)
     contents = json.dumps({"training": original}) + "\n"
     state.args.config.write_text(contents)
@@ -4738,7 +4753,9 @@ def test_onboarding_reference_free_check_does_not_require_accumulation_override(
 def test_onboarding_accumulation_prerequisite_honors_bf16_override(_onboarding_prerequisites, dtype, bf16, required):
     state = _onboarding_prerequisites
     state.config.sub_job["dtype"] = dtype
-    ds_config = {} if bf16 is None else {"bf16": bf16}
+    ds_config = {"data_types": {"grad_accum_dtype": "bf16"}}
+    if bf16 is not None:
+        ds_config["bf16"] = bf16
     state.config.training["ds_config"] = copy.deepcopy(ds_config)
 
     if required:
@@ -4753,7 +4770,7 @@ def test_onboarding_accumulation_prerequisite_honors_bf16_override(_onboarding_p
 
 @pytest.mark.parametrize("format_name", ["native", "cortex"])
 @pytest.mark.parametrize("accumulation", [None, "bf16", "fp32"])
-def test_onboarding_loaded_config_requires_preset_accumulation_without_mutation(
+def test_onboarding_loaded_config_resolves_accumulation_without_mutation(
     tmp_path, monkeypatch, format_name, accumulation
 ):
     from arctic_platform.correctness.harness import config as config_module
@@ -4785,7 +4802,7 @@ def test_onboarding_loaded_config_requires_preset_accumulation_without_mutation(
     monkeypatch.setattr(onboard, "_configure_fixture_target", lambda *a: calls.append("fixture"))
     args._prerequisites_checked = True
 
-    if accumulation == "fp32":
+    if accumulation in (None, "fp32"):
         onboard._onboarding_preflight(args, config)
         assert calls == ["fixture"]
     else:
@@ -25475,6 +25492,7 @@ class SyntheticCollective:
             weight_name,
             kind,
             parameter,
+            _,
         ) in lora_training_native._iter_param_wrapper_expert_loras(self.model):
             name = lora_training_native._expert_lora_vllm_key(prefix, weight_name, kind)
             normalized[name] = lora_training_native._reshape_expert_lora_for_ep(
@@ -61459,8 +61477,121 @@ def test_durable_startup_error_new_binding_rejects_invalid_identity_or_collision
     assert payload == before
 
 
+# Reference optimizer compute dtype.
+
+
+_optimizer_compute_dtype_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+
+_optimizer_compute_dtype_FLASH_NEXT_BF16 = (
+    _optimizer_compute_dtype_CONFIG_DIR / "qwen3.8-flash-next" / "h200" / "train-sft-full-8gpus-sp8-256k.config"
+)
+_optimizer_compute_dtype_FLASH_NEXT_FP32 = (
+    _optimizer_compute_dtype_CONFIG_DIR / "qwen3.8-flash-next" / "h200" / "train-sft-full-16gpus-sp16-256k.config"
+)
+_optimizer_compute_dtype_GLM_BF16 = (
+    _optimizer_compute_dtype_CONFIG_DIR / "glm5.3-flash" / "h200" / "train-sft-lora-8gpus-sp8-256k.config"
+)
+
+
+@pytest.fixture
+def _optimizer_compute_dtype_fast_output():
+    with tempfile.TemporaryDirectory(prefix="optimizer-compute-dtype-", dir="/data-fast/tmp") as directory:
+        yield Path(directory)
+
+
+def _optimizer_compute_dtype_model_dir(root: Path, model_type: str) -> str:
+    path = root / model_type
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(path)
+
+
+def test_optimizer_compute_dtype_follows_the_resolved_product_implementation(tmp_path: Path) -> None:
+    flash_next = _optimizer_compute_dtype_model_dir(tmp_path, "qwen4_exp")
+    glm = _optimizer_compute_dtype_model_dir(tmp_path, "glm_moe_dsa")
+    bf16_cpu_adam = load_config(_optimizer_compute_dtype_FLASH_NEXT_BF16)
+    assert bf16_cpu_adam.optimizer_dtype == "bfloat16"
+    assert bf16_cpu_adam.optimizer_compute_dtype(flash_next) == "float32"
+    assert load_config(_optimizer_compute_dtype_FLASH_NEXT_FP32).optimizer_compute_dtype(flash_next) == "float32"
+    bf16_nonfused = load_config(_optimizer_compute_dtype_GLM_BF16)
+    assert bf16_nonfused.optimizer_dtype == "bfloat16"
+    assert bf16_nonfused.optimizer_compute_dtype(glm) == "bfloat16"
+
+
+def _optimizer_compute_dtype_bf16_problem():
+    generator = torch.Generator().manual_seed(0)
+    weight = (torch.randn(64, 4096, generator=generator) * 0.02).to(torch.bfloat16)
+    gradient = (torch.randn(64, 4096, generator=generator) * 1e-3).to(torch.bfloat16)
+    return weight, gradient
+
+
+def _optimizer_compute_dtype_cpu_adam_step(weight: torch.Tensor, gradient: torch.Tensor) -> dict:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+    master = torch.nn.Parameter(weight.clone())
+    master.grad = gradient.clone()
+    optimizer = DeepSpeedCPUAdam(
+        [master], lr=0.01, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, adamw_mode=True, fp32_optimizer_states=False
+    )
+    optimizer.step()
+    state = optimizer.state[master]
+    return {
+        "parameter_update": master.detach().float() - weight.float(),
+        "exp_avg": state["exp_avg"].detach().clone(),
+        "exp_avg_sq": state["exp_avg_sq"].detach().clone(),
+    }
+
+
+def _optimizer_compute_dtype_reference_step(weight, gradient, output_dir: Path, **dtypes) -> dict:
+    model = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    artifact = run_adamw_step(
+        model,
+        {"weight": gradient.float()},
+        {"name": "AdamW", "betas": [0.9, 0.999], "eps": 1e-08, "weight_decay": 0},
+        learning_rate=0.01,
+        gradient_clipping=None,
+        output_dir=output_dir,
+        **dtypes,
+    )
+    manifest = json.loads(artifact.manifest_path.read_text())
+    return torch.load(output_dir / manifest["parameters"][0]["file"], weights_only=True)
+
+
+def _optimizer_compute_dtype_mismatched_update_elements(reference: dict, product: dict) -> int:
+    return int((reference["parameter_update"] != product["parameter_update"]).sum())
+
+
+def test_float32_compute_reference_follows_the_bf16_cpu_adam_kernel(
+    _optimizer_compute_dtype_fast_output: Path,
+) -> None:
+    weight, gradient = _optimizer_compute_dtype_bf16_problem()
+    product = _optimizer_compute_dtype_cpu_adam_step(weight, gradient)
+    storage = _optimizer_compute_dtype_reference_step(
+        weight, gradient, _optimizer_compute_dtype_fast_output / "storage", optimizer_dtype="bfloat16"
+    )
+    compute = _optimizer_compute_dtype_reference_step(
+        weight,
+        gradient,
+        _optimizer_compute_dtype_fast_output / "compute",
+        optimizer_dtype="bfloat16",
+        optimizer_compute_dtype="float32",
+    )
+    for name in ("parameter_update", "exp_avg", "exp_avg_sq"):
+        assert compute[name].shape == product[name].shape
+    assert compute["exp_avg"].dtype == compute["exp_avg_sq"].dtype == torch.bfloat16
+    torch.testing.assert_close(compute["exp_avg"], product["exp_avg"], rtol=0, atol=0)
+    # The kernel updates the master from its unrounded float32 moments; a storage-precision reference rounds the
+    # denominator first, which moves a large share of bf16 masters by one unit in the last place.
+    assert _optimizer_compute_dtype_mismatched_update_elements(
+        compute, product
+    ) < _optimizer_compute_dtype_mismatched_update_elements(storage, product)
+
+
 _SELFTEST_FIXTURES = (
     "_selected_lora_case",
+    "_optimizer_compute_dtype_fast_output",
     "_isolated_gateway_ownership",
     "_external_operator_catalog",
     "_dense_checkpoint_onboarding_cli",

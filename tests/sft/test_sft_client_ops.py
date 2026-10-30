@@ -21,9 +21,14 @@ shared ops as an SFT caller sees them.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import AsyncArcticClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -198,6 +203,51 @@ class TestSFTOpMapping:
         sampling_client.sync_weights()
         payload = sampling_client.transport.calls[1].body["payload"]
         assert payload == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}
+
+
+LORA = {"peft_type": "LORA", "r": 8}
+
+
+def _cortex_config(peft=None, config_type=ArcticSFTClientConfig) -> ArcticClientConfig:
+    return config_type(
+        model_name="m",
+        training_gpus=1,
+        sampling_gpus=1,
+        backend=CortexConfig(base_url="http://localhost"),
+        training=TrainingConfig(peft=peft),
+    )
+
+
+def _sync_payload(client) -> dict:
+    (sync,) = [call for call in client.transport.calls if call.op == "operation"]
+    return sync.body["payload"]
+
+
+class TestSyncWeightFormat:
+    def test_peft_job_syncs_the_adapter_by_default(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config(peft=LORA))
+        client.sync_weights()
+        assert _sync_payload(client)["weight_format"] == "lora"
+
+    @pytest.mark.parametrize("weight_format", ["vllm", "hf", "lora"])
+    def test_peft_job_sends_an_explicit_weight_format_as_given(self, monkeypatch, weight_format):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config(peft=LORA))
+        client.sync_weights(weight_format=weight_format)
+        assert _sync_payload(client)["weight_format"] == weight_format
+
+    def test_dense_job_leaves_weight_format_to_the_server(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config())
+        client.sync_weights()
+        assert "weight_format" not in _sync_payload(client)
+
+    def test_async_client_syncs_the_adapter_by_default(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = AsyncArcticClient(_cortex_config(peft=LORA, config_type=ArcticClientConfig))
+        asyncio.run(client.sync_weights())
+        assert _sync_payload(client)["weight_format"] == "lora"
 
 
 class TestSFTLifecycle:

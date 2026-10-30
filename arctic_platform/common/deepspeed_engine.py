@@ -92,7 +92,8 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     The caller steps after each microbatch, so the microbatch size and the
     accumulation count are both 1. Sequence parallelism reduces the
     data-parallel degree, and therefore ``train_batch_size``, to
-    ``world_size // sequence_parallel``.
+    ``world_size // sequence_parallel``. Gradients accumulate in FP32 unless the
+    merged config says otherwise; see ``apply_default_grad_accum_dtype``.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -127,6 +128,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
+    apply_default_grad_accum_dtype(ds_config)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -135,6 +137,50 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         ds_config.get("communication_data_type"),
     )
     return ds_config
+
+
+def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
+    """Set ``data_types.grad_accum_dtype`` to ``"fp32"`` in place when the config leaves it unset.
+
+    DeepSpeed accumulates gradients in the model dtype when ``grad_accum_dtype`` is absent or ``None``, so a bf16
+    job would sum its microbatch gradients at bfloat16 granularity. The default belongs to the key, not the block: a
+    supplied ``data_types`` without it gets FP32 too, and its other fields are kept. An explicit value is never
+    changed. The block is replaced by a copy, so a caller's shared ``data_types`` dict is never mutated.
+
+    DeepSpeed refuses FP32 accumulation in two configurations, which keep its model-dtype default instead: ZeRO
+    disabled with bf16 or fp16 parameters (``unsupported mix of model_dtype and grad_accum_dtype``), and ZeRO stage 1
+    with bf16 parameters, ``compute_grad_norm`` false and no CPU optimizer offload, which selects the BF16 optimizer
+    that requires the norm.
+    """
+    data_types = ds_config.get("data_types")
+    if data_types is not None and not isinstance(data_types, dict):
+        return
+    if (data_types or {}).get("grad_accum_dtype") is not None:
+        return
+    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config):
+        return
+    ds_config["data_types"] = {**(data_types or {}), "grad_accum_dtype": "fp32"}
+
+
+def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool:
+    """Whether ``deepspeed.initialize`` accepts this config once ``grad_accum_dtype`` is ``"fp32"``."""
+    bf16_config = ds_config.get("bf16")
+    if bf16_config is None:
+        bf16_config = ds_config.get("bfloat16")
+    fp16_config = ds_config.get("fp16")
+    bf16 = isinstance(bf16_config, dict) and bool(bf16_config.get("enabled"))
+    fp16 = isinstance(fp16_config, dict) and bool(fp16_config.get("enabled"))
+    zero_config = ds_config.get("zero_optimization")
+    if not isinstance(zero_config, dict):
+        zero_config = {}
+    stage = int(zero_config.get("stage") or 0)
+    if stage == 0:
+        return not (bf16 or fp16)
+    offload = zero_config.get("offload_optimizer")
+    cpu_offload = isinstance(offload, dict) and offload.get("device") == "cpu"
+    if stage == 1 and bf16 and not cpu_offload and zero_config.get("compute_grad_norm", True) is False:
+        return False
+    return True
 
 
 def split_expert_param_groups(param_groups: list) -> list:

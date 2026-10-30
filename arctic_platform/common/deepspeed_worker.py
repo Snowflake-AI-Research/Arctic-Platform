@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
+from arctic_platform.common.deepspeed_engine import apply_default_grad_accum_dtype
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import dp_sp_world_size
@@ -403,13 +404,7 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
-        # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
-        # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
-        data_types = dict(ds_config.get("data_types") or {})
-        if data_types.get("grad_accum_dtype") is None:
-            data_types["grad_accum_dtype"] = "fp32"
-        ds_config["data_types"] = data_types
+        apply_default_grad_accum_dtype(ds_config)
 
         return ds_config
 

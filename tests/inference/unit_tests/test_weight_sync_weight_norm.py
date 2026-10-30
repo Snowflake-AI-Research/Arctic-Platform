@@ -359,7 +359,9 @@ def test_nccl_batched_sync_reports_a_skipped_source(tp_world_size, cpu_cuda):
                     names.add("proj")
             return names
 
-    result = _nccl_sync(_extension(_DroppingModel()), _Engine(_weights()))
+    ext = _extension(_DroppingModel())
+    ext.parallel_config = SimpleNamespace(enable_expert_parallel=True, pipeline_parallel_size=1)
+    result = _nccl_sync(ext, _Engine(_weights()))
 
     assert result["recv_l2_sq"] == 32.5
     assert result["applied_source_l2_sq"] == 30.0

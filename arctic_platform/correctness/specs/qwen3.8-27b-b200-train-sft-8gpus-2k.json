@@ -35,7 +35,7 @@
   "inapplicable": {},
   "model": {
     "cache_path": "/data-fast/base-models/synthetic/Qwen3.8-27B-4L",
-    "content_hash": "986aad8a51f1c0fa",
+    "content_hash": "69f90626548e1a25",
     "measured_reference_peak_gib": 15.856251239776611,
     "num_hidden_layers": 4,
     "param_count": 4144619200,

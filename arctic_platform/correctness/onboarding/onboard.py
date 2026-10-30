@@ -704,18 +704,34 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         bf16 = ds_config.get("bf16")
         bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
         if bf16_enabled:
-            data_types = ds_config.get("data_types") or {}
-            # ``DeepSpeedWorker.ds_training_config`` sets ``grad_accum_dtype`` to FP32 whenever the key is missing or
-            # ``None``, whatever the state of the ``data_types`` block; only an explicit value overrides it.
-            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else "invalid"
-            if accumulation is None:
-                accumulation = "fp32"
-            if accumulation != "fp32":
+            from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+            from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+
+            # ``build_deepspeed_config`` resolves the target's accumulation dtype with the rule the on-prem worker
+            # shares: FP32 unless ``data_types.grad_accum_dtype`` is set, or DeepSpeed refuses FP32 accumulation under
+            # the ZeRO setting. Only the ZeRO and ``data_types`` keys decide it, so the rest of the client config is
+            # left for the target to validate.
+            overrides = {key: ds_config[key] for key in ("data_types", "zero_optimization") if key in ds_config}
+            resolved = build_deepspeed_config(
+                TrainingEngineSpec(world_size=1, ds_overrides={**overrides, "bf16": {"enabled": True}})
+            )
+            data_types = resolved.get("data_types")
+            remedy = None
+            if data_types is not None and not isinstance(data_types, dict):
+                remedy = f'Set data_types to a mapping with grad_accum_dtype "fp32" (got {data_types!r})'
+            elif (accumulation := (data_types or {}).get("grad_accum_dtype")) is None:
+                remedy = (
+                    "DeepSpeed refuses FP32 gradient accumulation with ZeRO disabled and at ZeRO stage 1 with "
+                    "compute_grad_norm false and no CPU optimizer offload, so the target would accumulate in BF16; "
+                    "change zero_optimization"
+                )
+            elif accumulation != "fp32":
+                remedy = f'Set data_types.grad_accum_dtype to "fp32" (got {accumulation!r})'
+            if remedy is not None:
                 raise ValueError(
                     f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "
-                    'Set data_types.grad_accum_dtype to "fp32" in the supplied configuration\'s training.ds_config '
-                    "(training_config.ds_config for Cortex recipes) before onboarding; "
-                    f"got {accumulation!r}. Onboarding does not change this setting."
+                    f"{remedy} in the supplied configuration's training.ds_config (training_config.ds_config for "
+                    "Cortex recipes) before onboarding. Onboarding does not change this setting."
                 )
     _configure_fixture_target(args, config, selection)
     if getattr(args, "_prerequisites_checked", False):

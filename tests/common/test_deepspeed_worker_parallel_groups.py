@@ -56,7 +56,7 @@ def _spec(ep=8, sp=8):
 
 
 @pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_worker_training_config_does_not_insert_accumulation_precision(runtime, job_config):
+def test_worker_training_config_without_zero_does_not_insert_accumulation_precision(runtime, job_config):
     config = {}
 
     result = runtime.worker.ds_training_config(job_config, config, {})
