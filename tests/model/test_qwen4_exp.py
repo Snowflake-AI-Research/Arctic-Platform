@@ -154,6 +154,21 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     assert embedding.weight._dss_skip_weight_sync
 
 
+def test_qwen38_gated_delta_net_output_norms_round_once():
+    _require()
+    from arctic_platform.model.implementations.gpu import vllm_rounding
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+    language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config()))
+    norms = [layer.linear_attn.norm for layer in language_model.layers if layer.layer_type == "linear_attention"]
+
+    # The rounding of each stock class is checked in test_gated_norm_rounding.py; here, that every norm uses it.
+    assert len(norms) == 1
+    for norm in norms:
+        assert vars(norm)["forward"].__func__ is vllm_rounding._rms_norm_gated_once_forward
+        assert norm.activation == "sigmoid"
+
+
 def test_qwen38_decoder_forwards_its_physical_layer_routes():
     _require()
     from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -660,7 +675,8 @@ def test_qwen38_qsa_compresses_after_gather_for_unaligned_cp_shards(monkeypatch)
     assert routes.shape == (1, 3, 3)
 
 
-def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
+@pytest.mark.parametrize("fp32_parity", [True, False])
+def test_qwen38_sparse_gqa_custom_backward_matches_autograd(fp32_parity):
     from arctic_platform.model.implementations.qwen38.qsa_flex import _sparse_gqa_chunk
     from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
 
@@ -670,12 +686,12 @@ def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
     value = torch.randn(1, 5, 2, 2, dtype=torch.double, requires_grad=True)
     routes = torch.tensor([[[0, 1, -1], [1, 2, 3], [0, 3, 4]]], dtype=torch.int32)
 
-    expected, *_ = _sparse_gqa_chunk(query, key, value, routes, 0.5)
+    expected, *_ = _sparse_gqa_chunk(query, key, value, routes, 0.5, fp32_parity)
     expected.sum().backward()
     expected_grads = tuple(tensor.grad.clone() for tensor in (query, key, value))
 
     actual_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in (query, key, value))
-    actual = _SparseGQAAttention.apply(*actual_inputs, routes, 0.5, 2)
+    actual = _SparseGQAAttention.apply(*actual_inputs, routes, 0.5, 2, fp32_parity)
     actual.sum().backward()
 
     torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)

@@ -33,6 +33,35 @@ from .collectives import sequence_head_all_to_all
 logger = logging.getLogger(__name__)
 
 _CP_CONTEXT_ATTRIBUTE = "_dss_gated_delta_net_cp_context"
+
+
+def kernel_groups_value_heads(rule: Callable[..., Any] | None) -> bool:
+    """Whether ``rule`` applies grouped value attention when there are more value heads than key heads.
+
+    FLA's chunk rule does: value head ``hv`` reads key head ``hv // (HV // H)``, the assignment
+    ``repeat_interleave`` would build, and it sums dq/dk in fp32. The pure-PyTorch fallback assumes one head
+    count for q, k, v, beta and g, so q and k still have to be expanded for it.
+    """
+    fn = getattr(rule, "__func__", rule)
+    fn = getattr(fn, "__wrapped__", fn)
+    return str(getattr(fn, "__module__", "")).startswith("fla.")
+
+
+def repeat_query_key_for_value_heads(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    num_key_heads: int,
+    num_value_heads: int,
+    rule: Callable[..., Any] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand q and k to the value-head count unless ``rule`` groups value heads itself."""
+    replication = num_value_heads // num_key_heads
+    if replication > 1 and not kernel_groups_value_heads(rule):
+        query = query.repeat_interleave(replication, dim=2)
+        key = key.repeat_interleave(replication, dim=2)
+    return query, key
+
+
 # Set by the model's SP wrapper before the layer loop; see qwen35/sequence_parallel.py.
 _GLOBAL_CU_SEQLENS_ATTRIBUTE = "_dss_sp_global_cu_seqlens"
 
@@ -149,21 +178,15 @@ def _pack_and_exchange_head_tensors(
 
     exchanged: dict[str, torch.Tensor] = {}
     for fields in grouped.values():
-        destination_chunks = []
         widths: dict[str, int] = {}
-        for destination in range(world_size):
-            packed_fields = []
-            for name, tensor in fields:
-                local_heads, _tail_shape = specs[name]
-                start = destination * local_heads
-                stop = start + local_heads
-                part = tensor[:, :, start:stop]
-                width = part[0, 0].numel()
-                widths[name] = width
-                packed_fields.append(part.reshape(batch_size, local_sequence_length, width))
-            destination_chunks.append(torch.cat(packed_fields, dim=-1))
-
-        packed = torch.stack(destination_chunks, dim=2)
+        views = []
+        for name, tensor in fields:
+            # Each destination's heads are contiguous, so ``[B, T, world, width]`` is a view of the
+            # field; one cat packs every field, and its backward is views rather than one
+            # zero-filled full-size gradient per destination.
+            widths[name] = tensor[0, 0].numel() // world_size
+            views.append(tensor.reshape(batch_size, local_sequence_length, world_size, widths[name]))
+        packed = torch.cat(views, dim=-1)
         packed = sequence_head_all_to_all(
             process_group,
             packed,
@@ -171,19 +194,16 @@ def _pack_and_exchange_head_tensors(
             gather_dim=1,
         ).squeeze(2)
 
-        offset = 0
         global_sequence_length = local_sequence_length * world_size
-        for name, _tensor in fields:
-            width = widths[name]
+        # split, not slicing: its backward is one cat instead of a zero-filled packed-size gradient per field.
+        for (name, _tensor), field in zip(fields, torch.split(packed, [widths[name] for name, _ in fields], dim=-1)):
             local_heads, tail_shape = specs[name]
-            field = packed[:, :, offset : offset + width]
             exchanged[name] = field.reshape(
                 batch_size,
                 global_sequence_length,
                 local_heads,
                 *tail_shape,
             )
-            offset += width
     return exchanged
 
 
@@ -455,10 +475,7 @@ def head_parallel_gated_delta_net(
     beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
-    replication = num_value_heads // num_key_heads
-    if replication > 1:
-        query = query.repeat_interleave(replication, dim=2)
-        key = key.repeat_interleave(replication, dim=2)
+    query, key = repeat_query_key_for_value_heads(query, key, local_key_heads, local_value_heads, gated_delta_rule)
 
     if rule_kwargs.get("initial_state") is not None:
         raise RuntimeError("head-parallel GatedDeltaNet training does not support an initial recurrent state")

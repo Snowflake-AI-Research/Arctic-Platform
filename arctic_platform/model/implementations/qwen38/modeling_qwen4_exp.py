@@ -27,17 +27,20 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
 from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
 
+from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norm_once
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
+from . import hyper_connection
 from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
 from .converting_qwen4_exp import convert_prime_layer_to_hf
@@ -121,7 +124,7 @@ class EPShardedEmbedding(nn.Embedding):
 
 
 class Qwen4ExpSparseMoePrimeRL(MoE):
-    def __init__(self, config, *, use_grouped_mm: bool):
+    def __init__(self, config, *, use_grouped_mm: bool, fp32_routed_weighting: bool = False):
         super().__init__(
             MoEArgs(
                 num_experts=config.num_experts,
@@ -133,6 +136,7 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
                 top_k=config.num_experts_per_tok,
                 use_grouped_mm=use_grouped_mm,
                 load_balance_coeff=None,
+                fp32_routed_weighting=fp32_routed_weighting,
             ),
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
@@ -159,6 +163,14 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
 
 
 class Qwen4ExpTextNGramEmbeddingPrimeRL(Qwen4ExpTextNGramEmbedding):
+    _dss_weight_export_buffers = frozenset(
+        {
+            "layer_multipliers",
+            "ngram_heads_vocab_sizes",
+            "ngram_heads_offsets",
+        }
+    )
+
     def forward(
         self, input_ids: torch.Tensor, past_key_values: Cache | None, position_ids: Tensor | None = None
     ) -> torch.Tensor:
@@ -262,6 +274,48 @@ class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
         return output
 
 
+class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
+    """The hyper-connection mix and combine in fp32, rounded once, as vLLM's ``hc_gate_mix`` and ``hc_combine`` are.
+
+    ``forward`` returns the injection logits in place of the weights; ``combine`` applies them.
+    """
+
+    def forward(self, hyper_input: torch.Tensor):
+        normed = self.hc_norm(hyper_input)
+        down = self.input_mix_weight_down(normed)
+        gate = self.input_mix_weight_up(F.silu(down.float() / self.hc_count).to(down.dtype))
+        mixed = hyper_connection.gate_mix(normed, gate, self.hc_count)
+        if self.block_inject_weight is None:
+            return mixed
+        return mixed, hyper_input, self.block_inject_weight(normed)
+
+    def combine(self, hyper_input: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor):
+        return hyper_connection.combine(hyper_input, block_output, injection_logits, self.hc_count)
+
+
+def _mix_streams(module, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``(mixed, hyper_input, injection)`` of the module's forward, fused when the module allows."""
+    if hyper_connection.fused_hyper_connection_supported(module, hidden_states):
+        round_once = isinstance(module, Qwen4ExpTextGatedResidualPrimeRL)
+        mixed, injection = hyper_connection.gated_residual(module, hidden_states, round_once=round_once)
+        return mixed, hidden_states, injection
+    return module(hidden_states)
+
+
+def _inject(hyper_input: Tensor, block_output: Tensor, injection_weights: Tensor) -> Tensor:
+    hc = injection_weights.shape[-1]
+    if hyper_input.is_cuda and hyper_input.dtype == torch.bfloat16 and hc & (hc - 1) == 0:
+        return hyper_connection.inject(hyper_input, block_output, injection_weights)
+    injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    return hyper_input + injection.flatten(-2)
+
+
+def _combine(module, hyper_input: Tensor, block_output: Tensor, injection: Tensor) -> Tensor:
+    if isinstance(module, Qwen4ExpTextGatedResidualPrimeRL):
+        return module.combine(hyper_input, block_output, injection)
+    return _inject(hyper_input, block_output, injection)
+
+
 class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
     def forward(
         self,
@@ -284,7 +338,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 position_ids=ple_position_ids,
             )
 
-        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = _mix_streams(self.attn_hyper_connection, hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
@@ -298,16 +352,13 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 **kwargs,
             )
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = _combine(self.attn_hyper_connection, hyper_input, hidden_states, injection)
 
-        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = _mix_streams(self.mlp_hyper_connection, hidden_states)
         routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
         hidden_states = self.mlp(hidden_states, routed_experts=routes)
 
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
-        return hidden_states
+        return _combine(self.mlp_hyper_connection, hyper_input, hidden_states, injection)
 
 
 class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
@@ -331,13 +382,20 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         self.model.__class__ = Qwen4ExpModelPrimeRL
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
+        if getattr(config, "fp32_parity", True):
+            for module in self.model.language_model.modules():
+                if type(module) is Qwen4ExpTextGatedResidual:
+                    module.__class__ = Qwen4ExpTextGatedResidualPrimeRL
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
+            if layer.layer_type == "linear_attention":
+                round_gated_norm_once(layer.linear_attn.norm)
             if isinstance(layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
                     use_grouped_mm=use_grouped_mm,
+                    fp32_routed_weighting=getattr(config, "fp32_routed_weighting", False),
                 )
             if layer.ple is not None:
                 layer.ple.__class__ = Qwen4ExpTextPLELayerPrimeRL

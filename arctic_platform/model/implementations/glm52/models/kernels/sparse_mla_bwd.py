@@ -81,6 +81,18 @@ def postprocess(
     return postprocess_kernel
 
 
+# cp.async for the KV row gather: TileLang only emits it inside T.Pipelined, which needs a second KV tile that does
+# not fit in shared memory next to Q, dO and the dKV staging buffer.
+_CP_ASYNC_SRC = r"""
+__device__ __forceinline__ void arl_cp_async16(void* smem, const void* gmem) {
+  unsigned int s = static_cast<unsigned int>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void arl_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void arl_cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
+"""
+
+
 @tilelang.jit(
     out_idx=[-2],
     pass_configs={
@@ -88,7 +100,7 @@ def postprocess(
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         # Avoid TileLang MLA backward NaNs: https://github.com/tile-ai/tilelang/issues/2199
         # Enabling this aliases acc_dkv_shared onto a buffer still live inside the
-        # pipelined loop, so dQ and dKV come back Inf once a query has more than
+        # slot loop, so dQ and dKV come back Inf once a query has more than
         # ``block_size // split_store`` unmasked slots. At topk=2048 that is every
         # query, which silently zeroes learning: DeepSpeed then skips every step.
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
@@ -103,17 +115,29 @@ def bwd(
     sm_scale=None,
     is_causal=True,
     block_size=32,
-    num_stages=0,
     threads=256,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    """One CTA per (query, head block). Each slot block of ``block_size`` selected keys runs the P, dP and dQ GEMMs
+    against the gathered KV tile, then the dKV GEMMs, whose rows go to dKV as FP32 atomics staged through shared
+    memory. The atomics, ~38.7G FP32 adds into rows scattered over the whole 256K-key dKV for GLM-5.3's last CP
+    shard, make the gathers and index loads of the original kernel wait on a loaded memory system. So:
+
+    * the next slot block's KV rows are gathered with cp.async into the (single) KV tile right after the dQ GEMM, its
+      last reader, and land while the dKV GEMMs and atomics run;
+    * the query's indices, LSE and Delta are staged in shared memory once instead of loaded in every slot block;
+    * GEMMs split their columns across the two warpgroups (FullCol).
+
+    ``D_tail`` may be 0 (GLM-5.3-Flash's rope-free 512-wide q / kv).
+    """
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
+    assert D % 8 == 0 and D_tail % 8 == 0, "the KV gather moves 16-byte vectors"
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -138,6 +162,10 @@ def bwd(
     NH = padded_H // block_H
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
+    has_tail = D_tail > 0
+    Dt = max(D_tail, 8)  # placeholder width for the unused tail buffers when D_tail == 0
+    VEC = 8  # bf16 elements per 16-byte cp.async
+    policy = T.GemmWarpPolicy.FullCol
 
     split_store = 2
 
@@ -153,121 +181,169 @@ def bwd(
         dKV: T.Tensor(k_shape, accum_dtype),
     ):
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
+            T.import_source(_CP_ASYNC_SRC)
             Q_shared = T.alloc_shared([block_H, D], dtype)
-            Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
+            Q_tail_shared = T.alloc_shared([block_H, Dt], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
-            KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
+            KV_tail_shared = T.alloc_shared([BS, Dt], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
             mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dQ_shared = T.alloc_shared([block_H, D], dtype)
-            dQ_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
+            dQ_tail_shared = T.alloc_shared([block_H, Dt], dtype)
 
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
-            acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
+            acc_dq_tail = T.alloc_fragment([block_H, Dt], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
-            acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
+            acc_dkv_tail = T.alloc_fragment([BS, Dt], accum_dtype)
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, Dt], accum_dtype)
+            idx_shared = T.alloc_shared([topk], indices_dtype)
+            lse_shared = T.alloc_shared([block_H], accum_dtype)
+            delta_shared = T.alloc_shared([block_H], accum_dtype)
 
-            max_kv_i = s_i
+            # Mask only the sentinel row; see sparse_mla_fwd (indices are global and already causal).
+            sentinel = S_kv - 1
 
+            T.copy(Indices[by, s_i, bz // NH, :], idx_shared)
+            T.copy(Lse[by, s_i, bz * block_H : (bz + 1) * block_H], lse_shared)
+            T.copy(Delta[by, s_i, bz * block_H : (bz + 1) * block_H], delta_shared)
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
-            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
+            if has_tail:
+                T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
             T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
 
             T.clear(acc_dq)
-            T.clear(acc_dq_tail)
+            if has_tail:
+                T.clear(acc_dq_tail)
 
-            for i_i in T.Pipelined(NS, num_stages=num_stages):
+            # Gather slot block 0.
+            T.sync_threads()
+            for bi_i, d_i in T.Parallel(BS, D // VEC):
+                T.call_extern(
+                    "handle",
+                    "arl_cp_async16",
+                    T.address_of(KV_shared[bi_i, d_i * VEC]),
+                    T.address_of(KV[by, idx_shared[bi_i], bz // NH, d_i * VEC]),
+                )
+            if has_tail:
+                for bi_i, d_i in T.Parallel(BS, D_tail // VEC):
+                    T.call_extern(
+                        "handle",
+                        "arl_cp_async16",
+                        T.address_of(KV_tail_shared[bi_i, d_i * VEC]),
+                        T.address_of(KV[by, idx_shared[bi_i], bz // NH, D + d_i * VEC]),
+                    )
+            T.call_extern("handle", "arl_cp_async_commit")
+
+            for i_i in T.serial(NS):
                 for bi_i in T.Parallel(BS):
-                    mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i
+                    mask[bi_i] = idx_shared[i_i * BS + bi_i] < sentinel
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
 
-                for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i]
+                # This slot block's KV rows have landed (generic-proxy writes, read by WGMMA).
+                T.call_extern("handle", "arl_cp_async_wait_all")
+                T.fence_proxy_async()
+                T.sync_threads()
 
-                T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-
-                for bi_i, d_i in T.Parallel(BS, D_tail):
-                    KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
-                T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=policy)
+                if has_tail:
+                    T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=policy)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.exp2(
-                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i]
-                    )
+                    acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - lse_shared[h_i])
 
                 T.copy(acc_p, P_shared_cast)
 
-                T.gemm(
-                    dO_shared, KV_shared, acc_dp, transpose_B=True, policy=T.GemmWarpPolicy.FullRow, clear_accum=True
-                )
+                T.gemm(dO_shared, KV_shared, acc_dp, transpose_B=True, policy=policy, clear_accum=True)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_dp[h_i, bi_i] = (
-                        acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i]) * sm_scale
-                    )
+                    acc_dp[h_i, bi_i] = acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - delta_shared[h_i]) * sm_scale
 
                 T.copy(acc_dp, dP_shared_cast)
-                T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullRow)
-                T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=policy)
+                if has_tail:
+                    T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, policy=policy)
+
+                # The dQ GEMM was the KV tile's last reader: gather the next slot block into it now, behind the
+                # dKV GEMMs and atomics.
+                T.sync_threads()
+                if i_i + 1 < NS:
+                    for bi_i, d_i in T.Parallel(BS, D // VEC):
+                        T.call_extern(
+                            "handle",
+                            "arl_cp_async16",
+                            T.address_of(KV_shared[bi_i, d_i * VEC]),
+                            T.address_of(KV[by, idx_shared[(i_i + 1) * BS + bi_i], bz // NH, d_i * VEC]),
+                        )
+                    if has_tail:
+                        for bi_i, d_i in T.Parallel(BS, D_tail // VEC):
+                            T.call_extern(
+                                "handle",
+                                "arl_cp_async16",
+                                T.address_of(KV_tail_shared[bi_i, d_i * VEC]),
+                                T.address_of(KV[by, idx_shared[(i_i + 1) * BS + bi_i], bz // NH, D + d_i * VEC]),
+                            )
+                    T.call_extern("handle", "arl_cp_async_commit")
 
                 T.gemm(
                     dP_shared_cast,
                     Q_shared,
                     acc_dkv,
                     transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullRow,
+                    policy=policy,
                     clear_accum=True,
                 )
-                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=policy)
 
-                T.clear(acc_dkv_tail)
-                T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
+                if has_tail:
+                    T.clear(acc_dkv_tail)
+                    T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=policy)
 
                 for s in range(split_store):
                     for bi_i, d_i in T.Parallel(BS, D):
                         if bi_i < BS // split_store:
                             acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
 
-                    for bi_i, d_i in T.Parallel(BS, D_tail):
-                        if bi_i < BS // split_store:
-                            acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+                    if has_tail:
+                        for bi_i, d_i in T.Parallel(BS, D_tail):
+                            if bi_i < BS // split_store:
+                                acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                         T.atomic_addx4(
                             dKV[
                                 by,
-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                idx_shared[i_i * BS + bi_i + s * (BS // split_store)],
                                 bz // NH,
                                 d_i * 4,
                             ],
                             acc_dkv_shared[bi_i, d_i * 4],
                         )
 
-                    for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
-                        T.atomic_addx4(
-                            dKV[
-                                by,
-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                bz // NH,
-                                D + d_i * 4,
-                            ],
-                            acc_dkv_tail_shared[bi_i, d_i * 4],
-                        )
+                    if has_tail:
+                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+                            T.atomic_addx4(
+                                dKV[
+                                    by,
+                                    idx_shared[i_i * BS + bi_i + s * (BS // split_store)],
+                                    bz // NH,
+                                    D + d_i * 4,
+                                ],
+                                acc_dkv_tail_shared[bi_i, d_i * 4],
+                            )
 
             T.copy(acc_dq, dQ_shared)
-            T.copy(acc_dq_tail, dQ_tail_shared)
-
             T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
-            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
+            if has_tail:
+                T.copy(acc_dq_tail, dQ_tail_shared)
+                T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
 
     return sparse_mla_bwd_kernel
 

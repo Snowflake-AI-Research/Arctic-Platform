@@ -6,8 +6,10 @@ import logging
 import os
 import random
 import re
+import shutil
 import stat
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -30,6 +32,10 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
+from arctic_platform.inference.vllm.startup_error import (
+    ENV_VAR as _STARTUP_ERROR_DIR_ENV,
+    earliest_startup_error,
+)
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
 )
@@ -44,6 +50,9 @@ _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
+_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY = "router_replay_cache_device"
+_ROUTER_REPLAY_CACHE_DEVICES = ("cuda", "cpu")
+_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY = "router_replay_staging_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
@@ -64,21 +73,6 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     replaces xgrammar's stop set rather than extending it.
     """
     eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
-    return _stop_token_ids(eos, tokenizer)
-
-
-def _semip_grammar_stop_token_ids(model: str, tokenizer: Any) -> tuple[int, ...]:
-    """``_grammar_stop_token_ids`` for a restored engine, which has no vllm_config.
-
-    Reads the same generation config vLLM's default ``generation_config="auto"``
-    does.
-    """
-    from transformers import GenerationConfig
-
-    try:
-        eos = GenerationConfig.from_pretrained(model).eos_token_id
-    except OSError:
-        eos = None
     return _stop_token_ids(eos, tokenizer)
 
 
@@ -310,6 +304,46 @@ def _console_tail(max_bytes: int = 4096) -> str:
     return "\n".join(tails)
 
 
+def _begin_engine_startup_capture() -> str | None:
+    """Point this attempt's engine processes at a fresh directory for their startup failure."""
+    try:
+        directory = tempfile.mkdtemp(prefix="arctic-engine-startup-")
+    except OSError as exc:
+        logger.info("Engine startup failures are not recorded for this attempt: %s", exc)
+        return None
+    os.environ[_STARTUP_ERROR_DIR_ENV] = directory
+    return directory
+
+
+def _end_engine_startup_capture(directory: str | None) -> None:
+    os.environ.pop(_STARTUP_ERROR_DIR_ENV, None)
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeError | None:
+    """vLLM's generic startup error with the earliest engine process's own failure appended.
+
+    The root has to be in the message: Ray drops ``__cause__``, and dss-platform's
+    classifier matches on the error's type and ``str()``, which leaves out
+    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
+    replaced, so every other type keeps the type a classifier matches on. Returns
+    None, so the original is raised as it is, for any other type, when there is no
+    record, or when reading one fails; the last two are logged.
+    """
+    if directory is None or type(exc) is not RuntimeError:
+        return None
+    try:
+        root_cause = earliest_startup_error(directory)
+    except Exception:
+        logger.info("Engine startup root cause not appended: reading %s failed", directory, exc_info=True)
+        return None
+    if root_cause is None:
+        logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
+        return None
+    return RuntimeError(f"{exc}\n{root_cause}")
+
+
 def _is_address_in_use_error(exc: BaseException) -> bool:
     stack: list[BaseException] = [exc]
     seen: set[int] = set()
@@ -333,6 +367,21 @@ def _is_address_in_use_error(exc: BaseException) -> bool:
         if _BASE_EXCEPTION_GROUP is not None and isinstance(current, _BASE_EXCEPTION_GROUP):
             stack.extend(current.exceptions)
     return False
+
+
+def _with_rank_recv_l2_sq(results: list[Any]) -> dict[str, Any]:
+    """Rank 0's weight-load result, plus every TP rank's ``recv_l2_sq``.
+
+    Each TP rank receives the full model on its own, so each rank's received
+    checksum must match the trainer's; rank 0's alone does not prove the others.
+    """
+    if not results:
+        return {}
+    head = dict(results[0])
+    head["rank_recv_l2_sq"] = [
+        r.get("recv_l2_sq") if isinstance(r, dict) else None for r in results
+    ]
+    return head
 
 
 def _ensure_arctic_vllm_patches() -> None:
@@ -385,6 +434,11 @@ def _create_async_engine_args(
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
+    text_config_overrides = engine_kwargs.pop("text_config_overrides", None)
+    if text_config_overrides:
+        from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+        engine_kwargs["hf_overrides"] = text_config_hf_overrides(engine_kwargs["model"], text_config_overrides)
 
     try:
         engine_args = engine_args_cls(**engine_kwargs)
@@ -425,12 +479,42 @@ def _create_async_engine_args(
         )
 
 
+def _validate_mla_lora_targets(model_config: Any, peft_config: dict[str, Any] | None) -> None:
+    # vLLM's MLA attention calls the unwrapped kv_b_proj it was built with and decodes with weights absorbed from it.
+    targets = (peft_config or {}).get("target_modules", [])
+    names = [targets] if isinstance(targets, str) else targets
+    if any("kv_b_proj" in name or name == "all-linear" for name in names) and model_config.use_mla:
+        raise ValueError(
+            "LoRA target kv_b_proj is absorbed into MLA attention weights and cannot be served; "
+            "remove it from the training and sampling LoRA targets and retrain the adapter."
+        )
+
+
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
-        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(
-            _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY
+    for key in (
+        _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
+        _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY,
+        _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY,
+    ):
+        if key in engine_kwargs:
+            out[key] = engine_kwargs.pop(key)
+    device = out.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY)
+    if device is not None and device not in _ROUTER_REPLAY_CACHE_DEVICES:
+        raise ValueError(
+            f"{_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY} must be one of "
+            f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
         )
+    staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
+    if staging_bytes is not None:
+        # JSON transports (Cortex Training among them) can deliver an integer as a whole float.
+        if isinstance(staging_bytes, float) and staging_bytes.is_integer():
+            staging_bytes = int(staging_bytes)
+        if isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0:
+            raise ValueError(
+                f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
+            )
+        out[_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY] = staging_bytes
     return out
 
 
@@ -590,6 +674,10 @@ def _result_from_output(
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
 
+    spec = getattr(choice, "spec_decode_metrics", None)
+    if spec is not None:
+        result["spec_decode_metrics"] = spec.to_dict()
+
     if final_output.prompt_logprobs is not None:
         # The dense patch leaves tensors here instead of one dict per position;
         # everything else still gets the per-position dicts, unchanged.
@@ -686,6 +774,29 @@ class WorkerLifecycleState(str, Enum):
     UNINITIALIZED = "uninitialized"
     READY = "ready"
     SLEEPING = "sleeping"
+    # Weights remapped; KV cache not allocated yet. Colocated sync wakes in
+    # two calls (``["weights"]``, then ``["kv_cache"]``) and generate is only
+    # legal after the second one.
+    WEIGHTS_READY = "weights_ready"
+
+
+def _normalize_wake_tags(tags: list[str] | None) -> set[str] | None:
+    if tags is None:
+        return None
+    return set(tags)
+
+
+def _is_full_wake(tags: list[str] | None) -> bool:
+    tag_set = _normalize_wake_tags(tags)
+    return tag_set is None or tag_set >= {"weights", "kv_cache"}
+
+
+def _is_weights_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"weights"}
+
+
+def _is_kv_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"kv_cache"}
 
 
 _ACTOR_LOG_HANDLER_MARK = "_arctic_actor_handler"
@@ -753,6 +864,8 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._router_replay_tx_on_host = False
+        self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
         self._router_replay_shm_entry: dict[str, Any] | None = None
@@ -838,10 +951,16 @@ class InferenceWorker(StreamingWorkerMixin):
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+        lora_peft_config = engine_kwargs.pop("lora_peft_config", None)
+        checkpoint_peft_config = None
+        if lora_adapter_path:
+            import json
+            with open(os.path.join(lora_adapter_path, "adapter_config.json")) as adapter_file:
+                checkpoint_peft_config = json.load(adapter_file)
 
         # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
         # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
-        # kwargs); if set, build the Instance-backed adapter and return early.
+        # kwargs); if set, the loop below restores where it would build.
         semi_p = bool(engine_kwargs.pop("semi_p", False))
         # Popped unconditionally even though it is no longer a config field: a
         # dss that predates the derived image cache still sends it, and
@@ -851,34 +970,9 @@ class InferenceWorker(StreamingWorkerMixin):
         # same way and for the same reason: AsyncEngineArgs rejects what it
         # does not know, and Ray actor handles are certainly that.
         semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
-        if semi_p:
-            # A restored engine has neither, and serving without them returns
-            # plausible output that is wrong, so refuse before restoring.
-            if lora_adapter_path:
-                raise ValueError(
-                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
-                    "a restored engine serves the base weights it was dumped "
-                    "with. Disable semi_p for this job.")
-            if engine_kwargs.get("enable_return_routed_experts"):
-                raise ValueError(
-                    "semi_p does not capture routed experts, so router replay "
-                    "would get none. Disable semi_p for this job.")
-            from arctic_platform.inference.server.semip_engine import restore_and_wrap
-            self.llm = await asyncio.to_thread(
-                restore_and_wrap, engine_kwargs, semi_p_agents)
-            if not engine_kwargs.get("skip_tokenizer_init"):
-                self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
-                    engine_kwargs["model"], self.llm.get_tokenizer())
-            self.state = WorkerLifecycleState.READY
-            self._maybe_init_reasoning_parser(reasoning_parser_name)
-            logger.info(
-                "Worker %d initialized via semi_p restore: model=%s",
-                os.getpid(), engine_kwargs.get("model"),
-            )
-            return
 
         from arctic_platform.inference.semi_persistence import matched_baseline
-        if matched_baseline.requested():
+        if not semi_p and matched_baseline.requested():
             changed = matched_baseline.apply(engine_kwargs)
             logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
                         matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
@@ -914,6 +1008,7 @@ class InferenceWorker(StreamingWorkerMixin):
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
         for attempt in range(1, max_attempts + 1):
+            startup_error_dir = _begin_engine_startup_capture()
             try:
                 attempt_kwargs = dict(engine_kwargs)
                 engine_args = _create_async_engine_args(
@@ -937,6 +1032,8 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                _validate_mla_lora_targets(vllm_config.model_config, lora_peft_config)
+                _validate_mla_lora_targets(vllm_config.model_config, checkpoint_peft_config)
                 self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
                     vllm_config, chat_reasoning_parser, tool_call_parser
                 )
@@ -944,16 +1041,27 @@ class InferenceWorker(StreamingWorkerMixin):
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
-                self.llm = AsyncLLM.from_vllm_config(
-                    vllm_config,
-                    stat_loggers=[RingStatLogger],
-                )
+                if semi_p:
+                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
+                else:
+                    self.llm = AsyncLLM.from_vllm_config(
+                        vllm_config,
+                        stat_loggers=[RingStatLogger],
+                    )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
-                if attempt >= max_attempts or not _is_address_in_use_error(exc):
-                    if tail := _console_tail():
-                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                # semi_p is not retried here: the restore retries its own
+                # ports, so another attempt would only repeat a whole restore.
+                if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    tail = _console_tail()
+                    startup_exc = _engine_startup_error(exc, startup_error_dir)
+                    target = startup_exc if startup_exc is not None else exc
+                    if len(tail) > 0:
+                        target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                    if startup_exc is not None:
+                        raise startup_exc from exc
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
@@ -965,6 +1073,8 @@ class InferenceWorker(StreamingWorkerMixin):
                     exc_info=True,
                 )
                 await asyncio.sleep(delay_s)
+            finally:
+                _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
@@ -1110,8 +1220,17 @@ class InferenceWorker(StreamingWorkerMixin):
         from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
         import torch
 
-        # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
-        if _ray_blanked_cuda_visible_devices():
+        router_replay_engine_kwargs = router_replay_engine_kwargs or {}
+        self._router_replay_tx_on_host = (
+            router_replay_engine_kwargs.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY, "cuda") == "cpu"
+        )
+        self._router_replay_staging_bytes = router_replay_engine_kwargs.get(
+            _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY
+        )
+        if self._router_replay_tx_on_host:
+            tx_device = torch.device("cpu")
+        elif _ray_blanked_cuda_visible_devices():
+            # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
             tx_device = torch.device("cpu")
             logger.warning(
                 "router-replay TX cache on CPU (CUDA_VISIBLE_DEVICES=%r)",
@@ -1120,7 +1239,7 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             tx_device = torch.device("cuda:0")
         max_bytes = int(
-            (router_replay_engine_kwargs or {}).get(
+            router_replay_engine_kwargs.get(
                 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
                 16 * 1024**3,
             )
@@ -1130,7 +1249,11 @@ class InferenceWorker(StreamingWorkerMixin):
             max_bytes=max_bytes,
         )
         self._replica_label = f"pid={os.getpid()}"
-        logger.info("router-replay TX cache initialized max_bytes=%d", max_bytes)
+        logger.info(
+            "router-replay TX cache initialized max_bytes=%d device=%s",
+            max_bytes,
+            "host" if self._router_replay_tx_on_host else tx_device,
+        )
 
     def _register_router_replay_shm(
         self,
@@ -1323,7 +1446,9 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def is_healthy(self) -> bool:
         return self.llm is not None and self.state in (
-            WorkerLifecycleState.READY, WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.WEIGHTS_READY,
         )
 
     def get_state(self) -> str:
@@ -1346,7 +1471,7 @@ class InferenceWorker(StreamingWorkerMixin):
         }
 
     def drain_metrics(self) -> dict[str, Any]:
-        """Return and clear the buffered per-step replica snapshots."""
+        """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
             action_mask_replay_cache_stats,
         )
@@ -1354,6 +1479,8 @@ class InferenceWorker(StreamingWorkerMixin):
         return {
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
+            "engine_totals": get_collector().totals(),
+            "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
@@ -1400,7 +1527,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 f"is_available={torch.cuda.is_available()})"
             )
         tx_device = torch.device("cuda:0")
-        if self._router_replay_tx.device != tx_device:
+        if not self._router_replay_tx_on_host and self._router_replay_tx.device != tx_device:
             max_bytes = self._router_replay_tx.max_bytes
             self._router_replay_tx = RouterReplayCacheTX(
                 device=tx_device,
@@ -1418,6 +1545,7 @@ class InferenceWorker(StreamingWorkerMixin):
             master_port=master_port,
             device=tx_device,
             is_server=is_server,
+            staging_bytes=self._router_replay_staging_bytes,
         )
         return {"status": "ok", "rank": rank, "world_size": world_size}
 
@@ -1455,7 +1583,10 @@ class InferenceWorker(StreamingWorkerMixin):
         Args:
             level: 1 = free KV cache only, 2 = free KV cache + weights.
         """
-        if self.state != WorkerLifecycleState.READY:
+        if self.state not in (
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.WEIGHTS_READY,
+        ):
             raise RuntimeError(f"Cannot sleep: worker state is {self.state.value}")
         await self.llm.collective_rpc("sleep", kwargs={"level": level})
         self.state = WorkerLifecycleState.SLEEPING
@@ -1465,21 +1596,66 @@ class InferenceWorker(StreamingWorkerMixin):
     async def wake_up(self, tags: list[str] | None = None) -> dict[str, Any]:
         """Restore GPU memory (reverse of :meth:`sleep`).
 
+        A colocated sync calls this twice: ``tags=["weights"]`` leaves the
+        worker in ``weights_ready`` with the KV cache still discarded, then
+        ``tags=["kv_cache"]`` allocates the cache and returns to ``ready``.
+        Treating the first call as a full wake drops the second one, and the
+        next generate reads the freed KV cache.
+
         Args:
-            tags: What to restore, e.g. ``["weights"]`` or
-                  ``["weights", "kv_cache"]``.  ``None`` restores everything.
+            tags: What to restore, e.g. ``["weights"]`` or ``["kv_cache"]``.
+                ``None`` or both tags restores everything.
         """
+        if self.state == WorkerLifecycleState.READY:
+            return {"status": "already_ready"}
+
+        if self.state == WorkerLifecycleState.WEIGHTS_READY:
+            if _is_weights_only_wake(tags):
+                return {"status": "already_weights_ready"}
+            if not (_is_kv_only_wake(tags) or _is_full_wake(tags)):
+                raise RuntimeError(
+                    f"Cannot wake up from weights_ready with tags={tags!r}; "
+                    "use tags=['kv_cache'] or a full wake"
+                )
+            return await self._wake_collective(
+                tags=["kv_cache"],
+                target_state=WorkerLifecycleState.READY,
+            )
+
         if self.state != WorkerLifecycleState.SLEEPING:
-            if self.state == WorkerLifecycleState.READY:
-                return {"status": "already_ready"}
             raise RuntimeError(f"Cannot wake up: worker state is {self.state.value}")
+
+        if _is_kv_only_wake(tags):
+            raise RuntimeError(
+                "Cannot wake kv_cache only from sleeping; wake weights first "
+                "(tags=['weights'])"
+            )
+
+        target = (
+            WorkerLifecycleState.READY
+            if _is_full_wake(tags)
+            else WorkerLifecycleState.WEIGHTS_READY
+        )
+        return await self._wake_collective(tags=tags, target_state=target)
+
+    async def _wake_collective(
+        self,
+        tags: list[str] | None,
+        target_state: WorkerLifecycleState,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         if tags is not None:
             kwargs["tags"] = tags
         await self.llm.collective_rpc("wake_up", kwargs=kwargs)
-        self.state = WorkerLifecycleState.READY
-        logger.info("Worker %d awake", os.getpid())
-        return {"status": "ready"}
+        self.state = target_state
+        logger.info(
+            "Worker %d awake (tags=%s, state=%s)",
+            os.getpid(),
+            tags,
+            self.state.value,
+        )
+        status = "ready" if target_state == WorkerLifecycleState.READY else "weights_ready"
+        return {"status": status}
 
     # ------------------------------------------------------------------
     # Weight sync
@@ -1563,7 +1739,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, direct_mode, reverse),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     @stream_lifecycle_change
     async def sync_weights_broadcast(
@@ -1663,6 +1839,75 @@ class InferenceWorker(StreamingWorkerMixin):
                   bucket_size, engine_only, reverse),
         )
         return results[0] if results else {}
+
+    async def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict[str, Any]:
+        """Load weights from CUDA IPC handles (zero-copy, same GPU)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc", args=(ipc_payload,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_cuda_ipc_chunk(
+        self, ipc_payload: dict, validate_names=None,
+    ) -> dict[str, Any]:
+        """Stream a single CUDA IPC param chunk (low-memory weight sync)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc_chunk",
+            args=(ipc_payload, validate_names),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_from_shm_path(self, path: str) -> dict[str, Any]:
+        """Load weights from a shared-memory file path."""
+        results = await self.llm.collective_rpc(
+            "load_weights_from_shm_path", args=(path,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def compute_weight_norm(self) -> dict[str, Any]:
+        """Global L2 norm of the engine's live weights, summed across TP ranks.
+
+        Tensor parallelism and a quantized engine return an error result with
+        ``disable`` set, rather than a norm. Adding the ranks up is only a whole
+        model when every tensor is sharded, and a tensor each rank keeps whole (an
+        ``RMSNorm`` weight, a ``ReplicatedLinear`` weight, a row-parallel bias) would
+        land in the total once per rank. A sleeping sampler has those weights unmapped;
+        reading them is a CUDA fault that kills the engine, so that state returns an
+        error and does not set ``disable`` (sleep is temporary). This is a debug
+        check: the weight sync's own ``checksum_match`` shows the sampler received
+        the trainer's weights, at any TP size.
+        """
+        if self.state not in (WorkerLifecycleState.READY, WorkerLifecycleState.WEIGHTS_READY):
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": f"weight norm is not read while the sampler is {self.state.value}",
+            }
+        results = await self.llm.collective_rpc("compute_weight_norm")
+        for result in results:
+            if result.get("error_code"):
+                unavailable = {
+                    "error_code": "weight_norm_unavailable",
+                    "error": result.get("error", result["error_code"]),
+                }
+                if result.get("disable"):
+                    unavailable["disable"] = True
+                return unavailable
+        tp_size = max((r.get("tp_size", 1) for r in results), default=1)
+        if tp_size > 1:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                    f"engine runs tensor_parallel_size={tp_size}. Replicated tensors would be "
+                    "counted once per rank, so the norm would not be comparable to the "
+                    "training engine's. The weight sync result's checksum_match verifies "
+                    "the sync at any tensor_parallel_size."
+                ),
+                "disable": True,
+            }
+        sq_sum = sum(r["sq_sum"] for r in results)
+        num_params = sum(r["num_params"] for r in results)
+        return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
     async def close_weight_sync(self) -> dict[str, Any]:
         """Destroy persistent NCCLEngine on all TP workers."""

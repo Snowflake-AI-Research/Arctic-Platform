@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import glob
+import json
+import logging
 import os
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -32,6 +35,8 @@ WeightIterator = Iterator[tuple[str, torch.Tensor]]
 WeightIteratorBuilder = Callable[[nn.Module], Callable[..., WeightIterator]]
 
 PEFT_ADAPTER_DIRNAME = "default"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,9 +68,12 @@ def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> boo
     if weight_format == "lora":
         return is_peft_model(model)
     contract = weight_export_contract(model)
-    if contract is not None and getattr(contract, weight_format) is not None:
-        return True
-    return weight_format == "hf" and not _has_ep_sharded_parameters(model)
+    if contract is not None:
+        if getattr(contract, weight_format) is not None:
+            return True
+        if weight_format == "vllm":
+            return False
+    return not _has_ep_sharded_parameters(model)
 
 
 def strip_activation_checkpoint_segments(name: str) -> str:
@@ -92,6 +100,138 @@ def hf_export_parameter_name(name: str) -> str | None:
     if name.startswith("base_model.model."):
         name = name[len("base_model.model.") :]
     return name
+
+
+def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
+    """Map exported parameter names onto the names ``save_pretrained`` writes.
+
+    Transformers renames checkpoint keys on load (for example, Transformers 5
+    drops Siglip's ``vision_model`` segment). Weight sync streams live
+    parameters, so it must apply the same reverse renames that saving does.
+    Only names that change are returned. Names consumed by a tensor converter
+    are left alone because they do not map one-to-one.
+    """
+    from transformers import PreTrainedModel
+    from transformers.core_model_loading import PrefixChange
+    from transformers.core_model_loading import WeightConverter
+    from transformers.core_model_loading import WeightRenaming
+    from transformers.core_model_loading import rename_source_key
+
+    base = pretrained_module_for_hf_save(model)
+    if not isinstance(base, PreTrainedModel):
+        return {}
+    conversions = getattr(base, "_weight_conversions", None)
+    if conversions is None:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+
+        # Without load-time history Transformers cannot tell whether a removed
+        # prefix existed, so ``save_pretrained`` drops prefix changes too.
+        conversions = [
+            conversion
+            for conversion in get_model_conversion_mapping(base, add_legacy=False)
+            if not isinstance(conversion, PrefixChange)
+        ]
+    if not conversions:
+        return {}
+
+    reverse = [conversion.reverse_transform() for conversion in conversions[::-1]]
+    renamings = [transform for transform in reverse if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in reverse if isinstance(transform, WeightConverter)]
+    names: dict[str, str] = {}
+    for name, _ in model.named_parameters():
+        export_name = hf_export_parameter_name(name)
+        if export_name is None:
+            continue
+        checkpoint_name, converter_pattern = rename_source_key(export_name, renamings, converters, reverse=True)
+        if converter_pattern is None and checkpoint_name != export_name:
+            names[export_name] = checkpoint_name
+    return names
+
+
+def read_checkpoint_weight_names(checkpoint_dir: str) -> set[str]:
+    """Tensor names in an HF checkpoint directory, or empty if unreadable.
+
+    Only the index or safetensors headers are read.
+    """
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(checkpoint_dir, index_name)
+        if os.path.exists(index_path):
+            try:
+                with open(index_path) as handle:
+                    return set(json.load(handle)["weight_map"])
+            except (OSError, ValueError, KeyError):
+                return set()
+
+    shards = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+    if not shards:
+        return set()
+    try:
+        from safetensors import safe_open
+
+        names: set[str] = set()
+        for shard in shards:
+            with safe_open(shard, framework="pt") as handle:
+                names.update(handle.keys())
+        return names
+    except Exception:  # noqa: BLE001 - best-effort probe
+        return set()
+
+
+_HF_SYNC_NAME_MAPS: WeakKeyDictionary[nn.Module, tuple[str | None, dict[str, str]]] = WeakKeyDictionary()
+
+
+def hf_sync_name_map(model: nn.Module, checkpoint_dir: str | None = None) -> dict[str, str]:
+    """Renames that put generic ``weight_format="hf"`` names in the checkpoint's layout.
+
+    Starts from :func:`hf_checkpoint_name_map`. With ``checkpoint_dir``, a rename
+    is kept only if the checkpoint has the target name, and a partial translation
+    raises: the hf receiver drops unmatched names silently. Cached per model.
+    """
+    cached = _HF_SYNC_NAME_MAPS.get(model)
+    if cached is not None and cached[0] == checkpoint_dir:
+        return cached[1]
+
+    names = hf_checkpoint_name_map(model)
+    saved = read_checkpoint_weight_names(checkpoint_dir) if checkpoint_dir else set()
+    if saved:
+        renames: dict[str, str] = {}
+        unmapped: list[str] = []
+        for name, _ in model.named_parameters():
+            export_name = hf_export_parameter_name(name)
+            if export_name is None:
+                continue
+            target = names.get(export_name, export_name)
+            if target in saved:
+                if target != export_name:
+                    renames[export_name] = target
+            # Tied-embedding checkpoints omit lm_head.
+            elif export_name not in saved and export_name != "lm_head.weight":
+                unmapped.append(export_name)
+        if renames and unmapped:
+            raise RuntimeError(
+                f"weight_format='hf' name translation is incomplete: {len(renames)} parameter(s) map onto "
+                f"{checkpoint_dir} but {len(unmapped)} do not (e.g. {', '.join(unmapped[:10])}). Was the model "
+                "loaded with from_pretrained?"
+            )
+        names = renames
+    if names:
+        logger.info(
+            "weight sync: translating %d parameter name(s) into the HF checkpoint layout (e.g. %s -> %s)",
+            len(names),
+            *next(iter(names.items())),
+        )
+    _HF_SYNC_NAME_MAPS[model] = (checkpoint_dir, names)
+    return names
+
+
+def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None) -> bool:
+    """Whether direct vLLM copy would drop tensors, so sync must use ``weight_format="hf"``."""
+    if getattr(model, "_requires_hf_weight_sync", False):
+        return True
+    contract = weight_export_contract(model)
+    if contract is not None and contract.vllm is not None:
+        return False
+    return bool(hf_sync_name_map(model, checkpoint_dir))
 
 
 def is_peft_model(model: Any) -> bool:
@@ -166,14 +306,26 @@ def _expert_parallel_group(parameter: Any):
     return ds_groups._get_expert_parallel_group(parameter.group_name)
 
 
-def _gather_ep_parameter(parameter: Any, *, dim: int) -> torch.Tensor:
+def _gather_ep_shards(parameter: Any) -> list[torch.Tensor]:
     import torch.distributed as dist
 
     group = _expert_parallel_group(parameter)
     local = parameter.data.contiguous()
     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
     dist.all_gather(shards, local, group=group)
-    return torch.cat(shards, dim=dim)
+    return shards
+
+
+def _gather_ep_expert_lora(parameter: Any, *, kind: str, rank: int) -> torch.Tensor:
+    """Gather an EP-sharded expert LoRA factor in PEFT's global ``ParamWrapper`` layout.
+
+    ``lora_A`` is ``[experts * r, in]`` (expert-major), so the rank shards stack. ``lora_B`` is ``[out, r * experts]``
+    with the expert index fastest, so each rank's experts interleave into the global tensor.
+    """
+    shards = _gather_ep_shards(parameter)
+    if kind == "A":
+        return torch.cat(shards, dim=0)
+    return torch.cat([shard.view(shard.shape[0], rank, -1) for shard in shards], dim=2).flatten(1)
 
 
 def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
@@ -208,8 +360,8 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
 
             if not dist.is_initialized():
                 raise RuntimeError(f"EP-sharded LoRA parameter {name!r} needs a process group")
-            gather_dim = 1 if "lora_B" in export_name.split(".") else 0
-            gathered = _gather_ep_parameter(parameter, dim=gather_dim)
+            kind = "B" if "lora_B" in export_name.split(".") else "A"
+            gathered = _gather_ep_expert_lora(parameter, kind=kind, rank=_peft_adapter_rank(model, name))
             if rank == 0:
                 output[export_name] = gathered.detach().cpu().contiguous()
         elif rank == 0:
@@ -217,19 +369,54 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
     return output
 
 
+def peft_adapter_checkpoint_state_dict(
+    model: nn.Module, state: dict[str, torch.Tensor], adapter_name: str
+) -> dict[str, torch.Tensor]:
+    """Return ``adapter_name``'s entries of a gathered adapter state under PEFT's checkpoint keys.
+
+    PEFT selects adapter entries by the live module names, which keep the activation-checkpoint wrapper segments that
+    the gathered names drop. The selection therefore runs on the live names, and the segments are stripped after it.
+    """
+    from peft.utils import get_peft_model_state_dict
+
+    live_names = {strip_activation_checkpoint_segments(name): name for name, _ in model.named_parameters()}
+    selected = get_peft_model_state_dict(
+        model,
+        state_dict={live_names.get(name, name): tensor for name, tensor in state.items()},
+        adapter_name=adapter_name,
+        save_embedding_layers=False,
+    )
+    return {strip_activation_checkpoint_segments(name): tensor for name, tensor in selected.items()}
+
+
 def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool = False) -> None:
-    """Collectively write a PEFT adapter pack under ``checkpoint_dir/default``."""
+    """Collectively write a PEFT adapter pack under ``checkpoint_dir/default``.
+
+    The layout is ``PeftModel.save_pretrained``'s: the ``default`` adapter in that directory, any other adapter in a
+    subdirectory named after it.
+    """
     if not is_peft_model(model):
         return
+    import copy
+
     import torch.distributed as dist
+    from safetensors.torch import save_file
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3)
     if rank != 0:
         return
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
-    os.makedirs(adapter_dir, exist_ok=True)
-    model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True)
+    for adapter_name, peft_config in model.peft_config.items():
+        tensors = peft_adapter_checkpoint_state_dict(model, state, adapter_name)
+        if state and not tensors:
+            raise RuntimeError(f"none of the {len(state)} gathered adapter tensors belong to adapter {adapter_name!r}")
+        output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
+        os.makedirs(output_dir, exist_ok=True)
+        save_file(tensors, os.path.join(output_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
+        peft_config = copy.deepcopy(peft_config)
+        peft_config.inference_mode = True
+        peft_config.save_pretrained(output_dir)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -311,13 +498,23 @@ def _expert_lora_vllm_key(experts_prefix: str, weight_name: str, kind: str) -> s
     return f"{experts_prefix}.{weight_name}.lora_{kind}.weight"
 
 
-def _peft_adapter_rank(model: nn.Module) -> int:
+def _peft_adapter_rank(model: nn.Module, parameter_name: str | None = None) -> int:
+    """``r`` of the adapter that owns ``parameter_name``, or of the only adapter when the name is omitted."""
     peft_config = getattr(model, "peft_config", None)
     if isinstance(peft_config, dict) and peft_config:
-        rank = getattr(next(iter(peft_config.values())), "r", None)
-        if rank is not None and int(rank) > 0:
-            return int(rank)
-    raise RuntimeError("LoRA export requires model.peft_config[*].r")
+        if parameter_name is not None:
+            parts = parameter_name.split(".")
+            for index, part in enumerate(parts[:-1]):
+                adapter_name = parts[index + 1]
+                if part in ("lora_A", "lora_B") and adapter_name in peft_config:
+                    rank = getattr(peft_config[adapter_name], "r", None)
+                    if rank is not None and int(rank) > 0:
+                        return int(rank)
+        if len(peft_config) == 1 or parameter_name is None:
+            rank = getattr(next(iter(peft_config.values())), "r", None)
+            if rank is not None and int(rank) > 0:
+                return int(rank)
+    raise RuntimeError(f"LoRA export requires model.peft_config[*].r for {parameter_name or 'the adapter'}")
 
 
 def _iter_param_wrapper_expert_loras(model: nn.Module):
@@ -335,10 +532,14 @@ def _iter_param_wrapper_expert_loras(model: nn.Module):
         if not (experts_prefix.endswith(".experts") or experts_prefix == "experts"):
             continue
         for kind, bucket in (("A", module.lora_A), ("B", module.lora_B)):
-            if bucket:
-                weight = getattr(bucket[next(iter(bucket))], "weight", None)
-                if weight is not None:
-                    yield experts_prefix, weight_name, kind, weight
+            if not bucket:
+                continue
+            for adapter_name, layer in bucket.items():
+                weight = getattr(layer, "weight", None)
+                if weight is None:
+                    continue
+                rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
+                yield experts_prefix, weight_name, kind, weight, rank
 
 
 def iter_lora_weights(
@@ -356,13 +557,15 @@ def iter_lora_weights(
 
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
-    lora_rank = _peft_adapter_rank(model)
+    # Families whose module tree differs from the served checkpoint rename adapter tensors here.
+    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
     expert_parameter_ids: set[int] = set()
     for (
         experts_prefix,
         weight_name,
         kind,
         parameter,
+        lora_rank,
     ) in _iter_param_wrapper_expert_loras(model):
         expert_parameter_ids.add(id(parameter))
         prefix = strip_activation_checkpoint_segments(experts_prefix).replace(".base_layer", "")
@@ -377,16 +580,16 @@ def iter_lora_weights(
             dist.all_gather(shards, local, group=group)
             if is_master:
                 yield (
-                    _expert_lora_vllm_key(prefix, weight_name, kind),
+                    rename(_expert_lora_vllm_key(prefix, weight_name, kind)),
                     torch.cat(shards, dim=0).contiguous(),
                 )
         elif is_master:
-            yield _expert_lora_vllm_key(prefix, weight_name, kind), local
+            yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
     for name, parameter in model.named_parameters():
         if not is_peft_lora_param(name, parameter) or id(parameter) in expert_parameter_ids:
             continue
-        export_name = _peft_lora_parameter_to_vllm_name(name)
+        export_name = rename(_peft_lora_parameter_to_vllm_name(name))
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
@@ -400,6 +603,38 @@ def iter_lora_weights(
             yield export_name, parameter.data
 
 
+def _iter_generic_weights(
+    model: nn.Module,
+    weight_format: WeightFormat,
+    *,
+    is_master: bool,
+    is_zero3: bool,
+    checkpoint_dir: str | None,
+) -> WeightIterator:
+    if _has_ep_sharded_parameters(model):
+        raise RuntimeError("EP-sharded models require an AP weight-export contract")
+    names = hf_sync_name_map(model, checkpoint_dir) if weight_format == "hf" else {}
+    for name, parameter in model.named_parameters():
+        if weight_format == "hf":
+            export_name = hf_export_parameter_name(name)
+            if export_name is None:
+                continue
+            export_name = names.get(export_name, export_name)
+        else:
+            export_name = strip_activation_checkpoint_segments(name)
+
+        if is_zero3 and hasattr(parameter, "ds_id"):
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters(parameter):
+                tensor = parameter.data.clone() if is_master else None
+        else:
+            tensor = parameter.data
+        if is_master:
+            assert tensor is not None
+            yield export_name, tensor
+
+
 def iter_model_weights(
     model: nn.Module,
     weight_format: WeightFormat,
@@ -407,8 +642,16 @@ def iter_model_weights(
     is_master: bool,
     is_zero3: bool,
     include_skipped: bool = False,
+    checkpoint_dir: str | None = None,
 ) -> WeightIterator:
-    """Yield model weights through the AP-owned export contract."""
+    """Yield model weights on ``is_master``; every rank must iterate in lockstep for the gathers.
+
+    Models without a family contract stream ``named_parameters()``: unchanged for
+    ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
+    :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+    """
+    if weight_format not in ("hf", "vllm", "lora"):
+        raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
     if weight_format == "lora":
@@ -424,14 +667,12 @@ def iter_model_weights(
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
         return
 
-    if weight_format == "vllm":
+    if weight_format == "vllm" and contract is not None:
         raise ValueError("this model does not provide direct vLLM weight export")
-    if _has_ep_sharded_parameters(model):
-        raise RuntimeError("EP-sharded models require an AP HF weight-export contract")
-    if is_zero3:
-        raise NotImplementedError("generic HF weight export does not support ZeRO-3")
-    if is_master:
-        for name, parameter in model.named_parameters():
-            export_name = hf_export_parameter_name(name)
-            if export_name is not None:
-                yield export_name, parameter.data
+    yield from _iter_generic_weights(
+        model,
+        weight_format,
+        is_master=is_master,
+        is_zero3=is_zero3,
+        checkpoint_dir=checkpoint_dir,
+    )

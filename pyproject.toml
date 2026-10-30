@@ -15,6 +15,8 @@ include = [
   "arctic_platform/integrations/verl/config/**/*.yaml",
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
+  "arctic_platform/integrations/prime_rl/examples/**/*.toml",
+  "arctic_platform/integrations/prime_rl/README.md",
 ]
 # Kept beside the inference package and left out of the wheel. Trailing
 # slashes make hatchling skip the directories. csrc/, setup.py, and
@@ -36,6 +38,13 @@ path = "hatch_build.py"
 [tool.hatch.build.targets.sdist.force-include]
 "hatch_build.py" = "hatch_build.py"
 
+# Install the prime-rl grading-policy startup hook at the venv root: the .pth runs at every
+# interpreter startup (orchestrator + each spawned EnvWorker) and applies the verifiers
+# monkey-patch, so the policy reaches the subprocess rollout/scoring code without a verifiers fork.
+[tool.hatch.build.targets.wheel.force-include]
+"arctic_platform/integrations/prime_rl/_grading_startup.py" = "arctic_prime_rl_grading_startup.py"
+"arctic_platform/integrations/prime_rl/zz_arctic_prime_rl_grading.pth" = "zz_arctic_prime_rl_grading.pth"
+
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
 Repository = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
@@ -43,7 +52,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.1.5rc9"
+version = "0.1.5rc22"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
@@ -87,6 +96,9 @@ all = [
     "arctic_platform[onprem]",
     "arctic_platform[tinker]",
     "arctic_platform[verl]",
+    "arctic_platform[prime-rl]",
+    "arctic_platform[sonicmoe]",
+    "arctic_platform[harbor]",
 ]
 
 dev = [
@@ -96,11 +108,15 @@ dev = [
 
 # Pulls [tinker], itself a superset of [cortex], so the transport tests can
 # import the client and the Tinker tests can import the SDK. Not [onprem]:
-# it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
+# it reaches [rl] -> [inference] -> vllm, and vLLM's build needs CUDA_HOME,
 # which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
+    "arctic_platform[harbor]",
     "arctic_platform[tinker]",
     "httpx",
+    # The Harbor recipe's agent tests. The recipe itself pins a git revision.
+    "openhands-sdk==1.7.1",
+    "openhands-tools==1.7.1",
     "parameterized",
     "pytest-asyncio",
     "pytest-instafail",
@@ -121,6 +137,13 @@ formatting = [
 gdn = [
     "flash-linear-attention",
     "causal-conv1d",
+]
+
+# BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults off; turning it on needs this extra.
+# The floor is the one Dao-AILab/sonic-moe declares. quack-kernels depends on nvidia-cutlass-dsl (the cutlass module);
+# nvidia-cutlass-dsl-libs-base depends on cuda-bindings, which provides cuda.bindings.
+sonicmoe = [
+    "quack-kernels>=0.4.0",
 ]
 
 # The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
@@ -146,8 +169,10 @@ tinker = [
 # excludes the sampling stack: the server imports arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
-    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "liger-kernel>=0.8.0",
+    # [rl], [onprem] and [verl] include [sft], so a training install gets SonicMoE with the rest of the stack.
+    "arctic_platform[sonicmoe]",
+    "deepspeed>=0.19.8",  # fix fp32 compute issue #8749
+    "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",
     "nvidia-ml-py",
     # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.
@@ -171,16 +196,13 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.31.0",
-    "xgrammar==0.2.7",
+    "vllm==0.32.0",
+    "xgrammar==0.2.8",
 ]
 
-# [sft] plus the published sampling package. On-prem still imports
-# arctic_inference; that package's Ray path is not the in-tree one.
-# arctic-inference[vllm] pulls vLLM. [rl] does not declare vLLM itself.
+# [sft] plus the in-tree Arctic Inference sampler. That extra pins vLLM.
 rl = [
-    "arctic_platform[sft]",
-    "arctic-inference[server,vllm]>=0.3.0",
+    "arctic_platform[sft,inference]",
 ]
 
 onprem = [
@@ -194,6 +216,30 @@ verl = [
     "arctic_platform[rl]",
     "codetiming",
     "omegaconf",
+]
+
+# prime-rl launcher (arctic_platform/integrations/prime_rl). prime-rl itself and its
+# verifiers runtime are user-supplied and version-pinned in launchers (see that package's
+# README); here we only carry the Cortex client stack plus the few libraries the launcher
+# and worker need beyond [cortex]. The worker trains on Cortex, so no local vLLM/DeepSpeed.
+prime-rl = [
+    "arctic_platform[cortex]",
+    "httpx",
+    "huggingface-hub",
+    "orjson",
+]
+
+# Harbor RL integration (arctic_platform/integrations/harbor) and its bundled
+# Snowflake Cortex Sandboxes environment. harbor 0.25.0 is the newest release
+# with the environment APIs snowflake_sandbox uses. OpenHands is pinned by git
+# revision in recipes/rl/harbor/run_qwen35_4b.sh: package metadata can't carry
+# git URLs.
+harbor = [
+    "certifi",
+    "dockerfile-parse>=2.0.1",
+    "harbor==0.25.0",
+    "pathspec>=1.0.3",
+    "snowflake-sandbox-python==0.2.2a5",
 ]
 
 [tool.pytest.ini_options]

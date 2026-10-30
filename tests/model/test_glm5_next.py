@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -23,6 +24,10 @@ from arctic_platform.model import ParallelismConfig
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_layer_to_prime
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
 from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 def _checkpoint(tmp_path, model_type: str) -> str:
@@ -399,6 +404,77 @@ def test_glm53_defaults_to_sparse_mla_and_allows_context_parallelism(tmp_path):
     assert spec.attn_implementation == "sparse_mla"
 
 
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_spec_accepts_sparse_backend_selection(tmp_path, backend):
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "glm5_next"),
+        attn_implementation=backend,
+    )
+    assert spec.attn_implementation == backend
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_loader_preserves_backend_and_constructs_hf_eager_attention(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+    config = integration._build_model_config("unused", 1, 1, "bfloat16", backend, Qwen3_5MoeOptions())
+    assert config.attn == backend
+    get_model = Mock(return_value=torch.nn.Module())
+    monkeypatch.setattr(integration.qwen_ds, "_generic_adapter", lambda: types.SimpleNamespace(get_model=get_model))
+    model = integration._get_model(config, torch.device("meta"), torch.bfloat16)
+    assert model is get_model.return_value
+    assert get_model.call_args.args[0].attn == "eager"
+    assert config.attn == backend
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_deepspeed_adapter_forwards_backend_at_sp1(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+
+    apply_cp = Mock()
+    monkeypatch.setattr(integration, "apply_context_parallelism", apply_cp)
+    model = torch.nn.Module()
+    integration._adapter(backend).apply_sequence_parallelism(model, 1, None)
+    apply_cp.assert_called_once_with(model, 1, None, attn_implementation=backend)
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_deepspeed_loader_uses_model_config_backend(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+    config = integration._build_model_config("unused", 1, 1, "bfloat16", backend, Qwen3_5MoeOptions())
+    model = torch.nn.Module()
+    apply_cp = Mock()
+    monkeypatch.setattr(integration, "apply_context_parallelism", apply_cp)
+
+    def load(adapter, *_args, **kwargs):
+        adapter.apply_sequence_parallelism(model, kwargs["sp_size"], kwargs["sp_group"])
+        return model
+
+    monkeypatch.setattr(integration.qwen_ds, "_load_moe_model_for_deepspeed", load)
+    assert integration.load_glm5_next_model_for_deepspeed(config, None, None, "unused") is model
+    apply_cp.assert_called_once_with(model, 1, None, attn_implementation=backend)
+
+
+def _assert_sparse_mla_gradient_close(actual, expected, dtype, *, is_kv):
+    # FP16 KV scatter sums 4 queries x 64 heads; H200 cancellation residuals reached 2.4e-4.
+    # Keep query/BF16 checks strict and bound only FP16 KV's absolute floor to 3e-4.
+    atol = 3e-4 if dtype == torch.float16 and is_kv else 1e-6
+    torch_assert_close(actual, expected.to(dtype), atol=atol, rtol=torch.finfo(dtype).eps)
+
+
+@pytest.mark.parametrize("dtype,is_kv", [(torch.float16, True), (torch.float16, False), (torch.bfloat16, True)])
+def test_sparse_mla_gradient_tolerance_is_bounded(dtype, is_kv):
+    expected = torch.zeros(2, dtype=dtype)
+    allowed = 2.4e-4 if dtype == torch.float16 and is_kv else 5e-7
+    _assert_sparse_mla_gradient_close(expected + allowed, expected, dtype, is_kv=is_kv)
+    rejected = 5e-4 if dtype == torch.float16 and is_kv else 2e-6
+    with pytest.raises(AssertionError):
+        _assert_sparse_mla_gradient_close(expected + rejected, expected, dtype, is_kv=is_kv)
+
+
 def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
     from arctic_platform.model.implementations.glm53.context_parallel import _reference_sparse_mla
 
@@ -419,6 +495,83 @@ def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
     assert output.shape == (1, 2, 2, 3)
     assert query.grad is not None
     assert key_value.grad is not None
+
+
+def test_glm53_sparse_reference_tiles_match_dense():
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    torch.manual_seed(0)
+    query = torch.randn(1, 5, 2, 4, requires_grad=True)
+    key_value = torch.randn(1, 7, 1, 4, requires_grad=True)
+    indices = torch.tensor(
+        [[[0, 2, -1, 6], [1, 3, 4, -1], [0, 1, 2, 3], [-1, -1, -1, -1], [5, 5, 0, 2]]],
+        dtype=torch.int32,
+    )
+    scale = 0.5
+    value_dim = 3
+
+    dense = cp._reference_sparse_mla_math(query, key_value, indices, scale, value_dim)
+    dense.square().sum().backward()
+    query_grad = query.grad.detach().clone()
+    key_grad = key_value.grad.detach().clone()
+    query.grad = None
+    key_value.grad = None
+
+    previous = cp._REFERENCE_SPARSE_MLA_TILE_BYTES
+    cp._REFERENCE_SPARSE_MLA_TILE_BYTES = 64
+    try:
+        output = cp._reference_sparse_mla(
+            query,
+            key_value,
+            indices,
+            scale=scale,
+            value_dim=value_dim,
+        )
+        output.square().sum().backward()
+    finally:
+        cp._REFERENCE_SPARSE_MLA_TILE_BYTES = previous
+
+    torch.testing.assert_close(output, dense)
+    torch.testing.assert_close(query.grad, query_grad)
+    torch.testing.assert_close(key_value.grad, key_grad)
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_glm53_flashinfer_sparse_mla_matches_reference(monkeypatch, dtype):
+    pytest.importorskip("flashinfer")
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    set_seed(0)
+    device = "cuda"
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FlashInfer FA3 MLA requires Hopper")
+    query = (torch.randn(1, 4, 64, 512, device=device, dtype=dtype) * 0.05).requires_grad_()
+    key_value = (torch.randn(1, 33, 1, 512, device=device, dtype=dtype) * 0.05).requires_grad_()
+    indices = torch.randint(0, 32, (1, 4, 16), device=device, dtype=torch.int32)
+    indices[:, :, -3:] = -1
+    indices[0, 0, :] = -1
+    scale = 512**-0.5
+
+    assert cp._use_flashinfer(query, key_value)
+    reference_query = query.detach().float().requires_grad_()
+    reference_kv = key_value.detach().float().requires_grad_()
+    dense = cp._reference_sparse_mla_math(reference_query, reference_kv, indices, scale, 512).to(dtype)
+    output = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
+    monkeypatch.setattr(cp, "_FLASHINFER_MAX_REQUESTS", 2)
+    monkeypatch.setattr(cp, "_REFERENCE_SPARSE_MLA_TILE_BYTES", 16 * 512 * 4)
+    chunked = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
+    # Permit one dtype rounding unit per element and a fixed CUDA-cancellation floor.
+    for actual in (output, chunked):
+        torch_assert_close(actual, dense, atol=1e-4, rtol=torch.finfo(dtype).eps)
+        torch_assert_equal(actual[:, 0], torch.zeros_like(actual[:, 0]))
+    gradient = torch.randn_like(dense)
+    expected_grads = torch.autograd.grad(dense, (reference_query, reference_kv), gradient)
+    for actual in (output, chunked):
+        actual_grads = torch.autograd.grad(actual, (query, key_value), gradient)
+        for index, (actual_grad, expected_grad) in enumerate(zip(actual_grads, expected_grads, strict=True)):
+            assert torch.isfinite(actual_grad).all()
+            _assert_sparse_mla_gradient_close(actual_grad, expected_grad, dtype, is_kv=index == 1)
 
 
 def test_glm53_sparse_indices_are_padded_for_flashmla():
@@ -453,3 +606,119 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     assert sparse_attention.q_a_proj.weight.grad is not None
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
     assert sparse_attention.indexer.wq_b.weight.grad is None
+
+
+def test_glm53_sparse_mla_applies_kv_b_proj_lora():
+    """The absorbed sparse path must see a kv_b_proj LoRA exactly as if it were merged into the weight."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    set_seed(0)
+    config = _tiny_config()
+    config.use_cache = False
+    config.text_config.use_cache = False
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    apply_context_parallelism(model, cp_size=1, cp_group=None)
+    model = get_peft_model(model, LoraConfig(r=2, lora_alpha=2, target_modules=["kv_b_proj"]))
+    sparse_attention = model.base_model.model.model.language_model.layers[-1].self_attn
+    kv_b_proj = sparse_attention.kv_b_proj
+    torch.nn.init.normal_(kv_b_proj.lora_B["default"].weight)
+    hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    output, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    output.square().sum().backward()
+    assert kv_b_proj.lora_A["default"].weight.grad.abs().sum() > 0
+    assert kv_b_proj.lora_B["default"].weight.grad.abs().sum() > 0
+
+    with torch.no_grad():
+        kv_b_proj.base_layer.weight.add_(kv_b_proj.get_delta_weight("default"))
+        kv_b_proj.lora_B["default"].weight.zero_()
+        merged, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    torch_assert_close(output.detach(), merged)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")
+def test_glm53_fused_indexer_selects_the_general_paths_keys():
+    """One packed row takes the fused path; a batch of two identical rows takes the general path."""
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextIndexer
+
+    from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
+
+    config = _tiny_config().text_config
+    config.hidden_size, config.q_lora_rank = 64, 32
+    config.index_n_heads, config.index_head_dim, config.index_topk, config.index_kpool = 4, 128, 64, 4
+    config.index_kpool_always_select_tail = True
+    torch.manual_seed(0)
+    indexer = Glm5NextTextIndexer(config, layer_idx=3)
+    with torch.no_grad():
+        indexer.index_kpool_compress_ape.normal_()
+        indexer.index_kpool_compress_gate.normal_(std=0.1)
+    indexer = indexer.bfloat16().cuda()
+    length = 1030  # two packed documents; the second ends inside a pool
+    hidden = torch.randn(1, length, config.hidden_size, device="cuda").bfloat16()
+    q_resid = torch.randn(1, length, config.q_lora_rank, device="cuda").bfloat16()
+    cu_seqlens = torch.tensor([0, 600, length], dtype=torch.int32, device="cuda")
+
+    def select(rows):
+        return _select_sparse_indices(
+            indexer,
+            hidden.expand(rows, -1, -1),
+            q_resid.expand(rows, -1, -1),
+            torch.ones(rows, length, dtype=torch.bool, device="cuda"),
+            cu_seqlens,
+            cp_group=None,
+            cp_rank=0,
+        )[0]
+
+    fused, general = select(1), select(2)
+
+    assert fused.shape == general.shape
+    assert torch.equal((fused >= 0).sum(-1), (general >= 0).sum(-1))
+    # Same inputs; scores differ only in FP32 accumulation order, so only exact near-ties may swap.
+    rows_equal = (fused.sort(-1).values == general.sort(-1).values).all(-1).float().mean().item()
+    assert rows_equal > 0.995
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashMLA forward with the fused TileLang backward")
+def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
+    """GLM-5.3-Flash's 512-wide NoPE latent runs the 576-wide kernels with a zero-padded tail."""
+    import torch.nn.functional as F
+
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+        sparse_mla_flashmla_fused_apply,
+    )
+    from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
+    from arctic_platform.model.implementations.glm53.context_parallel import _reference_sparse_mla
+
+    if not flash_mla_available():
+        pytest.skip("flash_mla / vllm._flashmla_C not installed")
+    torch.manual_seed(0)
+    queries, keys, heads, latent, topk = 256, 1024, 64, 512, 256
+    query = (torch.randn(1, queries, heads, latent, device="cuda") * 0.5).bfloat16()
+    key_value = (torch.randn(1, keys + 1, 1, latent, device="cuda") * 0.5).bfloat16()
+    key_value[:, keys] = 0
+    # The queries are the last shard of a longer key sequence, as under context parallelism.
+    positions = torch.arange(keys - queries, keys, device="cuda")
+    indices = torch.randint(0, keys, (1, queries, topk), device="cuda")
+    indices = torch.where(indices <= positions[None, :, None], indices, -1).to(torch.int32)
+
+    q, kv = query.clone().requires_grad_(True), key_value.clone().requires_grad_(True)
+    q_ref, kv_ref = query.float().requires_grad_(True), key_value.float().requires_grad_(True)
+    sentinel = indices.masked_fill(indices < 0, keys)
+    out = sparse_mla_flashmla_fused_apply(F.pad(q, (0, 64)), F.pad(kv, (0, 64)), sentinel.unsqueeze(2), 0.0625)
+    out_ref = _reference_sparse_mla(q_ref, kv_ref, indices, scale=0.0625, value_dim=latent)
+    grad = torch.randn_like(out_ref)
+    out.backward(grad.bfloat16())
+    out_ref.backward(grad)
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    assert type(out.grad_fn).__name__ == "_SparseMLATilelangBackward"
+    assert rel(out, out_ref) < 1e-2
+    assert rel(q.grad, q_ref.grad) < 1e-2
+    assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2

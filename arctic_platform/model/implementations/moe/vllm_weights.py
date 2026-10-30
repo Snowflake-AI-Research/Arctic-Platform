@@ -2,15 +2,35 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import torch
 import torch.nn as nn
 
 
-def named_weight_sync_tensors(model: nn.Module):
+def named_weight_sync_tensors(
+    model: nn.Module, *, include_export_buffers: bool = True
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield parameters, expert biases and module-declared persistent buffers.
+
+    Weight sync passes ``include_export_buffers=False``: declared buffers are constant
+    checkpoint state the sampler loads with the model, and the receiver only accepts
+    parameter destinations.
+    """
     yield from model.named_parameters()
-    yield from (
-        (name, buffer) for name, buffer in model.named_buffers() if name.endswith(".expert_bias")
-    )
+    for name, buffer in model.named_buffers():
+        if name.endswith(".expert_bias"):
+            yield name, buffer
+            continue
+        if not include_export_buffers:
+            continue
+        module_name, _, buffer_name = name.rpartition(".")
+        owning_module = model.get_submodule(module_name)
+        sync_names = getattr(owning_module, "_dss_weight_export_buffers", ())
+        if buffer_name not in sync_names:
+            continue
+        if buffer_name not in owning_module._non_persistent_buffers_set:
+            yield name, buffer
 
 
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:
@@ -198,7 +218,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
     def _iter():
         is_master = dist.get_rank() == 0
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
             by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
         ordered_layers: list[int] = []
