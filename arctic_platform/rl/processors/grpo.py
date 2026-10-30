@@ -265,7 +265,7 @@ def _sampler_kl(log_ratio: torch.Tensor, kind: str, ratio_cap: float) -> torch.T
     if kind == "k2":
         value, slope = 0.5 * clamped.square(), clamped
     else:
-        value, slope = clamped.exp() - 1.0 - clamped, clamped.exp() - 1.0
+        value, slope = torch.expm1(clamped) - clamped, torch.expm1(clamped)
     return value + slope.detach() * (log_ratio - clamped)
 
 
