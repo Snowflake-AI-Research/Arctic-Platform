@@ -43,6 +43,7 @@ from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
+from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
@@ -298,7 +299,13 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+        # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
+        # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
+        # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
+        data_types = dict(ds_config.get("data_types") or {})
+        if data_types.get("grad_accum_dtype") is None:
+            data_types["grad_accum_dtype"] = "fp32"
+        ds_config["data_types"] = data_types
 
         return ds_config
 
@@ -727,7 +734,7 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
-        from arctic_inference.server.weight_sync.sender import WeightSender
+        from arctic_platform.inference.server.weight_sync.sender import WeightSender
 
         self._weight_sender = WeightSender(
             group=group,
@@ -756,32 +763,40 @@ class DeepSpeedWorker:
         materializes the full param on every rank; the resulting sum of
         squares is therefore the whole-model value (the server reads rank 0).
         Summing squares is layout-invariant, so it compares directly against
-        the vLLM engine's norm despite vLLM fusing params differently. Used by
-        tests to confirm a weight sync landed.
+        the vLLM engine's norm despite vLLM fusing params differently. A debug
+        check: a weight sync proves itself with its ``sent_l2_sq`` checksum.
         """
-        sq_sum = 0.0
+        sq_sum = torch.zeros((), dtype=torch.float64, device=self._device)
         num_params = 0
         for _, p in self.engine.module.named_parameters():
             if hasattr(p, "ds_id"):
                 with deepspeed.zero.GatheredParameters([p], enabled=True):
-                    sq_sum += p.data.double().pow(2).sum().item()
+                    sq_sum.add_(tensor_l2_sq(p.data).to(sq_sum.device))
             else:
-                sq_sum += p.data.double().pow(2).sum().item()
+                sq_sum.add_(tensor_l2_sq(p.data).to(sq_sum.device))
             num_params += 1
+        sq_sum = sq_sum.item()
         return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
+    def _weights_l2_sq(self, weights: list[tuple[str, torch.Tensor]]) -> float:
+        total = torch.zeros((), dtype=torch.float64, device=self._device)
+        for _, weight in weights:
+            total.add_(tensor_l2_sq(weight).to(total.device))
+        return total.item()
+
     def send_weights(self) -> dict:
+        """Send the full model to this rank's NCCL group.
+
+        ``sent_l2_sq`` is the sum of squares of the full tensors handed to the sender. Every sender rank gathers the
+        whole model, so each one's value is authoritative for the replicas in its own group.
+        """
         weights = self.get_weights()
         if self._weight_sender is not None:
-            return self._weight_sender.send(weights)
+            sent_l2_sq = self._weights_l2_sq(weights)
+            result = self._weight_sender.send(weights)
+            result["sent_l2_sq"] = sent_l2_sq
+            return result
         return {"status": "not_initialized"}
-
-    def send_weights_ipc(self, group_id: int) -> dict:
-        """Save weights to shared memory for colocated (same-GPU) transfer."""
-        from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
-
-        weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
-        return save_weights_to_shm(weights, group_id)
 
     def get_cuda_ipc_handles(self) -> dict:
         """Create CUDA IPC handles for all model parameters.
@@ -831,6 +846,10 @@ class DeepSpeedWorker:
         keyed by its own GPU UUID before the context manager frees the
         gathered tensor.  Every rank returns its payload; the server merges
         them so each colocated inference replica finds a handle for its GPU.
+
+        ``sent_l2_sq`` is the sum of squares of the full tensors behind this
+        rank's handles, so each rank's value is authoritative for the replicas
+        on its own GPU.
         """
         import base64
         import pickle
@@ -845,6 +864,7 @@ class DeepSpeedWorker:
         handles = []
         self._ipc_tensor_refs = []
         model = self.engine.module
+        sent_l2_sq = torch.zeros((), dtype=torch.float64, device=self._device)
 
         # Every rank builds IPC handles for the full (gathered) weight on its
         # OWN physical GPU, keyed by that GPU's UUID. With colocated multi-GPU
@@ -871,6 +891,7 @@ class DeepSpeedWorker:
                 names.append(name)
                 dtype_names.append(str(weight.dtype).split(".")[-1])
                 shapes.append(list(weight.shape))
+            sent_l2_sq.add_(tensor_l2_sq(weight).to(sent_l2_sq.device))
 
         if hasattr(self.engine, "empty_partition_cache"):
             self.engine.empty_partition_cache()
@@ -888,6 +909,7 @@ class DeepSpeedWorker:
             "ipc_handles_pickled": pickled,
             "num_params": len(names),
             "gpu_uuid": gpu_uuid,
+            "sent_l2_sq": sent_l2_sq.item(),
         }
 
     def release_ipc_handles(self) -> bool:
@@ -925,6 +947,9 @@ class DeepSpeedWorker:
         ``name`` (``GatheredParameters`` is a collective op). The caller must
         invoke ``release_ipc_handles`` between params so peak extra GPU memory
         stays at one full parameter per GPU.
+
+        ``sent_l2_sq`` covers this one parameter; the caller streaming the
+        parameters adds them up per rank.
         """
         import base64
         import pickle
@@ -954,6 +979,7 @@ class DeepSpeedWorker:
             "ipc_handles_pickled": base64.b64encode(pickle.dumps([{gpu_uuid: handle}])).decode("utf-8"),
             "num_params": 1,
             "gpu_uuid": gpu_uuid,
+            "sent_l2_sq": tensor_l2_sq(weight).item(),
         }
 
     def save_state_dict_to_path(self, path: str) -> dict:
@@ -984,19 +1010,25 @@ class DeepSpeedWorker:
         All ranks must call this collectively.  Every parameter is wrapped
         in GatheredParameters so the all-gather runs on all ranks.  Only
         rank 0 copies the full tensor and writes to disk.
+
+        Only rank 0 reports ``sent_l2_sq``, squared on the GPU over the tensors
+        it writes: the file is the only copy the sampler reads.
         """
         import deepspeed
 
         t0 = time.monotonic()
         model = self.engine.module
         weights = []
+        sent_l2_sq = torch.zeros((), dtype=torch.float64, device=self._device)
         for n, p in model.named_parameters():
             if hasattr(p, "ds_id"):
                 with deepspeed.zero.GatheredParameters([p], enabled=True):
                     if self.rank == 0:
+                        sent_l2_sq.add_(tensor_l2_sq(p.data).to(sent_l2_sq.device))
                         weights.append((n, p.data.cpu()))
             else:
                 if self.rank == 0:
+                    sent_l2_sq.add_(tensor_l2_sq(p.data).to(sent_l2_sq.device))
                     weights.append((n, p.data.cpu()))
         if self.rank == 0:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1011,7 +1043,9 @@ class DeepSpeedWorker:
         torch.cuda.empty_cache()
         elapsed = time.monotonic() - t0
         logger.info("Rank %d gathered+saved state dict in %.2fs (%d params)", self.rank, elapsed, num_params)
-        return {"num_params": num_params, "elapsed": elapsed}
+        if self.rank != 0:
+            return {"num_params": num_params, "elapsed": elapsed}
+        return {"num_params": num_params, "elapsed": elapsed, "sent_l2_sq": sent_l2_sq.item()}
 
     def _log_mem(self, label):
         from deepspeed.runtime.utils import see_memory_usage

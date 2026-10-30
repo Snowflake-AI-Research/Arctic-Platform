@@ -86,17 +86,46 @@ class ActivationCheckpointConfig(BaseModel):
 
     mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
     freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    layers: list[NonNegativeInt] | None = Field(
+        None, description="Checkpoint exactly these block indices instead of every freq-th block."
+    )
     targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
     offload_config: ActivationOffloadConfig = Field(
         default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
     )
     router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+    combine_replay: bool = Field(
+        False,
+        description=(
+            "On a fully checkpointed block, keep the MoE combine output and return it to the recompute instead of "
+            "repeating the expert-parallel all-to-all. Costs one local-tokens-by-hidden tensor per checkpointed "
+            "layer until that layer's backward."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:
         if self.offload_config.enabled and self.mode != "full":
             raise ValueError("activation offload requires activation checkpointing mode='full'")
         return self
+
+    @model_validator(mode="after")
+    def _validate_layers(self) -> Self:
+        if self.layers is not None and self.freq != 1:
+            raise ValueError("set ac_config.layers or ac_config.freq, not both")
+        if self.layers is not None and len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"ac_config.layers lists a block twice: {self.layers}")
+        return self
+
+    def checkpoints(self, layer_id: int) -> bool:
+        """Whether block ``layer_id`` is checkpointed: listed in ``layers`` when given, else every ``freq``-th."""
+        return layer_id in self.layers if self.layers is not None else layer_id % self.freq == 0
+
+    def check_layers_exist(self, num_layers: int) -> None:
+        """Refuse ``layers`` naming a block the model does not have, rather than silently checkpointing fewer."""
+        missing = [layer for layer in self.layers or () if layer >= num_layers]
+        if missing:
+            raise ValueError(f"ac_config.layers {missing} are past the model's {num_layers} blocks")
 
 
 class ParallelismConfig(BaseModel):
