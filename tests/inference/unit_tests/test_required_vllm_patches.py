@@ -10,6 +10,7 @@ from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
+from arctic_platform.inference.vllm import xgrammar_request_errors
 from arctic_platform.inference.vllm import xgrammar_stop_mask
 
 
@@ -24,6 +25,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         xgrammar_stop_mask,
         "ensure_xgrammar_stop_mask_fix",
         lambda: calls.append("xgrammar"),
+    )
+    monkeypatch.setattr(
+        xgrammar_request_errors,
+        "ensure_xgrammar_request_error_isolation",
+        lambda: calls.append("xgrammar_request_errors"),
     )
     monkeypatch.setattr(
         dense_prompt_logprobs,
@@ -78,6 +84,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
     assert calls == [
         "router",
         "xgrammar",
+        "xgrammar_request_errors",
         "dense_prompt_logprobs",
         "spec_decode_grammar",
         "hybrid_state",
