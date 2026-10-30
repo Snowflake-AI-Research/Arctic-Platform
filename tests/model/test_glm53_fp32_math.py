@@ -189,27 +189,25 @@ def test_glm53_kda_beta_gate_is_an_fp32_sigmoid(tiny_glm_sparse_model, single_ra
 
 
 @pytest.mark.parametrize("fp32_parity", [True, False])
-def test_qwen38_context_parallel_gated_delta_net_beta_is_an_fp32_sigmoid(fp32_parity):
+def test_qwen38_gated_delta_net_beta_is_the_same_at_every_sequence_parallel_size(monkeypatch, fp32_parity):
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as stock
+
     from arctic_platform.model.implementations.qwen38 import context_parallel as cp
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
+    from tests.model.test_qwen4_exp import _tiny_config
 
     set_seed(0)
-    module = torch.nn.Module()
-    module.num_k_heads = module.num_v_heads = 2
-    module.head_k_dim = module.head_v_dim = 4
-    module.activation = "silu"
-    module.in_proj_qkv = torch.nn.Linear(16, 24, bias=False)
-    module.conv1d = torch.nn.Conv1d(24, 24, 4, groups=24, bias=False)
-    module.in_proj_b, module.in_proj_a = torch.nn.Linear(16, 2, bias=False), torch.nn.Linear(16, 2, bias=False)
-    module.A_log, module.dt_bias = torch.nn.Parameter(torch.zeros(2)), torch.nn.Parameter(torch.zeros(2))
-    module.in_proj_z, module.out_proj = torch.nn.Linear(16, 8, bias=False), torch.nn.Linear(8, 16, bias=False)
-    module.norm = lambda output, gate: output
-    module.to(torch.bfloat16)
+    config = _tiny_config()
+    config.fp32_parity = fp32_parity
+    module = Qwen4ExpForConditionalGenerationPrimeRL(config).to(torch.bfloat16).model.language_model.layers[0]
+    module = module.linear_attn
     captured = []
 
     def chunk_gated_delta_rule(query, key, value, g, beta, **_kwargs):
         captured.append(beta)
         return torch.zeros_like(value), None
 
+    monkeypatch.setattr(stock, "torch_chunk_gated_delta_rule", chunk_gated_delta_rule)
     fla, modules, conv, ops, rule = (
         types.ModuleType(name)
         for name in ("fla", "fla.modules", "fla.modules.conv", "fla.ops", "fla.ops.gated_delta_rule")
@@ -218,15 +216,18 @@ def test_qwen38_context_parallel_gated_delta_net_beta_is_an_fp32_sigmoid(fp32_pa
     rule.chunk_gated_delta_rule = chunk_gated_delta_rule
     fla.modules, modules.conv, fla.ops, ops.gated_delta_rule = modules, conv, ops, rule
     fakes = {"fla": fla, "fla.modules": modules, "fla.modules.conv": conv, "fla.ops": ops}
-    hidden_states = torch.randn(1, 8, 16).to(torch.bfloat16)
+    hidden_states = torch.randn(1, 8, config.text_config.hidden_size).to(torch.bfloat16)
     with patch.dict(sys.modules, {**fakes, "fla.ops.gated_delta_rule": rule}), torch.no_grad():
-        cp._adapt_linear_attention(module, None, fp32_parity=fp32_parity)
+        module(hidden_states)  # sp 1: transformers' stock forward
+        cp._adapt_linear_attention(module, None)
         setattr(module, cp._FLA_CP_CONTEXT, object())
-        module(hidden_states)
-        logits = module.in_proj_b(hidden_states)
-        expected = torch.sigmoid(logits.float() if fp32_parity else logits)
+        module(hidden_states)  # sp > 1: the context-parallel forward
+    logits = F.linear(hidden_states, module.in_proj_b.weight)
+    expected = torch.sigmoid(logits.float() if fp32_parity else logits)
 
-    torch_assert_equal(captured[0], expected)
+    assert len(captured) == 2
+    for beta in captured:
+        torch_assert_equal(beta, expected)
 
 
 def _fake_ep_runtime():

@@ -326,6 +326,10 @@ class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
         return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
 
 
+def _fp32_output(_module: nn.Module, _args, output: Tensor) -> Tensor:
+    return output.float()
+
+
 class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -345,6 +349,10 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
             layer._replay_layer_idx = layer_idx
             if layer.layer_type == "linear_attention":
                 round_gated_norm_once(layer.linear_attn.norm)
+                if getattr(config, "fp32_parity", True):
+                    # vLLM sigmoids the GatedDeltaNet beta gate in fp32; both the stock (sp 1) and the
+                    # context-parallel forwards sigmoid this projection's output.
+                    layer.linear_attn.in_proj_b.register_forward_hook(_fp32_output)
             if isinstance(layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
