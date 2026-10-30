@@ -340,7 +340,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
 
         if grouped is None:
             return logprobs, entropy
-        return logprobs, entropy, grouped.normalized_log_probs(logz)
+        return logprobs, entropy, grouped.normalized_log_probs(chunk_size)
 
     @staticmethod
     def backward(
@@ -364,9 +364,10 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         vocab_chunk_size = min(vocab, 8192)
 
         # A frozen LM head (LoRA elsewhere) needs no weight gradient: no [vocab, hidden] buffer, no GEMM per tile.
+        # Sum the tiles in fp32 even when the projection runs in bf16: a bf16 running sum rounds once per tile.
         need_hidden, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
-        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype) if need_hidden else None
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype) if need_weight else None
+        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32) if need_hidden else None
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32) if need_weight else None
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -447,15 +448,17 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                     grad_logits = grad_logits * inv_t_chunk
 
                 if need_hidden:
+                    assert grad_hidden is not None
                     grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
                     grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
                 if need_weight:
+                    assert grad_weight is not None
                     grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
                     grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
 
         return (
-            grad_hidden.to(hidden.dtype) if need_hidden else None,
-            grad_weight.to(weight.dtype) if need_weight else None,
+            grad_hidden.to(hidden.dtype) if grad_hidden is not None else None,
+            grad_weight.to(weight.dtype) if grad_weight is not None else None,
             None,
             None,
             None,

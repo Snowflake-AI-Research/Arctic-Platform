@@ -59,9 +59,11 @@ def _install_finite_check(module: nn.Module, name: str) -> None:
     module.register_forward_hook(check)
 
 
-def _adapt_linear_attention(module: nn.Module, process_group) -> None:
+def _adapt_linear_attention(module: nn.Module, process_group, *, fp32_parity: bool = True) -> None:
     from fla.modules.conv import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 
     check_finite = os.environ.get("ARCTIC_QWEN38_CP_CHECK_FINITE") == "1"
 
@@ -105,11 +107,11 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         value = value.view(batch_size, local_sequence_length, num_value_heads, int(self.head_v_dim))
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
-        beta = b.sigmoid()
+        beta = b.float().sigmoid() if fp32_parity else b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        # q/k stay at the 16 key heads: FLA's chunk rule applies grouped value attention for HV > H, reading key
-        # head hv // (HV // H) for value head hv, the assignment repeat_interleave would build. Its fp32 dq/dk sum over
-        # the value heads of a key head replaces the BF16 RepeatInterleaveBackward sum.
+        query, key = repeat_query_key_for_value_heads(
+            query, key, num_key_heads, num_value_heads, chunk_gated_delta_rule
+        )
         if check_finite:
             for name, tensor in (
                 ("query", query),
@@ -293,7 +295,9 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
     for layer_idx, layer in enumerate(backbone.layers):
         if getattr(layer, "layer_type", None) == "linear_attention":
             linear_attention = layer.linear_attn
-            _adapt_linear_attention(linear_attention, model_cp_group)
+            _adapt_linear_attention(
+                linear_attention, model_cp_group, fp32_parity=getattr(model.config, "fp32_parity", True)
+            )
             linear_modules.append(linear_attention)
             if check_finite:
                 _install_finite_check(linear_attention, f"layer {layer_idx} GatedDeltaNet")

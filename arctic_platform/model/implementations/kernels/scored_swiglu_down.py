@@ -97,6 +97,8 @@ def _scored_swiglu_bwd_kernel(
 def _down_weight(weight: torch.Tensor, scale: torch.Tensor | None, block_size: int | None) -> torch.Tensor:
     if scale is None:
         return weight.bfloat16()
+    if block_size is None:
+        raise ValueError("block FP8 down-projection decode requires block_size")
     from arctic_platform.model.implementations.fp8 import _decode_fp8_to_bf16
 
     return _decode_fp8_to_bf16(weight, scale, block_size)
@@ -114,8 +116,13 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
         h = torch.empty(gate_up.shape[0], hidden, dtype=gate_up.dtype, device=gate_up.device)
         if h.numel():
             _packed_swiglu_fwd_kernel[(h.shape[0],)](
-                gate_up, h, hidden, gate_up.stride(0), 0.0 if limit is None else float(limit),
-                HAS_LIMIT=limit is not None, BLOCK_D=_BLOCK_D,
+                gate_up,
+                h,
+                hidden,
+                gate_up.stride(0),
+                0.0 if limit is None else float(limit),
+                HAS_LIMIT=limit is not None,
+                BLOCK_D=_BLOCK_D,
             )
         y = torch._grouped_mm(h, _down_weight(weight, scale, block_size).transpose(-2, -1), offs=offsets)
         del h

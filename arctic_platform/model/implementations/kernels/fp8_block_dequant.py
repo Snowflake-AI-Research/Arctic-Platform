@@ -83,7 +83,9 @@ def dequantize_fp8_blocks(
         or out.shape[-1] != cols
         or out.shape[-2] < out_row + rows
     ):
-        raise ValueError(f"out {out.dtype} {tuple(out.shape)} cannot hold rows {out_row}..{out_row + rows} of {tuple(weight.shape)}")
+        raise ValueError(
+            f"out {out.dtype} {tuple(out.shape)} cannot hold rows {out_row}..{out_row + rows} of {tuple(weight.shape)}"
+        )
     if weight.numel():
         grid = (triton.cdiv(rows, _TILE_ROWS), triton.cdiv(cols, _TILE_COLS), experts)
         with torch.cuda.device(weight.device):

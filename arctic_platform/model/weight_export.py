@@ -361,7 +361,7 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
             if not dist.is_initialized():
                 raise RuntimeError(f"EP-sharded LoRA parameter {name!r} needs a process group")
             kind = "B" if "lora_B" in export_name.split(".") else "A"
-            gathered = _gather_ep_expert_lora(parameter, kind=kind, rank=_peft_adapter_rank(model))
+            gathered = _gather_ep_expert_lora(parameter, kind=kind, rank=_peft_adapter_rank(model, name))
             if rank == 0:
                 output[export_name] = gathered.detach().cpu().contiguous()
         elif rank == 0:
@@ -498,13 +498,23 @@ def _expert_lora_vllm_key(experts_prefix: str, weight_name: str, kind: str) -> s
     return f"{experts_prefix}.{weight_name}.lora_{kind}.weight"
 
 
-def _peft_adapter_rank(model: nn.Module) -> int:
+def _peft_adapter_rank(model: nn.Module, parameter_name: str | None = None) -> int:
+    """``r`` of the adapter that owns ``parameter_name``, or of the only adapter when the name is omitted."""
     peft_config = getattr(model, "peft_config", None)
     if isinstance(peft_config, dict) and peft_config:
-        rank = getattr(next(iter(peft_config.values())), "r", None)
-        if rank is not None and int(rank) > 0:
-            return int(rank)
-    raise RuntimeError("LoRA export requires model.peft_config[*].r")
+        if parameter_name is not None:
+            parts = parameter_name.split(".")
+            for index, part in enumerate(parts[:-1]):
+                adapter_name = parts[index + 1]
+                if part in ("lora_A", "lora_B") and adapter_name in peft_config:
+                    rank = getattr(peft_config[adapter_name], "r", None)
+                    if rank is not None and int(rank) > 0:
+                        return int(rank)
+        if len(peft_config) == 1 or parameter_name is None:
+            rank = getattr(next(iter(peft_config.values())), "r", None)
+            if rank is not None and int(rank) > 0:
+                return int(rank)
+    raise RuntimeError(f"LoRA export requires model.peft_config[*].r for {parameter_name or 'the adapter'}")
 
 
 def _iter_param_wrapper_expert_loras(model: nn.Module):
@@ -522,10 +532,14 @@ def _iter_param_wrapper_expert_loras(model: nn.Module):
         if not (experts_prefix.endswith(".experts") or experts_prefix == "experts"):
             continue
         for kind, bucket in (("A", module.lora_A), ("B", module.lora_B)):
-            if bucket:
-                weight = getattr(bucket[next(iter(bucket))], "weight", None)
-                if weight is not None:
-                    yield experts_prefix, weight_name, kind, weight
+            if not bucket:
+                continue
+            for adapter_name, layer in bucket.items():
+                weight = getattr(layer, "weight", None)
+                if weight is None:
+                    continue
+                rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
+                yield experts_prefix, weight_name, kind, weight, rank
 
 
 def iter_lora_weights(
@@ -543,13 +557,15 @@ def iter_lora_weights(
 
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
-    lora_rank = _peft_adapter_rank(model)
+    # Families whose module tree differs from the served checkpoint rename adapter tensors here.
+    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
     expert_parameter_ids: set[int] = set()
     for (
         experts_prefix,
         weight_name,
         kind,
         parameter,
+        lora_rank,
     ) in _iter_param_wrapper_expert_loras(model):
         expert_parameter_ids.add(id(parameter))
         prefix = strip_activation_checkpoint_segments(experts_prefix).replace(".base_layer", "")
@@ -564,16 +580,16 @@ def iter_lora_weights(
             dist.all_gather(shards, local, group=group)
             if is_master:
                 yield (
-                    _expert_lora_vllm_key(prefix, weight_name, kind),
+                    rename(_expert_lora_vllm_key(prefix, weight_name, kind)),
                     torch.cat(shards, dim=0).contiguous(),
                 )
         elif is_master:
-            yield _expert_lora_vllm_key(prefix, weight_name, kind), local
+            yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
     for name, parameter in model.named_parameters():
         if not is_peft_lora_param(name, parameter) or id(parameter) in expert_parameter_ids:
             continue
-        export_name = _peft_lora_parameter_to_vllm_name(name)
+        export_name = rename(_peft_lora_parameter_to_vllm_name(name))
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 

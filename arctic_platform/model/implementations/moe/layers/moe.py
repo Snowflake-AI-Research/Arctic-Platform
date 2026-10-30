@@ -18,6 +18,8 @@ from ..config import EPCommBackend
 from ..distributed.combine_replay import CombineReplay
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
+from ...kernels.sonic_experts import sonic_routed_experts
+from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
@@ -90,10 +92,13 @@ class MoEArgs:
     route_norm: bool = False
     route_scale: float = 1.0
     score_before_experts: bool = True
+    fp32_router_logits: bool = False
 
     # token-choice
     top_k: int = 1
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
+    # BF16 DeepEP/UCCL experts take SonicMoE when the kernel applies. False (the default) keeps the grouped GEMM path.
+    use_sonicmoe: bool = False
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
@@ -303,32 +308,18 @@ def _run_experts_grouped_mm_impl(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
-    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
     _offsets_must_cover_no_more_than_the_rows("gated", x, num_tokens_per_expert, offsets)
 
-    if x.is_cuda and scores is not None and not (w1.requires_grad or w2.requires_grad or w3.requires_grad):
-        from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
-
-        # Frozen gate and up stacked: one GEMM each way instead of two plus a sum of their input gradients.
-        w13 = torch.cat([w1, w3], dim=-2).bfloat16()
-        gate_up = torch._grouped_mm(x.bfloat16(), w13.transpose(-2, -1), offs=offsets)
-        rows = int(offsets[-1])
-        return scored_swiglu_down(gate_up, scores, w2, None, offsets, rows, limit=swiglu_limit).type_as(x)
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    if gate.is_cuda:
-        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
-
-        h = fused_swiglu(gate, up, swiglu_limit)
-    else:
-        h = _apply_swiglu(gate, up, swiglu_limit)
+    h = _apply_swiglu(gate, up, swiglu_limit)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
-    return out if scores is None else apply_routing_weights(out, scores)
+    return out
 
 
 class _AddIntoRows(torch.autograd.Function):
@@ -486,7 +477,9 @@ class GroupedExperts(nn.Module):
     def _forward_deepep(
         self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if scores is not None and not (self.use_grouped_mm and x.is_cuda):
+        # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can;
+        # the other paths scale their outputs here.
+        if scores is not None and not (self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda):
             return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
@@ -556,16 +549,24 @@ class GroupedExperts(nn.Module):
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
+            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
 
     def forward(
         self,
         x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None,
         scores: torch.Tensor | None = None,
+        expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs."""
+        """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs.
+
+        With ``expert_indices`` the rows are the EP receive buffer as delivered instead (one row per token, ``[tokens,
+        top_k]`` local expert ids, ``-1`` elsewhere, and their scores), run through SonicMoE. Called through the PEFT
+        wrappers, so LoRA-trained experts see their merged weights here.
+        """
+        if expert_indices is not None:
+            return sonic_routed_experts(self, x, expert_indices, scores)
         if not uses_dispatch_ep(self.ep_comm_backend):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
@@ -591,6 +592,7 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: ``sigmoid``, ``softmax``, or DeepSeek V4's ``sqrtsoftplus``.
         route_norm (bool): Whether to normalize the routing scores when using sigmoid.
         route_scale (float): Scaling factor applied to the routing scores.
+        fp32_logits (bool): Compute the gate GEMM in fp32 from the bf16 operands, as the model's reference does.
     """
 
     def __init__(
@@ -601,9 +603,11 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"],
         route_norm: bool,
         route_scale: float,
+        fp32_logits: bool = False,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.fp32_logits = fp32_logits
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_func = score_func
@@ -623,7 +627,12 @@ class TokenChoiceTopKRouter(nn.Module):
         assert (
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
-        scores = self.gate(x)
+        if self.fp32_logits:
+            # Autocast would run the GEMM in bf16 despite the fp32 operands.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                scores = F.linear(x.float(), self.gate.weight.float())
+        else:
+            scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -735,8 +744,9 @@ class MoE(nn.Module):
         )
         self.ep_comm_backend: EPCommBackend = "deepep"
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
-        # Set by full activation checkpointing (see CombineReplay); UCCL-EP replays the combine on recompute.
+        # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
+        self.use_sonicmoe = moe_args.use_sonicmoe
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -744,6 +754,7 @@ class MoE(nn.Module):
             score_func=moe_args.score_func,
             route_norm=moe_args.route_norm,
             route_scale=moe_args.route_scale,
+            fp32_logits=moe_args.fp32_router_logits,
         )
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         # TODO: Add the s back and use FF when the weights support it
@@ -787,6 +798,9 @@ class MoE(nn.Module):
 
     def set_deepep_token_chunk_size(self, chunk_size: int | None) -> None:
         self.deepep_token_chunk_size = chunk_size
+
+    def set_use_sonicmoe(self, enabled: bool) -> None:
+        self.use_sonicmoe = enabled
 
     def _run_local_routed_experts(
         self,
@@ -837,8 +851,16 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
+        # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
+        use_sonic = (
+            self.use_sonicmoe
+            and not self.score_before_experts
+            and hasattr(ep_comm, "finalize_dispatch_rows")
+            and sonic_routed_experts_applicable(experts)
+        )
         combine_kwargs = {}
-        if self.combine_replay is not None and self.ep_comm_backend == "uccl":
+        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
 
@@ -853,6 +875,10 @@ class MoE(nn.Module):
             )
 
         def run_pending_chunk(pending_state):
+            if use_sonic:
+                hidden_states, indices, scores = ep_comm.finalize_dispatch_rows(pending_state)
+                routed = self.experts(hidden_states, None, scores, expert_indices=indices)
+                return ep_comm.combine_rows(routed, pending_state, **combine_kwargs)
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
@@ -985,6 +1011,17 @@ class MoE(nn.Module):
             self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
             if self.load_balance_coeff is not None:
                 self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+
+
+def install_combine_replay(block: nn.Module) -> None:
+    """Give each ``MoE`` in ``block`` a :class:`CombineReplay`.
+
+    A full-checkpoint recompute that runs to the end of the block repeats the expert-parallel combine. The replay
+    returns the forward's combined output instead and releases the recompute's dispatch handle.
+    """
+    for module in block.modules():
+        if isinstance(module, MoE):
+            module.combine_replay = CombineReplay()
 
 
 def relu2(x: torch.Tensor) -> torch.Tensor:

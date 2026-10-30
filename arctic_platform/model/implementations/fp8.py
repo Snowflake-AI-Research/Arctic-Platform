@@ -21,9 +21,8 @@ activation-quant kernel is imported lazily from the shared kernels package.
 
 from __future__ import annotations
 
-from typing import Any
-
 import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -51,7 +50,7 @@ def keeps_fp32(tensor: Tensor) -> bool:
     return bool(getattr(tensor, KEEP_FP32_ATTR, False))
 
 
-_FP8_STORAGE_DTYPES = ("float8_e4m3fn", "float8_e5m2")
+_FP8_STORAGE_DTYPES = ("float8_e4m3fn", "float8_e5m2", "float8_e8m0fnu")
 
 
 def _fp8_storage_dtypes() -> tuple:
@@ -63,15 +62,21 @@ def _keeps_source_dtype(tensor, fp8_dtypes) -> bool:
     return tensor.dtype in fp8_dtypes or keeps_fp32(tensor)
 
 
-def _remark_fp8_scales(model) -> int:
-    """Re-apply the keep-FP32 marker to every block scale, by name.
+def _remark_keep_fp32(model) -> int:
+    """Re-apply the keep-FP32 marker, by name, to block scales and to the FP32
+    parameters the model family keeps out of the bf16 cast.
 
     The marker is an attribute on the parameter object, so a rebuild between
     construction and ``deepspeed.initialize`` drops it.
     """
+    get_base = getattr(model, "get_base_model", None)
+    family = get_base() if callable(get_base) else model
+    family_keeps = getattr(type(family), "keeps_fp32_parameter", None)
     marked = 0
     for name, param in model.named_parameters():
-        if name.endswith("_scale_inv") and param.dtype == torch.float32:
+        if param.dtype != torch.float32:
+            continue
+        if name.endswith("_scale_inv") or (family_keeps is not None and family_keeps(name)):
             mark_keep_fp32(param)
             marked += 1
     return marked
@@ -98,7 +103,8 @@ def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
     if original is None:
         return False
 
-    def _cast_module_mixed_precision(self, param_dtype, buffer_dtype, is_zero_init_model):
+    # DeepSpeed 0.19.8 adds ``keep_pattern`` (fp32 buffers), which the original still has to apply.
+    def _cast_module_mixed_precision(self, param_dtype, buffer_dtype, is_zero_init_model, *args, **kwargs):
         if param_dtype is not None and not is_zero_init_model:
             for param in self.module.parameters(recurse=True):
                 if (
@@ -107,8 +113,7 @@ def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
                     and not _keeps_source_dtype(param, fp8_dtypes)
                 ):
                     param.data = param.data.to(param_dtype)
-        if buffer_dtype is not None:
-            original(self, None, buffer_dtype, is_zero_init_model)
+        original(self, None, buffer_dtype, is_zero_init_model, *args, **kwargs)
 
     DeepSpeedEngine._cast_module_mixed_precision = _cast_module_mixed_precision
     DeepSpeedEngine._ap_fp8_param_cast_guard = True
@@ -116,18 +121,17 @@ def _install_deepspeed_fp8_param_cast_guard(fp8_dtypes) -> bool:
 
 
 def preserve_fp8_params_through_ds_cast(model) -> tuple[int, int]:
-    """Keep frozen FP8 weights and FP32 block scales out of DeepSpeed's dtype cast.
+    """Keep frozen FP8 weights and marked FP32 parameters out of DeepSpeed's dtype cast.
 
-    Returns ``(fp8 parameter count, remarked scale count)``. A model with no FP8
-    parameters is left unchanged.
+    Returns ``(fp8 parameter count, FP32 parameters marked)``. A model with
+    neither is left unchanged.
     """
     import types
 
     fp8_dtypes = _fp8_storage_dtypes()
-    if not fp8_dtypes:
-        return 0, 0
     fp8_params = sum(1 for param in model.parameters() if param.dtype in fp8_dtypes)
-    if not fp8_params:
+    marked = _remark_keep_fp32(model)
+    if not fp8_params and not marked:
         return 0, 0
 
     model.bfloat16 = types.MethodType(
@@ -139,7 +143,7 @@ def preserve_fp8_params_through_ds_cast(model) -> tuple[int, int]:
         model,
     )
     _install_deepspeed_fp8_param_cast_guard(fp8_dtypes)
-    return fp8_params, _remark_fp8_scales(model)
+    return fp8_params, marked
 
 
 def carry_keep_fp32(src: Tensor, dst: nn.Parameter) -> nn.Parameter:

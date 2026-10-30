@@ -200,8 +200,9 @@ class _InjectFn(torch.autograd.Function):
         hidden = width // hc
         y = torch.empty_like(x)
         out, inj = out.contiguous(), inj.contiguous()
-        _inject_fwd_kernel[(rows, triton.cdiv(hidden, _BLOCK_H))](x.contiguous(), out, inj, y, hidden, HC=hc,
-                                                                 BLOCK_H=_BLOCK_H)
+        _inject_fwd_kernel[(rows, triton.cdiv(hidden, _BLOCK_H))](
+            x.contiguous(), out, inj, y, hidden, HC=hc, BLOCK_H=_BLOCK_H
+        )
         ctx.save_for_backward(out, inj)
         ctx.hc = hc
         return y

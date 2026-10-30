@@ -54,6 +54,7 @@ EXPECTED_KEYS = {
     "lm_head.cross_entropy": ("trainer", "memory"),
     "liger": ("trainer", "speed"),
     "moe.grouped_mm": ("trainer", "speed"),
+    "moe.sonicmoe": ("trainer", "speed"),
     "moe.comm_backend": ("trainer", "speed"),
     "moe.comm_sms": ("trainer", "speed"),
     "moe.comm_token_chunk": ("trainer", "speed"),
@@ -75,6 +76,8 @@ EXPECTED_PROFILES = {
     "glm5_next",
     "qwen4_exp",
     "deepseek_v4",
+    "deepseek_v41",
+    "dflash2",
 }
 
 SYNTHETIC_KEYS = ("lm_head.fp32", "moe.grouped_mm", "moe.comm_backend", "liger")
@@ -530,7 +533,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 23 options x 7 profiles = 161 cells, ")
+        assert out[0].startswith("check passed: 24 options x 9 profiles = 216 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

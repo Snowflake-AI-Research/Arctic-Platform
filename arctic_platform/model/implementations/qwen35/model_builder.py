@@ -40,11 +40,11 @@ from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
 from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 
 from .config import ModelConfig
-from arctic_platform.model.implementations.moe.distributed.combine_replay import CombineReplay
 from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
@@ -67,7 +67,7 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import (
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
 )
-from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
 from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
@@ -176,9 +176,9 @@ def _patch_qwen3_5_linear_attn_varlen():
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        query, key = repeat_query_key_for_value_heads(
+            query, key, self.num_k_heads, self.num_v_heads, self.chunk_gated_delta_rule
+        )
 
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
@@ -340,6 +340,8 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
     for transformer_block in language_model.layers:
         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
             continue
+        if isinstance(transformer_block.mlp, MoE):
+            transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
         transformer_block.mlp.set_ep_comm_backend(backend)
         transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
 
@@ -359,6 +361,8 @@ def get_model(
         ),
     )
     model_config.use_cache = False
+    if config.dequantize_checkpoint and hasattr(model_config, "quantization_config"):
+        del model_config.quantization_config
     is_vlm_arch = is_vlm_architecture(model_config)
 
     # Fallback Qwen3.5 patch detection from loaded config model_type
@@ -544,6 +548,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
+                # Packed and dequantized conversions of one checkpoint must not share a cache.
+                fmt = "prime-dequantized"
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."
@@ -551,6 +558,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            # Models whose snapshot cannot sit in host memory convert shard by shard.
+            stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
@@ -562,6 +571,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -574,6 +584,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
 
     # All ranks wait for master rank to finish conversion
@@ -690,10 +701,10 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
             # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
             # The recompute runs past the combine, so it would run the EP all-to-all a second time just to
-            # rebuild the tensors saved after it; replay the forward's combined output instead.
-            for module in transformer_block.modules():
-                if isinstance(module, MoE):
-                    module.combine_replay = CombineReplay()
+            # rebuild the tensors saved after it. Replay keeps that output instead; turning it off spends the
+            # all-to-all again and drops the saved tensor.
+            if ac_config.combine_replay:
+                install_combine_replay(transformer_block)
             transformer_block = checkpoint_wrapper(
                 transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
             )
@@ -723,5 +734,6 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     logger.info(
         f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, full_layers={full_layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
+        f"combine_replay={ac_config.combine_replay}, "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )
