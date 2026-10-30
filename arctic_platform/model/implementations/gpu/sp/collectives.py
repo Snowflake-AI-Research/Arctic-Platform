@@ -69,17 +69,19 @@ class _GatherSequence(torch.autograd.Function):
     @staticmethod
     def forward(ctx, group, tensor):
         ctx.group = group
+        tensor = tensor.contiguous()
         parts = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(parts, tensor.contiguous(), group=group)
+        dist.all_gather(parts, tensor, group=group)
         return torch.cat(parts, dim=1)
 
     @staticmethod
     def backward(ctx, grad):
         # torch's own all_gather backward reduce-scatters in the gradient's dtype, and a bf16 ring rounds each partial sum.
         accumulate_dtype = torch.promote_types(grad.dtype, torch.float32)
-        parts = [part.contiguous() for part in grad.to(accumulate_dtype).chunk(dist.get_world_size(ctx.group), dim=1)]
+        parts = grad.unflatten(1, (dist.get_world_size(ctx.group), -1)).movedim(1, 0)
+        parts = parts.to(accumulate_dtype, memory_format=torch.contiguous_format)
         summed = torch.empty_like(parts[0])
-        dist.reduce_scatter(summed, parts, group=ctx.group)
+        dist.reduce_scatter_tensor(summed, parts.flatten(0, 1), group=ctx.group)
         return None, summed.to(grad.dtype)
 
 
