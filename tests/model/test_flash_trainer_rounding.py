@@ -17,7 +17,7 @@ fp32, as vLLM's kernels do.
 
 Each test runs the trainer's own modules with bf16 parameters (DeepSpeed's cast) and checks one site against the
 fp64 value of the same formula from the same bf16 inputs, rounded once. With ``fp32_parity`` off, the sites keep
-the transformers order.
+the transformers order. The routed experts round once only with ``fp32_routed_weighting``, which is off by default.
 """
 
 from types import SimpleNamespace
@@ -43,6 +43,25 @@ def test_flash_loaders_take_fp32_parity(name):
     options = loader_mod._LOADERS[name].options
     assert options().fp32_parity is True
     assert options.model_validate({"fp32_parity": False}).fp32_parity is False
+
+
+@pytest.mark.parametrize("name", ["glm5_next", "qwen4_exp"])
+def test_flash_loaders_pass_fp32_routed_weighting_to_the_model_config(name):
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
+    from arctic_platform.model.loaders import flash_moe
+
+    options = loader_mod._LOADERS[name].options
+    assert options().fp32_routed_weighting is False
+    for enabled in (True, False):
+        spec_options = options.model_validate({"fp32_routed_weighting": enabled}).model_dump(exclude_unset=True)
+        load_options = flash_moe._FlashLoadOptions.model_validate(spec_options)
+        config = _build_model_config(name, 1, 1, "bfloat16", "sdpa", options=load_options)
+        assert config.fp32_routed_weighting is enabled
+
+
+def test_qwen3_5_moe_loader_rejects_fp32_routed_weighting():
+    with pytest.raises(ValueError, match="fp32_routed_weighting"):
+        loader_mod._LOADERS["qwen3_5_moe"].options.model_validate({"fp32_routed_weighting": True})
 
 
 def _glm_norms(fp32_parity: bool) -> list:
@@ -256,7 +275,7 @@ class _OneRankDispatch:
         pass
 
 
-def _flash_moe(model: str, fp32_parity: bool, use_grouped_mm: bool):
+def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool):
     from arctic_platform.model.implementations.moe.layers.moe import MoE
 
     if model == "glm5_next":
@@ -273,7 +292,7 @@ def _flash_moe(model: str, fp32_parity: bool, use_grouped_mm: bool):
 
         config = _qwen_tiny_config()
     config.use_grouped_mm = use_grouped_mm
-    config.fp32_parity = fp32_parity
+    config.fp32_routed_weighting = fp32_routed_weighting
     torch.manual_seed(0)
     layer = next(module for module in model_cls(config).modules() if isinstance(module, MoE)).to(torch.bfloat16)
     with torch.no_grad():
@@ -282,18 +301,18 @@ def _flash_moe(model: str, fp32_parity: bool, use_grouped_mm: bool):
     return layer
 
 
-@pytest.mark.parametrize("fp32_parity", [True, False])
+@pytest.mark.parametrize("fp32_routed_weighting", [True, False])
 @pytest.mark.parametrize("use_grouped_mm", [True, False])
 @pytest.mark.parametrize("model", ["glm5_next", "qwen4_exp"])
 def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
-    monkeypatch, model, use_grouped_mm, fp32_parity
+    monkeypatch, model, use_grouped_mm, fp32_routed_weighting
 ):
     """The routed rows reaching the expert-parallel combine are ``score * (h @ w2.T)`` rounded once, as vLLM's
     fused MoE kernel stores them, through the production dispatch path with only the cross-rank exchange replaced."""
     from arctic_platform.model.implementations.moe.distributed import expert_parallel
     from arctic_platform.model.implementations.moe.layers import moe
 
-    layer = _flash_moe(model, fp32_parity, use_grouped_mm)
+    layer = _flash_moe(model, fp32_routed_weighting, use_grouped_mm)
     dispatch = _OneRankDispatch()
     hidden = []
     swiglu = moe._apply_swiglu
@@ -316,7 +335,7 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
     h, w2 = torch.cat(hidden).double(), layer.experts.w2.detach().double()
     expert = torch.repeat_interleave(torch.arange(len(received.counts)), received.counts)
     reference = torch.einsum("ri,rhi->rh", h, w2[expert]) * received.scores.detach().double()[:, None]
-    if fp32_parity:
+    if fp32_routed_weighting:
         _assert_rounded_once(received.rows, reference)
     else:
         with pytest.raises(AssertionError, match="rounded more than once"):

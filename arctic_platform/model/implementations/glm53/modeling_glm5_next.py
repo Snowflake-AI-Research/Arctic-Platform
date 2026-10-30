@@ -186,7 +186,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
                     route_scale=text_config.routed_scaling_factor,
                     score_before_experts=False,
                     fp32_router_logits=fp32_parity,
-                    fp32_routed_weighting=fp32_parity and fp8_block_size is None,
+                    fp32_routed_weighting=getattr(config, "fp32_routed_weighting", False),
                     top_k=text_config.num_experts_per_tok,
                     load_balance_coeff=getattr(
                         text_config,
