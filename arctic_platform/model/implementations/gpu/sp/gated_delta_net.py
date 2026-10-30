@@ -270,8 +270,9 @@ def _shard_convolution_parameter(
     )
 
 
-def _packed_sequence_indices(global_cu_seqlens: torch.Tensor) -> torch.Tensor:
+def _packed_sequence_indices(global_cu_seqlens: torch.Tensor, total_length: int) -> torch.Tensor:
     sequence_lengths = global_cu_seqlens[1:] - global_cu_seqlens[:-1]
+    # output_size: otherwise torch reads the total back from the device, a host synchronization at every layer.
     return torch.repeat_interleave(
         torch.arange(
             sequence_lengths.numel(),
@@ -279,6 +280,7 @@ def _packed_sequence_indices(global_cu_seqlens: torch.Tensor) -> torch.Tensor:
             device=global_cu_seqlens.device,
         ),
         sequence_lengths,
+        output_size=total_length,
     ).unsqueeze(0)
 
 
@@ -428,7 +430,7 @@ def head_parallel_gated_delta_net(
             weight=local_convolution_weight,
             bias=local_convolution_bias,
             activation=convolution_activation,
-            seq_idx=_packed_sequence_indices(global_cu_seqlens),
+            seq_idx=_packed_sequence_indices(global_cu_seqlens, global_sequence_length),
         )
     else:
         mixed_qkv = _fallback_depthwise_causal_convolution(
