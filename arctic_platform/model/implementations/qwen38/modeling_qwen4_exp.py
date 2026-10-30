@@ -27,6 +27,7 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
@@ -271,6 +272,24 @@ class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
         return output
 
 
+class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
+    """The hyper-connection mix and injection weights in fp32, as vLLM's ``hc_gate_mix`` and ``hc_combine`` compute them.
+
+    The mixed block input is rounded once. The injection weights stay fp32, so the decoder's residual add rounds once.
+    """
+
+    def forward(self, hyper_input: torch.Tensor):
+        normed = self.hc_norm(hyper_input)
+        gate = self.input_mix_weight_up(F.silu(self.input_mix_weight_down(normed) / self.hc_count))
+        streams = (self.hc_count, self.hidden_size)
+        mixed = (torch.sigmoid(gate.float()).unflatten(-1, streams) * normed.unflatten(-1, streams)).mean(dim=-2)
+        mixed = mixed.to(normed.dtype)
+        if self.block_inject_weight is None:
+            return mixed
+        injection_weights = 2 * torch.sigmoid(self.block_inject_weight(normed).float() / self.hc_count)
+        return mixed, hyper_input, injection_weights
+
+
 class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
     def forward(
         self,
@@ -308,14 +327,14 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
             )
 
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = (hyper_input + injection.flatten(-2)).to(hyper_input.dtype)
 
         hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
         routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
         hidden_states = self.mlp(hidden_states, routed_experts=routes)
 
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = (hyper_input + injection.flatten(-2)).to(hyper_input.dtype)
         return hidden_states
 
 
@@ -340,6 +359,10 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         self.model.__class__ = Qwen4ExpModelPrimeRL
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
+        if getattr(config, "fp32_parity", True):
+            for module in self.model.language_model.modules():
+                if type(module) is Qwen4ExpTextGatedResidual:
+                    module.__class__ = Qwen4ExpTextGatedResidualPrimeRL
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx

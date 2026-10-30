@@ -177,8 +177,8 @@ def register(registry: Registry) -> None:
             " under full activation checkpointing every decoder layer after the first holds the residual as a"
             " second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the"
             " end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on"
-            " Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product and"
-            " output gate in fp32."
+            " Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product, output"
+            " gate and hyper-connection mix and injection in fp32."
         ),
         remove_when="no job needs the residual adds, rotary embedding and beta gate in the input dtype",
         source="`loader_options.fp32_parity`",
