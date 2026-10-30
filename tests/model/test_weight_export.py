@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import sys
+import weakref
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
@@ -734,3 +735,69 @@ def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
     assert not supports_weight_format(model, weight_format)
     with pytest.raises(RuntimeError, match="EP-sharded models require an AP weight-export contract"):
         list(iter_model_weights(model, weight_format, is_master=True, is_zero3=False))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_vllm_ep_export_frees_each_gather_before_the_next(monkeypatch, rank):
+    """Every rank all-gathers each expert tensor whole; one gather's buffers must be gone before the next is allocated,
+    and while rank 0 hands its tensors out."""
+    import deepspeed.utils.groups as ds_groups
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import tag_expert_params_for_deepspeed
+    from arctic_platform.model.implementations.moe.layers.moe import MoE
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            num_experts=4,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            use_grouped_mm=False,
+            attn_implementation="sdpa",
+        )
+    )
+    for module in model.modules():  # this rank's expert-parallel half, as DeepEPExpertParallel leaves it
+        if isinstance(module, MoE):
+            for name, parameter in list(module.experts.named_parameters(recurse=False)):
+                module.experts.register_parameter(name, nn.Parameter(parameter.data[: len(parameter) // 2].clone()))
+    tag_expert_params_for_deepspeed(model, "ep_size_2")
+
+    gathered = []
+
+    def all_gather(outputs, local, group=None):
+        for output in outputs:
+            output.copy_(local)
+            gathered.append(weakref.ref(output))
+
+    def alive():
+        return sum(ref() is not None for ref in gathered)
+
+    class AliveAtAllocation(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.overloadpacket is torch.ops.aten.empty_like:
+                at_allocation.append(alive())
+            return func(*args, **(kwargs or {}))
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(ds_groups, "_get_expert_parallel_group", lambda group_name: None)
+    at_allocation, at_yield = [], []
+    with AliveAtAllocation():
+        for _, tensor in build_iter_full_vllm_weights(model)():
+            at_yield.append(alive())
+            del tensor
+
+    assert len(gathered) == 12  # 2 layers x 3 expert tensors x 2 buffers
+    assert at_allocation == [0] * 12
+    assert not any(at_yield) and bool(at_yield) == (rank == 0)
