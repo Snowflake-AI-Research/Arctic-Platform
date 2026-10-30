@@ -29,11 +29,10 @@ class _SumRowsByToken(torch.autograd.Function):
     @staticmethod
     def forward(ctx, rows: torch.Tensor, token_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
         ctx.save_for_backward(token_indices)
-        bags = torch.argsort(token_indices, stable=True)
+        sorted_tokens, bags = torch.sort(token_indices, stable=True)
         tokens = torch.arange(num_tokens, dtype=token_indices.dtype, device=token_indices.device)
         # Unlike CUDA bincount, fixed-size searchsorted does not read index extrema back to the host.
-        offsets = torch.searchsorted(token_indices.index_select(0, bags), tokens)
-        return F.embedding_bag(bags, rows, offsets, mode="sum")
+        return F.embedding_bag(bags, rows, torch.searchsorted(sorted_tokens, tokens), mode="sum")
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
