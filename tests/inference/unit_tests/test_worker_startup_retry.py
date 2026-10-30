@@ -487,3 +487,117 @@ def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc)
     assert str(worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))) == (
         "generic\nRoot cause in EngineCore: RuntimeError: x"
     )
+
+
+def test_durable_startup_error_new_retry_attempts_are_separated_and_ordered(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+
+    def begin(ordinal):
+        token = object()
+        events.append(("begin", ordinal, token))
+        return token
+
+    def finish(token, outcome, error):
+        events.append(("finish", token, outcome, error))
+
+    monkeypatch.setattr(
+        worker_mod,
+        "maybe_begin_inference_startup_attempt",
+        begin,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "maybe_finish_inference_startup_attempt",
+        finish,
+    )
+    retry_error = RuntimeError(
+        "DistNetworkError: EADDRINUSE address already in use"
+    )
+    terminal_error = ValueError("terminal engine construction failure")
+
+    observed, _ = _initialize_with_engine_attempts(
+        monkeypatch,
+        tmp_path,
+        [_raise(retry_error), _raise(terminal_error)],
+    )
+
+    assert observed is terminal_error
+    first_token = events[0][2]
+    second_token = events[2][2]
+    assert first_token is not second_token
+    assert events == [
+        ("begin", 1, first_token),
+        ("finish", first_token, "retry", retry_error),
+        ("begin", 2, second_token),
+        ("finish", second_token, "error", terminal_error),
+    ]
+
+
+def test_durable_startup_error_new_success_finishes_before_post_startup_work(
+    monkeypatch,
+):
+    events = []
+
+    class FakeEngineArgs:
+        def create_engine_config(self):
+            return types.SimpleNamespace(
+                structured_outputs_config=types.SimpleNamespace(
+                    enable_in_reasoning=False
+                ),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True,
+                    architecture="LlamaForCausalLM",
+                ),
+            )
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_vllm_config(cls, vllm_config, stat_loggers):
+            events.append("engine")
+            return cls()
+
+    _install_fake_vllm(monkeypatch, FakeAsyncLLM)
+    monkeypatch.setattr(worker_mod, "_ensure_arctic_vllm_patches", lambda: None)
+    monkeypatch.setattr(
+        worker_mod,
+        "_ensure_router_replay_vllm_patches",
+        lambda: None,
+    )
+    monkeypatch.setattr(worker_mod, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_spec_decode_grammar_fix", lambda: None)
+    monkeypatch.setattr(
+        worker_mod,
+        "_create_async_engine_args",
+        lambda kwargs, **_ignored: FakeEngineArgs(),
+    )
+    token = object()
+    monkeypatch.setattr(
+        worker_mod,
+        "maybe_begin_inference_startup_attempt",
+        lambda ordinal: events.append(("begin", ordinal)) or token,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "maybe_finish_inference_startup_attempt",
+        lambda attempt, outcome, error: events.append(
+            ("finish", attempt, outcome, error)
+        ),
+    )
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+
+    asyncio.run(
+        worker.initialize(
+            {"model": "test-model"},
+            model_id="job-1",
+        )
+    )
+
+    assert events == [
+        ("begin", 1),
+        "engine",
+        ("finish", token, "ready", None),
+    ]
+    assert worker.state == WorkerLifecycleState.READY

@@ -31,6 +31,15 @@ def _layer_indices(state_dict: dict[str, Tensor]) -> list[int]:
     return sorted({int(match.group(1)) for name in state_dict if (match := _LAYER_RE.match(name)) is not None})
 
 
+def checkpoint_conversion_groups(names: tuple[str, ...]) -> list[list[str]]:
+    """Keep each language layer's fused projections and expert scales together."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        match = _LAYER_RE.match(name)
+        groups.setdefault(match.group(0) if match is not None else name, []).append(name)
+    return list(groups.values())
+
+
 def _rename(state_dict: dict[str, Tensor], old: str, new: str) -> None:
     if old in state_dict:
         state_dict[new] = state_dict.pop(old)
@@ -107,6 +116,32 @@ def convert_hf_layer_to_prime(
         ("f_b_proj.weight", "forget_gate.f_b_proj.weight"),
     ):
         _rename(state_dict, f"{attn}.{source}", f"{attn}.{target}")
+
+    mlp_prefix = f"{prefix}.mlp."
+    packed_key = f"{mlp_prefix}experts.gate_up_proj"
+    if packed_key in state_dict or f"{packed_key}.weight" in state_dict:
+        from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_glm_moe_dsa import (
+            convert_hf_layer_to_tt,
+        )
+
+        # GLM-5.3 nests the same MoE tensor layout under its language-model prefix.
+        converter_prefix = f"model.layers.{layer_idx}.mlp."
+        mlp_state = {
+            converter_prefix + name[len(mlp_prefix) :]: tensor
+            for name, tensor in state_dict.items()
+            if name.startswith(mlp_prefix)
+        }
+        convert_hf_layer_to_tt(mlp_state, layer_idx)
+        for expert_kind in ("experts", "shared_expert"):
+            for projection in ("w1", "w2", "w3"):
+                weight_key = f"{converter_prefix}{expert_kind}.{projection}"
+                if mlp_state[weight_key].dtype == torch.float8_e4m3fn and f"{weight_key}_scale_inv" not in mlp_state:
+                    raise ValueError(f"GLM-5.3 native FP8 weight {weight_key} is missing its scale")
+        for name in tuple(state_dict):
+            if name.startswith(mlp_prefix):
+                del state_dict[name]
+        state_dict.update({mlp_prefix + name[len(converter_prefix) :]: tensor for name, tensor in mlp_state.items()})
+        return state_dict
 
     expert_ids = _expert_indices(state_dict, prefix)
     if expert_ids:

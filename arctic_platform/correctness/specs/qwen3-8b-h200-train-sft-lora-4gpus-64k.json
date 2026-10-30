@@ -1,0 +1,96 @@
+{
+  "applicable_tests": [
+    "checkpoint-resume-loss",
+    "e2e-sft-train-validate",
+    "single-step-grads",
+    "single-step-optimizer"
+  ],
+  "arms": [
+    {
+      "active_tokens": 30442,
+      "dss_microbatches": 1,
+      "global_batch_size": 4,
+      "max_seq_len": 16384,
+      "name": "gas1",
+      "pad_fraction": 0.535491943359375,
+      "total_tokens": 65536
+    },
+    {
+      "active_tokens": 133124,
+      "dss_microbatches": 4,
+      "global_batch_size": 16,
+      "max_seq_len": 16384,
+      "name": "gas4",
+      "pad_fraction": 0.4921722412109375,
+      "total_tokens": 262144
+    }
+  ],
+  "attn_implementations": [
+    "flash_attention_3"
+  ],
+  "config_checksum": "da2feff48b64657f133dd36f2ef245d46bfca4c7ae72a5b70efb2779a85d8bb5",
+  "config_id": "qwen3-8b-h200-train-sft-lora-4gpus-64k",
+  "config_path": "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-lora-4gpus-64k.config",
+  "inapplicable": {},
+  "model": {
+    "cache_path": "/data-fast/base-models/synthetic/Qwen3-8B-4L",
+    "content_hash": "ea50295f7d03ddc9",
+    "measured_reference_peak_gib": 11.78840446472168,
+    "num_hidden_layers": 4,
+    "param_count": 2016449536,
+    "seed": 0,
+    "sized_against_gib": 100.0,
+    "source_checkpoint": "Qwen/Qwen3-8B",
+    "vision_depth": 2
+  },
+  "notes": [
+    "Single-GPU reference uses flash_attention_3 with 4 complete-cycle layers and peaks at 11.788 GiB."
+  ],
+  "param_name_map": {},
+  "test_settings": {
+    "single-step-optimizer": {
+      "calibration_metric": "maximum pairwise full-tensor L2 delta across 16 runs",
+      "ce_chunk": 2048,
+      "learning_rate": 0.01,
+      "model_cache_path": "/data-fast/base-models/synthetic/Qwen3-8B-4L",
+      "num_hidden_layers": 4,
+      "optimizer_dtype": "float32",
+      "reference_token_budget": 10240
+    }
+  },
+  "test_tolerances": {
+    "checkpoint-resume-loss": {
+      "absolute": 0.001,
+      "calibration_runs": 3,
+      "computed_gate": 0.0009791851043701172,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 0.0004895925521850586,
+      "rounding_quantum": 0.001,
+      "status": "calibrated",
+      "worst_tensor": "gas1 loss at iteration 2"
+    },
+    "single-step-grads": {
+      "absolute": 0.001,
+      "calibration_runs": 16,
+      "computed_gate": 7.65770673751831e-05,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 3.828853368759155e-05,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 16 nondeterministic reference executions; 2x rounded upward in 1e-3 units",
+      "worst_tensor": "base_model.model.model.layers.0.self_attn.k_proj.lora_B.default.weight"
+    },
+    "single-step-optimizer": {
+      "absolute": 0.537,
+      "calibration_runs": 16,
+      "computed_gate": 0.5363892316818237,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 0.26819461584091187,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 16 nondeterministic optimizer-reference executions; 2x the maximum pairwise full-tensor delta, rounded upward in 1e-3 units",
+      "worst_tensor": "layers.0.self_attn.q_proj.lora_B.default.weight::parameter_update"
+    }
+  }
+}

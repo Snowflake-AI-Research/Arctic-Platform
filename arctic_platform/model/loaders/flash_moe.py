@@ -24,6 +24,10 @@ from __future__ import annotations
 from pydantic import Field
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
+from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
+from arctic_platform.model.implementations.qwen38 import QWEN38_ATTN_BACKEND
+from arctic_platform.model.implementations.qwen38 import QWEN38_NUM_EXPERTS
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -58,11 +62,11 @@ class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
 
 
-def _matches(model_type: str):
+def _matches(family: str):
     def matches(ctx: LoaderContext) -> bool:
         if ctx.spec.parallelism.expert_parallel <= 1:
             return False
-        return ctx.hf_model_type == model_type or ctx.hf_text_model_type == model_type
+        return ctx.hf_model_family == family
 
     return matches
 
@@ -97,9 +101,6 @@ def _validate_common(
 
 
 def _validate_glm5_next(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.glm53.context_parallel import SPARSE_MLA_BACKENDS
-    from arctic_platform.model.implementations.glm53.deepspeed_integration import GLM53_ATTN_BACKEND
-
     _validate_common(
         spec,
         "GLM-5.3-Flash",
@@ -113,9 +114,6 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
 
 
 def _validate_qwen4_exp(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_ATTN_BACKEND
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_NUM_EXPERTS
-
     _validate_common(
         spec,
         "Qwen3.8-Flash-Next",
@@ -133,6 +131,32 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
             f"Qwen3.8-Flash-Next has {QWEN38_NUM_EXPERTS} experts, "
             f"so ep_size={ep_size} must divide {QWEN38_NUM_EXPERTS}."
         )
+
+
+def _prepare(spec: ModelSpec, prepare_weights, *, world_size: int, rank: int, local_rank: int):
+    assert spec.attn_implementation is not None
+    return prepare_weights(
+        model_name=spec.model_path_or_name,
+        optimization_dtype=spec.dtype,
+        attn_implementation=spec.attn_implementation,
+        ep_size=spec.parallelism.expert_parallel,
+        world_size=world_size,
+        options=Qwen3_5MoeOptions.model_validate(spec.loader_options),
+        rank=rank,
+        local_rank=local_rank,
+    )
+
+
+def _prepare_glm5_next(spec: ModelSpec, **kwargs):
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import prepare_glm5_next_weights
+
+    return _prepare(spec, prepare_glm5_next_weights, **kwargs)
+
+
+def _prepare_qwen4_exp(spec: ModelSpec, **kwargs):
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import prepare_qwen4_exp_weights
+
+    return _prepare(spec, prepare_qwen4_exp_weights, **kwargs)
 
 
 def _load(ctx: LoaderContext, load_model) -> LoadedModel:
@@ -161,6 +185,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     matches=_matches("glm5_next"),
     options=FlashMoeOptions,
     validate_spec=_validate_glm5_next,
+    prepare_weights=_prepare_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
@@ -173,6 +198,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     matches=_matches("qwen4_exp"),
     options=FlashMoeOptions,
     validate_spec=_validate_qwen4_exp,
+    prepare_weights=_prepare_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model

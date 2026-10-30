@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_a
 )
 from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
+from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
@@ -53,7 +54,6 @@ _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
 # Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
 _SCORE_BUDGET_BYTES = 1 << 30
-SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
 
 
 def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
@@ -560,6 +560,24 @@ def _pad_sparse_indices(indices: torch.Tensor, multiple: int = 128) -> torch.Ten
     return F.pad(indices, (0, padded_width - width), value=-1)
 
 
+def _sparse_indexer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    q_resid: torch.Tensor,
+    attention_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+):
+    return _select_sparse_indices(
+        self,
+        hidden_states,
+        q_resid,
+        attention_mask,
+        cu_seqlens,
+        cp_group=self._cp_group,
+        cp_rank=self._cp_rank,
+    )
+
+
 def _sparse_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -605,14 +623,11 @@ def _sparse_attention_forward(
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-        topk_indices = _select_sparse_indices(
-            self.indexer,
+        topk_indices = self.indexer(
             hidden_states,
             q_resid,
             attention_mask,
             global_cu_seqlens,
-            cp_group=self._cp_group,
-            cp_rank=self._cp_rank,
         )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
@@ -981,6 +996,10 @@ def apply_context_parallelism(
         attention._cp_world_size = cp_world_size
         if layer.block_type == "deepseek_sparse_attention":
             attention._ap_sparse_mla_backend = attn_implementation
+            if attention.indexer is not None:
+                attention.indexer._cp_group = cp_group
+                attention.indexer._cp_rank = cp_rank
+                attention.indexer.forward = types.MethodType(_sparse_indexer_forward, attention.indexer)
             attention.forward = types.MethodType(
                 _sparse_attention_forward,
                 attention,

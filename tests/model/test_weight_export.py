@@ -14,6 +14,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -38,6 +39,8 @@ from arctic_platform.model import save_peft_adapters
 from arctic_platform.model import supports_weight_format
 from arctic_platform.model.weight_export import register_weight_export
 from arctic_platform.model.weight_export import transfer_weight_export
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 class _Model(nn.Module):
@@ -441,6 +444,188 @@ def test_save_peft_adapters_writes_peft_names_under_activation_checkpointing(tmp
     assert all(torch.equal(wrapped[name], plain[name]) for name in plain)
 
 
+class _AdapterBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+        self.head = nn.Linear(4, 2, bias=False)
+        self.embed = nn.Embedding(8, 4)
+        self.config = {"model_type": "test"}
+
+    def forward(self, hidden):
+        return self.head(self.proj(hidden))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("adapter_names", [("default",), ("trained",), ("default", "trained"), ("first", "second")])
+def test_peft_checkpoint_roundtrip_preserves_trained_tensors(tmp_path, wrapped, adapter_names):
+    from peft import LoraConfig
+    from peft import PeftModel
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    set_seed(0)
+    config = LoraConfig(r=2, lora_alpha=2, target_modules=["proj", "embed"], modules_to_save=["head"])
+    model = get_peft_model(_AdapterBase(), config, adapter_name=adapter_names[0])
+    for adapter_name in adapter_names[1:]:
+        model.add_adapter(adapter_name, config)
+    expected = {}
+    for index, adapter_name in enumerate(adapter_names):
+        with torch.no_grad():
+            model.base_model.model.proj.lora_A[adapter_name].weight.fill_(0.25 + index)
+            model.base_model.model.proj.lora_B[adapter_name].weight.fill_(0.5 + index)
+            model.base_model.model.head.modules_to_save[adapter_name].weight.fill_(0.75 + index)
+            model.base_model.model.embed.lora_embedding_A[adapter_name].fill_(0.125 + index)
+            model.base_model.model.embed.lora_embedding_B[adapter_name].fill_(0.375 + index)
+        expected[adapter_name] = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+            if adapter_name in name.split(".") and ("lora_" in name or "modules_to_save" in name)
+        }
+    if wrapped:
+        model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+        model.base_model.model.head = checkpoint_wrapper(model.base_model.model.head)
+        model.base_model.model.embed = checkpoint_wrapper(model.base_model.model.embed)
+
+    save_peft_adapters(model, str(tmp_path))
+
+    for adapter_name in adapter_names:
+        adapter = tmp_path / PEFT_ADAPTER_DIRNAME
+        if adapter_name != "default":
+            adapter /= adapter_name
+        saved = load_file(adapter / "adapter_model.safetensors")
+        assert len(saved) == 5
+        assert all("_checkpoint_wrapped_module" not in name for name in saved)
+        reloaded = PeftModel.from_pretrained(_AdapterBase(), adapter, adapter_name=adapter_name)
+        actual = {
+            name: parameter.detach()
+            for name, parameter in reloaded.named_parameters()
+            if "lora_" in name or "modules_to_save" in name
+        }
+        assert actual.keys() == expected[adapter_name].keys()
+        for name, tensor in expected[adapter_name].items():
+            torch_assert_equal(actual[name], tensor, msg=name)
+
+
+@pytest.mark.parametrize("is_zero3", [False, True])
+@pytest.mark.parametrize("keep_checkpoint_wrappers", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_gather_peft_adapter_state_dict_preserves_public_name_contract(
+    monkeypatch, is_zero3, keep_checkpoint_wrappers, rank
+):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+    live = {name: parameter for name, parameter in model.named_parameters() if "lora_" in name}
+    entered = []
+
+    class GatheredParameters:
+        def __init__(self, parameters, modifier_rank):
+            assert [id(parameter) for parameter in parameters] == [id(parameter) for parameter in live.values()]
+            assert modifier_rank == 0
+
+        def __enter__(self):
+            entered.append(True)
+
+        def __exit__(self, *_exc):
+            pass
+
+    if is_zero3:
+        _install_gathered_parameters(monkeypatch, GatheredParameters)
+    kwargs = dict(keep_checkpoint_wrappers=True) if keep_checkpoint_wrappers else {}
+    state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3, **kwargs)
+
+    assert entered == ([True] if is_zero3 else [])
+    if rank != 0:
+        assert state == {}
+        return
+    expected = {
+        name if keep_checkpoint_wrappers else name.replace("._checkpoint_wrapped_module", ""): parameter
+        for name, parameter in live.items()
+    }
+    assert state.keys() == expected.keys()
+    for name, tensor in state.items():
+        torch_assert_equal(tensor, expected[name])
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_peft_checkpoint_handles_shared_adapter_storage(tmp_path, wrapped):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj", "head"]))
+    model.base_model.model.head.lora_A["default"].weight.data = model.base_model.model.proj.lora_A[
+        "default"
+    ].weight.data
+    expected = model.base_model.model.proj.lora_A["default"].weight.detach().clone()
+    if wrapped:
+        model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+        model.base_model.model.head = checkpoint_wrapper(model.base_model.model.head)
+
+    save_peft_adapters(model, str(tmp_path))
+
+    saved = load_file(tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors")
+    assert len(saved) == 4
+    for module_name in ("proj", "head"):
+        torch_assert_equal(saved[f"base_model.model.{module_name}.lora_A.weight"], expected)
+
+
+def test_peft_checkpoint_saves_peft_auto_mapping(tmp_path):
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+
+    save_peft_adapters(model, str(tmp_path))
+
+    config = json.loads((tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_config.json").read_text())
+    assert config["auto_mapping"] == dict(base_model_class="_AdapterBase", parent_library=__name__)
+    assert config["inference_mode"] is True
+    assert model.peft_config["default"].inference_mode is False
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_peft_checkpoint_rejects_empty_adapter(tmp_path, monkeypatch, wrapped):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    if wrapped:
+        model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+    monkeypatch.setattr("peft.peft_model.get_peft_model_state_dict", lambda *args, **kwargs: {})
+
+    with pytest.raises(ValueError, match="PEFT saved an empty adapter: default"):
+        save_peft_adapters(model, str(tmp_path))
+
+
+def test_peft_checkpoint_rejects_colliding_portable_names(tmp_path, monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import save_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+
+    def save_with_collision(tensors, filename, **kwargs):
+        name = next(iter(tensors))
+        tensors = dict(tensors)
+        tensors[name.replace("._checkpoint_wrapped_module", "")] = tensors[name].clone()
+        save_file(tensors, filename, **kwargs)
+
+    monkeypatch.setattr("peft.peft_model.safe_save_file", save_with_collision)
+
+    with pytest.raises(ValueError, match="PEFT checkpoint names collide after unwrapping"):
+        save_peft_adapters(model, str(tmp_path))
+
+
 def test_iter_lora_weights_rejects_non_lora_trainables():
     model = _Model(
         [
@@ -460,7 +645,7 @@ def test_iter_lora_weights_rejects_non_lora_trainables():
         list(iter_lora_weights(model, is_master=True, is_zero3=False))
 
 
-def _export_names(model, weight_format, monkeypatch):
+def _export_names(model, weight_format, monkeypatch, **kwargs):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     return [
         name
@@ -469,8 +654,39 @@ def _export_names(model, weight_format, monkeypatch):
             weight_format,
             is_master=True,
             is_zero3=False,
+            **kwargs,
         )
     ]
+
+
+@pytest.mark.parametrize("weight_format", ["vllm", "hf"])
+def test_full_weight_sync_refuses_trainable_lora_parameters(weight_format, monkeypatch):
+    model = _Model(
+        [
+            ("base_model.model.proj.base_layer.weight", SimpleNamespace(requires_grad=False, data=torch.ones(1))),
+            ("base_model.model.proj.lora_A.default.weight", SimpleNamespace(requires_grad=True, data=torch.ones(1))),
+            ("base_model.model.proj.lora_B.default.weight", SimpleNamespace(requires_grad=True, data=torch.ones(1))),
+        ],
+        peft_config={"default": SimpleNamespace(r=8)},
+    )
+
+    with pytest.raises(ValueError, match=r"2 trainable LoRA parameter.*weight_format='lora'"):
+        _export_names(model, weight_format, monkeypatch)
+
+
+def test_hf_checkpoint_export_of_a_peft_model_writes_the_unmerged_base(monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    base_weight = model.base_model.model.proj.base_layer.weight
+
+    with pytest.raises(ValueError, match="weight_format='lora'"):
+        _export_names(model, "hf", monkeypatch)
+    exported = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False, include_skipped=True))
+
+    assert not any("lora_" in name for name in exported)
+    assert torch.equal(exported["proj.weight"], base_weight)
 
 
 def test_peft_wrapped_qwen3_moe_keeps_hf_family_export(monkeypatch):
@@ -506,7 +722,7 @@ def test_peft_wrapped_qwen3_moe_keeps_hf_family_export(monkeypatch):
     with pytest.raises(RuntimeError, match="convert_layer_to_hf"):
         build_iter_full_hf_weights(wrapped)
 
-    names = _export_names(wrapped, "hf", monkeypatch)
+    names = _export_names(wrapped, "hf", monkeypatch, include_skipped=True)
     assert "model.layers.0.mlp.gate.weight" in names
     assert any(name.startswith("model.layers.0.mlp.experts.") for name in names)
     assert not any("lora_" in name for name in names)
@@ -550,6 +766,7 @@ def test_peft_wrapped_qwen3_5_moe_keeps_vllm_family_export(monkeypatch):
     with pytest.raises(AssertionError, match="PeftModel"):
         _build_iter_full_vllm_weights(wrapped)
 
+    wrapped.requires_grad_(False)
     names = _export_names(wrapped, "vllm", monkeypatch)
     assert "model.layers.0.mlp.gate.weight" in names
     assert "model.layers.0.mlp.experts.w13_weight" in names
@@ -734,3 +951,31 @@ def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
     assert not supports_weight_format(model, weight_format)
     with pytest.raises(RuntimeError, match="EP-sharded models require an AP weight-export contract"):
         list(iter_model_weights(model, weight_format, is_master=True, is_zero3=False))
+
+
+def test_peft_normalization_failure_preserves_the_saved_adapter(tmp_path, monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+    weights_path = tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors"
+    original_bytes = []
+
+    def failed_save(tensors, filename, **kwargs):
+        original_bytes.append(weights_path.read_bytes())
+        assert Path(filename) != weights_path
+        Path(filename).write_bytes(b"incomplete normalization")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr("safetensors.torch.save_file", failed_save)
+    with pytest.raises(OSError, match="injected write failure"):
+        save_peft_adapters(model, str(tmp_path))
+
+    assert weights_path.read_bytes() == original_bytes[0]
+    saved = load_file(weights_path)
+    assert len(saved) == 2
+    assert all("_checkpoint_wrapped_module" in name for name in saved)
+    assert list(weights_path.parent.glob(".adapter-*")) == []

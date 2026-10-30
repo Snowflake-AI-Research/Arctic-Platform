@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Mapping
+from urllib.parse import quote
 
 import torch
 import torch.nn as nn
@@ -13,9 +17,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 
+from arctic_platform.debug.lora import maybe_observe_model_materialization
 from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
+from arctic_platform.model.loader import canonical_parameter_name
 
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
@@ -42,10 +48,152 @@ class MoEDeepSpeedAdapter:
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
+    hf_weight_export: Callable[[nn.Module], Callable] | None = None
+    # ``(config) -> source dir`` and ``(model, config, source, *, rank, local_rank) -> cache dir | None``: the
+    # conversion half of ``load_dcp_from_hf``, callable without a process group.
+    resolve_weight_source: Callable[[Any], Path] | None = None
+    prepare_weight_conversion: Callable[..., Path | None] | None = None
 
 
-# Largest EP-group gather assembled on the master GPU in one piece during weight export.
-_EXPORT_GATHER_BYTES = 1 << 30
+def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
+    if not any(isinstance(module, (MoE, LatentMoE)) for module in model.modules()):
+        return {}
+    groups: dict[str, dict[str, nn.Parameter]] = {}
+    for name, parameter in model.named_parameters():
+        if getattr(parameter, "allreduce", True) is False:
+            group_name = parameter.group_name
+            groups.setdefault(group_name, {})[name] = parameter
+    return groups
+
+
+def _ep_checkpoint_identity(group_name: str) -> dict:
+    import deepspeed.utils.groups as ds_groups
+
+    return dict(
+        group_name=group_name,
+        ep_size=ds_groups._get_expert_parallel_world_size(group_name),
+        ep_rank=ds_groups._get_expert_parallel_rank(group_name),
+    )
+
+
+def _ep_checkpoint_path(directory, tag, identity: dict) -> Path:
+    group_name = quote(identity["group_name"], safe="")
+    return Path(directory) / tag / f"ap_ep_{group_name}_rank_{identity['ep_rank']:02d}_model_states.pt"
+
+
+def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
+    import deepspeed.utils.groups as ds_groups
+    from deepspeed.checkpoint.constants import FROZEN_PARAM_FRAGMENTS
+
+    original_load = engine_type._load_checkpoint
+    original_module_load = engine_type.load_module_state_dict
+    load_signature = signature(original_load)
+    module_load_signature = signature(original_module_load)
+
+    def wrap_save(original_save):
+        save_signature = signature(original_save)
+
+        @wraps(original_save)
+        def save(self, *args, **kwargs):
+            bound = save_signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            arguments = bound.arguments
+            parameters = _ep_checkpoint_parameters(self.module)
+            if len(parameters) > 0 and self.zero_optimization_partition_weights():
+                raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
+            result = original_save(self, *args, **kwargs)
+            for group_name, named_parameters in parameters.items():
+                data_rank = ds_groups._get_expert_data_parallel_rank(group_name)
+                if not self.checkpoint_engine.is_data_parallel_writer(data_rank):
+                    continue
+                identity = _ep_checkpoint_identity(group_name)
+                state = {
+                    name: parameter.detach()
+                    for name, parameter in named_parameters.items()
+                    if parameter.requires_grad or not arguments["exclude_frozen_parameters"]
+                }
+                self.checkpoint_engine.save(
+                    dict(
+                        version=1,
+                        **identity,
+                        exclude_frozen_parameters=arguments["exclude_frozen_parameters"],
+                        module=state,
+                    ),
+                    str(_ep_checkpoint_path(arguments["save_dir"], arguments["tag"], identity)),
+                )
+            return result
+
+        return save
+
+    @wraps(original_load)
+    def load(self, *args, **kwargs):
+        bound = load_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        parameters = _ep_checkpoint_parameters(self.module)
+        if len(parameters) == 0:
+            return original_load(self, *args, **kwargs)
+        if self.zero_optimization_partition_weights():
+            raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
+        local_state = {}
+        for group_name, named_parameters in parameters.items():
+            identity = _ep_checkpoint_identity(group_name)
+            path = _ep_checkpoint_path(arguments["load_dir"], arguments["tag"], identity)
+            if not path.is_file():
+                raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
+            shard = self.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
+            if (
+                not isinstance(shard, dict)
+                or type(shard.get("version")) is not int
+                or shard["version"] != 1
+                or any(shard.get(key) != value for key, value in identity.items())
+                or type(shard.get("exclude_frozen_parameters")) is not bool
+                or not isinstance(shard.get("module"), dict)
+            ):
+                raise ValueError(f"AP expert-parallel checkpoint shard metadata does not match: {path}")
+            expected_names = {
+                name
+                for name, parameter in named_parameters.items()
+                if parameter.requires_grad or not shard["exclude_frozen_parameters"]
+            }
+            if set(shard["module"]) != expected_names:
+                raise ValueError(f"AP expert-parallel checkpoint parameter coverage does not match: {path}")
+            for name, value in shard["module"].items():
+                if not isinstance(value, torch.Tensor) or value.shape != named_parameters[name].shape:
+                    raise ValueError(f"AP expert-parallel checkpoint tensor shape does not match for {name}: {path}")
+            local_state.update(shard["module"])
+        self._ap_ep_checkpoint_state = local_state
+        try:
+            return original_load(*bound.args, **bound.kwargs)
+        finally:
+            del self._ap_ep_checkpoint_state
+
+    @wraps(original_module_load)
+    def load_module(self, *args, **kwargs):
+        if not hasattr(self, "_ap_ep_checkpoint_state"):
+            return original_module_load(self, *args, **kwargs)
+        bound = module_load_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        checkpoint = dict(bound.arguments["checkpoint"])
+        checkpoint["module"] = dict(checkpoint["module"])
+        checkpoint["module"].update(
+            (canonical_parameter_name(name), value) for name, value in self._ap_ep_checkpoint_state.items()
+        )
+        # DeepSpeed restores frozen fragments after the module, so both must use the local shard.
+        if checkpoint.get(FROZEN_PARAM_FRAGMENTS) is not None:
+            fragments = dict(checkpoint[FROZEN_PARAM_FRAGMENTS])
+            fragments.update(
+                (name, value) for name, value in self._ap_ep_checkpoint_state.items() if name in fragments
+            )
+            checkpoint[FROZEN_PARAM_FRAGMENTS] = fragments
+        bound.arguments["checkpoint"] = checkpoint
+        return original_module_load(*bound.args, **bound.kwargs)
+
+    engine_type._save_moe_checkpoint = wrap_save(engine_type._save_moe_checkpoint)
+    # Frozen expert-only models follow DeepSpeed's ordinary checkpoint path.
+    engine_type._save_checkpoint = wrap_save(engine_type._save_checkpoint)
+    engine_type._load_checkpoint = load
+    engine_type.load_module_state_dict = load_module
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -72,6 +220,7 @@ def patch_deepspeed_moe_detection() -> None:
             if num_experts is not None:
                 self.num_experts.append(num_experts)
 
+    _patch_deepspeed_ep_checkpoints(ds_engine.DeepSpeedEngine)
     ds_engine.DeepSpeedEngine._configure_distributed_model = patched
     ds_engine.DeepSpeedEngine._ap_moe_patched = True
 
@@ -153,6 +302,84 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+def _gather_ep_weight_to_cpu(
+    tensor: torch.Tensor,
+    ep_group,
+    *,
+    is_master: bool,
+    max_gather_bytes: int = 64 * 1024 * 1024,
+) -> torch.Tensor | None:
+    import torch.distributed as dist
+
+    local = tensor.detach().contiguous()
+    ep_size = dist.get_world_size(group=ep_group)
+    if local.ndim == 0:
+        raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
+    if max_gather_bytes < ep_size * local.element_size():
+        raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    full = None
+    if is_master:
+        full = torch.empty(
+            (ep_size * local.shape[0], *local.shape[1:]),
+            dtype=local.dtype,
+            device="cpu",
+        )
+    if local.numel() == 0:
+        return full
+    if ep_size == 1:
+        if full is not None:
+            full.copy_(local)
+        return full
+
+    # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
+    flat = local.view(-1)
+    chunk_elements = min(flat.numel(), max_gather_bytes // (ep_size * local.element_size()))
+    gathered = torch.empty(ep_size * chunk_elements, dtype=local.dtype, device=local.device)
+    full_shards = full.view(ep_size, flat.numel()) if full is not None else None
+    use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
+    for offset in range(0, flat.numel(), chunk_elements):
+        count = min(chunk_elements, flat.numel() - offset)
+        outputs = gathered[: ep_size * count]
+        inputs = flat[offset : offset + count]
+        if use_direct_buffer:
+            # NCCL's list gather allocates another packed output; write into the bounded buffer directly.
+            dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
+        else:
+            dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if full_shards is not None:
+            for rank, shard in enumerate(outputs.view(ep_size, count)):
+                full_shards[rank, offset : offset + count].copy_(shard)
+    return full
+
+
+def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
+    """Gather an EP-sharded tensor to rank 0's host memory with one GPU piece buffer per rank."""
+    import torch.distributed as dist
+
+    ranks = dist.get_process_group_ranks(ep_group)
+    if 0 not in ranks:
+        return None
+    is_master = dist.get_rank() == 0
+    world, rows = dist.get_world_size(group=ep_group), local.shape[0]
+    pieces = local.tensor_split(world)
+    full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+    received = torch.empty_like(pieces[0])
+    start = 0
+    for piece in pieces:
+        for group_rank, rank in enumerate(ranks):
+            if rank == 0:
+                if full is not None:
+                    full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
+                continue
+            buffer = piece if dist.get_rank() == rank else received[: len(piece)]
+            dist.broadcast(buffer, src=rank, group=ep_group)
+            if full is not None:
+                full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
+        start += len(piece)
+    return full
+
+
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
     if getattr(model_type, "convert_layer_to_hf", None) is None:
@@ -175,39 +402,6 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
-        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
-
-        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
-        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
-        """
-        rows = local.shape[0]
-        row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
-        if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
-            if is_master:
-                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
-                gather_list = list(full.chunk(world, dim=0))
-            else:
-                full = None
-                gather_list = None
-            dist.gather(local, gather_list, dst=0, group=ep_group)
-            return full
-        step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
-        if is_master:
-            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
-            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
-        else:
-            full = None
-            buffer = None
-        for start in range(0, rows, step):
-            n = min(step, rows - start)
-            outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
-            if full is not None and buffer is not None:
-                for r in range(world):
-                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
-        return full
-
     def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
@@ -221,8 +415,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
-                getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
+                getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids
             ):
                 continue
             hf_name = hf_export_param_name(name)
@@ -235,13 +428,15 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
-                    # Only the master consumes the export: gather its EP group's shards straight into one output
-                    # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
-                    if 0 not in dist.get_process_group_ranks(ep_group):
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
+                        local = tensor.data.contiguous()
+                        full = _gather_ep_shards_to_rank0_host(local, ep_group)
+                        if is_master:
+                            layer_state[name] = full
+                        del full
                         continue
-                    local = tensor.data.contiguous()
-                    world = dist.get_world_size(group=ep_group)
-                    full = _gather_to_master(local, world, ep_group, is_master)
+                    full = _gather_ep_weight_to_cpu(tensor, ep_group, is_master=is_master)
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -293,6 +488,7 @@ def setup_model_local_no_train(
     if config.ac is not None:
         adapter.apply_ac(model, config.ac)
 
+    maybe_observe_model_materialization(model, adapter, config, parallel_dims, ep_mesh)
     adapter.load_dcp_from_hf(model, config, parallel_dims)
     adapter.reset_runtime_moe_buffers(model)
     count = convert_dtensors_to_local(model)
@@ -337,11 +533,52 @@ def load_moe_model_for_deepspeed(
     register_weight_export(
         model,
         WeightExportContract(
-            hf=build_iter_full_hf_weights,
+            hf=adapter.hf_weight_export or build_iter_full_hf_weights,
             vllm=adapter.vllm_weight_export,
         ),
     )
     return model
+
+
+def prepare_moe_weights(
+    adapter: MoEDeepSpeedAdapter,
+    *,
+    model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
+    ep_size: int,
+    world_size: int,
+    options: Any,
+    rank: int,
+    local_rank: int,
+) -> Path | None:
+    """Fill the converted-weight cache that ``load_moe_model`` with the same arguments loads from.
+
+    Runs without a process group, on a meta-device model, so one process per node can convert before the training
+    job starts and the distributed load then finds a ready cache. Returns the cache path, or None when the family
+    has no conversion step, the checkpoint already matches the model's format, or the model is randomly initialized.
+    """
+    if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
+        return None
+    if world_size % ep_size:
+        raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+    model_config = adapter.build_model_config(
+        model_name,
+        ep_size,
+        world_size // ep_size,
+        optimization_dtype,
+        attn_implementation,
+        options,
+    )
+    if model_config.debug.random_init:
+        return None
+    model = adapter.get_model(
+        model_config,
+        device=torch.device("meta"),
+        dtype=adapter.dtype_map[model_config.optimization_dtype],
+    )
+    source_path = adapter.resolve_weight_source(model_config)
+    return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
 
 def load_moe_model(

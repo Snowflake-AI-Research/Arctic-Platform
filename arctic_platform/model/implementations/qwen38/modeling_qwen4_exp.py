@@ -430,6 +430,12 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         return convert_hf_to_prime(state_dict)
 
     @classmethod
+    def convert_to_prime_checkpoint(cls, source_dir, save_dir) -> None:
+        from .converting_qwen4_exp import convert_hf_checkpoint_to_prime
+
+        convert_hf_checkpoint_to_prime(source_dir, save_dir)
+
+    @classmethod
     def convert_layer_to_hf(
         cls,
         state_dict: dict[str, Tensor],

@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from arctic_platform.debug.training import maybe_record_router_replay_received
+
 logger = logging.getLogger(__name__)
 
 ROUTER_REPLAY_CACHE_DTYPE = torch.uint8
@@ -592,3 +594,8 @@ class RouterReplayCacheRX(_RouterReplayCacheBase):
     Filled by ``recv_router_replay`` and drained by the per-rank
     ``fwd_bwd``. Empty after each successful step (asserted in tests).
     """
+
+    def pop(self, sample_id: str) -> torch.Tensor:
+        tensor = super().pop(sample_id)
+        maybe_record_router_replay_received(sample_id, tensor)
+        return tensor

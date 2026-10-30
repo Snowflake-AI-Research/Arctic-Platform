@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.debug.training import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
@@ -43,6 +44,7 @@ class DebugModelOptions(BaseModel):
     num_layers: int | None = Field(None, gt=0)
     gradient_sample_max_numel: int = Field(0, ge=0)
     full_determinism: bool = False
+    reduced_fixture_mtp: ReducedFixtureMTP | None = None
 
 
 class Qwen3_5MoeOptions(BaseModel):
@@ -94,7 +96,7 @@ class Qwen3_5MoeOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    return ctx.hf_model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or ctx.hf_text_model_type == "qwen3_5_moe_text"
+    return ctx.hf_model_family == "qwen3_5_moe"
 
 
 def _validate_spec(spec: ModelSpec) -> None:
@@ -118,11 +120,28 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
 
+def _prepare_weights(spec: ModelSpec, *, world_size: int, rank: int, local_rank: int):
+    from arctic_platform.model.implementations.qwen35 import prepare_qwen3_5_moe_weights
+
+    assert spec.attn_implementation is not None
+    return prepare_qwen3_5_moe_weights(
+        model_name=spec.model_path_or_name,
+        optimization_dtype=spec.dtype,
+        attn_implementation=spec.attn_implementation,
+        ep_size=spec.parallelism.expert_parallel,
+        world_size=world_size,
+        options=Qwen3_5MoeOptions.model_validate(spec.loader_options),
+        rank=rank,
+        local_rank=local_rank,
+    )
+
+
 @register_loader(
     "qwen3_5_moe",
     matches=_matches,
     options=Qwen3_5MoeOptions,
     validate_spec=_validate_spec,
+    prepare_weights=_prepare_weights,
 )
 def load_qwen3_5_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

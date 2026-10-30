@@ -866,3 +866,198 @@ class TestGatherTrainingRefs(TestCasePlus):
             self.assertEqual(saved, [])
 
         asyncio.run(_run())
+
+
+class TestNcclWeightSyncRefs(TestCasePlus):
+    async def _sync(self, send, receive, *, ready=True):
+        server = _server([])
+        server.weight_sync_ready = ready
+        server.weight_sync_bucket_size = 4096
+
+        async def _ip():
+            return "127.0.0.1"
+
+        async def _max_bytes():
+            return 4096
+
+        async def _init(*args):
+            return None
+
+        async def _wake():
+            return {}
+
+        workers = [
+            SimpleNamespace(
+                get_ip=_Remote(_ip),
+                max_param_bytes=_Remote(_max_bytes),
+                init_weight_sender=_Remote(_init),
+                send_weights=_Remote(fn),
+            )
+            for fn in send
+        ]
+        server.training_workers = workers
+        server.arctic_rl_ray_server_state = SimpleNamespace(wake_inference=_Remote(_wake))
+        pool = SimpleNamespace(num_replicas=1, tp_size=1, sync_weights=lambda **kwargs: receive())
+        schedule = SimpleNamespace(
+            groups=[
+                SimpleNamespace(group_id=rank, sender_train_rank=rank, world_size=2, replica_ids=[0])
+                for rank in range(len(workers))
+            ]
+        )
+        schedule_class = SimpleNamespace(build=lambda **kwargs: schedule)
+        with (
+            patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=schedule_class),
+            patch("arctic_platform.debug.lora.selected_lora_request", return_value=None),
+        ):
+            async with server._training_op_lock:
+                result = await server._sync_weights_nccl(workers, pool)
+        return server, result
+
+    def test_unselected_sync_preserves_native_status_and_sizing_awaiter(self):
+        async def _done():
+            return {}
+
+        async def _run():
+            with (
+                patch("arctic_platform.debug.weight_sync.enabled", return_value=False),
+                patch.object(
+                    ArcticRLRayServer,
+                    "_await_training_refs",
+                    autospec=True,
+                    side_effect=ArcticRLRayServer._await_training_refs,
+                ) as awaiting,
+            ):
+                server, result = await self._sync([_done], _done, ready=False)
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(result["checksum_match"], "missing transfer checksums must not be reported as a match")
+            self.assertEqual(
+                awaiting.await_count, 5, "IP, sizing, sender init, send and receive must use native awaiters"
+            )
+            self.assertTrue(server.weight_sync_ready)
+            self.assertFalse(server._training_failed)
+
+        asyncio.run(_run())
+
+    def test_completed_byte_verification_receipts_are_retained(self):
+        sent = {"all_rank_weight_sync_verification": {"sender": True}}
+        received = {"workers": [{"all_rank_weight_sync_verification": {"receiver": True}}]}
+
+        async def _send():
+            return sent
+
+        async def _receive():
+            return received
+
+        async def _run():
+            with patch("arctic_platform.debug.weight_sync.enabled", return_value=True):
+                server, result = await self._sync([_send], _receive)
+            self.assertEqual(result["targets"], [{"send": [sent], "recv": received}])
+            self.assertFalse(server._training_failed)
+
+        asyncio.run(_run())
+
+    def test_sender_failure_cancels_hanging_sender_and_receiver(self):
+        cancelled = []
+        servers = []
+
+        async def _fail():
+            raise RuntimeError("sender failed")
+
+        async def _hang(name):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(name)
+
+        async def _run():
+            original = ArcticRLRayServer._await_weight_sync_refs
+
+            async def _collect(server, *args):
+                servers.append(server)
+                return await original(server, *args)
+
+            with patch.object(ArcticRLRayServer, "_await_weight_sync_refs", _collect):
+                with self.assertRaisesRegex(RuntimeError, "sender failed"):
+                    await asyncio.wait_for(
+                        self._sync([_fail, lambda: _hang("sender")], lambda: _hang("receiver")), timeout=2.0
+                    )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertCountEqual(cancelled, ["sender", "receiver"])
+            server = servers[0]
+            self.assertTrue(server._training_failed)
+            self.assertFalse(server._training_op_lock.locked())
+            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                await server.step(1)
+
+        asyncio.run(_run())
+
+    def test_receiver_failure_cancels_pending_sender_and_latches_training(self):
+        server = _server([])
+        cancelled = asyncio.Event()
+
+        async def _send():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async def _receive():
+            raise RuntimeError("receiver failed")
+
+        async def _run():
+            with self.assertRaisesRegex(RuntimeError, "receiver failed"):
+                await asyncio.wait_for(server._await_weight_sync_refs(_receive(), [_send()]), timeout=2.0)
+            await asyncio.sleep(0)
+            self.assertTrue(cancelled.is_set())
+            self.assertTrue(server._training_failed)
+
+        asyncio.run(_run())
+
+    def test_receiver_failure_after_send_completion_does_not_latch_training(self):
+        server = _server([])
+        sent = asyncio.Event()
+
+        async def _send():
+            sent.set()
+            return {}
+
+        async def _receive():
+            await sent.wait()
+            await asyncio.sleep(0)
+            raise RuntimeError("receiver failed")
+
+        async def _run():
+            with self.assertRaisesRegex(RuntimeError, "receiver failed"):
+                await server._await_weight_sync_refs(_receive(), [_send()])
+            self.assertFalse(server._training_failed)
+
+        asyncio.run(_run())
+
+    def test_caller_cancellation_cancels_both_transfer_sides(self):
+        server = _server([])
+        started, cancelled = [], []
+
+        async def _hang(name):
+            started.append(name)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(name)
+
+        async def _run():
+            task = asyncio.create_task(server._await_weight_sync_refs(_hang("receiver"), [_hang("sender")]))
+            for _ in range(50):
+                if len(started) == 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(len(started), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertCountEqual(cancelled, ["sender", "receiver"])
+            self.assertTrue(server._training_failed)
+
+        asyncio.run(_run())

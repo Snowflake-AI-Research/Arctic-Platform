@@ -33,6 +33,9 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 
@@ -88,7 +91,8 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     The caller steps after each microbatch, so the microbatch size and the
     accumulation count are both 1. Sequence parallelism reduces the
     data-parallel degree, and therefore ``train_batch_size``, to
-    ``world_size // sequence_parallel``.
+    ``world_size // sequence_parallel``. Gradients accumulate in FP32 unless the
+    merged config says otherwise; see ``apply_default_grad_accum_dtype``.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -123,6 +127,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
+    apply_default_grad_accum_dtype(ds_config)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -131,6 +136,50 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         ds_config.get("communication_data_type"),
     )
     return ds_config
+
+
+def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
+    """Set ``data_types.grad_accum_dtype`` to ``"fp32"`` in place when the config leaves it unset.
+
+    DeepSpeed accumulates gradients in the model dtype when ``grad_accum_dtype`` is absent or ``None``, so a bf16
+    job would sum its microbatch gradients at bfloat16 granularity. The default belongs to the key, not the block: a
+    supplied ``data_types`` without it gets FP32 too, and its other fields are kept. An explicit value is never
+    changed. The block is replaced by a copy, so a caller's shared ``data_types`` dict is never mutated.
+
+    DeepSpeed refuses FP32 accumulation in two configurations, which keep its model-dtype default instead: ZeRO
+    disabled with bf16 or fp16 parameters (``unsupported mix of model_dtype and grad_accum_dtype``), and ZeRO stage 1
+    with bf16 parameters, ``compute_grad_norm`` false and no CPU optimizer offload, which selects the BF16 optimizer
+    that requires the norm.
+    """
+    data_types = ds_config.get("data_types")
+    if data_types is not None and not isinstance(data_types, dict):
+        return
+    if (data_types or {}).get("grad_accum_dtype") is not None:
+        return
+    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config):
+        return
+    ds_config["data_types"] = {**(data_types or {}), "grad_accum_dtype": "fp32"}
+
+
+def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool:
+    """Whether ``deepspeed.initialize`` accepts this config once ``grad_accum_dtype`` is ``"fp32"``."""
+    bf16_config = ds_config.get("bf16")
+    if bf16_config is None:
+        bf16_config = ds_config.get("bfloat16")
+    fp16_config = ds_config.get("fp16")
+    bf16 = isinstance(bf16_config, dict) and bool(bf16_config.get("enabled"))
+    fp16 = isinstance(fp16_config, dict) and bool(fp16_config.get("enabled"))
+    zero_config = ds_config.get("zero_optimization")
+    if not isinstance(zero_config, dict):
+        zero_config = {}
+    stage = int(zero_config.get("stage") or 0)
+    if stage == 0:
+        return not (bf16 or fp16)
+    offload = zero_config.get("offload_optimizer")
+    cpu_offload = isinstance(offload, dict) and offload.get("device") == "cpu"
+    if stage == 1 and bf16 and not cpu_offload and zero_config.get("compute_grad_norm", True) is False:
+        return False
+    return True
 
 
 def split_expert_param_groups(param_groups: list) -> list:
@@ -165,6 +214,8 @@ def initialize_training_engine(
     ``mpu`` is forwarded only when it is set, so ZeRO reduces sequence-parallel
     gradients over the sequence-data-parallel group.
     """
+    ds_config = maybe_configure_broadcast_training(ds_config)
+    ds_config = maybe_configure_router_replay_trace(ds_config, model, rank)
     built = None
     choice = None
     # Marks first: the optimizer groups split on them.
@@ -189,23 +240,35 @@ def initialize_training_engine(
     import deepspeed
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
-    if built is not None:
-        engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
-    else:
-        engine, *_ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
-        built = None
+    with maybe_trace_zero_initialization(ds_config, rank) as init_config:
+        if built is not None:
+            engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=init_config, **init_kwargs)
+        else:
+            engine, *_ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
+            built = None
     return engine, built, choice
 
 
-def resolve_optimizer_name(name: str, ds_config: dict) -> str:
-    """Map a caller optimizer name onto the implementation DeepSpeed will run."""
-    resolved = name.strip().lower().replace("-", "_")
-    if resolved in {"", "adam", "adamw"}:
-        return "deepspeed_cpu_adam" if _optimizer_cpu_offload_enabled(ds_config) else "fused_adam"
-    if resolved not in _OPTIMIZER_ALIASES:
+def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) -> str:
+    """Resolve defaults by offload policy, while preserving explicit optimizer choices."""
+    normalized_name = name.strip().lower().replace("-", "_")
+    cpu_offload = _optimizer_cpu_offload_enabled(ds_config)
+
+    if normalized_name in {"", "adam", "adamw"}:
+        if not cpu_offload:
+            return "fused_adam"
+        elif fused:
+            return "deepspeed_cpu_adam"
+        else:
+            return "torch_cpu_adamw"
+
+    optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
+    if optimizer_name is None:
         supported = ", ".join(sorted(set(_OPTIMIZER_ALIASES.values())))
         raise ValueError(f"Unsupported optimizer {name!r}; supported values: {supported}")
-    return _OPTIMIZER_ALIASES[resolved]
+    if optimizer_name == "torch_adamw" and cpu_offload:
+        return "torch_cpu_adamw"
+    return optimizer_name
 
 
 def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
@@ -214,6 +277,8 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
         return "fused_adam"
     if optimizer_name == "deepspeed_cpu_adam":
         return "deepspeed_cpu_adam"
+    if optimizer_name == "torch_cpu_adamw":
+        return "deepspeed_cpu_adam_nonfused"
     if optimizer_name in ("torch_adamw", "fused_adam"):
         return "torch_adamw"
     raise AssertionError(f"Unhandled optimizer {optimizer_name!r}")
@@ -221,9 +286,11 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
 
 def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bool) -> dict[str, str]:
     """The implementation a job runs and the customer-facing reason."""
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
     implementation = optimizer_implementation(optimizer_name, fused=fused)
-    if implementation == "deepspeed_cpu_adam":
+    if implementation == "deepspeed_cpu_adam_nonfused":
+        reason = "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic"
+    elif implementation == "deepspeed_cpu_adam":
         reason = (
             "optimizer state is offloaded to CPU, so the CPU implementation (CPUAdam) ran"
             if _optimizer_cpu_offload_enabled(ds_config)
@@ -248,14 +315,14 @@ def cpu_adam_fp32_optimizer_states(ds_config: dict) -> bool:
 def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool):
     """Build AdamW with decay disabled on bias and norm parameters.
 
-    GPU ``FusedAdam`` by default, or ``DeepSpeedCPUAdam`` when ZeRO optimizer
-    offload is enabled.
+    Generic AdamW uses fused implementations unless the model or caller disables
+    them. Explicit CPUAdam remains selected regardless of that policy.
     """
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
-    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name == "deepspeed_cpu_adam":
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
+    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name in ("deepspeed_cpu_adam", "torch_cpu_adamw"):
         logger.info(
-            "training_config.ds_config.zero_optimization.offload_optimizer is configured; "
-            "using optimizer='deepspeed_cpu_adam'"
+            "training_config.ds_config.zero_optimization.offload_optimizer is configured; using optimizer=%r",
+            optimizer_name,
         )
     decay_params = [
         param
@@ -287,10 +354,10 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             eps=optimizer.eps,
             adam_w_mode=True,
         )
-    if implementation == "deepspeed_cpu_adam":
+    if implementation in ("deepspeed_cpu_adam", "deepspeed_cpu_adam_nonfused"):
         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
-        return DeepSpeedCPUAdam(
+        built = DeepSpeedCPUAdam(
             param_groups,
             lr=optimizer.lr,
             betas=betas,
@@ -298,6 +365,11 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             adamw_mode=True,
             fp32_optimizer_states=cpu_adam_fp32_optimizer_states(ds_config),
         )
+        if implementation == "deepspeed_cpu_adam_nonfused":
+            from arctic_platform.common.cpu_adam import configure_nonfused_cpu_adam
+
+            return configure_nonfused_cpu_adam(built)
+        return built
     import torch
 
     return torch.optim.AdamW(
