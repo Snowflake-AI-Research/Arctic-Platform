@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
@@ -175,12 +177,6 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             _ZERO2,
             False,
             ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
-        ),
-        (
-            OptimizerSettings(),
-            _ZERO2,
-            False,
-            ("torch_adamw", "FusedAdam isn't supported for this model, so standard AdamW ran"),
         ),
     ],
 )
@@ -379,7 +375,6 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
 
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", _build)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
     ds_config = {"train_micro_batch_size_per_gpu": 1}
@@ -426,7 +421,8 @@ def test_initialize_without_an_optimizer_omits_it_and_the_mpu(monkeypatch):
     assert calls["kwargs"] == {}
 
 
-def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monkeypatch):
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
+def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp_path, model_type):
     calls = {}
 
     class _Adam:
@@ -439,7 +435,6 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
     monkeypatch.setattr("torch.optim.AdamW", _Adam)
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: True)
     monkeypatch.setattr(deepspeed_engine, "split_expert_param_groups", _split)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
 
@@ -449,6 +444,7 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(2, 2, bias=False)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
 
     engine, optimizer, choice = initialize_training_engine(
         model,
@@ -456,12 +452,12 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
         optimizer=OptimizerSettings(),
         ep_size=2,
         mpu=None,
-        model_path="glm",
+        model_path=str(tmp_path),
         rank=0,
     )
 
     assert engine == "engine"
     assert optimizer is calls["optimizer"]
-    assert choice["implementation"] == "torch_adamw"
+    assert choice["implementation"] == "fused_adam"
     assert calls["split"]
     assert optimizer.param_groups == [{"params": [], "name": "experts"}]

@@ -35,7 +35,6 @@ from pydantic import ConfigDict
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
-from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -171,9 +170,7 @@ def initialize_training_engine(
     # Marks first: the optimizer groups split on them.
     preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused
-        if fused is None:
-            fused = not is_glm_moe_model(model_path)
+        fused = optimizer.fused is not False
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
@@ -236,10 +233,8 @@ def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bo
         reason = "AdamW ran as the faster fused GPU implementation (FusedAdam)"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    elif optimizer.fused is False:
-        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     else:
-        reason = "FusedAdam isn't supported for this model, so standard AdamW ran"
+        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     return {"implementation": implementation, "reason": reason}
 
 
