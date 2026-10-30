@@ -43,6 +43,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,31 @@ ENV_ALIASES = {"host": HOST_HARBOR_ENV, "snowflake": SNOWFLAKE_HARBOR_ENV}
 def resolve_env(env: str) -> str:
     """Map ``host`` and ``snowflake`` to their import paths; pass anything else through."""
     return ENV_ALIASES.get(env.strip().lower(), env.strip())
+
+
+def require_driver_resident_agent(agent: str) -> Any:
+    """The Harbor agent class for ``agent``, if it runs on the driver rather than inside the environment.
+
+    Harbor exports an installed agent's credentials into every command it runs
+    in the environment, so a task or prompt-injected command could read the
+    rollout's proxy key. Driver-resident agents receive the key as a
+    constructor argument that their commands never see.
+    """
+    from harbor.agents.factory import AgentFactory
+    from harbor.agents.installed.base import BaseInstalledAgent
+    from harbor.models.trial.config import AgentConfig
+
+    if ":" in agent:
+        agent_cls = AgentFactory.get_agent_class_from_config(AgentConfig(import_path=agent))
+    else:
+        agent_cls = AgentFactory.get_agent_class_from_config(AgentConfig(name=agent))
+    if issubclass(agent_cls, BaseInstalledAgent):
+        raise ValueError(
+            f"HARBOR_AGENT={agent!r} is installed and run inside the environment, where its commands could read "
+            "the rollout's API key. Use an agent that runs on the driver, such as the default "
+            "harbor_rl.agent:OpenHandsHarborAgent or your own harbor BaseAgent subclass (module:Class)."
+        )
+    return agent_cls
 
 
 def require_task_dir(path: Path) -> Path:
@@ -87,8 +113,6 @@ def _build_trial_config(
     agent_kwargs: dict[str, Any] | None = None,
     env_kwargs: dict[str, Any] | None = None,
 ) -> Any:
-    from harbor.agents.factory import AgentFactory
-    from harbor.agents.installed.base import BaseInstalledAgent
     from harbor.models.environment_type import EnvironmentType
     from harbor.models.trial.config import AgentConfig
     from harbor.models.trial.config import EnvironmentConfig
@@ -110,17 +134,7 @@ def _build_trial_config(
     else:
         env_type = EnvironmentType(env)
 
-    agent_cls = AgentFactory.get_agent_class_from_config(AgentConfig(name=agent_name, import_path=agent_import_path))
-    merged_agent_env = {
-        "OPENAI_BASE_URL": base_url,
-        "LLM_BASE_URL": base_url,
-        "LLM_MODEL": model_name,
-    }
-    # Harbor exports AgentConfig.env into every command the agent runs, so the
-    # rollout key goes there only for agents installed inside the environment,
-    # which read it from there. Agents running on the driver get it as a kwarg.
-    if issubclass(agent_cls, BaseInstalledAgent):
-        merged_agent_env.update(OPENAI_API_KEY=api_key, LLM_API_KEY=api_key)
+    agent_cls = require_driver_resident_agent(agent)
     kw = dict(agent_kwargs or {})
     kw.setdefault("api_key", api_key)
     if agent_import_path is not None:
@@ -132,7 +146,6 @@ def _build_trial_config(
         model_name=model_name,
         skills=[Path(s) for s in (skills or [])],
         kwargs=kw,
-        env=merged_agent_env,
     )
     if getattr(agent_cls, "MODEL_CONNECTION", None) is not None:
         agent_cfg_kwargs["base_url"] = base_url
@@ -223,8 +236,16 @@ class _LoopThread:
     def submit(self, coro: Any) -> concurrent.futures.Future:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-    def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> None:
-        """Cancel every pending rollout, wait for their cleanup, then stop and close the loop."""
+    def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> bool:
+        """Cancel every pending rollout, close the loop, and wait for its worker threads.
+
+        Cancelling a task doesn't stop a thread it is waiting on, so each agent
+        has to end its own blocking work when cancelled (``OpenHandsHarborAgent``
+        pauses its conversation). Closing the loop first makes any further
+        ``environment.exec`` from such a thread fail at once instead of running.
+        Returns whether every worker thread finished within ``timeout_s``.
+        """
+        deadline = time.monotonic() + timeout_s
 
         async def cancel_pending() -> None:
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -235,16 +256,19 @@ class _LoopThread:
         try:
             asyncio.run_coroutine_threadsafe(cancel_pending(), self.loop).result(timeout_s)
         except concurrent.futures.TimeoutError:
-            logger.warning(
-                "Harbor rollouts did not finish cleaning up within %ss; stopping the loop anyway", timeout_s
-            )
+            logger.warning("Harbor rollouts did not finish cleaning up within %ss", timeout_s)
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
-            self._thread.join(timeout_s)
-            # Agent conversations block worker threads that can't be interrupted.
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._thread.join(max(0.0, deadline - time.monotonic()))
             if not self._thread.is_alive():
                 self.loop.close()
+        waiter = threading.Thread(target=self._executor.shutdown, kwargs=dict(cancel_futures=True), daemon=True)
+        waiter.start()
+        waiter.join(max(0.0, deadline - time.monotonic()))
+        if waiter.is_alive():
+            logger.warning("Harbor worker threads were still running %ss after close; leaving them", timeout_s)
+            return False
+        return True
 
 
 class HarborTrialAdapter:
@@ -321,17 +345,18 @@ class HarborTrialAdapter:
             env_kwargs=self._env_kwargs,
         )
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> None:
         """Cancel in-flight rollouts, stop the rollout loop, and release what the environment shares across trials.
 
         Environments loaded by import path may define a ``close_shared_resources()``
         classmethod for state that outlives a single trial (sessions, credentials).
+        It runs after the worker threads finish, or after ``timeout_s`` if one is stuck.
         """
         with self._lock:
             loop_thread, self._loop_thread = self._loop_thread, None
         try:
             if loop_thread is not None:
-                loop_thread.close()
+                loop_thread.close(timeout_s)
         finally:
             module_name, _, class_name = self._env.partition(":")
             env_cls = getattr(sys.modules.get(module_name), class_name, None) if class_name else None

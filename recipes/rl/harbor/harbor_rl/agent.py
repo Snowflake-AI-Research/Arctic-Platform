@@ -33,6 +33,7 @@ rather than the environment's.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import threading
@@ -97,7 +98,9 @@ def _load_skills(skill_paths: Sequence[str | Path]) -> list[Any]:
     return loaded
 
 
+@functools.cache
 def _build_harbor_finish_tool() -> Any:
+    """The ``harbor_finish`` tool class, built once: OpenHands rejects a second class with the same kind."""
     from openhands.sdk import Action
     from openhands.sdk import Observation
     from openhands.sdk import ToolDefinition
@@ -200,6 +203,38 @@ GENERAL_HARBOR_SYSTEM_PROMPT = (
 )
 
 
+class ConversationStop:
+    """Lets a cancelled rollout pause the conversation running on its worker thread.
+
+    ``stopped`` is also handed to the terminal executor, which refuses commands
+    once it is set, so the step in progress ends without touching the environment.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._conversation: Any = None
+        self.stopped = threading.Event()
+
+    def attach(self, conversation: Any) -> bool:
+        """Register ``conversation``; False if the rollout was already stopped."""
+        with self._lock:
+            self._conversation = conversation
+            return not self.stopped.is_set()
+
+    def stop(self) -> None:
+        """Ask the conversation to end after the step in progress. Never blocks.
+
+        OpenHands holds the conversation's lock for a whole step, and ``pause()``
+        waits for it, so the pause runs on its own thread: called from the event
+        loop it would deadlock with a step waiting on that loop for a command.
+        """
+        with self._lock:
+            self.stopped.set()
+            conversation = self._conversation
+        if conversation is not None:
+            threading.Thread(target=conversation.pause, name="harbor-pause", daemon=True).start()
+
+
 def _run_openhands_sync(*, terminal_executor: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], Any, int]:
     from harbor_rl.terminal import terminal_tool
 
@@ -221,6 +256,7 @@ def _converse(
     is_localization: bool,
     instance: dict[str, Any],
     skill_paths: list[str],
+    stop: ConversationStop,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, int]:
     from openhands.sdk import LLM
     from openhands.sdk import Agent
@@ -288,8 +324,9 @@ def _converse(
         workspace=str(scratch),
     )
     try:
-        conversation.send_message(user_prompt)
-        conversation.run()
+        if stop.attach(conversation):
+            conversation.send_message(user_prompt)
+            conversation.run()
         events = list(conversation.state.events)
     finally:
         try:
@@ -378,30 +415,37 @@ class OpenHandsHarborAgent(BaseAgent):
         working_dir = (pwd.stdout or "").strip().splitlines()[-1] if pwd.return_code == 0 and pwd.stdout else ""
         if not working_dir:
             raise RuntimeError(f"Couldn't read the environment's working directory: {pwd.stderr or pwd.stdout!r}")
+        stop = ConversationStop()
         executor = HarborTerminalExecutor(
             environment,
             asyncio.get_running_loop(),
             working_dir,
             default_timeout_s=self._terminal_timeout_sec,
+            stopped=stop.stopped,
         )
 
         truth_exists = self._instance.get("file_changes") is not None or self._instance.get("target") is not None
 
-        messages, locations, n_turns = await asyncio.to_thread(
-            _run_openhands_sync,
-            instruction=instruction,
-            working_dir=working_dir,
-            terminal_executor=executor,
-            logs_dir=self.logs_dir,
-            model_name=self.model_name or "Qwen/Qwen3.5-4B",
-            base_url=self._base_url,
-            api_key=self._api_key,
-            max_turns=self._max_turns,
-            training_phase=self._training_phase,
-            is_localization=truth_exists,
-            instance=self._instance,
-            skill_paths=self._skill_paths,
-        )
+        try:
+            messages, locations, n_turns = await asyncio.to_thread(
+                _run_openhands_sync,
+                instruction=instruction,
+                working_dir=working_dir,
+                terminal_executor=executor,
+                logs_dir=self.logs_dir,
+                model_name=self.model_name or "Qwen/Qwen3.5-4B",
+                base_url=self._base_url,
+                api_key=self._api_key,
+                max_turns=self._max_turns,
+                training_phase=self._training_phase,
+                is_localization=truth_exists,
+                instance=self._instance,
+                skill_paths=self._skill_paths,
+                stop=stop,
+            )
+        except asyncio.CancelledError:
+            stop.stop()
+            raise
 
         if locations is not None:
             sub_file = self.logs_dir / "localization_submission.json"

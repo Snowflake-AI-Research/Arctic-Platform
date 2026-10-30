@@ -40,6 +40,7 @@ from openhands_localization.trainer import openhands_trainer_cls
 from arctic_platform.integrations.harbor.adapter import DEFAULT_HARBOR_ENV
 from arctic_platform.integrations.harbor.adapter import HarborTrialAdapter
 from arctic_platform.integrations.harbor.adapter import grade_harbor
+from arctic_platform.integrations.harbor.adapter import require_driver_resident_agent
 from arctic_platform.integrations.harbor.adapter import resolve_env
 from arctic_platform.integrations.harbor.env import contained_path
 from arctic_platform.integrations.harness.generator import Grade
@@ -281,9 +282,15 @@ def _run_remote(remote_cfg: Any, reconnect_config: Any) -> None:
         experiment.run()
     finally:
         # Ray raises SystemExit on SIGTERM, so this also runs when the job is stopped.
+        # The adapter closes first: its rollouts are the proxy's only clients.
         adapter = getattr(experiment, "harbor_adapter", None)
-        if adapter is not None:
-            adapter.close()
+        proxy = getattr(experiment, "sampling_proxy", None)
+        try:
+            if adapter is not None:
+                adapter.close()
+        finally:
+            if proxy is not None:
+                proxy.stop()
 
 
 def _require_source_checkout() -> None:
@@ -322,8 +329,16 @@ def check_harbor_env() -> None:
             "ERROR: HARBOR_ENV=host runs task and agent commands on this machine without isolation.\n"
             f"       Use a sandbox, or set {ALLOW_HOST_EXEC_VAR}=1 if every task is trusted."
         )
+    try:
+        require_driver_resident_agent(os.environ.get("HARBOR_AGENT", DEFAULT_HARBOR_AGENT))
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     # Rollouts build Trials directly, which skips the preflight `harbor run` does.
-    if ":" in env:
+    if env == SNOWFLAKE_HARBOR_ENV:
+        from arctic_platform.integrations.harbor.snowflake_sandbox.environment import SnowflakeSandboxEnvironment
+
+        SnowflakeSandboxEnvironment.preflight(**kwargs)
+    elif ":" in env:
         EnvironmentFactory.run_preflight(None, import_path=env)
     else:
         EnvironmentFactory.run_preflight(EnvironmentType(env))

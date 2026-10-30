@@ -124,10 +124,13 @@ class ImageRegistry:
         self._image_locks_guard = threading.Lock()
         self._ca_tar: Path | None = None
         self._docker_config: Path | None = None
+        self._closed = False
 
     @property
     def docker_config(self) -> Path:
         with self._login_guard:
+            if self._closed:
+                raise ImageMirrorError("The image registry was closed; its credentials are gone")
             if self._docker_config is None:
                 self._docker_config = _private_docker_config()
             return self._docker_config
@@ -139,8 +142,12 @@ class ImageRegistry:
         return await _run("crane", *args, timeout=timeout, env=self._crane_env())
 
     def close(self) -> None:
-        """Delete the registry token and the CA layer this registry wrote to disk."""
+        """Delete the registry token and the CA layer this registry wrote to disk.
+
+        Waits for a login in progress, and refuses to write credentials afterwards.
+        """
         with self._login_guard:
+            self._closed = True
             for path in (self._docker_config, self._ca_tar.parent if self._ca_tar else None):
                 if path is not None:
                     shutil.rmtree(path, ignore_errors=True)
@@ -227,6 +234,8 @@ class ImageRegistry:
             return self._ca_layer_locked()
 
     def _ca_layer_locked(self) -> Path:
+        if self._closed:
+            raise ImageMirrorError("The image registry was closed")
         if self._ca_tar is None:
             tmp = Path(tempfile.mkdtemp(prefix="harbor-sf-ca-"))
             tar_path = tmp / "ca-layer.tar"

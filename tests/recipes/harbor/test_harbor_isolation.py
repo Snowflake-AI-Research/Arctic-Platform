@@ -467,6 +467,9 @@ class _ScriptedLLM(BaseHTTPRequestHandler):
     script: list[tuple[str, dict]] = []
     calls: list[dict] = []
     auth: list[str | None] = []
+    block_on_call: int | None = None
+    blocked = threading.Event()
+    release = threading.Event()
 
     def log_message(self, *args) -> None:
         pass
@@ -475,6 +478,9 @@ class _ScriptedLLM(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         type(self).calls.append(body)
         type(self).auth.append(self.headers.get("Authorization"))
+        if len(self.calls) == self.block_on_call:
+            type(self).blocked.set()
+            type(self).release.wait(30)
         name, args = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
         call = dict(id=f"call{len(self.calls)}", type="function", function=dict(name=name, arguments=json.dumps(args)))
         out = json.dumps(
@@ -507,6 +513,9 @@ def scripted_llm():
     pytest.importorskip("openhands.sdk")
     _ScriptedLLM.calls = []
     _ScriptedLLM.auth = []
+    _ScriptedLLM.block_on_call = None
+    _ScriptedLLM.blocked = threading.Event()
+    _ScriptedLLM.release = threading.Event()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ScriptedLLM)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -557,6 +566,35 @@ def test_agent_commands_run_in_the_harbor_environment_the_verifier_grades(tmp_pa
     assert set(llm.auth) == {f"Bearer {_ROLLOUT_KEY}"}
     tools = {t["function"]["name"] for t in llm.calls[0]["tools"]}
     assert "terminal" in tools and "file_editor" not in tools
+
+
+def test_consecutive_general_harbor_rollouts_in_one_process_all_run(tmp_path, monkeypatch, scripted_llm):
+    llm, base_url = scripted_llm
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    monkeypatch.delenv("OPENHANDS_TOOLS", raising=False)
+    rewards = []
+    for i in range(2):
+        llm.calls.clear()
+        llm.script = [
+            ("terminal", dict(command="cd /app && echo hello > output.txt")),
+            ("harbor_finish", dict(summary="done")),
+        ]
+        out = asyncio.run(
+            run_harbor_trial(
+                task_dir=_task(tmp_path, name=f"task{i}"),
+                trials_dir=tmp_path / "trials",
+                trial_name=f"trial{i}",
+                agent="harbor_rl.agent:OpenHandsHarborAgent",
+                env="host",
+                model_name="openai/test-model",
+                base_url=base_url,
+                api_key="k",
+                agent_kwargs=dict(max_turns=5, instance={}),
+            )
+        )
+        assert out["exception"] is None, out["exception"]
+        rewards.append(out["reward"])
+    assert rewards == [1.0, 1.0]
 
 
 class _ForwardingAgent(BaseAgent):
@@ -648,11 +686,16 @@ def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(m
 
     from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
     from arctic_platform.integrations.harbor.adapter import SNOWFLAKE_HARBOR_ENV
+    from arctic_platform.integrations.harbor.snowflake_sandbox.environment import SnowflakeSandboxEnvironment
 
     preflights: list[tuple] = []
     monkeypatch.setattr(
         EnvironmentFactory, "run_preflight", lambda type, import_path=None: preflights.append((type, import_path))
     )
+    monkeypatch.setattr(
+        SnowflakeSandboxEnvironment, "preflight", lambda **kwargs: preflights.append((None, SNOWFLAKE_HARBOR_ENV))
+    )
+    monkeypatch.delenv("HARBOR_AGENT", raising=False)
     monkeypatch.setenv("HARBOR_ENV", "snowflake")
     monkeypatch.delenv("HARBOR_ENV_KWARGS", raising=False)
     with pytest.raises(SystemExit, match="image_repo"):
@@ -679,6 +722,7 @@ def test_launch_preflight_catches_a_missing_crane_before_gpus_are_provisioned(mo
 
     from arctic_platform.integrations.harbor.snowflake_sandbox import images
 
+    monkeypatch.delenv("HARBOR_AGENT", raising=False)
     monkeypatch.setenv("HARBOR_ENV", "snowflake")
     monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(image_repo="DB.SCHEMA.REPO")))
     monkeypatch.setattr(images.shutil, "which", lambda name: None)
@@ -686,29 +730,85 @@ def test_launch_preflight_catches_a_missing_crane_before_gpus_are_provisioned(mo
         check_harbor_env()
 
 
-def test_the_rollout_key_is_exported_only_to_agents_installed_in_the_environment(tmp_path):
+def test_a_sandbox_path_prebuilt_image_needs_no_crane(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from harbor_rl.entrypoint import check_harbor_env
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    monkeypatch.delenv("HARBOR_AGENT", raising=False)
+    monkeypatch.setenv("HARBOR_ENV", "snowflake")
+    monkeypatch.setattr(images.shutil, "which", lambda name: None)
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(prebuilt_image="/db/schema/repo/image:tag")))
+    check_harbor_env()
+
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(prebuilt_image="python:3.12-slim")))
+    with pytest.raises(SystemExit, match="also set image_repo"):
+        check_harbor_env()
+
+
+def test_a_sandbox_path_prebuilt_image_is_used_without_the_registry(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    def no_registry(*args, **kwargs):
+        raise AssertionError("a sandbox-path prebuilt image must not touch the image registry")
+
+    monkeypatch.setattr(sf_env, "get_registry", no_registry)
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+    image, plan = asyncio.run(env._resolve_image(force_build=False))
+    assert (image, plan) == ("/db/schema/repo/image:tag", None)
+
+
+@pytest.mark.parametrize("installed_agent", ["openhands-sdk", "mini-swe-agent", "claude-code"])
+def test_agents_installed_in_the_environment_are_refused(tmp_path, monkeypatch, installed_agent):
+    from harbor_rl.entrypoint import check_harbor_env
+
     from arctic_platform.integrations.harbor.adapter import _build_trial_config
 
-    task = _task(tmp_path)
-
-    def agent_config(agent: str):
-        return _build_trial_config(
-            task,
+    with pytest.raises(ValueError, match="could read the rollout's API key"):
+        _build_trial_config(
+            _task(tmp_path),
             tmp_path / "trials",
             "trial",
-            agent=agent,
+            agent=installed_agent,
             env="host",
             model_name="m",
             base_url="http://127.0.0.1:1/v1",
             api_key=_ROLLOUT_KEY,
-        ).agent
+        )
+    monkeypatch.setenv("HARBOR_ENV", "host")
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    monkeypatch.setenv("HARBOR_AGENT", installed_agent)
+    with pytest.raises(SystemExit, match="could read the rollout's API key"):
+        check_harbor_env()
 
-    driver_resident = agent_config("harbor_rl.agent:OpenHandsHarborAgent")
-    assert _ROLLOUT_KEY not in json.dumps(driver_resident.env)
-    assert driver_resident.kwargs["api_key"] == _ROLLOUT_KEY
 
-    installed = agent_config("openhands-sdk")
-    assert installed.env["OPENAI_API_KEY"] == installed.env["LLM_API_KEY"] == _ROLLOUT_KEY
+def test_driver_resident_agents_get_the_key_only_as_a_constructor_argument(tmp_path):
+    from arctic_platform.integrations.harbor.adapter import _build_trial_config
+
+    agent = _build_trial_config(
+        _task(tmp_path),
+        tmp_path / "trials",
+        "trial",
+        agent="harbor_rl.agent:OpenHandsHarborAgent",
+        env="host",
+        model_name="m",
+        base_url="http://127.0.0.1:1/v1",
+        api_key=_ROLLOUT_KEY,
+    ).agent
+    assert agent.env == {}
+    assert agent.kwargs["api_key"] == _ROLLOUT_KEY
 
 
 class _SharedStateEnv:
@@ -721,12 +821,12 @@ class _SharedStateEnv:
         cls.closed += 1
 
 
-def _request(task: Path, rollout_id: str) -> RolloutRequest:
+def _request(task: Path, rollout_id: str, base_url: str = "http://127.0.0.1:1/v1") -> RolloutRequest:
     return RolloutRequest(
         env_extra=dict(harbor_task_dir=str(task)),
         trajectory_id=SimpleNamespace(repetition_id=0),
         routing_key=rollout_id,
-        base_url="http://127.0.0.1:1/v1",
+        base_url=base_url,
         api_key="k",
         phase="train",
         global_step=1,
@@ -784,14 +884,138 @@ def test_snowflake_shared_resources_remove_registry_tokens_and_close_sessions(mo
     assert images._registries == {} and session._configs == {}
 
 
+def test_close_waits_for_a_blocked_worker_thread_to_finish(tmp_path, monkeypatch):
+    started = threading.Event()
+    finished: list[bool] = []
+
+    async def trial_blocked_in_a_thread(**kwargs):
+        stop = threading.Event()
+
+        def conversation() -> None:
+            started.set()
+            stop.wait(10)
+            time.sleep(0.5)
+            finished.append(True)
+
+        try:
+            await asyncio.to_thread(conversation)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+
+    monkeypatch.setattr("arctic_platform.integrations.harbor.adapter.run_harbor_trial", trial_blocked_in_a_thread)
+    before = set(threading.enumerate())
+    adapter = HarborTrialAdapter("openai/m", agent="a:B", trials_root=str(tmp_path / "trials"))
+    adapter.submit(_request(_task(tmp_path), "r0"))
+    assert started.wait(5)
+    adapter.close(timeout_s=10)
+    assert finished == [True]
+    assert not [t for t in set(threading.enumerate()) - before if t.name.startswith("harbor-")]
+
+
+def test_close_gives_up_on_a_stuck_worker_thread_after_its_timeout(tmp_path, monkeypatch, caplog):
+    started = threading.Event()
+    release = threading.Event()
+
+    async def stuck_trial(**kwargs):
+        await asyncio.to_thread(lambda: (started.set(), release.wait(30)))
+
+    monkeypatch.setattr("arctic_platform.integrations.harbor.adapter.run_harbor_trial", stuck_trial)
+    adapter = HarborTrialAdapter("openai/m", agent="a:B", trials_root=str(tmp_path / "trials"))
+    adapter.submit(_request(_task(tmp_path), "r0"))
+    assert started.wait(5)
+    t0 = time.monotonic()
+    try:
+        adapter.close(timeout_s=1)
+        assert time.monotonic() - t0 < 5
+        assert "still running" in caplog.text
+    finally:
+        release.set()
+
+
+def test_a_login_in_progress_is_closed_rather_than_cached_after_cleanup(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import session
+
+    connecting = threading.Event()
+    release = threading.Event()
+    connection = SimpleNamespace(closed=False)
+    connection.close = lambda: setattr(connection, "closed", True)
+
+    def slow_connect(connection_name, role):
+        connecting.set()
+        release.wait(10)
+        return SimpleNamespace(connection=connection)
+
+    monkeypatch.setattr(session, "_connect", slow_connect)
+    monkeypatch.setattr(session, "_configs", {})
+    monkeypatch.setattr(session, "_locks", {})
+    login = threading.Thread(target=session._get_or_connect, args=("conn", "role"))
+    login.start()
+    assert connecting.wait(5)
+    cleanup = threading.Thread(target=session.close_sessions)
+    cleanup.start()
+    cleanup.join(0.3)
+    assert cleanup.is_alive(), "cleanup must wait for the login in progress"
+    release.set()
+    login.join(5)
+    cleanup.join(5)
+    assert connection.closed
+    assert session._configs == {}
+
+
+def test_a_closed_registry_refuses_to_write_credentials():
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    registry = images.ImageRegistry("DB.SCHEMA.REPO", connection=None, role=None)
+    token_dir = registry.docker_config
+    registry.close()
+    assert not token_dir.exists()
+    with pytest.raises(images.ImageMirrorError, match="closed"):
+        registry.docker_config
+    with pytest.raises(images.ImageMirrorError, match="closed"):
+        registry._ca_layer()
+
+
+def test_closing_the_adapter_pauses_a_blocked_openhands_conversation(tmp_path, monkeypatch, scripted_llm):
+    llm, base_url = scripted_llm
+    llm.script = [("terminal", dict(command="echo step"))] * 9 + [("harbor_finish", dict(summary="done"))]
+    llm.block_on_call = 2
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    monkeypatch.delenv("OPENHANDS_TOOLS", raising=False)
+    before = set(threading.enumerate())
+    adapter = HarborTrialAdapter(
+        "openai/test-model",
+        agent="harbor_rl.agent:OpenHandsHarborAgent",
+        env="host",
+        trials_root=str(tmp_path / "trials"),
+        max_turns=10,
+    )
+    adapter.submit(_request(_task(tmp_path), "r0", base_url=base_url))
+    assert llm.blocked.wait(30), "the conversation never reached the blocked model call"
+
+    closer = threading.Thread(target=adapter.close, kwargs=dict(timeout_s=30))
+    closer.start()
+    time.sleep(0.3)
+    llm.release.set()
+    closer.join(30)
+
+    assert not closer.is_alive()
+    assert len(llm.calls) == 2, "the conversation kept calling the model after its rollout was cancelled"
+    assert adapter.get_status("r0") == "errored"
+    assert not [t for t in set(threading.enumerate()) - before if t.name.startswith("harbor-")]
+
+
 def test_a_stopped_job_still_closes_the_adapter(monkeypatch):
     from harbor_rl import entrypoint
 
-    closed: list[bool] = []
+    closed: list[str] = []
 
     class StoppedExperiment:
         def __init__(self, cfg, reconnect_config):
-            self.harbor_adapter = SimpleNamespace(close=lambda: closed.append(True))
+            self.harbor_adapter = SimpleNamespace(close=lambda: closed.append("adapter"))
+            self.sampling_proxy = SimpleNamespace(stop=lambda: closed.append("proxy"))
 
         def run(self):
             os.kill(os.getpid(), signal.SIGTERM)
@@ -810,7 +1034,7 @@ def test_a_stopped_job_still_closes_the_adapter(monkeypatch):
             entrypoint._run_remote(None, None)
     finally:
         signal.signal(signal.SIGTERM, previous)
-    assert closed == [True]
+    assert closed == ["adapter", "proxy"]
 
 
 def test_the_default_backend_is_a_sandbox_and_host_is_an_explicit_alias():

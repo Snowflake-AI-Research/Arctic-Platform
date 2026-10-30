@@ -216,7 +216,13 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
 
     @classmethod
     @override
-    def preflight(cls) -> None:
+    def preflight(cls, *, image_repo: str | None = None, prebuilt_image: str | None = None, **_: Any) -> None:
+        """Check the SDK, and ``crane`` when images may need mirroring.
+
+        Harbor calls this without kwargs, which assumes mirroring. A
+        ``prebuilt_image`` that is already a sandbox path (``/db/schema/repo/image:tag``)
+        with no ``image_repo`` never touches the registry.
+        """
         if not _HAS_SDK:
             raise SystemExit(
                 "The Snowflake sandbox environment needs the Cortex Sandboxes SDK. "
@@ -224,7 +230,14 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 "  pip install 'harbor[snowflake]'\n"
                 "  uv tool install 'harbor[snowflake]'"
             )
-        ImageRegistry.preflight()
+        sandbox_native = bool(prebuilt_image) and prebuilt_image.startswith("/")
+        if prebuilt_image and not sandbox_native and not image_repo:
+            raise SystemExit(
+                f"prebuilt_image={prebuilt_image!r} is not a sandbox image path (/DB/SCHEMA/REPO/IMAGE:TAG), "
+                "so it has to be mirrored: also set image_repo=DATABASE.SCHEMA.REPOSITORY"
+            )
+        if image_repo or not sandbox_native:
+            ImageRegistry.preflight()
 
     @classmethod
     def close_shared_resources(cls) -> None:

@@ -73,12 +73,18 @@ async def get_config(connection: str | None, role: str | None) -> Config:
 
 
 def close_sessions() -> None:
-    """Close every cached connector session; the next trial logs in again."""
+    """Close every cached connector session; the next trial logs in again.
+
+    Takes each session's lock, so a login still in progress finishes first and
+    its connection is closed too rather than cached after cleanup.
+    """
     with _locks_guard:
-        configs = list(_configs.values())
-        _configs.clear()
-    for config in configs:
-        if config.connection is None:
+        keys = set(_locks) | set(_configs)
+        locks = {key: _locks.setdefault(key, threading.Lock()) for key in keys}
+    for key, lock in locks.items():
+        with lock:
+            config = _configs.pop(key, None)
+        if config is None or config.connection is None:
             continue
         try:
             config.connection.close()

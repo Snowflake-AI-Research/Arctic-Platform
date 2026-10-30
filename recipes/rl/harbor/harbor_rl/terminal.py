@@ -30,7 +30,9 @@ OpenHands serializes tool specs, so a rollout's executor is looked up by id
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -50,6 +52,7 @@ DEFAULT_TIMEOUT_S = 180
 # Extra wait on the driver side beyond the command's own timeout, for the
 # environment's transport to report back.
 _RESULT_SLACK_S = 60
+_STOP_POLL_S = 0.5
 
 
 def wrap_command(command: str) -> str:
@@ -77,12 +80,14 @@ class HarborTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         working_dir: str,
         *,
         default_timeout_s: int = DEFAULT_TIMEOUT_S,
+        stopped: threading.Event | None = None,
     ) -> None:
         self._environment = environment
         self._loop = loop
         self._initial_cwd = working_dir
         self._cwd = working_dir
         self._default_timeout_s = int(default_timeout_s)
+        self._stopped = stopped or threading.Event()
 
     @property
     def working_dir(self) -> str:
@@ -112,14 +117,18 @@ class HarborTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             )
 
         timeout = int(action.timeout) if action.timeout else self._default_timeout_s
-        future = asyncio.run_coroutine_threadsafe(
-            self._environment.exec(wrap_command(action.command), cwd=self._cwd, timeout_sec=timeout),
-            self._loop,
-        )
+        future: concurrent.futures.Future | None = None
         try:
-            result = future.result(timeout + _RESULT_SLACK_S)
+            if self._stopped.is_set() or self._loop.is_closed():
+                raise RuntimeError("the rollout was stopped")
+            future = asyncio.run_coroutine_threadsafe(
+                self._environment.exec(wrap_command(action.command), cwd=self._cwd, timeout_sec=timeout),
+                self._loop,
+            )
+            result = self._wait(future, timeout + _RESULT_SLACK_S)
         except Exception as exc:  # noqa: BLE001 - surfaced to the agent as the command's output
-            future.cancel()
+            if future is not None:
+                future.cancel()
             timed_out = "timed out" in str(exc).lower() or isinstance(exc, TimeoutError)
             metadata = CmdOutputMetadata(exit_code=-1 if timed_out else 1, working_dir=self._cwd)
             return TerminalObservation.from_text(
@@ -145,6 +154,19 @@ class HarborTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             metadata=metadata,
             exit_code=exit_code,
         )
+
+    def _wait(self, future: concurrent.futures.Future, timeout_s: float) -> Any:
+        """``future``'s result, giving up early if the rollout is stopped while the command runs."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out after {timeout_s:.0f}s")
+            try:
+                return future.result(min(remaining, _STOP_POLL_S))
+            except concurrent.futures.TimeoutError:
+                if self._stopped.is_set():
+                    raise RuntimeError("the rollout was stopped") from None
 
 
 _EXECUTORS: dict[str, HarborTerminalExecutor] = {}
