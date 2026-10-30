@@ -43,7 +43,7 @@ class MoEDeepSpeedAdapter:
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
     # Writes the node-local HF<->Prime cache ``load_dcp_from_hf`` would otherwise write inside the ranks.
-    prepare_conversion_cache: Callable[[nn.Module, Any], None] | None = None
+    prepare_conversion_cache: Callable[[nn.Module, Any], bool] | None = None
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -347,11 +347,14 @@ def prepare_moe_conversion_cache(
     attn_implementation: str,
     ep_size: int,
     options: Any,
-) -> None:
-    """Write this node's weight-conversion cache with no process group, on a meta-device model."""
+) -> bool:
+    """Write this node's weight-conversion cache with no process group, on a meta-device model.
+
+    Returns whether the ranks' load will read the weights without converting them.
+    """
     config = adapter.build_model_config(model_name, ep_size, 1, optimization_dtype, attn_implementation, options)
     model = adapter.get_model(config, device=torch.device("meta"), dtype=adapter.dtype_map[config.optimization_dtype])
-    adapter.prepare_conversion_cache(model, config)
+    return adapter.prepare_conversion_cache(model, config)
 
 
 def load_moe_model(

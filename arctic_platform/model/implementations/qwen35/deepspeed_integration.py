@@ -313,12 +313,12 @@ def load_moe_model_for_deepspeed(
     )
 
 
-def prepare_qwen3_5_moe_weights(**kwargs) -> None:
-    prepare_moe_conversion_cache(_adapter(), **kwargs)
+def prepare_qwen3_5_moe_weights(**kwargs) -> bool:
+    return prepare_moe_conversion_cache(_adapter(), **kwargs)
 
 
-def prepare_generic_moe_weights(**kwargs) -> None:
-    prepare_moe_conversion_cache(_generic_adapter(), **kwargs)
+def prepare_generic_moe_weights(**kwargs) -> bool:
+    return prepare_moe_conversion_cache(_generic_adapter(), **kwargs)
 
 
 def load_qwen3_5_moe_model(

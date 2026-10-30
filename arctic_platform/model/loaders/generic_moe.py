@@ -92,10 +92,10 @@ def _validate_spec(spec: ModelSpec) -> None:
         )
 
 
-def _prepare(ctx: LoaderContext) -> None:
+def _prepare(ctx: LoaderContext) -> bool:
     from arctic_platform.model.implementations.qwen35.deepspeed_integration import prepare_generic_moe_weights
 
-    prepare_moe(ctx, prepare_generic_moe_weights)
+    return prepare_moe(ctx, prepare_generic_moe_weights)
 
 
 @register_loader(

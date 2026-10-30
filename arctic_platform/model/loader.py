@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -33,6 +34,8 @@ from arctic_platform.model.config import ModelSpec
 if TYPE_CHECKING:
     from pydantic import BaseModel
     from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,7 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
-Preparer = Callable[[LoaderContext], None]
+Preparer = Callable[[LoaderContext], bool]
 
 
 @dataclass
@@ -243,7 +246,8 @@ def register_loader(
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
     ``options`` pydantic model used to validate ``ModelSpec.loader_options``. ``prepare``
-    does a node's one-time weight work with no process group, before the ranks start.
+    does a node's one-time weight work with no process group, before the ranks start, and
+    returns whether the ranks can then load without converting.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -293,11 +297,14 @@ def resolve_loader_name(spec: ModelSpec) -> str:
     return _DEFAULT_LOADER
 
 
-def prepare_weights(spec: ModelSpec) -> None:
-    """Run the resolved loader's per-node weight preparation, if it has one."""
+def prepare_weights(spec: ModelSpec) -> bool:
+    """Run the resolved loader's per-node weight preparation; False if it has none or the ranks still have work."""
+    assert spec.loader is not None, "spec.loader must be resolved before prepare_weights"
     prepare = _LOADERS[spec.loader].prepare
-    if prepare is not None:
-        prepare(LoaderContext(spec=spec))
+    if prepare is None:
+        logger.warning(f"Loader {spec.loader!r} has no per-node weight preparation; its ranks convert while loading")
+        return False
+    return prepare(LoaderContext(spec=spec))
 
 
 def select_loader(ctx: LoaderContext) -> Loader:

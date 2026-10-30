@@ -571,14 +571,25 @@ def _convert_snapshot(model: nn.Module, config: ModelConfig, *, node_local_only:
     return snapshot_path, conversion is not None
 
 
-def prepare_node_conversion_cache(model: nn.Module, config: ModelConfig) -> None:
+def prepare_node_conversion_cache(model: nn.Module, config: ModelConfig) -> bool:
     """Fill this node's HF<->Prime conversion cache as ``load_dcp_from_hf`` would, without torch.distributed.
 
     A runtime runs it once per node before any rank starts, so a cold node's conversion is bounded by neither the
     ranks' start-up deadline nor their first collective. A shared (not node-local) cache stays the master rank's.
+
+    Returns whether the ranks' load will read the weights without converting them: False only for a shared cache
+    that is not written yet.
     """
-    if not config.debug.random_init:
-        _convert_snapshot(model, config, node_local_only=True)
+    if config.debug.random_init:
+        return True
+    snapshot_path, converted = _convert_snapshot(model, config, node_local_only=True)
+    if converted and not conversion_cache_ready(snapshot_path):
+        get_logger().warning(
+            f"Did not write the shared conversion cache {snapshot_path}; the master rank writes it inside the ranks' "
+            f"load (scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')})"
+        )
+        return False
+    return True
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):

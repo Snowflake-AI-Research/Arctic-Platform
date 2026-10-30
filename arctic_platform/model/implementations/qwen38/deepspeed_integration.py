@@ -111,8 +111,8 @@ def load_qwen4_exp_model_for_deepspeed(
     return model
 
 
-def prepare_qwen4_exp_weights(**kwargs) -> None:
-    qwen_ds.prepare_moe_conversion_cache(_adapter(), **kwargs)
+def prepare_qwen4_exp_weights(**kwargs) -> bool:
+    return qwen_ds.prepare_moe_conversion_cache(_adapter(), **kwargs)
 
 
 def load_qwen4_exp_model(
