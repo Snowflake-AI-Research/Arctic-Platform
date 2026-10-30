@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 # The server answers generate inline, so it has no request to poll or cancel.
 _UNSUPPORTED_OPS = frozenset({"generate-stream", "request-status", "cancel-request"})
+# Cancel in-flight ops, then wait for the loop thread to exit, before close().
+_LOOP_SHUTDOWN_TIMEOUT_S = 30
 
 
 class OnPremTransport(Transport):
@@ -43,8 +46,9 @@ class OnPremTransport(Transport):
     ``ArcticRLRayServer`` wrapper (typed async ops) that snapshots workers at
     construction, so the wrapper is built after jobs are initialized.
 
-    `call` resolves ``op -> method`` and forwards the request unchanged; async
-    callers use `acall`, which awaits the actor coroutine on the caller's loop.
+    `call` and `acall` both submit the actor coroutine to the private loop.
+    `call` blocks on that future. `acall` awaits it, so a server
+    ``asyncio.Lock`` is only used from that one loop.
 
     Reconnect: when handed an existing ``server_state`` actor (plus reconnect
     job ids on the config) the transport reattaches to the already-running
@@ -63,10 +67,8 @@ class OnPremTransport(Transport):
         # races and raises "This event loop is already running". Running the loop in a dedicated thread and
         # submitting via `run_coroutine_threadsafe` makes dispatch safe for any number of caller threads.
         #
-        # The server must not block this loop on training RPCs. One lock covers every training-worker
-        # op (forward, step, save, load, weight sync, sleep/wake, and empty-cache). A training op
-        # outside that lock can overlap a DP collective, and generation stalls for the whole step
-        # if a training RPC blocks the loop.
+        # Training RPCs on this loop await under ``ArcticRLRayServer._training_op_lock`` (#104).
+        # A blocking gather on the loop thread stalls generate for the whole step.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = self._start_loop_thread(self._loop)
 
@@ -149,28 +151,24 @@ class OnPremTransport(Transport):
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
         return method, args
 
-    def _run_on_loop(self, coro):
-        """Run ``coro`` on the private loop and block for its result.
+    def _submit(self, coro) -> concurrent.futures.Future:
+        """Schedule ``coro`` on the private loop.
 
-        The loop runs forever in its own thread, so this works uniformly for
-        every caller: sync callers (``ArcticRLClient`` / ``SyncArcticRLClient``,
-        destroy from a non-async thread), concurrent sync callers (TRL's trainer
-        thread and background rollout worker), and async callers
-        (``AsyncArcticRLClient.shutdown`` under verl's ``asyncio.run``, whose
-        loop is a different loop). ``run_coroutine_threadsafe`` schedules on the
-        loop thread and ``.result()`` blocks the caller -- no thread drives the
-        loop itself, so there is no "event loop is already running" race.
-
-        Calling this from the loop thread deadlocks: ``.result()`` waits for a
-        callback that cannot run until this call returns.
+        Blocking on the returned future from the loop thread deadlocks: the
+        loop cannot run ``coro`` until this call returns. ``acall`` awaits the
+        future from the caller's loop instead of blocking this thread.
         """
         if threading.current_thread() is self._loop_thread:
             coro.close()
             raise RuntimeError(
-                "OnPremTransport._run_on_loop was called from the transport loop thread; "
-                "Future.result() would deadlock. Await the server method on this loop instead."
+                "OnPremTransport._submit was called from the transport loop thread; "
+                "waiting on that future would deadlock. Await the server method on this loop instead."
             )
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def _run_on_loop(self, coro):
+        """Block until ``coro`` finishes on the private loop."""
+        return self._submit(coro).result()
 
     def _cancel_pending(self) -> None:
         """Cancel tasks still on the private loop, then wait until they finish."""
@@ -185,17 +183,17 @@ class OnPremTransport(Transport):
                 await asyncio.gather(*pending, return_exceptions=True)
 
         try:
-            asyncio.run_coroutine_threadsafe(_cancel(), loop).result(timeout=30)
-        except Exception:
+            self._submit(_cancel()).result(timeout=_LOOP_SHUTDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
             logger.warning("in-flight Ray transport ops were still running at shutdown", exc_info=True)
 
     def call(self, request: Request) -> dict:
         method, args = self._resolve(request)
-        return self._run_on_loop(method(*args))
+        return self._submit(method(*args)).result()
 
     async def acall(self, request: Request) -> dict:
         method, args = self._resolve(request)
-        return await method(*args)
+        return await asyncio.wrap_future(self._submit(method(*args)))
 
     def shutdown(self) -> None:
         # In reconnect mode the jobs/server are owned by the driver process;
@@ -215,10 +213,11 @@ class OnPremTransport(Transport):
         if thread.is_alive():
             self._cancel_pending()
             self._loop.call_soon_threadsafe(self._loop.stop)
-            thread.join(timeout=30)
+            thread.join(timeout=_LOOP_SHUTDOWN_TIMEOUT_S)
             if thread.is_alive():
                 raise RuntimeError(
-                    "Ray transport loop thread did not exit within 30s; refusing to close a running event loop"
+                    "Ray transport loop thread did not exit within "
+                    f"{_LOOP_SHUTDOWN_TIMEOUT_S:.0f}s; refusing to close a running event loop"
                 )
         if not self._loop.is_closed():
             self._loop.close()
