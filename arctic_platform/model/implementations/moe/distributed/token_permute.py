@@ -8,6 +8,7 @@ operand, and it has to be assertable wherever tests run, including hosts without
 
 import torch
 
+from ..token_combine import gather_token_rows
 from ..token_combine import sum_rows_by_token
 
 
@@ -34,7 +35,7 @@ def permute_tokens(
     permuted_indices = torch.arange(len(hidden_states), device=hidden_states.device).repeat_interleave(
         mask.sum(dim=1)
     )[sort_order]
-    permuted_hidden_states = hidden_states.index_select(0, permuted_indices)
+    permuted_hidden_states = gather_token_rows(hidden_states, permuted_indices)
     permuted_scores = valid_scores[sort_order]
 
     num_tokens_per_expert = torch.bincount(valid_expert_ids, minlength=num_local_experts)

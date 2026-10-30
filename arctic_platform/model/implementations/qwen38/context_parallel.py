@@ -63,6 +63,8 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
     from fla.modules.conv import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
+
     check_finite = os.environ.get("ARCTIC_QWEN38_CP_CHECK_FINITE") == "1"
 
     num_key_heads = int(module.num_k_heads)
@@ -107,10 +109,9 @@ def _adapt_linear_attention(module: nn.Module, process_group) -> None:
         a = self.in_proj_a(hidden_states)
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        if num_value_heads // num_key_heads > 1:
-            replication = num_value_heads // num_key_heads
-            query = query.repeat_interleave(replication, dim=2)
-            key = key.repeat_interleave(replication, dim=2)
+        query, key = repeat_query_key_for_value_heads(
+            query, key, num_key_heads, num_value_heads, chunk_gated_delta_rule
+        )
         if check_finite:
             for name, tensor in (
                 ("query", query),

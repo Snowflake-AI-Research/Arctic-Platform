@@ -39,6 +39,7 @@ def register(registry: Registry) -> None:
             "lm_head.token_chunk_size",
             "lm_head.cross_entropy",
             "moe.grouped_mm",
+            "moe.sonicmoe",
             "moe.comm_backend",
             "moe.comm_sms",
             "moe.comm_token_chunk",
