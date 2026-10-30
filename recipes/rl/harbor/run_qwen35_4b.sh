@@ -103,9 +103,8 @@ try:
     cfg = CortexConfig()
 except ValidationError:
     sys.exit(
-        "ERROR: no Cortex connection. Either run\n"
-        "         cortex-training login <config.json>\n"
-        "       or export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT."
+        "ERROR: no Cortex connection. Export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT\n"
+        "       (the host, database, schema, and pat from your cortex-training config JSON)."
     )
 print(cfg.base_url or f"{cfg.host} {cfg.database}.{cfg.schema_}")
 PY

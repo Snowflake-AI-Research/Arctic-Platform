@@ -11,6 +11,20 @@ Every Harbor task already defines `instruction.md`, `environment/`, and `tests/t
 2. **Token Splicing**: `ChatCompletionsProxy` records every `/v1/chat/completions` call and splices the exact sampled token IDs across turns (`loss_mask = 1` on assistant turns, `0` on prompts and tool outputs).
 3. **`Verifier`**: Harbor's `Verifier` executes the task's `tests/test.sh` and reads `/logs/verifier/reward.txt` or `reward.json`.
 
+## Before You Start
+
+The driver needs [`uv`](https://docs.astral.sh/uv/) and a SkyRL checkout; the launcher installs OpenHands and Harbor itself. Run the commands below from the root of this repository.
+
+```bash
+git clone --branch skyrl-v0.3.0 --depth 1 https://github.com/NovaSky-AI/SkyRL
+export SKYRL_HOME=$PWD/SkyRL
+
+# The launcher reads the Cortex connection only from these variables.
+cfg=~/cortex-training-config.json
+export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg") ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
+export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg") ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+```
+
 ## Go from `harbor run` (eval) to RL Post-Training in 3 Steps
 
 ### 1. Any Harbor Task Set

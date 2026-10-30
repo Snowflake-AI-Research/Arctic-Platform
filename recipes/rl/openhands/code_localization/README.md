@@ -131,10 +131,18 @@ cd Arctic-Platform
 `SKYRL_HOME` must contain `integrations/arctic_rl`. The launcher installs
 OpenHands SDK `85ecfd93`.
 
-Cortex credentials are `cortex-training login ~/cortex-training-config.json`,
-or `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and
-`ARCTIC_CORTEX_PAT`. A file that assigns those without `export` has to be
-loaded with `set -a`.
+The launcher reads Cortex credentials only from `ARCTIC_CORTEX_HOST`,
+`ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and `ARCTIC_CORTEX_PAT`;
+`cortex-training login` alone is not enough. To use the config JSON you log in
+with:
+
+```bash
+cfg=~/cortex-training-config.json
+export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg") ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
+export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg") ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+```
+
+A file that assigns those without `export` has to be loaded with `set -a`.
 
 You need a Cortex account with 8 H200s free, and disk on the driver for one
 git checkout per in-flight rollout. That checkout is the sandbox.
