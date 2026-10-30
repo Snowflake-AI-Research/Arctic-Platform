@@ -1095,7 +1095,8 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, ent
 
 
 @pytest.mark.parametrize("entry_point", _SYNC_ENTRY_POINTS)
-def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp_path, entry_point):
+@pytest.mark.parametrize("is_act_and_mul", [True, False])
+def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp_path, entry_point, is_act_and_mul):
     # vLLM 0.32.0: FlashInfer CUTLASS experts hold w13 as [up; gate] after load (oracle/unquantized.py
     # convert_to_unquantized_kernel_format); a sync's loaders write [gate; up] (routed_experts.py _load_w13).
     backends = SimpleNamespace(FLASHINFER_CUTLASS="FlashInfer CUTLASS", TRITON="TRITON")
@@ -1110,26 +1111,28 @@ def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp
 
     gate = torch.arange(24.0).view(2, 3, 4).bfloat16()  # [experts, rows, hidden]
     up = gate + 24
+    checkpoint = torch.cat([gate, up], dim=1) if is_act_and_mul else gate
+    expected = torch.cat([up, gate], dim=1) if is_act_and_mul else gate
     layers = {}
     for name, backend in (("cutlass", backends.FLASHINFER_CUTLASS), ("triton", backends.TRITON)):
         layers[name] = nn.Module()
         layers[name].quant_method = SimpleNamespace(unquantized_backend=backend)
-        layers[name].moe_config = SimpleNamespace(is_act_and_mul=True)
-        layers[name].w13_weight = nn.Parameter(torch.zeros(2, 6, 4).bfloat16(), requires_grad=False)
+        layers[name].moe_config = SimpleNamespace(is_act_and_mul=is_act_and_mul)
+        layers[name].w13_weight = nn.Parameter(torch.zeros_like(checkpoint), requires_grad=False)
     address = layers["cutlass"].w13_weight.data_ptr()
 
     def load_checkpoint_order():
         for layer in layers.values():
-            layer.w13_weight.data.copy_(torch.cat([gate, up], dim=1))
+            layer.w13_weight.data.copy_(checkpoint)
 
     result = _run_sync_entry_point(entry_point, monkeypatch, tmp_path, layers, load_checkpoint_order)
 
     cutlass = layers["cutlass"].w13_weight
-    wrong = int((cutlass != torch.cat([up, gate], dim=1)).sum())
+    wrong = int((cutlass != expected).sum())
     assert wrong == 0, f"{wrong} of {cutlass.numel()} CUTLASS w13 elements hold the other projection after the sync"
     assert cutlass.data_ptr() == address
-    assert torch.equal(layers["triton"].w13_weight, torch.cat([gate, up], dim=1))
-    assert result["cached_weight_copies_refreshed"] == 1
+    assert torch.equal(layers["triton"].w13_weight, checkpoint)
+    assert result["cached_weight_copies_refreshed"] == int(is_act_and_mul)
 
 
 async def _noop_abort_all_streams():

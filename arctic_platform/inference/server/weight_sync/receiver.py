@@ -323,7 +323,7 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
 
 
 def _refresh_cached_weight_copies(model) -> int:
-    """Rebuild the weight copies vLLM GLM-5.3 caches on its first forward from the synced parameters.
+    """Restore cached weight copies and CUTLASS expert layout after a full-weight load.
 
     ``Glm5NextLinearAttention._forward`` (vLLM 0.31/0.32 ``glm5next/common/kda.py``) concatenates
     the three conv weights once and reuses that copy, so a sync never reaches the convolution; the
