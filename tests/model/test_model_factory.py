@@ -457,6 +457,24 @@ class TestModelFeaturePatches:
         assert type(model.model.layers[0]).__name__ == "CheckpointWrapper"
         assert type(model.model.layers[1]).__name__ == "Linear"
 
+    def test_listed_checkpointing_wraps_only_those_layers(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        model = nn.Module()
+        model.config = types.SimpleNamespace(model_type="llama", use_cache=True)
+        model.model = nn.Module()
+        model.model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(4)])
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=[1, 2]))
+
+        assert [type(layer).__name__ for layer in model.model.layers] == [
+            "Linear",
+            "CheckpointWrapper",
+            "CheckpointWrapper",
+            "Linear",
+        ]
+        with pytest.raises(ValueError, match=r"layers \[4\] are past the model's 4 layers"):
+            apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=[4]))
+
     def test_rejects_fullgraph_with_tiling(self):
         from arctic_platform.model.config import Patches
 

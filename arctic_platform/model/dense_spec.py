@@ -49,7 +49,13 @@ def dense_model_spec(
             f"not in training_options; move {', '.join(misplaced)}"
         )
 
-    offload_config = (training_options.get("ac_config") or {}).get("offload_config") or {}
+    ac_config = training_options.get("ac_config") or {}
+    gradient_checkpointing = training_options.get("activation_checkpointing", False)
+    if ac_config.get("layers") is not None:
+        if gradient_checkpointing is not True:
+            raise ValueError("ac_config.layers requires activation_checkpointing true on the dense route")
+        gradient_checkpointing = list(ac_config["layers"])
+    offload_config = ac_config.get("offload_config") or {}
     activation_offload = None
     if offload_config.get("enabled", False):
         activation_offload = {
@@ -74,7 +80,7 @@ def dense_model_spec(
         parallelism=ParallelismConfig(sequence_parallel=sequence_parallel),
         patches=Patches(
             liger=liger,
-            gradient_checkpointing=training_options.get("activation_checkpointing", False),
+            gradient_checkpointing=gradient_checkpointing,
             activation_offload=activation_offload,
             compile=training_options.get("compile"),
             tiled_mlp=tiled_mlp,

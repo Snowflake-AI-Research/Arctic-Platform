@@ -192,9 +192,12 @@ class Patches(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
-    gradient_checkpointing: StrictBool | PositiveInt = Field(
+    gradient_checkpointing: StrictBool | PositiveInt | list[NonNegativeInt] = Field(
         False,
-        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+        description=(
+            "False disables; True checkpoints every layer; an integer checkpoints every Nth layer; "
+            "a list checkpoints exactly those layer indices."
+        ),
     )
     activation_offload: ActivationOffloadPatch | None = Field(
         None, description="CPU offload for activations saved by checkpointed layers."
@@ -209,6 +212,12 @@ class Patches(BaseModel):
 
     @model_validator(mode="after")
     def _validate_patch_combinations(self) -> Self:
+        layers = self.gradient_checkpointing
+        if isinstance(layers, list):
+            if not layers:
+                raise ValueError("gradient_checkpointing layers is empty; use False to disable checkpointing")
+            if len(set(layers)) != len(layers):
+                raise ValueError(f"gradient_checkpointing lists a layer twice: {layers}")
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")
