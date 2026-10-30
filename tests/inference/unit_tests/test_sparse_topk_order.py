@@ -12,7 +12,7 @@ _GROUPS = 512
 
 
 def _expand_pools_and_append_tail(pool_ids, seq_lens, pool_size):
-    # Torch copy of vLLM 0.31 `_expand_pools_and_append_tail_kernel` (glm5next/nvidia/ops/kpool_compress.py).
+    # Torch copy of vLLM 0.32 `_expand_pools_and_append_tail_kernel` (glm5next/nvidia/ops/kpool_compress.py).
     rows, groups = pool_ids.shape
     history = (pool_ids.unsqueeze(-1) * pool_size + torch.arange(pool_size)).reshape(rows, groups * pool_size)
     history = torch.where(pool_ids.repeat_interleave(pool_size, dim=1) >= 0, history, -1)
@@ -101,9 +101,9 @@ def test_qsa_block_order_no_longer_depends_on_topk_slot_order(vllm_ops):
     logits = torch.randn(3, 1024, generator=torch.Generator().manual_seed(0))
     runs = []
     for seed in (1, 2):
-        block_indices = torch.empty(3, _GROUPS, dtype=torch.int32)
-        qsa.qsa_select(logits, visible, _GROUPS * _POOL, _POOL, block_indices, torch.Generator().manual_seed(seed))
-        runs.append(block_indices)
+        backing = torch.empty(5, _GROUPS, dtype=torch.int32)
+        qsa.qsa_select(logits, visible, _GROUPS * _POOL, _POOL, backing[1:4], torch.Generator().manual_seed(seed))
+        runs.append(backing[1:4])
 
     assert torch.equal(runs[0], runs[1]), "same selected set, different key order handed to attention"
     _assert_sorted_rows(runs[0])

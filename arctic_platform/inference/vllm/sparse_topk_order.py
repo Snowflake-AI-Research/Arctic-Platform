@@ -16,12 +16,11 @@
 """Give the sparse-attention key lists of GLM-5.3-Flash and Qwen3.8-Flash-Next a fixed order.
 
 vLLM's indexer top-k kernels (``top_k_per_row_prefill``, ``cooperative_topk``,
-``persistent_topk``) place each selected id through an atomic slot counter, so
-the same set comes out in a different order on every run. Nothing sorts it
-before the sparse attention kernels, which accumulate keys in list order
-(online softmax), so the same input gives different output bits, and the next
-FP8 indexer can then select a different set. Sorting each row ascending, with
-the -1 padding last, keeps the set and makes the order a function of it.
+``persistent_topk``) hand out output slots with ``atomicAdd``, so the same set
+can come back in a different order on each run, and the sparse attention
+kernels sum keys in list order. Sorting each row ascending, -1 padding last,
+keeps the set and makes its order a function of it. It does not change which
+ids top-k selects.
 """
 
 import torch
@@ -50,8 +49,7 @@ def apply_sparse_topk_order_fix() -> None:
     topk = qsa_indexer._topk
 
     class KpoolCompressPatch(ArcticPatch[kpool_compress]):
-        # GLM-5.3-Flash prefill and decode both expand their selected pools here. The
-        # tail tokens sit above every complete pool, so sorted pools give a sorted list.
+        # GLM-5.3-Flash prefill and decode both expand their selected pools here; the tail stays after any padding.
         @staticmethod
         def expand_pools_and_append_tail(pool_ids, seq_lens, pool_size):
             return expand_pools_and_append_tail(sort_topk_ids(pool_ids), seq_lens, pool_size)
