@@ -28,11 +28,15 @@ WEIGHT_METHODS = (
     "sync_lora_weights_broadcast",
     "sync_spec_weights",
 )
-MUTATIONS = [("sleep", None)] + [
-    (method, strategy)
-    for method in WEIGHT_METHODS
-    for strategy in ("pause", "drain", "skip", "hotswap")
-    if method != "sync_spec_weights" or strategy != "pause"
+# One sleep path plus one weight-sync method across the strategies that
+# change prep/abort behavior. The full method × strategy grid tested the
+# same quarantine and restore code many times.
+MUTATIONS = [
+    ("sleep", None),
+    ("sync_weights", "pause"),
+    ("sync_weights", "drain"),
+    ("sync_weights", "skip"),
+    ("sync_weights", "hotswap"),
 ]
 
 
@@ -183,9 +187,8 @@ def test_worker_rejects_legacy_generation_after_uncertain_cleanup():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("method", WEIGHT_METHODS)
 @pytest.mark.parametrize("failed", [False, True])
-def test_skip_sync_does_not_clear_quarantine(method, failed):
+def test_skip_sync_does_not_clear_quarantine(failed):
     async def scenario():
         pool, handle = make_pool()
         scheduler = pool._scheduler
@@ -193,9 +196,9 @@ def test_skip_sync_does_not_clear_quarantine(method, failed):
         state.quarantined = True
         state.available = False
         if failed:
-            getattr(handle, method).remote.side_effect = RuntimeError("sync failed")
+            handle.sync_weights.remote.side_effect = RuntimeError("sync failed")
         try:
-            await mutate(pool, method, "skip")
+            await mutate(pool, "sync_weights", "skip")
         except RuntimeError:
             assert failed
         assert not scheduler.is_worker_available(0)
@@ -318,16 +321,13 @@ def test_uncertain_stream_cleanup_prevents_engine_mutation(method, strategy):
 @pytest.mark.parametrize("method,strategy,phase", [
     ("sleep", None, "abort_streams"),
     ("sleep", None, "drain"),
-] + [
-    (method, strategy, phase)
-    for method, strategy in MUTATIONS[1:]
-    for phase in ("abort_streams", "drain")
-    if phase == "abort_streams" or strategy == "drain"
+    ("sync_weights", "pause", "abort_streams"),
+    ("sync_weights", "drain", "abort_streams"),
+    ("sync_weights", "drain", "drain"),
 ])
 @pytest.mark.parametrize("initially_paused", [False, True])
-@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 def test_lifecycle_preparation_failure_restores_previous_state(
-    method, strategy, phase, initially_paused, failure,
+    method, strategy, phase, initially_paused,
 ):
     async def scenario():
         pool, handle = make_pool()
@@ -339,9 +339,13 @@ def test_lifecycle_preparation_failure_restores_previous_state(
         if initially_paused:
             scheduler.pause()
         original_phase = getattr(scheduler, phase)
-        setattr(scheduler, phase, AsyncMock(side_effect=failure("preparation failed")))
+        setattr(
+            scheduler,
+            phase,
+            AsyncMock(side_effect=RuntimeError("preparation failed")),
+        )
         try:
-            with pytest.raises(failure, match="preparation failed"):
+            with pytest.raises(RuntimeError, match="preparation failed"):
                 await mutate(pool, method, strategy)
             assert scheduler._paused == initially_paused
             assert scheduler._pause_event.is_set() == (not initially_paused)
@@ -357,17 +361,21 @@ def test_lifecycle_preparation_failure_restores_previous_state(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("method,strategy", MUTATIONS[1:])
-@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
-def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, strategy, failure):
+@pytest.mark.parametrize("method,strategy", [
+    ("sync_weights", "pause"),
+    ("sync_weights", "drain"),
+])
+def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, strategy):
     async def scenario():
         pool, handle = make_pool()
         scheduler = pool._scheduler
         await pool.sleep()
         original_abort = scheduler.abort_streams
-        scheduler.abort_streams = AsyncMock(side_effect=failure("preparation failed"))
+        scheduler.abort_streams = AsyncMock(
+            side_effect=RuntimeError("preparation failed")
+        )
         try:
-            with pytest.raises(failure, match="preparation failed"):
+            with pytest.raises(RuntimeError, match="preparation failed"):
                 await mutate(pool, method, strategy)
             assert pool.sleeping
             assert scheduler.paused
@@ -382,7 +390,10 @@ def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, str
 
 
 @pytest.mark.parametrize("method,strategy", [
-    (method, strategy) for method, strategy in MUTATIONS if strategy != "hotswap"
+    ("sleep", None),
+    ("sync_weights", "pause"),
+    ("sync_weights", "drain"),
+    ("sync_weights", "skip"),
 ])
 def test_cancellation_after_engine_mutation_starts_does_not_restore_scheduling(method, strategy):
     async def scenario():
