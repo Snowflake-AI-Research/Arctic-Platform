@@ -43,6 +43,19 @@ class FlashMoeOptions(GenericMoeOptions):
             "them to the input dtype."
         ),
     )
+    fp32_routed_weighting: bool = Field(
+        False,
+        description=(
+            "BF16 experts multiply the down projection's fp32 accumulator by the routing weight and round once, as "
+            "vLLM's Triton fused MoE kernel does, instead of rounding the expert output and then weighting it. It "
+            "runs one fp32-output GEMM per local expert in place of the grouped GEMM: on H200 the routed experts' "
+            "forward plus backward takes 16-19% longer. FP8 experts reject it."
+        ),
+    )
+
+
+class _FlashLoadOptions(Qwen3_5MoeOptions):
+    fp32_routed_weighting: bool = False
 
 
 def _matches(family: str):
@@ -128,7 +141,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
         raise ValueError("flash MoE requires parallel_groups['ep_group'] from the runtime")
     if ctx.spec.parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
         raise ValueError("flash MoE requires parallel_groups['sp_group'] when sequence_parallel > 1")
-    options = Qwen3_5MoeOptions.model_validate(ctx.spec.loader_options)
+    options = _FlashLoadOptions.model_validate(ctx.spec.loader_options)
     assert ctx.spec.attn_implementation is not None
     model = load_model(
         model_name=ctx.spec.model_path_or_name,

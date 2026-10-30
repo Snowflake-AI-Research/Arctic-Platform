@@ -124,7 +124,7 @@ class EPShardedEmbedding(nn.Embedding):
 
 
 class Qwen4ExpSparseMoePrimeRL(MoE):
-    def __init__(self, config, *, use_grouped_mm: bool):
+    def __init__(self, config, *, use_grouped_mm: bool, fp32_routed_weighting: bool = False):
         super().__init__(
             MoEArgs(
                 num_experts=config.num_experts,
@@ -136,6 +136,7 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
                 top_k=config.num_experts_per_tok,
                 use_grouped_mm=use_grouped_mm,
                 load_balance_coeff=None,
+                fp32_routed_weighting=fp32_routed_weighting,
             ),
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
@@ -394,6 +395,7 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
                     use_grouped_mm=use_grouped_mm,
+                    fp32_routed_weighting=getattr(config, "fp32_routed_weighting", False),
                 )
             if layer.ple is not None:
                 layer.ple.__class__ = Qwen4ExpTextPLELayerPrimeRL
