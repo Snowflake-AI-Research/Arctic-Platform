@@ -71,7 +71,7 @@ def _worker(rank, rendezvous, offload, overlap, contiguous, managed):
     }  # several buckets per backward
     if offload:
         zero["offload_optimizer"] = {"device": "cpu", "pin_memory": False}
-    # The fp32-master body our RL client sends (bf16 parameters, fp32 masters and optimizer states).
+    # bf16 parameters with fp32 masters and optimizer states.
     ds_config = build_deepspeed_config(
         TrainingEngineSpec(
             world_size=_WORLD,

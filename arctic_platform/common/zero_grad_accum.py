@@ -16,8 +16,7 @@
 
 DeepSpeed 0.19.7 ignores that dtype at stage 2. Without optimizer offload the first call's bf16 gradient partition
 becomes the running sum; with CPU offload a bf16 host buffer per parameter does. Either way fp32 master weights
-receive a bf16 sum of every model call of the step. This applies the change proposed for DeepSpeed itself
-(DSS-Issue-Tracker issue b20d5655, ``fix/deepspeed-0.19.7-zero2-grad-accum-dtype.patch``) on 0.19.7 only;
+receive a bf16 sum of every model call of the step. This applies an fp32 accumulation fix on 0.19.7 only;
 0.19.8 uses its native fp32 partition accumulator.
 It changes nothing unless the accumulation dtype differs from the parameter dtype.
 """
