@@ -115,15 +115,17 @@ def test_family_defaults_remain_distinct():
     qwen_config = qwen._build_model_config("qwen", 2, 4, "bfloat16", "flash_attention_3", Qwen3_5MoeOptions())
     glm_config = glm._build_model_config("glm", 2, 4, "bfloat16", "flash_attention_2", GlmMoeDsaOptions())
 
-    assert (qwen_config.attn, qwen_config.moe_use_grouped_mm) == (
+    assert (qwen_config.attn, qwen_config.moe_use_grouped_mm, qwen_config.moe_use_sonicmoe) == (
         "flash_attention_3",
         True,
+        False,
     )
     assert (
         glm_config.attn,
         glm_config.moe_use_grouped_mm,
+        glm_config.moe_use_sonicmoe,
         glm_config.sparse_mla_backend,
-    ) == ("flash_attention_2", False, "ref")
+    ) == ("flash_attention_2", False, False, "ref")
 
 
 def test_qwen_adapter_keeps_sp_and_vllm_export(monkeypatch):
@@ -322,7 +324,8 @@ def test_ep_weight_gather_to_cpu_rejects_budget_smaller_than_one_group_element(m
     assert state["calls"] == []
 
 
-def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
+@pytest.mark.parametrize("rank,group_ranks", [(0, [0, 1]), (2, [2, 3])])
+def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank, group_ranks):
     converted = {}
 
     class ExportableModel(nn.Module):
@@ -349,7 +352,8 @@ def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: group_ranks)
     calls = []
 
     def gather(tensor, ep_group, *, is_master, max_gather_bytes=64 * 1024 * 1024):
@@ -360,6 +364,12 @@ def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
     model = ExportableModel()
 
     exported = dict(common.build_iter_full_hf_weights(model)())
+
+    if rank != 0:
+        assert exported == {}
+        assert converted == {}
+        assert calls == []
+        return
 
     assert list(exported) == ["dense", "expert"]
     assert converted == {"layer_index": -1, "expert_device": "cpu"}
