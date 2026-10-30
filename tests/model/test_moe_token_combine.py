@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
 import torch
 
 from arctic_platform.model.implementations.moe.token_combine import sum_rows_by_token
@@ -136,3 +137,31 @@ def test_every_expert_parallel_backend_folds_through_the_shared_implementation()
             f"{module_name}'s unpermute does not fold through models.moe.token_combine.sum_rows_by_token, so a "
             "change to the shared fold reaches every other combine path and not this one"
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered fold runs on CUDA")
+def test_gather_token_rows_gradient_sums_each_tokens_rows_deterministically():
+    from arctic_platform.model.implementations.moe.token_combine import gather_token_rows
+
+    torch.manual_seed(0)
+    num_tokens, hidden = 300, 2100  # hidden past one column block; some tokens get no rows
+    token_indices = torch.randint(0, num_tokens - 20, (1500,), device="cuda")
+    hidden_states = torch.randn(num_tokens, hidden, device="cuda").bfloat16().requires_grad_(True)
+    grad = torch.randn(token_indices.numel(), hidden, device="cuda").bfloat16()
+
+    rows = gather_token_rows(hidden_states, token_indices)
+    rows.backward(grad)
+    first = hidden_states.grad.clone()
+    hidden_states.grad = None
+    gather_token_rows(hidden_states, token_indices).backward(grad)
+
+    expected = torch.zeros(num_tokens, hidden, dtype=torch.float64, device="cuda")
+    expected.index_add_(0, token_indices, grad.double())
+    assert torch.equal(rows, hidden_states.detach().index_select(0, token_indices))
+    assert type(rows.grad_fn).__name__ == "_GatherTokenRowsBackward"
+    # The CUDA fold sums each token's rows in fp32 and stores bf16. The reference sums the same bf16
+    # addends in fp64, so the gap is one bf16 ulp of the largest sum.
+    span = expected.abs().max().item()
+    torch.testing.assert_close(first.double(), expected, rtol=0, atol=torch.finfo(torch.bfloat16).eps * max(span, 1.0))
+    assert (first[num_tokens - 20 :] == 0).all()
+    assert torch.equal(first, hidden_states.grad)
