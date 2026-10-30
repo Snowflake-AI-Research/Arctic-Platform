@@ -1615,9 +1615,9 @@ class ArcticRLRayServer:
             encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
             workers = self.log_prob_workers
             # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same
-            # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
-            # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
-            wrapper = dict(batch=dict(encoded), meta={}, processing={})
+            # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard.
+            # balance_batch false keeps request order; torch.cat does not undo a reorder.
+            wrapper = dict(batch=dict(encoded), meta={"balance_batch": False}, processing={})
             shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
