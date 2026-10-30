@@ -143,7 +143,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 }
 ```
 
-**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is also preserved. If a supplied `data_types` block omits `grad_accum_dtype`, or a caller initializes DeepSpeed without going through the AP worker, DeepSpeed defaults to the model dtype for gradient accumulation.
+**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is also preserved. If a supplied `data_types` block omits `grad_accum_dtype`, DeepSpeed defaults to the model dtype for gradient accumulation.
+
+**`build_deepspeed_config` applies the same rule for BF16 ZeRO-2 with FP32 masters.** Callers that build the config there without the AP worker, such as the DSS server, get `data_types={"grad_accum_dtype": "fp32"}` when the block is absent; a supplied block is kept as given. Without it, FP32 master gradients would be a BF16 running sum of every model call of the step. Other precisions and stages are left to DeepSpeed's default, the model dtype.
 
 **Regression coverage verifies the existing default, not a numerical-default change.** Worker tests cover both the absent `data_types` block and preserved supplied blocks. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
 
