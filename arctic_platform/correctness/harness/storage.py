@@ -891,12 +891,17 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
 
     dependencies["torch"] = str(torch.__version__)
     root = Path(__file__).resolve().parents[1]
+    package = root.parent
     sources = {
-        str(path.relative_to(root)): file_identity(path)
+        str(path.relative_to(package if path.is_relative_to(package / "model") else root)): file_identity(path)
         for path in [
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "sft.py",
             root / "harness" / "optimizer.py",
+            # The reference applies the target loader's rounding through these modules.
+            package / "model" / "loaders" / "huggingface.py",
+            package / "model" / "implementations" / "gpu" / "vllm_rounding.py",
+            package / "model" / "implementations" / "gpu" / "qwen3_5_dense_parity.py",
             *(
                 [root / "harness" / "lora.py"]
                 if isinstance(recipe.get("initialization"), dict)

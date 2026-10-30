@@ -249,6 +249,13 @@ def _checkpoint_placement(args: argparse.Namespace, config):
 def _validation_gateway(args: argparse.Namespace):
     """Use the installed DSS gateway, and shut down only the server this command started."""
     if not getattr(args, "_automatic_cortex_gateway", False):
+        if getattr(args, "_automatic_checkpoint_bridge", False):
+            from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
+
+            # A configured loopback gateway still needs the bridge: its plain save has no durable catalog entry.
+            with local_checkpoint_bridge():
+                yield None
+            return
         yield None
         return
     from arctic_platform.correctness.harness.gateway import local_cortex_gateway
@@ -697,8 +704,12 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         bf16 = ds_config.get("bf16")
         bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
         if bf16_enabled:
-            data_types = ds_config.get("data_types")
-            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else None
+            data_types = ds_config.get("data_types") or {}
+            # ``DeepSpeedWorker.ds_training_config`` sets ``grad_accum_dtype`` to FP32 whenever the key is missing or
+            # ``None``, whatever the state of the ``data_types`` block; only an explicit value overrides it.
+            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else "invalid"
+            if accumulation is None:
+                accumulation = "fp32"
             if accumulation != "fp32":
                 raise ValueError(
                     f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "

@@ -75,6 +75,7 @@ from arctic_platform.model.weight_export import pretrained_module_for_hf_save
 from arctic_platform.model.weight_export import read_checkpoint_weight_names
 from arctic_platform.model.weight_export import requires_hf_weight_sync
 from arctic_platform.model.weight_export import save_exported_state_dict
+from arctic_platform.model.weight_export import save_exported_weights
 from arctic_platform.model.weight_export import save_hf_pretrained
 from arctic_platform.model.weight_export import save_peft_adapters
 from arctic_platform.model.weight_export import supports_weight_format
@@ -141,6 +142,7 @@ __all__ = [
     "resolve_conversion_cache_path",
     "ROUTER_REPLAY_FRESH",
     "save_exported_state_dict",
+    "save_exported_weights",
     "select_loader",
     "validate_lora_sync_trainable_parameters",
     "validate_expert_parallel",

@@ -525,7 +525,12 @@ def validate_glm53_full_config(source_config, export_config):
 
 
 def validate_glm53_full_schema(source_config, source_schema, export_schema):
-    """Admit only GLM's named active-parameter casts; preserve every other header."""
+    """Preserve every original GLM header, including the FP32 mHC base/scale and KDA ``A_log``/``dt_bias``.
+
+    The training model keeps those four parameter families in the checkpoint's FP32
+    (``Glm5NextForConditionalGeneration.keeps_fp32_parameter``) and the sampler serves them in FP32, so an export that
+    casts them no longer carries the trained model's tensors.
+    """
     validate_glm53_full_config(source_config, source_config)
     quantization = source_config.get("quantization_config")
     original_schema_bytes(source_schema, quantization)
@@ -540,17 +545,7 @@ def validate_glm53_full_schema(source_config, source_schema, export_schema):
         prefix = f"model.language_model.layers.{index}."
         if not {prefix + name for name in ("eh_proj.weight", "enorm.weight", "hnorm.weight")} <= source_schema.keys():
             raise ValueError("complete original GLM prediction-layer inventory required: " + prefix)
-    projected = {}
-    for name, (dtype, shape) in source_schema.items():
-        cast = re.fullmatch(
-            layer_pattern + r"(?:self_attn\.(?:A_log|dt_bias)|hc_(?:attn|ffn)_(?:base|scale))",
-            name,
-        )
-        # Native GLM loads these active parameters in the configured BF16 dtype.
-        # Inactive prediction tensors, FP8 weights and FP32 scales are retained.
-        if cast and int(cast[1]) < active_layers and dtype == "F32":
-            dtype = "BF16"
-        projected[name] = [dtype, shape]
+    projected = {name: [dtype, shape] for name, (dtype, shape) in source_schema.items()}
     if export_schema != projected:
         missing = sorted(set(projected) - set(export_schema))
         unexpected = sorted(set(export_schema) - set(projected))
@@ -558,7 +553,7 @@ def validate_glm53_full_schema(source_config, source_schema, export_schema):
             name for name in projected.keys() & export_schema.keys() if projected[name] != export_schema[name]
         )
         raise ValueError(
-            "exact original GLM inventory and supported active-parameter dtypes required: "
+            "exact original GLM inventory and dtypes required: "
             + "; ".join(
                 f"{key}={len(names)} {names[:8]!r}"
                 for key, names in (("missing", missing), ("unexpected", unexpected), ("differences", differences))

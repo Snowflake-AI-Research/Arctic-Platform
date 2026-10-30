@@ -2144,6 +2144,9 @@ def main() -> None:
             install_manager(server_head.app.state.manager)
 
         async def serve(args):
+            from arctic_platform.correctness.harness.native_optimizer import install_zone_routes
+
+            install_zone_routes(server_head.app)
             return await _serve_with_listener(server_head, original_serve, args, listener)
 
         with _zone_listener() as listener:

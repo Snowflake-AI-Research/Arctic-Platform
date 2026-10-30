@@ -678,6 +678,7 @@ def test_load_direct_still_rejects_orphan_sources(monkeypatch):
 def test_load_fp8_tracks_all_received_bytes(monkeypatch):
     class FakeUpdater:
         pending = 0
+        unplaced = ()
 
         def __init__(self, model, dtype, device) -> None:
             self.names = []
@@ -737,6 +738,7 @@ def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
     updater._fp8_modules = {"layer.down_proj": module}
     updater._bufs = {}
     updater._shards_left = {}
+    updater._dequant = {}
 
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(
         torch.float8_e4m3fn
@@ -871,6 +873,113 @@ def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch)
         model.mlp.gate_up_proj.weight_scale.data, torch.tensor([2.0])
     )
     torch.testing.assert_close(model.mlp.down_proj.weight.data, down)
+
+
+class _Fp8RoutedExperts(nn.Module):
+    """``RoutedExperts`` with block-FP8 weights; its loader records every call and copies one expert's shard."""
+
+    def __init__(self, experts=2, inter=2, hidden=4):
+        super().__init__()
+        self.w13_weight = _frozen(torch.zeros((experts, 2 * inter, hidden), dtype=torch.float8_e4m3fn))
+        self.w2_weight = _frozen(torch.zeros((experts, hidden, inter), dtype=torch.float8_e4m3fn))
+        self.w13_weight_scale_inv = _frozen(torch.zeros((experts, 2, 2)))
+        self.w2_weight_scale_inv = _frozen(torch.zeros((experts, 2, 1)))
+        self.calls = []
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id):
+        return expert_id
+
+    def weight_loader(self, param, loaded, weight_name, shard_id, expert_id, return_success=False):
+        self.calls.append((weight_name, shard_id, expert_id, tuple(loaded.shape)))
+        rows = param.shape[1] // 2
+        target = param.data[expert_id]
+        if shard_id == "w1":
+            target = target.narrow(0, 0, rows)
+        elif shard_id == "w3":
+            target = target.narrow(0, rows, rows)
+        target.copy_(loaded)
+        return True
+
+
+def test_fp8_updater_loads_lora_wrapped_fp8_experts_and_scales(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = nn.Module()
+    model.mlp.experts.base_layer = nn.Module()
+    experts = model.mlp.experts.base_layer.routed_experts = _Fp8RoutedExperts()
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    w13 = torch.arange(32, dtype=torch.float32).reshape(2, 4, 4).to(torch.float8_e4m3fn)
+    w2 = (torch.arange(16, dtype=torch.float32).reshape(2, 4, 2) + 1).to(torch.float8_e4m3fn)
+    w13_scale = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2) + 1
+    w2_scale = torch.arange(4, dtype=torch.float32).reshape(2, 2, 1) + 1
+
+    for name, tensor in (
+        ("mlp.experts.w13_weight", w13),
+        ("mlp.experts.w2_weight", w2),
+        ("mlp.experts.w13_weight_scale_inv", w13_scale),
+        ("mlp.experts.w2_weight_scale_inv", w2_scale),
+    ):
+        updater.feed(name, tensor)
+
+    assert updater.unplaced == []
+    assert [(weight_name, shard_id) for weight_name, shard_id, _, _ in experts.calls] == [
+        *[("w13_weight", "w1"), ("w13_weight", "w3")] * 2,
+        *[("w2_weight", "w2")] * 2,
+        *[("w13_weight_scale_inv", "w1"), ("w13_weight_scale_inv", "w3")] * 2,
+        *[("w2_weight_scale_inv", "w2")] * 2,
+    ]
+    assert torch.equal(experts.w13_weight.view(torch.uint8), w13.view(torch.uint8))
+    assert torch.equal(experts.w2_weight.view(torch.uint8), w2.view(torch.uint8))
+    torch.testing.assert_close(experts.w13_weight_scale_inv.data, w13_scale)
+    torch.testing.assert_close(experts.w2_weight_scale_inv.data, w2_scale)
+
+
+def test_fused_writer_refines_block_scales_behind_a_lora_modular_quant_method():
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    experts = _Fp8RoutedExperts()
+    experts.w13_weight_scale_inv = _frozen(torch.zeros((2, 4, 2)))
+    experts.w13_weight_scale_inv.quant_method = "block"
+    # vLLM's LoRA wrapper swaps in a modular quant method that keeps the refine factor on the method it wraps.
+    experts.quant_method = SimpleNamespace(old_quant_method=SimpleNamespace(weight_scale_refine=(2, 1)))
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = experts
+    writer = _ShardAwareFusedWriter(model, torch.device("cpu"))
+    scale = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+
+    assert writer.feed("mlp.experts.w13_weight_scale_inv", scale)
+
+    torch.testing.assert_close(experts.w13_weight_scale_inv.data, scale.repeat_interleave(2, dim=1))
+
+
+def test_load_fp8_rejects_tensors_that_reach_no_parameter(monkeypatch):
+    class FakeUpdater:
+        pending = 0
+
+        def __init__(self, model, dtype, device) -> None:
+            self.unplaced = []
+
+        def feed(self, name, tensor):
+            self.unplaced.append(name)
+
+    import arctic_platform.inference.server.weight_sync.utils as utils
+
+    monkeypatch.setattr(utils, "_FP8InplaceUpdater", FakeUpdater)
+    with pytest.raises(RuntimeError, match="1 of them are LoRA adapter tensors"):
+        WeightSyncExtension._load_fp8(
+            SimpleNamespace(device=torch.device("cpu"), model_config=SimpleNamespace(dtype=torch.bfloat16)),
+            object(),
+            _FakeEngine(
+                [
+                    ("layer.o_proj.lora_A.default.weight", torch.ones(2)),
+                    ("layer.missing.weight", torch.ones(1)),
+                ]
+            ),
+        )
 
 
 def test_fused_writer_reports_canonical_moe_destination():
@@ -1044,7 +1153,7 @@ def test_broadcast_reports_loaded_validation_applicability(
             {"source.weight": ["weight"]},
             [],
         ),
-        _load_fp8=lambda model, engine: (1, 4.0),
+        _load_fp8=lambda model, engine, verifier=None: (1, 4.0),
         _build_result=lambda *args: {"status": "done"},
     )
 

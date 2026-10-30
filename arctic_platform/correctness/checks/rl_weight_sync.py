@@ -25,12 +25,15 @@ then runs with the gateway's defaults, and three records are compared:
   wrote it into (``ARCTIC_INFERENCE_WEIGHT_SYNC_VERIFY=1`` in the sampling workers' environment);
 - each sampler rank's shadow replay: every received tensor is loaded a second time into NaN-filled copies of
   its destination parameters, so a NaN left behind is an element no tensor wrote, and a written element that
-  differs from the live parameter is one the live load did not keep.
+  differs from the live parameter is one the live load did not keep. A quantized FP8 sampler replays through a
+  second instance of its in-place updater, so fused-module shards staged across tensors are quantized again
+  into the copies. Each copy exists only while its parameter is partially written, and a parameter whose live
+  bytes change after its copy was compared is reported.
 
 The check fails when the trainer sends fewer elements than it holds, when a rank's received set differs from
 the sent set by name, shape, dtype, element count or bytes, when a received tensor reaches no parameter, when a
-destination is not covered or not equal, when a destination cannot be shadow-verified, or when a sampler
-parameter is written by no tensor.
+destination is not covered or not equal, when a destination cannot be shadow-verified or changed after it was
+verified, or when a sampler parameter is written by no tensor.
 """
 
 from __future__ import annotations
@@ -186,6 +189,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         "uncovered": 0,
         "mismatched": 0,
         "unverifiable": 0,
+        "changed": 0,
         "untouched": 0,
         "untouched_elements": 0,
         "destinations": 0,
@@ -212,12 +216,14 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
             set(record.get("unverifiable_destinations") or []) | set(record.get("non_parameter_destinations") or [])
         )
         untouched: Dict[str, int] = record.get("untouched_parameters") or {}
+        changed = sorted(record.get("changed_after_verification") or [])
         for kind, names in (
             ("not received", missing),
             ("received but not sent", extra),
             ("received with different bytes, shape, dtype or count", differing),
             ("received but written to no parameter", dropped),
             ("written but not shadow-verifiable", unverifiable),
+            ("changed after its shadow verification", changed),
         ):
             for name in names:
                 failed.append(Mismatch(f"{label}: {name} {kind}", 1.0, 0.0))
@@ -234,6 +240,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         totals["uncovered"] += sum(uncovered.values())
         totals["mismatched"] += sum(mismatched.values())
         totals["unverifiable"] += len(unverifiable)
+        totals["changed"] += len(changed)
         totals["untouched"] += len(untouched)
         totals["untouched_elements"] += sum(untouched.values())
         totals["destinations"] += len(destinations)

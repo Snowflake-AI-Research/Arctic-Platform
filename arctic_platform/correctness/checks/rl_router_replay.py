@@ -53,6 +53,7 @@ from arctic_platform.correctness.harness import sft as gsm8k
 from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
 from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import generate
+from arctic_platform.correctness.harness.gateway import minimum_context_parallel_row_tokens
 from arctic_platform.correctness.harness.gateway import rl_batch
 from arctic_platform.correctness.harness.gateway import rl_fwd_bwd
 from arctic_platform.correctness.harness.gateway import running_rl_client
@@ -120,7 +121,9 @@ def _run(ctx) -> TestResult:
     model_path = cfg.model_name
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
-    examples = gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(TRAIN_SPLIT, count=configured_rows_per_step(cfg)))
+    examples = replay_examples(
+        tokenizer, configured_rows_per_step(cfg), minimum_context_parallel_row_tokens(cfg, model_path)
+    )
     prompts = [list(e.input_ids[: e.n_prompt]) for e in examples]
     # Each prompt may generate as many tokens as the dataset's own answer to it has; nothing else bounds the
     # rollout, and the sampler's own defaults decide everything else about sampling.
@@ -164,6 +167,32 @@ def _run(ctx) -> TestResult:
     failed, metrics = judge(samples, traces, full_recompute=expects_full_recompute(cfg.training))
     metrics["train_loss"] = float(response.get("avg_loss", float("nan")))
     return verdict(ctx, failed, metrics)
+
+
+def replay_examples(tokenizer, rows: int, minimum_prompt_tokens: int) -> List[gsm8k.Example]:
+    """The train split's first ``rows`` examples, in file order, whose prompt holds ``minimum_prompt_tokens`` or more.
+
+    Router replay admits a row only when its attended tokens are exactly the prompt plus the generation the sampler
+    captured, so a row too short for context parallelism cannot be widened with loss-free tail tokens the way
+    ``rl_batch(minimum_row_tokens=...)`` widens the other RL checks' rows. A packed window holds whole rows, so a
+    prompt that alone spans the minimum keeps every rank's shard of every window wide enough, however few tokens the
+    sampler generates. A minimum of zero selects the leading rows.
+    """
+    if type(minimum_prompt_tokens) is not int or minimum_prompt_tokens < 0:
+        raise ValueError("minimum_prompt_tokens must be a nonnegative integer")
+    if minimum_prompt_tokens == 0:
+        return gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(TRAIN_SPLIT, count=rows))
+    selected: List[gsm8k.Example] = []
+    for row in gsm8k.read_rows(TRAIN_SPLIT):
+        (example,) = gsm8k.tokenize_examples(tokenizer, [row])
+        if example.n_prompt >= minimum_prompt_tokens:
+            selected.append(example)
+            if len(selected) == rows:
+                return selected
+    raise ValueError(
+        f"{TRAIN_SPLIT} holds {len(selected)} prompt(s) of at least {minimum_prompt_tokens} tokens; the config trains "
+        f"{rows} row(s) per step"
+    )
 
 
 def sample_from_result(prompt: Sequence[int], result: dict) -> dict:

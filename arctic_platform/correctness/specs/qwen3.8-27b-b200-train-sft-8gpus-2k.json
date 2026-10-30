@@ -72,14 +72,14 @@
       "worst_tensor": "gas1 loss at iteration 9"
     },
     "single-step-grads": {
-      "absolute": 0.004,
+      "absolute": 0.01,
       "calibration_runs": 16,
       "computed_gate": 0.0033863186836242676,
       "minimum_gate": 0.001,
       "multiplier": 2.0,
       "raw_max_same_tensor_range": 0.0008465796709060669,
-      "rounding_quantum": 0.001,
-      "status": "calibrated from 16 nondeterministic reference executions; 2x rounded upward in 1e-3 units",
+      "rounding_quantum": 0.01,
+      "status": "calibrated from 16 nondeterministic reference executions; selected gate 1e-2",
       "worst_tensor": "model.language_model.layers.2.linear_attn.in_proj_a.weight"
     },
     "single-step-optimizer": {

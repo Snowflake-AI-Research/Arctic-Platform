@@ -34,8 +34,10 @@ from arctic_platform.debug.inference import maybe_install_inference_warmup_obser
 from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
 from arctic_platform.debug.weight_sync import maybe_begin_broadcast_load
 from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+from arctic_platform.debug.weight_sync import maybe_bind_fp8_updater
 from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
 from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
+from arctic_platform.debug.weight_sync import maybe_observe_fp8_tensor
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -547,18 +549,22 @@ class WeightSyncExtension:
     # Loading strategies
     # ------------------------------------------------------------------
 
-    def _load_fp8(self, model, engine) -> tuple[int, float]:
-        from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+    def _load_fp8(self, model, engine, verifier=None) -> tuple[int, float]:
+        from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater, _is_lora_adapter_name
 
         updater = _FP8InplaceUpdater(
             model, self.model_config.dtype, self.device,
+        )
+        replay = maybe_bind_fp8_updater(
+            verifier, updater, lambda: _FP8InplaceUpdater(model, self.model_config.dtype, self.device)
         )
         loaded = 0
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, tensor in engine.receive_weights():
             recv_l2_sq.add_(_tensor_l2_sq(tensor))
             try:
-                updater.feed(name, tensor)
+                with maybe_observe_fp8_tensor(verifier, updater, replay, name, tensor):
+                    updater.feed(name, tensor)
             except Exception as exc:
                 raise RuntimeError(
                     f"FP8 weight sync failed for {name!r} with shape "
@@ -570,6 +576,25 @@ class WeightSyncExtension:
             logger.warning(
                 "FP8 updater has %d incomplete modules", updater.pending,
             )
+        unplaced = list(updater.unplaced)
+        if unplaced:
+            adapters = [name for name in unplaced if _is_lora_adapter_name(name)]
+            sample = "\n".join(f"  - {n}" for n in unplaced[:10])
+            more = f"\n  ... and {len(unplaced) - 10} more" if len(unplaced) > 10 else ""
+            message = (
+                f"Weight sync (_load_fp8) received {len(unplaced)}/{loaded} tensor(s) that reached no vLLM "
+                f"parameter; the inference model keeps stale values for them.\n\nSample names:\n{sample}{more}"
+            )
+            if adapters:
+                message += (
+                    f"\n\n{len(adapters)} of them are LoRA adapter tensors, which have no full-weight destination: "
+                    "vLLM serves adapters through its LoRA manager, which weight_format='lora' loads."
+                )
+            # Under shadow verification every such tensor is reported as received but written to no parameter,
+            # which fails the comparison; raising here would discard that report.
+            if verifier is None:
+                raise RuntimeError(message)
+            logger.error("%s", message)
         return loaded, recv_l2_sq.item()
 
     def _load_direct_zero_copy(self, model, engine) -> int:
@@ -845,7 +870,7 @@ class WeightSyncExtension:
             ) = self._load_batched(model, engine, verifier=verifier)
         elif self.model_config.quantization:
             path = "fp8"
-            loaded, recv_l2_sq = self._load_fp8(model, engine)
+            loaded, recv_l2_sq = self._load_fp8(model, engine, verifier=verifier)
         elif get_tensor_model_parallel_world_size() == 1:
             path = "direct"
             (

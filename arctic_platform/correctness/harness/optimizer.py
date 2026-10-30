@@ -1260,6 +1260,9 @@ _SCHEMA_GLOBALS = {
 }
 _OPTIM_FILE = re.compile(r"(?:bf16_|fp16_)?zero_pp_rank_(\d+)_mp_rank_00_optim_states\.pt")
 _NATIVE_OPTIM_FILE = re.compile(r"bf16_zero_pp_rank_(\d+)_mp_rank_(\d+)_optim_states\.pt")
+# The rank-local expert shard ``model/implementations/moe/deepspeed_integration.py`` saves beside every EP checkpoint
+# for resume. The native decoder never reads it, and each node holds only the shards its own ranks wrote.
+_AP_EP_SHARD_FILE = re.compile(r"ap_ep_.+_rank_(\d{2,})_model_states\.pt")
 _NATIVE_SOURCE_ROLES = {
     "expert_checkpointer",
     "base_checkpointer",
@@ -2573,7 +2576,7 @@ def assemble_native_optimizer_layout(
 def _native_checkpoint_files(root: Path, layout: dict) -> tuple[Path, list[Path], list[Path]]:
     if not root.is_dir() or root.is_symlink():
         raise ValueError("checkpoint root must be a local directory")
-    models = list(root.rglob("*_model_states.pt"))
+    models = [path for path in root.rglob("*_model_states.pt") if not _AP_EP_SHARD_FILE.fullmatch(path.name)]
     if len(models) != 1 or models[0].name != "mp_rank_00_model_states.pt":
         raise ValueError("native checkpoint requires exactly one replicated mp_rank_00 model")
     model = models[0]
@@ -2595,6 +2598,9 @@ def _native_checkpoint_files(root: Path, layout: dict) -> tuple[Path, list[Path]
             if rank >= layout["world_size"] or rank in optimizers or mp != layout["optimizer_mp_ranks"][rank]:
                 raise ValueError("native optimizer rank inventory or MP filename mismatch")
             optimizers[rank] = path
+            continue
+        match = _AP_EP_SHARD_FILE.fullmatch(path.name)
+        if match and int(match.group(1)) < layout["ep_size"]:
             continue
         match = re.fullmatch(r"experts_ep_rank_(\d{3})\.pt", path.name)
         if not match or int(match.group(1)) in experts:

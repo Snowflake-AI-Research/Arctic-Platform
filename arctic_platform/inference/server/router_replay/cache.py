@@ -1,10 +1,12 @@
-"""GPU-resident caches for router-replay tensors.
+"""Caches for router-replay tensors.
 
 TX (sampling side, overwrite-on-put) and RX (training side, pop-on-read)
-share a common base. Tensors are ``torch.uint8`` on the worker's device
+share a common base. Tensors are ``torch.uint8`` on the cache's device
 (``torch.uint16`` for models with more than 256 experts, as vLLM captures
 them), shape ``[seq_len, num_layers, topk]``. Byte counts back ``max_bytes``
-backpressure (raises ``RouterReplayCacheFull``).
+backpressure (raises ``RouterReplayCacheFull``). RX lives on the training
+GPU; TX lives on the sampling GPU or, to hold larger batches, in host memory,
+in which case the exchange stages it onto the GPU in bounded rounds.
 """
 
 from __future__ import annotations
@@ -304,11 +306,16 @@ class _RouterReplayCacheBase:
                 f"router-replay cache.put expects torch.Tensor or np.ndarray, "
                 f"got {type(value).__name__}"
             )
+        source_ptr = t.data_ptr()
         if t.dtype not in ROUTER_REPLAY_CACHE_DTYPES:
             t = t.to(ROUTER_REPLAY_CACHE_DTYPE)
         if t.device != self.device:
             t = t.to(self.device, non_blocking=True)
-        return t.contiguous()
+        t = t.contiguous()
+        if t.device.type == "cpu" and t.data_ptr() == source_ptr:
+            # A host cache must own its entry: the caller (vLLM's output) may reuse the buffer it passed in.
+            t = t.clone()
+        return t
 
     def _evict_for_put_locked(
         self,

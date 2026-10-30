@@ -502,21 +502,11 @@ def _regression_gateway(args):
         with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.training") as url:
             yield url
         return
-    from arctic_platform.correctness.harness.cortex import LOCAL_CHECKPOINT_BRIDGE_ENV
-    from arctic_platform.correctness.harness.cortex import LOCAL_NATIVE_FORWARD_ENV
+    from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
 
-    names = (LOCAL_NATIVE_FORWARD_ENV, LOCAL_CHECKPOINT_BRIDGE_ENV)
-    previous = {name: os.environ.get(name) for name in names}
-    try:
-        os.environ.update({name: "1" for name in names})
+    with local_checkpoint_bridge():
         with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.correctness.harness.gateway") as url:
             yield url
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
 
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
@@ -868,6 +858,17 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 run_cases = scaled_for_placement(selected_cases, multiple)
                 if len(widths) > 1:
                     print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
+                native_optimizer = {}
+                if (
+                    local_fixture
+                    and "single-step-optimizer" in args.test
+                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+                    and run_cfg.training.get("ep_size", 1) > 1
+                ):
+                    # EP checkpoints shard optimizer state per expert rank; only the native layout decodes them.
+                    from arctic_platform.correctness.harness.native_optimizer import owner_split_execution
+
+                    native_optimizer = owner_split_execution(run_cfg)
                 results.extend(
                     run_executor(
                         run_cfg,
@@ -908,6 +909,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             if dense_checkpoint_allocation is not None
                             else {}
                         ),
+                        **native_optimizer,
                     )
                 )
 

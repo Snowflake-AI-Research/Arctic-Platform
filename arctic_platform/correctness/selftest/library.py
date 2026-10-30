@@ -7273,6 +7273,36 @@ def test_onboarding_automatic_gateway_does_not_start_or_stop_configured_target(t
         assert url is None
 
 
+def test_onboarding_configured_gateway_routes_checkpoint_resume_through_bridge(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import cortex as cortex_fixture
+    from arctic_platform.correctness.onboarding import onboard
+
+    names = (cortex_fixture.LOCAL_NATIVE_FORWARD_ENV, cortex_fixture.LOCAL_CHECKPOINT_BRIDGE_ENV)
+    for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT", *names):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(onboard.subprocess, "Popen", lambda *a, **k: pytest.fail("external target was replaced"))
+    args = execution.parse_args(
+        [
+            "onboard",
+            "--config",
+            str(tmp_path / "model.json"),
+            "--test",
+            "checkpoint-resume-loss",
+            "--backend",
+            "cortex-training",
+            "--base-url",
+            "http://127.0.0.1:53357",
+        ]
+    )
+    onboard._configure_fixture_target(args, SimpleNamespace(is_rl=True), ["checkpoint-resume-loss"])
+    assert not getattr(args, "_automatic_cortex_gateway", False)
+    assert args._automatic_checkpoint_bridge and args.local_cortex_fixture
+    with onboard._validation_gateway(args) as url:
+        assert url is None
+        assert [os.environ.get(name) for name in names] == ["1", "1"]
+    assert [os.environ.get(name) for name in names] == [None, None]
+
+
 @pytest.fixture
 def _automatic_regression_gateway(tmp_path, monkeypatch):
     import requests
@@ -15833,7 +15863,13 @@ def _automatic_participation_receipts(tmp_path, shapes, world_size):
     for entry in after["participation"]["parameters"].values():
         entry["state"] = "active"
     return [
-        {"rank": rank, "job_id": "child", "before": deepcopy(before), "after": deepcopy(after)}
+        {
+            "rank": rank,
+            "job_id": "child",
+            "before": deepcopy(before),
+            "after": deepcopy(after),
+            "expert_parallel_widths": {name: 1 for name in shapes},
+        }
         for rank in range(world_size)
     ]
 
@@ -15865,6 +15901,55 @@ def test_automatic_participation_rejects_incomplete_or_unbound_receipts(tmp_path
         for receipt in receipts:
             receipt["after"]["participation"]["parameters"]["weight"]["state"] = "missing"
     with pytest.raises(ValueError):
+        merge_worker_receipts(receipts, job_id="child", world_size=2)
+
+
+def test_automatic_participation_globalizes_expert_parallel_shapes(monkeypatch):
+    from arctic_platform.debug.training import WorkerParticipation
+    from arctic_platform.debug.training import merge_worker_receipts
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(2, 2, bias=False)
+    model.head = torch.nn.Linear(2, 2, bias=False)
+    model.experts = torch.nn.Parameter(torch.ones(1, 2, 2))
+    model.experts.allreduce = False
+    model.experts.group_name = "ep_size_4"
+    model.get_decoder = lambda: model.decoder
+    model.get_output_embeddings = lambda: model.head
+    monkeypatch.setitem(
+        sys.modules, "deepspeed.utils.groups", SimpleNamespace(_get_expert_parallel_group=lambda name: name)
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: {"ep_size_4": 4}[group])
+    receipts = []
+    for rank in range(4):
+        worker = SimpleNamespace(job_id="child", rank=rank, _engine=SimpleNamespace(module=model, global_steps=0))
+        capture = WorkerParticipation(worker)
+        try:
+            model.head(model.decoder(torch.ones(1, 2)) @ model.experts[0]).sum().backward()
+            worker._engine.global_steps = 1
+            receipts.append(capture.finish())
+        finally:
+            capture.close()
+    result = merge_worker_receipts(receipts, job_id="child", world_size=4)
+    assert result["parameters"]["experts"] == {"shape": [4, 2, 2], "state": "active", "evidence": None}
+    assert result["parameters"]["decoder.weight"]["shape"] == [2, 2]
+    assert all(not parameter._backward_hooks for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("damage", ["absent", "inventory", "zero", "rank-drift"])
+def test_automatic_participation_rejects_incomplete_expert_parallel_widths(tmp_path, damage):
+    from arctic_platform.debug.training import merge_worker_receipts
+
+    receipts = _automatic_participation_receipts(tmp_path, {"weight": [2, 2]}, 2)
+    if damage == "absent":
+        del receipts[0]["expert_parallel_widths"]
+    elif damage == "inventory":
+        receipts[0]["expert_parallel_widths"] = {}
+    elif damage == "zero":
+        receipts[0]["expert_parallel_widths"]["weight"] = 0
+    else:
+        receipts[1]["expert_parallel_widths"]["weight"] = 2
+    with pytest.raises(ValueError, match="expert-parallel widths"):
         merge_worker_receipts(receipts, job_id="child", world_size=2)
 
 
@@ -17583,6 +17668,43 @@ def test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_ac
     assert all(not root.exists() for root in case.saved)
 
 
+def _native_ap_ep_shards(pair, source, root, step, ep_ranks):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import _ep_checkpoint_path
+
+    tag, ep_size = f"global_step{step}", pair.layout["ep_size"]
+    paths = []
+    for ep_rank in ep_ranks:
+        identity = {"group_name": f"ep_size_{ep_size}", "ep_size": ep_size, "ep_rank": ep_rank}
+        module = torch.load(source / tag / f"experts_ep_rank_{ep_rank:03d}.pt", weights_only=True)
+        path = _ep_checkpoint_path(root, tag, identity)
+        torch.save({"version": 1, **identity, "exclude_frozen_parameters": False, "module": module}, path)
+        paths.append(path)
+    return paths
+
+
+def test_maintained_native_optimizer_supplier_admits_node_local_ap_expert_shards(_maintained_native_capture):
+    case = _maintained_native_capture
+    original_supplier = case.supplier
+    routes = case.pair.layout["expert_data_parallel_groups"]["native-experts"]
+    # The shard writer is each EP rank's first expert-DP rank; only writers on the head node (ranks 0-3) save here.
+    head_ep_ranks = [ep_rank for ep_rank, route in enumerate(routes) if route[0] < 4]
+    written = []
+
+    def supplier(root, *, step):
+        source = case.pair.before if step == 0 else case.pair.after
+        written.extend(_native_ap_ep_shards(case.pair, source, root, step, head_ep_ranks))
+        return original_supplier(root, step=step)
+
+    case.supplier = supplier
+    result = _maintained_native_run(case)
+    record = json.loads(Path(result.optimizer_state_manifest).read_text())
+    assert len(written) == 2 * len(head_ep_ranks) == 8
+    assert all(row["name"] in case.pair.expected for row in record["parameters"])
+    for entry in record["parameters"]:
+        value = torch.load(Path(result.optimizer_state_manifest).parent / entry["file"], weights_only=True)
+        torch.testing.assert_close(value["parameter_update"], case.pair.expected[entry["name"]], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("timed_out_step", [0, 1])
 @pytest.mark.parametrize("error_type", [TimeoutError, ConnectionError, KeyboardInterrupt])
 def test_maintained_native_optimizer_supplier_timeout_keeps_inputs_for_pending_owner(
@@ -17963,7 +18085,15 @@ def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
             request, gateway_snowapi=snow, gateway=gateway, manager=manager, ray=ray
         )
         scope = factory(case.session, case.job)
-    return SimpleNamespace(scope=scope, workers=workers, child=child, helper_source=helper_source)
+    return SimpleNamespace(
+        scope=scope,
+        workers=workers,
+        child=child,
+        helper_source=helper_source,
+        request=request,
+        gateway=gateway,
+        manager=manager,
+    )
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
@@ -18026,6 +18156,132 @@ def test_maintained_native_optimizer_scopes_integrate_capture_and_restore_before
     assert case.events[-1] == "release"
     if failure == "target":
         _maintained_native_unpublished(case)
+
+
+@pytest.mark.parametrize("failure", [None, "target", "parent"])
+def test_native_optimizer_owner_split_routes_capture_through_gateway_and_zone_head(
+    _maintained_native_capture, monkeypatch, failure
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from arctic_platform.correctness.harness import native_optimizer
+
+    case = _maintained_native_capture
+    fixture = _maintained_native_scope(case, monkeypatch, split=True)
+    source = native_optimizer.owner_split_source()
+    request = {**fixture.request, "verify_parent_binding_source": source}
+    fixture.gateway.app = FastAPI()
+    fixture.gateway._zones["actual-zone"] = SimpleNamespace(url="http://zone-head")
+    zone = FastAPI()
+    zone.state.manager = fixture.manager
+    native_optimizer.install_gateway_route(fixture.gateway)
+    native_optimizer.install_zone_routes(zone)
+    clients = {case.session.backend.base_url: TestClient(fixture.gateway.app), "http://zone-head": TestClient(zone)}
+    routes = []
+
+    def post(base_url, route, body):
+        routes.append(route)
+        return native_optimizer._reply(route, clients[base_url].post(route, json=body))
+
+    monkeypatch.setattr(native_optimizer, "_post", post)
+    if failure == "target":
+        case.state.failure = "fwd_bwd"
+    scope = native_optimizer.owner_split_scope(request)
+
+    def run():
+        with scope(case.session, case.job) as supplier:
+            case.supplier, case.descriptor = supplier, source
+            with pytest.raises(RuntimeError, match="child release is blocked"):
+                case.client.shutdown()
+            if failure == "parent":
+                fixture.child.job_id = "wrong"
+            result = _maintained_native_run(case)
+            assert Path(result.optimizer_state_manifest).is_file()
+
+    if failure:
+        with pytest.raises((RuntimeError, ValueError)):
+            run()
+    else:
+        run()
+        assert routes.count(native_optimizer.SUPPLY_ROUTE) == 2
+    assert routes[:2] == [native_optimizer.PARENT_ROUTE, native_optimizer.OPEN_ROUTE]
+    # Only the zone head's own parent re-verification may follow the runner's close.
+    closed = routes.index(native_optimizer.CLOSE_ROUTE)
+    assert set(routes[closed + 1 :]) <= {native_optimizer.PARENT_ROUTE}
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+    assert all(decoder._CLEANUP_STATE not in vars(worker) for worker in fixture.workers)
+    assert decoder._SCOPE_STATE not in vars(case.client) and "shutdown" not in vars(case.client)
+    case.client.shutdown()
+    assert case.events[-1] == "release"
+    if failure is None:
+        assert all(not root.exists() for root in case.saved)
+    else:
+        _maintained_native_unpublished(case, supplier_failed=failure == "parent")
+
+
+def test_native_optimizer_owner_split_refusal_before_arm_leaves_client_shutdown_unfenced(
+    _maintained_native_capture, monkeypatch
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from arctic_platform.correctness.harness import native_optimizer
+
+    case = _maintained_native_capture
+    fixture = _maintained_native_scope(case, monkeypatch, split=True)
+    fixture.gateway.app = FastAPI()
+    fixture.gateway._zones["actual-zone"] = SimpleNamespace(url="http://zone-head")
+    zone = FastAPI()
+    zone.state.manager = fixture.manager
+    native_optimizer.install_gateway_route(fixture.gateway)
+    native_optimizer.install_zone_routes(zone)
+    clients = {case.session.backend.base_url: TestClient(fixture.gateway.app), "http://zone-head": TestClient(zone)}
+    monkeypatch.setattr(
+        native_optimizer,
+        "_post",
+        lambda base_url, route, body: native_optimizer._reply(route, clients[base_url].post(route, json=body)),
+    )
+    # The fixture's parent verifier is this file, not the module whose closure the zone head verifies with.
+    scope = native_optimizer.owner_split_scope(fixture.request)
+    with pytest.raises(native_optimizer.NativeOwnerError, match="native-optimizer/open") as caught:
+        with scope(case.session, case.job):
+            raise AssertionError("an unverifiable parent verifier must not arm workers")
+    assert caught.value.cleanup_complete is True
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+    assert decoder._SCOPE_STATE not in vars(case.client) and "shutdown" not in vars(case.client)
+    case.client.shutdown()
+    assert case.events == ["release"]
+
+
+def test_native_optimizer_owner_split_request_binds_installed_producer_sources(tmp_path, monkeypatch):
+    pytest.importorskip("deepspeed")
+    pytest.importorskip("dss.ray_dss.jobs.checkpointing")
+    ray = pytest.importorskip("ray")
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from dss.ray_dss.jobs.checkpointing import ExpertParallelCheckpointer
+
+    from arctic_platform.correctness.harness import native_optimizer
+    from arctic_platform.correctness.harness import storage
+
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n")
+    cfg = SimpleNamespace(training={"ep_size": 16}, n_gpus=16)
+    request = native_optimizer.owner_split_request(cfg, checkpoint_parent=tmp_path / "run", hostfile=hostfile)
+    assert decoder._native_split_request(request) == decoder._native_split_request(json.loads(json.dumps(request)))
+    assert request["allocation_hosts"] == ["10.0.0.1", "10.0.0.2"] and request["expected_world_size"] == 16
+    assert request["checkpoint_parent"] == str(tmp_path / "run")
+    assert request["reserve_bytes"] == 0 and request["rpc_timeout_seconds"] == 900
+    assert request["verify_parent_binding_source"] == native_optimizer.owner_split_source()
+    sources = request["source_files"]
+    decoder.verify_native_callback(ExpertParallelCheckpointer.save_resumable, sources["expert_checkpointer"])
+    decoder.verify_native_callback(DeepSpeedZeroOptimizer.backward, sources["zero_base"])
+    decoder.verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
+    decoder._native_scope_origin(ray.get, request["route_sources"]["ray_get"])
+    with pytest.raises(ValueError, match="allocation hosts"):
+        hostfile.write_text("10.0.0.1 slots=8\n10.0.0.1 slots=8\n")
+        native_optimizer.owner_split_request(cfg, checkpoint_parent=tmp_path / "run", hostfile=hostfile)
 
 
 def _native_ep_bf16_decode(pair, output):
@@ -18252,6 +18508,44 @@ def test_native_ep_bf16_optimizer_rejects_incomplete_native_inventory(tmp_path, 
     path = next(pair.after.rglob(pattern))
     path.rename(tmp_path / "retained-missing.pt")
     with pytest.raises(ValueError, match="every optimizer and expert rank"):
+        _native_ep_bf16_decode(pair, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("ep_ranks", [list(range(8)), [4, 5, 6, 7]], ids=["every-ep-rank", "one-node"])
+def test_native_ep_bf16_optimizer_admits_ap_expert_shards_beside_the_checkpoint(tmp_path, ep_ranks):
+    pair = _native_ep_bf16_pair(tmp_path)
+    for root, step in ((pair.before, 0), (pair.after, 1)):
+        _native_ap_ep_shards(pair, root, root, step, ep_ranks)
+    model, optimizers, experts = decoder._native_checkpoint_files(pair.after, pair.layout)
+    assert model.name == "mp_rank_00_model_states.pt"
+    assert len(optimizers) == pair.layout["world_size"] and len(experts) == pair.layout["ep_size"]
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+
+
+@pytest.mark.parametrize(
+    "damage,reason",
+    [
+        ("ep_rank", "unsupported native checkpoint tensor file"),
+        ("nested", "empty or nested tensor files"),
+        ("model", "exactly one replicated mp_rank_00 model"),
+    ],
+)
+def test_native_ep_bf16_optimizer_ap_expert_shards_keep_the_inventory_strict(tmp_path, damage, reason):
+    pair = _native_ep_bf16_pair(tmp_path)
+    (path,) = _native_ap_ep_shards(pair, pair.after, pair.after, 1, [0])
+    if damage == "ep_rank":
+        path.rename(path.with_name(path.name.replace("_rank_00_", f"_rank_{pair.layout['ep_size']:02d}_")))
+    elif damage == "nested":
+        (path.parent / "nested").mkdir()
+        path.rename(path.parent / "nested" / path.name)
+    else:
+        shutil.copyfile(path.parent / "mp_rank_00_model_states.pt", path.parent / "mp_rank_01_model_states.pt")
+    with pytest.raises(ValueError, match=reason):
         _native_ep_bf16_decode(pair, tmp_path / "out")
     assert not (tmp_path / "out").exists()
 
@@ -52213,14 +52507,25 @@ def test_sampler_evidence_hc_padding_requires_exact_geometry_and_preserved_bytes
     name = "input_mix_weight_down_block_inject.weight"
     padding_before = tensor_manifest(model.input_mix_weight_down_block_inject.weight[5:])
     verifier.load("down", torch.ones(3, 8))
+    if case == "shadow-corruption":
+        calls = []
+
+        def corrupting(wire, value):
+            calls.append(wire)
+            projection = model.input_mix_weight_down_block_inject.weight.data
+            projection.narrow(0, 3, 2).copy_(value)
+            if len(calls) == 2:
+                projection[5:6, :1].add_(1)
+
+        with pytest.raises(RuntimeError, match="unused HC projection padding"):
+            verifier.load("inject", torch.full((2, 8), 2.0), loader=corrupting)
+        assert tensor_manifest(model.input_mix_weight_down_block_inject.weight[5:]) == padding_before
+        return
     if case != "partial":
         verifier.load("inject", torch.full((2, 8), 2.0))
     if case == "live-corruption":
         with torch.no_grad():
             model.input_mix_weight_down_block_inject.weight[5, 0] += 1
-    elif case == "shadow-corruption":
-        verifier.shadows[name][5, 0] += 1
-    if case in ("live-corruption", "shadow-corruption"):
         with pytest.raises(RuntimeError, match="unused HC projection padding"):
             verifier.finish()
         return
@@ -52289,23 +52594,50 @@ def test_sampler_evidence_shadow_mla_views_share_private_backing(destination):
         if name == "kv_b_proj.weight":
             expected = value.numel()
         assert result["destinations"][name] == {"uncovered": parameter.numel() - expected, "mismatched": 0}
-    assert len({sampler_evidence_evidence._storage(value) for value in verifier.shadows.values()}) == 1
-    assert sampler_evidence_evidence._storage(verifier.shadows[destination]) != sampler_evidence_evidence._storage(
-        live[destination]
-    )
+    storage = model.kv_b_proj.weight.untyped_storage().nbytes()
+    assert result["shadow_bytes"] == {"limit": 1024, "peak": storage}
+    assert verifier.backings == {} and verifier.shadow_keys == {}
     assert {name: id(value) for name, value in model.named_parameters()} == identities
 
 
 def test_sampler_evidence_shadow_mla_alias_mismatch_is_reported():
     model = _MlaViewModel()
     verifier = _verifier(model)
-    verifier.load("kv_b_proj.weight", torch.zeros_like(model.kv_b_proj.weight))
+    verifier.load("W_UV", torch.zeros_like(model.W_UV))
     with torch.no_grad():
         model.W_UV[0, 0, 0] = 1
     result = verifier.finish()
     assert result["destinations"]["W_UV"]["mismatched"] == 1
     assert result["destinations"]["kv_b_proj.weight"]["mismatched"] == 1
     assert result["destinations"]["W_UK_T"]["mismatched"] == 0
+    assert result["changed_after_verification"] == []
+
+
+def test_sampler_evidence_shadow_change_after_completed_verification_is_reported():
+    model = _MlaViewModel()
+    verifier = _verifier(model)
+    verifier.load("kv_b_proj.weight", torch.zeros_like(model.kv_b_proj.weight))
+    assert verifier.backings == {}
+    with torch.no_grad():
+        model.W_UV[0, 0, 0] = 1
+    result = verifier.finish()
+    assert result["changed_after_verification"] == ["W_UV", "kv_b_proj.weight"]
+    assert all(entry == {"uncovered": 0, "mismatched": 0} for entry in result["destinations"].values())
+
+
+def test_sampler_evidence_shadow_completed_storage_reopens_from_verified_live_bytes():
+    model = _PackedModel()
+    verifier = _verifier(model)
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    verifier.load("right", torch.tensor([3.0, 4.0]))
+    assert set(verifier.completed) == {sampler_evidence_evidence._storage(model.packed)}
+    verifier.load("other", torch.tensor([5.0]))
+    verifier.load("again", torch.tensor([6.0, 7.0]), loader=lambda name, value: model.packed.data[:2].copy_(value))
+    result = verifier.finish()
+    assert result["received"]["again"]["destinations"] == ["packed"]
+    assert result["destinations"]["packed"] == {"uncovered": 0, "mismatched": 0}
+    assert result["changed_after_verification"] == []
+    assert model.packed.tolist() == [6.0, 7.0, 3.0, 4.0]
 
 
 def test_sampler_evidence_shadow_mla_budget_counts_unique_backing_once():
@@ -52346,9 +52678,16 @@ def test_sampler_evidence_shadow_dense_permutation_preserves_layout():
     model.packed = torch.nn.Parameter(torch.zeros(2, 3).T)
     verifier = _verifier(model)
     value = torch.arange(6, dtype=torch.float32).reshape(3, 2)
-    verifier.load("packed", value, loader=lambda name, tensor: model.packed.data.copy_(tensor))
-    assert verifier.shadows["packed"].stride() == model.packed.stride()
+    strides = []
+
+    def loader(name, tensor):
+        strides.append(model.packed.data.stride())
+        model.packed.data.copy_(tensor)
+
+    verifier.load("packed", value, loader=loader)
+    assert strides == [model.packed.stride()] * 2
     assert verifier.finish()["destinations"]["packed"] == {"uncovered": 0, "mismatched": 0}
+    assert torch.equal(model.packed, value)
 
 
 def test_sampler_evidence_shadow_exception_never_exposes_nan_to_live_model():
@@ -52404,9 +52743,8 @@ def test_sampler_evidence_shadow_integer_buffer_complete_copy_is_byte_verified()
     assert record["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 0}
     assert record["non_parameter_destinations"] == []
     assert record["untouched_parameters"] == {"packed": 4, "other": 1}
-    assert sampler_evidence_evidence._storage(verifier.shadows["ngram"]) != sampler_evidence_evidence._storage(
-        model.ngram
-    )
+    assert record["shadow_bytes"]["peak"] == model.ngram.untyped_storage().nbytes()
+    assert verifier.backings == {}
 
 
 def test_sampler_evidence_shadow_integer_buffer_byte_drift_is_reported():
@@ -52414,7 +52752,22 @@ def test_sampler_evidence_shadow_integer_buffer_byte_drift_is_reported():
     verifier = _verifier(model)
     verifier.load("ngram", torch.arange(4, dtype=torch.int64))
     model.ngram[2] = 2**53 + 1
-    assert verifier.finish()["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 1}
+    record = verifier.finish()
+    assert record["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 0}
+    assert record["changed_after_verification"] == ["ngram"]
+
+
+def test_sampler_evidence_shadow_integer_buffer_replay_byte_drift_is_mismatched():
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+    calls = []
+
+    def loader(name, value):
+        calls.append(name)
+        model.ngram.copy_(value + (len(calls) == 2))
+
+    verifier.load("ngram", torch.arange(4, dtype=torch.int64), loader=loader)
+    assert verifier.finish()["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 4}
 
 
 @pytest.mark.parametrize("mutation", ["partial", "add", "fill", "reinterpret", "broadcast"])
@@ -52470,12 +52823,36 @@ def test_sampler_evidence_shadow_integer_buffer_inventory_drift_is_rejected(chan
 
 def test_sampler_evidence_shadow_integer_buffer_budget_includes_private_storage(monkeypatch):
     model = _IntegerBufferModel()
-    total = sum(value.untyped_storage().nbytes() for value in [*model.parameters(), model.ngram])
-    sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=total)
+    largest = max(value.untyped_storage().nbytes() for value in [*model.parameters(), model.ngram])
+    assert largest == model.ngram.untyped_storage().nbytes()
     with monkeypatch.context() as patch:
-        patch.setattr(torch, "full", lambda *args, **kwargs: pytest.fail("allocation preceded budget check"))
+        for allocator in ("full", "empty"):
+            patch.setattr(torch, allocator, lambda *args, **kwargs: pytest.fail("verifier allocated at construction"))
+        verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=largest)
         with pytest.raises(ValueError, match="explicit"):
-            sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=total - 1)
+            sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=largest - 1)
+    assert verifier.backings == {}
+
+
+def test_sampler_evidence_shadow_lazy_backings_stay_under_the_limit():
+    model = _PackedModel()
+    packed, other = (value.untyped_storage().nbytes() for value in (model.packed, model.other))
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=packed)
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    assert verifier.resident_bytes == packed
+    verifier.load("right", torch.tensor([3.0, 4.0]))
+    assert verifier.resident_bytes == 0
+    verifier.load("other", torch.tensor([5.0]))
+    result = verifier.finish()
+    assert result["shadow_bytes"] == {"limit": packed, "peak": packed}
+    assert all(entry == {"uncovered": 0, "mismatched": 0} for entry in result["destinations"].values())
+
+    model = _PackedModel()
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=packed + other - 1)
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    with pytest.raises(ValueError, match=f"shadow allocation {packed + other} exceeds the explicit"):
+        verifier.load("other", torch.tensor([5.0]))
+    assert model.other.tolist() == [0.0]
 
 
 def test_sampler_evidence_shadow_nonpersistent_integer_buffer_allows_parameter_load():
@@ -52490,7 +52867,7 @@ def test_sampler_evidence_shadow_nonpersistent_integer_buffer_allows_parameter_l
     assert model.temporary is original
     assert torch.equal(model.temporary, saved)
     assert "temporary" in verifier.buffer_inventory
-    assert "temporary" not in verifier.shadows
+    assert "temporary" not in verifier.registered
 
 
 @pytest.mark.parametrize("operation", ["copy", "fill", "add", "view"])
@@ -53005,10 +53382,331 @@ def test_native_broadcast_trainer_replica_disagreement_is_rejected():
 
 def test_native_broadcast_quantized_receive_rejected_before_transport(monkeypatch):
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
-    receiver = SimpleNamespace(model_config=SimpleNamespace(quantization="fp8"))
+    for quantization in (None, "fp8"):
+        receiver = SimpleNamespace(model_config=SimpleNamespace(quantization=quantization))
+        broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=False)
+    receiver = SimpleNamespace(model_config=SimpleNamespace(quantization="gptq"))
     broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=True)
     with pytest.raises(ValueError, match="quantized"):
         broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=False)
+
+
+_FP8_FIXTURE_NAMESPACE = "ap_fp8_replay_fixture"
+_FP8_FIXTURE_LIBRARY = []
+
+
+def _fp8_fixture_operations():
+    if not _FP8_FIXTURE_LIBRARY:
+        library = torch.library.Library(_FP8_FIXTURE_NAMESPACE, "DEF")
+        library.define("dynamic_scaled_fp8_quant(Tensor(a!) result, Tensor input, Tensor(b!) scale) -> ()")
+        library.define("unrelated(Tensor(a!) result, Tensor input) -> ()")
+
+        def quantize(result, input, scale):
+            scale.copy_(input.float().abs().amax().clamp(min=1e-12).reshape(1) / 448.0)
+            result.copy_((input.float() / scale).clamp(-448.0, 448.0).to(result.dtype))
+
+        library.impl("dynamic_scaled_fp8_quant", quantize, "CPU")
+        library.impl("unrelated", lambda result, input: result.copy_(input.to(result.dtype)), "CPU")
+        _FP8_FIXTURE_LIBRARY.append(library)
+    return getattr(torch.ops, _FP8_FIXTURE_NAMESPACE)
+
+
+class _Fp8FixtureLinear(torch.nn.Module):
+    """A block-free FP8 linear in vLLM's layout: ``weight`` is stored transposed, ``weight_scale`` is per tensor."""
+
+    def __init__(self, output_sizes, input_size):
+        super().__init__()
+        self.output_sizes = list(output_sizes)
+        weight = torch.zeros(input_size, sum(output_sizes)).to(torch.float8_e4m3fn)
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def weight_loader(self, parameter, value, shard=None):
+        if shard is None:
+            parameter.data.copy_(value)
+            return
+        index = {"q": 0, "k": 1, "v": 2}.get(shard, shard)
+        start = sum(self.output_sizes[:index])
+        parameter.data.narrow(0, start, self.output_sizes[index]).copy_(value)
+
+
+class _Fp8FixtureModel(torch.nn.Module):
+    def __init__(self, linear):
+        super().__init__()
+        self.attn = torch.nn.Module()
+        self.attn.qkv_proj = linear.QKVParallelLinear([2, 2, 2], 4)
+        self.norm = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16), requires_grad=False)
+
+    def load_weights(self, weights):
+        raise AssertionError("the FP8 updater writes parameters directly")
+
+
+def _fp8_fixture(monkeypatch, *, corrupt=False, build=None):
+    operations = _fp8_fixture_operations()
+    names = ("dynamic_scaled_fp8_quant", "static_scaled_fp8_quant")
+    monkeypatch.setattr(broadcast, "FP8_QUANT_OPERATIONS", (_FP8_FIXTURE_NAMESPACE, names))
+
+    def scaled_fp8_quant(input, scale=None):
+        output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
+        scale = torch.zeros(1, dtype=torch.float32, device=input.device)
+        operations.dynamic_scaled_fp8_quant(output, input, scale)
+        return output, scale
+
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.ColumnParallelLinear = type("ColumnParallelLinear", (_Fp8FixtureLinear,), {})
+    linear.MergedColumnParallelLinear = type("MergedColumnParallelLinear", (linear.ColumnParallelLinear,), {})
+    linear.QKVParallelLinear = type("QKVParallelLinear", (linear.MergedColumnParallelLinear,), {})
+    linear.RowParallelLinear = type("RowParallelLinear", (_Fp8FixtureLinear,), {})
+    parameter = ModuleType("vllm.model_executor.parameter")
+    parameter.BasevLLMParameter = type("BasevLLMParameter", (torch.nn.Parameter,), {})
+    custom_ops = ModuleType("vllm._custom_ops")
+    custom_ops.scaled_fp8_quant = scaled_fp8_quant
+    package = ModuleType("vllm")
+    package.__path__ = []
+    package._custom_ops = custom_ops
+    for name, module in (
+        ("vllm", package),
+        ("vllm._custom_ops", custom_ops),
+        ("vllm.model_executor", ModuleType("vllm.model_executor")),
+        ("vllm.model_executor.layers", ModuleType("vllm.model_executor.layers")),
+        ("vllm.model_executor.layers.linear", linear),
+        ("vllm.model_executor.parameter", parameter),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    path = Path(__file__).resolve().parents[2] / "inference/server/weight_sync/utils.py"
+    spec = importlib.util.spec_from_file_location("_native_broadcast_fp8_updater_control", path)
+    utils = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, utils)
+    spec.loader.exec_module(utils)
+
+    class Updater(utils._FP8InplaceUpdater):
+        corrupting = False
+
+        def _flush_module(self, mod_path):
+            super()._flush_module(mod_path)
+            mod = self._fp8_modules[mod_path]
+            if self.corrupting:
+                first = mod.weight.data[:1, :1]
+                first.copy_((-first.float() - 1.0).to(first.dtype))
+
+    model = (build or _Fp8FixtureModel)(linear)
+    updater = Updater(model, torch.bfloat16, torch.device("cpu"))
+    updater.corrupting = corrupt
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=1024)
+    replay = broadcast.maybe_bind_fp8_updater(
+        verifier, updater, lambda: Updater(model, torch.bfloat16, torch.device("cpu"))
+    )
+    return SimpleNamespace(
+        model=model, updater=updater, replay=replay, verifier=verifier, operations=operations, quant=scaled_fp8_quant
+    )
+
+
+def _fp8_feed(fixture, stream):
+    for name, value in stream:
+        with broadcast.maybe_observe_fp8_tensor(fixture.verifier, fixture.updater, fixture.replay, name, value):
+            fixture.updater.feed(name, value)
+
+
+def _fp8_stream():
+    generator = torch.Generator().manual_seed(7)
+    shards = [(f"attn.{leaf}_proj.weight", torch.randn(2, 4, generator=generator).bfloat16()) for leaf in "qkv"]
+    return shards + [("norm", torch.arange(4, dtype=torch.bfloat16))]
+
+
+def test_native_broadcast_fp8_replay_quantizes_fused_shards_into_private_backings(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    stream = _fp8_stream()
+    _fp8_feed(fixture, stream[:1])
+    assert set(fixture.updater._bufs) == set(fixture.replay._bufs) == {"attn.qkv_proj"}
+    live_buffer, replay_buffer = fixture.updater._bufs["attn.qkv_proj"], fixture.replay._bufs["attn.qkv_proj"]
+    assert sampler_evidence_evidence._storage(live_buffer) != sampler_evidence_evidence._storage(replay_buffer)
+    assert fixture.verifier.backings == {}
+    _fp8_feed(fixture, stream[1:])
+    result = fixture.verifier.finish()
+    assert fixture.updater.pending == fixture.replay.pending == 0
+    fused = ["attn.qkv_proj.weight", "attn.qkv_proj.weight_scale"]
+    assert {name: entry["destinations"] for name, entry in result["received"].items()} == {
+        "attn.q_proj.weight": fused,
+        "attn.k_proj.weight": fused,
+        "attn.v_proj.weight": fused,
+        "norm": ["norm"],
+    }
+    assert result["destinations"] == {name: {"uncovered": 0, "mismatched": 0} for name in [*fused, "norm"]}
+    assert result["untouched_parameters"] == {} and result["changed_after_verification"] == []
+    assert list(result["admitted_native_operations"]) == [f"{_FP8_FIXTURE_NAMESPACE}.dynamic_scaled_fp8_quant.default"]
+    weight = torch.cat([value for _, value in stream[:3]])
+    expected, scale = fixture.quant(weight)
+    live = fixture.model.attn.qkv_proj.weight
+    assert torch.equal(live.view(torch.uint8), expected.t().contiguous().view(torch.uint8))
+    assert torch.equal(fixture.model.attn.qkv_proj.weight_scale, scale)
+    assert result["shadow_bytes"]["peak"] <= result["shadow_bytes"]["limit"]
+
+
+def test_native_broadcast_fp8_corrupting_updater_is_mismatched(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch, corrupt=True)
+    _fp8_feed(fixture, _fp8_stream())
+    result = fixture.verifier.finish()
+    assert result["destinations"]["attn.qkv_proj.weight"] == {"uncovered": 0, "mismatched": 1}
+    assert result["destinations"]["attn.qkv_proj.weight_scale"] == {"uncovered": 0, "mismatched": 0}
+
+
+def test_native_broadcast_fp8_incomplete_fused_module_is_uncovered(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    stream = _fp8_stream()
+    _fp8_feed(fixture, [stream[0], stream[1], stream[3]])
+    result = fixture.verifier.finish()
+    assert fixture.updater.pending == fixture.replay.pending == 1
+    assert result["received"]["attn.k_proj.weight"]["destinations"] == [
+        "attn.qkv_proj.weight",
+        "attn.qkv_proj.weight_scale",
+    ]
+    assert result["destinations"]["attn.qkv_proj.weight"] == {"uncovered": 24, "mismatched": 0}
+    assert result["destinations"]["attn.qkv_proj.weight_scale"] == {"uncovered": 1, "mismatched": 0}
+    assert result["untouched_parameters"] == {}
+
+
+def test_native_broadcast_fp8_unadmitted_native_operation_still_fails(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    norm = fixture.model.norm
+
+    def unrelated(name, value):
+        fixture.operations.unrelated(norm.data, value)
+
+    with pytest.raises(ValueError, match="unobservable native"):
+        with fixture.verifier.observe_load("norm", torch.ones(4, dtype=torch.bfloat16), loader=unrelated):
+            unrelated("norm", torch.ones(4, dtype=torch.bfloat16))
+    assert norm.tolist() == [0.0] * 4
+
+
+def test_native_broadcast_fp8_bind_requires_independent_fresh_replay(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    verifier = sampler_evidence_evidence.ShadowVerifier(fixture.model, max_shadow_bytes=1024)
+    with pytest.raises(ValueError, match="fresh independent updater"):
+        broadcast.maybe_bind_fp8_updater(verifier, fixture.updater, lambda: fixture.updater)
+    assert broadcast.maybe_bind_fp8_updater(None, fixture.updater, lambda: pytest.fail("built a replay")) is None
+
+
+class _Bf16FixtureLinear(torch.nn.Module):
+    """An unquantized merged linear in vLLM's layout: ``weight`` is ``[out, in]`` and loads shard by shard."""
+
+    def __init__(self, output_sizes, input_size, *, bias=False):
+        super().__init__()
+        self.output_sizes = list(output_sizes)
+        self.weight = torch.nn.Parameter(torch.zeros(sum(output_sizes), input_size, dtype=torch.bfloat16))
+        self.weight.requires_grad_(False)
+        self.weight.weight_loader = self.weight_loader
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(sum(output_sizes), dtype=torch.bfloat16), requires_grad=False)
+            self.bias.weight_loader = self.weight_loader
+
+    def weight_loader(self, parameter, value, shard=None):
+        if shard is None:
+            parameter.data.copy_(value)
+            return
+        start = sum(self.output_sizes[:shard])
+        parameter.data.narrow(0, start, self.output_sizes[shard]).copy_(value)
+
+
+class _LoraFixtureWrapper(torch.nn.Module):
+    """vLLM's LoRA layer wrapper: the wrapped layer moves under ``base_layer``."""
+
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+
+
+class _Fp8LoraFixtureModel(torch.nn.Module):
+    """GLM-5 shaped LoRA sampler: FP8 MLP projections and BF16 MLA projections under LoRA wrappers, and an unwrapped
+    BF16 vision MLP whose gate and up projections vLLM fuses."""
+
+    def __init__(self, linear):
+        super().__init__()
+        self.layer = torch.nn.Module()
+        self.layer.mlp = torch.nn.Module()
+        self.layer.mlp.gate_up_proj = _LoraFixtureWrapper(linear.MergedColumnParallelLinear([2, 2], 4))
+        self.layer.mlp.down_proj = _LoraFixtureWrapper(linear.RowParallelLinear([4], 4))
+        attn = self.layer.self_attn = torch.nn.Module()
+        # The kv_a shard holds rope rows a NoPE checkpoint omits: 3 checkpoint rows load into 4.
+        attn.fused_qkv_a_proj = _LoraFixtureWrapper(_Bf16FixtureLinear([6, 4], 4))
+        attn.q_b_proj = _LoraFixtureWrapper(_Bf16FixtureLinear([4], 4))
+        self.visual = torch.nn.Module()
+        self.visual.gate_up_proj = _Bf16FixtureLinear([2, 2], 4, bias=True)
+
+    def load_weights(self, weights):
+        raise AssertionError("the FP8 updater writes parameters directly")
+
+
+def _fp8_lora_block(generator, rows, cols, scale_shape):
+    weight = (torch.randn(rows, cols, generator=generator) * 64).to(torch.float8_e4m3fn)
+    return weight, torch.rand(scale_shape, generator=generator) + 0.5
+
+
+def _fp8_lora_dequantized(weight, scale):
+    rows, cols = weight.shape
+    block = cols // scale.shape[1]
+    expanded = scale.repeat_interleave(block, dim=0)[:rows].repeat_interleave(block, dim=1)[:, :cols]
+    return (weight.float() * expanded).bfloat16()
+
+
+def test_native_broadcast_fp8_lora_wrapped_stream_reaches_every_parameter(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch, build=_Fp8LoraFixtureModel)
+    generator = torch.Generator().manual_seed(11)
+    q_a, q_a_scale = _fp8_lora_block(generator, 6, 4, (3, 2))
+    kv_a, kv_a_scale = _fp8_lora_block(generator, 3, 4, (2, 2))
+    q_b, q_b_scale = _fp8_lora_block(generator, 4, 4, (2, 2))
+    gate, up, down = (torch.randn(rows, 4, generator=generator).bfloat16() for rows in (2, 2, 4))
+    visual = [torch.randn(2, 4, generator=generator).bfloat16() for _ in range(2)]
+    visual_bias = [torch.randn(2, generator=generator).bfloat16() for _ in range(2)]
+    adapter = "layer.self_attn.q_b_proj.lora_A.default.weight"
+    attn = "layer.self_attn"
+    stream = [
+        ("layer.mlp.gate_proj.weight", gate),
+        ("layer.mlp.up_proj.weight", up),
+        ("layer.mlp.down_proj.weight", down),
+        (f"{attn}.q_a_proj.base_layer.weight", q_a),
+        (f"{attn}.q_a_proj.base_layer.weight_scale_inv", q_a_scale),
+        (f"{attn}.kv_a_proj_with_mqa.base_layer.weight", kv_a),
+        (f"{attn}.kv_a_proj_with_mqa.base_layer.weight_scale_inv", kv_a_scale),
+        (f"{attn}.q_b_proj.base_layer.weight_scale_inv", q_b_scale),
+        (f"{attn}.q_b_proj.base_layer.weight", q_b),
+        (adapter, torch.randn(2, 4, generator=generator).bfloat16()),
+        ("visual.gate_proj.weight", visual[0]),
+        ("visual.up_proj.weight", visual[1]),
+        ("visual.gate_proj.bias", visual_bias[0]),
+        ("visual.up_proj.bias", visual_bias[1]),
+    ]
+    _fp8_feed(fixture, stream)
+    result = fixture.verifier.finish()
+
+    gate_up = ["layer.mlp.gate_up_proj.base_layer.weight", "layer.mlp.gate_up_proj.base_layer.weight_scale"]
+    down_proj = ["layer.mlp.down_proj.base_layer.weight", "layer.mlp.down_proj.base_layer.weight_scale"]
+    fused_qkv_a = [f"{attn}.fused_qkv_a_proj.base_layer.weight"]
+    q_b_proj = [f"{attn}.q_b_proj.base_layer.weight"]
+    expected = [gate_up, gate_up, down_proj, *[fused_qkv_a] * 4, *[q_b_proj] * 2, []]
+    expected += [["visual.gate_up_proj.weight"]] * 2 + [["visual.gate_up_proj.bias"]] * 2
+    assert {name: entry["destinations"] for name, entry in result["received"].items()} == {
+        name: destinations for (name, _), destinations in zip(stream, expected)
+    }
+    assert result["destinations"] == {
+        name: {"uncovered": 0, "mismatched": 0} for name in sorted({name for names in expected for name in names})
+    }
+    assert result["untouched_parameters"] == {} and result["changed_after_verification"] == []
+    assert fixture.updater.pending == fixture.replay.pending == 0
+    assert fixture.updater.unplaced == fixture.replay.unplaced == [adapter]
+
+    model = fixture.model
+    rope_rows = torch.zeros(1, 4, dtype=torch.bfloat16)
+    assert torch.equal(
+        model.layer.self_attn.fused_qkv_a_proj.base_layer.weight,
+        torch.cat([_fp8_lora_dequantized(q_a, q_a_scale), _fp8_lora_dequantized(kv_a, kv_a_scale), rope_rows]),
+    )
+    assert torch.equal(model.layer.self_attn.q_b_proj.base_layer.weight, _fp8_lora_dequantized(q_b, q_b_scale))
+    assert torch.equal(model.visual.gate_up_proj.weight, torch.cat(visual))
+    assert torch.equal(model.visual.gate_up_proj.bias, torch.cat(visual_bias))
+    expected_down, _ = fixture.quant(down)
+    assert torch.equal(
+        model.layer.mlp.down_proj.base_layer.weight.view(torch.uint8), expected_down.t().contiguous().view(torch.uint8)
+    )
 
 
 def test_sampler_evidence_close_resources_even_when_source_guard_would_fail():
@@ -57374,19 +58072,6 @@ def glm53_inference_export_case():
         "model.visual.norm.weight": ["BF16", [2]],
     }
     target = copy.deepcopy(source)
-    for name in source:
-        if name.endswith(
-            (
-                "A_log",
-                "dt_bias",
-                "hc_attn_base",
-                "hc_attn_scale",
-                "hc_ffn_base",
-                "hc_ffn_scale",
-            )
-        ):
-            if not name.startswith(prefix + "2."):
-                target[name][0] = "BF16"
     return config, source, target
 
 
@@ -57397,7 +58082,7 @@ def test_glm53_inference_schema_preserves_quantized_and_inactive_headers(
     before = copy.deepcopy((config, source, target))
     payload_bytes = export.validate_glm53_full_schema(config, source, target)
     assert payload_bytes == export.original_schema_bytes(target, config["quantization_config"])
-    assert payload_bytes == export.original_schema_bytes(source, config["quantization_config"]) - 24
+    assert payload_bytes == export.original_schema_bytes(source, config["quantization_config"])
     assert (config, source, target) == before
 
 
@@ -57423,7 +58108,7 @@ def test_glm53_inference_schema_rejects_any_unapproved_header_change(glm53_infer
     elif damage == "auxiliary":
         target[prefix + "2.hc_attn_base"][0] = "BF16"
     else:
-        target[prefix + "0.self_attn.A_log"][0] = "F32"
+        target[prefix + "0.self_attn.A_log"][0] = "BF16"
     with pytest.raises(ValueError):
         export.validate_glm53_full_schema(config, source, target)
 
@@ -57524,7 +58209,7 @@ def test_glm53_inference_schema_local_export_admits_real_mixed_headers_without_m
         )
         == exported_schema
     )
-    assert original_schema != exported_schema
+    assert original_schema == exported_schema
     assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before} == before
 
 
@@ -58943,6 +59628,10 @@ def test_rl_checks_weight_sync_counts_only_bound_exported_buffers(case):
             lambda s: _rl_checks_rank(s, 0)["untouched_parameters"].update({"visual.w": 5}),
             "written by no tensor",
         ),
+        (
+            lambda s: _rl_checks_rank(s, 1).update(changed_after_verification=["b.weight"]),
+            "sampler rank 1: b.weight changed after its shadow verification",
+        ),
     ],
 )
 def test_rl_checks_weight_sync_disagreement_fails(mutate, expected):
@@ -59596,6 +60285,100 @@ def test_rl_checks_minimum_causal_tail_survives_packing_without_scoring_extra_to
 def test_rl_checks_rl_batch_rejects_invalid_minimum_row_tokens(minimum):
     with pytest.raises(ValueError, match="minimum_row_tokens must be a nonnegative integer"):
         rl_batch([[1, 2]], [1], pad_id=0, minimum_row_tokens=minimum)
+
+
+def _router_replay_examples_fixture(monkeypatch, prompt_lengths):
+    rows = [(f"question {index}", "answer") for index in range(len(prompt_lengths))]
+    reads = []
+
+    def read_rows(path, *, start=0, count=None):
+        assert path == rl_router_replay.TRAIN_SPLIT
+        reads.append(count)
+        return list(rows if count is None else rows[start : start + count])
+
+    def tokenize_examples(tokenizer, selected):
+        examples = []
+        for question, answer in selected:
+            length = prompt_lengths[int(question.split()[1])]
+            examples.append(
+                rl_router_replay.gsm8k.Example(
+                    question=question,
+                    prompt=question,
+                    completion=answer,
+                    input_ids=tuple(range(1, length + 3)),
+                    n_prompt=length,
+                )
+            )
+        return examples
+
+    monkeypatch.setattr(rl_router_replay.gsm8k, "read_rows", read_rows)
+    monkeypatch.setattr(rl_router_replay.gsm8k, "tokenize_examples", tokenize_examples)
+    return reads
+
+
+def test_rl_checks_router_replay_rows_span_the_context_parallel_minimum(monkeypatch):
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import token_shard
+
+    reads = _router_replay_examples_fixture(monkeypatch, [41, 150, 143, 144, 200])
+    leading = rl_router_replay.replay_examples(object(), 2, 0)
+    assert [example.question for example in leading] == ["question 0", "question 1"]
+    assert reads == [2]
+
+    selected = rl_router_replay.replay_examples(object(), 2, 144)
+    assert [example.question for example in selected] == ["question 1", "question 3"]
+    # The replay batch attends exactly prompt plus generation, so the shortest admissible row is the prompt alone.
+    rows = [list(example.input_ids[: example.n_prompt]) for example in selected]
+    batch = rl_batch(rows, [example.n_prompt for example in selected], pad_id=0)
+    assert batch["kwargs"]["attention_mask"].sum(dim=1).tolist() == [len(row) for row in rows]
+    _, unpacked, _, _ = unpack_batch(batch)
+    width = unpacked["input_ids"].shape[1]
+    unpacked["position_ids"] = torch.arange(width).expand(len(rows), width).clone()
+    for index in range(len(rows)):
+        packed, metadata = pack_microbatch({key: value[[index]] for key, value in unpacked.items()})
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        assert all(token_shard(packed, metadata, 16, rank)["input_ids"].shape[1] >= 9 for rank in range(16))
+
+
+@pytest.mark.parametrize("minimum", [-1, True, 1.5])
+def test_rl_checks_router_replay_examples_reject_invalid_minimum(monkeypatch, minimum):
+    _router_replay_examples_fixture(monkeypatch, [200])
+    with pytest.raises(ValueError, match="minimum_prompt_tokens must be a nonnegative integer"):
+        rl_router_replay.replay_examples(object(), 1, minimum)
+
+
+def test_rl_checks_router_replay_examples_refuse_a_split_without_enough_long_prompts(monkeypatch):
+    _router_replay_examples_fixture(monkeypatch, [200, 10, 143])
+    with pytest.raises(ValueError, match="holds 1 prompt\\(s\\) of at least 144 tokens"):
+        rl_router_replay.replay_examples(object(), 2, 144)
+
+
+def test_rl_checks_router_replay_selects_rows_with_the_configured_minimum(monkeypatch):
+    cfg = load_config(_rl_config_CONFIG)
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
+    calls = []
+
+    class Selected(Exception):
+        pass
+
+    def minimum_context_parallel_row_tokens(actual_cfg, model_path):
+        calls.append(("minimum", actual_cfg, model_path))
+        return 144
+
+    def replay_examples(actual_tokenizer, rows, minimum_prompt_tokens):
+        calls.append(("examples", actual_tokenizer, rows, minimum_prompt_tokens))
+        raise Selected
+
+    monkeypatch.setattr(rl_router_replay.gsm8k, "load_tokenizer", lambda path: tokenizer)
+    monkeypatch.setattr(rl_router_replay, "minimum_context_parallel_row_tokens", minimum_context_parallel_row_tokens)
+    monkeypatch.setattr(rl_router_replay, "replay_examples", replay_examples)
+    with pytest.raises(Selected):
+        rl_router_replay._run(SimpleNamespace(cfg=cfg))
+    assert calls == [
+        ("minimum", cfg, cfg.model_name),
+        ("examples", tokenizer, rl_router_replay.configured_rows_per_step(cfg), 144),
+    ]
 
 
 @pytest.mark.parametrize("check", [rl_weight_sync, rl_router_replay], ids=["weight-sync", "router-replay"])
@@ -61456,6 +62239,9 @@ _SELFTEST_GROUPS = {
         "test_maintained_native_optimizer_scope_admits_bounded_collection_budget",
         "test_maintained_native_optimizer_scope_rejects_invalid_collection_budget",
         "test_maintained_native_optimizer_scopes_integrate_capture_and_restore_before_release",
+        "test_native_optimizer_owner_split_routes_capture_through_gateway_and_zone_head",
+        "test_native_optimizer_owner_split_refusal_before_arm_leaves_client_shutdown_unfenced",
+        "test_native_optimizer_owner_split_request_binds_installed_producer_sources",
         "test_native_ep_bf16_optimizer_reconstructs_actual_ordered_groups_without_sidefile_substitution",
         "test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records",
         "test_native_ep_bf16_optimizer_checkpoint_wrapper_names_match_state_dict",
@@ -62634,6 +63420,15 @@ _SELFTEST_GROUPS = {
         "test_native_broadcast_invalid_buffer_inventory_fails_collectively",
         "test_native_broadcast_trainer_replica_disagreement_is_rejected",
         "test_native_broadcast_quantized_receive_rejected_before_transport",
+        "test_native_broadcast_fp8_replay_quantizes_fused_shards_into_private_backings",
+        "test_native_broadcast_fp8_corrupting_updater_is_mismatched",
+        "test_native_broadcast_fp8_incomplete_fused_module_is_uncovered",
+        "test_native_broadcast_fp8_unadmitted_native_operation_still_fails",
+        "test_native_broadcast_fp8_bind_requires_independent_fresh_replay",
+        "test_sampler_evidence_shadow_change_after_completed_verification_is_reported",
+        "test_sampler_evidence_shadow_completed_storage_reopens_from_verified_live_bytes",
+        "test_sampler_evidence_shadow_integer_buffer_replay_byte_drift_is_mismatched",
+        "test_sampler_evidence_shadow_lazy_backings_stay_under_the_limit",
         "test_sampler_evidence_close_resources_even_when_source_guard_would_fail",
         "test_sampler_evidence_external_pool_worker_injection_uses_public_argument",
         "test_sampler_evidence_worker_optin_explicitly_propagates_to_ray_actor",
@@ -62870,6 +63665,10 @@ _SELFTEST_GROUPS = {
         "test_rl_checks_minimum_causal_tail_survives_packing_without_scoring_extra_tokens",
         "test_rl_checks_rl_batch_rejects_invalid_minimum_row_tokens",
         "test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones",
+        "test_rl_checks_router_replay_rows_span_the_context_parallel_minimum",
+        "test_rl_checks_router_replay_examples_reject_invalid_minimum",
+        "test_rl_checks_router_replay_examples_refuse_a_split_without_enough_long_prompts",
+        "test_rl_checks_router_replay_selects_rows_with_the_configured_minimum",
         "test_rl_checks_gpu_count_includes_both_sub_jobs",
         "test_inference_warmup_observer_new_disabled_paths_are_exact_noops",
         "test_inference_warmup_observer_new_sampling_payload_binds_descriptor_before_ray_import",

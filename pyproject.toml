@@ -98,6 +98,7 @@ all = [
     "arctic_platform[tinker]",
     "arctic_platform[verl]",
     "arctic_platform[prime-rl]",
+    "arctic_platform[sonicmoe]",
 ]
 
 dev = [
@@ -145,6 +146,13 @@ gdn = [
     "causal-conv1d",
 ]
 
+# BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults off; turning it on needs this extra.
+# The floor is the one Dao-AILab/sonic-moe declares. quack-kernels depends on nvidia-cutlass-dsl (the cutlass module);
+# nvidia-cutlass-dsl-libs-base depends on cuda-bindings, which provides cuda.bindings.
+sonicmoe = [
+    "quack-kernels>=0.4.0",
+]
+
 # The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
 cortex = [
     "aiohttp",
@@ -168,6 +176,8 @@ tinker = [
 # excludes the sampling stack: the server imports arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
+    # [rl], [onprem] and [verl] include [sft], so a training install gets SonicMoE with the rest of the stack.
+    "arctic_platform[sonicmoe]",
     "deepspeed>=0.19.8",  # fix fp32 compute issue #8749
     "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",

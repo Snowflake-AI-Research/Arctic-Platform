@@ -194,6 +194,15 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
                 "dp_shared_memory": False,
                 "use_thp": False,
             }
+    if ctx.cfg.training.get("peft_config"):
+        from arctic_platform.model import checkpoint_peft_adapter_dir
+
+        # A sampler started on a checkpoint id loads the saved adapter pack on its own; one started on a local
+        # export directory only enables LoRA, and would serve the untrained base weights unless the pack is named.
+        adapter_dir = checkpoint_peft_adapter_dir(str(model_path)) if os.path.isdir(str(model_path)) else None
+        if adapter_dir is not None:
+            engine = payload["inference_config"]["vllm_config"]
+            engine.setdefault("extra_engine_kwargs", {})["lora_adapter_path"] = adapter_dir
     maybe_bind_inference_warmup_observer(payload, ctx)
     maybe_bind_inference_startup_error(payload, ctx)
     return payload

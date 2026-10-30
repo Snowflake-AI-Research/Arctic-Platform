@@ -5,13 +5,18 @@ and save helpers used by ``load_dcp_from_hf`` for the one-time HF->Prime
 conversion cache. The distributed gather / LoRA helpers are dropped.
 """
 
+import inspect
 import json
+import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal
 
 import torch
+from huggingface_hub import get_torch_storage_id
+from huggingface_hub import get_torch_storage_size
 from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.serialization._base import parse_size_to_int
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
@@ -161,6 +166,120 @@ def save_state_dict(
             save_file(state_dict, save_dir / weights_name, metadata={"format": "pt"})
         else:
             torch.save(state_dict, save_dir / weights_name)
+
+
+class _StreamedShard:
+    def __init__(self) -> None:
+        self.index: int | None = None
+        self.tensors: dict[str, Tensor] = {}
+        self.names: list[str] = []
+        self.size = 0
+        self.storages: set = set()
+        self.partial: Path | None = None
+
+
+def save_state_dict_stream(weights: Iterable[tuple[str, Tensor]], save_dir: Path) -> None:
+    """Write :func:`save_state_dict`'s sharded safetensors output while consuming ``weights`` once.
+
+    Each tensor is copied to the CPU on arrival, as a caller collecting ``weights`` into a dict for ``save_state_dict``
+    would, so storage sharing is the same. ``split_torch_state_dict_into_shards`` places every view in the shard of its
+    storage's first tensor, so a closed shard is written only once its tensors tile every storage they view; until then
+    a later view may still join it. Host memory holds the open shard and the closed shards still awaiting views, not
+    the whole state.
+    """
+    max_shard_size = inspect.signature(split_torch_state_dict_into_shards).parameters["max_shard_size"].default
+    if isinstance(max_shard_size, str):
+        max_shard_size = parse_size_to_int(max_shard_size)
+    filename_pattern = SAFE_WEIGHTS_NAME.replace(".safetensors", "{suffix}.safetensors")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    shards: list[_StreamedShard] = []
+    current = _StreamedShard()
+    owners: dict = {}
+    spans: dict = {}
+    seen: set[str] = set()
+    total_size = 0
+
+    def tiled(storage_id) -> bool:
+        storage_spans = spans[storage_id]
+        nbytes = storage_id[-1]
+        # A zero-byte storage id is shared by every empty tensor, so it never stops accepting views.
+        if storage_spans is None or nbytes == 0 or sum(end - start for start, end in storage_spans) < nbytes:
+            return False
+        covered, reach = 0, 0
+        for start, end in sorted(storage_spans):
+            covered += max(0, end - max(start, reach))
+            reach = max(reach, end)
+        return covered == nbytes
+
+    def write(shard: _StreamedShard) -> None:
+        assert shard.index is not None
+        shard.partial = save_dir / f".{filename_pattern.format(suffix=f'-{shard.index + 1:05d}')}.partial"
+        tensors = {name: tensor.contiguous() for name, tensor in shard.tensors.items()}
+        save_file(tensors, shard.partial, metadata={"format": "pt"})
+        shard.tensors = {}
+        for storage_id in shard.storages:
+            del owners[storage_id]
+            del spans[storage_id]
+
+    def write_if_complete(shard: _StreamedShard) -> None:
+        if shard.index is not None and shard.partial is None and all(tiled(storage) for storage in shard.storages):
+            write(shard)
+
+    def close(shard: _StreamedShard) -> None:
+        shard.index = len(shards)
+        shards.append(shard)
+        write_if_complete(shard)
+
+    for name, tensor in weights:
+        if name in seen:
+            raise ValueError(f"Duplicate exported tensor: {name}")
+        seen.add(name)
+        tensor = tensor.detach().cpu()
+        storage_id = get_torch_storage_id(tensor)
+        shared = storage_id in owners
+        if not shared:
+            tensor_size = get_torch_storage_size(tensor)
+            total_size += tensor_size
+            if tensor_size > max_shard_size:
+                owners[storage_id] = _StreamedShard()
+            else:
+                if current.size + tensor_size > max_shard_size:
+                    close(current)
+                    current = _StreamedShard()
+                current.size += tensor_size
+                owners[storage_id] = current
+            spans[storage_id] = []
+        shard = owners[storage_id]
+        shard.tensors[name] = tensor
+        shard.names.append(name)
+        shard.storages.add(storage_id)
+        if spans[storage_id] is not None and tensor.is_contiguous():
+            start = tensor.storage_offset() * tensor.element_size()
+            spans[storage_id].append((start, start + tensor.numel() * tensor.element_size()))
+        else:
+            spans[storage_id] = None
+        if not shared and shard is not current:
+            close(shard)
+        else:
+            write_if_complete(shard)
+        # A view pins its whole storage; holding it until the producer's next item would keep a written layer alive.
+        del tensor
+    if current.names:
+        close(current)
+    for shard in shards:
+        if shard.partial is None:
+            write(shard)
+
+    weight_map: dict[str, str] = {}
+    for shard in shards:
+        suffix = "" if len(shards) == 1 else f"-{shard.index + 1:05d}-of-{len(shards):05d}"
+        filename = filename_pattern.format(suffix=suffix)
+        os.replace(shard.partial, save_dir / filename)
+        weight_map.update((name, filename) for name in shard.names)
+    index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+    with open(save_dir / SAFE_WEIGHTS_INDEX_NAME, "w", encoding="utf-8") as f:
+        f.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
 
 
 def _strip_activation_checkpoint_segments(name: str) -> str:

@@ -130,7 +130,14 @@ class ShadowVerifier:
     Unknown/custom operations and writes outside registered parameters,
     complete persistent integer buffers or newly allocated temporaries fail
     before dispatch. Shared parameter views require one complete backing owner.
-    Nonfloating parameters and quantized loaders are deliberately unsupported.
+    Nonfloating parameters are deliberately unsupported. Only the FP8 quantization operations bound by
+    :func:`maybe_bind_fp8_updater` are admitted beside ATen, with their schema-declared writes checked the same way.
+
+    A storage's private backing is allocated when the replay first writes or reads it and is compared, recorded and
+    freed as soon as every element has been written, so only the storages being written at once are resident and
+    ``max_shadow_bytes`` bounds that resident sum. A completed storage written again is reopened from the live bytes
+    it was verified equal to, after rehashing them; completed live bytes that change by any other route are reported
+    in ``changed_after_verification``.
     """
 
     def __init__(self, model, *, max_shadow_bytes: int):
@@ -218,9 +225,11 @@ class ShadowVerifier:
             self.storage_names[key] = {name}
             storage_owners[key] = name
         self.registered = {**self.parameters, **self.buffers}
-        total = sum(key[2] for key in self.storage_names)
-        if type(max_shadow_bytes) is not int or not 0 < total <= max_shadow_bytes:
-            raise ValueError(f"shadow allocation {total} exceeds the explicit {max_shadow_bytes} byte limit")
+        self.owners = storage_owners
+        largest = max(key[2] for key in self.storage_names)
+        if type(max_shadow_bytes) is not int or not 0 < largest <= max_shadow_bytes:
+            raise ValueError(f"shadow allocation {largest} exceeds the explicit {max_shadow_bytes} byte limit")
+        self.max_shadow_bytes = max_shadow_bytes
         self.sources = source_files(
             model.load_weights,
             TorchDispatchMode,
@@ -231,27 +240,121 @@ class ShadowVerifier:
         for entry in self.padding.values():
             self.sources.update(source_files(type(entry["module"]), type(entry["projection"])))
         verify_sources(self.sources)
-        self.backings = {
-            key: torch.full(
-                (key[2] // self.registered[name].element_size(),),
-                float("nan") if name in self.parameters else 0,
-                dtype=self.registered[name].dtype,
-                device=self.registered[name].device,
-            )
-            for key, name in storage_owners.items()
-        }
-        self.shadows = {
-            name: (
-                self.backings[self.storage_keys[name]].as_strided(value.shape, value.stride(), value.storage_offset())
-            )
-            for name, value in self.registered.items()
-        }
-        for name, entry in self.padding.items():
-            with torch.no_grad():
-                self.shadows[name][entry["start"] :].copy_(self.parameters[name][entry["start"] :])
-        self.shadow_names = {_storage(value): self.storage_names[key] for key, value in self.backings.items()}
+        self.native_operations: set = set()
+        self.native_schemas: dict[str, str] = {}
+        self.backings: dict[tuple[str, int, int], Any] = {}
+        self.shadow_keys: dict[tuple[str, int, int], tuple[str, int, int]] = {}
+        self.written_numel: dict[tuple[str, int, int], int] = {}
+        self.completed: dict[tuple[str, int, int], dict[str, dict]] = {}
+        self.destinations: dict[str, dict[str, int]] = {}
+        self.changed: set[str] = set()
+        self.resident_bytes = 0
+        self.peak_bytes = 0
         self.received: dict[str, dict] = {}
         self.touched: set[str] = set()
+
+    def _fill(self, name):
+        """Bytes of the value a never-written element holds; compared bytewise, so float8 needs no NaN kernels."""
+        import torch
+
+        value = torch.tensor([float("nan") if name in self.parameters else 0.0]).to(self.registered[name].dtype)
+        return value.view(torch.uint8)
+
+    def _view(self, name):
+        value = self.registered[name]
+        return self.backings[self.storage_keys[name]].as_strided(value.shape, value.stride(), value.storage_offset())
+
+    def _reserve(self, extra):
+        if self.resident_bytes + extra > self.max_shadow_bytes:
+            raise ValueError(
+                f"shadow allocation {self.resident_bytes + extra} exceeds the explicit {self.max_shadow_bytes} byte "
+                f"limit with {len(self.backings)} partially written storages resident"
+            )
+
+    def _open(self, key, *, from_live):
+        import torch
+
+        owner = self.registered[self.owners[key]]
+        self._reserve(key[2])
+        raw = torch.empty(key[2], dtype=torch.uint8, device=owner.device)
+        with torch.no_grad():
+            if from_live:
+                raw.copy_(owner.detach().as_strided((owner.numel(),), (1,), 0).view(torch.uint8))
+            else:
+                fill = self._fill(self.owners[key]).to(owner.device)
+                raw.view(-1, fill.numel()).copy_(fill.expand(key[2] // fill.numel(), -1))
+        backing = raw.view(owner.dtype)
+        self.backings[key] = backing
+        self.shadow_keys[_storage(backing)] = key
+        self.resident_bytes += key[2]
+        self.peak_bytes = max(self.peak_bytes, self.resident_bytes)
+        written = owner.numel() if from_live else self.written_numel.get(key, 0)
+        for name in self.storage_names[key].intersection(self.padding):
+            start = self.padding[name]["start"]
+            with torch.no_grad():
+                self._view(name)[start:].copy_(self.parameters[name][start:])
+            written += 0 if from_live else self.parameters[name][start:].numel()
+        self.written_numel[key] = written
+        return backing
+
+    def _reopen(self, key):
+        """A completed storage equals its verified live bytes, unless something unobserved changed them."""
+        digests = self.completed.pop(key)
+        self.changed.update(
+            name for name, digest in digests.items() if tensor_manifest(self.registered[name]) != digest
+        )
+        return self._open(key, from_live=True)
+
+    def _uncovered(self, name):
+        import torch
+
+        shadow = self._view(name)
+        if name not in self.parameters:
+            return torch.zeros_like(shadow, dtype=torch.bool)
+        fill = self._fill(name).to(shadow.device)
+        flat = shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, fill.numel())
+        uncovered = (flat == fill).all(dim=1).reshape(shadow.shape)
+        if name in self.padding:
+            uncovered[self.padding[name]["start"] :] = False
+        return uncovered
+
+    def _complete(self, key, *, digest=True):
+        """Compare, record and free one storage that the loader can no longer leave partially written."""
+        import torch
+
+        for name in sorted(self.storage_names[key]):
+            live = self.registered[name].detach()
+            shadow = self._view(name)
+            if name in self.padding and tensor_manifest(shadow[self.padding[name]["start"] :]) != (
+                self.padding[name]["before"]
+            ):
+                raise RuntimeError(f"shadow loader changed unused HC projection padding: {name}")
+            uncovered = self._uncovered(name)
+            byte_diff = (
+                live.contiguous().reshape(-1).view(torch.uint8).reshape(-1, live.element_size())
+                != shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, shadow.element_size())
+            ).any(dim=1)
+            entry = self.destinations.setdefault(name, {"uncovered": 0, "mismatched": 0})
+            entry["uncovered"] += int(uncovered.sum().item())
+            entry["mismatched"] += int((byte_diff & ~uncovered.reshape(-1)).sum().item())
+        if digest:
+            self.completed[key] = {name: tensor_manifest(self.registered[name]) for name in self.storage_names[key]}
+        self._free(key)
+
+    def _free(self, key):
+        backing = self.backings.pop(key)
+        del self.shadow_keys[_storage(backing)]
+        self.written_numel.pop(key, None)
+        self.resident_bytes -= key[2]
+
+    def _maybe_complete(self, key):
+        owner = self.owners[key]
+        if (
+            key in self.backings
+            and self.written_numel.get(key, 0) >= self.registered[owner].numel()
+            and not bool(self._uncovered(owner).any().item())
+        ):
+            self._complete(key)
 
     def _projection_padding(self):
         """Only the installed Qwen HC loader's unused trailing rows are padding."""
@@ -351,7 +454,12 @@ class ShadowVerifier:
                 raise RuntimeError(f"weight loader changed unused HC projection padding: {name}")
 
     @contextmanager
-    def observe_load(self, name, value, *, loader):
+    def observe_load(self, name, value, *, loader, staging=None):
+        """``staging`` is a live and a replay callable mapping held staging storages to their eventual destinations.
+
+        A received tensor that only fills staging reaches those destinations; they stay uncovered until a later
+        tensor completes the staging and the loader writes them.
+        """
         import torch
         from torch.utils._python_dispatch import TorchDispatchMode
         from torch.utils._pytree import tree_flatten
@@ -367,15 +475,22 @@ class ShadowVerifier:
         verifier = self
 
         class Observe(TorchDispatchMode):
-            def __init__(self, shadow):
+            def __init__(self, shadow, persistent):
                 super().__init__()
                 self.shadow = shadow
-                self.owned = {_storage(tensor) for tensor in verifier.shadows.values()} if shadow else set()
+                # Loader-owned staging that outlives one received tensor, held by this side's loader only.
+                self.owned = set(persistent)
+                if shadow:
+                    self.owned.update(_storage(backing) for backing in verifier.backings.values())
                 self.written = set()
+                self.keys = set()
+                self.opened = {}
+                self.staged = set()
+                self.reserved = set()
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
                 kwargs = kwargs or {}
-                if func.namespace not in {"aten", "prims"}:
+                if func.namespace not in {"aten", "prims"} and func not in verifier.native_operations:
                     raise ValueError(f"unobservable native weight-loader operation: {func}")
                 flat, _ = tree_flatten((args, kwargs))
                 inputs = {_storage(t) for t in flat if isinstance(t, torch.Tensor)}
@@ -386,7 +501,14 @@ class ShadowVerifier:
                     key = _storage(tensor)
                     if key not in verifier.storage_names or not self.shadow:
                         return tensor
-                    backing = verifier.backings[key]
+                    backing = verifier.backings.get(key)
+                    if backing is None:
+                        self.opened[key] = key in verifier.completed
+                        if key in verifier.completed:
+                            backing = verifier._reopen(key)
+                        else:
+                            backing = verifier._open(key, from_live=False)
+                        self.owned.add(_storage(backing))
                     if tensor.dtype != backing.dtype:
                         raise ValueError("reinterpretation of parameter storage is unsupported")
                     return backing.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
@@ -400,9 +522,10 @@ class ShadowVerifier:
                         if not isinstance(tensor, torch.Tensor):
                             continue
                         key = _storage(tensor)
-                        destination = verifier.storage_names.get(key)
-                        if self.shadow:
-                            destination = destination or verifier.shadow_names.get(key)
+                        target = key if key in verifier.storage_names else None
+                        if self.shadow and target is None:
+                            target = verifier.shadow_keys.get(key)
+                        destination = verifier.storage_names.get(target) if target is not None else None
                         if destination is not None:
                             for buffer_name in destination.intersection(verifier.buffers):
                                 buffer = verifier.buffers[buffer_name]
@@ -419,7 +542,18 @@ class ShadowVerifier:
                                 ):
                                     raise ValueError("integer buffer writes require one complete, exact-dtype copy")
                             self.written.update(destination)
-                        elif key not in self.owned:
+                            self.keys.add(target)
+                            if self.shadow:
+                                verifier.written_numel[target] = verifier.written_numel.get(target, 0) + tensor.numel()
+                            elif target in verifier.completed:
+                                verifier._reopen(target)
+                            elif target not in verifier.backings and target not in self.reserved:
+                                # The replay opens this storage; refuse before the live write, not after it.
+                                self.reserved.add(target)
+                                verifier._reserve(sum(reserved[2] for reserved in self.reserved))
+                        elif key in self.owned:
+                            self.staged.add(key)
+                        else:
                             raise ValueError("weight loader writes an input, buffer or unowned storage")
                 call_args = tree_map(substitute, args)
                 call_kwargs = tree_map(substitute, kwargs)
@@ -432,18 +566,29 @@ class ShadowVerifier:
                             self.owned.add(key)
                 return result
 
-        with torch.no_grad(), Observe(False) as live:
+        def pending(held, staged):
+            return {name for key, names in held.items() if key in staged for name in names}
+
+        live_staging, replay_staging = staging if staging is not None else (dict, dict)
+        with torch.no_grad(), Observe(False, live_staging()) as live:
             yield
+        live_pending = pending(live_staging(), live.staged)
         # Each replay receives private input too; loaders must not mutate the wire tensor.
-        with torch.no_grad(), Observe(True) as replay:
+        with torch.no_grad(), Observe(True, replay_staging()) as replay:
             loader(name, value.detach().clone())
+        replay_pending = pending(replay_staging(), replay.staged)
         self._check_inventory()
         verify_sources(self.sources)
-        if live.written != replay.written or tensor_manifest(value) != entry:
+        if live.written != replay.written or live_pending != replay_pending or tensor_manifest(value) != entry:
             raise RuntimeError("shadow loader destination set or received bytes changed")
-        entry["destinations"] = sorted(live.written)
+        for key in replay.keys | set(replay.opened):
+            if key in replay.keys or replay.opened[key]:
+                self._maybe_complete(key)
+            elif key in self.backings:
+                self._free(key)
+        entry["destinations"] = sorted(live.written | live_pending)
         self.received[name] = entry
-        self.touched.update(live.written)
+        self.touched.update(live.written | live_pending)
 
     def load(self, name, value, *, loader=None):
         """Debug-only convenience for a live load and its private shadow replay."""
@@ -456,38 +601,35 @@ class ShadowVerifier:
             return loader(name, value)
 
     def finish(self):
-        import torch
-
         self._check_inventory()
         verify_sources(self.sources)
-        destinations = {}
-        for name in sorted(self.touched):
-            live = self.registered[name].detach()
-            shadow = self.shadows[name]
-            uncovered = torch.isnan(shadow) if name in self.parameters else torch.zeros_like(shadow, dtype=torch.bool)
-            if name in self.padding:
-                entry = self.padding[name]
-                if tensor_manifest(shadow[entry["start"] :]) != entry["before"]:
-                    raise RuntimeError(f"shadow loader changed unused HC projection padding: {name}")
-                uncovered[entry["start"] :] = False
-            byte_diff = (
-                live.contiguous().reshape(-1).view(torch.uint8).reshape(-1, live.element_size())
-                != shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, shadow.element_size())
-            ).any(dim=1)
-            destinations[name] = {
-                "uncovered": int(uncovered.sum().item()),
-                "mismatched": int((byte_diff & ~uncovered.reshape(-1)).sum().item()),
-            }
+        for digests in self.completed.values():
+            self.changed.update(
+                name for name, digest in digests.items() if tensor_manifest(self.registered[name]) != digest
+            )
+        for key in list(self.backings):
+            if self.storage_names[key] & self.touched:
+                self._complete(key, digest=False)
+            else:
+                self._free(key)
+        # A destination reached only through staging the loader never wrote out is uncovered in full.
+        destinations = {
+            name: dict(self.destinations.get(name) or {"uncovered": self.registered[name].numel(), "mismatched": 0})
+            for name in sorted(self.touched)
+        }
         return {
             "status": "ok",
             "received": self.received,
             "destinations": destinations,
             "unverifiable_destinations": [],
             "non_parameter_destinations": [],
+            "changed_after_verification": sorted(self.changed),
             "untouched_parameters": {
                 name: value.numel() for name, value in self.parameters.items() if name not in self.touched
             },
             "evidence_sources": self.sources,
+            "admitted_native_operations": dict(self.native_schemas),
+            "shadow_bytes": {"limit": self.max_shadow_bytes, "peak": self.peak_bytes},
             "preserved_padding": {
                 name: dict(start_row=entry["start"], **entry["before"]) for name, entry in self.padding.items()
             },
@@ -972,7 +1114,7 @@ def prepare_collective_weights(
     )
     sources = _bind_sources(admitted_sources, selected)
     if (
-        "20806894cebc1050d877351bf67764bab44dcf6ac8fd8bbaef56c10027b651a1" not in source_files(builder).values()
+        "1654b373bec81a411f4d5369270f3ec96b0345a48af192144c3d3495ea741e51" not in source_files(builder).values()
         or "543c34347f9d5f67e35a6e9cdcc3f5d47bc45c608751ff78ffd1369ee4975a5a" not in source_files(converter).values()
     ):
         raise ValueError("actual native gather/GLM packing source differs from this selected recipe")
@@ -1212,6 +1354,8 @@ def bind_receiver_results(
         ):
             if field_name not in record or type(record[field_name]) is not type(empty) or record[field_name] != empty:
                 raise ValueError("native receiver has unproved or untouched destinations")
+        if record.get("changed_after_verification", []) != []:
+            raise ValueError("native receiver destinations changed after their shadow verification")
         records.append({"result_index": index, "actual_result": result})
     verify_sources(sources)
     prepared.verify()
@@ -1587,15 +1731,13 @@ def _verify_trainer_replicas(records, inventory, *, buffer_names=()):
 def maybe_admit_broadcast_receiver(receiver, *, engine_only):
     if not enabled():
         return
-    if not engine_only and receiver.model_config.quantization:
-        raise ValueError("quantized native broadcast shadow evidence is not implemented")
+    if not engine_only and receiver.model_config.quantization not in (None, "fp8"):
+        raise ValueError("quantized native broadcast shadow evidence supports only the FP8 in-place updater")
 
 
 def maybe_begin_broadcast_load(receiver, model, engine):
     if not enabled():
         return None
-    if receiver.model_config.quantization:
-        raise ValueError("quantized native broadcast shadow evidence is not implemented")
     limit = int(os.environ.get(SHADOW_MAX_BYTES_ENV, str(1 << 30)))
     verifier = ShadowVerifier(model, max_shadow_bytes=limit)
     verifier.sources.update(source_files(maybe_begin_broadcast_load, type(engine).receive_weights))
@@ -1616,6 +1758,65 @@ def maybe_observe_broadcast_tensor(verifier, loader, name, value):
         yield
         return
     with verifier.observe_load(name, value, loader=loader):
+        yield
+
+
+# The vLLM ``_C`` FP8 quantization kernels ``scaled_fp8_quant`` dispatches; nothing else non-ATen is admitted.
+FP8_QUANT_OPERATIONS = (
+    "_C",
+    ("dynamic_scaled_fp8_quant", "static_scaled_fp8_quant", "dynamic_per_token_scaled_fp8_quant"),
+)
+
+
+def maybe_bind_fp8_updater(verifier, updater, make_replay):
+    """Bind the live FP8 in-place updater and build its independent replay twin.
+
+    The replay instance is fed every received tensor a second time; its own staging state accumulates fused-module
+    shards across tensors, and its parameter writes land in the verifier's private backings.
+    """
+    if verifier is None:
+        return None
+    import torch
+    from vllm import _custom_ops
+
+    namespace, names = FP8_QUANT_OPERATIONS
+    library = getattr(torch.ops, namespace)
+    operations = {getattr(library, name).default for name in names if hasattr(library, name)}
+    if not operations:
+        raise ValueError("no vLLM FP8 quantization operation is registered for the quantized updater")
+    for operation in operations:
+        arguments = operation._schema.arguments
+        if not any(argument.alias_info is not None and argument.alias_info.is_write for argument in arguments):
+            raise ValueError(f"FP8 quantization operation declares no written argument: {operation}")
+    replay = make_replay()
+    if replay is updater or type(replay) is not type(updater) or updater.pending or replay.pending:
+        raise ValueError("FP8 shadow replay needs a fresh independent updater of the live updater's class")
+    verify_sources(verifier.sources)
+    classes = [cls for cls in type(updater).__mro__ if cls is not object]
+    verifier.sources.update(source_files(*classes, _custom_ops.scaled_fp8_quant, maybe_bind_fp8_updater))
+    verify_sources(verifier.sources)
+    verifier.native_operations.update(operations)
+    verifier.native_schemas.update({str(operation): str(operation._schema) for operation in operations})
+    return replay
+
+
+def _fp8_staging(verifier, updater):
+    def held():
+        return {
+            _storage(buffer): [name for name in names if name in verifier.parameters]
+            for buffer, names in updater.staged()
+        }
+
+    return held
+
+
+@contextmanager
+def maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
+    if verifier is None:
+        yield
+        return
+    staging = (_fp8_staging(verifier, updater), _fp8_staging(verifier, replay))
+    with verifier.observe_load(name, value, loader=replay.feed, staging=staging):
         yield
 
 

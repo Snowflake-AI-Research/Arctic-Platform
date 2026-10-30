@@ -27,9 +27,12 @@ chunked cross entropy to bound the logits.
 
 Accumulation makes the peak independent of the global batch. The request gradient is
 ``sum_i (w_i / W) * grad(CE_i)``: each sequence contributes independently and backward accumulates
-additively, so grouping sequences into microbatches any way at all gives the same result. This engine
-therefore chooses its own microbatch size from its own memory budget, and does not reproduce the split Arctic Platform
-uses. The only hard constraint is that a sequence is never split, since attention would change.
+additively, so in exact arithmetic grouping sequences into microbatches any way at all gives the same result. This
+engine therefore chooses its own microbatch size from its own memory budget, and does not reproduce the split Arctic
+Platform uses. The only hard constraint is that a sequence is never split, since attention would change. Each model
+call's gradient is still rounded to bfloat16 before it is accumulated, so grouping is not free: on a 4-layer Qwen3.8-27B
+fixture, five-row and one-row calls over the same 32 rows of 2,048 tokens differ by 4.9e-03 in the final norm's
+gradient norm.
 
 Accumulation happens in float32. With a thousand-sequence global batch the gradient receives on the order of
 a thousand additions, and bfloat16 carries two to three decimal digits, so a bfloat16 accumulator would
@@ -186,6 +189,26 @@ def row_groups(lengths: List[int], seq_len: int, token_budget: int) -> List[List
     return groups
 
 
+def apply_target_loader_numerics(model, model_path: str) -> bool:
+    """Round ``model`` as the target's loader rounds it when that loader is the stock HuggingFace one.
+
+    A dense target worker builds its spec with empty ``loader_options``, so the HuggingFace loader runs with its
+    defaults: the GatedDeltaNet output norms round once and the dense Qwen3.5 operations run in fp32. A stock reference
+    without them differs from the target on one GPU before any distribution, by more than the gradient gate. Models
+    another loader builds (the custom MoE and GLM implementations) are compared against stock transformers and are
+    left alone. Returns whether the numerics were applied.
+    """
+    from arctic_platform.model.config import ModelSpec
+    from arctic_platform.model.loader import resolve_loader_name
+    from arctic_platform.model.loaders.huggingface import HuggingfaceOptions
+    from arctic_platform.model.loaders.huggingface import apply_loader_numerics
+
+    if resolve_loader_name(ModelSpec.model_construct(model_path_or_name=str(model_path))) != "huggingface":
+        return False
+    apply_loader_numerics(model, HuggingfaceOptions.model_validate({}), sequence_parallel=False)
+    return True
+
+
 def build_engine(
     model_path: str,
     *,
@@ -225,6 +248,7 @@ def build_engine(
         )
     else:
         model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
+    apply_target_loader_numerics(model, model_path)
     if peft_adapter_path:
         from peft import PeftModel
 

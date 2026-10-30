@@ -2444,6 +2444,7 @@ def main() -> None:
     from dss.ray_dss import gateway_server
 
     from arctic_platform.correctness.harness.lora import gateway_scope
+    from arctic_platform.correctness.harness.native_optimizer import install_gateway_route
     from arctic_platform.correctness.harness.storage import NativeCheckpointStore
 
     hostfiles = [sys.argv[index + 1] for index, arg in enumerate(sys.argv[:-1]) if arg == "--hostfile"]
@@ -2454,6 +2455,7 @@ def main() -> None:
         raise ValueError("owned correctness gateway must bind explicitly to 127.0.0.1")
     store = NativeCheckpointStore(Path(hostfiles[0]))
     install_checkpoint_routes(gateway_server, store)
+    install_gateway_route(gateway_server)
     with gateway_scope(gateway_server):
         gateway_server.main()
 

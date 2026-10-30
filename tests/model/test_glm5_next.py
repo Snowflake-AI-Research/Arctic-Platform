@@ -1134,6 +1134,39 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
         assert entry["evidence"]["integer_outputs_only"] is True
 
 
+def test_glm53_sparse_mla_applies_kv_b_proj_lora():
+    """The absorbed sparse path must see a kv_b_proj LoRA exactly as if it were merged into the weight."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    set_seed(0)
+    config = _tiny_config()
+    config.use_cache = False
+    config.text_config.use_cache = False
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    apply_context_parallelism(model, cp_size=1, cp_group=None)
+    model = get_peft_model(model, LoraConfig(r=2, lora_alpha=2, target_modules=["kv_b_proj"]))
+    sparse_attention = model.base_model.model.model.language_model.layers[-1].self_attn
+    kv_b_proj = sparse_attention.kv_b_proj
+    torch.nn.init.normal_(kv_b_proj.lora_B["default"].weight)
+    hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    output, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    output.square().sum().backward()
+    assert kv_b_proj.lora_A["default"].weight.grad.abs().sum() > 0
+    assert kv_b_proj.lora_B["default"].weight.grad.abs().sum() > 0
+
+    with torch.no_grad():
+        kv_b_proj.base_layer.weight.add_(kv_b_proj.get_delta_weight("default"))
+        kv_b_proj.lora_B["default"].weight.zero_()
+        merged, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    torch_assert_close(output.detach(), merged)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")
 def test_glm53_fused_indexer_selects_the_general_paths_keys():
     """One packed row takes the fused path; a batch of two identical rows takes the general path."""

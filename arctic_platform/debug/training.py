@@ -578,14 +578,8 @@ def maybe_select_participation_coordinator(manager_module, actor_key, original_a
         manager_module._ACTOR_CLS[actor_key] = original_actor
 
 
-def participation_coordinator_class(training):
-    import ray
-
-    # The correctness gateway is optional; ordinary model imports must not load its service stack.
-    native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
-    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
-    worker_base = training._DeepSpeedWorker
-    coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
+def participation_worker_class(worker_base):
+    """Capture participation over the first optimizer step only; later steps of the same job run unobserved."""
 
     class ParticipationWorker(worker_base):
         def fwd_bwd(self, batch):
@@ -600,6 +594,9 @@ def participation_coordinator_class(training):
         def step(self, learning_rate=None):
             if not hasattr(self, "_correctness_participation"):
                 raise ValueError("participation capture requires backward before step")
+            # Multi-step checks (e2e training) share this gateway: the receipt describes step 1, later steps add none.
+            if hasattr(self, "_correctness_participation_receipt"):
+                return super().step(learning_rate)
             try:
                 result = super().step(learning_rate)
                 self._correctness_participation_receipt = self._correctness_participation.finish()
@@ -615,6 +612,18 @@ def participation_coordinator_class(training):
             if capture is not None:
                 capture.close()
             return super().destroy(remove_checkpoint_scratch=remove_checkpoint_scratch)
+
+    return ParticipationWorker
+
+
+def participation_coordinator_class(training):
+    import ray
+
+    # The correctness gateway is optional; ordinary model imports must not load its service stack.
+    native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
+    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
+    ParticipationWorker = participation_worker_class(training._DeepSpeedWorker)
+    coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
 
     class ParticipationCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
@@ -632,8 +641,11 @@ def participation_coordinator_class(training):
 
         async def step(self, learning_rate=None):
             response = await super().step(learning_rate)
-            if response.get("global_steps") != 1:
-                raise ValueError("participation capture requires exactly the first optimizer step")
+            global_steps = response.get("global_steps")
+            if not isinstance(global_steps, int) or global_steps < 1:
+                raise ValueError("participation capture requires a completed optimizer step")
+            if global_steps > 1:
+                return response
             receipts = await asyncio.wait_for(
                 asyncio.gather(*(worker.correctness_participation_receipt.remote() for worker in self._workers)),
                 timeout=60,
@@ -644,6 +656,17 @@ def participation_coordinator_class(training):
             return response
 
     return ray.remote(num_cpus=1, num_gpus=0)(ParticipationCoordinator)
+
+
+def expert_parallel_width(parameter) -> int:
+    """Count the expert-parallel ranks holding disjoint dim-0 slices of ``parameter``; 1 for a replicated one."""
+    group_name = getattr(parameter, "group_name", None)
+    if group_name is None or getattr(parameter, "allreduce", True) is not False or parameter.dim() < 2:
+        return 1
+    groups = importlib.import_module("deepspeed.utils.groups")
+    return importlib.import_module("torch.distributed").get_world_size(
+        group=groups._get_expert_parallel_group(group_name)
+    )
 
 
 class WorkerParticipation:
@@ -669,6 +692,9 @@ class WorkerParticipation:
         self.sources = {str(source): hashlib.sha256(source.read_bytes()).hexdigest() for source in sources}
         self.capture = ParticipationCapture(model, decoder=decoder, head=head)
         try:
+            self.expert_widths = {
+                name: expert_parallel_width(parameter) for name, parameter in self.capture.parameters.items()
+            }
             self.before = self.evidence()
         except BaseException:
             self.close()
@@ -696,6 +722,7 @@ class WorkerParticipation:
             "job_id": self.worker.job_id,
             "before": deepcopy(self.before),
             "after": self.evidence(),
+            "expert_parallel_widths": dict(self.expert_widths),
         }
 
     def close(self):
@@ -752,11 +779,19 @@ def merge_worker_receipts(receipts, *, job_id, world_size):
             ):
                 raise ValueError("participation worker inventory is incomplete")
     shapes = {name: entry["shape"] for name, entry in receipts[0]["before"]["participation"]["parameters"].items()}
+    widths = receipts[0].get("expert_parallel_widths")
+    if (
+        not isinstance(widths, dict)
+        or set(widths) != set(shapes)
+        or any(type(width) is not int or width < 1 for width in widths.values())
+        or any(receipt.get("expert_parallel_widths") != widths for receipt in receipts)
+    ):
+        raise ValueError("participation expert-parallel widths are incomplete or differ across ranks")
     participation, _ = merge_rank_participation(
         [receipt["before"] for receipt in receipts],
         [receipt["after"] for receipt in receipts],
         shapes,
-        {name: [0] for name in shapes},
+        {name: [0] * widths[name] for name in shapes},
     )
     return {**participation, "training_child_id": job_id, "rank_receipts": deepcopy(receipts)}
 
@@ -765,6 +800,9 @@ def main():
     from dss.ray_dss import gateway_server
 
     gateway_scope = importlib.import_module("arctic_platform.correctness.harness.lora").gateway_scope
+    importlib.import_module("arctic_platform.correctness.harness.native_optimizer").install_gateway_route(
+        gateway_server
+    )
 
     os.environ[CAPTURE_ENV] = "1"
     with gateway_scope(gateway_server):

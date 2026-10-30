@@ -263,6 +263,7 @@ def _build_model_config(
         optimization_dtype=optimization_dtype,
         reduce_dtype=options.reduce_dtype,
         moe_use_grouped_mm=options.moe_use_grouped_mm,
+        moe_use_sonicmoe=options.moe_use_sonicmoe,
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,

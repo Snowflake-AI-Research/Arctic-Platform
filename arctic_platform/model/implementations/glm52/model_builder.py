@@ -34,6 +34,7 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import set_s
 from arctic_platform.model.implementations.moe.layers.checkpointing import supports_selective_activation_checkpointing
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE
 from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import install_combine_replay
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -71,6 +72,8 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
     for transformer_block in language_model.layers:
         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
             continue
+        if isinstance(transformer_block.mlp, MoE):
+            transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
         transformer_block.mlp.set_ep_comm_backend(backend)
         transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
 
@@ -398,8 +401,9 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             f"tensor_size_threshold={ac_config.offload_config.tensor_size_threshold})"
         )
 
+    ac_config.check_layers_exist(len(language_model.layers))
     for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
-        if layer_id % ac_config.freq != 0:
+        if not ac_config.checkpoints(layer_id):
             continue
 
         if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
@@ -411,7 +415,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 fallback_layer_types.add(type(transformer_block).__name__)
             if ac_config.router_replay_recompute:
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
-            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE)
+            # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
+            # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
+            # The recompute then repeats the EP all-to-all. Replay keeps the forward's combined output instead.
+            if ac_config.combine_replay:
+                install_combine_replay(transformer_block)
+            transformer_block = checkpoint_wrapper(
+                transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
+            )
             full_layers += 1
 
         language_model.layers.register_module(layer_name, transformer_block)
@@ -430,13 +441,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             )
         logger.info(
             "Applied selective activation checkpointing "
-            f"(freq={ac_config.freq}, targets={target_list}, selective_layers={selective_layers}, "
+            f"(freq={ac_config.freq}, layers={ac_config.layers}, targets={target_list}, selective_layers={selective_layers}, "
             f"full_fallback_layers={full_layers})"
         )
         return
 
     logger.info(
-        f"Applied activation checkpointing (freq={ac_config.freq}, "
+        f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
+        f"combine_replay={ac_config.combine_replay}, "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )

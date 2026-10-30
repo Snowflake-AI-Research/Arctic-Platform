@@ -40,6 +40,8 @@ from typing import List
 from arctic_platform.correctness.harness.optimizer import active_gradient_norms
 from arctic_platform.correctness.harness.optimizer import align
 from arctic_platform.correctness.harness.optimizer import compare_participation
+from arctic_platform.correctness.harness.optimizer import normalize
+from arctic_platform.correctness.harness.optimizer import validate_participation
 
 from ..harness.config import tolerance_text
 from ..harness.registry import Mismatch
@@ -60,6 +62,29 @@ def run(ctx) -> List[TestResult]:
     return results
 
 
+def _without_absent_bypassed_tower(reference: dict | None, target: dict | None) -> dict | None:
+    """Drop the reference's bypassed vision tower when the target model has no vision tower at all.
+
+    A text-only target (``AutoModelForCausalLM`` of a VLM checkpoint) builds no vision tower, while the
+    ``ForConditionalGeneration`` reference carries one that a text-only request never calls; the reference records
+    those parameters inactive with zero-call ``text-decoder-bypass`` evidence. Only parameters with that evidence are
+    dropped, and only when no target parameter belongs to the tower, so every other inventory difference still fails.
+    """
+    if not isinstance(reference, dict) or not isinstance(target, dict):
+        return reference
+    parameters = validate_participation(reference)
+    if any(normalize(name).split(".", 1)[0] == "visual" for name in validate_participation(target)):
+        return reference
+    kept = {
+        name: entry
+        for name, entry in parameters.items()
+        if entry["state"] != "inactive" or entry["evidence"]["kind"] != "text-decoder-bypass"
+    }
+    if len(kept) == len(parameters):
+        return reference
+    return {**reference, "parameters": kept}
+
+
 def _run_arm(ctx, arm) -> TestResult:
     reference = ctx.reference_for(arm)
     target = ctx.target_for(arm)
@@ -78,7 +103,9 @@ def _run_arm(ctx, arm) -> TestResult:
         if participation is None and getattr(target, "optimizer_state_manifest", None):
             participation = json.loads(Path(target.optimizer_state_manifest).read_text()).get("participation")
         if reference.get("participation") is not None or participation is not None:
-            _, inactive = compare_participation(participation, reference.get("participation"))
+            _, inactive = compare_participation(
+                participation, _without_absent_bypassed_tower(reference.get("participation"), participation)
+            )
             target_norms = active_gradient_norms(participation, target_norms)
             reference_norms = active_gradient_norms(reference["participation"], reference_norms)
         pairs, only_dss, only_reference = align(target_norms, reference_norms)

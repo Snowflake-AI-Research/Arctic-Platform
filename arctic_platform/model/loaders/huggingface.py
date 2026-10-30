@@ -94,6 +94,22 @@ def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
     )
 
 
+def apply_loader_numerics(model, options: HuggingfaceOptions, *, sequence_parallel: bool) -> None:
+    """Round a loaded stock transformers model the way this loader does, after its weights load.
+
+    The GatedDeltaNet output norms always round once; ``fp32_parity`` adds the dense Qwen3.5 fp32 operations. A
+    single-GPU reference that compares against a model built by this loader calls this with the same options, so
+    both sides evaluate the same function.
+    """
+    from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
+
+    round_gated_norms_once(model)
+    if options.fp32_parity:
+        from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
+
+        apply_fp32_parity(model, sequence_parallel=sequence_parallel, fp32_residual=options.fp32_residual)
+
+
 @register_loader("huggingface", default=True, options=HuggingfaceOptions)
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
@@ -131,15 +147,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
 
         if model.loss_function is ForCausalLMLoss:
             model.loss_function = chunked_causal_lm_loss
-    from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
-
-    round_gated_norms_once(model)
-    if options.fp32_parity:
-        from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
-
-        apply_fp32_parity(
-            model, sequence_parallel=parallelism.sequence_parallel > 1, fp32_residual=options.fp32_residual
-        )
+    apply_loader_numerics(model, options, sequence_parallel=parallelism.sequence_parallel > 1)
     if parallelism.sequence_parallel > 1:
         from arctic_platform.model.implementations.gpu.sp.transformers import (
             configure_transformers_sequence_parallel_model,
