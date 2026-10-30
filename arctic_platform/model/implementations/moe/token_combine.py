@@ -10,18 +10,32 @@ a job happens to select.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def sum_rows_by_token(rows: torch.Tensor, token_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """Sum the rows belonging to each token, with one atomic per row.
+    """Sum each token's rows, accumulating 16-bit inputs in fp32 and rounding once, as vLLM's ``moe_sum`` does.
 
     ``token_indices[i]`` names the destination token of ``rows[i]``, and a token appears once per expert holding
-    it, so several rows fold onto one destination. Atomics aimed at a repeated destination are applied in
-    delivery order, which is the device's to choose: a token holding three or more of its experts on one rank
-    sums them in an order two runs of one configuration need not agree on. Rows the index does not name are
-    dropped, because the scatter iterates over the index rather than over the source.
+    it, so several rows fold onto one destination. ``embedding_bag`` adds each token's rows in the order they
+    appear in ``rows``, accumulating 16-bit rows in fp32 (CUDA ``EmbeddingBag_updateOutputKernel_sum_mean``),
+    where a ``scatter_add`` into a 16-bit output rounds after every atomic, in an order the device chooses. Rows
+    the index does not name are dropped.
     """
-    hidden_dim = rows.shape[1]
-    output = rows.new_zeros((num_tokens, hidden_dim))
-    output.scatter_add_(0, token_indices.unsqueeze(1).expand(-1, hidden_dim), rows)
-    return output
+    return _SumRowsByToken.apply(rows, token_indices, num_tokens)
+
+
+class _SumRowsByToken(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, rows: torch.Tensor, token_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        ctx.save_for_backward(token_indices)
+        sorted_tokens, bags = torch.sort(token_indices, stable=True)
+        tokens = torch.arange(num_tokens, dtype=token_indices.dtype, device=token_indices.device)
+        # Unlike CUDA bincount, fixed-size searchsorted does not read index extrema back to the host.
+        return F.embedding_bag(bags, rows, torch.searchsorted(sorted_tokens, tokens), mode="sum")
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        # Each row reaches one token: its gradient is that token's, as scatter_add's backward gives it.
+        (token_indices,) = ctx.saved_tensors
+        return grad.index_select(0, token_indices), None, None

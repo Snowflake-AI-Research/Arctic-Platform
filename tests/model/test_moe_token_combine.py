@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
 import torch
 
 from arctic_platform.model.implementations.moe.token_combine import sum_rows_by_token
@@ -95,6 +96,34 @@ def test_the_shared_fold_differentiates():
 
     assert rows.grad is not None
     torch.testing.assert_close(rows.grad, upstream.index_select(0, token_indices), rtol=0, atol=0)
+
+
+def _cuda_scatter_add_(self, dim, index, src):
+    """Emulate CUDA's per-row atomic rounding; CPU scatter accumulates 16-bit inputs in fp32."""
+    assert dim == 0
+    for row, token in enumerate(index[:, 0].tolist()):
+        self[token] += src[row]
+    return self
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_a_tokens_rows_on_one_rank_are_summed_in_fp32_and_rounded_once(monkeypatch, dtype):
+    from arctic_platform.model.implementations.moe.distributed.token_permute import permute_tokens
+    from arctic_platform.model.implementations.moe.distributed.token_permute import unpermute_tokens
+
+    monkeypatch.setattr(torch.Tensor, "scatter_add_", _cuda_scatter_add_)
+    dispatched = torch.tensor([[0, 1, 2, 3], [-1, -1, -1, -1]])
+    _, _, indices, _ = permute_tokens(torch.zeros((2, 2), dtype=dtype), dispatched, torch.ones((2, 4)), 4)
+    large = 2 / torch.finfo(dtype).eps
+    # Each atomic loses the unit addends; the fp32 sum is exactly 2, with no CPU/CUDA tie ambiguity.
+    rows = torch.tensor([large, 1, 1, -large], dtype=dtype).view(4, 1).expand(-1, 2).requires_grad_()
+
+    folded = unpermute_tokens(rows, indices, 2)
+
+    torch.testing.assert_close(folded, torch.tensor([[2, 2], [0, 0]], dtype=dtype), rtol=0, atol=0)
+    upstream = torch.tensor([[2, -3], [5, 7]], dtype=dtype)
+    folded.backward(upstream)
+    torch.testing.assert_close(rows.grad, upstream.index_select(0, indices), rtol=0, atol=0)
 
 
 def test_every_expert_parallel_backend_folds_through_the_shared_implementation():
