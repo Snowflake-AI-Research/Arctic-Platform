@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import types
 from typing import Any
@@ -654,6 +655,38 @@ def _is_gated_delta_net_module(module: nn.Module) -> bool:
         and _has_gated_delta_net_kernel_slot(module, "causal_conv1d_fn")
         and _has_gated_delta_net_kernel_slot(module, "chunk_gated_delta_rule")
     )
+
+
+def validate_packed_gated_delta_net_kernels(model: nn.Module) -> None:
+    """Reject HF hybrid fallbacks that silently ignore packed boundaries."""
+    found = False
+    for name, module in model.named_modules():
+        if not _is_gated_delta_net_module(module):
+            continue
+        found = True
+        for attribute, boundary in (
+            ("causal_conv1d_fn", "seq_idx"),
+            ("chunk_gated_delta_rule", "cu_seqlens"),
+        ):
+            kernel = _resolve_gated_delta_net_kernel(module, attribute)
+            try:
+                parameters = inspect.signature(kernel).parameters if callable(kernel) else {}
+            except (TypeError, ValueError):
+                parameters = {}
+            # The HF torch fallback accepts **kwargs but ignores cu_seqlens.
+            # Require the explicit boundary argument of the supported kernels.
+            if boundary not in parameters:
+                raise RuntimeError(
+                    f"Packed hybrid attention requires boundary-aware {attribute} "
+                    f"with explicit {boundary} at {name or '<root>'}. Install the "
+                    "supported causal-conv1d and flash-linear-attention kernels; "
+                    "the Hugging Face torch fallbacks do not isolate packed rows."
+                )
+    if not found:
+        raise RuntimeError(
+            "model configuration contains linear_attention layers, but no "
+            "compatible packed GatedDeltaNet modules were found"
+        )
 
 
 def _hidden_states_from_call(args: tuple, kwargs: dict) -> torch.Tensor:

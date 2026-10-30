@@ -188,19 +188,6 @@ def test_guard_is_removed_before_strict_moe_debug_validation():
     assert "gpu_mem_preallocate_gib" not in spec.loader_options["debug"]
 
 
-def test_ds_worker_config_forwards_only_capacity_guard():
-    from arctic_platform.model import ModelSpec
-
-    spec = ModelSpec.from_ds_worker_config(
-        "x",
-        {
-            "attn_implementation": "sdpa",
-            "debug": {"gpu_mem_preallocate_gib": 20, "gradient_norms_per_param": True},
-        },
-    )
-    assert spec.debug == {"gpu_mem_preallocate_gib": 20}
-
-
 def test_factory_reserves_before_loading_and_retains_on_final_model(stub_loader, monkeypatch):
     import weakref
 

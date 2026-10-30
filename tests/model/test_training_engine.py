@@ -81,6 +81,103 @@ def test_sequence_parallel_shrinks_the_data_parallel_batch():
     assert ds_config["sequence_parallel_size"] == 2
 
 
+def test_batch_shape_and_zero_stage_are_typed_engine_inputs():
+    ds_config = build_deepspeed_config(
+        _spec(
+            world_size=8,
+            sequence_parallel=2,
+            train_micro_batch_size_per_gpu=2,
+            gradient_accumulation_steps=3,
+            zero_stage=1,
+        )
+    )
+
+    assert ds_config["train_micro_batch_size_per_gpu"] == 2
+    assert ds_config["gradient_accumulation_steps"] == 3
+    assert ds_config["train_batch_size"] == 24
+    assert ds_config["zero_optimization"] == {"stage": 1}
+
+
+def test_existing_deepspeed_config_translates_optimizer_and_preserves_scheduler():
+    source = {
+        "train_micro_batch_size_per_gpu": 2,
+        "gradient_accumulation_steps": 4,
+        "gradient_clipping": 0.5,
+        "bf16": {"enabled": True},
+        "communication_data_type": "fp32",
+        "optimizer": {"type": "AdamW", "params": {"lr": 3e-4}},
+        "scheduler": {"type": "WarmupLR", "params": {"warmup_num_steps": 10}},
+    }
+
+    spec = TrainingEngineSpec.from_deepspeed_config(
+        source,
+        dtype="bfloat16",
+        world_size=2,
+        seed=7,
+    )
+    ds_config = build_deepspeed_config(spec)
+
+    assert spec.optimizer == OptimizerSettings(lr=3e-4)
+    assert spec.zero_stage is None
+    assert ds_config["train_batch_size"] == 16
+    assert "optimizer" not in ds_config
+    assert ds_config["scheduler"] == source["scheduler"]
+    assert "zero_optimization" not in ds_config
+    assert ds_config["seed"] == 7
+
+
+def test_existing_torch_adam_config_selects_torch_optimizer():
+    spec = TrainingEngineSpec.from_deepspeed_config(
+        {
+            "communication_data_type": "fp32",
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": 2e-4,
+                    "betas": [0.8, 0.95],
+                    "eps": 1e-6,
+                    "weight_decay": 0.1,
+                    "torch_adam": True,
+                    "adam_w_mode": False,
+                },
+            },
+        },
+        dtype="bfloat16",
+        world_size=1,
+    )
+
+    assert spec.optimizer == OptimizerSettings(
+        name="torch_adamw",
+        lr=2e-4,
+        betas=[0.8, 0.95],
+        eps=1e-6,
+        weight_decay=0.1,
+        fused=False,
+    )
+    assert spec.adam_w_mode is True
+
+
+@pytest.mark.parametrize(
+    "optimizer_type, adam_w_mode, expected",
+    [("AdamW", False, True), ("Adam", False, False), ("Adam", True, True), ("AdamW", True, True)],
+)
+def test_deepspeed_adam_w_mode_matches_deepspeed(optimizer_type, adam_w_mode, expected):
+    spec = TrainingEngineSpec.from_deepspeed_config(
+        {"optimizer": {"type": optimizer_type, "params": {"lr": 1e-4, "adam_w_mode": adam_w_mode}}},
+        dtype="bfloat16",
+        world_size=1,
+    )
+
+    assert spec.adam_w_mode is expected
+
+
+def test_deepspeed_optimizer_requires_lr():
+    with pytest.raises(ValueError, match="must set lr"):
+        TrainingEngineSpec.from_deepspeed_config(
+            {"optimizer": {"type": "AdamW", "params": {"weight_decay": 0.1}}}, dtype="bfloat16", world_size=1
+        )
+
+
 def test_sequence_parallel_must_divide_the_world():
     with pytest.raises(ValueError, match="must be divisible by sp_size"):
         build_deepspeed_config(_spec(world_size=4, sequence_parallel=3))
@@ -188,6 +285,16 @@ def test_optimizer_choice_matches_the_class_built(optimizer, ds_config, fused, e
     choice = optimizer_choice(optimizer, ds_config, fused=fused)
 
     assert (choice["implementation"], choice["reason"]) == expected
+
+
+def test_adam_w_mode_off_selects_adam():
+    choice = optimizer_choice(OptimizerSettings(fused=False), _ZERO2, fused=False, adam_w_mode=False)
+    optimizer = build_training_optimizer(
+        torch.nn.Linear(2, 2), OptimizerSettings(fused=False), _ZERO2, fused=False, adam_w_mode=False
+    )
+
+    assert choice == {"implementation": "torch_adam", "reason": "you disabled AdamW mode, so standard Adam ran"}
+    assert type(optimizer) is torch.optim.Adam
 
 
 def test_optimizer_implementation_rejects_unknown_names():
@@ -367,8 +474,9 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
     sentinel = object()
     calls = {}
 
-    def _build(model, optimizer, ds_config, *, fused):
+    def _build(model, optimizer, ds_config, *, fused, adam_w_mode):
         calls["fused"] = fused
+        calls["adam_w_mode"] = adam_w_mode
         return sentinel
 
     def _initialize(*, model, config, **kwargs):
@@ -399,6 +507,7 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
     assert optimizer is sentinel
     assert choice["implementation"] == "fused_adam"
     assert calls["fused"] is True
+    assert calls["adam_w_mode"] is True
     assert calls["kwargs"] == {"optimizer": sentinel, "mpu": mpu}
 
 
@@ -424,6 +533,32 @@ def test_initialize_without_an_optimizer_omits_it_and_the_mpu(monkeypatch):
 
     assert (engine, optimizer, choice) == ("engine", None, None)
     assert calls["kwargs"] == {}
+
+
+def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeypatch):
+    calls = {}
+
+    def _initialize(*, model, config, **kwargs):
+        calls["model"] = model
+        calls["kwargs"] = kwargs
+        return "engine", "optimizer", None, None
+
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    monkeypatch.setattr("deepspeed.initialize", _initialize)
+    model = torch.nn.Linear(1, 1)
+
+    engine, optimizer, choice = initialize_training_engine(
+        model,
+        {"optimizer": {"type": "AdamW"}},
+        optimizer=None,
+        ep_size=1,
+        mpu=None,
+        model_path="unused",
+        rank=0,
+    )
+
+    assert (engine, optimizer, choice) == ("engine", "optimizer", None)
+    assert list(calls["kwargs"]["model_parameters"]) == list(model.parameters())
 
 
 def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monkeypatch):
