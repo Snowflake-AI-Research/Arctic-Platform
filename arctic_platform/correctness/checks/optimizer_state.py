@@ -41,6 +41,8 @@ from arctic_platform.correctness.harness.optimizer import (
 )
 from arctic_platform.correctness.harness.optimizer import validate_optimizer_participation
 
+from .fwd_bwd import _without_absent_bypassed_tower
+
 
 @dataclass(frozen=True)
 class StateDelta:
@@ -242,14 +244,17 @@ def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> Optim
     """Compare scalar norms by absolute difference, including zero and near-zero values without exemptions.
 
     Names and shapes must align exactly; even unmatched zero vision tensors remain coverage failures. All summaries
-    must carry the versioned step-one state coverage metadata, and every norm must be finite and nonnegative.
+    must carry the versioned step-one state coverage metadata, and every norm must be finite and nonnegative. The
+    participation inventories are compared as the gradient check compares them: a reference vision tower that a
+    text-only target does not build is dropped only when every one of its parameters is an uncalled bypass.
     """
     dss = _validate_optimizer_norm_summary(dss_summary)
     reference = _validate_optimizer_norm_summary(reference_summary)
     validate_optimizer_participation(dss_summary, backend="dss")
     validate_optimizer_participation(reference_summary, backend="reference")
     if dss_summary.get("participation") is not None or reference_summary.get("participation") is not None:
-        compare_participation(dss_summary.get("participation"), reference_summary.get("participation"))
+        target = dss_summary.get("participation")
+        compare_participation(target, _without_absent_bypassed_tower(reference_summary.get("participation"), target))
     deltas = []
     for name in sorted(set(dss) & set(reference)):
         if dss[name]["shape"] != reference[name]["shape"]:

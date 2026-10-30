@@ -1966,6 +1966,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "learning_rate": OPTIMIZER_LEARNING_RATE,
                 "gradient_clipping": config.training.get("gradient_clipping"),
                 "dtype": config.optimizer_dtype,
+                "compute_dtype": config.optimizer_compute_dtype(str(args.optimizer_model_path)),
             }
             if (
                 recipe.get("model") != expected_model

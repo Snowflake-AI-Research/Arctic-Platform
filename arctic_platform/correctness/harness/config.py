@@ -359,6 +359,24 @@ class LoadedConfig:
             )
         return "bfloat16" if master_bf16 else "float32"
 
+    def optimizer_compute_dtype(self, model_path: str) -> str:
+        """Resolve the precision the product's AdamW update is computed in, for the model at ``model_path``.
+
+        FusedAdam and the native CPUAdam kernel load masters and moments into float32, update from the unrounded
+        moments, and round only on store. The PyTorch implementations compute in the storage precision.
+        """
+        from arctic_platform.common.deepspeed_engine import optimizer_implementation
+        from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
+        from arctic_platform.common.optimizer import OptimizerSettings
+        from arctic_platform.model.moe_spec import is_glm_moe_model
+
+        settings = OptimizerSettings.model_validate(self.training["optimizer"])
+        fused = settings.fused if settings.fused is not None else not is_glm_moe_model(model_path)
+        name = resolve_optimizer_name(settings.name, self.training.get("ds_config") or {}, fused=fused)
+        if optimizer_implementation(name, fused=fused) in ("fused_adam", "deepspeed_cpu_adam"):
+            return "float32"
+        return self.optimizer_dtype
+
     @property
     def n_gpus(self) -> int:
         if self.native is not None:

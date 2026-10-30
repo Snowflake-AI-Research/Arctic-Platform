@@ -43063,6 +43063,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
                     "learning_rate": runner.OPTIMIZER_LEARNING_RATE,
                     "gradient_clipping": cfg.training.get("gradient_clipping"),
                     "dtype": cfg.optimizer_dtype,
+                    "compute_dtype": cfg.optimizer_compute_dtype(str(model)),
                 },
             }
             if state.failure == "wrong-inputs":

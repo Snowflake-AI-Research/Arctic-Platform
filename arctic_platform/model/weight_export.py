@@ -21,7 +21,6 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from collections.abc import Iterable
 from collections.abc import Iterator
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
@@ -457,19 +456,6 @@ def save_exported_state_dict(state_dict: dict[str, torch.Tensor], output_dir: st
     from arctic_platform.model.implementations.moe.weights import save_state_dict
 
     save_state_dict(state_dict, Path(output_dir), save_sharded=True)
-
-
-def save_exported_weights(weights: Iterable[tuple[str, torch.Tensor]], output_dir: str) -> None:
-    """Write the files :func:`save_exported_state_dict` writes for ``dict(weights)``, one shard at a time.
-
-    Consumes a stream such as :func:`iter_model_weights` on the master rank, so host memory is bounded by the layer
-    being exported instead of the whole model.
-    """
-    from pathlib import Path
-
-    from arctic_platform.model.implementations.moe.weights import save_state_dict_stream
-
-    save_state_dict_stream(weights, Path(output_dir))
 
 
 def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:

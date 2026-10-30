@@ -541,6 +541,7 @@ def run(
     learning_rate: float | None = None,
     gradient_clipping: float | None = None,
     optimizer_dtype: str = "float32",
+    optimizer_compute_dtype: str | None = None,
     optimizer_output_dir: str | None = None,
 ) -> ReferenceResult:
     """Forward-backward the whole request and return one L2 gradient norm per parameter."""
@@ -594,6 +595,7 @@ def run(
             learning_rate=learning_rate,
             gradient_clipping=gradient_clipping,
             optimizer_dtype=optimizer_dtype,
+            optimizer_compute_dtype=optimizer_compute_dtype,
             output_dir=Path(optimizer_output_dir),
             consume_gradients=True,
             participation=forward.participation,

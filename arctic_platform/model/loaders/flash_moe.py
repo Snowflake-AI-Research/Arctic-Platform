@@ -49,13 +49,11 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
-def _matches(model_type: str):
-    model_types = {model_type, f"{model_type}_text"}
-
+def _matches(family: str):
     def matches(ctx: LoaderContext) -> bool:
         if ctx.spec.parallelism.expert_parallel <= 1:
             return False
-        return ctx.hf_model_type in model_types or ctx.hf_text_model_type in model_types
+        return ctx.hf_model_family == family
 
     return matches
 

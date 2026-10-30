@@ -169,6 +169,7 @@ def run_reference(
     learning_rate: float | None = None,
     gradient_clipping: float | None = None,
     optimizer_dtype: str = "float32",
+    optimizer_compute_dtype: str | None = None,
     optimizer_output_dir: Path | None = None,
     cuda_device: int | None = None,
     deterministic: bool = True,
@@ -224,6 +225,8 @@ def run_reference(
             str(learning_rate),
             "--optimizer-dtype",
             optimizer_dtype,
+            "--optimizer-compute-dtype",
+            optimizer_compute_dtype or optimizer_dtype,
             "--optimizer-output-dir",
             str(optimizer_output_dir),
         ]
@@ -638,6 +641,7 @@ def execute(
             spec.model.cache_path, label="local Cortex reference model"
         ):
             raise ValueError("local optimizer fixture must match the frozen optimizer reference model")
+    optimizer_compute_dtype = cfg.optimizer_compute_dtype(reference_model_path) if stepping else None
     target_model = published_fixture["model_name"] if published_fixture is not None else reference_model_path
     tmp = workdir if workdir is not None else correctness_workdir("dss-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
@@ -879,6 +883,7 @@ def execute(
                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else None,
                 gradient_clipping=cfg.training.get("gradient_clipping"),
                 optimizer_dtype=cfg.optimizer_dtype,
+                optimizer_compute_dtype=optimizer_compute_dtype,
                 optimizer_output_dir=optimizer_output_dir,
                 cuda_device=cuda_device,
                 deterministic=deterministic,
@@ -946,6 +951,7 @@ def execute(
                     "learning_rate": OPTIMIZER_LEARNING_RATE,
                     "gradient_clipping": cfg.training.get("gradient_clipping"),
                     "dtype": cfg.optimizer_dtype,
+                    "compute_dtype": optimizer_compute_dtype,
                 }
                 if stepping
                 else None
