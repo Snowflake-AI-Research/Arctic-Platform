@@ -65,7 +65,9 @@ def test_fused_sparse_gqa_matches_float64_at_least_as_well_as_the_pytorch_path(S
     scale = 1 / math.sqrt(q.shape[-1])
     exact = _run(_reference64, q, k, v, idx, scale, torch.float64)
     fused = _run(fused_sparse_gqa_attention, q, k, v, idx, scale)
-    chunked = _run(lambda *a: _SparseGQAAttention.apply(*a, 128), q, k, v, idx, scale)
+    # The fused kernel rounds the unnormalized probabilities to BF16 before P·V, as vLLM's QSA kernel does; the
+    # fp32_parity reference keeps them in FP32, so it is the BF16-probability reference this is measured against.
+    chunked = _run(lambda *a: _SparseGQAAttention.apply(*a, 128, False), q, k, v, idx, scale)
 
     assert (fused[0][0, 0] == 0).all()
     for name, f, c, e in zip(("out", "dq", "dk", "dv"), fused, chunked, exact):

@@ -154,7 +154,9 @@ def test_bf16_experts_keep_scaling_the_outputs():
     expected = apply_routing_weights(experts(x, counts), scores)
 
     assert type(out.grad_fn).__name__ == "_ApplyRoutingWeightsBackward"
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    # Padding rows past the expert counts are never written by the grouped GEMM.
+    rows = int(counts.sum())
+    torch.testing.assert_close(out[:rows], expected[:rows], rtol=0, atol=0)
 
 
 def test_down_projection_lora_keeps_scaling_the_outputs():
