@@ -131,6 +131,7 @@ from .stats_tracker import scalar
 from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
+from .weighted_logprob_sum import weighted_logprob_sum_loss
 
 __all__ = [
     # pipeline
@@ -217,6 +218,7 @@ __all__ = [
     "cortex_grpo_echo_v1_loss",
     "sft_loss",
     "sft_ce_loss",
+    "weighted_logprob_sum_loss",
     "LOGIT_LOSS_FNS",
     "SFT_LOSS_FNS",
     "run_sft_pipeline",
