@@ -15,7 +15,7 @@
 """GLM-5.3-Flash computes in fp32 where the vLLM sampler does, with bf16 (DeepSpeed-cast) parameters.
 
 Router logits (``moe_router_dtype: float32``; transformers' reference also uses fp32), the mHC remix (vLLM ``mhc_post``:
-fp32, one rounding), the KDA beta gate and Qwen3.8-Flash-Next's context-parallel GatedDeltaNet beta gate (vLLM sigmoids
+fp32, one rounding), the KDA beta gate and Qwen3.8-Flash-Next's GatedDeltaNet beta gate at both SP paths (vLLM sigmoids
 the bf16 logit in fp32), and the router-score gradient through the EP dispatch backward. The forward sites also run
 under bf16 autocast, as DeepSpeed's ``torch_autocast`` does, and keep the transformers rounding with ``fp32_parity`` off.
 """
@@ -188,8 +188,9 @@ def test_glm53_kda_beta_gate_is_an_fp32_sigmoid(tiny_glm_sparse_model, single_ra
         torch_assert_equal(beta.reshape(expected.shape), expected)
 
 
+@pytest.mark.parametrize("autocast", [False, True])
 @pytest.mark.parametrize("fp32_parity", [True, False])
-def test_qwen38_gated_delta_net_beta_is_the_same_at_every_sequence_parallel_size(monkeypatch, fp32_parity):
+def test_qwen38_gated_delta_net_beta_is_the_same_at_every_sequence_parallel_size(monkeypatch, fp32_parity, autocast):
     from transformers.models.qwen4_exp import modeling_qwen4_exp as stock
 
     from arctic_platform.model.implementations.qwen38 import context_parallel as cp
@@ -217,7 +218,7 @@ def test_qwen38_gated_delta_net_beta_is_the_same_at_every_sequence_parallel_size
     fla.modules, modules.conv, fla.ops, ops.gated_delta_rule = modules, conv, ops, rule
     fakes = {"fla": fla, "fla.modules": modules, "fla.modules.conv": conv, "fla.ops": ops}
     hidden_states = torch.randn(1, 8, config.text_config.hidden_size).to(torch.bfloat16)
-    with patch.dict(sys.modules, {**fakes, "fla.ops.gated_delta_rule": rule}), torch.no_grad():
+    with patch.dict(sys.modules, {**fakes, "fla.ops.gated_delta_rule": rule}), torch.no_grad(), _autocast(autocast):
         module(hidden_states)  # sp 1: transformers' stock forward
         cp._adapt_linear_attention(module, None)
         setattr(module, cp._FLA_CP_CONTEXT, object())
