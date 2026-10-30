@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 
 def sum_rows_by_token(rows: torch.Tensor, token_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """Sum the rows belonging to each token in fp32 and round once per token, as vLLM's ``moe_sum`` does.
+    """Sum each token's rows, accumulating 16-bit inputs in fp32 and rounding once, as vLLM's ``moe_sum`` does.
 
     ``token_indices[i]`` names the destination token of ``rows[i]``, and a token appears once per expert holding
     it, so several rows fold onto one destination. ``embedding_bag`` adds each token's rows in the order they
@@ -29,9 +29,11 @@ class _SumRowsByToken(torch.autograd.Function):
     @staticmethod
     def forward(ctx, rows: torch.Tensor, token_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
         ctx.save_for_backward(token_indices)
-        counts = torch.bincount(token_indices, minlength=num_tokens)
         bags = torch.argsort(token_indices, stable=True)
-        return F.embedding_bag(bags, rows, counts.cumsum(0) - counts, mode="sum")
+        tokens = torch.arange(num_tokens, dtype=token_indices.dtype, device=token_indices.device)
+        # Unlike CUDA bincount, fixed-size searchsorted does not read index extrema back to the host.
+        offsets = torch.searchsorted(token_indices.index_select(0, bags), tokens)
+        return F.embedding_bag(bags, rows, offsets, mode="sum")
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
