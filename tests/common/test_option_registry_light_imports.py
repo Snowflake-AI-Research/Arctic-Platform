@@ -55,8 +55,8 @@ from arctic_platform.common import model_options  # noqa: F401
 from arctic_platform.common import option_registry
 from arctic_platform.common import profiles  # noqa: F401
 
-assert len(option_registry.options()) == 23
-assert len(option_registry.profiles()) == 7
+assert len(option_registry.options()) == 24
+assert len(option_registry.profiles()) == 9
 assert option_registry.check_coverage() == []
 loaded = sorted(name for name in sys.modules if name.split(".")[0] in HEAVY)
 assert loaded == [], loaded
