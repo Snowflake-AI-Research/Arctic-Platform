@@ -61513,9 +61513,9 @@ def test_optimizer_compute_dtype_follows_the_resolved_product_implementation(tmp
     assert bf16_cpu_adam.optimizer_dtype == "bfloat16"
     assert bf16_cpu_adam.optimizer_compute_dtype(flash_next) == "float32"
     assert load_config(_optimizer_compute_dtype_FLASH_NEXT_FP32).optimizer_compute_dtype(flash_next) == "float32"
-    bf16_nonfused = load_config(_optimizer_compute_dtype_GLM_BF16)
-    assert bf16_nonfused.optimizer_dtype == "bfloat16"
-    assert bf16_nonfused.optimizer_compute_dtype(glm) == "bfloat16"
+    glm_bf16_cpu_adam = load_config(_optimizer_compute_dtype_GLM_BF16)
+    assert glm_bf16_cpu_adam.optimizer_dtype == "bfloat16"
+    assert glm_bf16_cpu_adam.optimizer_compute_dtype(glm) == "float32"
 
 
 def _optimizer_compute_dtype_bf16_problem():
