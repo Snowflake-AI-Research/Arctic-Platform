@@ -45,7 +45,6 @@ class MoEDeepSpeedAdapter:
 
 
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
-_EXPORT_GATHER_BYTES = 1 << 30
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -176,36 +175,33 @@ def build_iter_full_hf_weights(model: nn.Module):
         return int(index) if index.isdigit() else -1
 
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
-        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
-
-        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
-        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
-        """
+        """Gather checkpoint-only shards into host memory without an all-gather copy on every rank."""
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
-        if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
-            if is_master:
-                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
-                gather_list = list(full.chunk(world, dim=0))
-            else:
-                full = None
-                gather_list = None
-            dist.gather(local, gather_list, dst=0, group=ep_group)
-            return full
-        step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
-        if is_master:
-            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
-            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
-        else:
-            full = None
-            buffer = None
+        step = max(1, (64 * 1024 * 1024) // max(row_bytes * world, 1))
+        step = min(step, max(rows, 1))
+        full = (
+            torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        )
+        buffer = (
+            torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            if is_master and local.device.type != "cpu"
+            else None
+        )
         for start in range(0, rows, step):
-            n = min(step, rows - start)
-            outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
+            count = min(step, rows - start)
+            if buffer is not None:
+                outputs = [buffer[rank, :count] for rank in range(world)]
+            elif full is not None:
+                outputs = [
+                    full[rank * rows + start : rank * rows + start + count] for rank in range(world)
+                ]
+            else:
+                outputs = None
+            dist.gather(local[start : start + count].contiguous(), outputs, dst=0, group=ep_group)
             if full is not None and buffer is not None:
-                for r in range(world):
-                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                for rank in range(world):
+                    full[rank * rows + start : rank * rows + start + count].copy_(buffer[rank, :count])
         return full
 
     def iterator(*, include_skipped: bool = False):
@@ -235,13 +231,17 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
-                    # Only the master consumes the export: gather its EP group's shards straight into one output
-                    # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
+                    # Only the master's EP replica participates; gather its shards into bounded CPU output.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
-                    local = tensor.data.contiguous()
-                    world = dist.get_world_size(group=ep_group)
-                    full = _gather_to_master(local, world, ep_group, is_master)
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        local = tensor.data.contiguous()
+                        full = _gather_to_master(local, dist.get_world_size(group=ep_group), ep_group, is_master)
+                        if is_master:
+                            layer_state[name] = full
+                        del full
+                        continue
+                    full = _gather_ep_weight_to_cpu(tensor, ep_group, is_master=is_master)
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -412,3 +412,54 @@ def load_moe_model(
     )
     maybe_use_fixed_order_row_sum(model, options.model_dump())
     return model
+
+
+def _gather_ep_weight_to_cpu(
+    tensor: torch.Tensor,
+    ep_group,
+    *,
+    is_master: bool,
+    max_gather_bytes: int = 64 * 1024 * 1024,
+) -> torch.Tensor | None:
+    import torch.distributed as dist
+
+    local = tensor.detach().contiguous()
+    ep_size = dist.get_world_size(group=ep_group)
+    if local.ndim == 0:
+        raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
+    if max_gather_bytes < ep_size * local.element_size():
+        raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    full = None
+    if is_master:
+        full = torch.empty(
+            (ep_size * local.shape[0], *local.shape[1:]),
+            dtype=local.dtype,
+            device="cpu",
+        )
+    if local.numel() == 0:
+        return full
+    if ep_size == 1:
+        if full is not None:
+            full.copy_(local)
+        return full
+
+    # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
+    flat = local.view(-1)
+    chunk_elements = min(flat.numel(), max_gather_bytes // (ep_size * local.element_size()))
+    gathered = torch.empty(ep_size * chunk_elements, dtype=local.dtype, device=local.device)
+    full_shards = full.view(ep_size, flat.numel()) if full is not None else None
+    use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
+    for offset in range(0, flat.numel(), chunk_elements):
+        count = min(chunk_elements, flat.numel() - offset)
+        outputs = gathered[: ep_size * count]
+        inputs = flat[offset : offset + count]
+        if use_direct_buffer:
+            # NCCL's list gather allocates another packed output; write into the bounded buffer directly.
+            dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
+        else:
+            dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if full_shards is not None:
+            for rank, shard in enumerate(outputs.view(ep_size, count)):
+                full_shards[rank, offset : offset + count].copy_(shard)
+    return full
