@@ -22,6 +22,7 @@ class DebugModelConfig:
     hidden_size: int | None = None
     intermediate_size: int | None = None
     moe_intermediate_size: int | None = None
+    full_determinism: bool = False
 
 
 @dataclass
@@ -49,6 +50,7 @@ class ModelConfig:
     optimization_dtype: Literal["bfloat16", "float32"] = "float32"
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = False
+    moe_use_sonicmoe: bool = False
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False

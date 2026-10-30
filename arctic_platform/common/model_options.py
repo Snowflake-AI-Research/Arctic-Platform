@@ -119,6 +119,17 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.sonicmoe",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Run BF16 routed experts through SonicMoE on the expert-parallel receive buffer when that kernel applies."
+            " Off keeps the grouped GEMM path."
+        ),
+        source="`loader_options.moe_use_sonicmoe`",
+        registry=registry,
+    )
+    register_option(
         "moe.comm_backend",
         runs_in="trainer",
         goal="speed",
@@ -177,8 +188,8 @@ def register(registry: Registry) -> None:
             " under full activation checkpointing every decoder layer after the first holds the residual as a"
             " second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the"
             " end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on"
-            " Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product and"
-            " output gate in fp32."
+            " Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product, output"
+            " gate and hyper-connection mix and injection in fp32."
         ),
         remove_when="no job needs the residual adds, rotary embedding and beta gate in the input dtype",
         source="`loader_options.fp32_parity`",
@@ -197,6 +208,22 @@ def register(registry: Registry) -> None:
         ),
         remove_when="GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity",
         source="`loader_options.fp32_residual`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.fp32_routed_weighting",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "GLM-5.3-Flash and Qwen3.8-Flash-Next BF16 experts multiply the down projection's fp32 accumulator by the"
+            " routing weight and round once, as vLLM's Triton fused MoE kernel does, instead of rounding the expert"
+            " output and then weighting it. Bit-identical to that kernel where a sampler rank computes whole experts;"
+            " under sampler tensor parallelism each rank rounds its own partial sum. Off by default: it runs one"
+            " fp32-output GEMM per local expert in place of the grouped GEMM, and on H200 the routed experts' forward"
+            " plus backward takes 16-19% longer."
+        ),
+        remove_when="a grouped GEMM with a weighted fp32 epilogue makes it cheap enough to fold into fp32_parity",
+        source="`loader_options.fp32_routed_weighting`",
         registry=registry,
     )
     register_option(
