@@ -252,3 +252,14 @@ def test_glm_spec_rejects_sequence_parallelism(tmp_path):
     checkpoint = _write_config(tmp_path / "glm", {"model_type": "glm_moe_dsa"})
     with pytest.raises(ValueError, match="glm_moe_dsa does not support sequence parallelism"):
         moe_model_spec(model_name=checkpoint, ep_size=8, sp_size=2)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_glm53_uses_the_glm_moe_training_policy(tmp_path, nested):
+    payload = {"model_type": "glm5_next_text"}
+    if nested:
+        payload = {"model_type": "glm5_next", "text_config": payload}
+    checkpoint = _write_config(tmp_path / "glm53", payload)
+
+    assert hf_text_model_type(checkpoint) == "glm5_next_text"
+    assert is_glm_moe_model(checkpoint)
