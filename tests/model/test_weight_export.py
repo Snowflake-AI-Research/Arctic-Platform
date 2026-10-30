@@ -740,7 +740,7 @@ def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
 @pytest.mark.parametrize("rank", [0, 1])
 def test_vllm_ep_export_frees_each_gather_before_the_next(monkeypatch, rank):
     """Every rank all-gathers each expert tensor whole; one gather's buffers must be gone before the next is allocated,
-    and while rank 0 hands its tensors out (GLM-5.3-Flash at EP 32: 4.5 GiB per gather)."""
+    and while rank 0 hands its tensors out."""
     import deepspeed.utils.groups as ds_groups
     from torch.utils._python_dispatch import TorchDispatchMode
 
