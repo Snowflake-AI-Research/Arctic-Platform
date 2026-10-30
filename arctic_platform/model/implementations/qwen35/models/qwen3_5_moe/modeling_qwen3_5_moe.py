@@ -17,10 +17,13 @@ from transformers.utils import TransformersKwargs
 from transformers.utils import logging
 
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
+from arctic_platform.model.implementations.fp8 import make_linear
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNorm as _FusedAddRMSNorm
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32 as _rope_rotary_slice_fp32
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
@@ -252,11 +255,15 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        # Block-FP8 checkpoints quantize these three projections; in_proj_a/b stay BF16.
+        fp8_block_size = getattr(config, "fp8_block_size", None)
+        self.out_proj = make_linear(self.value_dim, self.hidden_size, fp8_block_size=fp8_block_size)
 
         # Input projections
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_qkv = make_linear(
+            self.hidden_size, self.key_dim * 2 + self.value_dim, fp8_block_size=fp8_block_size
+        )
+        self.in_proj_z = make_linear(self.hidden_size, self.value_dim, fp8_block_size=fp8_block_size)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.fp32_parity = config.fp32_parity
@@ -347,10 +354,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             # low-precision ``b`` would round the gate before the kernel reads it.
             beta = b.float().sigmoid() if self.fp32_parity else b.sigmoid()
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-            if self.num_v_heads // self.num_k_heads > 1:
-                replication = self.num_v_heads // self.num_k_heads
-                query = query.repeat_interleave(replication, dim=2)
-                key = key.repeat_interleave(replication, dim=2)
+            query, key = repeat_query_key_for_value_heads(
+                query, key, self.num_k_heads, self.num_v_heads, self._chunk_gated_delta_rule
+            )
             core_attn_out, _ = self._chunk_gated_delta_rule(
                 query,
                 key,
@@ -387,6 +393,7 @@ class Qwen3_5MoeGatedAttentionConfig:
     attention_bias: bool = False
     attention_dropout: float = 0.0
     fp32_parity: bool = True
+    fp8_block_size: int | None = None
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -411,14 +418,11 @@ class Qwen3_5MoeGatedAttentionBase(nn.Module):
         self.attention_dropout = config.attention_dropout
 
         # Q projects 2x: query + gate
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim * 2, bias=config.attention_bias)
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        linear = functools.partial(make_linear, bias=config.attention_bias, fp8_block_size=config.fp8_block_size)
+        self.q_proj = linear(config.hidden_size, self.num_heads * self.head_dim * 2)
+        self.k_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.v_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.o_proj = linear(self.num_heads * self.head_dim, config.hidden_size)
 
         # QK normalization with (1+weight) parameterization
         self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -624,6 +628,7 @@ def _get_gated_attention(config: Qwen3_5MoeConfig) -> nn.Module:
         attention_bias=config.attention_bias,
         attention_dropout=config.attention_dropout,
         fp32_parity=config.fp32_parity,
+        fp8_block_size=getattr(config, "fp8_block_size", None),
     )
 
     attn_impl = config._attn_implementation
@@ -681,11 +686,16 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             top_k=config.num_experts_per_tok,
             use_grouped_mm=config.use_grouped_mm,
             load_balance_coeff=config.load_balance_coeff,
+            fp8_block_size=getattr(config, "fp8_block_size", None),
         )
         self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
 
         # Separate gated shared expert
-        self.shared_expert = FeedForward(dim=config.hidden_size, hidden_dim=config.shared_expert_intermediate_size)
+        self.shared_expert = FeedForward(
+            dim=config.hidden_size,
+            hidden_dim=config.shared_expert_intermediate_size,
+            fp8_block_size=getattr(config, "fp8_block_size", None),
+        )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
         # Layer norms with (1+weight) parameterization
@@ -1015,6 +1025,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self._is_vlm = hasattr(config, "vision_config")
+        # Fine-grained FP8 checkpoints keep their e4m3 weights and FP32 block scales: the text layers read
+        # ``fp8_block_size`` and build block-FP8 projections and experts for the modules the checkpoint quantizes.
+        fp8_block_size = fp8_weight_block_size(config)
+        if getattr(config, "quantization_config", None) and fp8_block_size is None:
+            raise NotImplementedError("Qwen3.5-MoE training only supports BF16 or fine-grained FP8 checkpoints")
+        (config.text_config if self._is_vlm else config).fp8_block_size = fp8_block_size
 
         if self._is_vlm:
             self.model = Qwen3_5MoeVLMModel(config)
