@@ -119,6 +119,17 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.sonicmoe",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Run BF16 routed experts through SonicMoE on the expert-parallel receive buffer when that kernel applies."
+            " Off keeps the grouped GEMM path."
+        ),
+        source="`loader_options.moe_use_sonicmoe`",
+        registry=registry,
+    )
+    register_option(
         "moe.comm_backend",
         runs_in="trainer",
         goal="speed",

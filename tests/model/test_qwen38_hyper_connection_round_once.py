@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from arctic_platform.model.implementations.qwen38 import hyper_connections as hc
+from arctic_platform.model.implementations.qwen38 import hyper_connection as hc
 from arctic_platform.testing_utils import require_torch_gpu
 
 HC, HIDDEN, TOKENS = 4, 640, 300

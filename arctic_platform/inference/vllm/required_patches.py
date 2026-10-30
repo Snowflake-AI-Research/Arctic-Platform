@@ -21,6 +21,7 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.deepseek_v41_lora import ensure_deepseek_v41_lora
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
     from arctic_platform.inference.vllm.glm5next_indexer_page import apply_glm5next_indexer_page_fix
+    from arctic_platform.inference.vllm.glm5next_lora import ensure_glm5next_lora
     from arctic_platform.inference.vllm.hybrid_state_fixes import apply_hybrid_state_fixes
     from arctic_platform.inference.vllm.kv_group_size import ensure_kv_group_size_patch
     from arctic_platform.inference.vllm.mamba_completion_refresh import ensure_mamba_completion_refresh
@@ -37,6 +38,7 @@ def apply_required_vllm_patches() -> None:
     # Drop with glm5next_indexer_page.py once the pinned vLLM contains
     # https://github.com/vllm-project/vllm/pull/57169.
     apply_glm5next_indexer_page_fix()
+    ensure_glm5next_lora()
     ensure_kv_group_size_patch()
     ensure_dflash_max_position_patch()
     ensure_mrope_yarn_fix()

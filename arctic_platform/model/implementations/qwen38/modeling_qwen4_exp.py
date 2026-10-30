@@ -40,7 +40,7 @@ from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
-from . import hyper_connections
+from . import hyper_connection
 from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
 from .converting_qwen4_exp import convert_prime_layer_to_hf
@@ -283,19 +283,36 @@ class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
         normed = self.hc_norm(hyper_input)
         down = self.input_mix_weight_down(normed)
         gate = self.input_mix_weight_up(F.silu(down.float() / self.hc_count).to(down.dtype))
-        mixed = hyper_connections.gate_mix(normed, gate, self.hc_count)
+        mixed = hyper_connection.gate_mix(normed, gate, self.hc_count)
         if self.block_inject_weight is None:
             return mixed
         return mixed, hyper_input, self.block_inject_weight(normed)
 
     def combine(self, hyper_input: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor):
-        return hyper_connections.combine(hyper_input, block_output, injection_logits, self.hc_count)
+        return hyper_connection.combine(hyper_input, block_output, injection_logits, self.hc_count)
 
 
-def _combine(hyper_connection: nn.Module, hyper_input: Tensor, block_output: Tensor, injection: Tensor) -> Tensor:
-    if isinstance(hyper_connection, Qwen4ExpTextGatedResidualPrimeRL):
-        return hyper_connection.combine(hyper_input, block_output, injection)
-    return hyper_input + (block_output.unsqueeze(-2) * injection.unsqueeze(-1)).flatten(-2)
+def _mix_streams(module, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``(mixed, hyper_input, injection)`` of the module's forward, fused when the module allows."""
+    if hyper_connection.fused_hyper_connection_supported(module, hidden_states):
+        round_once = isinstance(module, Qwen4ExpTextGatedResidualPrimeRL)
+        mixed, injection = hyper_connection.gated_residual(module, hidden_states, round_once=round_once)
+        return mixed, hidden_states, injection
+    return module(hidden_states)
+
+
+def _inject(hyper_input: Tensor, block_output: Tensor, injection_weights: Tensor) -> Tensor:
+    hc = injection_weights.shape[-1]
+    if hyper_input.is_cuda and hyper_input.dtype == torch.bfloat16 and hc & (hc - 1) == 0:
+        return hyper_connection.inject(hyper_input, block_output, injection_weights)
+    injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    return hyper_input + injection.flatten(-2)
+
+
+def _combine(module, hyper_input: Tensor, block_output: Tensor, injection: Tensor) -> Tensor:
+    if isinstance(module, Qwen4ExpTextGatedResidualPrimeRL):
+        return module.combine(hyper_input, block_output, injection)
+    return _inject(hyper_input, block_output, injection)
 
 
 class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
@@ -320,7 +337,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
                 position_ids=ple_position_ids,
             )
 
-        hidden_states, hyper_input, injection = self.attn_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = _mix_streams(self.attn_hyper_connection, hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
@@ -336,7 +353,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
 
         hidden_states = _combine(self.attn_hyper_connection, hyper_input, hidden_states, injection)
 
-        hidden_states, hyper_input, injection = self.mlp_hyper_connection(hidden_states)
+        hidden_states, hyper_input, injection = _mix_streams(self.mlp_hyper_connection, hidden_states)
         routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
         hidden_states = self.mlp(hidden_states, routed_experts=routes)
 
