@@ -151,14 +151,14 @@ class TestKlPenalty(TestCasePlus):
         # more than k3 ~ x^2 / 2 itself near x = 0, and comes out negative.
         log_ratio = torch.tensor([-1e-3, -1e-4, -1e-7, 0.0, 1e-7, 1e-4, 1e-3])
         expected = torch.expm1(log_ratio.double()) - log_ratio.double()
-        one_step = log_ratio.double().abs() * 2.0**-23
+        tolerance = log_ratio.double().abs() * 2.0**-23
         for name, k3 in (
             ("sampler_kl", _sampler_kl(log_ratio, "k3", 5.0)),
             ("kl_penalty", kl_penalty(torch.zeros_like(log_ratio), log_ratio, "k3")),
         ):
             with self.subTest(name=name):
                 self.assertTrue((k3 >= 0).all(), k3)
-                self.assertTrue(((k3.double() - expected).abs() <= one_step).all(), k3.double() - expected)
+                self.assertTrue(((k3.double() - expected).abs() <= tolerance).all(), k3.double() - expected)
 
     def test_identical_policies_give_zero_kl(self):
         logp = torch.tensor([-1.0, -2.0, -3.0])
