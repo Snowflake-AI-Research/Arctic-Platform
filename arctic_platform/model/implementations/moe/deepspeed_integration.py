@@ -149,6 +149,33 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
+    """Gather an EP-sharded tensor to rank 0's host memory with one GPU piece buffer per rank."""
+    import torch.distributed as dist
+
+    ranks = dist.get_process_group_ranks(ep_group)
+    if 0 not in ranks:
+        return None
+    is_master = dist.get_rank() == 0
+    world, rows = dist.get_world_size(group=ep_group), local.shape[0]
+    pieces = local.tensor_split(world)
+    full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+    received = torch.empty_like(pieces[0])
+    start = 0
+    for piece in pieces:
+        for group_rank, rank in enumerate(ranks):
+            if rank == 0:
+                if full is not None:
+                    full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
+                continue
+            buffer = piece if dist.get_rank() == rank else received[: len(piece)]
+            dist.broadcast(buffer, src=rank, group=ep_group)
+            if full is not None:
+                full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
+        start += len(piece)
+    return full
+
+
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
     if getattr(model_type, "convert_layer_to_hf", None) is None:
@@ -182,7 +209,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             for parameter in module.parameters(recurse=False)
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
                 getattr(tensor, "_dss_skip_weight_sync", False)
                 or id(tensor) in skipped_parameter_ids
@@ -199,6 +226,13 @@ def build_iter_full_hf_weights(model: nn.Module):
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     local = tensor.data.contiguous()
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
+                        full = _gather_ep_shards_to_rank0_host(local, ep_group)
+                        if is_master:
+                            layer_state[name] = full
+                        del full
+                        continue
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
                     dist.all_gather(shards, local, group=ep_group)
                     if is_master:
