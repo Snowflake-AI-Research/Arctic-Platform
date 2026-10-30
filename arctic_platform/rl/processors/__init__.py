@@ -36,6 +36,9 @@ from .cortex_grpo import cortex_grpo_loss
 from .cortex_grpo import cortex_grpo_mixed_v1_loss
 from .dflash2 import DFlash2Loss
 
+# Native preference objective
+from .dpo import DPOLoss
+
 # Functional math
 from .functional import _compute_sequence_level_ratio_and_advantages
 from .functional import agg_loss
@@ -137,6 +140,7 @@ __all__ = [
     "POST_PROCESSORS",
     "LOSS_FNS",
     "BaseLoss",
+    "DPOLoss",
     "prepare_request_loss",
     "REQUIRES_ALIGNED_TOKEN_LOGPROBS",
     "REQUIRES_TOKEN_LOGPROBS",

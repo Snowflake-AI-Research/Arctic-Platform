@@ -66,6 +66,7 @@ from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
 from arctic_platform.common.utils.batch import META_FWD_SCALAR_KEYS
 from arctic_platform.common.utils.batch import _reject_meta_fwd_scalars_on_batch
+from arctic_platform.common.utils.batch import flatten_batch_rows
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
@@ -73,6 +74,7 @@ from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 
+from .base_loss import USES_TOKEN_BUDGET_PIPELINE
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
@@ -415,6 +417,8 @@ def run_pipeline(
         Set to ``"loss_only"`` to compute the loss in train mode and return
         the raw loss tensor (requires_grad=True) without calling backward —
         the caller is responsible for scaling and calling engine.backward().
+        Set to ``"summed"`` to reduce all packed-window losses and call backward
+        once at the final accumulation boundary. Window graphs stay live until then.
     pack
         If *True* (default), automatically handle sequence packing for flash
         attention: splits the input into microbatches by token budget, packs
@@ -442,8 +446,8 @@ def run_pipeline(
     -------
     dict
         ``{"avg_loss": float, "metrics": dict}`` when a loss function ran.
-        A loss path also includes ``"batch"`` when the class-controlled output
-        callback leaves model outputs to return. The base callback removes raw
+        A loss path also includes ``"batch"``; it is empty when the
+        class-controlled output callback removes all model outputs. The base callback removes raw
         logits; class losses may additionally remove objective-only outputs or
         explicitly override that default when logits are part of their API.
         ``{"batch": dict, "metrics": {}}`` when no loss function (forward-
@@ -627,7 +631,11 @@ def run_pipeline(
         loss_object.output_callback(model_outputs)
         batch = dict(model_outputs)
 
-        if backward is True:
+        if backward is True or backward == "summed":
+            if backward == "summed":
+                loss_object.backward_validation_callback(loss)
+                if hasattr(engine, "set_gradient_accumulation_boundary"):
+                    engine.set_gradient_accumulation_boundary(True)
 
             prof_bwd = ProfilerContext(type=PROFILER_TYPE, name="BWD")
             tname = timers.start(f"pipe bwd {rank}")
@@ -652,8 +660,9 @@ def run_pipeline(
             "avg_loss": loss.detach().cpu().item(),
             "metrics": metrics,
         }
-        if batch:
-            result["batch"] = batch
+        # Replace the posts' saved response even when the loss removed all
+        # outputs; otherwise the cached post batch bypasses output_callback.
+        result["batch"] = batch
         see_memory_usage("after bwd", force=True)
 
         if backward == "loss_only":
@@ -711,6 +720,9 @@ def _run_pipeline_with_packing(
     from .packing import pack_sequences
     from .packing import unpack_sequences
 
+    if backward is True and loss_object is not None and loss_object.has_capability(USES_TOKEN_BUDGET_PIPELINE):
+        backward = "summed"
+
     # Combine for splitting — meta tensors are split the same way as batch
     all_input = {**meta, **batch}  # batch takes priority on key collision
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
@@ -729,8 +741,11 @@ def _run_pipeline_with_packing(
     captured_metrics: list[dict] = []
     collected_batch: dict[str, list[torch.Tensor]] = {}
 
-    for i, mb in enumerate(mb_list.mbs):
-        packed = pack_sequences(mb)
+    scheduled_mbs = mb_list.mbs + [mb_list.mbs[-1]] * mb_list.padding_count
+    for i, mb in enumerate(scheduled_mbs):
+        is_padding = i >= n_mbs
+        batch_shape = mb["attention_mask"].shape[:-1]
+        packed = pack_sequences(flatten_batch_rows(mb))
         pack_meta = packed.pop("_pack_meta")
 
         # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
@@ -755,9 +770,9 @@ def _run_pipeline_with_packing(
             mb_kwargs["position_ids"] = packed["position_ids"]
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
-            engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
+            engine.set_gradient_accumulation_boundary(i == len(scheduled_mbs) - 1)
 
-        inner_backward = "loss_only" if backward is True else backward
+        inner_backward = "loss_only" if backward is True or backward == "summed" else backward
         result = run_pipeline(
             engine,
             args,
@@ -772,24 +787,28 @@ def _run_pipeline_with_packing(
             loss_object=loss_object,
         )
 
+        loss_tensor = result.pop("loss_tensor", None)
+        if loss_tensor is not None:
+            scaled = apply_packed_loss_reduction(
+                engine,
+                loss_tensor,
+                0.0 if is_padding else reduction.loss_scales[i],
+                backward=backward,
+            )
+            if scaled is not None:
+                captured_loss_tensors.append(scaled)
+        if is_padding:
+            continue
+
         if "avg_loss" in result:
             captured_losses.append(result["avg_loss"])
-            loss_tensor = result.pop("loss_tensor", None)
-            if loss_tensor is not None:
-                scaled = apply_packed_loss_reduction(
-                    engine,
-                    loss_tensor,
-                    reduction.loss_scales[i],
-                    backward=backward,
-                )
-                if scaled is not None:
-                    captured_loss_tensors.append(scaled)
             captured_metrics.append(result.get("metrics") or {})
 
         for k, v in result.get("batch", {}).items():
             if torch.is_tensor(v):
                 v_1d = v.squeeze(0) if v.ndim == 2 and v.shape[0] == 1 else v
                 unpacked = unpack_sequences(v_1d, pack_meta)
+                unpacked = unpacked.reshape(*batch_shape, *unpacked.shape[1:])
                 collected_batch.setdefault(k, []).append(unpacked)
 
     # Restore original sequence order if microbatches were reordered
@@ -807,10 +826,16 @@ def _run_pipeline_with_packing(
         avg_loss = combine_packed_losses(captured_losses, reduction)
         averaged_metrics = combine_packed_metrics(captured_metrics, reduction.reporting_weights)
         result = {"avg_loss": avg_loss, "metrics": averaged_metrics}
-        if batch_out:
-            result["batch"] = detensorize(batch_out)
-        if backward == "loss_only" and captured_loss_tensors:
-            result["loss_tensor"] = sum(captured_loss_tensors)
+        result["batch"] = detensorize(batch_out)
+        if backward in ("loss_only", "summed") and captured_loss_tensors:
+            loss_tensor = sum(captured_loss_tensors)
+            loss_object.backward_validation_callback(loss_tensor)
+            if backward == "summed":
+                if hasattr(engine, "set_gradient_accumulation_boundary"):
+                    engine.set_gradient_accumulation_boundary(True)
+                engine.backward(loss_tensor, scale_wrt_gas=False)
+            else:
+                result["loss_tensor"] = loss_tensor
         return result
 
     return {"batch": detensorize(batch_out), "metrics": {}}
