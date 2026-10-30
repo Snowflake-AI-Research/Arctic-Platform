@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.zero_offload_window import patch_zero2_offload_boundary_window
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
@@ -191,6 +192,7 @@ def initialize_training_engine(
         )
     import deepspeed
 
+    patch_zero2_offload_boundary_window()
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
         engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
