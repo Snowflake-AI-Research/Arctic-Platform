@@ -38,8 +38,9 @@ class FlashMoeOptions(GenericMoeOptions):
         True,
         description=(
             "Round once where vLLM does: GLM-5.3-Flash's RMSNorms multiply the weight in fp32 before rounding, and "
-            "Qwen3.8-Flash-Next's QSA rotary embedding, softmax probabilities, P·V product and output gate run in "
-            "fp32. False keeps the transformers order, which rounds each of them to the input dtype."
+            "Qwen3.8-Flash-Next's QSA rotary embedding, softmax probabilities, P·V product, output gate and "
+            "hyper-connection mix and injection run in fp32. False keeps the transformers order, which rounds each of "
+            "them to the input dtype."
         ),
     )
 

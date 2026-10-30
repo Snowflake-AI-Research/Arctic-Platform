@@ -22,6 +22,10 @@ The vLLM stat logger lives in the engine process. Because each
 ``InferenceWorker`` Ray actor runs its own engine (and process), the
 collector is a process-singleton — the stat logger and the worker share the
 same instance via :func:`get_collector`.
+
+:class:`EngineTotals` accumulates speculative-decoding and preemption counters on every
+iteration, before snapshot thinning; ``drain()`` never resets them, so consumers difference
+totals within one ``started_at`` epoch to measure an interval.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import bisect
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -67,6 +71,17 @@ class RequestRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class EngineTotals:
+    """Lifetime counters; started_at distinguishes worker restarts."""
+
+    started_at: float = field(default_factory=time.time)
+    num_preempted_reqs: int = 0
+    num_drafts: int = 0
+    num_draft_tokens: int = 0
+    num_accepted_tokens: int = 0
 
 
 @dataclass
@@ -144,9 +159,10 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
-        # Speculative-decoding counters since engine start, summed over every step
+        # Lifetime counters since engine start, summed over every step.
+        # Speculative-decoding fields are also exposed via spec_decoding_totals().
         self._spec_lock = threading.Lock()
-        self._spec_totals = {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
+        self._totals = EngineTotals()
 
     def set_replica_id(self, replica_id: int) -> None:
         self.replica_id = replica_id
@@ -156,14 +172,17 @@ class WorkerMetricsCollector:
         scheduler_stats: SchedulerStats | None,
         iteration_stats: IterationStats | None,
     ) -> None:
+        if iteration_stats is not None:
+            with self._spec_lock:
+                self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
         spec = scheduler_stats.spec_decoding_stats
         if spec is not None:
             with self._spec_lock:
-                self._spec_totals["num_drafts"] += spec.num_drafts
-                self._spec_totals["num_draft_tokens"] += spec.num_draft_tokens
-                self._spec_totals["num_accepted_tokens"] += spec.num_accepted_tokens
+                self._totals.num_drafts += spec.num_drafts
+                self._totals.num_draft_tokens += spec.num_draft_tokens
+                self._totals.num_accepted_tokens += spec.num_accepted_tokens
         now = time.time()
         if (
             self.min_interval_s > 0
@@ -200,6 +219,10 @@ class WorkerMetricsCollector:
             num_tokens_in_step=int(tokens_in_step),
         ))
 
+    def totals(self) -> dict[str, Any]:
+        with self._spec_lock:
+            return asdict(self._totals)
+
     def drain_snapshots(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._snapshots.drain()]
 
@@ -210,7 +233,11 @@ class WorkerMetricsCollector:
         ``1 + d(num_accepted_tokens) / d(num_drafts)`` between two reads.
         """
         with self._spec_lock:
-            return dict(self._spec_totals)
+            return {
+                "num_drafts": self._totals.num_drafts,
+                "num_draft_tokens": self._totals.num_draft_tokens,
+                "num_accepted_tokens": self._totals.num_accepted_tokens,
+            }
 
     def latest(self) -> dict[str, Any]:
         """Return the latest scheduler stats without draining the ring.
