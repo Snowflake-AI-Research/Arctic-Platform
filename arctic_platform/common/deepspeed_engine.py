@@ -57,7 +57,9 @@ class TrainingEngineSpec(BaseModel):
 
     ``fp32_masters`` and ``zero_bucket_size`` come from the caller's job config.
     ``ds_overrides`` is shallow-merged last, matching a client DeepSpeed
-    override block.
+    override block. The ``bf16`` and ``fp16`` blocks are the one exception:
+    keys the override omits keep their resolved value, because a block that
+    only says ``{"enabled": true}`` is not a request for fp32 masters.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -113,7 +115,9 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["reduce_bucket_size"] = spec.zero_bucket_size
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
+        resolved_precision = {"bf16": ds_config["bf16"], "fp16": ds_config["fp16"]}
         ds_config.update(spec.ds_overrides)
+        _keep_unstated_precision_keys(ds_config, resolved_precision)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -314,6 +318,42 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     if not isinstance(zero_config, dict):
         return False
     return bool(zero_config.get("offload_optimizer"))
+
+
+def _keep_unstated_precision_keys(ds_config: dict[str, Any], resolved: dict[str, dict[str, Any]]) -> None:
+    """Put back precision keys a client block replaced rather than set.
+
+    The client override is a shallow merge, so a block as small as
+    ``{"bf16": {"enabled": true}}`` replaces the whole resolved ``bf16``
+    sub-dict and takes ``bf16_master_weights_and_grads`` and
+    ``bf16_optimizer_states`` with it. DeepSpeed then falls back to fp32
+    master weights and fp32 optimizer moments, which is both a different
+    update rule from the fused path and, under
+    ``zero_optimization.offload_optimizer``, 16 bytes per parameter of host
+    memory (4 master + 4 grad + 8 moments) instead of 8 -- enough to exhaust
+    a zone's host memory on a 27B model before the first step.
+
+    Omitting a key is not a request for the DeepSpeed default, so it keeps
+    the value resolved from ``dtype`` and ``fp32_masters``. A key the client
+    states wins, ``false`` included; ``fp32_masters`` is the supported way to
+    ask for fp32 masters.
+    """
+    for block_name, resolved_block in resolved.items():
+        client_block = ds_config.get(block_name)
+        if client_block is resolved_block or not isinstance(client_block, dict):
+            continue
+        unstated = [key for key in resolved_block if key not in client_block]
+        if not unstated:
+            continue
+        # Copy: the merge aliased the caller's override dict into ds_config.
+        merged = dict(client_block)
+        merged.update({key: resolved_block[key] for key in unstated})
+        ds_config[block_name] = merged
+        logger.info(
+            "Kept resolved %s keys the training_config.ds_config override did not state: %s",
+            block_name,
+            ", ".join(f"{key}={resolved_block[key]}" for key in unstated),
+        )
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
