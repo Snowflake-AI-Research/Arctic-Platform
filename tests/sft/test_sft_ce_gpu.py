@@ -28,6 +28,7 @@ import sys
 import pytest
 import torch
 
+from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.sft.processor import sft_ce_sum_from_hidden
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -88,6 +89,45 @@ class TestParseStepMetrics(TestCasePlus):
         out = "loading loss=9.9\nstep 1/1 loss=abc grad_norm=2.0\nblah"
         # "loading …" lacks "step "; the malformed-loss step line is dropped whole.
         self.assertEqual(_parse_step_metrics(out), ([], []))
+
+
+@require_torch_gpu
+class TestChunkedHFCausalLossGPU(TestCasePlus):
+    def test_masked_loss_and_gradient_match_hf(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        for dtype in (torch.float32, torch.bfloat16):
+            base = torch.randn(2, 257, 4096, device="cuda", dtype=dtype)
+            labels = torch.randint(0, 4096, (2, 257), device="cuda")
+            labels[:, ::3] = -100
+            original = base.clone().requires_grad_(True)
+            candidate = base.clone().requires_grad_(True)
+            expected = ForCausalLMLoss(original, labels, 4096)
+            actual = chunked_causal_lm_loss(candidate, labels, 4096, chunk_rows=31)
+            expected.backward()
+            actual.backward()
+            torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+            torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
+            torch_assert_close(candidate.grad.float().norm(), original.grad.float().norm(), rtol=0, atol=1e-6)
+
+    def test_explicit_shift_and_fractional_denominator(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(41)
+        original = torch.randn(2, 17, 4096, device="cuda", requires_grad=True)
+        candidate = original.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, 4096, (2, 17), device="cpu")
+        shifted = labels.clone()
+        shifted[:, ::3] = -100
+        options = {"num_items_in_batch": torch.tensor(0.5), "shift_labels": shifted}
+        expected = ForCausalLMLoss(original, labels, 4096, **options)
+        actual = chunked_causal_lm_loss(candidate, labels, 4096, chunk_rows=7, **options)
+        (expected * 0.7).backward()
+        (actual * 0.7).backward()
+        # Chunk summation changes only fp32 reduction ordering of the scalar.
+        torch_assert_close(actual, expected, rtol=0, atol=1e-4)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
 
 
 @require_torch_gpu
