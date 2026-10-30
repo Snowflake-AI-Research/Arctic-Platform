@@ -271,14 +271,20 @@ def _unfused_causal_conv1d_module(global_cu_seqlens):
 
 
 def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution):
+    import runpy
     import sys
     from datetime import timedelta
+    from pathlib import Path
     from unittest.mock import patch
 
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
-    from tests.model.conftest import build_tiny_glm_sparse_model
+
+    # Load by filename: an installed tests package can shadow this checkout in spawned workers.
+    build_tiny_glm_sparse_model = runpy.run_path(str(Path(__file__).with_name("conftest.py")))[
+        "build_tiny_glm_sparse_model"
+    ]
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
