@@ -30,6 +30,9 @@ import typing
 import pytest
 from pydantic import BaseModel
 
+from arctic_platform.common.model_options import LOADER_FIELD_OVERRIDES
+from arctic_platform.common.model_options import LOADER_OPTION_FIELDS
+from arctic_platform.common.model_options import loader_option_field
 from arctic_platform.common.option_registry import SUPPORTS
 from arctic_platform.common.option_registry import options
 from arctic_platform.common.option_registry import profiles
@@ -68,43 +71,6 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "compile.fullgraph": "patches.compile.fullgraph",
     "peft": "patches.peft",
     "zorro_train": "patches.zorro_train",
-}
-
-# For the custom loaders: a field path under the loader's options model (``ModelSpec.loader_options``), or a
-# ``ModelSpec.``-prefixed path for a ``ModelSpec`` field the loader accepts. None: no loader-side name.
-LOADER_OPTION_FIELDS: dict[str, str | None] = {
-    "checkpointing.mode": "ac_config.mode",
-    "checkpointing.freq": "ac_config.freq",
-    "checkpointing.targets": "ac_config.targets",
-    "checkpointing.offload": "ac_config.offload_config",
-    "tiled_mlp.token_chunk_size": "tiled_mlp_token_chunk_size",
-    "lm_head.fp32": "fp32_lm_head",
-    "lm_head.token_chunk_size": "fused_lm_head_token_chunk_size",
-    "lm_head.vocab_chunk_size": None,
-    "lm_head.cross_entropy": "fused_cross_entropy",
-    "liger": None,
-    "moe.grouped_mm": "moe_use_grouped_mm",
-    "moe.sonicmoe": "moe_use_sonicmoe",
-    "moe.comm_backend": "ep_comm_backend",
-    "moe.comm_sms": "deepep_num_sms",
-    "moe.comm_token_chunk": "deepep_token_chunk_size",
-    "attention.backend": "ModelSpec.attn_implementation",
-    "attention.sparse_mla": "sparse_mla_backend",
-    "numerics.reduce_dtype": "reduce_dtype",
-    "numerics.fp32_parity": "fp32_parity",
-    "numerics.fp32_residual": None,
-    "numerics.fp32_routed_weighting": "fp32_routed_weighting",
-    "numerics.optimization_dtype": "ModelSpec.dtype",
-    "compile.fullgraph": None,
-    "peft": None,
-    "zorro_train": None,
-}
-
-
-# Per-loader entries that differ from ``LOADER_OPTION_FIELDS``. ``glm5_next`` picks its sparse MLA kernel through
-# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend.
-LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
-    "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
 }
 
 _MODEL_SPEC_PREFIX = "ModelSpec."
@@ -146,7 +112,7 @@ def _mapped_field_exists(name: str, key: str) -> bool:
     """Whether the loader-side name that ``key`` maps to exists for loader ``name``."""
     if name == HUGGINGFACE:
         return _huggingface_field_exists(HUGGINGFACE_FIELDS[key])
-    path = LOADER_FIELD_OVERRIDES.get(name, {}).get(key, LOADER_OPTION_FIELDS[key])
+    path = loader_option_field(name, key)
     if path is not None and path.startswith(_MODEL_SPEC_PREFIX):
         return _field_exists(ModelSpec, path.removeprefix(_MODEL_SPEC_PREFIX))
     return _field_exists(loader_mod._LOADERS[name].options, path)
@@ -155,7 +121,7 @@ def _mapped_field_exists(name: str, key: str) -> bool:
 def _mapped_path(name: str, key: str) -> str | None:
     if name == HUGGINGFACE:
         return HUGGINGFACE_FIELDS[key]
-    return LOADER_FIELD_OVERRIDES.get(name, {}).get(key, LOADER_OPTION_FIELDS[key])
+    return loader_option_field(name, key)
 
 
 def test_mapping_tables_cover_every_key():
