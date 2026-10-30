@@ -90,6 +90,14 @@ def _pack_sparse_mla(layer_sd: dict, prefix: str) -> None:
     _fuse(
         layer_sd,
         [
+            f"{attn}.q_a_proj.weight_scale_inv",
+            f"{attn}.kv_a_proj_with_mqa.weight_scale_inv",
+        ],
+        f"{attn}.fused_qkv_a_proj.weight_scale_inv",
+    )
+    _fuse(
+        layer_sd,
+        [
             f"{attn}.indexer.wk.weight",
             f"{attn}.indexer.weights_proj.weight",
         ],
