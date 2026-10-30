@@ -72,9 +72,36 @@ def test_fused_hyper_connection_matches_hugging_face(tokens):
         assert _rel(fused, reference) < 1e-2, (what, _rel(fused, reference))
 
 
-def test_trainable_hyper_connection_keeps_the_hugging_face_path():
+@pytest.mark.parametrize("tokens", [1, 257])
+def test_trainable_hyper_connection_weight_gradients_match_hugging_face(tokens):
+    """Full fine-tuning: the fused read returns the norm, down/inject and up weight gradients too."""
     from arctic_platform.model.implementations.qwen38 import hyper_connection
+    from arctic_platform.model.implementations.qwen38 import modeling_qwen4_exp as qwen38
 
-    module = _module().requires_grad_(True)
-    x = torch.randn(1, 3, 4 * 2560, device="cuda").bfloat16()
-    assert not hyper_connection.fused_hyper_connection_supported(module, x)
+    torch.manual_seed(1)
+    x = torch.randn(1, tokens, 4 * 2560, device="cuda").bfloat16()
+    out_weight = (torch.randn(2560, 2560, device="cuda") * 0.02).bfloat16()
+    grad = torch.randn(1, tokens, 4 * 2560, device="cuda").bfloat16()
+
+    def reference_inject(hyper_input, out, inj):
+        return hyper_input + (out.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
+
+    # Accuracy is judged against the reference in FP64: the fused path has to be within 1e-2 of it, or no worse
+    # than 1.5x the reference's own BF16 path.
+    results = {}
+    for name, mix, inject, dtype in (
+        ("bf16", lambda m, h: m(h), reference_inject, torch.bfloat16),
+        ("fused", qwen38._mix_streams, qwen38._inject, torch.bfloat16),
+        ("fp64", lambda m, h: m(h), reference_inject, torch.float64),
+    ):
+        module = _module().to(dtype).requires_grad_(True)
+        assert name != "fused" or hyper_connection.fused_hyper_connection_supported(module, x)
+        leaf = x.clone().to(dtype).requires_grad_(True)
+        y, _, _ = _sublayer(mix, inject, module, leaf, out_weight.to(dtype))
+        y.backward(grad.to(dtype))
+        results[name] = [leaf.grad] + [p.grad for p in module.parameters()]
+    names = ["dx"] + [n for n, _ in _module().named_parameters()]
+    for what, fused, bf16, exact in zip(names, results["fused"], results["bf16"], results["fp64"]):
+        assert fused is not None and fused.shape == exact.shape, what
+        bound = max(1e-2, 1.5 * _rel(bf16, exact))
+        assert _rel(fused, exact) < bound, (what, _rel(fused, exact), bound)
