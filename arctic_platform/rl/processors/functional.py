@@ -453,7 +453,7 @@ def kl_penalty(
     if method in ("low_var_kl", "k3"):
         kl = ref_logprob - logprob
         kl = torch.clamp(kl, min=-20.0, max=20.0)
-        return torch.clamp(kl.exp() - kl - 1, min=-10.0, max=10.0)
+        return torch.clamp(torch.expm1(kl) - kl, min=-10.0, max=10.0)
     raise ValueError(
         f"Invalid kl_penalty method: '{method}'. Expected one of: 'k1'/'kl', 'abs', 'k2'/'mse', 'k3'/'low_var_kl'."
     )

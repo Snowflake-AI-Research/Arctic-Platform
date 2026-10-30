@@ -241,9 +241,10 @@ def _online_logsumexp_and_weighted_update(
     chunk_exp = torch.where(finite_chunk, torch.exp(shifted), torch.zeros_like(chunk_logits))
     # Each row's target is left out of both sums: a near-certain target's exp(0) = 1 would absorb the rest in fp32.
     chunk_exp[target_rows, target_columns] = 0.0
-    weighted_logits = torch.where(finite_chunk, chunk_logits, torch.zeros_like(chunk_logits))
+    # t sums exp(x - m) * (x - m), relative to the running max, so a near-certain row's entropy keeps its tail.
+    shift = torch.where(torch.isfinite(m), m - m_new, torch.zeros_like(m))
     s_new = s * exp_old + chunk_exp.sum(dim=-1)
-    t_new = t * exp_old + (chunk_exp * weighted_logits).sum(dim=-1)
+    t_new = (t + shift * s) * exp_old + (chunk_exp * shifted).sum(dim=-1)
     return m_new, s_new, t_new
 
 
@@ -326,11 +327,12 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
             others_minus_target_chunk = (m - target_logits) + log_s
             logz_chunk = torch.logaddexp(m + log_s, target_logits)
             validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
-            target_exp = torch.exp(target_logits - m)
+            target_rel = target_logits - m
+            target_exp = torch.exp(target_rel)
             logz[start:end] = logz_chunk
             others_minus_target[start:end] = others_minus_target_chunk
             logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
-            entropy[start:end] = logz_chunk - (t + target_exp * target_logits) / (s + target_exp)
+            entropy[start:end] = torch.logaddexp(log_s, target_rel) - (t + target_exp * target_rel) / (s + target_exp)
 
         ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_minus_target)
         ctx.action_masks = action_masks
