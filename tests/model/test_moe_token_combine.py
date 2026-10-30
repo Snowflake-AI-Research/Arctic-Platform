@@ -97,6 +97,42 @@ def test_the_shared_fold_differentiates():
     torch.testing.assert_close(rows.grad, upstream.index_select(0, token_indices), rtol=0, atol=0)
 
 
+def _cuda_scatter_add_(self, dim, index, src):
+    """CUDA's ``scatter_add_``: one ``atomicAdd`` per source row on ``self``'s storage, so a bf16 ``self`` is rounded
+    after every add (``ScatterGatherKernel.cu`` ``ReduceAdd`` -> ``fastAtomicAdd``). The CPU kernel sums bf16 in
+    fp32 instead, so without this stand-in no CPU run can tell the two folds apart."""
+    assert dim == 0
+    for row, token in enumerate(index[:, 0].tolist()):
+        self[token] += src[row]
+    return self
+
+
+def test_a_tokens_rows_on_one_rank_are_summed_in_fp32_and_rounded_once(monkeypatch):
+    """vLLM's ``moe_sum`` adds a token's top-k rows in fp32 and rounds once; the rank-local fold behind the
+    dispatch-EP unpermute does the same, with the rows in the expert-sorted order the permutation delivers."""
+    from arctic_platform.model.implementations.moe.distributed.token_permute import permute_tokens
+    from arctic_platform.model.implementations.moe.distributed.token_permute import unpermute_tokens
+
+    monkeypatch.setattr(torch.Tensor, "scatter_add_", _cuda_scatter_add_)
+    torch.manual_seed(0)
+    local_experts = 8
+    dispatched = torch.stack([torch.randperm(local_experts)[:TOP_K] for _ in range(TOKENS)])
+    dispatched[::3, -1] = -1  # routed to an expert on another rank
+    hidden = torch.zeros((TOKENS, HIDDEN), dtype=torch.bfloat16)
+    _, _, permuted_indices, _ = permute_tokens(hidden, dispatched, torch.rand(TOKENS, TOP_K), local_experts)
+    # Magnitudes in [0.5, 4) keep each token's fp32 sum exact, so one rounding of it is one rounding of the sum.
+    shape = (permuted_indices.shape[0], HIDDEN)
+    rows = ((torch.rand(shape) * 3.5 + 0.5) * torch.where(torch.rand(shape) < 0.5, -1.0, 1.0)).to(torch.bfloat16)
+
+    folded = unpermute_tokens(rows, permuted_indices, TOKENS)
+
+    exact = _reference_fold(rows, permuted_indices, TOKENS)
+    # An exact tie may round either way: CUDA's cast rounds it to even, the CPU embedding_bag rounds it up.
+    tie = (exact * (1 + 1e-6)).to(torch.bfloat16) != (exact * (1 - 1e-6)).to(torch.bfloat16)
+    assert folded.dtype == torch.bfloat16 and float(tie.double().mean()) < 0.5
+    torch.testing.assert_close(folded[~tie], exact.to(torch.bfloat16)[~tie], rtol=0, atol=0)
+
+
 def test_every_expert_parallel_backend_folds_through_the_shared_implementation():
     """Each backend's unpermute reaches the shared fold, which is what having one of them is for.
 
