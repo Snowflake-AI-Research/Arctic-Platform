@@ -22,6 +22,7 @@ class DebugModelConfig:
     hidden_size: int | None = None
     intermediate_size: int | None = None
     moe_intermediate_size: int | None = None
+    full_determinism: bool = False
 
 
 @dataclass
