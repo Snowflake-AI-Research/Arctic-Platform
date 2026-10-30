@@ -27,7 +27,7 @@ each loader's own validation. The reasons follow the table.
 | `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `numerics.fp32_parity` | trainer | parity | no | no | no | no | no | no | yes | yes | no |
+| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no | yes | yes | yes |
 | `numerics.fp32_residual` | trainer | parity | no | no | no | no | no | no | yes | no | no |
 | `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes |
 | `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
@@ -54,7 +54,7 @@ each loader's own validation. The reasons follow the table.
 - `moe.comm_token_chunk`: Token chunk size of the expert-parallel dispatch. Today: `loader_options.deepep_token_chunk_size`.
 - `moe.grouped_mm`: Run the experts as one grouped matmul. Today: `loader_options.moe_use_grouped_mm`.
 - `moe.sonicmoe`: Run BF16 routed experts through SonicMoE on the expert-parallel receive buffer when that kernel applies. Off keeps the grouped GEMM path. Today: `loader_options.moe_use_sonicmoe`.
-- `numerics.fp32_parity`: Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights under bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and under full activation checkpointing every decoder layer after the first holds the residual as a second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the end of each layer. Today: `loader_options.fp32_parity`. Remove when: no job needs the residual adds, rotary embedding and beta gate in the input dtype.
+- `numerics.fp32_parity`: Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights under bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and under full activation checkpointing every decoder layer after the first holds the residual as a second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product and output gate in fp32. Today: `loader_options.fp32_parity`. Remove when: no job needs the residual adds, rotary embedding and beta gate in the input dtype.
 - `numerics.fp32_residual`: Experimental. With fp32_parity on, carry the residual stream of the stock dense Qwen3.5 family in fp32 between decoder layers, from the embeddings on, instead of rounding it to the branch dtype after each fused add. Checked on CPU against a reference and under checkpointing, offload and compile; its effect on GPU training is not yet measured. Under full activation checkpointing each decoder layer after the first holds an fp32 residual at its boundary, twice the bytes of a bf16 one. Today: `loader_options.fp32_residual`. Remove when: GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity.
 - `numerics.optimization_dtype`: The dtype the trainer keeps and optimizes the weights in: bfloat16 or float32. Today: `ModelSpec.dtype` on the custom MoE loaders.
 - `numerics.reduce_dtype`: The dtype gradients are reduced in. Today: `loader_options.reduce_dtype`.
@@ -72,7 +72,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
@@ -87,7 +87,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
@@ -127,7 +127,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
@@ -136,12 +136,11 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-7 of 24 options unsupported.
+6 of 24 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
@@ -153,7 +152,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
+- `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
@@ -190,13 +189,12 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-7 of 24 options unsupported.
+6 of 24 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`

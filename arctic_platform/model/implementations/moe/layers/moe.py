@@ -92,6 +92,7 @@ class MoEArgs:
     route_norm: bool = False
     route_scale: float = 1.0
     score_before_experts: bool = True
+    fp32_router_logits: bool = False
 
     # token-choice
     top_k: int = 1
@@ -591,6 +592,7 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: ``sigmoid``, ``softmax``, or DeepSeek V4's ``sqrtsoftplus``.
         route_norm (bool): Whether to normalize the routing scores when using sigmoid.
         route_scale (float): Scaling factor applied to the routing scores.
+        fp32_logits (bool): Compute the gate GEMM in fp32 from the bf16 operands, as the model's reference does.
     """
 
     def __init__(
@@ -601,9 +603,11 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"],
         route_norm: bool,
         route_scale: float,
+        fp32_logits: bool = False,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.fp32_logits = fp32_logits
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_func = score_func
@@ -623,7 +627,12 @@ class TokenChoiceTopKRouter(nn.Module):
         assert (
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
-        scores = self.gate(x)
+        if self.fp32_logits:
+            # Autocast would run the GEMM in bf16 despite the fp32 operands.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                scores = F.linear(x.float(), self.gate.weight.float())
+        else:
+            scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -745,6 +754,7 @@ class MoE(nn.Module):
             score_func=moe_args.score_func,
             route_norm=moe_args.route_norm,
             route_scale=moe_args.route_scale,
+            fp32_logits=moe_args.fp32_router_logits,
         )
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         # TODO: Add the s back and use FF when the weights support it

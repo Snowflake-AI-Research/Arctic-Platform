@@ -401,6 +401,46 @@ def test_peft_adapter_checkpoint_strips_activation_checkpoint_wrappers(tmp_path)
         torch.testing.assert_close(reloaded(hidden), model(hidden))
 
 
+def test_save_peft_adapters_writes_peft_names_under_activation_checkpointing(tmp_path):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from transformers import LlamaConfig
+    from transformers import LlamaForCausalLM
+
+    def pack(wrap):
+        torch.manual_seed(0)
+        config = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=128,
+        )
+        targets = ["q_proj", "o_proj", "embed_tokens"]
+        lora = LoraConfig(r=8, lora_alpha=8, target_modules=targets, init_lora_weights=False)
+        model = get_peft_model(LlamaForCausalLM(config), lora)
+        if wrap:
+            layers = model.base_model.model.model.layers
+            for index, layer in enumerate(layers):
+                layers[index] = checkpoint_wrapper(layer)
+        save_peft_adapters(model, str(tmp_path / f"wrap_{wrap}"))
+        return model, load_file(tmp_path / f"wrap_{wrap}" / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors")
+
+    plain_model, plain = pack(wrap=False)
+    _, wrapped = pack(wrap=True)
+
+    expected = get_peft_model_state_dict(plain_model, save_embedding_layers=False)
+    assert len(plain) == 10
+    assert plain.keys() == expected.keys()
+    assert all(torch.equal(plain[name], expected[name]) for name in expected)
+    assert wrapped.keys() == plain.keys()
+    assert all(torch.equal(wrapped[name], plain[name]) for name in plain)
+
+
 def test_iter_lora_weights_rejects_non_lora_trainables():
     model = _Model(
         [
