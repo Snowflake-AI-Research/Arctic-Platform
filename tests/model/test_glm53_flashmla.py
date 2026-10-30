@@ -20,7 +20,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+    sparse_mla_flashmla_fused_apply,
+)
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
+from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import (
+    sparse_mla_flashmla_fwd_interface,
+)
 from arctic_platform.model.implementations.glm53 import context_parallel
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import set_seed
@@ -282,7 +288,8 @@ def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, fus
     if expect_infer:
         assert flashinfer.call_args.args[0].shape[-1] == 512
     else:
-        assert flashmla.call_args.args[0].shape[-1] == 576
+        # Rope-free 512: unpadded for the fused TileLang backward, zero-padded to 576 for FlashMLA's own fallback.
+        assert flashmla.call_args.args[0].shape[-1] == (512 if fused else 576)
 
 
 @pytest.mark.parametrize(
@@ -560,10 +567,46 @@ def test_real_flashmla_padded_width_matches_original_reference():
 
 
 @require_torch_gpu
+def test_real_flashmla_rope_free_512_matches_the_padded_call():
+    """GLM-5.3-Flash's 512-wide latent, unpadded, against the same call zero-padded to 576."""
+    _require_flashmla_kernel()
+    if not context_parallel._fused_sparse_mla_backward_available():
+        pytest.skip("the unpadded call needs the fused TileLang sparse-MLA backward")
+    set_seed(42)
+    queries, keys, heads, topk, scale = 128, 256, 64, 128, 576**-0.5
+    query = (torch.randn(1, queries, heads, 512, device="cuda") * 0.5).bfloat16().requires_grad_()
+    kv = (torch.randn(1, keys + 1, 1, 512, device="cuda") * 0.5).bfloat16()
+    kv[:, keys] = 0
+    kv.requires_grad_()
+    # The last CP shard of the keys; slots past a query's position point at the zero sentinel row.
+    positions = torch.arange(keys - queries, keys, device="cuda")
+    indices = torch.randint(0, keys, (queries, topk), device="cuda")
+    indices = torch.where(indices <= positions[:, None], indices, keys).sort(-1).values.int()
+    indices = indices.view(1, queries, 1, topk).contiguous()
+
+    def pad(tensor):
+        return torch.nn.functional.pad(tensor, (0, 64))
+
+    unpadded = sparse_mla_flashmla_fwd_interface(query.detach(), kv.detach(), indices, scale)
+    padded = sparse_mla_flashmla_fwd_interface(pad(query.detach()), pad(kv.detach()), indices, scale)
+    for actual, expected in zip(unpadded, padded, strict=True):
+        torch_assert_equal(actual, expected)
+
+    grad = torch.randn(1, queries, heads, 512, device="cuda").bfloat16()
+    expected = torch.autograd.grad(
+        sparse_mla_flashmla_fused_apply(pad(query), pad(kv), indices, scale), (query, kv), grad
+    )
+    actual = torch.autograd.grad(sparse_mla_flashmla_fused_apply(query, kv, indices, scale), (query, kv), grad)
+    torch_assert_equal(actual[0], expected[0])
+    # dKV sums FP32 atomics in no fixed order before rounding to BF16, so elements may differ by one BF16 step.
+    _assert_bf16_kernel_close(actual[1], expected[1], atol=1e-3)
+
+
+@require_torch_gpu
 @pytest.mark.parametrize(
     "kv_lora_rank,rope_width,use_flashmla,capability",
     [
-        pytest.param(512, 0, True, None, id="rope-free-512-pads-to-576"),
+        pytest.param(512, 0, True, None, id="rope-free-512"),
         pytest.param(512, 64, True, None, id="native-576"),
         pytest.param(448, 64, False, None, id="query-512-values-not-512"),
         pytest.param(448, 128, False, None, id="query-576-values-not-512"),
@@ -587,9 +630,12 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     attention = _dispatch_attention(kv_lora_rank, rope_width)
     attention = attention.to(device="cuda", dtype=torch.bfloat16)
     hidden_states = torch.randn(1, 4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    indices = torch.arange(4, device="cuda").expand(1, 4, -1)
+    # int32, as the model's own top-k selection returns them (the fused backward takes int32 indices).
+    indices = torch.arange(4, device="cuda", dtype=torch.int32).expand(1, 4, -1)
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+        with patch.object(
+            context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply
+        ) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", wraps=context_parallel._reference_sparse_mla
             ) as ref:
@@ -607,8 +653,9 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     assert flash.call_count == int(use_flashmla)
     assert ref.call_count == 2 * int(not use_flashmla)
     if use_flashmla:
-        assert flash.call_args.args[0].shape[-1] == 576
-        assert flash.call_args.args[1].shape[-1] == 576
+        width = kv_lora_rank + rope_width if context_parallel._fused_sparse_mla_backward_available() else 576
+        assert flash.call_args.args[0].shape[-1] == width
+        assert flash.call_args.args[1].shape[-1] == width
     else:
         assert ref.call_args.args[0].shape[-1] == kv_lora_rank + rope_width
         assert ref.call_args.kwargs["value_dim"] == kv_lora_rank
@@ -633,7 +680,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+        with patch.object(
+            context_parallel, "sparse_mla_flashmla_fused_apply", wraps=sparse_mla_flashmla_fused_apply
+        ) as flash:
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
             ):
@@ -642,8 +691,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
                 hidden.float().square().mean().backward()
                 torch.cuda.synchronize()
     assert flash.call_count == sparse_layers
-    assert flash.call_args.args[0].shape[-1] == 576
-    assert flash.call_args.args[1].shape[-1] == 576
+    width = 512 if context_parallel._fused_sparse_mla_backward_available() else 576
+    assert flash.call_args.args[0].shape[-1] == width
+    assert flash.call_args.args[1].shape[-1] == width
     grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
     assert grads and all(torch.isfinite(gradient).all() for gradient in grads)
 
@@ -658,12 +708,16 @@ def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_mode
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
-    with patch.object(
-        context_parallel,
-        "_flashinfer_sparse_mla_apply",
-        wraps=context_parallel._flashinfer_sparse_mla_apply,
-    ) as flashinfer:
-        with patch.object(context_parallel, "sparse_mla_flashmla_apply", side_effect=AssertionError("FlashMLA")):
+    # With the fused TileLang backward installed, FlashMLA's forward and that backward take precedence.
+    with (
+        patch.object(context_parallel, "_fused_sparse_mla_backward_available", return_value=False),
+        patch.object(
+            context_parallel,
+            "_flashinfer_sparse_mla_apply",
+            wraps=context_parallel._flashinfer_sparse_mla_apply,
+        ) as flashinfer,
+    ):
+        with patch.object(context_parallel, "sparse_mla_flashmla_fused_apply", side_effect=AssertionError("FlashMLA")):
             with patch.object(
                 context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
             ):
