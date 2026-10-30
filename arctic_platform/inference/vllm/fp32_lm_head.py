@@ -28,22 +28,25 @@ LM-head matmul itself.
 This module fixes that by patching ``LogitsProcessor._apply_head``, the
 single chokepoint every logits path runs the projection through:
 
-    logits = F.linear(hidden_states.to(fp32), lm_head.weight.to(fp32),
-                      bias.to(fp32))
+    logits = torch.mm(hidden_states, lm_head.weight.t(), out_dtype=fp32)
+
+on CUDA/ROCm for a bf16/fp16 head (``F.linear`` on fp32-upcast operands
+everywhere else).
 
 Notes:
 - The lm_head **weight is not modified**: it stays in the model's
-  native dtype (typically bf16) in GPU memory. Only the matmul
-  operands are upcast on the fly.
+  native dtype (typically bf16) in GPU memory.
 - This bypasses ``lm_head.quant_method.apply`` (which would error on
   dtype mismatch). For unquantized lm_heads the original ``apply`` is
   just ``F.linear`` anyway, so we lose no functionality.
 - For quantized lm_heads (rare) the patch falls back to the original
   ``_get_logits`` so quant kernels still run; the result is the
   upstream behavior, not fp32 logits.
-- Per-step cost: a single ``vocab_size * hidden * 2`` byte read of the
-  weight tensor through HBM (sub-ms on H100/MI300 for 128k-vocab x
-  4k-hidden). No extra VRAM is used for an fp32 weight copy.
+- On CUDA/ROCm the bf16/fp16 operands go straight into a GEMM that
+  accumulates and writes fp32, as upstream vLLM does for
+  ``head_dtype=float32``: no fp32 copy of the weight is made. bf16/fp16
+  products are exact in fp32, so the logits differ from the upcast path
+  only by fp32 summation order (not bit-identical).
 
 Enable via the env var ``ARCTIC_FP32_LM_HEAD=1`` or the CLI flag
 ``--fp32-lm-head``.
@@ -105,8 +108,8 @@ def set_fp32_lm_head_enabled(enabled: bool) -> None:
     """Enable or disable fp32 lm_head globally."""
     global _FP32_LM_HEAD_ENABLED
     if enabled and not _FP32_LM_HEAD_ENABLED:
-        logger.info("FP32 LM head enabled: lm_head matmul will run in "
-                    "fp32 (weights stay bf16; on-the-fly upcast).")
+        logger.info("FP32 LM head enabled: lm_head matmul will accumulate "
+                    "and return fp32 (weights stay bf16).")
     _FP32_LM_HEAD_ENABLED = enabled
 
 
@@ -119,11 +122,20 @@ def _fp32_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """``F.linear`` with all operands promoted to fp32 (no-op if already fp32).
+    """``F.linear`` with fp32 accumulation and fp32 output.
 
-    The weight is upcast on the fly; the underlying Parameter is not
-    modified.
+    The underlying Parameter is not modified. A bf16/fp16 weight on CUDA/ROCm
+    is multiplied in its own dtype into an fp32 result; anything else is
+    upcast on the fly.
     """
+    if (hidden_states.is_cuda and hidden_states.dtype == weight.dtype
+            and weight.dtype in (torch.bfloat16, torch.float16)):
+        # An on-the-fly fp32 weight is 4 * vocab * hidden / TP bytes per call.
+        logits = torch.mm(hidden_states.reshape(-1, hidden_states.shape[-1]),
+                          weight.t(), out_dtype=torch.float32)
+        if bias is not None:
+            logits = logits + bias.to(torch.float32)
+        return logits.reshape(*hidden_states.shape[:-1], -1)
     if weight.dtype != torch.float32:
         weight = weight.to(torch.float32)
     if hidden_states.dtype != torch.float32:

@@ -256,14 +256,14 @@ def _build_bf16_parallel_lm_head(vocab_size: int, hidden_size: int):
 def test_fp32_logits_with_bf16_weight(fp32_enabled, vllm_cfg):
     """Bf16 lm_head weight + bf16 hidden_states → fp32 logits.
 
-    Verifies the on-the-fly upcast: the result must equal
-    ``F.linear(hidden.float(), weight_bf16.float())`` exactly, and
-    the underlying ``lm_head.weight`` Parameter must remain bf16
+    The result must match ``F.linear(hidden.float(), weight_bf16.float())``
+    up to fp32 summation order, without allocating an fp32 copy of the
+    weight, and the underlying ``lm_head.weight`` Parameter must remain bf16
     (we never modify it in place).
     """
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    vocab_size, hidden_size = 256, 64
+    vocab_size, hidden_size = 32768, 1024
     lm_head = _build_bf16_parallel_lm_head(vocab_size, hidden_size)
     logits_processor = LogitsProcessor(vocab_size).cuda()
 
@@ -277,9 +277,15 @@ def test_fp32_logits_with_bf16_weight(fp32_enabled, vllm_cfg):
     weight_ptr_before = lm_head.weight.data_ptr()
     weight_dtype_before = lm_head.weight.dtype
 
+    logits_processor(lm_head, hidden_bf16)  # GEMM workspace is allocated once, here
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    allocated_before = torch.cuda.memory_allocated()
     logits = logits_processor(lm_head, hidden_bf16)
+    peak_extra = torch.cuda.max_memory_allocated() - allocated_before
 
     assert logits.dtype == torch.float32
+    assert peak_extra < lm_head.weight.numel() * 4
 
     # Underlying weight Parameter is unchanged (still bf16, same storage).
     assert lm_head.weight.dtype == weight_dtype_before == torch.bfloat16
@@ -288,7 +294,7 @@ def test_fp32_logits_with_bf16_weight(fp32_enabled, vllm_cfg):
     ref = torch.nn.functional.linear(
         hidden_bf16.float(), weight_bf16.float())
     ref = ref[..., :vocab_size]
-    torch.testing.assert_close(logits, ref, rtol=0, atol=0)
+    torch.testing.assert_close(logits, ref, rtol=1e-5, atol=1e-4)
 
 
 def test_fp32_logits_handles_already_fp32_inputs(fp32_enabled, vllm_cfg):
@@ -344,8 +350,8 @@ def test_tied_lm_head_qwen3_style(fp32_enabled, vllm_cfg):
     """Qwen3-style tying: ``self.lm_head = self.model.embed_tokens``.
 
     The lm_head IS the bf16 ``VocabParallelEmbedding`` Parameter. The
-    patch must still produce fp32 logits via on-the-fly upcast and
-    must not touch the embed_tokens weight.
+    patch must still produce fp32 logits and must not touch the
+    embed_tokens weight.
     """
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -380,7 +386,7 @@ def test_tied_lm_head_qwen3_style(fp32_enabled, vllm_cfg):
     ref = torch.nn.functional.linear(
         hidden_bf16.float(), lm_head.weight.float())
     ref = ref[..., :vocab_size]
-    torch.testing.assert_close(logits, ref, rtol=0, atol=0)
+    torch.testing.assert_close(logits, ref, rtol=1e-5, atol=1e-4)
 
 
 def test_create_async_engine_args_accepts_arctic_args_without_fp32(monkeypatch):
