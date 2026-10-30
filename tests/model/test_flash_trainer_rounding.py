@@ -206,7 +206,7 @@ class _Branch(torch.nn.Linear):
         return super().forward(hidden_states)
 
 
-def _hyper_connection_sites(fp32_parity: bool):
+def _hyper_connection_sites(fp32_parity: bool, dtype=torch.bfloat16, hc_count=4):
     """Layer 0 and the final mixer of a tiny Qwen3.8-Flash-Next built by the trainer class, with each site recorded."""
     from arctic_platform.model.implementations.moe.vlm import get_language_model
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
@@ -214,7 +214,7 @@ def _hyper_connection_sites(fp32_parity: bool):
 
     torch.manual_seed(11)
     config = _qwen38_tiny_config()
-    config.text_config.hc_count = 4  # the checkpoint's
+    config.text_config.hc_count = hc_count
     config.fp32_parity = fp32_parity
     language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(config))
     layer = language_model.layers[0]
@@ -224,7 +224,7 @@ def _hyper_connection_sites(fp32_parity: bool):
     with torch.no_grad():
         for parameter in language_model.parameters():
             parameter.normal_(std=0.5)
-    language_model.to(torch.bfloat16)
+    language_model.to(dtype)
 
     sites: dict[str, dict[str, torch.Tensor]] = {"attn": {}, "mlp": {}, "final": {}}
     for name, hc, branch in (
@@ -235,6 +235,8 @@ def _hyper_connection_sites(fp32_parity: bool):
         site = sites[name]
         hc.register_forward_pre_hook(lambda _m, args, site=site: site.update(hyper_input=args[0]))
         hc.hc_norm.register_forward_hook(lambda _m, _a, out, site=site: site.update(normed=out))
+        hc.input_mix_weight_down.register_forward_hook(lambda _m, _a, out, site=site: site.update(down=out))
+        hc.input_mix_weight_up.register_forward_pre_hook(lambda _m, args, site=site: site.update(silu=args[0]))
         hc.input_mix_weight_up.register_forward_hook(lambda _m, _a, out, site=site: site.update(gate=out))
         if branch is not None:
             hc.block_inject_weight.register_forward_hook(lambda _m, _a, out, site=site: site.update(logits=out))
@@ -246,47 +248,61 @@ def _hyper_connection_sites(fp32_parity: bool):
     return layer, language_model.hyper_connection_mixer, sites
 
 
-def _mixed(site: dict[str, torch.Tensor]) -> torch.Tensor:
-    streams = (4, -1)
+def _mixed(site: dict[str, torch.Tensor], hc_count=4) -> torch.Tensor:
+    streams = (hc_count, -1)
     return (
         torch.sigmoid(site["gate"].double()).unflatten(-1, streams) * site["normed"].double().unflatten(-1, streams)
     ).mean(-2)
 
 
-def _combined(site: dict[str, torch.Tensor]) -> torch.Tensor:
-    weights = 2 * torch.sigmoid(site["logits"].double() / 4)
-    streams = site["hyper_input"].double().unflatten(-1, (4, -1))
-    return (streams + site["branch"].double().unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
+def _combined(site: dict[str, torch.Tensor], hc_count=4) -> torch.Tensor:
+    # Cancellation in the residual add can amplify fp32 noise, so use the kernel's fp32 arithmetic here.
+    weights = 2 * torch.sigmoid(site["logits"].float() / hc_count)
+    streams = site["hyper_input"].float().unflatten(-1, (hc_count, -1))
+    return (streams + site["branch"].float().unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
 
 
-def _run_hyper_connections(fp32_parity: bool, autocast: bool = False):
-    layer, mixer, sites = _hyper_connection_sites(fp32_parity)
-    hidden = (2 * torch.randn(2, 64, 64)).to(torch.bfloat16).requires_grad_()
+def _run_hyper_connections(fp32_parity: bool, autocast: bool = False, dtype=torch.bfloat16, hc_count=4):
+    layer, mixer, sites = _hyper_connection_sites(fp32_parity, dtype, hc_count)
+    hidden = (2 * torch.randn(2, 64, 16 * hc_count)).to(dtype).requires_grad_()
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
         output = mixer(layer(hidden, position_embeddings=(torch.ones(1), torch.zeros(1))))
     return layer, hidden, output, sites
 
 
-@pytest.mark.parametrize("autocast", [False, True])
-def test_qwen38_hyper_connection_mix_and_injection_round_once(autocast):
+@pytest.mark.parametrize("hc_count", [3, 4])
+def test_qwen38_hyper_connection_mix_and_injection_round_once(hc_count):
     """vLLM's hc_gate_mix and hc_combine keep sigmoid, products and sums in fp32 and store bf16 once."""
-    _, hidden, output, sites = _run_hyper_connections(fp32_parity=True, autocast=autocast)
+    _, _, _, sites = _run_hyper_connections(fp32_parity=True, hc_count=hc_count)
     for name in ("attn", "mlp", "final"):
-        _assert_rounded_once(sites[name]["mixed"], _mixed(sites[name]))
+        down = sites[name]["down"].double() / hc_count
+        _assert_rounded_once(sites[name]["silu"], down * torch.sigmoid(down))
+        _assert_rounded_once(sites[name]["mixed"], _mixed(sites[name], hc_count))
     for name in ("attn", "mlp"):
-        _assert_rounded_once(sites[name]["combined"], _combined(sites[name]))
-    output.float().square().sum().backward()
-    assert hidden.grad.dtype == torch.bfloat16 and bool(torch.isfinite(hidden.grad).all())
+        torch.testing.assert_close(
+            sites[name]["combined"], _combined(sites[name], hc_count).to(sites[name]["combined"].dtype), rtol=0, atol=0
+        )
 
 
-def test_qwen38_hyper_connections_keep_the_transformers_order_without_fp32_parity():
+@pytest.mark.parametrize("dtype,autocast", [(torch.bfloat16, False), (torch.float32, True), (torch.float32, False)])
+@pytest.mark.parametrize("fp32_parity", [False, True])
+def test_qwen38_hyper_connections_preserve_dtypes_and_stock_order(dtype, autocast, fp32_parity):
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
 
-    layer, hidden, _, sites = _run_hyper_connections(fp32_parity=False)
-    expected = Qwen4ExpTextDecoderLayer.forward(layer, hidden, position_embeddings=(torch.ones(1), torch.zeros(1)))
-    torch.testing.assert_close(sites["mlp"]["combined"], expected, rtol=0, atol=0)
-    with pytest.raises(AssertionError, match="rounded more than once"):
-        _assert_rounded_once(sites["attn"]["mixed"], _mixed(sites["attn"]))
+    layer, hidden, output, sites = _run_hyper_connections(fp32_parity, autocast, dtype)
+    output.float().square().sum().backward()
+    for tensor in (hidden, *layer.parameters()):
+        assert tensor.grad.dtype == tensor.dtype and bool(torch.isfinite(tensor.grad).all())
+    assert output.dtype == sites["mlp"]["combined"].dtype == dtype
+    if not fp32_parity:
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            expected = Qwen4ExpTextDecoderLayer.forward(
+                layer, hidden, position_embeddings=(torch.ones(1), torch.zeros(1))
+            )
+        torch.testing.assert_close(sites["mlp"]["combined"], expected, rtol=0, atol=0)
+        if dtype == torch.bfloat16:
+            with pytest.raises(AssertionError, match="rounded more than once"):
+                _assert_rounded_once(sites["attn"]["mixed"], _mixed(sites["attn"]))
 
 
 def test_qwen38_qsa_fp32_math_survives_autocast():

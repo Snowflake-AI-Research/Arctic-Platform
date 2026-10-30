@@ -280,7 +280,8 @@ class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
 
     def forward(self, hyper_input: torch.Tensor):
         normed = self.hc_norm(hyper_input)
-        gate = self.input_mix_weight_up(F.silu(self.input_mix_weight_down(normed) / self.hc_count))
+        down = self.input_mix_weight_down(normed)
+        gate = self.input_mix_weight_up(F.silu(down.float() / self.hc_count).to(down.dtype))
         streams = (self.hc_count, self.hidden_size)
         mixed = (torch.sigmoid(gate.float()).unflatten(-1, streams) * normed.unflatten(-1, streams)).mean(dim=-2)
         mixed = mixed.to(normed.dtype)
