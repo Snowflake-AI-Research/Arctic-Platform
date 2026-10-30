@@ -131,9 +131,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 ### Gradient Accumulation Precision
 
-**The AP DeepSpeed worker retains FP32 gradient accumulation when `data_types` is absent.** `DeepSpeedWorker.ds_training_config()` supplies `data_types={"grad_accum_dtype": "fp32"}` only when the entire `data_types` block is missing. An explicitly supplied block is preserved without filling in missing fields, including an empty `{}` block.
+**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `DeepSpeedWorker.ds_training_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
 
-**Set `data_types.grad_accum_dtype` explicitly to select accumulation precision.** For FP32 accumulation, include this block in the supplied `ds_config`, alongside the existing BF16 and ZeRO settings:
+**Set `data_types.grad_accum_dtype` explicitly to select a different accumulation precision.** An explicit value always wins; the FP32 default written out in full is:
 
 ```json
 {
@@ -143,9 +143,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 }
 ```
 
-**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is also preserved. If a supplied `data_types` block omits `grad_accum_dtype`, or a caller initializes DeepSpeed without going through the AP worker, DeepSpeed defaults to the model dtype for gradient accumulation.
+**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is preserved. A caller that initializes DeepSpeed without going through the AP worker gets DeepSpeed's own default, which accumulates in the model dtype.
 
-**Regression coverage verifies the existing default, not a numerical-default change.** Worker tests cover both the absent `data_types` block and preserved supplied blocks. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
+**Regression coverage.** Worker tests cover an absent block, supplied blocks without `grad_accum_dtype` (`null`, `{}`, `{"grad_accum_dtype": null}`, other fields only), and explicit `"bf16"` and `"fp32"` values. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default, an empty supplied block, and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
 
 ### GLM-5.3 Sparse Attention
 
