@@ -29,6 +29,7 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 from typing import Literal
 
@@ -371,6 +372,8 @@ class ArcticClientConfig(BaseModel):
             )
         if provider:
             training["model_provider"] = provider
+        if "model_options" in worker:
+            training["model_options"] = deepcopy(worker["model_options"])
         if worker.get("use_liger"):
             options = dict(training.get("model_options") or {})
             options["liger"] = True
@@ -380,7 +383,7 @@ class ArcticClientConfig(BaseModel):
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
         for key in ("ep_size", "mb_spec", "router_replay"):
             if key in worker:
-                training[key] = worker[key]
+                training[key] = deepcopy(worker[key])
         if ds:
             training["ds_config"] = _without_noop_offload(ds)
         if self.training.peft:

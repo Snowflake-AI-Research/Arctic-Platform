@@ -679,6 +679,54 @@ class TestUnifiedConfigDoesNotReadEnv:
         assert cfg.backend.type == "onprem"
 
 
+class TestCortexModelOptions:
+    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+        cfg = ArcticClientConfig(
+            model_name="model",
+            training_gpus=1,
+            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+        )
+        before = cfg.model_dump()
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_training_options_use_the_supported_server_channel(self):
+        from arctic_platform.client import CortexConfig
+
+        options = {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {"token_chunk_size": 1024, "fp32": False, "cross_entropy": False},
+        }
+        cfg = ArcticClientConfig(
+            model_name="model",
+            max_seq_len=262144,
+            training_gpus=8,
+            sampling_gpus=8,
+            backend=CortexConfig(base_url="http://mock"),
+            training={"ds_worker_config": {"ep_size": 8, "model_options": options}},
+        )
+        before = cfg.model_dump()
+        sub_jobs = cfg.to_cortex()
+        assert [sub["job_type"] for sub in sub_jobs] == ["sampling", "training"]
+        assert sub_jobs[0]["inference_config"]["n_gpus"] == 8
+        training = sub_jobs[1]["training_config"]
+        assert training["model_options"] == options
+        assert training["max_seq_len"] == 262144
+        assert training["ep_size"] == 8
+        assert "prime_rl" not in training
+        assert cfg.model_dump() == before
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_absent_options_do_not_add_a_transport_block(self):
+        cfg = ArcticClientConfig(model_name="model", training_gpus=1)
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert "model_options" not in training
+        assert "prime_rl" not in training
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
