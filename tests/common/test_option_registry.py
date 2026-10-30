@@ -54,6 +54,7 @@ EXPECTED_KEYS = {
     "lm_head.cross_entropy": ("trainer", "memory"),
     "liger": ("trainer", "speed"),
     "moe.grouped_mm": ("trainer", "speed"),
+    "moe.sonicmoe": ("trainer", "speed"),
     "moe.comm_backend": ("trainer", "speed"),
     "moe.comm_sms": ("trainer", "speed"),
     "moe.comm_token_chunk": ("trainer", "speed"),
@@ -533,7 +534,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 24 options x 9 profiles = 216 cells, ")
+        assert out[0].startswith("check passed: 25 options x 9 profiles = 225 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

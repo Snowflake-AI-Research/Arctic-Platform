@@ -479,6 +479,17 @@ def _create_async_engine_args(
         )
 
 
+def _validate_mla_lora_targets(model_config: Any, peft_config: dict[str, Any] | None) -> None:
+    # vLLM's MLA attention calls the unwrapped kv_b_proj it was built with and decodes with weights absorbed from it.
+    targets = (peft_config or {}).get("target_modules", [])
+    names = [targets] if isinstance(targets, str) else targets
+    if any("kv_b_proj" in name or name == "all-linear" for name in names) and model_config.use_mla:
+        raise ValueError(
+            "LoRA target kv_b_proj is absorbed into MLA attention weights and cannot be served; "
+            "remove it from the training and sampling LoRA targets and retrain the adapter."
+        )
+
+
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in (
@@ -662,6 +673,10 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+
+    spec = getattr(choice, "spec_decode_metrics", None)
+    if spec is not None:
+        result["spec_decode_metrics"] = spec.to_dict()
 
     if final_output.prompt_logprobs is not None:
         # The dense patch leaves tensors here instead of one dict per position;
@@ -936,6 +951,12 @@ class InferenceWorker(StreamingWorkerMixin):
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+        lora_peft_config = engine_kwargs.pop("lora_peft_config", None)
+        checkpoint_peft_config = None
+        if lora_adapter_path:
+            import json
+            with open(os.path.join(lora_adapter_path, "adapter_config.json")) as adapter_file:
+                checkpoint_peft_config = json.load(adapter_file)
 
         # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
         # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
@@ -1011,6 +1032,8 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                _validate_mla_lora_targets(vllm_config.model_config, lora_peft_config)
+                _validate_mla_lora_targets(vllm_config.model_config, checkpoint_peft_config)
                 self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
                     vllm_config, chat_reasoning_parser, tool_call_parser
                 )
@@ -1448,7 +1471,7 @@ class InferenceWorker(StreamingWorkerMixin):
         }
 
     def drain_metrics(self) -> dict[str, Any]:
-        """Return and clear the buffered per-step replica snapshots."""
+        """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
             action_mask_replay_cache_stats,
         )
@@ -1456,6 +1479,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return {
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
+            "engine_totals": get_collector().totals(),
             "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
