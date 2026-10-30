@@ -1,0 +1,120 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""A resumed ZeRO-2 job gives every parameter its own fp32 master and Adam moments, or refuses the checkpoint.
+
+DeepSpeed restores both by position in the flat optimizer buffers. GLM-5.3's FP32 group holds 3-element mHC scales
+between larger parameters, which ``_aligned_first`` moves to the end of the group, so a checkpoint saved in the model's
+order lands each parameter's state on another one. Real ``deepspeed.initialize``, save and load, production precision.
+"""
+
+import torch
+
+from arctic_platform.common import deepspeed_engine
+from arctic_platform.common.deepspeed_engine import OptimizerSettings
+from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.deepspeed_engine import initialize_training_engine
+from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import torch_assert_equal
+from tests.model.test_glm5_next import _tiny_config
+
+
+def _engine():
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.use_grouped_mm = False
+    spec = TrainingEngineSpec(
+        dtype="bfloat16",
+        world_size=1,
+        fp32_masters=True,
+        ds_overrides={
+            "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+            "zero_force_ds_cpu_optimizer": False,
+        },
+    )
+    engine, _, _ = initialize_training_engine(
+        Glm5NextForConditionalGenerationPrimeRL(config),
+        build_deepspeed_config(spec),
+        optimizer=OptimizerSettings(name="torch_adamw", lr=1e-3),
+        ep_size=1,
+        mpu=None,
+        model_path="zai-org/GLM-5.3-Flash-BF16",
+        rank=0,
+    )
+    return engine
+
+
+def _train_and_save(engine, path):
+    """One step with a different gradient for every parameter, so each has its own master and moments."""
+    generator = torch.Generator().manual_seed(1)
+    parameters = sorted(engine.module.named_parameters())
+    engine.backward(sum((p.float() * torch.randn(p.shape, generator=generator)).sum() for _, p in parameters))
+    engine.step()
+    engine.save_checkpoint(path, tag="step")
+    return _optimizer_state(engine)
+
+
+def _optimizer_state(engine):
+    """Each parameter's fp32 master and Adam moments, read where the engine's own mapping places it (one rank)."""
+    zero = engine.optimizer
+    state = {}
+    for params, flat in zip(zero.bit16_groups, zero.single_partition_of_fp32_groups):
+        moments = zero.optimizer.state[flat]
+        for p in params:
+            address = p._hp_mapping.get_hp_fragment_address()
+            tensors = [flat, moments["exp_avg"], moments["exp_avg_sq"]]
+            state[engine.param_names[p]] = [t.narrow(0, address.start, address.numel).clone() for t in tensors]
+    return state
+
+
+def _layout(engine):
+    return [[engine.param_names[p] for p in group] for group in engine.optimizer.bit16_groups]
+
+
+@require_deepspeed
+def test_resume_restores_every_parameters_own_master_and_moments(single_rank_group, tmp_path):
+    expected = _train_and_save(_engine(), tmp_path)
+    resumed = _engine()
+    resumed.load_checkpoint(tmp_path, tag="step")
+
+    for name, state in _optimizer_state(resumed).items():
+        for key, value, saved in zip(("master", "exp_avg", "exp_avg_sq"), state, expected[name]):
+            torch_assert_equal(value, saved, msg=lambda default, name=name, key=key: f"{name} {key}: {default}")
+
+
+@require_deepspeed
+def test_resume_across_a_parameter_order_change_refuses_or_restores_every_parameter(
+    single_rank_group, tmp_path, monkeypatch
+):
+    with monkeypatch.context() as patch:
+        patch.setattr(deepspeed_engine, "_aligned_first", list)  # the order before _aligned_first: the model's
+        saved = _engine()
+    expected = _train_and_save(saved, tmp_path)
+    resumed = _engine()
+    assert _layout(saved) != _layout(resumed)
+
+    try:
+        resumed.load_checkpoint(tmp_path, tag="step")
+    except RuntimeError as error:
+        assert "saved with the parameters at other positions" in str(error)
+        return
+    wrong = [
+        name
+        for name, state in _optimizer_state(resumed).items()
+        if not all(torch.equal(value, saved) for value, saved in zip(state, expected[name]))
+    ]
+    assert not wrong, f"{len(wrong)} of {len(expected)} parameters resumed with another one's state: {wrong[:4]}"

@@ -26,6 +26,7 @@ one engine-construction path.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 
@@ -191,6 +192,7 @@ def initialize_training_engine(
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
         engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
+        _refuse_restoring_another_parameter_layout(built)
     else:
         engine, *_ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         built = None
@@ -331,6 +333,42 @@ def _aligned_first(params: list) -> list:
     The sort is stable, so the order within each half is the model's.
     """
     return sorted(params, key=lambda param: param.numel() % 8 != 0)
+
+
+def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
+    """Refuse to restore ZeRO-1/2 masters or Adam moments saved with the parameters at other positions.
+
+    DeepSpeed restores both by position in each group's flat partition, so a checkpoint saved with another parameter
+    order (before ``_aligned_first``, for one) loads without error and gives parameters each other's state. Every
+    partition saved records where each named parameter sat in it (``param_slice_mappings``); the restore goes ahead
+    only when that is where the parameter sits now.
+    """
+    from deepspeed import comm as dist
+    from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    if not isinstance(zero_optimizer, DeepSpeedZeroOptimizer):
+        return
+    load = zero_optimizer._load_legacy_checkpoint
+
+    def load_same_layout(state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
+        if load_optimizer_states or load_from_fp32_weights:
+            rank = dist.get_rank(group=zero_optimizer.dp_process_group)
+            saved = state_dict_list[rank][PARAM_SLICE_MAPPINGS]
+            groups = itertools.zip_longest(saved, zero_optimizer._param_slice_mappings, fillvalue={})
+            for group, (old, new) in enumerate(groups):
+                for was, now in itertools.zip_longest(old.items(), new.items()):
+                    if was != now:
+                        raise RuntimeError(
+                            "This checkpoint's optimizer state was saved with the parameters at other positions in "
+                            f"ZeRO's flat buffers (rank {rank}, group {group}: saved {was}, now {now}). DeepSpeed "
+                            "restores masters and Adam moments by position, so they would land on other parameters. "
+                            "Resume with the code that saved it, or load the module weights only and start a fresh "
+                            "optimizer."
+                        )
+        return load(state_dict_list, load_optimizer_states, load_from_fp32_weights)
+
+    zero_optimizer._load_legacy_checkpoint = load_same_layout
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
