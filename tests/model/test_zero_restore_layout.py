@@ -12,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A resumed ZeRO-2 job gives every parameter its own fp32 master and Adam moments, or refuses the checkpoint.
-
-DeepSpeed restores both by position in the flat optimizer buffers. GLM-5.3's FP32 group holds 3-element mHC scales
-between larger parameters, which ``_aligned_first`` moves to the end of the group, so a checkpoint saved in the model's
-order lands each parameter's state on another one. Real ``deepspeed.initialize``, save and load, production precision.
-"""
+"""Real ZeRO-2 save/resume preserves each GLM-5.3 parameter's master and moments, or refuses a reordered checkpoint."""
 
 import torch
 
