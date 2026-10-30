@@ -32,6 +32,7 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+from arctic_platform.model.loaders.qwen3_5_moe import prepare_moe
 
 GENERIC_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "glm4_moe", "minimax", "minimax_m2", "afmoe", "nemotron_h"})
 
@@ -91,11 +92,18 @@ def _validate_spec(spec: ModelSpec) -> None:
         )
 
 
+def _prepare(ctx: LoaderContext) -> None:
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import prepare_generic_moe_weights
+
+    prepare_moe(ctx, prepare_generic_moe_weights)
+
+
 @register_loader(
     "generic_moe",
     matches=_matches,
     options=GenericMoeOptions,
     validate_spec=_validate_spec,
+    prepare=_prepare,
 )
 def load_generic_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

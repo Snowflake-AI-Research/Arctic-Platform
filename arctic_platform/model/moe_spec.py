@@ -75,6 +75,23 @@ def build_moe_model(
     ).model
 
 
+def prepare_moe_weights(
+    *,
+    model_name: str,
+    ep_size: int,
+    sp_size: int = 1,
+    loader_options: dict | None = None,
+) -> None:
+    """Write the node-local weight cache ``build_moe_model`` reads (the HF->Prime conversion), with no process group.
+
+    A runtime runs it once per node before it starts the ranks, so a cold node's conversion runs outside their
+    start-up deadline and first collective; ``build_moe_model`` then reuses the cache.
+    """
+    from arctic_platform.model.loader import prepare_weights
+
+    prepare_weights(moe_model_spec(model_name=model_name, ep_size=ep_size, sp_size=sp_size, loader_options=loader_options))
+
+
 def moe_model_spec(
     *,
     model_name: str,

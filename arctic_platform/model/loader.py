@@ -215,6 +215,7 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
+Preparer = Callable[[LoaderContext], None]
 
 
 @dataclass
@@ -223,6 +224,7 @@ class _LoaderEntry:
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
+    prepare: Preparer | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -235,11 +237,13 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
+    prepare: Preparer | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
-    ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``options`` pydantic model used to validate ``ModelSpec.loader_options``. ``prepare``
+    does a node's one-time weight work with no process group, before the ranks start.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -253,6 +257,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
+            prepare=prepare,
         )
         return fn
 
@@ -286,6 +291,13 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 
     assert _DEFAULT_LOADER is not None, "no default loader registered"
     return _DEFAULT_LOADER
+
+
+def prepare_weights(spec: ModelSpec) -> None:
+    """Run the resolved loader's per-node weight preparation, if it has one."""
+    prepare = _LOADERS[spec.loader].prepare
+    if prepare is not None:
+        prepare(LoaderContext(spec=spec))
 
 
 def select_loader(ctx: LoaderContext) -> Loader:

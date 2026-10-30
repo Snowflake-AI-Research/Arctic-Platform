@@ -56,6 +56,7 @@ from arctic_platform.model.moe_spec import build_moe_model
 from arctic_platform.model.moe_spec import hf_text_model_type
 from arctic_platform.model.moe_spec import is_glm_moe_model
 from arctic_platform.model.moe_spec import moe_model_spec
+from arctic_platform.model.moe_spec import prepare_moe_weights
 from arctic_platform.model.parallel.validation import validate_expert_parallel
 from arctic_platform.model.parallel.validation import validate_sequence_parallel
 from arctic_platform.model.patch import apply_patches
@@ -136,6 +137,7 @@ __all__ = [
     "apply_peft",
     "build_model",
     "build_moe_model",
+    "prepare_moe_weights",
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
