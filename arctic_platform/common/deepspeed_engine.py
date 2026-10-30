@@ -39,7 +39,17 @@ from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
-_NO_DECAY = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
+# Qwen3.8-Flash-Next's PLE names its RMSNorms norm_key/norm_query/norm_conv, which "norm.weight" does not match.
+_NO_DECAY = (
+    "bias",
+    "layer_norm.weight",
+    "layernorm.weight",
+    "norm.weight",
+    "ln_f.weight",
+    "norm_key.weight",
+    "norm_query.weight",
+    "norm_conv.weight",
+)
 _OPTIMIZER_ALIASES = {
     "fusedadam": "fused_adam",
     "fused_adam": "fused_adam",
