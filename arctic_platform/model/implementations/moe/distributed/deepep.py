@@ -6,6 +6,7 @@ from deep_ep.utils import EventHandle
 from deep_ep.utils import EventOverlap
 from torch.distributed import ProcessGroup
 
+from ..routing_weights import apply_routing_weights
 from .token_permute import permute_tokens
 from .token_permute import unpermute_tokens
 
@@ -113,8 +114,7 @@ def _dispatch_backward(
     after_event.current_stream_wait()
 
     grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
-    return grad_x, None, grad_topk_weights, None, None, None, None
+    return grad_x, None, grad_scores, None, None, None, None
 
 
 class _DeepEPCombine(torch.autograd.Function):
@@ -287,9 +287,7 @@ def finalize_dispatch_tokens(
     num_tokens_per_expert = num_tokens_per_expert.to(hidden_states.device)
 
     if pending_state.score_before_experts and permuted_scores is not None:
-        hidden_states = (hidden_states.to(torch.float32) * permuted_scores.to(torch.float32).reshape(-1, 1)).to(
-            hidden_states.dtype
-        )
+        hidden_states = apply_routing_weights(hidden_states, permuted_scores)
         permuted_scores_for_state = None
     else:
         permuted_scores_for_state = permuted_scores
@@ -305,9 +303,7 @@ def finalize_dispatch_tokens(
 
 def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
     if state.permuted_scores is not None:
-        hidden_states = (hidden_states.to(torch.float32) * state.permuted_scores.to(torch.float32).reshape(-1, 1)).to(
-            hidden_states.dtype
-        )
+        hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
     hidden_states = unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
     return _DeepEPCombine.apply(hidden_states, state.handle_id)
 

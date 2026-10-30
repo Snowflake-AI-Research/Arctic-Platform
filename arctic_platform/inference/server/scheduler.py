@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
+from arctic_platform.inference.server.token_prompts import is_token_tensor
 
 from arctic_platform.inference.server.metrics import (
     ConcurrencyHistory,
@@ -47,7 +50,7 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class _Request:
     id: int
-    prompt: str | list[int]
+    prompt: Any  # str, list[int], 1-D integer tensor, or ChatPrompt
     sampling_params: dict[str, Any]
     future: asyncio.Future
     worker_idx: int | None = None
@@ -98,10 +101,22 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt: str | list[int]) -> int:
-    """Hash the full prompt for affinity routing."""
+def _compute_prefix_hash(prompt: Any) -> int:
+    """Hash the full prompt for affinity routing.
+
+    A tensor prompt hashes its int32 bytes, so the same tokens route the same
+    way whatever integer dtype they arrive in. It hashes differently from the
+    same tokens sent as a list.
+    """
+    if isinstance(prompt, ChatPrompt):
+        # Already validated as plain JSON.
+        return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
+    if is_token_tensor(prompt):
+        import torch
+
+        return hash(prompt.to(torch.int32).contiguous().numpy().tobytes())
     return hash(tuple(prompt))
 
 
@@ -288,13 +303,29 @@ class Scheduler:
             except Exception:
                 pass
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_pause_event"] = None
+        state["_poll_task"] = None
+        state["_adjust_task"] = None
+        state["_inflight_tasks"] = {i: set() for i in state.get("_inflight_tasks", {})}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._pause_event = asyncio.Event()
+        if not self._paused:
+            self._pause_event.set()
+        self._poll_task = None
+        self._adjust_task = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def submit(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         sampling_params: dict[str, Any],
         routing_key: str | None = None,
         strict: bool = False,
@@ -302,6 +333,8 @@ class Scheduler:
         """Submit a single prompt for generation.
 
         Args:
+            prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token
+                ids; a tensor is sent to the worker as is.
             routing_key: Optional opaque string used as the affinity key for
                 routing. By default, the first request for a key is assigned
                 to the least-loaded worker and later requests for the same
@@ -476,6 +509,18 @@ class Scheduler:
     def is_worker_available(self, idx: int) -> bool:
         self._check_idx(idx)
         return self._workers[idx].schedulable
+
+    async def wait_for_schedulable_worker(self, timeout: float) -> ray.actor.ActorHandle:
+        """A worker that takes requests, waiting up to ``timeout`` seconds for one."""
+        deadline = time.monotonic() + timeout
+        while not self._stopped:
+            for ws in self._workers:
+                if ws.schedulable:
+                    return ws.handle
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"No schedulable worker within {timeout:g}s")
+            await asyncio.sleep(0.05)
+        raise RuntimeError("Scheduler stopped")
 
     def mark_worker_unavailable(self, idx: int) -> None:
         self._check_idx(idx)
@@ -818,9 +863,10 @@ class Scheduler:
 
           * ``requests``: list of :class:`RequestRecord` dicts (one per
             generation call completed since the last drain).
-          * ``replicas``: snapshots, lifetime engine totals, and replay-cache
-            counters. Each snapshot has ``max_concurrency`` back-filled from
-            the scheduler's per-replica concurrency-limit history.
+          * ``replicas``: snapshots, lifetime engine totals, speculative-decoding
+            counters, and replay-cache counters. Each snapshot has
+            ``max_concurrency`` back-filled from the scheduler's per-replica
+            concurrency-limit history.
 
         Calling this is idempotent and does not block scheduling.
         """
@@ -857,7 +903,8 @@ class Scheduler:
             replicas_payload.append({
                 "replica_id": idx,
                 "snapshots": snaps,
-                "engine_totals": res["engine_totals"],
+                "engine_totals": res.get("engine_totals", {}) if isinstance(res, dict) else {},
+                "spec_decoding": res.get("spec_decoding", {}) if isinstance(res, dict) else {},
                 "action_mask_replay_cache": (
                     res.get("action_mask_replay_cache", {})
                     if isinstance(res, dict)

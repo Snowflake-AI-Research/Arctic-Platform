@@ -110,6 +110,13 @@ class _BoundedDeque:
         self._buf: deque[Any] = deque(maxlen=max_items)
         self._lock = threading.Lock()
 
+    def __getstate__(self) -> dict[str, Any]:
+        return {"_buf": self._buf, "_lock": None}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._buf = state["_buf"]
+        self._lock = threading.Lock()
+
     def push(self, item: Any) -> None:
         with self._lock:
             self._buf.append(item)
@@ -152,6 +159,9 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
+        # Lifetime counters since engine start, summed over every step.
+        # Speculative-decoding fields are also exposed via spec_decoding_totals().
+        self._spec_lock = threading.Lock()
         self._totals = EngineTotals()
 
     def set_replica_id(self, replica_id: int) -> None:
@@ -163,14 +173,16 @@ class WorkerMetricsCollector:
         iteration_stats: IterationStats | None,
     ) -> None:
         if iteration_stats is not None:
-            self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
+            with self._spec_lock:
+                self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
         spec = scheduler_stats.spec_decoding_stats
         if spec is not None:
-            self._totals.num_drafts += spec.num_drafts
-            self._totals.num_draft_tokens += spec.num_draft_tokens
-            self._totals.num_accepted_tokens += spec.num_accepted_tokens
+            with self._spec_lock:
+                self._totals.num_drafts += spec.num_drafts
+                self._totals.num_draft_tokens += spec.num_draft_tokens
+                self._totals.num_accepted_tokens += spec.num_accepted_tokens
         now = time.time()
         if (
             self.min_interval_s > 0
@@ -208,10 +220,24 @@ class WorkerMetricsCollector:
         ))
 
     def totals(self) -> dict[str, Any]:
-        return asdict(self._totals)
+        with self._spec_lock:
+            return asdict(self._totals)
 
     def drain_snapshots(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._snapshots.drain()]
+
+    def spec_decoding_totals(self) -> dict[str, int]:
+        """Cumulative speculative-decoding counters (not cleared by a drain).
+
+        Mean acceptance length over a window is
+        ``1 + d(num_accepted_tokens) / d(num_drafts)`` between two reads.
+        """
+        with self._spec_lock:
+            return {
+                "num_drafts": self._totals.num_drafts,
+                "num_draft_tokens": self._totals.num_draft_tokens,
+                "num_accepted_tokens": self._totals.num_accepted_tokens,
+            }
 
     def latest(self) -> dict[str, Any]:
         """Return the latest scheduler stats without draining the ring.
@@ -312,6 +338,18 @@ class ConcurrencyHistory:
         self._retention_s = retention_s
         self._times: list[float] = []
         self._limits: list[int] = []
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "_retention_s": self._retention_s,
+            "_times": self._times,
+            "_limits": self._limits,
+            "_lock": None,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
         self._lock = threading.Lock()
 
     def record(self, limit: int) -> None:

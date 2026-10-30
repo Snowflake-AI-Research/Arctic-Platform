@@ -18,7 +18,9 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 from torch import nn
+from transformers.cache_utils import Cache
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
@@ -31,6 +33,10 @@ from .converting_glm5_next import convert_hf_layer_to_prime
 from .converting_glm5_next import convert_hf_to_prime
 from .converting_glm5_next import convert_prime_layer_to_hf
 from .converting_glm5_next import convert_prime_to_hf
+from .fused_norms import fuse_glm5_next_norms
+from .hyper_connections import fused_hyper_connection_applies
+from .hyper_connections import hyper_connection
+from .hyper_connections import mix_streams
 
 
 def _fp8_modules_to_skip(config) -> set[str]:
@@ -76,6 +82,84 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
+def _remix(fused: bool, fp32: bool, post, comb, sublayer_out, streams) -> torch.Tensor:
+    """``post * sublayer_out + comb^T @ streams``: the residual streams after a hyper-connection site.
+
+    With ``fp32``, computed in fp32 and rounded once, as vLLM's ``mhc_post``: the fused kernel on CUDA (it has
+    ``post`` and ``comb`` gradients), else elementwise FMAs so a TF32 matmul precision never rounds ``comb``.
+    """
+    if fused or (fp32 and streams.is_cuda and streams.shape[-2] == 4):
+        return mix_streams(post, comb, sublayer_out, streams)
+    if fp32:
+        # Under autocast ``post`` can arrive in bf16; the buffer must still accumulate in fp32.
+        mixed = post.float().unsqueeze(-1) * sublayer_out.unsqueeze(-2)
+        for weights, stream in zip(comb.float().unbind(-2), streams.unbind(-2)):
+            mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
+        return mixed.to(streams.dtype)
+    dtype = streams.dtype
+    return post.to(dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2) + torch.matmul(
+        comb.to(dtype).transpose(-1, -2), streams
+    )
+
+
+# mHC base/scale and KDA decay parameters: F32 in the checkpoint and in vLLM, and too small a step for bf16 at RL lrs.
+_FP32_PARAMETERS = ("_hc.base", "_hc.scale", ".A_log", ".dt_bias")
+
+
+class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
+        routed_experts: Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The fused kernels make one pass over the streams where the reference makes several FP32 ones.
+        fused_hc = fused_hyper_connection_applies(self.attn_hc, hidden_states)
+        residual = hidden_states
+        post, comb, hidden_states = hyper_connection(self.attn_hc, residual) if fused_hc else self.attn_hc(residual)
+        # Self attn
+        hidden_states = self.input_layernorm(hidden_states)
+        topk_indices = None
+        if self.block_type == "linear_attention":
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        else:
+            hidden_states, _, topk_indices = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                prev_topk_indices=prev_topk_indices,
+                **kwargs,
+            )
+        hidden_states = _remix(fused_hc, self._fp32_parity, post, comb, hidden_states, residual)
+
+        residual = hidden_states
+        post, comb, hidden_states = hyper_connection(self.ffn_hc, residual) if fused_hc else self.ffn_hc(residual)
+        # Feed forward
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, MoE):
+            routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
+            hidden_states = self.mlp(hidden_states, routed_experts=routes)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = _remix(fused_hc, self._fp32_parity, post, comb, hidden_states, residual)
+
+        return hidden_states, topk_indices
+
+
 class Glm5NextForConditionalGenerationPrimeRL(
     Glm5NextForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -86,7 +170,11 @@ class Glm5NextForConditionalGenerationPrimeRL(
             raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
         text_config = config.text_config
-        for layer in self.model.language_model.layers:
+        fp32_parity = getattr(config, "fp32_parity", True)
+        for layer_idx, layer in enumerate(self.model.language_model.layers):
+            layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
+            layer._replay_layer_idx = layer_idx
+            layer._fp32_parity = fp32_parity
             if not isinstance(layer.mlp, Glm5NextTextMoE):
                 continue
             layer.mlp = MoE(
@@ -97,6 +185,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
                     route_norm=text_config.norm_topk_prob,
                     route_scale=text_config.routed_scaling_factor,
                     score_before_experts=False,
+                    fp32_router_logits=fp32_parity,
                     top_k=text_config.num_experts_per_tok,
                     load_balance_coeff=getattr(
                         text_config,
@@ -112,7 +201,17 @@ class Glm5NextForConditionalGenerationPrimeRL(
             )
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
+        # The checkpoint stores these in FP32 and the sampler serves them in FP32; the load copies into each
+        # parameter's dtype, so they have to be FP32 before it, whatever dtype the model is built in.
+        for name, param in self.named_parameters():
+            if self.keeps_fp32_parameter(name):
+                param.data = param.data.float()
+        fuse_glm5_next_norms(self, fp32_parity=getattr(config, "fp32_parity", True))
         self._is_vlm = True
+
+    @classmethod
+    def keeps_fp32_parameter(cls, name: str) -> bool:
+        return name.endswith(_FP32_PARAMETERS)
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:

@@ -6,8 +6,13 @@ import logging
 import os
 import random
 import re
+import shutil
+import stat
+import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -15,8 +20,10 @@ from uuid import uuid4
 import ray
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
+from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
 from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
+from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
     stage_sampling_params as _stage_dense_prompt_logprobs,
@@ -24,6 +31,10 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
 )
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
+)
+from arctic_platform.inference.vllm.startup_error import (
+    ENV_VAR as _STARTUP_ERROR_DIR_ENV,
+    earliest_startup_error,
 )
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
@@ -39,6 +50,9 @@ _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
+_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY = "router_replay_cache_device"
+_ROUTER_REPLAY_CACHE_DEVICES = ("cuda", "cpu")
+_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY = "router_replay_staging_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
@@ -59,6 +73,10 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     replaces xgrammar's stop set rather than extending it.
     """
     eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
+    return _stop_token_ids(eos, tokenizer)
+
+
+def _stop_token_ids(eos: Any, tokenizer: Any) -> tuple[int, ...]:
     stop = set()
     if isinstance(eos, int):
         stop.add(eos)
@@ -95,6 +113,124 @@ def _coerce_structured_outputs_config(engine_kwargs: dict[str, Any]) -> None:
     raw_config = engine_kwargs.get("structured_outputs_config")
     if isinstance(raw_config, Mapping):
         engine_kwargs["structured_outputs_config"] = StructuredOutputsConfig(**dict(raw_config))
+
+
+def _add_chat_reasoner(
+    vllm_config: Any, chat_reasoning_parser: str | None, *, explicit: bool
+) -> bool:
+    """Give the engine a structured-output reasoner for chat, if it has none.
+
+    Chat grammars (tool_choice, JSON answers) must wait for the end of
+    reasoning, which vLLM does only with an engine-wide reasoner. Returns True
+    when it was added here; other requests then pass ``reasoning_ended=True``,
+    which vLLM treats exactly like having no reasoner. An engine that already
+    has one keeps it; an ``explicit`` chat_reasoning_parser must then match it.
+    """
+    if not chat_reasoning_parser:
+        return False
+    config = vllm_config.structured_outputs_config
+    if config.reasoning_parser:
+        # One reasoner per engine, from the reasoning_parser kwarg,
+        # structured_outputs_config or the model's own default (gpt-oss).
+        if explicit and config.reasoning_parser != chat_reasoning_parser:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} differs from "
+                f"reasoning_parser={config.reasoning_parser!r}"
+            )
+        return False
+    config.reasoning_parser = chat_reasoning_parser
+    return True
+
+
+def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
+    """Whether ``reasoning_parser`` can run on the model's tokenizer.
+
+    vLLM checks the job's reasoning_parser in create_engine_config, but builds
+    a structured-output reasoner added afterwards only on the first request
+    with a grammar, so check that one here. A parser that is unknown or fails
+    to build is unsupported whatever its error says. Most vLLM parsers raise
+    when the think tokens are missing; some build anyway with
+    ``start_token_id`` or ``end_token_id`` left None.
+    """
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tokenizers import cached_tokenizer_from_config
+
+    tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
+    if tokenizer is None:
+        # skip_tokenizer_init: no tokenizer to check, and no chat to render.
+        return True
+    try:
+        parser_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+        parser = parser_cls(tokenizer=tokenizer)
+    except Exception as exc:
+        logger.warning(
+            "reasoning_parser=%r cannot run on this tokenizer (%s: %s)",
+            reasoning_parser,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    missing = [
+        name
+        for name in ("start_token_id", "end_token_id")
+        if hasattr(parser, name) and getattr(parser, name) is None
+    ]
+    if missing:
+        logger.warning(
+            "reasoning_parser=%r finds no think tokens in this tokenizer (%s is None)",
+            reasoning_parser,
+            ", ".join(missing),
+        )
+        return False
+    return True
+
+
+def _resolve_chat_mode(
+    vllm_config: Any, chat_reasoning_parser: str | None, tool_call_parser: str | None
+) -> tuple[ChatModel | None, bool]:
+    """Chat parsers for this engine, and whether chat's reasoner was added to it.
+
+    May add chat's structured-output reasoner to ``vllm_config`` (see
+    ``_add_chat_reasoner``). The chat model is None when chat is unsupported.
+    """
+    chat_model = resolve_chat_model(
+        vllm_config.model_config.architecture,
+        reasoning_parser=chat_reasoning_parser,
+        tool_call_parser=tool_call_parser,
+    )
+    if (
+        chat_model is not None
+        and chat_model.reasoning_parser
+        and not vllm_config.structured_outputs_config.reasoning_parser
+        and not _tokenizer_runs_reasoner(vllm_config, chat_model.reasoning_parser)
+    ):
+        if chat_reasoning_parser is not None:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
+                "this model's tokenizer (an unknown parser, or the tokenizer lacks its "
+                "think tokens)"
+            )
+        logger.warning(
+            "Chat runs without reasoning_parser=%r",
+            chat_model.reasoning_parser,
+        )
+        chat_model = replace(chat_model, reasoning_parser=None)
+    chat_only_reasoner = _add_chat_reasoner(
+        vllm_config,
+        chat_model.reasoning_parser if chat_model is not None else None,
+        explicit=chat_reasoning_parser is not None,
+    )
+    if chat_model is not None:
+        # Chat parses with the reasoner the engine gates grammars on,
+        # wherever it came from (the table, chat_reasoning_parser,
+        # reasoning_parser, structured_outputs_config or the model's
+        # default).
+        chat_model = replace(
+            chat_model,
+            reasoning_parser=vllm_config.structured_outputs_config.reasoning_parser
+            or None,
+        )
+    return chat_model, chat_only_reasoner
 
 
 def _optional_bool(value: Any, *, name: str) -> bool | None:
@@ -149,6 +285,65 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return value
 
 
+def _console_tail(max_bytes: int = 4096) -> str:
+    """Tail this process's stdout/stderr when they are files (a Ray worker's logs).
+
+    vLLM engine-core and TP worker subprocesses inherit them and print the startup root
+    cause there; vLLM's own exception only says "See root cause above".
+    """
+    tails = []
+    for fd in (1, 2):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            with open(f"/proc/self/fd/{fd}", "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+                tails.append(f.read().decode(errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(tails)
+
+
+def _begin_engine_startup_capture() -> str | None:
+    """Point this attempt's engine processes at a fresh directory for their startup failure."""
+    try:
+        directory = tempfile.mkdtemp(prefix="arctic-engine-startup-")
+    except OSError as exc:
+        logger.info("Engine startup failures are not recorded for this attempt: %s", exc)
+        return None
+    os.environ[_STARTUP_ERROR_DIR_ENV] = directory
+    return directory
+
+
+def _end_engine_startup_capture(directory: str | None) -> None:
+    os.environ.pop(_STARTUP_ERROR_DIR_ENV, None)
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeError | None:
+    """vLLM's generic startup error with the earliest engine process's own failure appended.
+
+    The root has to be in the message: Ray drops ``__cause__``, and dss-platform's
+    classifier matches on the error's type and ``str()``, which leaves out
+    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
+    replaced, so every other type keeps the type a classifier matches on. Returns
+    None, so the original is raised as it is, for any other type, when there is no
+    record, or when reading one fails; the last two are logged.
+    """
+    if directory is None or type(exc) is not RuntimeError:
+        return None
+    try:
+        root_cause = earliest_startup_error(directory)
+    except Exception:
+        logger.info("Engine startup root cause not appended: reading %s failed", directory, exc_info=True)
+        return None
+    if root_cause is None:
+        logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
+        return None
+    return RuntimeError(f"{exc}\n{root_cause}")
+
+
 def _is_address_in_use_error(exc: BaseException) -> bool:
     stack: list[BaseException] = [exc]
     seen: set[int] = set()
@@ -172,6 +367,21 @@ def _is_address_in_use_error(exc: BaseException) -> bool:
         if _BASE_EXCEPTION_GROUP is not None and isinstance(current, _BASE_EXCEPTION_GROUP):
             stack.extend(current.exceptions)
     return False
+
+
+def _with_rank_recv_l2_sq(results: list[Any]) -> dict[str, Any]:
+    """Rank 0's weight-load result, plus every TP rank's ``recv_l2_sq``.
+
+    Each TP rank receives the full model on its own, so each rank's received
+    checksum must match the trainer's; rank 0's alone does not prove the others.
+    """
+    if not results:
+        return {}
+    head = dict(results[0])
+    head["rank_recv_l2_sq"] = [
+        r.get("recv_l2_sq") if isinstance(r, dict) else None for r in results
+    ]
+    return head
 
 
 def _ensure_arctic_vllm_patches() -> None:
@@ -224,6 +434,11 @@ def _create_async_engine_args(
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
+    text_config_overrides = engine_kwargs.pop("text_config_overrides", None)
+    if text_config_overrides:
+        from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+        engine_kwargs["hf_overrides"] = text_config_hf_overrides(engine_kwargs["model"], text_config_overrides)
 
     try:
         engine_args = engine_args_cls(**engine_kwargs)
@@ -264,12 +479,42 @@ def _create_async_engine_args(
         )
 
 
+def _validate_mla_lora_targets(model_config: Any, peft_config: dict[str, Any] | None) -> None:
+    # vLLM's MLA attention calls the unwrapped kv_b_proj it was built with and decodes with weights absorbed from it.
+    targets = (peft_config or {}).get("target_modules", [])
+    names = [targets] if isinstance(targets, str) else targets
+    if any("kv_b_proj" in name or name == "all-linear" for name in names) and model_config.use_mla:
+        raise ValueError(
+            "LoRA target kv_b_proj is absorbed into MLA attention weights and cannot be served; "
+            "remove it from the training and sampling LoRA targets and retrain the adapter."
+        )
+
+
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
-        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(
-            _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY
+    for key in (
+        _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
+        _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY,
+        _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY,
+    ):
+        if key in engine_kwargs:
+            out[key] = engine_kwargs.pop(key)
+    device = out.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY)
+    if device is not None and device not in _ROUTER_REPLAY_CACHE_DEVICES:
+        raise ValueError(
+            f"{_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY} must be one of "
+            f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
         )
+    staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
+    if staging_bytes is not None:
+        # JSON transports (Cortex Training among them) can deliver an integer as a whole float.
+        if isinstance(staging_bytes, float) and staging_bytes.is_integer():
+            staging_bytes = int(staging_bytes)
+        if isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0:
+            raise ValueError(
+                f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
+            )
+        out[_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY] = staging_bytes
     return out
 
 
@@ -529,6 +774,77 @@ class WorkerLifecycleState(str, Enum):
     UNINITIALIZED = "uninitialized"
     READY = "ready"
     SLEEPING = "sleeping"
+    # Weights remapped; KV cache not allocated yet. Colocated sync wakes in
+    # two calls (``["weights"]``, then ``["kv_cache"]``) and generate is only
+    # legal after the second one.
+    WEIGHTS_READY = "weights_ready"
+
+
+def _normalize_wake_tags(tags: list[str] | None) -> set[str] | None:
+    if tags is None:
+        return None
+    return set(tags)
+
+
+def _is_full_wake(tags: list[str] | None) -> bool:
+    tag_set = _normalize_wake_tags(tags)
+    return tag_set is None or tag_set >= {"weights", "kv_cache"}
+
+
+def _is_weights_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"weights"}
+
+
+def _is_kv_only_wake(tags: list[str] | None) -> bool:
+    return _normalize_wake_tags(tags) == {"kv_cache"}
+
+
+_ACTOR_LOG_HANDLER_MARK = "_arctic_actor_handler"
+
+
+def _ensure_actor_logging(level: int = logging.INFO) -> str:
+    """Give the ``arctic_platform.inference`` logger somewhere to go inside this actor.
+
+    DSS installs its structured root pipeline in zone and driver processes, but
+    ``InferenceWorker`` is a plain ``@ray.remote`` actor and nothing configures
+    logging there.  The root logger keeps its default state, so
+    ``logging.lastResort`` takes over: WARNING and above, unformatted, and
+    everything at INFO discarded.  That is why no ``logger.info`` from
+    ``semip_engine`` has ever appeared in a collected log, including the
+    materialize timing it has emitted since that feature shipped.
+
+    **The level matters as much as the handler.**  ``arctic_platform.inference`` sits at
+    ``NOTSET``, so its effective level is inherited from root's ``WARNING`` and
+    INFO records are dropped before any handler is consulted.  Attaching a
+    handler alone changes nothing.
+
+    Returns a short description of what it did, for the caller to log.  Never
+    raises: losing the log costs evidence, not correctness, and this runs in
+    ``__init__`` where an exception would kill actor construction.
+    """
+    try:
+        if logging.getLogger().handlers:
+            # Something already configured the root pipeline (DSS's own
+            # setup_logging in a driver-hosted actor, or a prior call here), so
+            # propagation already reaches a sink.  Only the level may need help.
+            pkg = logging.getLogger("arctic_platform.inference")
+            if pkg.level == logging.NOTSET:
+                pkg.setLevel(level)
+            return "root already configured; level ensured"
+        pkg = logging.getLogger("arctic_platform.inference")
+        for h in pkg.handlers:
+            if getattr(h, _ACTOR_LOG_HANDLER_MARK, False):
+                return "already attached"
+        handler = logging.StreamHandler(sys.stdout)
+        setattr(handler, _ACTOR_LOG_HANDLER_MARK, True)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s "
+            "%(filename)s:%(lineno)d %(message)s"))
+        pkg.addHandler(handler)
+        pkg.setLevel(level)
+        return "attached stdout handler to arctic_platform.inference"
+    except Exception as exc:  # noqa: BLE001
+        return f"failed: {exc!r}"
 
 
 @ray.remote
@@ -536,10 +852,20 @@ class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
 
     def __init__(self) -> None:
+        # First, so that everything below is loggable.  Reported rather than
+        # assumed: a StreamHandler here reaches Ray's worker log, which is not
+        # the file most semi-p debugging reads, so this line is how you find out
+        # whether the records land anywhere you collect.
+        logger.info("InferenceWorker logging: %s", _ensure_actor_logging())
         self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
+        self._chat_only_reasoner = False
+        # Chat parsers for this engine's model; None when chat is unsupported.
+        self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._router_replay_tx_on_host = False
+        self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
         self._router_replay_shm_entry: dict[str, Any] | None = None
@@ -582,7 +908,8 @@ class InferenceWorker(StreamingWorkerMixin):
         final_output = None
         generate_kwargs: dict[str, Any] = {
             "request_id": request_id,
-            "reasoning_ended": reasoning_ended,
+            # A grammar applies from the first token, as on an engine without chat's reasoner.
+            "reasoning_ended": True if self._chat_only_reasoner else reasoning_ended,
         }
         if lora_request is not None:
             generate_kwargs["lora_request"] = lora_request
@@ -617,8 +944,38 @@ class InferenceWorker(StreamingWorkerMixin):
         # `reasoning_parser` is used by vLLM structured outputs to avoid
         # constraining reasoning tokens.
         reasoning_parser_name = engine_kwargs.get("reasoning_parser")
+        # Chat-mode overrides of CHAT_MODELS (see ModelConfig), not engine args.
+        # chat_reasoning_parser leaves /generate (think prefill, reasoning
+        # split, action masks) on the job's own parser.
+        tool_call_parser = engine_kwargs.pop("tool_call_parser", None)
+        chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+        lora_peft_config = engine_kwargs.pop("lora_peft_config", None)
+        checkpoint_peft_config = None
+        if lora_adapter_path:
+            import json
+            with open(os.path.join(lora_adapter_path, "adapter_config.json")) as adapter_file:
+                checkpoint_peft_config = json.load(adapter_file)
+
+        # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
+        # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
+        # kwargs); if set, the loop below restores where it would build.
+        semi_p = bool(engine_kwargs.pop("semi_p", False))
+        # Popped unconditionally even though it is no longer a config field: a
+        # dss that predates the derived image cache still sends it, and
+        # BaseConfig's extra="allow" would carry it into AsyncEngineArgs.
+        engine_kwargs.pop("semi_p_model_dir", None)
+        # The other node-partitions of an engine whose TP group spans pods. Popped the
+        # same way and for the same reason: AsyncEngineArgs rejects what it
+        # does not know, and Ray actor handles are certainly that.
+        semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
+
+        from arctic_platform.inference.semi_persistence import matched_baseline
+        if not semi_p and matched_baseline.requested():
+            changed = matched_baseline.apply(engine_kwargs)
+            logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
+                        matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
 
         # Force-load vLLM general_plugins before constructing AsyncEngineArgs.
         # vLLM normally calls load_general_plugins() in
@@ -651,6 +1008,7 @@ class InferenceWorker(StreamingWorkerMixin):
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
         for attempt in range(1, max_attempts + 1):
+            startup_error_dir = _begin_engine_startup_capture()
             try:
                 attempt_kwargs = dict(engine_kwargs)
                 engine_args = _create_async_engine_args(
@@ -674,18 +1032,36 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                _validate_mla_lora_targets(vllm_config.model_config, lora_peft_config)
+                _validate_mla_lora_targets(vllm_config.model_config, checkpoint_peft_config)
+                self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
+                    vllm_config, chat_reasoning_parser, tool_call_parser
+                )
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
-                self.llm = AsyncLLM.from_vllm_config(
-                    vllm_config,
-                    stat_loggers=[RingStatLogger],
-                )
+                if semi_p:
+                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
+                else:
+                    self.llm = AsyncLLM.from_vllm_config(
+                        vllm_config,
+                        stat_loggers=[RingStatLogger],
+                    )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
-                if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                # semi_p is not retried here: the restore retries its own
+                # ports, so another attempt would only repeat a whole restore.
+                if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    tail = _console_tail()
+                    startup_exc = _engine_startup_error(exc, startup_error_dir)
+                    target = startup_exc if startup_exc is not None else exc
+                    if len(tail) > 0:
+                        target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                    if startup_exc is not None:
+                        raise startup_exc from exc
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
@@ -697,6 +1073,8 @@ class InferenceWorker(StreamingWorkerMixin):
                     exc_info=True,
                 )
                 await asyncio.sleep(delay_s)
+            finally:
+                _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
@@ -746,12 +1124,22 @@ class InferenceWorker(StreamingWorkerMixin):
         self._reasoning_parser = parser_cls(self.llm.get_tokenizer())
         logger.info("Worker %d reasoning parser enabled: %s", os.getpid(), reasoning_parser_name)
 
-    def _is_reasoning_open(self, prompt_ids: Sequence[int]) -> bool:
+    def _is_reasoning_open(self, prompt_ids: Any) -> bool:
+        """Whether the last think-start token comes after the last think-end token."""
         parser = self._reasoning_parser
         start_token_id = getattr(parser, "start_token_id", None)
         end_token_id = getattr(parser, "end_token_id", None)
         if start_token_id is None or end_token_id is None:
             return False
+        if is_token_tensor(prompt_ids):
+            import numpy as np
+
+            ids = prompt_ids.numpy()
+            starts = np.flatnonzero(ids == start_token_id)
+            if start_token_id == end_token_id:
+                return starts.size > 0
+            ends = np.flatnonzero(ids == end_token_id)
+            return (starts[-1] if starts.size else -1) > (ends[-1] if ends.size else -1)
         last_start = -1
         last_end = -1
         for index, token_id in enumerate(prompt_ids):
@@ -763,10 +1151,12 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def _prefill_think_for_generation(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         *,
         enable_thinking: bool | None,
     ) -> tuple[str | list[int], list[int], bool | None]:
+        if is_token_tensor(prompt):
+            return self._prefill_think_for_token_tensor(prompt, enable_thinking=enable_thinking)
         if isinstance(prompt, list):
             prompt_ids = [int(token_id) for token_id in prompt]
         else:
@@ -795,6 +1185,25 @@ class InferenceWorker(StreamingWorkerMixin):
             prompt_text = f"{prompt_text}{start_token}"
         return prompt_text, [], False
 
+    def _prefill_think_for_token_tensor(
+        self,
+        prompt: Any,
+        *,
+        enable_thinking: bool | None,
+    ) -> tuple[list[int], list[int], bool | None]:
+        """The token-list contract, for a tensor: ``tolist()`` builds the one list vLLM gets."""
+        prompt_ids = prompt.tolist()
+        if enable_thinking is None:
+            return prompt_ids, prompt_ids, self._reasoning_ended_for_prompt(prompt_ids)
+        if not enable_thinking:
+            return prompt_ids, prompt_ids, True
+        start_token_id = getattr(self._reasoning_parser, "start_token_id", None)
+        if start_token_id is None:
+            return prompt_ids, prompt_ids, None
+        if not self._is_reasoning_open(prompt):
+            prompt_ids.append(int(start_token_id))
+        return prompt_ids, prompt_ids, False
+
     def _reasoning_ended_for_prompt(self, prompt_ids: list[int]) -> bool | None:
         parser = self._reasoning_parser
         if parser is None or not hasattr(parser, "is_reasoning_end"):
@@ -811,8 +1220,17 @@ class InferenceWorker(StreamingWorkerMixin):
         from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
         import torch
 
-        # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
-        if _ray_blanked_cuda_visible_devices():
+        router_replay_engine_kwargs = router_replay_engine_kwargs or {}
+        self._router_replay_tx_on_host = (
+            router_replay_engine_kwargs.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY, "cuda") == "cpu"
+        )
+        self._router_replay_staging_bytes = router_replay_engine_kwargs.get(
+            _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY
+        )
+        if self._router_replay_tx_on_host:
+            tx_device = torch.device("cpu")
+        elif _ray_blanked_cuda_visible_devices():
+            # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
             tx_device = torch.device("cpu")
             logger.warning(
                 "router-replay TX cache on CPU (CUDA_VISIBLE_DEVICES=%r)",
@@ -821,7 +1239,7 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             tx_device = torch.device("cuda:0")
         max_bytes = int(
-            (router_replay_engine_kwargs or {}).get(
+            router_replay_engine_kwargs.get(
                 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
                 16 * 1024**3,
             )
@@ -831,7 +1249,11 @@ class InferenceWorker(StreamingWorkerMixin):
             max_bytes=max_bytes,
         )
         self._replica_label = f"pid={os.getpid()}"
-        logger.info("router-replay TX cache initialized max_bytes=%d", max_bytes)
+        logger.info(
+            "router-replay TX cache initialized max_bytes=%d device=%s",
+            max_bytes,
+            "host" if self._router_replay_tx_on_host else tx_device,
+        )
 
     def _register_router_replay_shm(
         self,
@@ -903,11 +1325,19 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
-    async def generate(self, prompt: str | list[int], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
+        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
         if getattr(self, "_stream_cleanup_failed", False):
             raise RuntimeError("Worker streaming cleanup unconfirmed")
+        # Anything else would be stringified and generated from as text.
+        if is_token_tensor(prompt):
+            check_token_tensor(prompt)
+        elif not isinstance(prompt, (str, list)):
+            raise TypeError(
+                f"Expected a text prompt, a token-id list or a 1-D token-id tensor, got {type(prompt).__name__}"
+            )
 
         from vllm import SamplingParams
 
@@ -1016,7 +1446,9 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def is_healthy(self) -> bool:
         return self.llm is not None and self.state in (
-            WorkerLifecycleState.READY, WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.WEIGHTS_READY,
         )
 
     def get_state(self) -> str:
@@ -1048,6 +1480,7 @@ class InferenceWorker(StreamingWorkerMixin):
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
             "engine_totals": get_collector().totals(),
+            "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
@@ -1058,6 +1491,10 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def pid(self) -> int:
         return os.getpid()
+
+    def get_node_id(self) -> str:
+        """The Ray node (pod) this actor runs on, which ReplicaPool numbers slots by."""
+        return ray.get_runtime_context().get_node_id()
 
     async def init_router_replay(
         self,
@@ -1090,7 +1527,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 f"is_available={torch.cuda.is_available()})"
             )
         tx_device = torch.device("cuda:0")
-        if self._router_replay_tx.device != tx_device:
+        if not self._router_replay_tx_on_host and self._router_replay_tx.device != tx_device:
             max_bytes = self._router_replay_tx.max_bytes
             self._router_replay_tx = RouterReplayCacheTX(
                 device=tx_device,
@@ -1108,6 +1545,7 @@ class InferenceWorker(StreamingWorkerMixin):
             master_port=master_port,
             device=tx_device,
             is_server=is_server,
+            staging_bytes=self._router_replay_staging_bytes,
         )
         return {"status": "ok", "rank": rank, "world_size": world_size}
 
@@ -1145,7 +1583,10 @@ class InferenceWorker(StreamingWorkerMixin):
         Args:
             level: 1 = free KV cache only, 2 = free KV cache + weights.
         """
-        if self.state != WorkerLifecycleState.READY:
+        if self.state not in (
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.WEIGHTS_READY,
+        ):
             raise RuntimeError(f"Cannot sleep: worker state is {self.state.value}")
         await self.llm.collective_rpc("sleep", kwargs={"level": level})
         self.state = WorkerLifecycleState.SLEEPING
@@ -1155,21 +1596,66 @@ class InferenceWorker(StreamingWorkerMixin):
     async def wake_up(self, tags: list[str] | None = None) -> dict[str, Any]:
         """Restore GPU memory (reverse of :meth:`sleep`).
 
+        A colocated sync calls this twice: ``tags=["weights"]`` leaves the
+        worker in ``weights_ready`` with the KV cache still discarded, then
+        ``tags=["kv_cache"]`` allocates the cache and returns to ``ready``.
+        Treating the first call as a full wake drops the second one, and the
+        next generate reads the freed KV cache.
+
         Args:
-            tags: What to restore, e.g. ``["weights"]`` or
-                  ``["weights", "kv_cache"]``.  ``None`` restores everything.
+            tags: What to restore, e.g. ``["weights"]`` or ``["kv_cache"]``.
+                ``None`` or both tags restores everything.
         """
+        if self.state == WorkerLifecycleState.READY:
+            return {"status": "already_ready"}
+
+        if self.state == WorkerLifecycleState.WEIGHTS_READY:
+            if _is_weights_only_wake(tags):
+                return {"status": "already_weights_ready"}
+            if not (_is_kv_only_wake(tags) or _is_full_wake(tags)):
+                raise RuntimeError(
+                    f"Cannot wake up from weights_ready with tags={tags!r}; "
+                    "use tags=['kv_cache'] or a full wake"
+                )
+            return await self._wake_collective(
+                tags=["kv_cache"],
+                target_state=WorkerLifecycleState.READY,
+            )
+
         if self.state != WorkerLifecycleState.SLEEPING:
-            if self.state == WorkerLifecycleState.READY:
-                return {"status": "already_ready"}
             raise RuntimeError(f"Cannot wake up: worker state is {self.state.value}")
+
+        if _is_kv_only_wake(tags):
+            raise RuntimeError(
+                "Cannot wake kv_cache only from sleeping; wake weights first "
+                "(tags=['weights'])"
+            )
+
+        target = (
+            WorkerLifecycleState.READY
+            if _is_full_wake(tags)
+            else WorkerLifecycleState.WEIGHTS_READY
+        )
+        return await self._wake_collective(tags=tags, target_state=target)
+
+    async def _wake_collective(
+        self,
+        tags: list[str] | None,
+        target_state: WorkerLifecycleState,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         if tags is not None:
             kwargs["tags"] = tags
         await self.llm.collective_rpc("wake_up", kwargs=kwargs)
-        self.state = WorkerLifecycleState.READY
-        logger.info("Worker %d awake", os.getpid())
-        return {"status": "ready"}
+        self.state = target_state
+        logger.info(
+            "Worker %d awake (tags=%s, state=%s)",
+            os.getpid(),
+            tags,
+            self.state.value,
+        )
+        status = "ready" if target_state == WorkerLifecycleState.READY else "weights_ready"
+        return {"status": status}
 
     # ------------------------------------------------------------------
     # Weight sync
@@ -1253,7 +1739,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, direct_mode, reverse),
         )
-        return results[0] if results else {}
+        return _with_rank_recv_l2_sq(results)
 
     @stream_lifecycle_change
     async def sync_weights_broadcast(
@@ -1354,6 +1840,75 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         return results[0] if results else {}
 
+    async def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict[str, Any]:
+        """Load weights from CUDA IPC handles (zero-copy, same GPU)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc", args=(ipc_payload,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_cuda_ipc_chunk(
+        self, ipc_payload: dict, validate_names=None,
+    ) -> dict[str, Any]:
+        """Stream a single CUDA IPC param chunk (low-memory weight sync)."""
+        results = await self.llm.collective_rpc(
+            "load_weights_cuda_ipc_chunk",
+            args=(ipc_payload, validate_names),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def load_weights_from_shm_path(self, path: str) -> dict[str, Any]:
+        """Load weights from a shared-memory file path."""
+        results = await self.llm.collective_rpc(
+            "load_weights_from_shm_path", args=(path,),
+        )
+        return _with_rank_recv_l2_sq(results)
+
+    async def compute_weight_norm(self) -> dict[str, Any]:
+        """Global L2 norm of the engine's live weights, summed across TP ranks.
+
+        Tensor parallelism and a quantized engine return an error result with
+        ``disable`` set, rather than a norm. Adding the ranks up is only a whole
+        model when every tensor is sharded, and a tensor each rank keeps whole (an
+        ``RMSNorm`` weight, a ``ReplicatedLinear`` weight, a row-parallel bias) would
+        land in the total once per rank. A sleeping sampler has those weights unmapped;
+        reading them is a CUDA fault that kills the engine, so that state returns an
+        error and does not set ``disable`` (sleep is temporary). This is a debug
+        check: the weight sync's own ``checksum_match`` shows the sampler received
+        the trainer's weights, at any TP size.
+        """
+        if self.state not in (WorkerLifecycleState.READY, WorkerLifecycleState.WEIGHTS_READY):
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": f"weight norm is not read while the sampler is {self.state.value}",
+            }
+        results = await self.llm.collective_rpc("compute_weight_norm")
+        for result in results:
+            if result.get("error_code"):
+                unavailable = {
+                    "error_code": "weight_norm_unavailable",
+                    "error": result.get("error", result["error_code"]),
+                }
+                if result.get("disable"):
+                    unavailable["disable"] = True
+                return unavailable
+        tp_size = max((r.get("tp_size", 1) for r in results), default=1)
+        if tp_size > 1:
+            return {
+                "error_code": "weight_norm_unavailable",
+                "error": (
+                    "compute_weight_norm is exact only at tensor_parallel_size=1, and this "
+                    f"engine runs tensor_parallel_size={tp_size}. Replicated tensors would be "
+                    "counted once per rank, so the norm would not be comparable to the "
+                    "training engine's. The weight sync result's checksum_match verifies "
+                    "the sync at any tensor_parallel_size."
+                ),
+                "disable": True,
+            }
+        sq_sum = sum(r["sq_sum"] for r in results)
+        num_params = sum(r["num_params"] for r in results)
+        return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
+
     async def close_weight_sync(self) -> dict[str, Any]:
         """Destroy persistent NCCLEngine on all TP workers."""
         results = await self.llm.collective_rpc("close_weight_sync")
@@ -1362,6 +1917,10 @@ class InferenceWorker(StreamingWorkerMixin):
     def shutdown(self) -> None:
         self._cleanup_registered_router_replay_shm()
         if self.llm is not None:
+            # semi_p engine holds an out-of-process Instance; tear it down.
+            close = getattr(self.llm, "close", None)
+            if callable(close):
+                close()
             del self.llm
             self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED

@@ -41,7 +41,7 @@ class MoEDeepSpeedAdapter:
     shared_expert_type: type[nn.Module]
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
-    extra_weight_iterators: tuple[tuple[str, Callable[[nn.Module], Callable]], ...] = ()
+    vllm_weight_export: Callable[[nn.Module], Callable] | None = None
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -149,11 +149,39 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
+    """Gather an EP-sharded tensor to rank 0's host memory with one GPU piece buffer per rank."""
+    import torch.distributed as dist
+
+    ranks = dist.get_process_group_ranks(ep_group)
+    if 0 not in ranks:
+        return None
+    is_master = dist.get_rank() == 0
+    world, rows = dist.get_world_size(group=ep_group), local.shape[0]
+    pieces = local.tensor_split(world)
+    full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+    received = torch.empty_like(pieces[0])
+    start = 0
+    for piece in pieces:
+        for group_rank, rank in enumerate(ranks):
+            if rank == 0:
+                if full is not None:
+                    full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
+                continue
+            buffer = piece if dist.get_rank() == rank else received[: len(piece)]
+            dist.broadcast(buffer, src=rank, group=ep_group)
+            if full is not None:
+                full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
+        start += len(piece)
+    return full
+
+
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
-    convert_layer_to_hf = getattr(model_type, "convert_layer_to_hf", None)
-    if convert_layer_to_hf is None:
+    if getattr(model_type, "convert_layer_to_hf", None) is None:
         raise RuntimeError(f"build_iter_full_hf_weights requires {model_type.__name__}.convert_layer_to_hf")
+    # Bound from the instance so a family whose layer mapping depends on its config can read it.
+    convert_layer_to_hf = model.convert_layer_to_hf
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
@@ -170,7 +198,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def iterator():
+    def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
@@ -181,8 +209,11 @@ def build_iter_full_hf_weights(model: nn.Module):
             for parameter in module.parameters(recurse=False)
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
-            if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
+            if not include_skipped and (
+                getattr(tensor, "_dss_skip_weight_sync", False)
+                or id(tensor) in skipped_parameter_ids
+            ):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
@@ -195,6 +226,13 @@ def build_iter_full_hf_weights(model: nn.Module):
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     local = tensor.data.contiguous()
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
+                        full = _gather_ep_shards_to_rank0_host(local, ep_group)
+                        if is_master:
+                            layer_state[name] = full
+                        del full
+                        continue
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
                     dist.all_gather(shards, local, group=ep_group)
                     if is_master:
@@ -286,9 +324,16 @@ def load_moe_model_for_deepspeed(
     )
     count = tag_expert_params_for_deepspeed(model, ep_group_name)
     get_logger().info(f"Tagged {count} expert parameters with group_name='{ep_group_name}', allreduce=False")
-    model._iter_full_hf_weights = build_iter_full_hf_weights(model)
-    for attribute, builder in adapter.extra_weight_iterators:
-        setattr(model, attribute, builder(model))
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+
+    register_weight_export(
+        model,
+        WeightExportContract(
+            hf=build_iter_full_hf_weights,
+            vllm=adapter.vllm_weight_export,
+        ),
+    )
     return model
 
 

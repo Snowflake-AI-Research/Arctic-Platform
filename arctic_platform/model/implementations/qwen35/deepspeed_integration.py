@@ -241,6 +241,7 @@ def _build_model_config(
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
+        fp32_parity=options.fp32_parity,
         debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 
@@ -259,9 +260,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_type=FeedForward,
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
-        extra_weight_iterators=(
-            ("_iter_full_vllm_weights", _build_iter_full_vllm_weights),
-        ),
+        vllm_weight_export=_build_iter_full_vllm_weights,
     )
 
 
@@ -359,7 +358,7 @@ def _generic_adapter() -> MoEDeepSpeedAdapter:
     return replace(
         _adapter(),
         apply_sequence_parallelism=_apply_generic_sequence_parallelism,
-        extra_weight_iterators=(("_iter_full_vllm_weights", build_iter_full_vllm_weights),),
+        vllm_weight_export=build_iter_full_vllm_weights,
     )
 
 

@@ -35,6 +35,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from arctic_platform.common.packing import pack_microbatch
+from arctic_platform.common.packing import pad_packed_microbatch
+from arctic_platform.common.packing import select_rows
+from arctic_platform.common.packing import token_shard
+from arctic_platform.common.packing import window_cu_seqlens
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
@@ -56,11 +61,15 @@ from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_ROLLOUT
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_METRICS
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_RECOMPUTE
 from arctic_platform.rl.processors.grpo import _apply_m2po_masking
+from arctic_platform.rl.processors.grpo import _grpo_metrics_callback
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
 from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
+from arctic_platform.rl.processors.grpo import _sampler_kl
 from arctic_platform.rl.processors.grpo import compute_prox_logp_approximations
 from arctic_platform.rl.processors.grpo import grpo_loss
+from arctic_platform.rl.processors.packing import pack_sequences
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
 
 
@@ -680,6 +689,23 @@ class TestMigratedGrpo(TestCasePlus):
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-1 / 3, 1 / 3, 1 / 3]]), rtol=0, atol=1e-6)
 
+    def test_ratio_mask_kept_k3_sum_covers_only_kept_tokens(self):
+        # log ratios ln2, -ln2 (kept), ln4 (dropped above 3.0), and one token outside loss_mask.
+        values = torch.full((1, 4), -1.0)
+        context = {
+            "old_log_probs_shifted": torch.tensor(
+                [[-1.0 - math.log(2), -1.0 + math.log(2), -1.0 - math.log(4), -3.0]]
+            ),
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.tensor([[True, True, True, False]]),
+        }
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 10.0, "ratio_mask_bounds_pos": [0.25, 3.0]}
+        _, metrics = grpo_loss({"logprobs": values}, context, {}, config, "cpu")
+        self.assertEqual(metrics["ratio_trainable_token_count"], 3.0)
+        self.assertEqual(metrics["ratio_mask_dropped_token_count"], 1.0)
+        # k3(ln2) + k3(-ln2) = (1 - ln2) + (ln2 - 1/2)
+        self.assertAlmostEqual(metrics["ratio_mask_kept_k3_sum"], 0.5, places=6)
+
     def test_packed_ratio_sequence_gate_uses_per_sequence_totals(self):
         values = torch.tensor([-0.5, -1.0, -1.0], requires_grad=True)
         context = {
@@ -1204,6 +1230,197 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["teacher_clipped_log_ratio_sum"], 0.0)
         loss.backward()
         torch_assert_close(values.grad, torch.zeros_like(values), rtol=0, atol=0)
+
+    def test_sampler_kl_raises_every_sampled_token_and_skips_nll_tokens(self):
+        # Token 1 has zero advantage and still gets the pull; token 3 is an NLL target, not a sampled token.
+        sampler_logprobs = torch.tensor([[-1.5, -1.0, -0.5, -4.0]])
+        nll_mask = torch.tensor([[False, False, False, True]])
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0}
+        for name, nll in (("grpo", None), ("ap_grpo", None), ("ap_grpo_mixed_v1", nll_mask)):
+            context = {
+                "old_log_probs_shifted": sampler_logprobs,
+                "advantages": torch.tensor([[1.0, 0.0, -1.0, 0.0]]),
+                "loss_mask": torch.ones((1, 4), dtype=torch.bool),
+            }
+            if nll is not None:
+                context["nll_mask"] = nll
+            sampled = torch.ones((1, 4), dtype=torch.bool) if nll is None else ~nll
+            runs = {}
+            for coef in (0.0, 0.25):
+                values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+                loss, metrics = LOSS_FNS[name](
+                    {"logprobs": values}, context, {}, {**config, "sampler_kl_coef": coef}, "cpu"
+                )
+                loss.backward()
+                runs[coef] = (loss.detach(), values.grad, metrics)
+            with self.subTest(name=name):
+                k1 = torch.where(sampled, sampler_logprobs - values.detach(), 0.0).sum() / 4
+                torch_assert_close(runs[0.25][0] - runs[0.0][0], 0.25 * k1)
+                torch_assert_close(runs[0.25][1] - runs[0.0][1], torch.where(sampled, -0.25 / 4, 0.0))
+                self.assertFalse(any(key.startswith("sampler_kl") for key in runs[0.0][2]))
+                metrics = dict(runs[0.25][2])
+                self.assertEqual(metrics["sampler_kl_coef"], 0.25)
+                self.assertEqual(metrics["sampler_kl_token_count"], float(sampled.sum()))
+                self.assertAlmostEqual(metrics["sampler_kl_sum"], float(k1 * 4), places=6)
+                _grpo_metrics_callback([], metrics)
+                self.assertAlmostEqual(metrics["sampler_kl"], float(k1 * 4 / sampled.sum()), places=6)
+        context.pop("nll_mask")
+        for key, invalid in (
+            ("sampler_kl_coef", -0.01),
+            ("sampler_kl_coef", float("inf")),
+            ("sampler_kl_coef", True),
+            ("sampler_kl_type", "low_var_kl"),
+            ("sampler_kl_ratio_cap", 1.0),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, key):
+                grpo_loss({"logprobs": values.detach()}, context, {}, {key: invalid}, "cpu")
+        weights = torch.tensor([[1.0, 0.0, 2.0, 0.5]])
+        values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+        grpo_loss(
+            {"logprobs": values}, {**context, "sampler_kl_weights": weights}, {}, {"sampler_kl_coef": 0.25}, "cpu"
+        )[0].backward()
+        unweighted = torch.tensor([[-1.0, -2.0, -0.5, -3.0]], requires_grad=True)
+        grpo_loss({"logprobs": unweighted}, context, {}, {}, "cpu")[0].backward()
+        torch_assert_close(values.grad - unweighted.grad, -0.25 * weights / 4)
+        with self.assertRaisesRegex(ValueError, "sampler_kl_weights must be a finite"):
+            grpo_loss({"logprobs": values.detach()}, {**context, "sampler_kl_weights": -weights}, {}, {}, "cpu")
+        no_sampler = {key: value for key, value in context.items() if key != "old_log_probs_shifted"}
+        with self.assertRaisesRegex(ValueError, "requires context 'old_log_probs_shifted'"):
+            grpo_loss({"logprobs": values.detach()}, no_sampler, {}, {"sampler_kl_coef": 0.25}, "cpu")
+        grpo_loss({"logprobs": values.detach()}, no_sampler, {}, {}, "cpu")
+        row_weighted = {**context, "sequence_loss_weights": torch.ones(1)}
+        with self.assertRaisesRegex(ValueError, "fold them into sampler_kl_weights"):
+            grpo_loss({"logprobs": values.detach()}, row_weighted, {}, {"sampler_kl_coef": 0.25}, "cpu")
+        grpo_loss(
+            {"logprobs": values.detach()},
+            {**row_weighted, "sampler_kl_weights": weights},
+            {},
+            {"sampler_kl_coef": 0.25},
+            "cpu",
+        )
+
+    def test_sampler_kl_anchors_tokens_dropped_by_m2po_and_ratio_masks(self):
+        sampler_logprobs = torch.tensor([[-1.5, -1.0, -0.5, -2.0]])
+        mask = torch.ones((1, 4), dtype=torch.bool)
+        context = {
+            "old_log_probs_shifted": sampler_logprobs,
+            # Token 3's proximal log-prob is far from the sampler's, so M2PO drops it from the policy term.
+            "prox_logp_shifted": torch.tensor([[-1.5, -1.0, -0.5, -4.0]]),
+            "advantages": torch.tensor([[1.0, -1.0, 1.0, -1.0]]),
+            "loss_mask": mask,
+        }
+        values = torch.tensor([[-1.0, -2.0, -0.5, -3.0]])
+        self.assertFalse(_apply_m2po_masking(sampler_logprobs, context["prox_logp_shifted"], mask, 0.5)[0, 3])
+        self.assertFalse(_apply_m2po_masking(sampler_logprobs, values, mask, 0.1).all())
+        for masking in (
+            {"m2_threshold": 0.5},
+            {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_m2_threshold": 0.1},
+        ):
+            runs = {}
+            for coef in (0.0, 0.25):
+                logprobs = values.clone().requires_grad_()
+                loss, metrics = grpo_loss(
+                    {"logprobs": logprobs}, context, {}, {**masking, "sampler_kl_coef": coef}, "cpu"
+                )
+                loss.backward()
+                runs[coef] = (logprobs.grad, metrics)
+            with self.subTest(**masking):
+                torch_assert_close(runs[0.25][0] - runs[0.0][0], torch.full((1, 4), -0.25 / 4))
+                self.assertEqual(runs[0.25][1]["sampler_kl_token_count"], 4.0)
+
+    def test_sampler_kl_per_sequence_weights_train_like_their_per_token_expansion(self):
+        # Rows of 7, 3 and 6 real tokens, one weight per row, through every layout a worker's loss receives.
+        set_seed(0)
+        valid = torch.arange(8) < torch.tensor([[7], [3], [6]])
+        rows = {
+            "input_ids": torch.randint(1, 100, (3, 8)),
+            "position_ids": torch.arange(8).expand(3, 8),
+            "logprobs": -torch.rand((3, 8)) - 0.1,
+            "old_log_probs_shifted": -torch.rand((3, 8)) - 0.1,
+            "advantages": torch.randn((3, 8)),
+            "loss_mask": valid & (torch.arange(8) > 0),
+        }
+        row_weights = torch.tensor([0.5, 0.0, 2.0])
+        config = {"sampler_kl_coef": 0.25, "sampler_kl_type": "k3"}
+
+        def squeezed(call):
+            return {
+                k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v
+                for k, v in call.items()
+            }
+
+        def model_calls(weights):
+            batch = {**rows, "sampler_kl_weights": weights}
+            context = {k: v for k, v in batch.items() if k not in ("input_ids", "position_ids")}
+            resolve_loss("ap_grpo").batching_callback(
+                {
+                    "input_ids": rows["input_ids"],
+                    "processing": {"loss_fn": "ap_grpo", "config": config},
+                    "context": context,
+                }
+            )
+            yield "padded", batch
+            packed = pack_sequences({**batch, "attention_mask": valid})
+            packed.pop("_pack_meta")
+            yield "pack_sequences", squeezed(packed)
+            # Dispatch: one DP shard / microbatch holding rows 2 and 0, packed, then cut into SP windows; at sp=8 a
+            # window holds 2 tokens, as many as the shard has rows.
+            index = torch.tensor([2, 0])
+            shard = select_rows(
+                {"input_ids": rows["input_ids"], "position_ids": rows["position_ids"], "context": context}, index, 3
+            )
+            shard["attention_mask"] = valid.index_select(0, index)
+            for sp in (1, 2, 4, 8):
+                call, metadata = pad_packed_microbatch(*pack_microbatch(shard), sp)
+                for rank in range(sp):
+                    window = token_shard(call, metadata, sp, rank)
+                    flat = {"input_ids": window["input_ids"], **window["context"]}
+                    yield f"sp={sp} rank={rank}", {
+                        **squeezed(flat),
+                        "cu_seqlens": window_cu_seqlens(metadata, sp, rank),
+                    }
+
+        def trained(call):
+            call = dict(call)
+            logprobs = call.pop("logprobs").clone().requires_grad_()
+            resolve_loss("ap_grpo").validation_callback(call, config)
+            loss, _ = grpo_loss({"logprobs": logprobs}, call, {}, config, "cpu")
+            loss.backward()
+            return loss.detach(), logprobs.grad
+
+        per_token = row_weights[:, None].expand(3, 8).contiguous()
+        for (name, per_sequence_call), (_, per_token_call) in zip(model_calls(row_weights), model_calls(per_token)):
+            with self.subTest(layout=name):
+                expected, actual = trained(per_token_call), trained(per_sequence_call)
+                torch_assert_close(actual[0], expected[0], rtol=0, atol=0)
+                torch_assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+    def test_sampler_kl_estimators_give_the_kl_gradient_in_expectation_and_cap_their_tails(self):
+        # Exact expectation over a categorical sampler q: E_q[d k(log p - log q) / dz] vs d KL(q || p) / dz = p - q.
+        q = torch.tensor([0.5, 0.3, 0.15, 0.05])
+        logits = torch.tensor([0.2, -0.4, 0.9, -1.5], requires_grad=True)
+        p = torch.softmax(logits, -1).detach()
+        for kind, cap, exact in (("k1", 5.0, True), ("k3", float("inf"), True), ("k2", float("inf"), False)):
+            (grad,) = torch.autograd.grad(
+                (q * _sampler_kl(torch.log_softmax(logits, -1) - q.log(), kind, cap)).sum(), logits
+            )
+            with self.subTest(kind=kind):
+                if exact:
+                    torch_assert_close(grad, p - q)
+                else:
+                    self.assertFalse(torch.allclose(grad, p - q))
+                    self.assertGreater(float(grad @ (p - q)), 0.0)
+        log_ratio = torch.tensor([-3.0, -0.5, 0.0, 0.5, 3.0], requires_grad=True)
+        bound = math.log(5.0)
+        for kind, slope in (
+            ("k1", -torch.ones(5)),
+            ("k2", log_ratio.detach().clamp(-bound, bound)),
+            ("k3", log_ratio.detach().clamp(-bound, bound).exp() - 1.0),
+        ):
+            (grad,) = torch.autograd.grad(_sampler_kl(log_ratio, kind, 5.0).sum(), log_ratio)
+            with self.subTest(kind=kind, cap=5.0):
+                torch_assert_close(grad, slope)
+        torch_assert_close(_sampler_kl(log_ratio, "k3", 5.0)[2], torch.tensor(0.0))
 
     def test_mixed_loss_and_worker_metrics_exclude_nll_from_rl_means(self):
         values = torch.tensor([[-2.0, -3.0]], requires_grad=True)

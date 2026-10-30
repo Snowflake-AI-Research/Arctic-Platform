@@ -5,9 +5,17 @@ Scoring formula: I_{t,s} = Σ_j w_{t,j} · ReLU(q_{t,j} · k_s)
 FP8 quantization vendored from vLLM (Apache 2.0).
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+    from flashinfer.topk import TopKTieBreak
+except ImportError:  # optional: torch.topk selects the same keys, more slowly
+    _flashinfer_top_k = None
 
 FP8_MAX = 448.0
 FP8_MIN = -448.0
@@ -97,7 +105,7 @@ def per_token_group_quant_fp8(
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
     ],
-    key=["S"],
+    key=["N_BUCKET"],
 )
 @triton.jit
 def _triton_fp8_indexer_kernel(
@@ -108,7 +116,9 @@ def _triton_fp8_indexer_kernel(
     Out,
     KS,
     KE,
-    S,
+    M,
+    N,
+    N_BUCKET,
     stride_qh,
     stride_qs,
     stride_ks,
@@ -125,15 +135,15 @@ def _triton_fp8_indexer_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D)
 
-    mask_m = offs_m < S
-    mask_n = offs_n < S
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-    ks_vals = tl.load(KS + offs_m, mask=mask_m, other=S)
+    ks_vals = tl.load(KS + offs_m, mask=mask_m, other=N)
     ke_vals = tl.load(KE + offs_m, mask=mask_m, other=0)
 
     offs_m_64 = offs_m.to(tl.int64)
     offs_n_64 = offs_n.to(tl.int64)
-    out_ptrs = Out + offs_m_64[:, None] * S + offs_n_64[None, :]
+    out_ptrs = Out + offs_m_64[:, None] * N + offs_n_64[None, :]
     out_mask = mask_m[:, None] & mask_n[None, :]
 
     ks_min = tl.min(ks_vals)
@@ -145,8 +155,8 @@ def _triton_fp8_indexer_kernel(
         return
 
     # Clamp indices for FP8 loads (can't use mask+other with fp8 dtype)
-    offs_n_safe = tl.minimum(offs_n, S - 1)
-    offs_m_safe = tl.minimum(offs_m, S - 1)
+    offs_n_safe = tl.minimum(offs_n, N - 1)
+    offs_m_safe = tl.minimum(offs_m, M - 1)
 
     k_block = tl.load(K_fp8 + offs_n_safe[:, None] * stride_ks + offs_d[None, :])
     k_sc = tl.load(K_scales + offs_n_safe, mask=mask_n, other=0.0).to(tl.float32)
@@ -167,72 +177,141 @@ def _triton_fp8_indexer_kernel(
     tl.store(out_ptrs, acc, mask=out_mask)
 
 
-def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
-    """Triton FP8 indexer: UE8M0 quantization + fused scoring kernel + topk.
+def topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Column indices of each row's ``k`` largest scores, in no particular order.
 
-    Args:
-        q: [S, H, D] bf16 query vectors per head
-        k: [S, D] bf16 key vectors (shared across heads)
-        w: [S, H] bf16 per-head weights
-        ks: [S] int32 sequence start per token
-        ke: [S] int32 causal end per token (= position + 1)
-        topk: number of top indices to return
-        weight_scale: constant scaling factor for weights
-
-    Returns:
-        [S, topk] int32 selected token indices per query
+    FlashInfer's radix select is about 4x faster than ``torch.topk`` on 128K-wide rows. Ties at the
+    selection boundary go to the smaller column, so the selected set is deterministic.
     """
-    # NOTE: We don't use weight scale in this kernel as it produces higher KL mismatch for some reason
-    # This is not a problem result-wise, as it is a constant multiplier
-    _weight_scale = weight_scale
-    S, H, D = q.shape
-    device = q.device
+    if _flashinfer_top_k is None or not scores.is_cuda:
+        return torch.topk(scores, k, dim=-1).indices
+    return _flashinfer_top_k(scores, k, sorted=False, deterministic=True, tie_break=TopKTieBreak.SMALL)[1]
 
-    q_flat = q.reshape(S * H, D).contiguous()
-    q_fp8, q_scales = per_token_group_quant_fp8(q_flat, group_size=D, use_ue8m0=True)
-    k_fp8, k_scales = per_token_group_quant_fp8(k.contiguous(), group_size=D, use_ue8m0=True)
 
-    q_fp8 = q_fp8.view(S, H, D).permute(1, 0, 2).contiguous()
+@functools.cache
+def _deep_gemm_mqa_logits(capability_major: int):
+    """DeepGEMM's FP8 MQA-logits kernel, bundled with vLLM, on SM90/SM100; else ``None``.
 
-    # Fold q_scale into weights
-    q_scales = q_scales.view(S, H)
-    w = w * q_scales
+    It scores exactly what ``_triton_fp8_indexer_kernel`` does, 2-3x faster on B200/B300, and
+    skips key blocks outside each row's ``[ks, ke)``.
+    """
+    if capability_major not in (9, 10):
+        return None
+    try:
+        from vllm.third_party.deep_gemm import fp8_fp4_mqa_logits
+    except ImportError:
+        return None
+    return fp8_fp4_mqa_logits
 
-    logits = torch.empty(S, S, dtype=torch.float32, device=device)
+
+def weighted_relu_scores(q, k, k_scales, w, ks, ke, width: int) -> torch.Tensor:
+    """FP32 ``[M, width]`` scores ``sum_h w[m, h] * relu(q[h, m] . k[n]) * k_scales[n]``.
+
+    ``q`` is ``[H, M, D]`` (row stride free) and ``k`` is ``[>= width, D]``, both FP8 or BF16; products
+    accumulate in FP32. Columns outside each row's ``[ks, ke)`` are ``-inf``.
+    """
+    H, M, D = q.shape
+    out = torch.empty(M, width, dtype=torch.float32, device=q.device)
 
     def grid(meta):
-        return (
-            triton.cdiv(S, meta["BLOCK_M"]),
-            triton.cdiv(S, meta["BLOCK_N"]),
-        )
+        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(width, meta["BLOCK_N"]))
 
     _triton_fp8_indexer_kernel[grid](
-        q_fp8,
-        k_fp8,
+        q,
+        k,
         k_scales,
         w,
-        logits,
+        out,
         ks,
         ke,
-        S,
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        k_fp8.stride(0),
+        M,
+        width,
+        triton.next_power_of_2(width),
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
         w.stride(0),
         H=H,
         D=D,
     )
+    return out
 
-    actual_topk = min(topk, S)
-    _, indices = torch.topk(logits, actual_topk, dim=-1)
-    if actual_topk < topk:
-        padding = torch.full((S, topk - actual_topk), S, dtype=indices.dtype, device=device)
-        indices = torch.cat([indices, padding], dim=-1)
 
-    # Replace cross-sequence indices with sentinel S (maps to zero-valued KV)
-    ks_exp = ks.unsqueeze(1).expand_as(indices)
-    ke_exp = ke.unsqueeze(1).expand_as(indices)
-    out_of_range = (indices < ks_exp) | (indices >= ke_exp)
-    indices = indices.masked_fill(out_of_range, S)
+# Scores are FP32 [queries, keys]; at long context a query chunk keeps that buffer bounded.
+_SCORE_BUDGET_BYTES = 1 << 30
 
-    return indices.to(torch.int32)
+
+def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
+    """FP8 indexer: UE8M0 quantization, scoring (DeepGEMM, else a fused Triton kernel), and top-k.
+
+    Queries and keys may differ in number: under context parallelism ``q`` holds
+    a rank's queries and ``k`` every key, and ``ks``/``ke`` index ``k`` globally.
+    Queries are scored in chunks whose FP32 score block stays under
+    ``_SCORE_BUDGET_BYTES``, each against only the keys its rows can select.
+
+    Args:
+        q: [M, H, D] bf16 query vectors per head
+        k: [N, D] bf16 key vectors (shared across heads)
+        w: [M, H] bf16 per-head weights
+        ks: [M] int32 first selectable key (sequence start) per query
+        ke: [M] int32 one past the last selectable key (causal end) per query
+        topk: number of top indices to return
+        weight_scale: constant scaling factor for weights
+
+    Returns:
+        [M, topk] int32 key indices per query; unselectable slots hold the sentinel ``N``
+    """
+    # NOTE: We don't use weight scale in this kernel as it produces higher KL mismatch for some reason
+    # This is not a problem result-wise, as it is a constant multiplier
+    _weight_scale = weight_scale
+    M, H, D = q.shape
+    N = k.shape[0]
+    device = q.device
+
+    q_flat = q.reshape(M * H, D).contiguous()
+    q_fp8, q_scales = per_token_group_quant_fp8(q_flat, group_size=D, use_ue8m0=True)
+    k_fp8, k_scales = per_token_group_quant_fp8(k.contiguous(), group_size=D, use_ue8m0=True)
+
+    # Fold q_scale into weights
+    q_scales = q_scales.view(M, H)
+    w = (w * q_scales).contiguous()
+    k_scales = k_scales.view(N)
+
+    mqa_logits = _deep_gemm_mqa_logits(torch.cuda.get_device_capability(device)[0]) if q.is_cuda else None
+    if mqa_logits is None:
+        q_fp8 = q_fp8.view(M, H, D).permute(1, 0, 2).contiguous()
+    else:
+        q_fp8 = q_fp8.view(M, H, D)
+
+    indices = torch.empty(M, topk, dtype=torch.int32, device=device)
+    rows = max(64, min(M, _SCORE_BUDGET_BYTES // (4 * max(N, 1))) // 64 * 64)
+    for start in range(0, M, rows):
+        stop = min(start + rows, M)
+        ks_c, ke_c = ks[start:stop], ke[start:stop]
+        # DeepGEMM needs 16-byte-aligned key scales; keys before a row's ``ks`` are masked anyway.
+        lo, hi = int(ks_c.min()) // 64 * 64, int(ke_c.max())
+        width = max(hi - lo, 1)
+        if mqa_logits is not None:
+            logits = mqa_logits(
+                (q_fp8[start:stop], None),
+                (k_fp8[lo : lo + width], k_scales[lo : lo + width]),
+                w[start:stop],
+                ks_c - lo,
+                ke_c - lo,
+                clean_logits=True,
+            )
+            # DeepGEMM pads each row past ``width``. Top-k reads whole rows, so take the padded rows
+            # with the padding masked instead of copying the block; picks there become the sentinel.
+            logits = logits.as_strided((stop - start, logits.stride(0)), (logits.stride(0), 1))
+            logits[:, width:] = float("-inf")
+        else:
+            logits = weighted_relu_scores(
+                q_fp8[:, start:stop], k_fp8[lo:], k_scales[lo:], w[start:stop], ks_c - lo, ke_c - lo, width
+            )
+        actual_topk = min(topk, width)
+        chosen = topk_indices(logits, actual_topk) + lo
+        # Keys outside a row's [ks, ke) -- other sequences, or the causal future -- become the sentinel N.
+        out_of_range = (chosen < ks_c.unsqueeze(1)) | (chosen >= ke_c.unsqueeze(1))
+        indices[start:stop, :actual_topk] = chosen.masked_fill(out_of_range, N).to(torch.int32)
+        indices[start:stop, actual_topk:] = N
+    return indices

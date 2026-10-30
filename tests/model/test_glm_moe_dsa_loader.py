@@ -138,12 +138,20 @@ def test_quack_fused_cross_entropy_is_supported():
     [
         {"dtype": "float16"},
         {"parallelism": ParallelismConfig(expert_parallel=2, sequence_parallel=2)},
-        {"patches": Patches(peft={"peft_type": "Lora"})},
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
     with pytest.raises(ValueError):
         ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
+
+
+def test_spec_accepts_peft():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="glm_moe_dsa",
+        patches=Patches(peft={"peft_type": "Lora"}),
+    )
+    assert spec.patches.peft == {"peft_type": "Lora"}
 
 
 def test_runtime_group_is_required():
@@ -161,7 +169,10 @@ def test_runtime_config_is_derived_from_validated_options():
         ep_comm_backend="uccl",
         sparse_mla_backend="flashmla",
         ac_config={"freq": 2},
-        debug={"num_layers": 6, "random_init": True},
+        debug={
+            "num_layers": 6,
+            "random_init": True,
+        },
     )
     config = _build_model_config(
         "local",

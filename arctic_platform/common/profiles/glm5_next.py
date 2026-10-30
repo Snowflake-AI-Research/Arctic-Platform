@@ -1,0 +1,37 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Profile of the ``glm5_next`` loader (GLM-5.3-Flash).
+
+The loader registers ``FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity``), so it extends the
+``generic_moe`` profile and overrides only what differs: it supports ``attention.sparse_mla`` through
+``ModelSpec.attn_implementation``, which the loader requires to name a sparse MLA backend, and
+``numerics.fp32_parity``, which rounds the RMSNorms once after the weight multiply, as vLLM does.
+"""
+
+from __future__ import annotations
+
+from arctic_platform.common.option_registry import Registry
+from arctic_platform.common.option_registry import register_profile
+
+
+def register(registry: Registry) -> None:
+    """Register the ``glm5_next`` profile into ``registry``."""
+    register_profile(
+        "glm5_next",
+        extends="generic_moe",
+        supports=["attention.sparse_mla", "numerics.fp32_parity"],
+        registry=registry,
+    )

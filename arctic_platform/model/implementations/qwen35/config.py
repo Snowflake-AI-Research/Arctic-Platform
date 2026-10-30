@@ -34,6 +34,9 @@ class ModelConfig:
     # falls back to ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` and then /data-fast.
     # Empty string restores write-to-sibling when no pre-baked cache exists.
     weight_conversion_cache_dir: str | None = None
+    # Ignore the checkpoint's ``quantization_config``: build plain modules and
+    # dequantize its packed weights during the HF->Prime conversion.
+    dequantize_checkpoint: bool = False
 
     seq_len: int = 2048
     attn: str = "flash_attention_2"
@@ -54,5 +57,7 @@ class ModelConfig:
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
+    # Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32.
+    fp32_parity: bool = True
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)

@@ -358,6 +358,8 @@ def get_model(
         ),
     )
     model_config.use_cache = False
+    if config.dequantize_checkpoint and hasattr(model_config, "quantization_config"):
+        del model_config.quantization_config
     is_vlm_arch = is_vlm_architecture(model_config)
 
     # Fallback Qwen3.5 patch detection from loaded config model_type
@@ -370,6 +372,10 @@ def get_model(
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
+    # Read by the custom Qwen3.5-MoE decoder, which a composite model builds from its text config.
+    model_config.fp32_parity = config.fp32_parity
+    if getattr(model_config, "text_config", None) is not None:
+        model_config.text_config.fp32_parity = config.fp32_parity
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
@@ -539,6 +545,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
+                # Packed and dequantized conversions of one checkpoint must not share a cache.
+                fmt = "prime-dequantized"
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."
@@ -546,6 +555,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            # Models whose snapshot cannot sit in host memory convert shard by shard.
+            stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
@@ -557,6 +568,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -569,6 +581,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
 
     # All ranks wait for master rank to finish conversion
