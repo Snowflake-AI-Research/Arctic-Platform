@@ -237,6 +237,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                     dist.all_gather(shards, local, group=ep_group)
                     if is_master:
                         layer_state[name] = torch.cat(shards, dim=0)
+                    del shards  # else it stays alive through the next gather and the whole yield
                 elif is_master:
                     layer_state[name] = tensor.data
 

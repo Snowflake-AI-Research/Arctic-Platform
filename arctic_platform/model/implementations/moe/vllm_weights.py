@@ -242,6 +242,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
+                    del shards  # else it stays alive through the next gather and the whole yield
                 elif is_master:
                     layer_sd[name] = tensor.data
 
