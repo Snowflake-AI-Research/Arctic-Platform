@@ -43,9 +43,14 @@ LOADER_ARCHITECTURES = {
     "qwen4_exp": {"Qwen4ExpForConditionalGeneration"},
     "deepseek_v4": {"DeepseekV4ForCausalLM"},
     "deepseek_v41": {"DeepseekV41ForCausalLM"},
+    # The frozen target is any model the other loaders list; the loader trains the draft.
+    "dflash2": {"DFlash2DraftModel"},
 }
 # Trainable architectures deliberately left without chat mode, with the reason.
 TRAINED_WITHOUT_CHAT: dict[str, str] = {
+    "DFlash2DraftModel": (
+        "a speculative-decoding draft: it only proposes tokens for its target model, so it is never served as a chat model"
+    ),
     "DeepseekV41ForCausalLM": (
         "V4.1 spaces its DSML tool-call tags and takes a numeric reasoning budget; "
         "vLLM's deepseek_v4 parsers read neither"
