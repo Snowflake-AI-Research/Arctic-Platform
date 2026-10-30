@@ -368,6 +368,10 @@ def shrink_config(full: dict, tiny: dict) -> tuple[dict, list[int]]:
     for key, value in (tiny.get("text_overrides") or {}).items():
         text[key] = _deep_merge(text.get(key), value) if isinstance(value, dict) else value
     for key, value in (tiny.get("config_overrides") or {}).items():
+        if value is None:
+            config.pop(key, None)
+            text.pop(key, None)
+            continue
         config[key] = _deep_merge(config.get(key), value) if isinstance(value, dict) else value
     return config, keep
 
