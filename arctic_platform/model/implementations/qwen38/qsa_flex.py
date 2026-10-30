@@ -164,16 +164,24 @@ def select_qsa_token_ids(
     tail_offsets = torch.arange(compress_ratio - 1, device=index_queries.device)
     first_sparse_position = (block_budget + 1) * compress_ratio - 1
 
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import fused_index_scores_supported
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import qsa_index_scores
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import top_block_indices
+
+    fused = fused_index_scores_supported(index_queries)
     for batch_idx, logical_length_tensor in enumerate(sequence_lengths):
         logical_length = int(logical_length_tensor)
         available_blocks = logical_length // compress_ratio
         local_valid_length = min(max(logical_length - query_offset, 0), sequence_length)
         if local_valid_length == 0:
             continue
-        keys = compressed_keys[batch_idx, :available_blocks, 0].float()
+        keys = compressed_keys[batch_idx, :available_blocks, 0]
+        if not fused:
+            keys = keys.float()
         topk_width = min(block_budget, available_blocks)
         chunk_rows = _query_chunk_rows(
-            num_heads=num_heads,
+            # The fused kernel sums the heads in registers: its score block has no head dimension.
+            num_heads=1 if fused else num_heads,
             num_blocks=max(available_blocks, 1),
             rows=local_valid_length,
         )
@@ -194,7 +202,11 @@ def select_qsa_token_ids(
                 top_blocks = candidate_blocks.unsqueeze(0).expand(rows, -1)
                 valid_blocks = candidate_blocks.unsqueeze(0) < visible_blocks.unsqueeze(1)
                 sparse_start = min(max(first_sparse_position - query_offset - query_start, 0), rows)
-                if sparse_start < rows:
+                if sparse_start < rows and fused:
+                    queries = index_queries[batch_idx, query_start + sparse_start : query_end]
+                    scores = qsa_index_scores(queries, keys, visible_blocks[sparse_start:])
+                    sparse_top_blocks = top_block_indices(scores, block_budget)
+                elif sparse_start < rows:
                     queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
                     scores = torch.einsum("qhd,pd->qhp", queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / math.sqrt(head_dim)
@@ -204,6 +216,7 @@ def select_qsa_token_ids(
                         -torch.inf,
                     )
                     sparse_top_blocks = torch.topk(scores, k=block_budget, dim=-1).indices
+                if sparse_start < rows:
                     top_blocks = torch.cat([top_blocks[:sparse_start], sparse_top_blocks], dim=0)
                     valid_blocks = torch.cat(
                         [
@@ -525,6 +538,11 @@ def flex_sparse_gqa_attention(
 ) -> torch.Tensor:
     if not query.is_cuda or any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise RuntimeError("Qwen3.8 QSA FlexAttention requires CUDA BF16 Q/K/V tensors")
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_attention
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_supported
+
+    if fused_sparse_gqa_supported(query, key):
+        return fused_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale)
     return _SparseGQAAttention.apply(
         query,
         key,
