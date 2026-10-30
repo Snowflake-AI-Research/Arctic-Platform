@@ -368,10 +368,9 @@ class LoadedConfig:
         from arctic_platform.common.deepspeed_engine import optimizer_implementation
         from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
         from arctic_platform.common.optimizer import OptimizerSettings
-        from arctic_platform.model.moe_spec import is_glm_moe_model
 
         settings = OptimizerSettings.model_validate(self.training["optimizer"])
-        fused = settings.fused if settings.fused is not None else not is_glm_moe_model(model_path)
+        fused = settings.fused is not False
         name = resolve_optimizer_name(settings.name, self.training.get("ds_config") or {}, fused=fused)
         if optimizer_implementation(name, fused=fused) in ("fused_adam", "deepspeed_cpu_adam"):
             return "float32"

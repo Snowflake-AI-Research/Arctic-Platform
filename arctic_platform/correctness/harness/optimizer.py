@@ -1581,6 +1581,29 @@ def _claim_native_checkpoint_root(state, target):
         state.get("pending_roots", {}).pop(str(target), None)
 
 
+@contextlib.contextmanager
+def node_local_model_state_writer(engine, node_rank: int):
+    """Let only the first rank of each node write ``mp_rank_00_model_states.pt`` under node-local storage.
+
+    DeepSpeed selects the node-local model-state writer by ``engine.local_rank``, read from ``LOCAL_RANK``. DSS starts
+    every Ray worker with ``LOCAL_RANK=0`` and one visible GPU, so with ``checkpoint.use_node_local_storage`` every
+    rank writes its own module state to the same path. Under expert parallelism those states hold different experts,
+    and the file left on a node is whichever rank wrote it last, not the rank-zero state the expert sidefile check
+    and the collector receipts attribute it to. ``node_rank`` is the worker's rank within its node.
+    """
+    if type(node_rank) is not int or node_rank < 0:
+        raise ValueError("node-local model-state writer requires the worker's nonnegative rank within its node")
+    if not engine.use_node_local_storage():
+        yield
+        return
+    saved = engine.save_non_zero_checkpoint
+    engine.save_non_zero_checkpoint = node_rank == 0
+    try:
+        yield
+    finally:
+        engine.save_non_zero_checkpoint = saved
+
+
 def arm_native_optimizer_collector(
     worker,
     *,
@@ -1665,7 +1688,8 @@ def arm_native_optimizer_collector(
             raise ValueError("native collector save scope or step changed")
         before = _native_worker_layout(worker, target, tag, sources)
         _claim_native_checkpoint_root(vars(worker)[_COLLECTOR_STATE], target)
-        result = original(selected_engine, str(target), tag)
+        with node_local_model_state_writer(engine, worker.local_rank):
+            result = original(selected_engine, str(target), tag)
         if worker.job_id != training_child_id or worker._engine is not engine or engine.global_steps != step:
             raise ValueError("native collector training child/engine changed during save")
         after = _native_worker_layout(worker, target, tag, sources)
@@ -2762,6 +2786,37 @@ def _native_checkpoint_parameter_names(parameters: dict, description: str) -> di
     return names
 
 
+def expert_sidefile_module_mismatch(
+    expert_files: list[Path], experts: list[dict], model_ep_rank: int, module: dict[str, torch.Tensor]
+) -> str | None:
+    """Describe how the model writer's expert sidefile differs from the module payload, or return None if equal.
+
+    ``module`` maps sidefile parameter names to the module payload's tensors. The description names the first
+    differing tensor, its largest difference with both values, and every sidefile that equals that module tensor,
+    which identifies the rank whose state the module payload holds.
+    """
+    shard = experts[model_ep_rank]
+    differing = [name for name, value in shard.items() if not torch.equal(value, module[name])]
+    if not differing:
+        return None
+    name = differing[0]
+    value, reference = shard[name], module[name]
+    difference = (value.float() - reference.float()).abs()
+    flat = int(torch.argmax(difference.nan_to_num(nan=math.inf)))
+    index = tuple(int(i) for i in torch.unravel_index(torch.tensor(flat), difference.shape))
+    owners = [
+        path.name for path, other in zip(expert_files, experts, strict=True) if torch.equal(other[name], reference)
+    ]
+    return (
+        f"rank-zero expert sidefile/module mismatch: {len(differing)} of {len(shard)} tensors in"
+        f" {expert_files[model_ep_rank].name} differ from the mp_rank_00 module payload; first"
+        f" {name!r} {tuple(value.shape)} {value.dtype}:"
+        f" {int(torch.count_nonzero(value != reference))}/{value.numel()} elements differ, max |sidefile - module|"
+        f" {float(difference[index]):.6e} at {index} (sidefile {float(value[index])!r}, module"
+        f" {float(reference[index])!r}); module tensor equals {', '.join(owners) if owners else 'no sidefile'}"
+    )
+
+
 def _snapshot(
     root: Path,
     *,
@@ -2840,11 +2895,14 @@ def _snapshot(
                     f"invalid expert sidefile tensor or module shape: {path.name}, parameter {name!r}: {reason}"
                 )
             _native_checkpoint_parameter_names(shard, path.name)
-        if any(
-            not torch.equal(value, module[module_names[_native_checkpoint_parameter_name(name)]])
-            for name, value in experts[native["model_ep_rank"]].items()
-        ):
-            raise ValueError("rank-zero expert sidefile/module mismatch")
+        mismatch = expert_sidefile_module_mismatch(
+            expert_files,
+            experts,
+            native["model_ep_rank"],
+            {name: module[module_names[_native_checkpoint_parameter_name(name)]] for name in experts[0]},
+        )
+        if mismatch is not None:
+            raise ValueError(mismatch)
         _native_checkpoint_parameter_names(
             {name: None for group in shape_groups if isinstance(group, dict) for name in group},
             "native param_shapes",
