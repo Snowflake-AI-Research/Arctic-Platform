@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import torch
 
+import arctic_platform.integrations.trl.loss  # noqa: F401
 import arctic_platform.rl.processors  # noqa: F401
 import arctic_platform.sft.processor  # noqa: F401
 from arctic_platform.common.registry import DECLARED_SUMMED_METRICS
