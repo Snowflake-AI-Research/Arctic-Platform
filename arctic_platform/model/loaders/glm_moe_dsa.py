@@ -46,6 +46,7 @@ class GlmMoeDsaDebugOptions(BaseModel):
     hidden_size: int | None = Field(None, gt=0)
     intermediate_size: int | None = Field(None, gt=0)
     moe_intermediate_size: int | None = Field(None, gt=0)
+    full_determinism: bool = False
 
 
 class GlmMoeDsaOptions(BaseModel):
@@ -61,6 +62,7 @@ class GlmMoeDsaOptions(BaseModel):
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = False
+    moe_use_sonicmoe: bool = False
     fused_cross_entropy: bool | Literal["liger", "quack"] = "liger"
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
