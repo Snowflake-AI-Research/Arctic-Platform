@@ -216,7 +216,11 @@ class Glm5NextForConditionalGenerationPrimeRL(
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any(".mlp.experts.0.gate_proj.weight" in name for name in state_dict)
+        return any(
+            ".mlp.experts.0.gate_proj.weight" in name
+            or name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.gate_up_proj.weight"))
+            for name in state_dict
+        )
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
