@@ -34,6 +34,10 @@ tiny:
     moe_intermediate_size: 256
     q_lora_rank: 256
     num_nextn_predict_layers: 0
+    # vLLM derives shared indexer layers from these, transformers from indexer_types. The tiny layers keep
+    # full/shared/full, so the stride must say the same.
+    index_skip_topk_offset: 1
+    index_topk_freq: 2
   # The source checkpoint is FP8; the tiny one is plain bf16.
   config_overrides:
     quantization_config: null
@@ -65,11 +69,11 @@ known_issues:
   optimizer.update_lands_at_launch_lr:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
     summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
-  optimizer.update_is_adamw: &unfused
+  sampler.repeatable:
     issue: pending
-    summary: "the GLM-MoE default runs torch AdamW, whose moments are bf16 under bf16 masters (fix: branch abkulkarni/glm53-fused-adam)"
-  optimizer.implementation_policy: *unfused
-  parallel.update_is_adamw: *unfused
+    summary: >-
+      once a query has more than index_topk keys the indexer's selection varies between identical runs (first
+      differing position is exactly index_topk; ~0.01 log-prob)
   # The tiny checkpoint is bf16; FP8 block scales and their training path are not covered.
   contract.tiny_layout_matches_source:
     issue: pending

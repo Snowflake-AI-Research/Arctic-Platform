@@ -79,11 +79,6 @@ known_issues:
   optimizer.update_lands_at_launch_lr:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
     summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
-  optimizer.update_is_adamw: &unfused
-    issue: pending
-    summary: "#333 put GLM-5.3 on the GLM-MoE torch AdamW default, whose moments are bf16 under bf16 masters (fix: branch abkulkarni/glm53-fused-adam)"
-  optimizer.implementation_policy: *unfused
-  parallel.update_is_adamw: *unfused
   sampler.tensor_parallel_matches_reference[tp1]:
     issue: pending
     summary: >-

@@ -100,6 +100,8 @@ def pytest_collection_modifyitems(config, items):
         profile = getattr(getattr(item, "callspec", None), "params", {}).get("profile")
         if check is None or profile is None:
             continue
+        # Session fixtures launch the probes inside the first test's setup; each probe bounds its own runtime.
+        item.add_marker(pytest.mark.timeout(0))
         variant = _variant(item, profile)
         reason = _profile_entry(profile.not_applicable, check, variant)
         if reason:

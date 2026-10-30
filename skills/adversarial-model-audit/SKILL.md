@@ -55,11 +55,12 @@ The suite is the cheapest broad sweep, and it already encodes every bug class fo
 before reading code, then triage every non-pass.
 
 ```bash
-pytest -p no:xdist -sv tests/model_audit --audit-model <model>                 # everything the pod can run
-pytest -p no:xdist -sv tests/model_audit --audit-model <model> -m "not vllm"   # trainer side only
+pytest -p no:xdist -sv --session-timeout=36000 tests/model_audit --audit-model <model>                 # everything
+pytest -p no:xdist -sv --session-timeout=36000 tests/model_audit --audit-model <model> -m "not vllm"   # trainer side
 ```
 
-`AP_MODEL_AUDIT_DIR` sets the artifact root (fast local disk). `AP_AUDIT_SAMPLER_PYTHON` points the sampler probes
+A cold run (any platform change invalidates the probe cache) can exceed the repo's one-hour session cap, hence an explicit
+`--session-timeout` (0 means zero seconds, not unlimited). `AP_MODEL_AUDIT_DIR` sets the artifact root (fast local disk). `AP_AUDIT_SAMPLER_PYTHON` points the sampler probes
 at an interpreter with the release's pinned vLLM when the training env has a different one.
 
 Results land in `$AP_MODEL_AUDIT_DIR/results/<session>.jsonl` (one row per check, with the measured numbers). Copy
