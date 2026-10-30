@@ -174,7 +174,10 @@ class ArcticRLActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     async def compute_log_prob(self, data: TensorDict) -> TensorDict:
-        return await self._run_log_prob(data, ref=False, calculate_entropy=True)
+        # Log-probs only. Entropy is a full-vocabulary softmax, and the trainer
+        # uses it solely for the actor/entropy log. The update computes it when
+        # entropy_coeff is nonzero.
+        return await self._run_log_prob(data, ref=False, calculate_entropy=False)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")

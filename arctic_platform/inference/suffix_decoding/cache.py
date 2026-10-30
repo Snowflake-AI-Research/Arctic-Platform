@@ -20,7 +20,12 @@ from typing import Hashable, KeysView, List, Optional, Sequence
 
 import numpy as np
 
-from arctic_platform.inference.suffix_decoding._C import SuffixTree, Draft
+try:
+    from arctic_platform.inference.suffix_decoding._C import Draft, SuffixTree
+except ModuleNotFoundError as exc:
+    if exc.name != "arctic_platform.inference.suffix_decoding._C":
+        raise
+    Draft = SuffixTree = None
 
 
 @dataclass
@@ -72,6 +77,11 @@ class SuffixDecodingCache:
         """
         if max_cached_requests > 0x7FFFFFFF:
             raise ValueError("max_cached_requests must be at most 2^31")
+        if SuffixTree is None:
+            raise RuntimeError(
+                "Suffix decoding requires the optional "
+                "arctic_platform.inference.suffix_decoding._C extension"
+            )
 
         self._max_tree_depth = max_tree_depth
         self._max_cached_requests = max_cached_requests

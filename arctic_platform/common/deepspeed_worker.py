@@ -409,19 +409,13 @@ class DeepSpeedWorker:
             for k, v in batch_data.items():
                 pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
-        grad_accum_steps = self.engine.gradient_accumulation_steps()
+        grad_accum_steps = int(self.engine.gradient_accumulation_steps())
         # H3: list-of-microbatches from the client skips concat→split_dict.
-        if isinstance(batch_data, list):
-            micro_batch_data = batch_data
-            if len(micro_batch_data) != grad_accum_steps:
-                raise ValueError(
-                    f"Received {len(micro_batch_data)} GAS microbatches but "
-                    f"engine.gradient_accumulation_steps()={grad_accum_steps}"
-                )
-        else:
-            micro_batch_data = split_dict(batch_data, grad_accum_steps)
-        num_micro_batches = len(micro_batch_data)
-        pipeline_micro_batch_outputs = []
+        if isinstance(batch_data, list) and len(batch_data) != grad_accum_steps:
+            raise ValueError(
+                f"Received {len(batch_data)} GAS microbatches but "
+                f"engine.gradient_accumulation_steps()={grad_accum_steps}"
+            )
         return_tensors = meta_data.get("worker_return_tensors", False)
 
         # Resolve before selecting a specialized pipeline so class registry
@@ -436,7 +430,7 @@ class DeepSpeedWorker:
             loss_object = resolve_loss(loss_fn)
         if loss_object is not None:
             loss_object.model_call_count_callback(
-                [num_micro_batches],
+                [grad_accum_steps],
                 processing.get("config") or {},
             )
         legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
@@ -446,19 +440,44 @@ class DeepSpeedWorker:
             and loss_object.is_legacy_adapter_for(legacy_sft_loss)
         )
 
-        if use_sft_pipeline:
-            self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
-
-        loss_reduction = None
         if not use_sft_pipeline:
-            from arctic_platform.rl.processors import resolve_packed_loss_reduction
+            from arctic_platform.common.unpacked_gas import run_unpacked_gas
 
-            loss_reduction = resolve_packed_loss_reduction(
-                processing,
-                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
-                require_declared=False,
+            pipeline_outputs = run_unpacked_gas(
+                self.engine,
+                gas=grad_accum_steps,
+                batch_data=batch_data,
+                meta_data=meta_data,
+                processing=processing,
+                args=args,
                 loss_object=loss_object,
+                backward=backward,
+                device=self._device,
+                return_tensors=return_tensors,
+                step_fn=self._engine_step,
             )
+            pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
+            see_memory_usage("_forward_maybe_backward end", force=True)
+            pr0(f"[DeepSpeedWorker] {tag}: {pipeline_outputs.keys()=}")
+            from arctic_platform import sft_profile
+
+            if sft_profile.enabled():
+                metrics = pipeline_outputs.get("metrics")
+                if not isinstance(metrics, dict):
+                    metrics = {}
+                metrics = sft_profile.merge_into_metrics(metrics)
+                pipeline_outputs["metrics"] = metrics
+                sft_profile.maybe_print(f"worker rank{self.rank} {tag}", metrics.get("_profile_ms"))
+            return pipeline_outputs
+
+        self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
+        if isinstance(batch_data, list):
+            micro_batch_data = batch_data
+        else:
+            micro_batch_data = split_dict(batch_data, grad_accum_steps)
+        num_micro_batches = len(micro_batch_data)
+        pipeline_micro_batch_outputs = []
+        loss_reduction = None
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
@@ -488,47 +507,21 @@ class DeepSpeedWorker:
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
-            if use_sft_pipeline:
-                from arctic_platform.sft.processor import run_sft_pipeline
+            from arctic_platform.sft.processor import run_sft_pipeline
 
-                # Match the GRPO packed path: only the last microbatch is an
-                # accumulation boundary so DeepSpeed does not all-reduce grads
-                # (or run optimizer bookkeeping) on every microbatch when gas>1.
-                if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
-                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+            # The boundary override is sticky. Set it for this SFT call only, and
+            # clear it after the loop so a later RL step uses DeepSpeed's counter.
+            if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
+                self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
 
-                micro_batch_output = run_sft_pipeline(
-                    self.engine,
-                    micro_batch,
-                    meta_data,
-                    processing,
-                    device=self._device,
-                    backward=backward,
-                )
-            else:
-                from arctic_platform.rl.processors import apply_packed_loss_reduction
-                from arctic_platform.rl.processors import run_pipeline
-
-                pipeline_backward = "loss_only" if backward and loss_reduction is not None else backward
-                micro_batch_output = run_pipeline(
-                    self.engine,
-                    args,
-                    micro_batch,
-                    meta_data,
-                    processing,
-                    device=self._device,
-                    backward=pipeline_backward,
-                    pack=False,
-                    return_tensors=return_tensors,
-                    loss_object=loss_object,
-                )
-                if backward and loss_reduction is not None:
-                    apply_packed_loss_reduction(
-                        self.engine,
-                        micro_batch_output.pop("loss_tensor"),
-                        loss_reduction.loss_scales[i],
-                        backward=True,
-                    )
+            micro_batch_output = run_sft_pipeline(
+                self.engine,
+                micro_batch,
+                meta_data,
+                processing,
+                device=self._device,
+                backward=backward,
+            )
 
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
@@ -537,6 +530,10 @@ class DeepSpeedWorker:
             # DS requires matching steps for backward pass
             if backward and i < num_micro_batches - 1:
                 self._engine_step()
+
+        from arctic_platform.common.unpacked_gas import clear_gradient_accumulation_boundary_override
+
+        clear_gradient_accumulation_boundary_override(self.engine)
 
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
@@ -611,17 +608,29 @@ class DeepSpeedWorker:
         does not assert; skip the optimizer update instead of crashing.
         Only that BF16 assert is skipped; every other ``AssertionError`` re-raises.
         """
+        at_boundary = False
+        try:
+            at_boundary = bool(self.engine.is_gradient_accumulation_boundary())
+        except Exception:
+            at_boundary = False
         try:
             self.engine.step()
         except AssertionError as err:
             if self._is_bf16_zero_norm_assert(err):
                 pr0("[DeepSpeedWorker] skip optimizer.step: global grad norm is 0")
+                # The assert fires inside the optimizer update, before DeepSpeed
+                # increments micro_steps. A skipped boundary would shift every
+                # later cycle by one.
+                if at_boundary:
+                    self.engine.micro_steps += 1
                 return
             raise
 
     def step(self) -> dict:
         from arctic_platform import sft_profile
+        from arctic_platform.common.unpacked_gas import assert_ready_for_final_step
 
+        assert_ready_for_final_step(self.engine)
         with sft_profile.timed("step"):
             self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
@@ -727,7 +736,7 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
-        from arctic_inference.server.weight_sync.sender import WeightSender
+        from arctic_platform.inference.server.weight_sync.sender import WeightSender
 
         self._weight_sender = WeightSender(
             group=group,
@@ -777,11 +786,16 @@ class DeepSpeedWorker:
         return {"status": "not_initialized"}
 
     def send_weights_ipc(self, group_id: int) -> dict:
-        """Save weights to shared memory for colocated (same-GPU) transfer."""
-        from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
+        """Reject the retired legacy shared-memory transport.
 
-        weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
-        return save_weights_to_shm(weights, group_id)
+        Colocated jobs use the CUDA IPC helpers in
+        :mod:`arctic_platform.common.utils.weight_sync`; the in-tree inference
+        stack intentionally has no file-backed ``ipc_engine`` equivalent.
+        """
+        raise RuntimeError(
+            "send_weights_ipc is unavailable with in-tree inference; "
+            f"use CUDA IPC weight sync instead (group_id={group_id})"
+        )
 
     def get_cuda_ipc_handles(self) -> dict:
         """Create CUDA IPC handles for all model parameters.

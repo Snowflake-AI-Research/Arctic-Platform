@@ -51,6 +51,10 @@ class ModelConfig(BaseModel):
     gdn_prefill_backend: str | None = None
     structured_outputs_config: dict[str, Any] | None = None
     speculative_config: dict[str, Any] | None = None
+    # The in-tree weight-sync path needs the draft checkpoint to describe and
+    # transfer its weights. This mirrors speculative_config["model"] while
+    # staying out of AsyncEngineArgs.
+    speculative_model: str | None = Field(default=None, exclude=True)
 
     # Optional vLLM reasoning parser name (e.g. "qwen3", "deepseek_r1"). This
     # is a serving-layer concept, not an AsyncEngineArgs field, so the worker

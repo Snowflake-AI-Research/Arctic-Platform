@@ -15,13 +15,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Example: Using ArcticRLClient with an ArcticInference server.
+"""Example: Using ArcticRLClient with the in-tree inference server.
 
 Prerequisites
 -------------
-1. Install arctic_inference with server extras:
+1. Install Arctic Platform's inference extra:
 
-       cd ArcticInference-internal && pip install -e ".[server]"
+       pip install -e ".[inference]"
 
 2. Start the server (on a GPU node):
 
