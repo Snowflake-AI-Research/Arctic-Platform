@@ -221,6 +221,7 @@ def test_local_moe_weighting_sites_preserve_forward_and_gradients(monkeypatch, d
     layer = SimpleNamespace(
         experts=experts,
         score_before_experts=site == "before",
+        fp32_routed_weighting=False,
         fc1_latent_proj=lambda x: x * 0.5,
         fc2_latent_proj=lambda x: x * 0.25,
         routed_scaling_factor=1.5,
@@ -257,7 +258,7 @@ def test_local_moe_after_experts_preserves_fp32_output():
         torch_assert_equal(num_tokens_per_expert, counts)
         return x.square().to(torch.bfloat16)
 
-    layer = SimpleNamespace(experts=experts, score_before_experts=False)
+    layer = SimpleNamespace(experts=experts, score_before_experts=False, fp32_routed_weighting=False)
     expert_output = experts(reference_hidden.index_select(0, rows), counts)
     expected = (expert_output.float() * reference_scores.reshape(-1, 1)).to(reference_hidden.dtype)
     actual = moe.MoE._run_routed_experts(layer, hidden, rows, counts, scores)
