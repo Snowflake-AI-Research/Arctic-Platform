@@ -461,8 +461,8 @@ grouped + per-suffix attention so each shared prefix block is read once per
 *group* instead of once per *request*. Equivalent to standard attention;
 larger wins with longer / more-shared prefixes.
 
-**Code:** Implemented in ArcticInference / vLLM attention — not in this
-package. Activated when `arctic_inference_config` contains:
+**Code:** Implemented by the in-tree Arctic Platform vLLM plugin. Activated
+when `arctic_inference_config` contains:
 
 ```python
 arctic_inference_config={
@@ -470,7 +470,7 @@ arctic_inference_config={
 }
 ```
 
-That maps to `ModelConfig.use_fca = True` in
+That maps to `ModelConfig.forest_cascade_attn_configs = "{}"` in
 `arctic_platform.common.utils.server_models`.
 
 **verl yaml:**
@@ -482,7 +482,7 @@ remote_backend:
       enable: True
 ```
 
-Requires a matching vLLM + ArcticInference build. Design/tuning:
+Requires the in-tree plugin's matching vLLM build. Design/tuning:
 [Forest Cascade Attention](https://github.com/snowflakedb/ArcticInference/tree/main/arctic_inference/vllm/attention).
 
 ## Framework integrations

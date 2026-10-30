@@ -90,6 +90,14 @@ class TestProvidedBy:
         """Only lines carrying this extra's marker count."""
         assert gate(FLATTENED)._provided_by("lite") == {"shared-dep", "lite-only"}
 
+    def test_honors_python_markers_alongside_extra(self, gate):
+        """Dependencies inactive on this interpreter must not fail an extra gate."""
+        metadata = (
+            "runtime-dep; extra == 'inference'",
+            "py311-only; python_version < '3.11' and extra == 'inference'",
+        )
+        assert gate(metadata)._provided_by("inference") == {"runtime-dep"}
+
     def test_recurses_self_references(self, gate):
         """A self-reference pulls in the referenced extra's requirements."""
         assert gate(NESTED)._provided_by("full") == {"shared-dep", "pinned-dep"}
@@ -161,15 +169,15 @@ class TestExtraNamesResolve:
                     ref = dep.split("[")[1].rstrip("]")
                     assert ref in optional, f"[{extra}] references undefined [{ref}]"
 
-    def test_cortex_install_does_not_pull_the_inference_extra(self):
-        """[cortex] and [sft] do not select [inference]. [rl] keeps published arctic-inference."""
+    def test_rl_selects_the_in_tree_inference_extra(self):
+        """[cortex] and [sft] avoid inference; [rl] selects the in-tree stack."""
         with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
             project = tomllib.load(f)
         include = project["tool"]["hatch"]["build"]["include"]
         assert "arctic_platform" in include
         optional = project["project"]["optional-dependencies"]
-        assert "arctic-inference[server,vllm]>=0.3.0" in optional["rl"]
-        assert "arctic_platform[inference]" not in optional["rl"]
+        assert "arctic_platform[inference]" in optional["rl"]
+        assert all("arctic-inference" not in dep for dep in optional["rl"])
         hook = project["tool"]["hatch"]["build"]["hooks"]["custom"]
         assert hook["path"] == "hatch_build.py"
         for extra in ("cortex", "sft"):

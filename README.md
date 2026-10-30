@@ -106,7 +106,7 @@ The base install carries the config models only. Pick the extra for the backend 
 ```shell
 pip install "arctic-platform[cortex]"   # drive Cortex training over SnowAPI
 pip install "arctic-platform[sft]"      # run a local training-only server
-pip install "arctic-platform[rl]"       # ...plus the sampling stack (arctic-inference, vLLM)
+pip install "arctic-platform[rl]"       # ...plus the in-tree sampling stack and vLLM
 pip install "arctic-platform[verl]"     # the verl adapter
 ```
 

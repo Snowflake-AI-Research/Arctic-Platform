@@ -21,8 +21,8 @@ port picking, or tensor asserts in the test file.
 
 `tests/inference` covers `arctic_platform.inference`. It is not part of the
 platform harness above. Default `pytest` and the `[sft,testing]` CI job skip
-it. `[cortex]`, `[sft]`, and `[rl]` do not install the `[inference]` extra.
-`[rl]` installs the published `arctic-inference` package.
+it. `[cortex]` and `[sft]` do not install the `[inference]` extra. `[rl]`
+includes the in-tree inference stack.
 
 ```text
 pip install -e ".[inference]"

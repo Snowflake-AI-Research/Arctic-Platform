@@ -297,6 +297,39 @@ def test_single_node_initialization_reserves_tp_times_pp_gpus(monkeypatch):
     assert killed == [0]
 
 
+def test_colocated_tp_pool_uses_the_assigned_bundles(monkeypatch):
+    worker_cls = _FakeWorkerClass()
+    killed = []
+
+    async def run():
+        pool = ReplicaPool(worker_cls=worker_cls)
+        pool._make_scheduler = lambda workers: _FakeScheduler()
+        pg = _placement_group(world_size=2)
+        replicas = await pool.initialize(
+            _config(tp=2, pp=1),
+            num_replicas=1,
+            ray_num_gpus=0.33,
+            placement_groups=[pg],
+            bundle_indices=[0],
+            extra_env={"VLLM_RAY_PER_WORKER_GPUS": "0.33"},
+        )
+
+        assert replicas == 1
+        options = worker_cls.options_calls[0]
+        assert options["num_gpus"] == 0
+        strategy = options["scheduling_strategy"]
+        assert strategy.placement_group is pg
+        assert strategy.placement_group_bundle_index == 0
+        _, worker_env, _ = worker_cls.actors[0].initialize_calls[0][0]
+        assert worker_env["VLLM_RAY_BUNDLE_INDICES"] == "0,1"
+        await pool.shutdown()
+
+    monkeypatch.setattr(replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index))
+    asyncio.run(run())
+
+    assert killed == [0]
+
+
 def test_placement_group_rejects_replica_scaling():
     pool = ReplicaPool()
     pool._config = _config()

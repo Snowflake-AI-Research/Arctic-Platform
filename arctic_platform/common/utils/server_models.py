@@ -186,14 +186,25 @@ def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=
 
     zorro = arctic_inference_config.get("zorro_inference")
     if isinstance(zorro, dict) and zorro.get("enable"):
-        if "use_fca" in fields:
+        if "forest_cascade_attn_configs" in fields:
+            out["forest_cascade_attn_configs"] = "{}"
+        elif "use_fca" in fields:
             out["use_fca"] = True
 
     spec = arctic_inference_config.get("speculative_decoding")
     if isinstance(spec, dict):
         model = (spec.get("model") or "").strip()
-        if model and "spec_model" in fields:
-            out["spec_model"] = model
+        if model:
+            if "speculative_config" in fields:
+                out["speculative_config"] = {
+                    "method": "arctic",
+                    "model": model,
+                    "num_speculative_tokens": int(spec.get("num_speculative_tokens", 3)),
+                }
+            if "speculative_model" in fields:
+                out["speculative_model"] = model
+            elif "spec_model" in fields:
+                out["spec_model"] = model
 
     return out
 
@@ -205,12 +216,12 @@ def build_model_config(
 ):
     """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
 
-    ``arctic_inference_config`` carries Arctic-platform signals (e.g. use_fca,
-    spec_model) that are not vLLM engine args: they are recorded on the
+    ``arctic_inference_config`` carries Arctic-platform signals (e.g. FCA,
+    speculative decoding) that are not direct vLLM engine args: they are recorded on the
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    from arctic_inference.server.config import ModelConfig
+    from arctic_platform.inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name

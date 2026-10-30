@@ -31,10 +31,11 @@ from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import distribution
 from importlib.metadata import metadata
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 _DIST = "arctic-platform"
 # Strip a requirement down to its distribution name: "foo[bar]>=1.2" -> "foo[bar]".
-_VERSION_SPEC = re.compile(r"[<>=!~\s(]")
 _NAME_SEP = re.compile(r"[-_.]+")
 
 
@@ -51,15 +52,19 @@ def _requires_dist() -> tuple[str, ...]:
 @cache
 def _provided_by(extra: str) -> frozenset[str]:
     """Distributions that ``pip install arctic-platform[extra]`` would install."""
-    marker = re.compile(rf"""extra\s*==\s*['"]{re.escape(extra)}['"]""")
     names: set[str] = set()
     for line in _requires_dist():
-        spec, _, condition = line.partition(";")
-        if not marker.search(condition):
+        requirement = Requirement(line)
+        if requirement.marker is None:
             continue
-        base, _, nested = _VERSION_SPEC.split(spec.strip(), 1)[0].partition("[")
+        environment = default_environment()
+        environment["extra"] = extra
+        if not requirement.marker.evaluate(environment):
+            continue
+        base = requirement.name
         if _NAME_SEP.sub("-", base).lower() == _DIST:
-            names |= _provided_by(nested.rstrip("]"))  # e.g. arctic_platform[sft]
+            for nested in requirement.extras:
+                names |= _provided_by(nested)  # e.g. arctic_platform[sft]
         else:
             names.add(base)
     return frozenset(names)

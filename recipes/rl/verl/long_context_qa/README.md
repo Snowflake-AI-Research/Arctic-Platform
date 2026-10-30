@@ -80,7 +80,7 @@ cd Arctic-Platform/recipes/rl/verl/long_context_qa
 
 Create the env on the remaining nodes (idempotent — the launching node already has it), then install the pinned
 dependencies on all nodes. cuda-12.9 is assumed — if you use a different version change the `torch` index URL below
-and the `cuda-bindings` pin in `requirements.txt`. `arctic-platform[rl]` installs `arctic-inference[vllm]`, which
+and the `cuda-bindings` pin in `requirements.txt`. `arctic-platform[rl]` installs the in-tree inference stack, which
 owns the validated vLLM pin; `overrides.txt` forces the few transitive deps (flashinfer / numpy / transformers /
 datasets) this recipe is validated against, which vLLM's metadata otherwise pins higher (without it the single
 resolve is unsatisfiable).
