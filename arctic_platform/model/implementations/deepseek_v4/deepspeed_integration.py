@@ -32,6 +32,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -102,6 +103,17 @@ def _install_context_parallel(model: nn.Module, sp_group, sp_size: int) -> None:
     setattr(backbone, "forward", forward)
 
 
+def _adapter(dequantize_checkpoint: bool) -> MoEDeepSpeedAdapter:
+    return replace(
+        qwen_ds._generic_adapter(),
+        build_model_config=partial(_build_model_config, dequantize_checkpoint=dequantize_checkpoint),
+    )
+
+
+def prepare_deepseek_v4_weights(*, dequantize_checkpoint: bool = False, **kwargs) -> bool:
+    return qwen_ds.prepare_moe_conversion_cache(_adapter(dequantize_checkpoint), **kwargs)
+
+
 def load_deepseek_v4_model(
     *,
     model_name: str,
@@ -115,12 +127,8 @@ def load_deepseek_v4_model(
     dequantize_checkpoint: bool = False,
 ) -> nn.Module:
     """Load DeepSeek-V4-Flash; ``dequantize_checkpoint`` trains the official FP8/MXFP4 weights in bf16."""
-    adapter = replace(
-        qwen_ds._generic_adapter(),
-        build_model_config=partial(_build_model_config, dequantize_checkpoint=dequantize_checkpoint),
-    )
     model = qwen_ds._load_moe_model(
-        adapter,
+        _adapter(dequantize_checkpoint),
         qwen_ds.load_generic_moe_model_for_deepspeed,
         model_name=model_name,
         optimization_dtype=optimization_dtype,

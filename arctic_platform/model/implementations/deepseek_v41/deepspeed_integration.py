@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -136,6 +137,17 @@ def install_tokenizer_compressed_map(model: nn.Module, model_path: str) -> bool:
     return True
 
 
+def _adapter(dequantize_checkpoint: bool) -> MoEDeepSpeedAdapter:
+    return replace(
+        qwen_ds._generic_adapter(),
+        build_model_config=partial(_build_model_config, dequantize_checkpoint=dequantize_checkpoint),
+    )
+
+
+def prepare_deepseek_v41_weights(*, dequantize_checkpoint: bool = False, **kwargs) -> bool:
+    return qwen_ds.prepare_moe_conversion_cache(_adapter(dequantize_checkpoint), **kwargs)
+
+
 def load_deepseek_v41_model(
     *,
     model_name: str,
@@ -149,12 +161,8 @@ def load_deepseek_v41_model(
     dequantize_checkpoint: bool = False,
 ) -> nn.Module:
     """Load V4.1 text; without ``dequantize_checkpoint`` an official snapshot keeps its experts in MXFP4."""
-    adapter = replace(
-        qwen_ds._generic_adapter(),
-        build_model_config=partial(_build_model_config, dequantize_checkpoint=dequantize_checkpoint),
-    )
     model = qwen_ds._load_moe_model(
-        adapter,
+        _adapter(dequantize_checkpoint),
         qwen_ds.load_generic_moe_model_for_deepspeed,
         model_name=model_name,
         optimization_dtype=optimization_dtype,

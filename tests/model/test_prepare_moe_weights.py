@@ -115,14 +115,38 @@ def _flash_checkpoint(tmp_path, family):
     return source
 
 
-@pytest.mark.parametrize("family", ["glm5_next", "qwen4_exp"])
-def test_flash_moe_prepare_builds_on_meta_and_writes_the_cache(tmp_path, monkeypatch, family):
+def _deepseek_checkpoint(tmp_path, family):
+    """A tiny model's own weights in the published layout, which the load converts to Prime."""
+    from arctic_platform.model.implementations.moe.weights import save_state_dict
+
+    if family == "deepseek_v4":
+        from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4ForCausalLM as model_cls
+        from tests.model.test_deepseek_v4 import _requires_sparse_attention_kernel
+        from tests.model.test_deepseek_v4 import _tiny_config
+
+        _requires_sparse_attention_kernel()
+    else:
+        from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41ForCausalLM as model_cls
+        from tests.model.test_deepseek_v41_checkpoint import _tiny_config
+    config = _tiny_config()
+    model = model_cls._from_config(config, dtype=torch.bfloat16)
+    source = tmp_path / family
+    config.save_pretrained(source)
+    save_state_dict(
+        model.convert_to_hf({name: tensor.detach().clone() for name, tensor in model.state_dict().items()}), source
+    )
+    return source
+
+
+@pytest.mark.parametrize("family", ["glm5_next", "qwen4_exp", "deepseek_v4", "deepseek_v41"])
+def test_prepare_builds_on_meta_and_writes_the_cache(tmp_path, monkeypatch, family):
     from arctic_platform.model import conversion_cache_ready
     from arctic_platform.model import moe_model_spec
     from arctic_platform.model import prepare_moe_weights
     from arctic_platform.model.implementations.qwen35 import model_builder
 
-    source = _flash_checkpoint(tmp_path, family)
+    make_checkpoint = _deepseek_checkpoint if family.startswith("deepseek") else _flash_checkpoint
+    source = make_checkpoint(tmp_path, family)
     options = {"weight_conversion_cache_dir": str(tmp_path / "cache")}
     assert moe_model_spec(model_name=str(source), ep_size=2, loader_options=options).loader == family
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node")
@@ -133,3 +157,22 @@ def test_flash_moe_prepare_builds_on_meta_and_writes_the_cache(tmp_path, monkeyp
     assert conversion_cache_ready(cache)
     _forbid(monkeypatch, model_builder, "_write_conversion_cache", "converted a ready cache again")
     assert prepare_moe_weights(model_name=str(source), ep_size=2, loader_options=options) is True
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41"])
+@pytest.mark.parametrize("peft", [None, {"peft_type": "Lora", "r": 8}])
+def test_deepseek_prepare_dequantizes_the_checkpoint_the_load_does(tmp_path, monkeypatch, family, peft):
+    import importlib
+    import json
+
+    from arctic_platform.model import prepare_moe_weights
+
+    integration = importlib.import_module(f"arctic_platform.model.implementations.{family}.deepspeed_integration")
+    calls = []
+    monkeypatch.setattr(integration, f"prepare_{family}_weights", lambda **kwargs: calls.append(kwargs) or True)
+    source = tmp_path / family
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": family, "n_routed_experts": 8}))
+
+    assert prepare_moe_weights(model_name=str(source), ep_size=8, peft_config=peft) is True
+    assert calls[0]["dequantize_checkpoint"] is (peft is None)

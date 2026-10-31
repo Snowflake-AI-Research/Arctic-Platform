@@ -81,11 +81,13 @@ def prepare_moe_weights(
     ep_size: int,
     sp_size: int = 1,
     loader_options: dict | None = None,
+    peft_config: dict | None = None,
 ) -> bool:
     """Write the node-local weight cache ``build_moe_model`` reads (the HF->Prime conversion), with no process group.
 
     A runtime runs it once per node before it starts the ranks, so a cold node's conversion runs outside their
-    start-up deadline and first collective; ``build_moe_model`` then reuses the cache.
+    start-up deadline and first collective; ``build_moe_model`` then reuses the cache. Pass the run's
+    ``peft_config``: DeepSeek V4/V4.1 keep a quantized checkpoint packed only under LoRA, in a different cache.
 
     Returns whether ``build_moe_model`` will read the weights without converting them: True when the checkpoint
     needs no conversion or its cache is ready, including a pre-baked ``<checkpoint>/prime``. False when the loader
@@ -94,7 +96,13 @@ def prepare_moe_weights(
     from arctic_platform.model.loader import prepare_weights
 
     return prepare_weights(
-        moe_model_spec(model_name=model_name, ep_size=ep_size, sp_size=sp_size, loader_options=loader_options)
+        moe_model_spec(
+            model_name=model_name,
+            ep_size=ep_size,
+            sp_size=sp_size,
+            loader_options=loader_options,
+            peft_config=peft_config,
+        )
     )
 
 

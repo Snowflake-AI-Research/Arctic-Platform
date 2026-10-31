@@ -160,13 +160,13 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 def _prepare_glm5_next(ctx: LoaderContext) -> bool:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import prepare_glm5_next_weights
 
-    return prepare_moe(ctx, prepare_glm5_next_weights)
+    return prepare_moe(ctx, prepare_glm5_next_weights, _FlashLoadOptions)
 
 
 def _prepare_qwen4_exp(ctx: LoaderContext) -> bool:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import prepare_qwen4_exp_weights
 
-    return prepare_moe(ctx, prepare_qwen4_exp_weights)
+    return prepare_moe(ctx, prepare_qwen4_exp_weights, _FlashLoadOptions)
 
 
 @register_loader(
