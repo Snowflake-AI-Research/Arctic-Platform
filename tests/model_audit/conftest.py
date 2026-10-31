@@ -319,13 +319,23 @@ def export_b(probes, profile, tiny_ckpt_b):
 
 
 @pytest.fixture(scope="session")
-def sampler_fresh_b(probes, profile, tiny_ckpt, tiny_ckpt_b, trainer_forward):
-    """A sampler started on B, except that tensors the production model's full HF export lacks keep A's values.
+def fresh_b_ckpt(tiny_ckpt, tiny_ckpt_b, trainer_forward) -> Path:
+    """B, except that tensors the production model's full HF export lacks keep A's values.
 
     The trainer holds no state for those, so training never changes them and a sampler synced from A keeps A's.
     ``trainer.export_round_trip`` reports them.
     """
     held = set(require_ok(trainer_forward, "production forward")["exported"])
     untrained = sorted(set(audit_lib.read_checkpoint_tensors(tiny_ckpt_b)) - held)
-    ckpt = audit_lib.with_tensors_from(tiny_ckpt_b, tiny_ckpt, untrained)
-    return probes.run("sampler", profile, ckpt, gpus=profile.sampler_gpus)
+    return audit_lib.with_tensors_from(tiny_ckpt_b, tiny_ckpt, untrained)
+
+
+@pytest.fixture(scope="session")
+def sampler_fresh_b(probes, profile, fresh_b_ckpt):
+    return probes.run("sampler", profile, fresh_b_ckpt, gpus=profile.sampler_gpus)
+
+
+@pytest.fixture(scope="session")
+def sampler_fresh_b_replica(probes, profile, fresh_b_ckpt):
+    """A second engine started on the same weights: a synced sampler is another engine, so it differs by this much."""
+    return probes.run("sampler", profile, fresh_b_ckpt, gpus=profile.sampler_gpus, replica=1)

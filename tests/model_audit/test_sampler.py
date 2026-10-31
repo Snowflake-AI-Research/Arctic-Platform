@@ -123,7 +123,7 @@ def pytest_generate_tests(metafunc):
 
 @pytest.mark.audit_check(SYNC)
 def test_weight_sync_matches_fresh_load(
-    probes, profile, tiny_ckpt, export_b, sampler_fresh_b, sync_format, sync_transport, record
+    probes, profile, tiny_ckpt, export_b, sampler_fresh_b, sampler_fresh_b_replica, sync_format, sync_transport, record
 ):
     exported = require_ok(export_b, "export of B")
     if sync_format not in exported["paths"]:
@@ -146,14 +146,19 @@ def test_weight_sync_matches_fresh_load(
     assert f"sync_{sync_format}_error" not in synced, synced[f"sync_{sync_format}_error"]
     errors = _row_errors(synced[f"after_sync_{sync_format}"], fresh["alone"])
     repeat_noise = _row_errors(fresh["alone_repeat"], fresh["alone"])
+    replica = require_ok(sampler_fresh_b_replica, "second sampler started on B")
+    engine_noise = _row_errors(replica["alone"], fresh["alone"])
     unsynced = _row_errors(synced["alone"], fresh["alone"])
-    record(per_row=errors, repeat_noise=repeat_noise, before_sync=unsynced, rpc=synced.get(f"sync_{sync_format}_rpc"))
-    bad = [
-        (e, r)
-        for e, r in zip(errors, repeat_noise)
-        if e["max_abs"] > 2 * r["max_abs"] + profile.tolerances["noise_slack"]
-    ]
-    assert not bad, f"synced sampler differs from a fresh load beyond its own repeat noise (error, noise): {bad}"
+    record(
+        per_row=errors,
+        repeat_noise=repeat_noise,
+        engine_noise=engine_noise,
+        before_sync=unsynced,
+        rpc=synced.get(f"sync_{sync_format}_rpc"),
+    )
+    noise = [max(r["max_abs"], n["max_abs"]) for r, n in zip(repeat_noise, engine_noise)]
+    bad = [(e, n) for e, n in zip(errors, noise) if e["max_abs"] > 2 * n + profile.tolerances["noise_slack"]]
+    assert not bad, f"synced sampler differs from a fresh load beyond the noise between two fresh loads: {bad}"
 
 
 @pytest.mark.audit_check(TP)

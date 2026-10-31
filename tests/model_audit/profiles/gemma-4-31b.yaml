@@ -1,0 +1,79 @@
+# Gemma-4-31B-it RL. No AP family: the stock transformers loader, as for any dense HF model. Launch target: bf16 full
+# fine-tune, DP trainer, TP4 sampler.
+name: gemma-4-31b
+checkpoint: google/gemma-4-31B-it
+
+launch:
+  dtype: bfloat16
+  max_seq_len: 32768
+  trainer:
+    loader: huggingface
+    # Full-attention layers have head_dim 512, past FlashAttention's 256.
+    attn_implementation: sdpa
+    parallelism: {expert_parallel: 1, sequence_parallel: 1}
+  engine: {gradient_clipping: 1.0, fp32_masters: false}
+  sampler:
+    tensor_parallel_size: 4
+    max_model_len: 32768
+    enable_prefix_caching: true
+  optimizer: {lr: 1.0e-6, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+
+probe:
+  pass_labels: false
+
+tiny:
+  # Head dims stay real: they pick the sampler's attention kernels, and the full layers' 512 is their edge case.
+  text_overrides:
+    hidden_size: 512
+    intermediate_size: 1024
+    num_attention_heads: 4
+    num_key_value_heads: 2
+    num_global_key_value_heads: 1
+  config_overrides:
+    vision_config: {hidden_size: 144, intermediate_size: 256, num_attention_heads: 2, num_key_value_heads: 2}
+  max_row_len: 2048
+  thresholds:
+    - {name: sliding_window, position: 1024, reason: "sliding layers stop attending to keys more than sliding_window back"}
+  parallel:
+    - {expert_parallel: 1, sequence_parallel: 2}
+    - {expert_parallel: 1, sequence_parallel: 1, world_size: 2}
+  sampler:
+    tensor_parallel_size: 4
+    max_model_len: 4096
+    gpu_memory_utilization: 0.3
+
+expect:
+  loader: huggingface
+  no_grad_params:
+    - {pattern: "vision_tower\\.|embed_vision\\.", reason: "text-only RL does not run the vision tower"}
+
+known_issues:
+  trainer.export_round_trip:
+    issue: pending
+    summary: >-
+      the generic (no family contract) complete HF export walks named_parameters only, so it drops the persistent
+      layer_scalar buffer of every decoder layer (the MoE contract exports buffers). A checkpoint written from it
+      loads with 1.0 there; the real model's values span 0.036-0.99
+  optimizer.clip_scale_exact:
+    issue: pending
+    summary: >-
+      with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
+      with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.30% low here, up to 0.39%)
+  optimizer.update_lands_at_launch_lr:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    summary: "engine default bf16 master weights drop ~99% of a 1e-6 AdamW step; fp32_masters: true keeps it"
+  parallel.logprobs_match_baseline[ep1-sp2]:
+    issue: pending
+    summary: "huggingface loader accepts SP > 1 but installs no sequence-parallel attention for attention-only models"
+  sampler.weight_sync_matches_fresh_load[hf-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
+      compute_expected_hf_param_names(model), which returns vLLM's module names for this model
+      (language_model.model.* for model.language_model.*), so it rejects a correct HF export before loading. The
+      NCCL placement passes
+  sampler.weight_sync_matches_fresh_load[vllm-file]:
+    issue: pending
+    summary: "same strict CPU-file name check as [hf-file]; the generic vLLM export ships the same names"
+
+not_applicable: {}

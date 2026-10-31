@@ -140,12 +140,13 @@ Hypothesis checklist (model-agnostic; tick each in the report with its evidence)
 - Determinism: atomics in top-k or scatter, batch-composition effects, prefix caching.
 - Trainer/sampler parity: precision casts, fused vs eager rounding, LM-head precision, temperature, router replay.
 - Weight sync: name coverage both ways, values after sync vs a fresh load, cached derived tensors, every sync path
-  (CUDA IPC, CPU file, NCCL broadcast, LoRA). The suite syncs every format the production model exports, each into
-  its own sampler, two ways: `file` (the CPU-file load) and `stream` (the NCCL receiver's placement, batched or TP1
-  direct, fed from the file so only the network is skipped). All run for every model: a broken variant is a finding
-  even when this launch takes another, since the client picks the format per job and colocated jobs use the file
-  path. A checkpoint
-  tensor the trainer's HF export lacks is never trained, so the fresh-load sampler keeps the pre-sync value there.
+  (CUDA IPC, CPU file, NCCL broadcast, LoRA). The suite syncs every format the production model exports, each into its
+  own sampler, two ways: `file` (the CPU-file load) and `stream` (the NCCL receiver's placement, batched or TP1 direct,
+  fed from the file so only the network is skipped). A synced sampler is compared with a fresh load of B, within twice
+  the larger of its repeat noise and the noise between two fresh engines (some models are repeatable within an engine
+  but not across engines). All run for every model: a broken variant is a finding even when this launch takes another,
+  since the client picks the format per job and colocated jobs use the file path. A checkpoint tensor the trainer's HF
+  export lacks is never trained, so the fresh-load sampler keeps the pre-sync value there.
 - Optimizer: policy per family, frozen and FP8 parameters, bf16 master-weight update loss at the launch lr, weight
   decay groups, clipping across EP/SP, expert-data-parallel reduction.
 - Parallelism: EP/SP parity, reduction groups, expert DP with SP, uneven sequence splits.

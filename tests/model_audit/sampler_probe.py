@@ -93,6 +93,7 @@ def main() -> None:
     parser.add_argument("--sync", action="append", default=[], help="fmt=path of a weight file to sync, repeatable")
     parser.add_argument("--sync-transport", choices=["file", "stream"], default="file")
     parser.add_argument("--engine-args", default="{}", help="JSON overrides of the profile's tiny sampler args")
+    parser.add_argument("--replica", type=int, default=0, help="tells apart otherwise identical engines")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
