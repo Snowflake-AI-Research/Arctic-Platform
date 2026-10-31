@@ -359,6 +359,7 @@ def prepare_moe_conversion_cache(
 
     Returns whether the ranks' load will read the weights without converting them.
     """
+    assert adapter.prepare_conversion_cache is not None, "this adapter has no per-node conversion cache"
     config = adapter.build_model_config(model_name, ep_size, 1, optimization_dtype, attn_implementation, options)
     model = adapter.get_model(config, device=torch.device("meta"), dtype=adapter.dtype_map[config.optimization_dtype])
     return adapter.prepare_conversion_cache(model, config)
