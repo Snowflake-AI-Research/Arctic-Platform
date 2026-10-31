@@ -209,6 +209,20 @@ def test_qwen_ngram_module_declares_all_persistent_export_buffers():
     )
 
 
+def test_nemotron_router_exports_its_score_correction_bias_only_to_checkpoints():
+    from arctic_platform.model.implementations.moe.layers.moe import NemotronHRouter
+
+    router = NemotronHRouter(dim=4, num_experts=4, top_k=2, n_group=1, topk_group=1, norm_topk_prob=True)
+
+    _assert_same_entries(
+        list(named_weight_sync_tensors(router)),
+        [("gate", router.gate), ("e_score_correction_bias", router.e_score_correction_bias)],
+    )
+    _assert_same_entries(
+        list(named_weight_sync_tensors(router, include_export_buffers=False)), [("gate", router.gate)]
+    )
+
+
 @pytest.mark.parametrize(("weight_format", "checkpoint_export"), (("hf", True), ("hf", False), ("vllm", False)))
 def test_checkpoint_export_keeps_persistent_buffers_and_weight_sync_omits_them(
     monkeypatch, weight_format, checkpoint_export
