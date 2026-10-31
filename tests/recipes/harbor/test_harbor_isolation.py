@@ -1274,7 +1274,8 @@ def test_live_sandboxes_from_an_earlier_run_are_counted_and_warned_about(monkeyp
         SimpleNamespace(name=None, status="ready"),
     ]
     monkeypatch.setattr(sf_env, "get_config_sync", lambda connection, role: (connection, role))
-    monkeypatch.setattr(sf_env.Sandbox, "list", lambda role=None, connection=None: listed)
+    # The session already carries the role; Sandbox.list refuses a role for a logged-in Config.
+    monkeypatch.setattr(sf_env.Sandbox, "list", lambda connection: listed)
     assert len(sf_env.SnowflakeSandboxEnvironment.live_sandboxes(connection="C", role="R")) == 50
 
     warn_live_sandboxes(dict(connection="C", role="R"), rollouts=40)

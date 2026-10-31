@@ -341,7 +341,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         config = get_config_sync(connection, role)
         return [
             s.name
-            for s in Sandbox.list(role=role, connection=config)
+            for s in Sandbox.list(connection=config)
             if s.status in ("ready", "pending") and (s.name or "").startswith(SANDBOX_NAME_PREFIX)
         ]
 
