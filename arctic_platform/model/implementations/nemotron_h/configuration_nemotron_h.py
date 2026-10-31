@@ -63,6 +63,8 @@ class NemotronHConfig(PretrainedConfig):
 
     PATTERN_MAP = {"M": "mamba", "E": "moe", "*": "attention"}
     REVERSE_PATTERN_MAP = {"mamba": "M", "moe": "E", "attention": "*"}
+    # Transformers 5 renames the legacy layer types on load and writes the new names on save.
+    TRANSFORMERS_LAYER_TYPE_MAP = {"linear_attention": "mamba", "full_attention": "attention"}
 
     def __init__(
         self,
@@ -134,6 +136,11 @@ class NemotronHConfig(PretrainedConfig):
 
         if layers_block_type is None:
             layers_block_type = ["mamba", "moe", "attention", "moe"]
+        layers_block_type = [self.TRANSFORMERS_LAYER_TYPE_MAP.get(t, t) for t in layers_block_type]
+        if kwargs.get("mtp_layers_block_type") is not None:
+            kwargs["mtp_layers_block_type"] = [
+                self.TRANSFORMERS_LAYER_TYPE_MAP.get(t, t) for t in kwargs["mtp_layers_block_type"]
+            ]
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
