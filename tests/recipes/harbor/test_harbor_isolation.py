@@ -611,6 +611,38 @@ def test_a_create_that_never_stops_failing_raises(tmp_path, monkeypatch):
     assert len(attempts) == 1
 
 
+def test_a_create_that_fails_in_the_client_terminates_the_sandbox_it_started(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    names: list[str] = []
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            names.append(name)
+            raise KeyError(5)
+
+        @staticmethod
+        async def connect(name, connection):
+            async def terminate() -> None:
+                terminated.append(name)
+
+            return SimpleNamespace(name=name, terminate=terminate)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0,))
+    env = _sandbox_env(tmp_path, sf_env)
+    with pytest.raises(KeyError):
+        asyncio.run(env._create_sandbox("image", {}))
+    assert terminated == names and len(names) == 1
+
+
 def test_a_cancelled_rollout_still_terminates_its_sandbox(tmp_path, monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env

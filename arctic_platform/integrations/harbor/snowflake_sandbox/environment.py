@@ -648,6 +648,10 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 logger.warning("The Snowflake session expired during sandbox create; renewing it")
                 await renew_config(self._connection, self._role, token)
                 continue
+            except Exception:
+                # A client-side failure (for example in the HTTP/2 stack) can come after the server started the sandbox.
+                await self._terminate_orphan(config, name)
+                raise
             except asyncio.CancelledError:
                 _track(name, self._connection, self._role)
                 raise
