@@ -202,10 +202,7 @@ async def run_harbor_trial(
         result = await trial.run()
         if result.exception_info is not None and result.verifier_result is None:
             info = result.exception_info
-            raise HarborTrialError(
-                f"Harbor trial ended without a verifier result: {info.exception_type}: {info.exception_message}\n"
-                f"{info.exception_traceback}"
-            )
+            raise HarborTrialError(f"{info.exception_type}: {info.exception_message}", info.exception_traceback)
         rewards = dict((result.verifier_result.rewards if result.verifier_result else None) or {})
         reward = float(rewards.get("reward", next(iter(rewards.values()), 0.0))) if rewards else 0.0
 
@@ -232,7 +229,14 @@ async def run_harbor_trial(
 
 
 class HarborTrialError(RuntimeError):
-    """A Harbor trial ended without a verifier result, so it has no reward."""
+    """A Harbor trial ended without a verifier result, so it has no reward.
+
+    ``reason`` is the exception that ended the trial; the message adds Harbor's traceback.
+    """
+
+    def __init__(self, reason: str, traceback: str = "") -> None:
+        super().__init__(f"Harbor trial ended without a verifier result: {reason}\n{traceback}".rstrip())
+        self.reason = reason
 
 
 class _LoopThread:

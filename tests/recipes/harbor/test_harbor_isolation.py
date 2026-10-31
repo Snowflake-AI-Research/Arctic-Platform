@@ -663,7 +663,7 @@ def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_pat
     from arctic_platform.integrations.harbor.adapter import grade_harbor
 
     monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
-    with pytest.raises(HarborTrialError, match=message):
+    with pytest.raises(HarborTrialError, match=message) as raised:
         asyncio.run(
             run_harbor_trial(
                 task_dir=_task(tmp_path),
@@ -676,6 +676,8 @@ def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_pat
                 api_key="k",
             )
         )
+    assert raised.value.reason.startswith("RuntimeError: ") and message in raised.value.reason
+    assert "Traceback" not in raised.value.reason and "Traceback" in str(raised.value)
     assert grade_harbor([], dict(error=message)).exhausted is True
 
 

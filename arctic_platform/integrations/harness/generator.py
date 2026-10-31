@@ -119,7 +119,12 @@ def rows_for_rollout(
 
 
 class HarnessGenerator:
-    """SkyRL ``GeneratorInterface`` for any harness that speaks to the chat proxy."""
+    """SkyRL ``GeneratorInterface`` for any harness that speaks to the chat proxy.
+
+    A batch in which every rollout errored is rerun up to ``all_errored_retries`` times, after
+    ``all_errored_wait_s`` and then twice as long each time, and then raises. A sandbox outage of a
+    few minutes costs a few rollout rounds instead of the run.
+    """
 
     def __init__(
         self,
@@ -133,9 +138,6 @@ class HarnessGenerator:
         all_errored_retries: int = 3,
         all_errored_wait_s: float = 60.0,
     ) -> None:
-        """``all_errored_retries``: how many times to rerun a batch in which every rollout errored, waiting
-        ``all_errored_wait_s`` and then twice as long each time, before raising. A sandbox service outage of a
-        few minutes then costs a few rollout rounds instead of the run."""
         self._tokenizer = tokenizer
         self._proxy = proxy
         self._traj_dir = traj_dir
