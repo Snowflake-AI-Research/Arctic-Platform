@@ -336,6 +336,16 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             ImageRegistry.preflight()
 
     @classmethod
+    def live_sandboxes(cls, *, connection: str | None = None, role: str | None = None, **_: Any) -> list[str]:
+        """Names of the live sandboxes on this connection that a Harbor environment started."""
+        config = get_config_sync(connection, role)
+        return [
+            s.name
+            for s in Sandbox.list(role=role, connection=config)
+            if s.status in ("ready", "pending") and (s.name or "").startswith(SANDBOX_NAME_PREFIX)
+        ]
+
+    @classmethod
     def close_shared_resources(cls) -> None:
         """Delete every registry's private token config, then close the shared Snowflake sessions."""
         close_registries()

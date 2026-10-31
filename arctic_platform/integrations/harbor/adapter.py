@@ -239,6 +239,15 @@ class HarborTrialError(RuntimeError):
         self.reason = reason
 
 
+def close_shared_resources(env: str) -> None:
+    """Call ``close_shared_resources()`` on an environment loaded by import path, if it defines one."""
+    module_name, _, class_name = resolve_env(env).partition(":")
+    env_cls = getattr(sys.modules.get(module_name), class_name, None) if class_name else None
+    close_shared = getattr(env_cls, "close_shared_resources", None)
+    if close_shared is not None:
+        close_shared()
+
+
 class _LoopThread:
     """An event loop running on a daemon thread until :meth:`close`."""
 
@@ -385,11 +394,7 @@ class HarborTrialAdapter:
             if loop_thread is not None:
                 loop_thread.close(timeout_s)
         finally:
-            module_name, _, class_name = self._env.partition(":")
-            env_cls = getattr(sys.modules.get(module_name), class_name, None) if class_name else None
-            close_shared = getattr(env_cls, "close_shared_resources", None)
-            if close_shared is not None:
-                close_shared()
+            close_shared_resources(self._env)
 
     def _finish(self, rollout_id: str, future: concurrent.futures.Future) -> None:
         exc = asyncio.CancelledError("Harbor adapter closed") if future.cancelled() else future.exception()

@@ -1221,7 +1221,69 @@ def test_stopping_a_conversation_never_blocks_the_caller():
     assert not late.attach(ConversationMidStep())
 
 
-def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(monkeypatch):
+def _train_parquet(path: Path, task_dirs: list[Path]) -> str:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table(dict(instance_id=[t.name for t in task_dirs], harbor_task_dir=[str(t) for t in task_dirs])), path
+    )
+    return str(path)
+
+
+def test_the_task_check_runs_the_first_task_and_stops_before_gpus_when_it_fails(tmp_path, monkeypatch, capsys):
+    from harbor_rl.check import check_first_task
+
+    from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
+
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    good = _task(tmp_path, name="good")
+    check_first_task(
+        _train_parquet(tmp_path / "good.parquet", [good]),
+        env=HOST_HARBOR_ENV,
+        env_kwargs={},
+        rollouts=1,
+        prepare_task_fn=lambda row, root: pytest.fail("rows with harbor_task_dir are used as is"),
+    )
+    assert "Task good ran and was graded" in capsys.readouterr().out
+
+    broken = _task(tmp_path, name="broken")
+    (broken / "tests" / "test.sh").write_text("#!/usr/bin/env bash\necho no reward file; exit 3\n", encoding="utf-8")
+    with pytest.raises(
+        SystemExit, match=r"(?s)task broken failed on HostEnvironment.*HARBOR_SKIP_TASK_CHECK=1"
+    ) as raised:
+        check_first_task(
+            _train_parquet(tmp_path / "broken.parquet", [broken, good]),
+            env=HOST_HARBOR_ENV,
+            env_kwargs={},
+            rollouts=1,
+            prepare_task_fn=lambda row, root: None,
+        )
+    assert "Traceback" not in str(raised.value)
+
+
+def test_live_sandboxes_from_an_earlier_run_are_counted_and_warned_about(monkeypatch, capsys):
+    pytest.importorskip("snowflake.sandbox")
+    from harbor_rl.check import warn_live_sandboxes
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    listed = [SimpleNamespace(name=f"harbor-rl-{i}", status="ready" if i % 2 else "pending") for i in range(50)] + [
+        SimpleNamespace(name="harbor-rl-dead", status="dead"),
+        SimpleNamespace(name="someone-else", status="ready"),
+        SimpleNamespace(name=None, status="ready"),
+    ]
+    monkeypatch.setattr(sf_env, "get_config_sync", lambda connection, role: (connection, role))
+    monkeypatch.setattr(sf_env.Sandbox, "list", lambda role=None, connection=None: listed)
+    assert len(sf_env.SnowflakeSandboxEnvironment.live_sandboxes(connection="C", role="R")) == 50
+
+    warn_live_sandboxes(dict(connection="C", role="R"), rollouts=40)
+    assert capsys.readouterr().err == ""
+    warn_live_sandboxes(dict(connection="C", role="R"), rollouts=64)
+    assert "50 sandboxes from an earlier Harbor run" in capsys.readouterr().err
+
+
+def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image(monkeypatch):
     from harbor.environments.factory import EnvironmentFactory
     from harbor_rl.entrypoint import check_harbor_env
     from harbor_rl.entrypoint import harbor_env_kwargs
@@ -1240,7 +1302,7 @@ def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(m
     monkeypatch.delenv("HARBOR_AGENT", raising=False)
     monkeypatch.setenv("HARBOR_ENV", "snowflake")
     monkeypatch.delenv("HARBOR_ENV_KWARGS", raising=False)
-    with pytest.raises(SystemExit, match="image_repo"):
+    with pytest.raises(SystemExit, match="base_image"):
         check_harbor_env()
     monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(image_repo="DB.SCHEMA.REPO", role="R")))
     check_harbor_env()
