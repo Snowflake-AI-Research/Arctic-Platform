@@ -84,6 +84,18 @@ def test_glm53_sparse_packed_rows_match_isolated_rows(layout, tiny_glm_sparse_mo
         torch.testing.assert_close(perturbed[:, row_a_length:], isolated, rtol=1e-5, atol=1e-6)
 
 
+@require_torch_gpu
+@pytest.mark.parametrize("short_length", [1, 2, 3, 4, 5])
+def test_glm53_fused_indexer_handles_rows_shorter_than_a_key_pool(short_length, tiny_glm_sparse_model):
+    # A power-of-two index head dim of at least 16 takes the fused scorer; a row under index_kpool tokens has no
+    # complete key pool to select.
+    model = tiny_glm_sparse_model(index_head_dim=16, index_kpool=4).cuda()
+    tokens = (torch.arange(8 + short_length) % 63 + 1)[None].cuda()
+    positions = torch.cat((torch.arange(8), torch.arange(short_length)))[None].cuda()
+    output = model(input_ids=tokens, position_ids=positions, use_cache=False).last_hidden_state
+    assert torch.isfinite(output).all()
+
+
 def test_glm53_sparse_forward_without_explicit_positions(tiny_glm_sparse_model):
     model = tiny_glm_sparse_model()
     output = model(input_ids=torch.tensor([[1, 2, 3, 4]]), use_cache=False)
