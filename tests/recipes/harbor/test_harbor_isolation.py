@@ -727,7 +727,9 @@ def test_a_batch_where_every_rollout_errors_is_rerun_then_stops_the_run(
     )
     saved = tmp_path / "step_1" / "train"
     if raises:
-        with pytest.raises(RuntimeError, match="(?s)Every train rollout at step 1 errored in 4 attempts.*never started"):
+        with pytest.raises(
+            RuntimeError, match="(?s)Every train rollout at step 1 errored in 4 attempts.*never started"
+        ):
             asyncio.run(generator.generate(batch))
         assert len(submitted) == 16
         assert len(list(saved.glob("*.error"))) == 4
