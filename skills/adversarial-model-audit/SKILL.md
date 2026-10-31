@@ -251,12 +251,14 @@ tiny:
   trainer: {parallelism: {expert_parallel: 2, sequence_parallel: 1}}   # baseline layout: smallest one production builds
   parallel: [{expert_parallel: 2, sequence_parallel: 2, world_size: 4}]
   sampler: {tensor_parallel_size: 8, max_model_len: 8192}   # the launch TP; smaller degrees are swept
-tolerances: {noise_factor: 4.0, noise_slack: 2.0e-3, adamw_mismatch_fraction: 1.0e-3, max_lost_update_fraction: 0.5, grad_norm_rel: 1.0e-4}
+tolerances: {noise_factor: 4.0, noise_slack: 2.0e-3, adamw_mismatch_fraction: 1.0e-3, max_lost_update_fraction: 0.5, grad_norm_rel: 1.0e-4,
+             engine_noise: 0.0}      # floor under the measured noise between two fresh sampler engines
 expect:
   loader: <name>
   optimizer_implementation: <fused_adam|torch_adamw|...>
   no_grad_params: [{pattern: <regex>, reason: ...}]
-known_issues: {<check id> or <check id>[<variant>]: {issue: <ISSUE.md or PR URL>, summary: ...}}
+  export_up_to_shift: [{pattern: <regex>, reason: ...}]   # exported equal to the checkpoint up to a constant
+known_issues: {<check id> or <check id>[<variant>]: {issue: <ISSUE.md or PR URL, or a label such as "upstream (vLLM)">, summary: ...}}
 not_applicable: {<check id>: <reason>}
 ```
 

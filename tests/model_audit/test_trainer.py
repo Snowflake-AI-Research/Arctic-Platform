@@ -203,11 +203,17 @@ def test_export_round_trip(profile, tiny_ckpt, trainer_forward, record):
     allowed = profile.expect.get("no_grad_params", []) + profile.expect.get("export_ignore", [])
     missing = sorted(n for n in saved if n not in exported and audit_lib.matches(allowed, n) is None)
     extra = sorted(n for n in exported if n not in saved)
+    shift_ok = profile.expect.get("export_up_to_shift", [])
     changed = []
     for name in sorted(set(saved) & set(exported)):
         a, e = exported[name], saved[name]
         if a.shape != e.shape:
             changed.append((name, f"shape {tuple(a.shape)} != {tuple(e.shape)}"))
+        elif audit_lib.matches(shift_ok, name) is not None:
+            # The shift rounds once in bf16, relative to the shifted values.
+            tol = float((e - e.min()).max()) * 2**-8
+            if float(((a - a.min()) - (e - e.min())).abs().max()) > tol:
+                changed.append((name, f"differs beyond a constant shift (tol {tol:.3g})"))
         elif not torch.equal(a, e):
             changed.append((name, f"max_abs={float((a - e).abs().max()):.4g}"))
     record(missing=missing[:30], extra=extra[:30], changed=changed[:30], tensors=len(saved))

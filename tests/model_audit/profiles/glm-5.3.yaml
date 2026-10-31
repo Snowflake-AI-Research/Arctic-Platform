@@ -63,7 +63,7 @@ expect:
 
 known_issues:
   sampler.weight_sync_matches_fresh_load[hf-file]:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
     summary: >-
       the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
       compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
@@ -72,15 +72,15 @@ known_issues:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
     summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism)"
   optimizer.update_lands_at_launch_lr:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    issue: launch config (fp32_masters)
     summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
   sampler.repeatable:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/401
     summary: >-
       once a query has more than index_topk keys the indexer's selection varies between identical runs (first
       differing position is exactly index_topk; ~0.01 log-prob)
   # The tiny checkpoint is bf16; FP8 block scales and their training path are not covered.
   contract.tiny_layout_matches_source:
-    issue: pending
+    issue: coverage gap
     summary: "the tiny checkpoint has no FP8 weight_scale_inv tensors; FP8 is untested at the tiny scale"
 not_applicable: {}

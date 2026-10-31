@@ -113,6 +113,7 @@ class Profile:
             "adamw_mismatch_fraction": 1e-3,
             "max_lost_update_fraction": 0.5,
             "grad_norm_rel": 1e-4,
+            "engine_noise": 0.0,
         }
         return {**defaults, **self.raw.get("tolerances", {})}
 

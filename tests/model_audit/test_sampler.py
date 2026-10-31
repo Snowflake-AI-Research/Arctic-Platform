@@ -156,7 +156,8 @@ def test_weight_sync_matches_fresh_load(
         before_sync=unsynced,
         rpc=synced.get(f"sync_{sync_format}_rpc"),
     )
-    noise = [max(r["max_abs"], n["max_abs"]) for r, n in zip(repeat_noise, engine_noise)]
+    floor = profile.tolerances["engine_noise"]
+    noise = [max(r["max_abs"], n["max_abs"], floor) for r, n in zip(repeat_noise, engine_noise)]
     bad = [(e, n) for e, n in zip(errors, noise) if e["max_abs"] > 2 * n + profile.tolerances["noise_slack"]]
     assert not bad, f"synced sampler differs from a fresh load beyond the noise between two fresh loads: {bad}"
 

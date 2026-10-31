@@ -56,30 +56,35 @@ expect:
   optimizer_implementation: fused_adam
   no_grad_params:
     - {pattern: "\\.experts\\.w3$", reason: "relu2 experts are not gated; the expert-parallel wrapper keeps an empty w3"}
+  export_up_to_shift:
+    - pattern: "mixer\\.gate\\.e_score_correction_bias$"
+      reason: >-
+        the loader subtracts each router's minimum so bf16 can resolve the ~0.04 spread at ~57; top-k of
+        scores + bias is shift-invariant and the routing weights come from the unbiased scores
   # transformers has no Nemotron-H MTP module, so the tiny checkpoint cannot carry mtp.*.
   layout_ignore: ["^mtp\\."]
 
 known_issues:
   trainer.export_round_trip:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/399
     summary: >-
       the HF export (DSS save_weights_only for EP models) drops every mixer.gate.e_score_correction_bias: the
       router keeps it as a plain buffer, which named_weight_sync_tensors skips. vLLM loads the saved checkpoint
       without it (torch.empty bias) and routes wrongly; the real model's bias spans 36.93-37.03 across experts
   trainer.config_survives_transformers_resave:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/400
     summary: >-
       AP's NemotronHConfig keeps layers_block_type as written, and the model only knows mamba/moe/attention;
       transformers 5 writes linear_attention/full_attention, so a checkpoint saved by any transformers tool fails
       to build (KeyError 'linear_attention')
   sampler.weight_sync_matches_fresh_load[hf-file]:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
     summary: >-
       the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
       compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
       (model.* for backbone.*, mixer.A for mixer.A_log), so it rejects a correct HF export before loading. The NCCL placement passes
   sampler.weight_sync_matches_fresh_load[vllm-file]:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
     summary: >-
       the CPU-file sync (load_weights_from_shm_path) hands FusedMoE's experts.w13_weight/w2_weight to
       model.load_weights, which cannot place them (the NCCL path's _ShardAwareFusedWriter does); the strict name
@@ -88,15 +93,15 @@ known_issues:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
     summary: "two identical forwards differ by up to ~0.008 log-prob (MoE combine is nondeterministic by default)"
   optimizer.clip_scale_exact:
-    issue: pending
+    issue: upstream (DeepSpeed)
     summary: >-
       with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
       with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.33% low here, up to 0.39%)
   optimizer.update_lands_at_launch_lr:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    issue: launch config (fp32_masters)
     summary: "the launch's bf16 master weights leave 69% of a 2e-5 AdamW step unapplied; fp32_masters: true keeps it"
   sampler.batch_invariant:
-    issue: pending
+    issue: upstream (vLLM; VLLM_BATCH_INVARIANT=1 opts in)
     summary: >-
       vLLM scores a row batched and alone with different bf16 rounding, which flips near-tied top-6 routing in
       single tokens (max 0.08 log-prob mid-row; mean error within the noise floor)

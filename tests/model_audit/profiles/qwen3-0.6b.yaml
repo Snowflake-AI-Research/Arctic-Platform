@@ -39,13 +39,7 @@ expect:
 
 known_issues:
   optimizer.update_lands_at_launch_lr:
-    issue: pending
+    issue: launch config (fp32_masters)
     summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
-  parallel.logprobs_match_baseline[ep1-sp2]:
-    issue: pending
-    summary: "huggingface loader accepts SP > 1 but installs no sequence-parallel attention for attention-only models"
-  parallel.gradients_match_reference[ep1-sp2]:
-    issue: pending
-    summary: "same cause as parallel.logprobs_match_baseline[ep1-sp2]"
 
 not_applicable: {}

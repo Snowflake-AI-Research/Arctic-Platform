@@ -66,35 +66,35 @@ expect:
 
 known_issues:
   sampler.weight_sync_matches_fresh_load[hf-file]:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
     summary: >-
       the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
       compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
       (language_model.model.* for model.language_model.*), so it rejects a correct HF export before loading. The NCCL placement passes
   sampler.weight_sync_matches_fresh_load[vllm-file]:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
     summary: >-
       the same strict CPU-file name check expects the vLLM names it derives (routed_experts.w13_weight, split
       gate_proj/up_proj) and rejects the model's own vLLM export (experts.w13_weight, fused gate_up_proj). The
       NCCL placement passes
   trainer.short_rows_supported:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/397
     summary: >-
       a packed sample of 2-3 tokens (under one index_kpool) asks FlashInfer top-k for k=0 and crashes the fused
-      indexer (fix: branch abkulkarni/glm53-topk-zero-k)
+      indexer
   trainer.deterministic:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
     summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism); routing amplifies it to ~0.2 log-prob"
   optimizer.update_lands_at_launch_lr:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    issue: launch config (fp32_masters)
     summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
   sampler.tensor_parallel_matches_reference[tp1]:
-    issue: pending
+    issue: upstream (vLLM)
     summary: >-
       vLLM 0.32: at TP1 with PIECEWISE CUDA graphs a single short request scores 0.5-0.8 mean log-prob off
       the reference (eager, FULL and TP2+ are exact; reproduces without the Arctic plugin)
   sampler.repeatable:
-    issue: pending
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/344
     summary: >-
       once a row's index pools exceed index_topk / index_kpool the indexer's selection varies between
       identical runs (first differing position is exactly that point; ~0.01 log-prob)

@@ -54,18 +54,40 @@ def _init_distributed() -> None:
         deepspeed.init_distributed(dist_backend="nccl")
 
 
-def _parallel_groups(parallelism: dict) -> dict:
+def _parallel_groups(parallelism: dict, spec) -> dict:
     from arctic_platform.model.parallel.groups import expert_parallel_group
     from arctic_platform.model.parallel.groups import setup_parallel_groups
+    from arctic_platform.model.parallel.groups import sp_result
 
     sp = int(parallelism.get("sequence_parallel", 1))
     ep = int(parallelism.get("expert_parallel", 1))
-    groups = setup_parallel_groups(sp, ep, world_size=dist.get_world_size(), gpus_per_node=torch.cuda.device_count())
+    if spec.loader == "huggingface" and sp > 1 and ep == 1:
+        # The trainer service's HF path: DeepSpeed's Ulysses replaces the attention function the model requests.
+        from types import SimpleNamespace
+
+        from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+        from transformers import AutoConfig
+
+        text_config = AutoConfig.from_pretrained(spec.model_path_or_name).get_text_config()
+        groups = sp_result(
+            UlyssesSPAttentionHF.register_with_transformers(
+                model_name_or_path=SimpleNamespace(config=text_config),
+                core_attn_implementation=spec.attn_implementation,
+                sequence_parallel_size=sp,
+                micro_batch_size=1,
+                seq_length_is_variable=True,
+            )
+        )
+    else:
+        groups = setup_parallel_groups(
+            sp, ep, world_size=dist.get_world_size(), gpus_per_node=torch.cuda.device_count()
+        )
     return {
         "ep_group": expert_parallel_group(ep) if ep > 1 else None,
         "sp_group": groups.sp_group,
         "sp_size": sp,
         "sp_rank": groups.sp_rank,
+        "mpu": groups.mpu,
     }
 
 
@@ -74,7 +96,7 @@ def _build_production_model(profile, ckpt: str, parallelism: dict | None):
     from arctic_platform.model import build_model
 
     spec = ModelSpec(**profile.trainer_spec(model_path=ckpt, parallelism=parallelism))
-    groups = _parallel_groups(spec.parallelism.model_dump())
+    groups = _parallel_groups(spec.parallelism.model_dump(), spec)
     model = build_model(spec, parallel_groups={"ep_group": groups["ep_group"], "sp_group": groups["sp_group"]}).model
     device = torch.device("cuda", torch.cuda.current_device())
     if any(p.device.type != "cuda" for p in model.parameters()):
@@ -374,15 +396,13 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float, engine_overrides:
         optimizer=optimizer,
         **{**profile.engine(), **(engine_overrides or {})},
     )
-    from deepspeed.utils import groups as ds_groups
-
     ds_config = build_deepspeed_config(engine_spec)
     engine, _, choice = initialize_training_engine(
         model,
         ds_config,
         optimizer=optimizer,
         ep_size=spec.parallelism.expert_parallel,
-        mpu=getattr(ds_groups, "mpu", None) if sp > 1 else None,
+        mpu=groups["mpu"] if sp > 1 else None,
         model_path=ckpt,
         rank=dist.get_rank(),
     )
