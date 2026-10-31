@@ -78,14 +78,14 @@ def _against(profile, ref, actual_per_row, expected_packed, record, label):
 @pytest.mark.audit_check(MATCHES_TRAINER)
 def test_matches_trainer(profile, reference, trainer_forward, sampler_run, record):
     ref, fwd = require_ok(reference, "reference"), require_ok(trainer_forward, "production forward")
-    sampler = require_ok(sampler_run[0], "sampler")
+    sampler = require_ok(sampler_run, "sampler")
     trainer_packed = torch.cat(fwd["isolated_logprobs"]).unsqueeze(0)
     _against(profile, ref, sampler["alone"], trainer_packed, record, "sampler_vs_trainer")
 
 
 @pytest.mark.audit_check(MATCHES_REFERENCE)
 def test_matches_reference(profile, reference, sampler_run, record):
-    ref, sampler = require_ok(reference, "reference"), require_ok(sampler_run[0], "sampler")
+    ref, sampler = require_ok(reference, "reference"), require_ok(sampler_run, "sampler")
     _against(profile, ref, sampler["alone"], ref["fp32_logprobs"], record, "sampler_vs_fp32")
 
 
@@ -95,7 +95,7 @@ def _row_errors(a_rows, b_rows) -> list[dict]:
 
 @pytest.mark.audit_check(REPEATABLE)
 def test_repeatable(profile, sampler_run, record):
-    sampler = require_ok(sampler_run[0], "sampler")
+    sampler = require_ok(sampler_run, "sampler")
     errors = _row_errors(sampler["alone_repeat"], sampler["alone"])
     record(per_row=errors)
     atol = float(profile.tolerances.get("sampler_repeat_atol", 0.0))
@@ -104,7 +104,7 @@ def test_repeatable(profile, sampler_run, record):
 
 @pytest.mark.audit_check(BATCH)
 def test_batch_invariant(profile, reference, sampler_run, record):
-    ref, sampler = require_ok(reference, "reference"), require_ok(sampler_run[0], "sampler")
+    ref, sampler = require_ok(reference, "reference"), require_ok(sampler_run, "sampler")
     errors = _row_errors(sampler["batched"], sampler["alone"])
     floors = []
     for sl in audit_lib.row_slices(ref["rows"]):
@@ -117,18 +117,31 @@ def test_batch_invariant(profile, reference, sampler_run, record):
 def pytest_generate_tests(metafunc):
     if "sync_format" in metafunc.fixturenames:
         metafunc.parametrize("sync_format", ["hf", "vllm"])
+    if "sync_transport" in metafunc.fixturenames:
+        metafunc.parametrize("sync_transport", ["file", "stream"])
 
 
 @pytest.mark.audit_check(SYNC)
-def test_weight_sync_matches_fresh_load(profile, sampler_run, sampler_fresh_b, sync_format, record):
-    if not profile.sync_formats:
-        pytest.skip("coverage gap: probe.sync_formats is empty, no probe transport matches production's sync")
-    if sync_format not in profile.sync_formats:
-        pytest.skip(f"production does not sync the {sync_format} format (probe.sync_formats)")
-    synced, exported = sampler_run
-    synced = require_ok(synced, "sampler synced to B")
+def test_weight_sync_matches_fresh_load(
+    probes, profile, tiny_ckpt, export_b, sampler_fresh_b, sync_format, sync_transport, record
+):
+    exported = require_ok(export_b, "export of B")
     if sync_format not in exported["paths"]:
         pytest.skip(f"the production model does not export the {sync_format!r} weight format")
+    # One sampler per format: a second sync into the same engine would start from B and hide a no-op.
+    synced = require_ok(
+        probes.run(
+            "sampler",
+            profile,
+            tiny_ckpt,
+            gpus=profile.sampler_gpus,
+            sync=[f"{sync_format}={exported['paths'][sync_format]}"],
+            sync_transport=sync_transport,
+        ),
+        "sampler synced to B",
+    )
+    if f"sync_{sync_format}_unsupported" in synced:
+        pytest.skip(f"coverage gap: {synced[f'sync_{sync_format}_unsupported']}")
     fresh = require_ok(sampler_fresh_b, "sampler started on B")
     assert f"sync_{sync_format}_error" not in synced, synced[f"sync_{sync_format}_error"]
     errors = _row_errors(synced[f"after_sync_{sync_format}"], fresh["alone"])

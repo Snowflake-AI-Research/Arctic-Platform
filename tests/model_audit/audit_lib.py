@@ -112,6 +112,7 @@ class Profile:
             "noise_slack": 2e-3,
             "adamw_mismatch_fraction": 1e-3,
             "max_lost_update_fraction": 0.5,
+            "grad_norm_rel": 1e-4,
         }
         return {**defaults, **self.raw.get("tolerances", {})}
 
@@ -153,11 +154,6 @@ class Profile:
         if tiny:
             args = _deep_merge(args, self.tiny.get("sampler", {}))
         return args
-
-    @property
-    def sync_formats(self) -> list[str]:
-        """Weight-export formats production ships to the sampler's receiver."""
-        return list(self.raw.get("probe", {}).get("sync_formats", ["vllm"]))
 
     @property
     def sampler_gpus(self) -> int:
@@ -413,11 +409,16 @@ def row_lengths(profile: Profile, tiny_config: dict) -> list[int]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+_TINY_FORMAT = 2
+
+
 def _config_hash(config: dict, seed: int, dtype: str) -> str:
     import torch
     import transformers
 
-    payload = json.dumps([config, seed, dtype, transformers.__version__, torch.__version__], sort_keys=True)
+    payload = json.dumps(
+        [config, seed, dtype, transformers.__version__, torch.__version__, _TINY_FORMAT], sort_keys=True
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -428,13 +429,17 @@ def tiny_config(profile: Profile) -> dict:
 def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
     """Random-init tiny checkpoint saved the way ``save_pretrained`` writes it, plus the source tokenizer files.
 
+    ``config.json`` is the source's own, with the tiny overrides: transformers may re-serialize a config in a newer
+    schema than the checkpoint ships with, and production reads the shipped one.
+
     Cached under ``audit_root()`` by config hash, so every probe of a session reads the same weights.
     """
     import torch
     import transformers
 
     config_dict = tiny_config(profile)
-    out = audit_root() / "checkpoints" / f"{profile.name}-{_config_hash(config_dict, seed, profile.dtype)}-s{seed}"
+    key = _config_hash(config_dict, seed, profile.dtype)
+    out = audit_root() / "checkpoints" / f"{profile.name}-{key}-s{seed}"
     if (out / ".complete").exists():
         _copy_tokenizer_files(profile, out)
         return out
@@ -451,6 +456,7 @@ def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
             model = model_cls._from_config(config, dtype=torch.float32)
         _perturb_zero_init(model, seed)
         model.to(getattr(torch, profile.dtype)).save_pretrained(str(staging), safe_serialization=True)
+        (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
         _copy_tokenizer_files(profile, staging)
         (staging / ".complete").write_text("")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +502,33 @@ def read_checkpoint_tensors(path: Path) -> dict:
     for file in sorted(Path(path).glob("*.safetensors")):
         tensors.update(load_file(str(file)))
     return tensors
+
+
+def with_tensors_from(base: Path, donor: Path, names: list[str]) -> Path:
+    """A copy of checkpoint ``base`` whose tensors ``names`` hold ``donor``'s values (cached next to ``base``)."""
+    from safetensors.torch import save_file
+
+    if not names:
+        return base
+    key = hashlib.sha256(json.dumps([donor.name, sorted(names)]).encode()).hexdigest()[:12]
+    out = base.parent / f"{base.name}-from-{key}"
+    if (out / ".complete").exists():
+        return out
+    tensors, given = read_checkpoint_tensors(base), read_checkpoint_tensors(donor)
+    tensors.update({name: given[name] for name in names})
+    staging = Path(tempfile.mkdtemp(prefix=f"{out.name}.", dir=base.parent))
+    try:
+        for file in base.iterdir():
+            if file.is_file() and file.suffix != ".safetensors" and not file.name.endswith(".index.json"):
+                shutil.copy(file, staging / file.name)
+        save_file(tensors, str(staging / "model.safetensors"), metadata={"format": "pt"})
+        (staging / ".complete").write_text("")
+        if out.exists():
+            shutil.rmtree(out)
+        staging.rename(out)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -600,12 +633,47 @@ def matches(pattern_entries: list[dict], name: str) -> dict | None:
     return None
 
 
+_EXPERT_INDEX = re.compile(r"(\.experts\.)\d+(\.)")
+_EXPERT_SLICE = re.compile(r"\[\d+\]$")
+
+
+def _expert_count(profile: Profile) -> int | None:
+    text = text_config_of(tiny_config(profile))
+    return next((int(text[k]) for k in _EXPERT_COUNT_KEYS if text.get(k)), None)
+
+
+def _split_fused_experts(tensors: dict, num_experts: int | None) -> dict:
+    """Fused routed-expert tensors (under ``.experts.``, leading dim the expert count) as one entry per expert."""
+    if not num_experts:
+        return tensors
+    out = {}
+    for name, tensor in tensors.items():
+        fused = ".experts." in name and _EXPERT_INDEX.search(name) is None
+        if fused and tensor.dim() >= 3 and tensor.shape[0] == num_experts:
+            out.update({f"{name}[{e}]": tensor[e] for e in range(num_experts)})
+        else:
+            out[name] = tensor
+    return out
+
+
+def _expert_group(name: str) -> str | None:
+    """The layer-and-projection key a routed expert's tensor shares with its siblings; None for other tensors."""
+    group = _EXPERT_SLICE.sub("", _EXPERT_INDEX.sub(r"\1N\2", name))
+    return group if group != name else None
+
+
+def _lower_quartile(values: list[float]) -> float:
+    return statistics.quantiles(values, n=4, method="inclusive")[0]
+
+
 def assert_gradients_match(profile: Profile, actual: dict, reference: dict, record) -> None:
     """Every reference gradient has a production gradient of the same shape within the per-tensor noise floor."""
     import torch
 
-    truth, floor = reference["fp32_grads"], reference["lowp_grads"]
-    mass = reference.get("fp32_grad_mass", {})
+    experts = _expert_count(profile)
+    truth, floor = (_split_fused_experts(reference[k], experts) for k in ("fp32_grads", "lowp_grads"))
+    mass = _split_fused_experts(reference.get("fp32_grad_mass", {}), experts)
+    actual = _split_fused_experts(actual, experts)
     allowed = profile.expect.get("no_grad_params", [])
     missing = sorted(n for n in truth if n not in actual and matches(allowed, n) is None)
     # Low-precision noise per unit of summed |row gradient|. A tensor whose rows cancel (e.g. a 3-element gate
@@ -616,6 +684,17 @@ def assert_gradients_match(profile: Profile, actual: dict, reference: dict, reco
         if n in mass and n in floor and bool(mass[n].abs().sum() > 0)
     }
     typical_rate = statistics.median(rate.values()) if rate else 0.0
+    # Routed experts: a token whose top-k flips at a near-tie moves a whole token's gradient between experts, and
+    # which tokens flip under low precision is luck. Each expert is held to the worst floor among its siblings in the
+    # layer (the reference's own flips set it), and each layer's lower-quartile expert to the lower-quartile floor:
+    # flips touch only some experts, while an error in the expert gradient math touches all of them. Fused expert
+    # tensors are compared per expert slice.
+    siblings: dict[str, list[float]] = {}
+    for name, expected in truth.items():
+        group = _expert_group(name)
+        if group and name in floor and bool(expected.abs().sum() > 0):
+            siblings.setdefault(group, []).append(relative_l2(floor[name], expected))
+    expert_errors: dict[str, list[float]] = {}
     rows, bad = [], []
     for name, expected in truth.items():
         if name not in actual or matches(allowed, name):
@@ -632,13 +711,32 @@ def assert_gradients_match(profile: Profile, actual: dict, reference: dict, reco
             err, noise = relative_l2(got, expected), relative_l2(floor[name], expected)
             if name in rate:
                 noise = max(noise, typical_rate * float(mass[name].norm() / expected.norm()))
+            group = _expert_group(name)
+            if group and len(siblings.get(group, ())) >= 4:
+                noise = max(noise, max(siblings[group]))
+                expert_errors.setdefault(group, []).append(err)
             rows.append((err, noise, name))
             if not within_noise(err, noise, profile):
                 bad.append((name, f"rel_l2={err:.4g} floor={noise:.4g}"))
+    for group, errs in expert_errors.items():
+        low_err, low_floor = _lower_quartile(errs), _lower_quartile(siblings[group])
+        if not within_noise(low_err, low_floor, profile):
+            bad.append((group, f"lower quartile of {len(errs)} experts rel_l2={low_err:.4g} floor={low_floor:.4g}"))
     rows.sort(reverse=True)
     record(worst=[(n, round(e, 5), round(f, 5)) for e, f, n in rows[:15]], missing=missing[:30], compared=len(rows))
     assert not missing, f"reference gradients with no production gradient: {missing[:20]}"
     assert not bad, f"gradients beyond the noise floor: {bad[:20]}"
+
+
+def assert_clip_norm_is_reduced_norm(profile: Profile, step: dict, record) -> None:
+    """The global gradient norm the engine clips by is the norm of the gradient it reduced."""
+    engine, reduced = step.get("clip_norm"), step["reduced_grad_norm"]
+    record(clip_norm=engine, reduced_grad_norm=reduced, gradient_clipping=step.get("gradient_clipping"))
+    assert engine is not None, "the engine reported no global gradient norm"
+    rel = abs(engine - reduced) / max(reduced, 1e-30)
+    assert (
+        rel <= profile.tolerances["grad_norm_rel"]
+    ), f"the engine's global gradient norm {engine:.6g} differs from the reduced gradient's {reduced:.6g} by {rel:.3%}"
 
 
 def assert_update_is_adamw(profile: Profile, step: dict, record) -> None:

@@ -15,7 +15,9 @@
 """One optimizer step through the production engine (``initialize_training_engine``) on the baseline layout.
 
 The AdamW check runs at the profile's ``audit_lr`` so the update is visible in the launch dtype, and recomputes the
-step from the engine-reduced gradient (whose correctness ``trainer.gradients_match_reference`` checks). The landing
+step from the engine-reduced gradient (whose correctness ``trainer.gradients_match_reference`` checks), clipped by
+whichever of the exact or the gradient-dtype clip coefficient the engine matches (``optimizer.clip_scale_exact``
+reports which). The landing
 check runs at the launch learning rate and measures how much of the update survives in the optimizer's master
 weights, which accumulate across steps.
 """
@@ -31,6 +33,15 @@ pytestmark = [pytest.mark.integration]
 DIRECTION = audit_lib.register_check(
     "optimizer.update_is_adamw",
     "every stored weight update is one AdamW step on the gradient the engine reduced, element for element",
+)
+CLIP_NORM = audit_lib.register_check(
+    "optimizer.clip_norm_is_reduced_norm",
+    "the global gradient norm the engine clips by is the norm of the gradient it reduced",
+)
+_FORCED_CLIP = 1e-3
+CLIP_SCALE = audit_lib.register_check(
+    "optimizer.clip_scale_exact",
+    "the stored update follows the exact clip coefficient, not one rounded to the gradient's dtype",
 )
 LANDS = audit_lib.register_check(
     "optimizer.update_lands_at_launch_lr", "at the launch learning rate the step changes the weights it should"
@@ -55,9 +66,44 @@ def step_launch_lr(probes, profile, tiny_ckpt):
     )
 
 
+@pytest.fixture(scope="session")
+def clipped_step(probes, profile, tiny_ckpt):
+    """The baseline step with clipping far below any gradient norm, so the clip coefficient shapes every update."""
+    return probes.run(
+        "trainer",
+        profile,
+        tiny_ckpt,
+        gpus=profile.baseline_gpus,
+        mode="step",
+        parallelism=profile.tiny_parallelism(),
+        engine_overrides={"gradient_clipping": _FORCED_CLIP},
+    )
+
+
 @pytest.mark.audit_check(DIRECTION)
 def test_update_is_adamw(profile, baseline_step, record):
     audit_lib.assert_update_is_adamw(profile, require_ok(baseline_step, "production step"), record)
+
+
+@pytest.mark.audit_check(CLIP_NORM)
+def test_clip_norm_is_reduced_norm(profile, baseline_step, record):
+    audit_lib.assert_clip_norm_is_reduced_norm(profile, require_ok(baseline_step, "production step"), record)
+
+
+@pytest.mark.audit_check(CLIP_SCALE)
+def test_clip_scale_exact(request, profile, baseline_step, record):
+    launch_clip = require_ok(baseline_step, "production step")["gradient_clipping"]
+    if not launch_clip:
+        pytest.skip("the launch does not clip gradients")
+    step = require_ok(request.getfixturevalue("clipped_step"), "production step with forced clipping")
+    coefficients, applied = step["clip_coefficients"], step["clip_applied"]
+    record(launch_clipping=launch_clip, forced_clipping=_FORCED_CLIP, coefficients=coefficients, applied=applied)
+    assert coefficients["exact"] < 1.0, f"gradient_clipping={_FORCED_CLIP} did not engage: {coefficients}"
+    # Whichever coefficient the probe picked has to explain the stored update, or the comparison says nothing.
+    audit_lib.assert_update_is_adamw(profile, step, record)
+    if coefficients["exact"] != coefficients["grad_dtype"]:
+        rel = abs(coefficients["grad_dtype"] / coefficients["exact"] - 1)
+        assert applied == "exact", f"the engine scaled the gradient by the clip coefficient rounded by {rel:.3%}"
 
 
 @pytest.mark.audit_check(LANDS)

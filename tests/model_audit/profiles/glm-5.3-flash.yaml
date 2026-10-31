@@ -26,9 +26,6 @@ launch:
 probe:
   # The prime MoE head takes next-token labels and returns per-token logprobs.
   pass_labels: true
-  # DSS ships GLM-5.3 as "vllm" names over NCCL direct copy. The probe's file transport goes through vLLM's HF
-  # loader and its strict name check, so neither format exercises the production sync here.
-  sync_formats: []
 
 tiny:
   # Attention, indexer and KDA head dims stay real: the sparse-MLA, DeepGEMM and FLA kernels constrain them. The KDA
@@ -68,6 +65,18 @@ expect:
     - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
 
 known_issues:
+  sampler.weight_sync_matches_fresh_load[hf-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
+      compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
+      (language_model.model.* for model.language_model.*), so it rejects a correct HF export before loading. The NCCL placement passes
+  sampler.weight_sync_matches_fresh_load[vllm-file]:
+    issue: pending
+    summary: >-
+      the same strict CPU-file name check expects the vLLM names it derives (routed_experts.w13_weight, split
+      gate_proj/up_proj) and rejects the model's own vLLM export (experts.w13_weight, fused gate_up_proj). The
+      NCCL placement passes
   trainer.short_rows_supported:
     issue: pending
     summary: >-

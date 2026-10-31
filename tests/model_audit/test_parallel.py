@@ -36,6 +36,10 @@ GRADS = audit_lib.register_check(
 UPDATE = audit_lib.register_check(
     "parallel.update_is_adamw", "under EP/SP/DP every stored update is one AdamW step on the reduced gradient"
 )
+CLIP_NORM = audit_lib.register_check(
+    "parallel.clip_norm_is_reduced_norm",
+    "under EP/SP/DP the global gradient norm the engine clips by is the norm of the reduced gradient",
+)
 
 
 def pytest_generate_tests(metafunc):
@@ -80,3 +84,8 @@ def test_gradients_match_reference(profile, reference, parallel_step, record):
 @pytest.mark.audit_check(UPDATE)
 def test_update_is_adamw(profile, parallel_step, record):
     audit_lib.assert_update_is_adamw(profile, require_ok(parallel_step, "parallel step"), record)
+
+
+@pytest.mark.audit_check(CLIP_NORM)
+def test_clip_norm_is_reduced_norm(profile, parallel_step, record):
+    audit_lib.assert_clip_norm_is_reduced_norm(profile, require_ok(parallel_step, "parallel step"), record)

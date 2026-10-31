@@ -23,7 +23,6 @@ launch:
 probe:
   # Given labels, the Liger head returns only the loss.
   pass_labels: false
-  sync_formats: [vllm]
 
 tiny:
   # MLA and indexer head dims stay real: the sparse-MLA and DeepGEMM kernels constrain them.
@@ -63,6 +62,12 @@ expect:
     - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
 
 known_issues:
+  sampler.weight_sync_matches_fresh_load[hf-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
+      compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
+      (routed_experts.w13_weight, fused_qkv_a_proj, W_UK_T), so it rejects a correct HF export before loading. The NCCL placement passes
   trainer.deterministic:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
     summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism)"

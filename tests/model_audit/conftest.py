@@ -304,20 +304,28 @@ def baseline_step(probes, profile, tiny_ckpt):
 
 
 @pytest.fixture(scope="session")
-def sampler_run(probes, profile, tiny_ckpt, tiny_ckpt_b):
-    """Sampler on checkpoint A, then synced from checkpoint B's production export in every supported format."""
-    export_dir = audit_lib.audit_root() / "exports" / f"{profile.name}-{tiny_ckpt_b.name}"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    exported = require_ok(
-        probes.run(
-            "trainer", profile, tiny_ckpt_b, gpus=profile.baseline_gpus, mode="export", export_dir=str(export_dir)
-        ),
-        "export of B",
-    )
-    syncs = [f"{fmt}={path}" for fmt, path in exported["paths"].items() if fmt in profile.sync_formats]
-    return probes.run("sampler", profile, tiny_ckpt, gpus=profile.sampler_gpus, sync=syncs), exported
+def sampler_run(probes, profile, tiny_ckpt):
+    return probes.run("sampler", profile, tiny_ckpt, gpus=profile.sampler_gpus)
 
 
 @pytest.fixture(scope="session")
-def sampler_fresh_b(probes, profile, tiny_ckpt_b):
-    return probes.run("sampler", profile, tiny_ckpt_b, gpus=profile.sampler_gpus)
+def export_b(probes, profile, tiny_ckpt_b):
+    """Checkpoint B's production weight streams, in every format the production model exports."""
+    export_dir = audit_lib.audit_root() / "exports" / f"{profile.name}-{tiny_ckpt_b.name}"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    return probes.run(
+        "trainer", profile, tiny_ckpt_b, gpus=profile.baseline_gpus, mode="export", export_dir=str(export_dir)
+    )
+
+
+@pytest.fixture(scope="session")
+def sampler_fresh_b(probes, profile, tiny_ckpt, tiny_ckpt_b, trainer_forward):
+    """A sampler started on B, except that tensors the production model's full HF export lacks keep A's values.
+
+    The trainer holds no state for those, so training never changes them and a sampler synced from A keeps A's.
+    ``trainer.export_round_trip`` reports them.
+    """
+    held = set(require_ok(trainer_forward, "production forward")["exported"])
+    untrained = sorted(set(audit_lib.read_checkpoint_tensors(tiny_ckpt_b)) - held)
+    ckpt = audit_lib.with_tensors_from(tiny_ckpt_b, tiny_ckpt, untrained)
+    return probes.run("sampler", profile, ckpt, gpus=profile.sampler_gpus)

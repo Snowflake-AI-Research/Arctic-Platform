@@ -305,6 +305,7 @@ def run_forward(profile, ckpt: str) -> dict:
             except Exception as err:  # noqa: BLE001
                 result["short_rows"][length] = f"{type(err).__name__}: {str(err).strip().splitlines()[-1][:200]}"
         result["exported"] = _export_hf(model, ckpt)
+        result["config_resave"] = _config_resave(ckpt)
         try:
             from arctic_platform.model import iter_model_weights
 
@@ -316,7 +317,46 @@ def run_forward(profile, ckpt: str) -> dict:
     return result
 
 
-def run_step(profile, ckpt: str, parallelism: dict, lr: float) -> dict:
+def _config_resave(ckpt: str) -> dict:
+    """What the config class production resolves reads differently once the pinned transformers re-saves the config.
+
+    Runs after the production build, so AutoConfig carries every registration the production loaders make.
+    """
+    import tempfile
+
+    import transformers
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+    model_type = json.loads(Path(ckpt, "config.json").read_text())["model_type"]
+    native = getattr(transformers, CONFIG_MAPPING_NAMES.get(model_type, ""), None)
+    if native is None:
+        return {"skipped": f"transformers {transformers.__version__} has no built-in config for {model_type!r}"}
+    with tempfile.TemporaryDirectory() as tmp:
+        native.from_pretrained(ckpt).save_pretrained(tmp)
+        shipped, resaved = AutoConfig.from_pretrained(ckpt), AutoConfig.from_pretrained(tmp)
+    return {
+        "model_type": model_type,
+        "resolved_class": f"{type(shipped).__module__}.{type(shipped).__qualname__}",
+        "changed": _config_changes(shipped.to_dict(), resaved.to_dict()),
+    }
+
+
+def _config_changes(before: dict, after: dict, prefix: str = "") -> dict:
+    """Keys whose value differs, sub-configs compared key by key; a key unset before may come back as its default."""
+    out = {}
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if key in ("transformers_version", "_name_or_path") or old is None:
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            out.update(_config_changes(old, new, f"{prefix}{key}."))
+        elif old != new:
+            out[f"{prefix}{key}"] = (old, new)
+    return out
+
+
+def run_step(profile, ckpt: str, parallelism: dict, lr: float, engine_overrides: dict | None = None) -> dict:
     from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
     from arctic_platform.common.deepspeed_engine import build_deepspeed_config
     from arctic_platform.common.deepspeed_engine import initialize_training_engine
@@ -332,13 +372,14 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float) -> dict:
         world_size=dist.get_world_size(),
         sequence_parallel=sp,
         optimizer=optimizer,
-        **profile.engine(),
+        **{**profile.engine(), **(engine_overrides or {})},
     )
     from deepspeed.utils import groups as ds_groups
 
+    ds_config = build_deepspeed_config(engine_spec)
     engine, _, choice = initialize_training_engine(
         model,
-        build_deepspeed_config(engine_spec),
+        ds_config,
         optimizer=optimizer,
         ep_size=spec.parallelism.expert_parallel,
         mpu=getattr(ds_groups, "mpu", None) if sp > 1 else None,
@@ -374,7 +415,17 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float) -> dict:
     with _params_hold(engine.module, {i: torch.full_like(g, float("nan")) for i, g in reduced.items()}):
         buffer_backed = {n for n, t in _export_hf(engine.module, ckpt).items() if not bool(t.isnan().all())}
     reduced_grads = {n: g for n, g in reduced_grads.items() if n not in buffer_backed}
+    norm = _reduced_grad_norm(engine.module, reduced)
+    # ZeRO-1/2 keep the optimizer's flat partitions (and their gradients) in the master dtype.
+    partitions = getattr(engine.optimizer, "single_partition_of_fp32_groups", None) or []
+    if partitions:
+        grad_dtype = partitions[0].dtype
+    else:
+        grad_dtype = (
+            torch.bfloat16 if ds_config.get("bf16", {}).get("bf16_master_weights_and_grads") else torch.float32
+        )
     engine.step()
+    clip_norm = engine.get_global_grad_norm()
     after = _export_hf(engine.module, ckpt)
     from deepspeed.utils import safe_get_full_fp32_param
 
@@ -402,23 +453,81 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float) -> dict:
         result["update"] = {name: after[name] - before[name] for name in after if name in before}
         # The optimizer's own copy: with fp32 masters a step below the launch dtype's resolution survives here.
         result["master_update"] = {name: master_after[name] - before[name] for name in master_after if name in before}
-        result["adamw_agreement"] = _adamw_agreement(
-            before, after, reduced_grads, profile.optimizer(lr=lr), getattr(torch, spec.dtype or profile.dtype)
-        )
+        max_norm = float(engine_spec.gradient_clipping or 0.0)
+        result["gradient_clipping"] = max_norm
+        result["reduced_grad_norm"] = norm
+        result["clip_norm"] = None if clip_norm is None else float(clip_norm)
+        # Scaling a low-precision gradient by a 0-dim fp32 tensor rounds the scale to the gradient's dtype first.
+        exact = _clip_coefficient(norm, max_norm)
+        rounded = float(torch.tensor(exact).to(grad_dtype)) if torch.finfo(grad_dtype).bits < 32 else exact
+        coefficients = {"exact": exact, "grad_dtype": rounded}
+        agreements = {
+            kind: _adamw_agreement(
+                before,
+                after,
+                reduced_grads,
+                profile.optimizer(lr=lr),
+                getattr(torch, spec.dtype or profile.dtype),
+                clip,
+                grad_dtype,
+            )
+            for kind, clip in coefficients.items()
+        }
+        applied = max(agreements, key=lambda kind: (sum(agreements[kind].values()), kind == "exact"))
+        result["clip_coefficients"] = coefficients
+        result["clip_applied"] = applied
+        result["adamw_agreement"] = agreements[applied]
     return result
 
 
-def _adamw_agreement(before, after, grads, opt: dict, lowp: torch.dtype) -> dict[str, float]:
+def _reduced_grad_norm(model, reduced: dict[int, torch.Tensor]) -> float:
+    """The global L2 norm of the reduced gradient, every trainable parameter counted once.
+
+    Replicated parameters carry the same reduced gradient on every rank; an expert-parallel parameter (DeepSpeed's
+    ``allreduce=False`` with a ``group_name``) holds this rank's experts, so its square sums over its EP group.
+    """
+    import deepspeed.utils.groups as ds_groups
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    dense = torch.zeros((), dtype=torch.float64, device=device)
+    experts: dict[str, torch.Tensor] = {}
+    for param in model.parameters():
+        grad = reduced.get(id(param))
+        if not param.requires_grad or grad is None or bool(grad.isnan().any()):
+            continue
+        square = grad.to(device, torch.float64).pow(2).sum()
+        if hasattr(param, "group_name") and getattr(param, "allreduce", True) is False:
+            experts[param.group_name] = experts.get(param.group_name, torch.zeros_like(dense)) + square
+        else:
+            dense += square
+    for name in sorted(experts):
+        dist.all_reduce(experts[name], group=ds_groups._get_expert_parallel_group(name))
+        dense += experts[name]
+    return float(dense.sqrt())
+
+
+def _clip_coefficient(norm: float, max_norm: float) -> float:
+    """DeepSpeed's global-norm clipping: the gradient is divided by ``(norm + 1e-6) / max_norm`` when that exceeds 1."""
+    if max_norm <= 0:
+        return 1.0
+    return min(1.0, max_norm / (norm + 1e-6))
+
+
+def _adamw_agreement(
+    before, after, grads, opt: dict, lowp: torch.dtype, clip: float, grad_dtype: torch.dtype
+) -> dict[str, float]:
     """Per tensor, the fraction of elements whose stored update equals one AdamW step on the reduced gradient.
 
-    First step with bias correction: ``m_hat = g`` and ``v_hat = g**2``, so the step is ``g / (|g| + eps)``. The
-    expectation is rounded to the stored dtype the same way the weights are.
+    First step with bias correction: ``m_hat = g`` and ``v_hat = g**2``, so the step is ``g / (|g| + eps)`` on the
+    clipped gradient, stored in ``grad_dtype`` (clipping only matters where ``|g|`` is near ``eps``). The expectation
+    is rounded to the stored dtype the same way the weights are.
     """
     out = {}
     for name, grad in grads.items():
         if name not in before or name not in after or bool(torch.isnan(grad).any()):
             continue
         w0 = before[name]
+        grad = (grad * clip).to(grad_dtype).float()
         ideal = w0 - opt["lr"] * (grad / (grad.abs() + opt["eps"]) + opt["weight_decay"] * w0)
         expected = ideal.to(lowp).float() - w0
         out[name] = float((after[name] - w0 == expected).float().mean())
@@ -456,6 +565,7 @@ def main() -> None:
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--parallelism", default="{}")
     parser.add_argument("--lr", type=float, default=None, help="step mode; defaults to the profile's audit_lr")
+    parser.add_argument("--engine-overrides", default="{}", help="step mode; JSON TrainingEngineSpec fields")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -471,7 +581,8 @@ def main() -> None:
             result = run_export(profile, args.ckpt, args.export_dir)
         else:
             lr = profile.audit_lr if args.lr is None else args.lr
-            result = run_step(profile, args.ckpt, json.loads(args.parallelism), lr)
+            overrides = json.loads(args.engine_overrides)
+            result = run_step(profile, args.ckpt, json.loads(args.parallelism), lr, overrides)
         status = {"ok": True}
     except Exception as err:
         result = {}

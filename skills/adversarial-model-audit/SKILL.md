@@ -70,10 +70,10 @@ reproduced it outside the suite.
 | Tier | File | Needs | What it compares |
 | --- | --- | --- | --- |
 | Contracts | `test_contracts.py` | CPU | launch spec resolution and validation, length support, tiny-checkpoint coverage and layout |
-| Trainer | `test_trainer.py` | baseline layout | production model vs transformers fp32 on the same tiny checkpoint: log-probs per position bucket, determinism, packed-row isolation, row order, 1..8-token samples, gradient coverage and values, LM-head gradient vs an unfused head, export round trip |
-| Optimizer | `test_optimizer.py` | baseline layout | one step through `initialize_training_engine` vs reference AdamW; master-weight update loss at the launch lr; frozen params; implementation policy |
-| Parallel | `test_parallel.py` | 2-8 GPUs | EP/SP/DP layouts vs the baseline layout: log-probs and the optimizer update (real gradient reductions) |
-| Sampler | `test_sampler.py` | 1-8 GPUs, vLLM | sampler vs trainer and vs fp32, repeatability, batch invariance, production weight sync vs a fresh load, TP degrees below launch vs fp32 |
+| Trainer | `test_trainer.py` | baseline layout | production model vs transformers fp32 on the same tiny checkpoint: log-probs per position bucket, determinism, packed-row isolation, row order, 1..8-token samples, gradient coverage and values, LM-head gradient vs an unfused head, export round trip, the production config class on a transformers-re-saved config |
+| Optimizer | `test_optimizer.py` | baseline layout | one step through `initialize_training_engine` vs reference AdamW on the clipped reduced gradient; the engine's clip norm vs the reduced gradient's, and (with clipping forced on) whether the clip coefficient reaches the gradient unrounded; master-weight update loss at the launch lr; frozen params; implementation policy |
+| Parallel | `test_parallel.py` | 2-8 GPUs | EP/SP/DP layouts vs the baseline layout: log-probs, the optimizer update and the clip norm (real gradient reductions) |
+| Sampler | `test_sampler.py` | 1-8 GPUs, vLLM | sampler vs trainer and vs fp32, repeatability, batch invariance, production weight sync (file and NCCL placement) vs a fresh load, TP degrees below launch vs fp32 |
 
 The baseline layout is the profile's `tiny.trainer.parallelism`: the smallest layout the production loader actually
 builds (one GPU for dense models, EP2 for MoE loaders that require EP > 1). Never test a layout production cannot
@@ -83,6 +83,11 @@ Gates are relative to the reference's own launch-dtype error against fp32 (the n
 split at the profile's thresholds and per row (each row is its own request, so a short-request fault is not diluted
 by long rows). Gradient floors also account for cancellation: a tensor whose per-row gradients nearly cancel gets
 the typical per-row error rate scaled by its gradient mass, so a 3-element scale is not flagged for bf16 rounding.
+Routed experts (per-expert tensors, or fused ones split along the expert dimension) are gated as a group: in a
+tiny random model bf16 noise flips near-tied top-k choices, and each flip moves a whole token's gradient between
+experts. Each expert gets its layer's worst sibling floor, and the layer's
+lower-quartile expert error must stay within the lower-quartile floor, so a math error that touches every expert
+fails while a flip-sized error in one expert does not (a known blind spot).
 A check that a floor can hide gets its own probe: the LM-head check compares the per-channel head-input contraction
 against an unfused head, because a 25% error there is under the cancellation floor of the norm weight it feeds.
 
@@ -135,10 +140,12 @@ Hypothesis checklist (model-agnostic; tick each in the report with its evidence)
 - Determinism: atomics in top-k or scatter, batch-composition effects, prefix caching.
 - Trainer/sampler parity: precision casts, fused vs eager rounding, LM-head precision, temperature, router replay.
 - Weight sync: name coverage both ways, values after sync vs a fresh load, cached derived tensors, every sync path
-  (CUDA IPC, CPU file, NCCL broadcast, LoRA). Find the format and transport production uses for this model first
-  (the orchestrator may switch formats for composite checkpoints) and set `probe.sync_formats` to it. The suite's
-  probe syncs through the CPU file path only; if production uses another transport, leave `sync_formats` empty and
-  record the gap instead of testing a path production never takes.
+  (CUDA IPC, CPU file, NCCL broadcast, LoRA). The suite syncs every format the production model exports, each into
+  its own sampler, two ways: `file` (the CPU-file load) and `stream` (the NCCL receiver's placement, batched or TP1
+  direct, fed from the file so only the network is skipped). All run for every model: a broken variant is a finding
+  even when this launch takes another, since the client picks the format per job and colocated jobs use the file
+  path. A checkpoint
+  tensor the trainer's HF export lacks is never trained, so the fresh-load sampler keeps the pre-sync value there.
 - Optimizer: policy per family, frozen and FP8 parameters, bf16 master-weight update loss at the launch lr, weight
   decay groups, clipping across EP/SP, expert-data-parallel reduction.
 - Parallelism: EP/SP parity, reduction groups, expert DP with SP, uneven sequence splits.
@@ -195,6 +202,17 @@ model:
 - Prefer extending an existing check (a new position threshold, a new probe output) over a new file.
 - A new check is a test with `@pytest.mark.audit_check("<tier>.<name>")` and a `register_check` claim. Compute
   model-specific inputs from the config or the profile, never by naming a model in the test.
+- Keep it model-agnostic in what it touches, not only in what it names:
+  - Observe production state from inside a production probe, after the production build: config classes, AutoConfig
+    registrations, the engine's dtypes. Never re-create it by importing one family's module.
+  - Walk the engine's unique parameters (DeepSpeed's EP marks) for whole-model quantities such as norms. Checkpoint
+    names can tie, fuse or split tensors.
+  - Handle both checkpoint layouts of a structure, e.g. per-expert tensors and fused `[experts, ...]` ones.
+  - Force the condition a check needs (clipping engaged, a threshold crossed) instead of relying on the tiny
+    model reaching it.
+  - Report a path the probe cannot drive (an FP8 receiver, a TP1-only route) as a coverage-gap skip, not a failure.
+- Before keeping a check, run it on every profile. A failure on a model it was not written for is a finding or a
+  false positive; resolve which before moving on.
 - If it fails on this model, add `known_issues: {<check id>: {issue: <ISSUE.md URL>, summary: ...}}` to the profile.
   That turns it into a strict xfail, so the check starts failing (XPASS) the day the fix lands, until the entry is
   removed. Only xfail a deterministic failure; a crash that depends on free memory or timing would flap, so let it
@@ -220,7 +238,7 @@ launch:
   engine: {gradient_clipping: 1.0, fp32_masters: false}    # TrainingEngineSpec fields
   sampler: {tensor_parallel_size: 8, ...}    # vLLM engine args
   optimizer: {lr: 1.0e-6, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
-probe: {pass_labels: true, audit_lr: 1.0e-3, pad_to_multiple: 8, sync_formats: [vllm]}
+probe: {pass_labels: true, audit_lr: 1.0e-3, pad_to_multiple: 8}
 tiny:
   layers: [..]               # optional; default keeps the first layer of every distinct kind
   experts: 16
@@ -232,7 +250,7 @@ tiny:
   trainer: {parallelism: {expert_parallel: 2, sequence_parallel: 1}}   # baseline layout: smallest one production builds
   parallel: [{expert_parallel: 2, sequence_parallel: 2, world_size: 4}]
   sampler: {tensor_parallel_size: 8, max_model_len: 8192}   # the launch TP; smaller degrees are swept
-tolerances: {noise_factor: 4.0, noise_slack: 2.0e-3, adamw_mismatch_fraction: 1.0e-3, max_lost_update_fraction: 0.5}
+tolerances: {noise_factor: 4.0, noise_slack: 2.0e-3, adamw_mismatch_fraction: 1.0e-3, max_lost_update_fraction: 0.5, grad_norm_rel: 1.0e-4}
 expect:
   loader: <name>
   optimizer_implementation: <fused_adam|torch_adamw|...>

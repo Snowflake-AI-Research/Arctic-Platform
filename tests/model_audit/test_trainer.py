@@ -55,6 +55,11 @@ HEAD_GRAD = audit_lib.register_check(
 EXPORT = audit_lib.register_check(
     "trainer.export_round_trip", "the HF weight export reproduces the loaded checkpoint, every tensor, bit for bit"
 )
+CONFIG_RESAVE = audit_lib.register_check(
+    "trainer.config_survives_transformers_resave",
+    "the config class the production loader resolves reads a config re-saved by the pinned transformers (as any HF "
+    "tool writing a checkpoint of this model does) the same as the shipped one",
+)
 
 
 def _cuts(profile, tiny_ckpt) -> list[int]:
@@ -209,3 +214,14 @@ def test_export_round_trip(profile, tiny_ckpt, trainer_forward, record):
     assert not missing, f"checkpoint tensors the export drops: {missing[:20]}"
     assert not extra, f"exported tensors absent from the checkpoint: {extra[:20]}"
     assert not changed, f"exported tensors that differ from the checkpoint: {changed[:20]}"
+
+
+@pytest.mark.audit_check(CONFIG_RESAVE)
+def test_config_survives_transformers_resave(profile, trainer_forward, record):
+    resave = require_ok(trainer_forward, "production forward")["config_resave"]
+    record(**resave)
+    if "skipped" in resave:
+        pytest.skip(resave["skipped"])
+    assert not resave[
+        "changed"
+    ], f"{resave['resolved_class']} reads a re-saved config differently: {resave['changed']}"
