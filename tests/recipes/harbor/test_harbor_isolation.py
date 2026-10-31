@@ -394,6 +394,389 @@ def test_registry_logs_in_on_a_freshly_booted_host(monkeypatch):
     assert logins == ["org-acct.registry.snowflakecomputing.com"]
 
 
+class _FakeRest:
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+
+class _FakeConnection:
+    def __init__(self, token: str) -> None:
+        self.rest = _FakeRest(token)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConfig:
+    def __init__(self, connection: _FakeConnection) -> None:
+        self.connection = connection
+
+    def resolve_pat(self) -> str:
+        return self.connection.rest.token
+
+
+@pytest.mark.parametrize("renewable", [True, False])
+def test_the_shared_snowflake_session_is_renewed_before_its_token_expires(monkeypatch, renewable):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import session
+
+    now = [0.0]
+    logins: list[_FakeConnection] = []
+    renewals: list[str] = []
+
+    def fake_connect(connection, role):
+        logins.append(_FakeConnection(f"login-{len(logins)}"))
+        return _FakeConfig(logins[-1])
+
+    def fake_refresh(config, stale):
+        renewals.append(stale)
+        if renewable:
+            config.connection.rest.token = f"renewed-{len(renewals)}"
+        return config
+
+    monkeypatch.setattr(session, "_connect", fake_connect)
+    monkeypatch.setattr(session, "refresh_config", fake_refresh)
+    monkeypatch.setattr(session.time, "monotonic", lambda: now[0])
+    for name in ("_configs", "_renewed_at", "_locks"):
+        monkeypatch.setattr(session, name, {})
+    monkeypatch.setattr(session, "_retired", [])
+
+    first = asyncio.run(session.get_config("conn", None))
+    now[0] = session.RENEW_AFTER_S - 1
+    assert asyncio.run(session.get_config("conn", None)) is first and renewals == []
+
+    now[0] = session.RENEW_AFTER_S
+    renewed = asyncio.run(session.get_config("conn", None))
+    assert renewals == ["login-0"]
+    if renewable:
+        assert renewed is first and renewed.resolve_pat() == "renewed-1" and len(logins) == 1
+    else:
+        assert renewed.resolve_pat() == "login-1" and not logins[0].closed
+    session.close_sessions()
+    assert all(conn.closed for conn in logins)
+
+
+def test_creates_refused_with_an_expired_token_renew_the_session_once(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import session
+
+    connection = _FakeConnection("stale")
+    renewals: list[str] = []
+
+    def fake_refresh(config, stale):
+        renewals.append(stale)
+        time.sleep(0.05)
+        config.connection.rest.token = "fresh"
+        return config
+
+    monkeypatch.setattr(session, "refresh_config", fake_refresh)
+    monkeypatch.setattr(session, "_configs", {("conn", None): _FakeConfig(connection)})
+    monkeypatch.setattr(session, "_renewed_at", {("conn", None): time.monotonic()})
+    monkeypatch.setattr(session, "_locks", {})
+
+    async def many() -> set[str]:
+        configs = await asyncio.gather(*(session.renew_config("conn", None, "stale") for _ in range(8)))
+        return {c.resolve_pat() for c in configs}
+
+    assert asyncio.run(many()) == {"fresh"}
+    assert renewals == ["stale"]
+    assert session.is_expired_session(RuntimeError("{'code': '390112', 'message': 'Your session has expired.'}"))
+    assert not session.is_expired_session(RuntimeError("image not found"))
+
+
+def _sandbox_env(tmp_path, sf_env):
+    (tmp_path / "environment").mkdir(exist_ok=True)
+    (tmp_path / "trial").mkdir(exist_ok=True)
+    return sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+
+
+def test_sandbox_create_survives_expiry_rate_limits_and_ambiguous_failures(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxError
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+    from snowflake.sandbox.exceptions import SandboxRateLimitError
+    from snowflake.sandbox.exceptions import SandboxTransportError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    token = ["stale"]
+    renewals: list[str | None] = []
+    names: list[str] = []
+    started: dict[str, SimpleNamespace] = {}
+    terminated: list[str] = []
+    failures = [
+        SandboxError("create returned no container id: {'code': '390112', 'message': 'Your session has expired.'}"),
+        SandboxRateLimitError("rate-limited after 4 retries"),
+        SandboxTransportError("POST containers failed after the request was sent (ReadError: )"),
+        SandboxTransportError("POST containers failed after the request was sent (WriteError: )"),
+    ]
+
+    def sandbox(name: str) -> SimpleNamespace:
+        async def terminate() -> None:
+            terminated.append(name)
+
+        return SimpleNamespace(id=f"id-{name}", name=name, terminate=terminate)
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            names.append(name)
+            failure = failures.pop(0) if failures else None
+            if failure is None or "ReadError" in str(failure):
+                started[name] = sandbox(name)
+            if failure is not None:
+                raise failure
+            return started[name]
+
+        @staticmethod
+        async def connect(name, connection):
+            if name not in started:
+                raise SandboxNotFoundError(name)
+            return started[name]
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: token[0])
+
+    async def fake_renew(connection, role, stale):
+        renewals.append(stale)
+        token[0] = "fresh"
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "renew_config", fake_renew)
+    monkeypatch.setattr(sf_env, "_CREATE_BACKOFF_S", 0.0)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {})
+    monkeypatch.setattr(sf_env, "_sweep_at_exit", True)
+    env = _sandbox_env(tmp_path, sf_env)
+
+    async def run() -> None:
+        created = await env._create_sandbox("image", {})
+        assert created.name == names[-1]
+        env._sandbox = created
+        await env.stop(delete=True)
+
+    asyncio.run(run())
+    assert renewals == ["stale"]
+    assert len(set(names)) == len(names) == 5
+    # The ReadError create had started a sandbox: it is found by name and terminated, then the run's own one.
+    assert terminated == [names[2], names[4]]
+    # The WriteError create's sandbox never showed up, so the exit sweep looks for it once more.
+    assert list(sf_env._LIVE_SANDBOXES) == [names[3]]
+
+
+def test_a_create_that_never_stops_failing_raises(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxError
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+    from snowflake.sandbox.exceptions import SandboxRateLimitError
+    from snowflake.sandbox.exceptions import SandboxValidationError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    attempts: list[str] = []
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxRateLimitError("rate-limited after 4 retries")
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "_CREATE_BACKOFF_S", 0.0)
+    env = _sandbox_env(tmp_path, sf_env)
+    with pytest.raises(SandboxRateLimitError):
+        asyncio.run(env._create_sandbox("image", {}))
+    assert len(attempts) == sf_env._CREATE_ATTEMPTS
+
+    looked_up: list[str] = []
+
+    class Failed(FakeAsyncSandbox):
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxError("sandbox failed to start: image pull failed")
+
+        @staticmethod
+        async def connect(name, connection):
+            looked_up.append(name)
+            raise SandboxNotFoundError(name)
+
+    attempts.clear()
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Failed)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0, 0.0))
+    with pytest.raises(SandboxError, match="image pull failed"):
+        asyncio.run(env._create_sandbox("image", {}))
+    # Not retried. The sandbox may yet appear, so the exit sweep gets its name.
+    assert len(attempts) == 1
+    assert looked_up == [attempts[0], attempts[0]]
+    assert list(sf_env._LIVE_SANDBOXES) == [attempts[0]]
+
+    class Invalid(Failed):
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxValidationError("image must not name a registry host")
+
+    attempts.clear()
+    looked_up.clear()
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Invalid)
+    with pytest.raises(SandboxValidationError):
+        asyncio.run(env._create_sandbox("docker.io/python:3.12", {}))
+    assert len(attempts) == 1
+    assert looked_up == []
+
+
+def test_only_a_reauth_response_code_counts_as_an_expired_session():
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox.session import is_expired_session
+
+    assert is_expired_session(
+        RuntimeError("create returned no container id: {'code': '390112', 'message': 'Your session has expired.'}")
+    )
+    assert is_expired_session(RuntimeError('got 401: {"code": "390114", "message": "expired"}'))
+    assert not is_expired_session(RuntimeError("create returned no container id: {'code': '390144'}"))
+    assert not is_expired_session(RuntimeError("sandbox harbor-rl-390112abc failed to start"))
+
+
+def test_sandbox_creates_in_flight_are_capped(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    in_flight = [0]
+    peak = [0]
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.01)
+            in_flight[0] -= 1
+            return SimpleNamespace(name=name)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "pat")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    envs = []
+    for _ in range(10):
+        env = _sandbox_env(tmp_path, sf_env)
+        env._max_creating = 3
+        envs.append(env)
+
+    async def run() -> list:
+        return await asyncio.gather(*(env._create_sandbox("image", {}) for env in envs))
+
+    assert len(asyncio.run(run())) == 10
+    assert peak[0] == 3
+
+
+def test_a_create_that_fails_in_the_client_terminates_the_sandbox_it_started(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    names: list[str] = []
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            names.append(name)
+            raise KeyError(5)
+
+        @staticmethod
+        async def connect(name, connection):
+            async def terminate() -> None:
+                terminated.append(name)
+
+            return SimpleNamespace(name=name, terminate=terminate)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0,))
+    env = _sandbox_env(tmp_path, sf_env)
+    with pytest.raises(KeyError):
+        asyncio.run(env._create_sandbox("image", {}))
+    assert terminated == names and len(names) == 1
+
+
+def test_a_cancelled_rollout_still_terminates_its_sandbox(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def terminate() -> None:
+            await release.wait()
+            terminated.append("harbor-1")
+
+        monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {"harbor-1": (None, None)})
+        env = _sandbox_env(tmp_path, sf_env)
+        env._sandbox = SimpleNamespace(id="id-1", name="harbor-1", terminate=terminate)
+        stopping = asyncio.ensure_future(env.stop(delete=True))
+        await asyncio.sleep(0)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        release.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert terminated == ["harbor-1"]
+    assert sf_env._LIVE_SANDBOXES == {}
+
+
+def test_sandboxes_left_running_are_terminated_when_shared_resources_close(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    order: list[str] = []
+
+    class FakeSandbox:
+        @staticmethod
+        def connect(name, connection):
+            if name == "harbor-gone":
+                raise SandboxNotFoundError(name)
+            return SimpleNamespace(terminate=lambda: terminated.append((name, connection)))
+
+    monkeypatch.setattr(sf_env, "Sandbox", FakeSandbox)
+    monkeypatch.setattr(sf_env, "get_config_sync", lambda connection, role: f"{connection}/{role}")
+    monkeypatch.setattr(sf_env, "close_registries", lambda: order.append("registries"))
+    monkeypatch.setattr(sf_env, "close_sessions", lambda: order.append("sessions"))
+    monkeypatch.setattr(
+        sf_env,
+        "_LIVE_SANDBOXES",
+        {"harbor-a": ("conn", None), "harbor-gone": ("conn", None), "harbor-b": ("other", "ROLE")},
+    )
+    sf_env.SnowflakeSandboxEnvironment.close_shared_resources()
+    assert terminated == [("harbor-a", "conn/None"), ("harbor-b", "other/ROLE")]
+    assert order == ["registries", "sessions"] and sf_env._LIVE_SANDBOXES == {}
+
+
 def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
@@ -402,6 +785,7 @@ def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, 
 
     class FakeSandbox:
         id = "sb-1"
+        name = "harbor-1"
 
         async def terminate(self) -> None:
             terminated.append(self.id)
@@ -412,7 +796,7 @@ def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, 
             return FakeSandbox()
 
     async def fake_get_config(connection, role):
-        return None
+        return SimpleNamespace(resolve_pat=lambda: "token")
 
     monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
     monkeypatch.setattr(sf_env, "get_config", fake_get_config)
