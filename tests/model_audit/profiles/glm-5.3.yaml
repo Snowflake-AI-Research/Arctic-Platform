@@ -1,0 +1,86 @@
+# GLM-5.3 RL. Launch target: bf16 full fine-tune, EP8 trainer, TP8 sampler.
+name: glm-5.3
+checkpoint: zai-org/GLM-5.3
+
+launch:
+  dtype: bfloat16
+  max_seq_len: 131072
+  trainer:
+    loader: glm_moe_dsa
+    attn_implementation: sdpa
+    parallelism: {expert_parallel: 8, sequence_parallel: 1}
+    loader_options:
+      seq_len: 131072
+      ep_comm_backend: deepep
+      reduce_dtype: float32
+  engine: {gradient_clipping: 0.0, fp32_masters: false}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 131072
+    enable_prefix_caching: true
+  optimizer: {lr: 1.0e-6, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+
+probe:
+  # Given labels, the Liger head returns only the loss.
+  pass_labels: false
+
+tiny:
+  # MLA and indexer head dims stay real: the sparse-MLA and DeepGEMM kernels constrain them.
+  experts: 16
+  text_overrides:
+    hidden_size: 1024
+    intermediate_size: 1024
+    moe_intermediate_size: 256
+    q_lora_rank: 256
+    num_nextn_predict_layers: 0
+    # vLLM derives shared indexer layers from these, transformers from indexer_types. The tiny layers keep
+    # full/shared/full, so the stride must say the same.
+    index_skip_topk_offset: 1
+    index_topk_freq: 2
+  # The source checkpoint is FP8; the tiny one is plain bf16.
+  config_overrides:
+    quantization_config: null
+  max_row_len: 4224
+  thresholds:
+    - {name: sparse_indexer_topk, position: 2048, reason: "queries past index_topk keys attend to a selected subset"}
+  trainer:
+    # glm_moe_dsa only builds at EP > 1 and has no sequence parallelism.
+    parallelism: {expert_parallel: 2, sequence_parallel: 1}
+    loader_options: {seq_len: 8192}
+  parallel:
+    - {expert_parallel: 4, sequence_parallel: 1}
+    - {expert_parallel: 2, sequence_parallel: 1, world_size: 4}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 8192
+    gpu_memory_utilization: 0.5
+
+expect:
+  loader: glm_moe_dsa
+  optimizer_implementation: fused_adam
+  no_grad_params:
+    - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
+
+known_issues:
+  sampler.weight_sync_matches_fresh_load[hf-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
+      compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
+      (routed_experts.w13_weight, fused_qkv_a_proj, W_UK_T), so it rejects a correct HF export before loading. The NCCL placement passes
+  trainer.deterministic:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
+    summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism)"
+  optimizer.update_lands_at_launch_lr:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
+  sampler.repeatable:
+    issue: pending
+    summary: >-
+      once a query has more than index_topk keys the indexer's selection varies between identical runs (first
+      differing position is exactly index_topk; ~0.01 log-prob)
+  # The tiny checkpoint is bf16; FP8 block scales and their training path are not covered.
+  contract.tiny_layout_matches_source:
+    issue: pending
+    summary: "the tiny checkpoint has no FP8 weight_scale_inv tensors; FP8 is untested at the tiny scale"
+not_applicable: {}

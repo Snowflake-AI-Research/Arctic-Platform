@@ -1,0 +1,103 @@
+# Nemotron-3.5-Lightning RL. Launch target (model catalog long/h200-training-full): bf16 full fine-tune at 262144
+# tokens, EP4 x SP8 trainer on 8 GPUs with full activation checkpointing, TP8 sampler.
+name: nemotron-3.5-lightning
+checkpoint: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+
+launch:
+  dtype: bfloat16
+  max_seq_len: 262144
+  trainer:
+    loader: generic_moe
+    attn_implementation: flash_attention_3
+    parallelism: {expert_parallel: 4, sequence_parallel: 8}
+    # What DSS's prime_rl_config hands the loader: the job's ac_config plus the resolved fused-CE backend.
+    loader_options:
+      ac_config: {mode: full, freq: 1}
+      fused_cross_entropy: liger
+  engine: {gradient_clipping: 1.0, fp32_masters: false}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 262144
+    trust_remote_code: true
+  optimizer: {lr: 2.0e-5, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+
+probe:
+  # Given labels, the Liger head returns only the loss.
+  pass_labels: false
+
+tiny:
+  # Mamba head dim, state size and group count, and the attention head dim, stay real: the Mamba2 SSD and FA3
+  # kernels constrain them, and SP shards Mamba groups (n_groups % sp == 0). Mamba and KV head counts stay real
+  # because they set the sampler's TP sharding and hybrid KV page size.
+  experts: 16
+  text_overrides:
+    hidden_size: 1024
+    intermediate_size: 256
+    moe_intermediate_size: 256
+    moe_shared_expert_intermediate_size: 512
+  max_row_len: 4224
+  thresholds:
+    - {name: mamba_chunk, position: 128, reason: "Mamba2 SSD switches from intra-chunk to carried inter-chunk state"}
+  trainer:
+    # generic_moe only builds at EP > 1.
+    parallelism: {expert_parallel: 2, sequence_parallel: 1}
+  parallel:
+    - {expert_parallel: 4, sequence_parallel: 8, world_size: 8}
+    - {expert_parallel: 2, sequence_parallel: 2, world_size: 4}
+    - {expert_parallel: 4, sequence_parallel: 1}
+    - {expert_parallel: 2, sequence_parallel: 1, world_size: 4}
+  sampler:
+    tensor_parallel_size: 8
+    max_model_len: 8192
+    gpu_memory_utilization: 0.5
+
+expect:
+  loader: generic_moe
+  optimizer_implementation: fused_adam
+  no_grad_params:
+    - {pattern: "\\.experts\\.w3$", reason: "relu2 experts are not gated; the expert-parallel wrapper keeps an empty w3"}
+  # transformers has no Nemotron-H MTP module, so the tiny checkpoint cannot carry mtp.*.
+  layout_ignore: ["^mtp\\."]
+
+known_issues:
+  trainer.export_round_trip:
+    issue: pending
+    summary: >-
+      the HF export (DSS save_weights_only for EP models) drops every mixer.gate.e_score_correction_bias: the
+      router keeps it as a plain buffer, which named_weight_sync_tensors skips. vLLM loads the saved checkpoint
+      without it (torch.empty bias) and routes wrongly; the real model's bias spans 36.93-37.03 across experts
+  trainer.config_survives_transformers_resave:
+    issue: pending
+    summary: >-
+      AP's NemotronHConfig keeps layers_block_type as written, and the model only knows mamba/moe/attention;
+      transformers 5 writes linear_attention/full_attention, so a checkpoint saved by any transformers tool fails
+      to build (KeyError 'linear_attention')
+  sampler.weight_sync_matches_fresh_load[hf-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
+      compute_expected_hf_param_names(model), which returns vLLM's renamed/fused parameter names for this model
+      (model.* for backbone.*, mixer.A for mixer.A_log), so it rejects a correct HF export before loading. The NCCL placement passes
+  sampler.weight_sync_matches_fresh_load[vllm-file]:
+    issue: pending
+    summary: >-
+      the CPU-file sync (load_weights_from_shm_path) hands FusedMoE's experts.w13_weight/w2_weight to
+      model.load_weights, which cannot place them (the NCCL path's _ShardAwareFusedWriter does); the strict name
+      check rejects them and the router bias the sender never ships. The NCCL placement passes
+  trainer.deterministic:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
+    summary: "two identical forwards differ by up to ~0.008 log-prob (MoE combine is nondeterministic by default)"
+  optimizer.clip_scale_exact:
+    issue: pending
+    summary: >-
+      with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
+      with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.33% low here, up to 0.39%)
+  optimizer.update_lands_at_launch_lr:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/322
+    summary: "the launch's bf16 master weights leave 69% of a 2e-5 AdamW step unapplied; fp32_masters: true keeps it"
+  sampler.batch_invariant:
+    issue: pending
+    summary: >-
+      vLLM scores a row batched and alone with different bf16 rounding, which flips near-tied top-6 routing in
+      single tokens (max 0.08 log-prob mid-row; mean error within the noise floor)
+not_applicable: {}
