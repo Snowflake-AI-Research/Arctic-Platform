@@ -650,41 +650,32 @@ class _CrashingAgent(_ForwardingAgent):
         raise RuntimeError("agent crashed after writing its answer")
 
 
-def test_a_trial_whose_sandbox_never_starts_is_an_error_not_a_zero_reward(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("agent", "env", "message"),
+    [
+        ("_ForwardingAgent", f"{__name__}:_UnstartableEnvironment", "status code 444"),
+        ("_CrashingAgent", "host", "agent crashed"),
+    ],
+)
+def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_path, monkeypatch, agent, env, message):
     from arctic_platform.integrations.harbor.adapter import HarborTrialError
+    from arctic_platform.integrations.harbor.adapter import grade_harbor
 
     monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
-    with pytest.raises(HarborTrialError, match="status code 444"):
+    with pytest.raises(HarborTrialError, match=message):
         asyncio.run(
             run_harbor_trial(
                 task_dir=_task(tmp_path),
                 trials_dir=tmp_path / "trials",
                 trial_name="trial",
-                agent=f"{__name__}:_ForwardingAgent",
-                env=f"{__name__}:_UnstartableEnvironment",
+                agent=f"{__name__}:{agent}",
+                env=env,
                 model_name="openai/test-model",
                 base_url="http://127.0.0.1:1/v1",
                 api_key="k",
             )
         )
-
-
-def test_an_agent_crash_stays_a_rollout_with_its_exception(tmp_path, monkeypatch):
-    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
-    out = asyncio.run(
-        run_harbor_trial(
-            task_dir=_task(tmp_path),
-            trials_dir=tmp_path / "trials",
-            trial_name="trial",
-            agent=f"{__name__}:_CrashingAgent",
-            env="host",
-            model_name="openai/test-model",
-            base_url="http://127.0.0.1:1/v1",
-            api_key="k",
-        )
-    )
-    assert "agent crashed" in out["exception"]
-    assert out["reward"] == 0.0
+    assert grade_harbor([], dict(error=message)).exhausted is True
 
 
 @pytest.mark.parametrize("failed", [3, 4])

@@ -21,8 +21,9 @@ orchestrator:
    Harbor agent, environment, and OpenHands skills) and starts ``Trial.run()`` in a
    background thread.
 2. ``get_status(rollout_id)`` returns ``"running"``, ``"completed"``, or
-   ``"errored"``. A trial that fails before its agent starts (the sandbox never
-   came up, agent setup failed) is ``"errored"``, not a reward of 0.
+   ``"errored"``. A trial that fails without a verifier result (the sandbox
+   never came up, the agent or the verifier crashed) is ``"errored"``, not a
+   reward of 0, and ``grade_harbor`` masks it out of the loss.
 3. ``collect_output(rollout_id)`` returns the Harbor ``TrialResult`` rewards
    produced by Harbor's ``Verifier`` (``tests/test.sh`` -> ``reward.txt`` /
    ``reward.json``), and ``grade_harbor`` converts them into a
@@ -199,10 +200,10 @@ async def run_harbor_trial(
     try:
         trial = await Trial.create(trial_cfg)
         result = await trial.run()
-        if result.exception_info is not None and result.agent_execution is None:
+        if result.exception_info is not None and result.verifier_result is None:
             info = result.exception_info
             raise HarborTrialError(
-                f"Harbor trial failed before the agent started: {info.exception_type}: {info.exception_message}\n"
+                f"Harbor trial ended without a verifier result: {info.exception_type}: {info.exception_message}\n"
                 f"{info.exception_traceback}"
             )
         rewards = dict((result.verifier_result.rewards if result.verifier_result else None) or {})
@@ -231,7 +232,7 @@ async def run_harbor_trial(
 
 
 class HarborTrialError(RuntimeError):
-    """A Harbor trial failed before its agent started, so it measures nothing about the policy."""
+    """A Harbor trial ended without a verifier result, so it has no reward."""
 
 
 class _LoopThread:
@@ -413,11 +414,14 @@ def grade_harbor(
     *,
     error_detail: dict[str, float] | None = None,
 ) -> Grade:
-    """Convert Harbor's verifier output in ``artifacts`` into a :class:`Grade`."""
+    """Convert Harbor's verifier output in ``artifacts`` into a :class:`Grade`.
+
+    An errored rollout was never graded, so it is ``exhausted``: its episodes add no loss.
+    """
     del episodes, request
     default_detail = dict(error_detail or dict(reward=0.0))
     if artifacts.get("error"):
-        return Grade(reward=0.0, reward_detail=default_detail, exhausted=False)
+        return Grade(reward=0.0, reward_detail=default_detail, exhausted=True)
     reward = float(artifacts.get("reward") or 0.0)
     raw_detail = dict(artifacts.get("reward_detail") or {})
     if not raw_detail:
