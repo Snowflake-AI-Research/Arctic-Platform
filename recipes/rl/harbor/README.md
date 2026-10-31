@@ -40,7 +40,7 @@ export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor rl"
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
 
-`HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`. A `prebuilt_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no `image_repo` or `crane`; any other `prebuilt_image` is mirrored, so it needs both. The launcher checks this before it provisions GPUs.
+`HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`. The registry must also accept pushes from the driver's network: if it rejects them (for example `HTTP 444: source IP address not allowed`), every rollout fails to start. A `prebuilt_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no `image_repo` or `crane`; any other `prebuilt_image` is mirrored, so it needs both. `base_image` replays each task's Dockerfile on the given image instead of its `FROM` image, so nothing is mirrored: use the sandbox catalog image `sandbox-base` (which has Python and git) or a sandbox image path, for tasks whose Dockerfile steps work on it. The launcher checks this before it provisions GPUs.
 
 `HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`. From the repository root, `uv run --extra harbor` provides the pinned `harbor` CLI with that environment importable:
 
@@ -67,11 +67,13 @@ uv run recipes/rl/harbor/prepare_data.py \
 
 export TRAIN_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/train
 export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
-export HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "egress_eai": "GITHUB_ACCESS"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "egress_eai": "GITHUB_ACCESS"}'
 export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor localization"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
 ```
+
+Each task clones its repository from GitHub inside the sandbox, so `egress_eai` must allow `github.com`. With `base_image`, the tasks need no image repository; to use their `python:3.11-slim` base instead, replace `base_image` with `image_repo`.
 
 ## Two Ways to Customize Your Training Run
 

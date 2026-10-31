@@ -216,12 +216,19 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
 
     @classmethod
     @override
-    def preflight(cls, *, image_repo: str | None = None, prebuilt_image: str | None = None, **_: Any) -> None:
+    def preflight(
+        cls,
+        *,
+        image_repo: str | None = None,
+        prebuilt_image: str | None = None,
+        base_image: str | None = None,
+        **_: Any,
+    ) -> None:
         """Check the SDK, and ``crane`` when images may need mirroring.
 
         Harbor calls this without kwargs, which assumes mirroring. A
-        ``prebuilt_image`` that is already a sandbox path (``/db/schema/repo/image:tag``)
-        with no ``image_repo`` never touches the registry.
+        ``prebuilt_image`` that is already a sandbox path (``/db/schema/repo/image:tag``),
+        or a ``base_image``, with no ``image_repo`` never touches the registry.
         """
         if not _HAS_SDK:
             raise SystemExit(
@@ -236,7 +243,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 f"prebuilt_image={prebuilt_image!r} is not a sandbox image path (/DB/SCHEMA/REPO/IMAGE:TAG), "
                 "so it has to be mirrored: also set image_repo=DATABASE.SCHEMA.REPOSITORY"
             )
-        if image_repo or not sandbox_native:
+        if image_repo or not (sandbox_native or base_image):
             ImageRegistry.preflight()
 
     @classmethod
@@ -258,6 +265,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         role: str | None = None,
         image_repo: str | None = None,
         prebuilt_image: str | None = None,
+        base_image: str | None = None,
         egress_eai: str | list[str] | None = None,
         emulate_non_root_user: bool | str | None = None,
         max_live: int | str = _DEFAULT_MAX_LIVE,
@@ -278,6 +286,11 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             prebuilt_image: Skip image resolution and use this image: either a
                 sandbox path (``/db/schema/repo/name:tag``) or a registry ref to
                 mirror.
+            base_image: Replay each task's Dockerfile on this image instead of
+                its ``FROM`` image, which is then never mirrored: a sandbox
+                path (``/db/schema/repo/name:tag``) or a sandbox catalog image
+                such as ``sandbox-base``. Lets Dockerfile tasks run without
+                ``image_repo`` when their steps work on that image.
             egress_eai: Comma-separated external access integrations granted to
                 every sandbox. Needed for tasks or agents that reach hosts
                 outside Snowflake and the public package registries.
@@ -308,6 +321,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         self._connection = connection
         self._role = role
         self._image_repo = image_repo
+        self._base_image = base_image
         self._egress_eais = _csv(egress_eai)
         if emulate_non_root_user is None:
             self._emulate_non_root_user: bool | None = None
@@ -434,7 +448,10 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 self._base_env,
             ) = await self._image_defaults(image)
             return image, None
-        image = await self._mirror(base_image(self._dockerfile), force_build=force_build)
+        if self._base_image:
+            image = self._base_image
+        else:
+            image = await self._mirror(base_image(self._dockerfile), force_build=force_build)
         workdir, user, entrypoint, base_env = await self._image_defaults(image)
         self._base_env = base_env
         try:
@@ -452,7 +469,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
 
     async def _image_defaults(self, image: str) -> tuple[str | None, str | None, list[str] | None, dict[str, str]]:
         """WORKDIR, USER, ENTRYPOINT and ENV baked into ``image``, so exec matches Docker."""
-        if not self._image_repo:
+        if not self._image_repo or not image.startswith("/"):
             return None, None, None, {}
         try:
             config = await self._registry().image_config(image)
