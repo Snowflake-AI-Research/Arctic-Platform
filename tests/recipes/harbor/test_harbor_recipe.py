@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,6 +116,28 @@ def test_materialize_swe_smith_localization_harbor_task(tmp_path: Path) -> None:
     truth = json.loads((task_dir / "tests" / "ground_truth.json").read_text(encoding="utf-8"))
     assert truth["instance_id"] == "owner__repo.123"
     assert truth["file_changes"][0]["file"] == "src/foo.py"
+
+
+def test_swe_smith_export_needs_only_the_standard_library(tmp_path: Path) -> None:
+    harbor_recipe = Path(__file__).resolve().parents[3] / "recipes" / "rl" / "harbor"
+    row = dict(instance_id="owner__repo.123", repo="owner/repo", base_commit="abc1234", problem_statement="Fix it")
+    script = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(harbor_recipe)!r})\n"
+        "from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row\n"
+        "from pathlib import Path\n"
+        f"task = materialize_harbor_task_from_row(json.loads(sys.argv[1]), Path({str(tmp_path / 'tasks')!r}))\n"
+        "print(task)\n"
+    )
+    # -I -S: no site-packages, so neither Arctic Platform nor the training dependencies are importable,
+    # matching prepare_data.py run as a `uv run` script.
+    out = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script, json.dumps(row)], capture_output=True, text=True, check=True
+    )
+    task_dir = Path(out.stdout.strip())
+    reward = harbor_recipe.parent / "openhands" / "code_localization" / "openhands_localization" / "reward.py"
+    assert (task_dir / "tests" / "localization_reward.py").read_text() == reward.read_text()
+    assert (task_dir / "tests" / "test.sh").is_file()
 
 
 def test_harbor_trial_adapter_and_grader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

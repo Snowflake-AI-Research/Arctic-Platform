@@ -23,15 +23,14 @@ against :class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy`
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
-import re
-import shlex
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
+from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
 from openhands_localization import reward as localization_reward_module
 from openhands_localization.config import validate_openhands_cfg
 from openhands_localization.events import last_step_is_one_tool_call
@@ -42,122 +41,12 @@ from arctic_platform.integrations.harbor.adapter import HarborTrialAdapter
 from arctic_platform.integrations.harbor.adapter import grade_harbor
 from arctic_platform.integrations.harbor.adapter import require_driver_resident_agent
 from arctic_platform.integrations.harbor.adapter import resolve_env
-from arctic_platform.integrations.harbor.env import contained_path
 from arctic_platform.integrations.harness.generator import Grade
 from arctic_platform.integrations.harness.generator import HarnessGenerator
 from arctic_platform.integrations.harness.proxy import ChatCompletionsProxy
 
 DEFAULT_HARBOR_AGENT = "harbor_rl.agent:OpenHandsHarborAgent"
 _ERROR_DETAIL = dict(file_reward=0.0, module_reward=0.0, entity_reward=0.0, reward=0.0)
-
-
-def _to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_to_jsonable(v) for v in value]
-    if hasattr(value, "tolist"):
-        return _to_jsonable(value.tolist())
-    return str(value)
-
-
-_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
-_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
-_COMMIT = re.compile(r"^[0-9a-fA-F]{7,40}$")
-
-
-def _require(pattern: re.Pattern[str], value: str, field: str) -> str:
-    if not pattern.fullmatch(value):
-        raise ValueError(f"Dataset row has an invalid {field}: {value!r}")
-    return value
-
-
-_LOCALIZATION_VERIFIER_SH = """#!/usr/bin/env bash
-set -euo pipefail
-mkdir -p /logs/verifier
-python3 - <<'PY'
-import json
-import pathlib
-import sys
-
-sys.path.insert(0, "/tests")
-from localization_reward import localization_reward
-
-sub = pathlib.Path("/logs/agent/localization_submission.json")
-truth = pathlib.Path("/tests/ground_truth.json")
-locations = json.loads(sub.read_text()) if sub.is_file() else None
-instance = json.loads(truth.read_text()) if truth.is_file() else {}
-total, detail = localization_reward(locations, instance)
-pathlib.Path("/logs/verifier/reward.txt").write_text(f"{total:.6f}\\n")
-pathlib.Path("/logs/verifier/reward.json").write_text(json.dumps(detail) + "\\n")
-PY
-"""
-
-
-def materialize_harbor_task_from_row(instance: dict[str, Any], tasks_root: Path) -> Path:
-    """Materialize a Harbor task directory for a SWE-smith code localization row on demand.
-
-    ``instance_id``, ``repo``, and ``base_commit`` come from the dataset, so they
-    are validated before they name a directory or reach a Dockerfile line.
-    """
-    instance_id = _require(_INSTANCE_ID, str(instance["instance_id"]), "instance_id")
-    repo = _require(_REPO, str(instance["repo"]), "repo")
-    base_commit = instance.get("base_commit")
-    if base_commit is not None and str(base_commit) in ("None", "nan", ""):
-        base_commit = None
-    if base_commit is not None:
-        base_commit = _require(_COMMIT, str(base_commit), "base_commit")
-
-    tasks_root.mkdir(parents=True, exist_ok=True)
-    task_dir = contained_path(tasks_root, tasks_root / instance_id, "Task directory")
-    test_sh = task_dir / "tests" / "test.sh"
-    if all(p.is_file() for p in (test_sh, task_dir / "instruction.md", task_dir / "tests" / "localization_reward.py")):
-        return task_dir
-
-    env_dir = task_dir / "environment"
-    tests_dir = task_dir / "tests"
-    env_dir.mkdir(parents=True, exist_ok=True)
-    tests_dir.mkdir(parents=True, exist_ok=True)
-
-    use_patch = bool(instance.get("use_patch", True))
-    patch_text = str(instance.get("patch") or "") if use_patch else ""
-    problem = str(instance.get("problem_statement") or "")
-    file_changes = _to_jsonable(
-        instance.get("file_changes") if instance.get("file_changes") is not None else instance.get("target") or []
-    )
-
-    (task_dir / "task.toml").write_text(
-        f'name = "{instance_id}"\nversion = "1.0"\n',
-        encoding="utf-8",
-    )
-    (task_dir / "instruction.md").write_text(problem, encoding="utf-8")
-
-    repo_dir = f"{repo.replace('/', '_')}_{instance_id}"
-    df_lines = [
-        "FROM python:3.11-slim",
-        "RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*",
-        "WORKDIR /app",
-        f"RUN git clone {shlex.quote(f'https://github.com/{repo}.git')} {shlex.quote(f'/app/{repo_dir}')}",
-        f"WORKDIR /app/{repo_dir}",
-    ]
-    if base_commit:
-        df_lines.append(f"RUN git checkout {shlex.quote(base_commit)}")
-    if patch_text:
-        (env_dir / "bug.patch").write_text(patch_text, encoding="utf-8")
-        df_lines.append("COPY bug.patch /app/bug.patch")
-        df_lines.append("RUN git apply /app/bug.patch && rm -f /app/bug.patch")
-    (env_dir / "Dockerfile").write_text("\n".join(df_lines) + "\n", encoding="utf-8")
-
-    (tests_dir / "ground_truth.json").write_text(
-        json.dumps(dict(instance_id=instance_id, file_changes=file_changes)),
-        encoding="utf-8",
-    )
-    shutil.copyfile(localization_reward_module.__file__, tests_dir / "localization_reward.py")
-    test_sh.write_text(_LOCALIZATION_VERIFIER_SH, encoding="utf-8")
-    test_sh.chmod(0o755)
-    return task_dir
 
 
 def harbor_env_kwargs() -> dict[str, Any]:
@@ -229,7 +118,9 @@ def _experiment_cls():
                 max_turns=max_turns,
                 skills=skills,
                 env_kwargs=harbor_env_kwargs(),
-                prepare_task_fn=materialize_harbor_task_from_row,
+                prepare_task_fn=functools.partial(
+                    materialize_harbor_task_from_row, reward_file=Path(localization_reward_module.__file__)
+                ),
             )
             self.harbor_adapter = adapter
 

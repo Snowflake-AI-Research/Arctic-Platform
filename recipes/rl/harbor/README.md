@@ -11,6 +11,20 @@ Every Harbor task already defines `instruction.md`, `environment/`, and `tests/t
 2. **Token Splicing**: `ChatCompletionsProxy` records every `/v1/chat/completions` call and splices the exact sampled token IDs across turns (`loss_mask = 1` on assistant turns, `0` on prompts and tool outputs).
 3. **`Verifier`**: Harbor's `Verifier` executes the task's `tests/test.sh` and reads `/logs/verifier/reward.txt` or `reward.json`.
 
+## Before You Start
+
+The driver needs [`uv`](https://docs.astral.sh/uv/) and a SkyRL checkout; the launcher installs OpenHands and Harbor itself. Run the commands below from the root of this repository.
+
+```bash
+git clone --branch skyrl-v0.3.0 --depth 1 https://github.com/NovaSky-AI/SkyRL
+export SKYRL_HOME=$PWD/SkyRL
+
+# The launcher reads the Cortex connection only from these variables.
+cfg=~/cortex-training-config.json
+export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg") ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
+export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg") ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+```
+
 ## Go from `harbor run` (eval) to RL Post-Training in 3 Steps
 
 ### 1. Any Harbor Task Set
@@ -28,10 +42,10 @@ bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 
 `HARBOR_ENV_KWARGS` is a JSON object passed to the environment, like `harbor run --ek`. For `snowflake` it takes `image_repo` (where task images are mirrored), `connection`, `role`, `prebuilt_image`, `egress_eai` (needed for tasks that reach the internet, such as `git clone` from GitHub), and `image_platform`. Mirroring task images needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH` (no Docker daemon), and the role needs WRITE on `image_repo`. A `prebuilt_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no `image_repo` or `crane`; any other `prebuilt_image` is mirrored, so it needs both. The launcher checks this before it provisions GPUs.
 
-`HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`:
+`HARBOR_ENV=snowflake` is the Snowflake environment bundled in `arctic_platform.integrations.harbor.snowflake_sandbox`; the pinned `harbor` release doesn't ship one. To evaluate on the same environment that training uses, pass its import path to `harbor run`. From the repository root, `uv run --extra harbor` provides the pinned `harbor` CLI with that environment importable:
 
 ```bash
-harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
+uv run --extra harbor harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
   --ek image_repo=DB.SCHEMA.REPO --ek connection=MY_CONN --ek role=MY_ROLE
 ```
