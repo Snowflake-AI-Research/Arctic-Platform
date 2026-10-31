@@ -615,7 +615,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             last = attempt == _CREATE_ATTEMPTS - 1
             config = await get_config(self._connection, self._role)
             token = config.resolve_pat()
-            name = f"harbor-{uuid.uuid4().hex[:20]}"
+            name = f"harbor-rl-{uuid.uuid4().hex[:20]}"
             try:
                 sandbox = await AsyncSandbox.create(
                     image=image,
