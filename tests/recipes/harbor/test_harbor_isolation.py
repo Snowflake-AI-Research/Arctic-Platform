@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import signal
@@ -992,6 +993,7 @@ def test_closing_the_adapter_cancels_rollouts_and_releases_shared_resources(tmp_
     rid = adapter.submit(_request(_task(tmp_path), "r0"))
     assert started.wait(5)
     loop_thread = adapter._loop_thread
+    gc.collect()
 
     adapter.close()
 

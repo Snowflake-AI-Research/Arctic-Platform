@@ -244,9 +244,20 @@ class _LoopThread:
         self.loop.set_default_executor(self._executor)
         self._thread = threading.Thread(target=self.loop.run_forever, name="harbor-loop", daemon=True)
         self._thread.start()
+        self._tasks: set[asyncio.Task] = set()
 
     def submit(self, coro: Any) -> concurrent.futures.Future:
-        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        # The loop holds tasks only weakly. A rollout waiting on an object nothing else references would be
+        # garbage-collected while pending, and its future would never finish.
+        async def held() -> Any:
+            task = asyncio.current_task()
+            self._tasks.add(task)
+            try:
+                return await coro
+            finally:
+                self._tasks.discard(task)
+
+        return asyncio.run_coroutine_threadsafe(held(), self.loop)
 
     def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> bool:
         """Cancel every pending rollout, close the loop, and wait for its worker threads.
