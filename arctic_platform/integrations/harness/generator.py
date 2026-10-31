@@ -159,13 +159,20 @@ class HarnessGenerator:
                 )
             )
         finished = await asyncio.gather(*[self._finish(request) for request in requests])
+        for request, (_, artifacts, grade) in zip(requests, finished):
+            self._write_trajectory(metadata, phase, request, artifacts, grade)
+        errors = [artifacts.get("error") for _, artifacts, _ in finished]
+        if len(errors) > 0 and all(errors):
+            raise RuntimeError(
+                f"Every {phase} rollout at step {metadata.global_step} errored, so there is nothing to train on. "
+                f"First error:\n{errors[0]}"
+            )
         rows = []
         trajectory_ids = []
         is_last_step = []
         reward_details = []
-        for request, (rollout_rows, artifacts, grade) in zip(requests, finished):
+        for request, (rollout_rows, _, grade) in zip(requests, finished):
             reward_details.append(grade.reward_detail)
-            self._write_trajectory(metadata, phase, request, artifacts, grade)
             for index, row in enumerate(rollout_rows):
                 rows.append(row)
                 trajectory_ids.append(request.trajectory_id)

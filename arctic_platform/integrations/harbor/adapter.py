@@ -21,7 +21,8 @@ orchestrator:
    Harbor agent, environment, and OpenHands skills) and starts ``Trial.run()`` in a
    background thread.
 2. ``get_status(rollout_id)`` returns ``"running"``, ``"completed"``, or
-   ``"errored"``.
+   ``"errored"``. A trial that fails before its agent starts (the sandbox never
+   came up, agent setup failed) is ``"errored"``, not a reward of 0.
 3. ``collect_output(rollout_id)`` returns the Harbor ``TrialResult`` rewards
    produced by Harbor's ``Verifier`` (``tests/test.sh`` -> ``reward.txt`` /
    ``reward.json``), and ``grade_harbor`` converts them into a
@@ -198,6 +199,12 @@ async def run_harbor_trial(
     try:
         trial = await Trial.create(trial_cfg)
         result = await trial.run()
+        if result.exception_info is not None and result.agent_execution is None:
+            info = result.exception_info
+            raise HarborTrialError(
+                f"Harbor trial failed before the agent started: {info.exception_type}: {info.exception_message}\n"
+                f"{info.exception_traceback}"
+            )
         rewards = dict((result.verifier_result.rewards if result.verifier_result else None) or {})
         reward = float(rewards.get("reward", next(iter(rewards.values()), 0.0))) if rewards else 0.0
 
@@ -221,6 +228,10 @@ async def run_harbor_trial(
         )
     finally:
         shutil.rmtree(trial_dir, ignore_errors=True)
+
+
+class HarborTrialError(RuntimeError):
+    """A Harbor trial failed before its agent started, so it measures nothing about the policy."""
 
 
 class _LoopThread:
