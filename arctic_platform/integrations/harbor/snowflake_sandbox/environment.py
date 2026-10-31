@@ -169,6 +169,7 @@ def _loop_semaphore(
         per_loop = slots.setdefault(loop, {})
         return per_loop.setdefault(size, asyncio.Semaphore(size))
 
+
 # Sandbox root has no capabilities, so apt can't drop privileges to `_apt` or
 # write its `_apt`-owned partial dirs. Run apt as root with root-owned cache and
 # list dirs, and drop Docker's apt-clean hook, which targets the old cache path.
