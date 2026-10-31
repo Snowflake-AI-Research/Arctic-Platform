@@ -23,6 +23,7 @@ import os
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from typing import Any
 from typing import Literal
 from weakref import WeakKeyDictionary
@@ -328,8 +329,13 @@ def _gather_ep_expert_lora(parameter: Any, *, kind: str, rank: int) -> torch.Ten
     return torch.cat([shard.view(shard.shape[0], rank, -1) for shard in shards], dim=2).flatten(1)
 
 
-def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
-    """Gather a PEFT adapter pack onto rank zero."""
+def gather_peft_adapter_state_dict(
+    model: nn.Module, *, rank: int, is_zero3: bool, keep_checkpoint_wrappers: bool = False
+) -> dict[str, torch.Tensor]:
+    """Gather adapter tensors on rank zero, stripping checkpoint wrappers by default.
+
+    ``keep_checkpoint_wrappers`` preserves live module names for PEFT's adapter selection during saving.
+    """
     adapter_parameters = [
         (name, parameter) for name, parameter in model.named_parameters() if is_peft_adapter_tensor_name(name)
     ]
@@ -348,13 +354,15 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
             if rank != 0:
                 return {}
             return {
-                strip_activation_checkpoint_segments(name): parameter.detach().cpu().contiguous()
+                name if keep_checkpoint_wrappers else strip_activation_checkpoint_segments(name): (
+                    parameter.detach().cpu().contiguous()
+                )
                 for name, parameter in adapter_parameters
             }
 
     output: dict[str, torch.Tensor] = {}
     for name, parameter in adapter_parameters:
-        export_name = strip_activation_checkpoint_segments(name)
+        export_name = name if keep_checkpoint_wrappers else strip_activation_checkpoint_segments(name)
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
@@ -369,26 +377,6 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
     return output
 
 
-def peft_adapter_checkpoint_state_dict(
-    model: nn.Module, state: dict[str, torch.Tensor], adapter_name: str
-) -> dict[str, torch.Tensor]:
-    """Return ``adapter_name``'s entries of a gathered adapter state under PEFT's checkpoint keys.
-
-    PEFT selects adapter entries by the live module names, which keep the activation-checkpoint wrapper segments that
-    the gathered names drop. The selection therefore runs on the live names, and the segments are stripped after it.
-    """
-    from peft.utils import get_peft_model_state_dict
-
-    live_names = {strip_activation_checkpoint_segments(name): name for name, _ in model.named_parameters()}
-    selected = get_peft_model_state_dict(
-        model,
-        state_dict={live_names.get(name, name): tensor for name, tensor in state.items()},
-        adapter_name=adapter_name,
-        save_embedding_layers=False,
-    )
-    return {strip_activation_checkpoint_segments(name): tensor for name, tensor in selected.items()}
-
-
 def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool = False) -> None:
     """Collectively write a PEFT adapter pack under ``checkpoint_dir/default``.
 
@@ -397,26 +385,38 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     """
     if not is_peft_model(model):
         return
-    import copy
-
     import torch.distributed as dist
+    from safetensors import safe_open
     from safetensors.torch import save_file
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3)
+    state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3, keep_checkpoint_wrappers=True)
     if rank != 0:
         return
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
-    for adapter_name, peft_config in model.peft_config.items():
-        tensors = peft_adapter_checkpoint_state_dict(model, state, adapter_name)
-        if state and not tensors:
-            raise RuntimeError(f"none of the {len(state)} gathered adapter tensors belong to adapter {adapter_name!r}")
+    os.makedirs(adapter_dir, exist_ok=True)
+    model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
+    # PEFT must select against live wrapped names before we make the pack portable.
+    for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
-        os.makedirs(output_dir, exist_ok=True)
-        save_file(tensors, os.path.join(output_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
-        peft_config = copy.deepcopy(peft_config)
-        peft_config.inference_mode = True
-        peft_config.save_pretrained(output_dir)
+        weights_path = os.path.join(output_dir, "adapter_model.safetensors")
+        with safe_open(weights_path, framework="pt") as handle:
+            metadata = handle.metadata()
+            saved_names = list(handle.keys())
+            portable = {}
+            for name in saved_names:
+                export_name = strip_activation_checkpoint_segments(name)
+                if export_name in portable:
+                    raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                portable[export_name] = handle.get_tensor(name)
+        if len(portable) == 0:
+            raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
+        if all(strip_activation_checkpoint_segments(name) == name for name in saved_names):
+            continue
+        with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+            temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
+            save_file(portable, temporary_path, metadata=metadata)
+            os.replace(temporary_path, weights_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
