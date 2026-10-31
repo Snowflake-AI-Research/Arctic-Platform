@@ -50,6 +50,16 @@ uv run --extra harbor harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <you
   --ek image_repo=DB.SCHEMA.REPO --ek connection=MY_CONN --ek role=MY_ROLE
 ```
 
+Snowflake allows 100 live sandboxes per owner, and suspended ones count. The environment renews its Snowflake session while the run lasts, retries rate-limited sandbox creates, and terminates every sandbox it started when the run ends, including when the run fails. A driver that is killed outright can't do that. When no other run is using the connection, terminate what it left behind:
+
+```bash
+uv run --extra harbor python -c "
+from snowflake.sandbox import Sandbox
+for s in Sandbox.list(connection='MY_CONN'):
+    if s.status in ('ready', 'pending') and (s.name or '').startswith('harbor-rl-'):
+        s.terminate()"
+```
+
 ### Where Rollouts Run
 
 The agent's `terminal` tool and the verifier both run through the selected Harbor environment, so the agent works in the same filesystem that `tests/test.sh` grades, on every backend. Each command runs to completion in a fresh shell: the working directory carries over between commands, but exported variables and background jobs do not. `file_editor` is not available because it would edit the training driver's filesystem instead.
