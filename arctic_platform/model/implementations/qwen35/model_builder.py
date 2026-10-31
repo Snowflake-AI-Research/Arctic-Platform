@@ -505,28 +505,12 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
-def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
-    device = "cpu" if config.fsdp_cpu_offload else "cuda"
-    model.to_empty(device=device)
-    torch.distributed.barrier()
+def _convert_snapshot(model: nn.Module, config: ModelConfig, *, node_local_only: bool = False) -> tuple[Path, bool]:
+    """Resolve the directory ``load_dcp_from_hf`` reads, writing its HF<->Prime conversion cache if one is needed.
 
-    def _init_buffers_post_meta():
-        if isinstance(model, PreTrainedModelPrimeRL):
-            model.init_buffers_post_meta()
-        else:
-            fix_model_post_empty(model)
-
+    Returns that directory and whether it is a conversion cache. No collective runs here.
+    """
     logger = get_logger()
-    if config.debug.random_init:
-        logger.warning("Randomly initializing model. Skipping loading weights from HF.")
-        _init_buffers_post_meta()
-        # Fill the (uninitialized) to_empty storage with name-seeded normals. The seed is per-parameter-name,
-        # so the model is identical across world size / SP / EP layout -- required for the SP-correctness test
-        # to compare each topology against its sp1 reference (see tests/sp/test_sp_topologies.py).
-        _random_init_deterministic(model, config)
-        _move_buffers_to_cuda(model, config)
-        return
-
     if not Path(config.name).exists():
         snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
     else:
@@ -575,7 +559,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
                 )
-            elif not conversion_cache_ready(snapshot_path) and world.is_master:
+            elif not node_local_only and not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
                     source_path,
                     snapshot_path,
@@ -589,9 +573,57 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     stream_convert_fn=stream_convert_fn,
                 )
 
+    return snapshot_path, conversion is not None
+
+
+def prepare_node_conversion_cache(model: nn.Module, config: ModelConfig) -> bool:
+    """Fill this node's HF<->Prime conversion cache as ``load_dcp_from_hf`` would, without torch.distributed.
+
+    A runtime runs it once per node before any rank starts, so a cold node's conversion is bounded by neither the
+    ranks' start-up deadline nor their first collective. A shared (not node-local) cache stays the master rank's.
+
+    Returns whether the ranks' load will read the weights without converting them: False only for a shared cache
+    that is not written yet.
+    """
+    if config.debug.random_init:
+        return True
+    snapshot_path, converted = _convert_snapshot(model, config, node_local_only=True)
+    if converted and not conversion_cache_ready(snapshot_path):
+        get_logger().warning(
+            f"Did not write the shared conversion cache {snapshot_path}; the master rank writes it inside the ranks' "
+            f"load (scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')})"
+        )
+        return False
+    return True
+
+
+def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    device = "cpu" if config.fsdp_cpu_offload else "cuda"
+    model.to_empty(device=device)
+    torch.distributed.barrier()
+
+    def _init_buffers_post_meta():
+        if isinstance(model, PreTrainedModelPrimeRL):
+            model.init_buffers_post_meta()
+        else:
+            fix_model_post_empty(model)
+
+    logger = get_logger()
+    if config.debug.random_init:
+        logger.warning("Randomly initializing model. Skipping loading weights from HF.")
+        _init_buffers_post_meta()
+        # Fill the (uninitialized) to_empty storage with name-seeded normals. The seed is per-parameter-name,
+        # so the model is identical across world size / SP / EP layout -- required for the SP-correctness test
+        # to compare each topology against its sp1 reference (see tests/sp/test_sp_topologies.py).
+        _random_init_deterministic(model, config)
+        _move_buffers_to_cuda(model, config)
+        return
+
+    snapshot_path, converted = _convert_snapshot(model, config)
+
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
-    if conversion is not None and not conversion_cache_ready(snapshot_path):
+    if converted and not conversion_cache_ready(snapshot_path):
         world = get_world()
         raise FileNotFoundError(
             "Converted weight cache is missing or incomplete after conversion barrier: "

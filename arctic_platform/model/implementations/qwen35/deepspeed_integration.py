@@ -27,6 +27,7 @@ from .model_builder import (
     configure_moe_ep_backend,
     get_model,
     load_dcp_from_hf,
+    prepare_node_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.deepspeed_integration import (
     MoEDeepSpeedAdapter,
@@ -35,6 +36,7 @@ from arctic_platform.model.implementations.moe.deepspeed_integration import (
     convert_dtensors_to_local as _convert_dtensors_to_local,
     load_moe_model as _load_moe_model,
     load_moe_model_for_deepspeed as _load_moe_model_for_deepspeed,
+    prepare_moe_conversion_cache,
     patch_deepspeed_moe_detection,
     setup_model_local_no_train,
     tag_expert_lora_adapters_for_deepspeed,
@@ -263,6 +265,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
         vllm_weight_export=_build_iter_full_vllm_weights,
+        prepare_conversion_cache=prepare_node_conversion_cache,
     )
 
 
@@ -310,6 +313,14 @@ def load_moe_model_for_deepspeed(
         sp_size=sp_size,
         sp_group=sp_group,
     )
+
+
+def prepare_qwen3_5_moe_weights(**kwargs) -> bool:
+    return prepare_moe_conversion_cache(_adapter(), **kwargs)
+
+
+def prepare_generic_moe_weights(**kwargs) -> bool:
+    return prepare_moe_conversion_cache(_generic_adapter(), **kwargs)
 
 
 def load_qwen3_5_moe_model(

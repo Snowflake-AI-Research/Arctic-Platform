@@ -29,6 +29,7 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+from arctic_platform.model.loaders.qwen3_5_moe import prepare_moe
 
 
 class FlashMoeOptions(GenericMoeOptions):
@@ -156,11 +157,24 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     return LoadedModel(model=model)
 
 
+def _prepare_glm5_next(ctx: LoaderContext) -> bool:
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import prepare_glm5_next_weights
+
+    return prepare_moe(ctx, prepare_glm5_next_weights, _FlashLoadOptions)
+
+
+def _prepare_qwen4_exp(ctx: LoaderContext) -> bool:
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import prepare_qwen4_exp_weights
+
+    return prepare_moe(ctx, prepare_qwen4_exp_weights, _FlashLoadOptions)
+
+
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
     options=FlashMoeOptions,
     validate_spec=_validate_glm5_next,
+    prepare=_prepare_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
@@ -173,6 +187,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     matches=_matches("qwen4_exp"),
     options=FlashMoeOptions,
     validate_spec=_validate_qwen4_exp,
+    prepare=_prepare_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model

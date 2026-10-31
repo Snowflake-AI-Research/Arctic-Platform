@@ -109,6 +109,10 @@ def load_glm5_next_model_for_deepspeed(
     )
 
 
+def prepare_glm5_next_weights(**kwargs) -> bool:
+    return qwen_ds.prepare_moe_conversion_cache(_adapter(), **kwargs)
+
+
 def load_glm5_next_model(
     *,
     model_name: str,

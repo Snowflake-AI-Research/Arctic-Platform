@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -33,6 +34,8 @@ from arctic_platform.model.config import ModelSpec
 if TYPE_CHECKING:
     from pydantic import BaseModel
     from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,7 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
+Preparer = Callable[[LoaderContext], bool]
 
 
 @dataclass
@@ -223,6 +227,7 @@ class _LoaderEntry:
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
+    prepare: Preparer | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -235,11 +240,14 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
+    prepare: Preparer | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
-    ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``options`` pydantic model used to validate ``ModelSpec.loader_options``. ``prepare``
+    does a node's one-time weight work with no process group, before the ranks start, and
+    returns whether the ranks can then load without converting.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -253,6 +261,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
+            prepare=prepare,
         )
         return fn
 
@@ -286,6 +295,16 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 
     assert _DEFAULT_LOADER is not None, "no default loader registered"
     return _DEFAULT_LOADER
+
+
+def prepare_weights(spec: ModelSpec) -> bool:
+    """Run the resolved loader's per-node weight preparation; False if it has none or the ranks still have work."""
+    assert spec.loader is not None, "spec.loader must be resolved before prepare_weights"
+    prepare = _LOADERS[spec.loader].prepare
+    if prepare is None:
+        logger.warning(f"Loader {spec.loader!r} has no per-node weight preparation; its ranks convert while loading")
+        return False
+    return prepare(LoaderContext(spec=spec))
 
 
 def select_loader(ctx: LoaderContext) -> Loader:

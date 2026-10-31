@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 
 from arctic_platform.model.config import ModelSpec
@@ -25,6 +26,7 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+from arctic_platform.model.loaders.qwen3_5_moe import prepare_moe
 
 DEEPSEEK_V41_ATTN_BACKEND = "eager"
 _MODEL_TYPES = frozenset({"deepseek_v41", "deepseek_v41_text"})
@@ -78,6 +80,19 @@ def _validate(spec: ModelSpec) -> None:
         )
 
 
+def _dequantize_checkpoint(spec: ModelSpec) -> bool:
+    # Packed MXFP4 experts are frozen, so only LoRA trains on them as published.
+    return spec.patches.peft is None
+
+
+def _prepare(ctx: LoaderContext) -> bool:
+    from arctic_platform.model.implementations.deepseek_v41.deepspeed_integration import prepare_deepseek_v41_weights
+
+    return prepare_moe(
+        ctx, partial(prepare_deepseek_v41_weights, dequantize_checkpoint=_dequantize_checkpoint(ctx.spec))
+    )
+
+
 def _load(ctx: LoaderContext) -> LoadedModel:
     groups = ctx.parallel_groups or {}
     if groups.get("ep_group") is None:
@@ -95,8 +110,7 @@ def _load(ctx: LoaderContext) -> LoadedModel:
         sp_group=groups.get("sp_group"),
         ep_group=groups["ep_group"],
         options=options,
-        # Packed MXFP4 experts are frozen, so only LoRA trains on them as published.
-        dequantize_checkpoint=ctx.spec.patches.peft is None,
+        dequantize_checkpoint=_dequantize_checkpoint(ctx.spec),
     )
     return LoadedModel(model=model)
 
@@ -106,6 +120,7 @@ def _load(ctx: LoaderContext) -> LoadedModel:
     matches=_matches,
     options=GenericMoeOptions,
     validate_spec=_validate,
+    prepare=_prepare,
 )
 def load_deepseek_v41(ctx: LoaderContext) -> LoadedModel:
     return _load(ctx)

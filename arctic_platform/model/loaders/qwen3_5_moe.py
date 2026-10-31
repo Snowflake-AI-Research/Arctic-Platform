@@ -118,11 +118,33 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
 
+def prepare_moe(ctx: LoaderContext, prepare_model, options_model: type[Qwen3_5MoeOptions] = Qwen3_5MoeOptions) -> bool:
+    """The ``prepare`` hook of the MoE loaders whose models load through qwen35's ``load_dcp_from_hf``.
+
+    ``options_model`` must be the one the loader's load validates ``loader_options`` against.
+    """
+    assert ctx.spec.attn_implementation is not None
+    return prepare_model(
+        model_name=ctx.spec.model_path_or_name,
+        optimization_dtype=ctx.spec.dtype,
+        attn_implementation=ctx.spec.attn_implementation,
+        ep_size=ctx.spec.parallelism.expert_parallel,
+        options=options_model.model_validate(ctx.spec.loader_options),
+    )
+
+
+def _prepare(ctx: LoaderContext) -> bool:
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import prepare_qwen3_5_moe_weights
+
+    return prepare_moe(ctx, prepare_qwen3_5_moe_weights)
+
+
 @register_loader(
     "qwen3_5_moe",
     matches=_matches,
     options=Qwen3_5MoeOptions,
     validate_spec=_validate_spec,
+    prepare=_prepare,
 )
 def load_qwen3_5_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
