@@ -1784,11 +1784,15 @@ def test_image_platform_reaches_every_crane_call(monkeypatch):
     registry.close()
 
 
-def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch):
+@pytest.mark.parametrize("drop", ["sdk", "h2"])
+def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch, drop):
     pytest.importorskip("snowflake.sandbox")
     from snowflake.sandbox.exceptions import SandboxTransportError
 
     from arctic_platform.integrations.harbor.snowflake_sandbox import transfer
+
+    # A reset HTTP/2 stream can surface from h2 as a bare KeyError of its stream id.
+    error = SandboxTransportError("transport error mid-transfer: ") if drop == "sdk" else KeyError(3881)
 
     async def no_sleep(_):
         return None
@@ -1803,16 +1807,28 @@ def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch):
         async def download_file(self, remote, local):
             self.calls += 1
             if self.calls <= self.drops:
-                raise SandboxTransportError("transport error mid-download: ")
+                raise error
             Path(local).write_text("reward", encoding="utf-8")
+
+        async def upload_file(self, local, remote):
+            self.calls += 1
+            if self.calls <= self.drops:
+                raise error
 
     monkeypatch.setattr(transfer.asyncio, "sleep", no_sleep)
     flaky = FlakyTransport(drops=1)
     asyncio.run(transfer.download_path(flaky, exec_fn, "/logs/verifier/reward.txt", tmp_path / "reward.txt"))
     assert (tmp_path / "reward.txt").read_text() == "reward" and flaky.calls == 2
 
+    agent_logs = tmp_path / "agent"
+    agent_logs.mkdir()
+    (agent_logs / "localization_submission.json").write_text("[]", encoding="utf-8")
+    flaky = FlakyTransport(drops=1)
+    asyncio.run(transfer.upload_dir(flaky, exec_fn, agent_logs, "/logs/agent"))
+    assert flaky.calls == 2
+
     dead = FlakyTransport(drops=99)
-    with pytest.raises(SandboxTransportError):
+    with pytest.raises(type(error)):
         asyncio.run(transfer.download_path(dead, exec_fn, "/logs/verifier/reward.txt", tmp_path / "other.txt"))
     assert dead.calls == transfer.TRANSFER_ATTEMPTS
 
