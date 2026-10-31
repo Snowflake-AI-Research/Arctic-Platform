@@ -68,10 +68,7 @@ def _connect(connection: str | None, role: str | None) -> Config:
         kwargs["connection_name"] = connection
     if role:
         kwargs["role"] = role
-    logger.info(
-        "Logging in to Snowflake%s (SSO connections open a browser once per run)",
-        f" with connection {connection!r}" if connection else "",
-    )
+    logger.info("Logging in to Snowflake%s", f" with connection {connection!r}" if connection else "")
     conn = snowflake.connector.connect(**kwargs)
     return resolve_config(connection=conn)
 
