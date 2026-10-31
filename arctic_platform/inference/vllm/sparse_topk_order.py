@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Give the sparse-attention key lists of GLM-5.3-Flash and Qwen3.8-Flash-Next a fixed order.
+"""Give the sparse-attention key lists of GLM-5.3, GLM-5.3-Flash and Qwen3.8-Flash-Next a fixed order.
 
 vLLM's indexer top-k kernels (``top_k_per_row_prefill``, ``cooperative_topk``,
 ``persistent_topk``) hand out output slots with ``atomicAdd``, so the same set
@@ -42,11 +42,13 @@ def apply_sparse_topk_order_fix() -> None:
     if _PATCHED:
         return
 
+    from vllm.models.deepseek_v32 import attention as dsa_attention
     from vllm.models.glm5next.nvidia.ops import kpool_compress
     from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer
 
     expand_pools_and_append_tail = kpool_compress.expand_pools_and_append_tail
     topk = qsa_indexer._topk
+    sparse_attn_indexer = dsa_attention.sparse_attn_indexer
 
     class KpoolCompressPatch(ArcticPatch[kpool_compress]):
         # GLM-5.3-Flash prefill and decode both expand their selected pools here; the tail stays after any padding.
@@ -62,6 +64,16 @@ def apply_sparse_topk_order_fix() -> None:
             topk(logits, visible_blocks, token_topk, compress_ratio, block_indices, topk_workspace)
             block_indices.copy_(sort_topk_ids(block_indices))
 
+    class DsaAttentionPatch(ArcticPatch[dsa_attention]):
+        # GLM-5.3's DSA indexer: the sparse MLA kernels read the token ids from this shared buffer afterwards.
+        @staticmethod
+        def sparse_attn_indexer(hidden_states, *args, **kwargs):
+            ids = sparse_attn_indexer(hidden_states, *args, **kwargs)
+            rows = ids[: hidden_states.shape[0]]
+            rows.copy_(sort_topk_ids(rows))
+            return ids
+
     KpoolCompressPatch.apply_patch()
     QsaIndexerPatch.apply_patch()
+    DsaAttentionPatch.apply_patch()
     _PATCHED = True

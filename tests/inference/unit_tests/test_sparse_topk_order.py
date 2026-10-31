@@ -41,6 +41,20 @@ def qsa_select(logits, visible_blocks, token_topk, compress_ratio, block_indices
 '''
 
 
+def _sparse_attn_indexer(hidden_states, scores, generator, topk_indices_buffer):
+    """Stand-in for vLLM's DSA indexer: writes each token's top-k into the shared buffer in atomic-slot order."""
+    width = topk_indices_buffer.shape[1]
+    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    for row in range(hidden_states.shape[0]):
+        visible = int(scores[row].isfinite().sum())
+        if visible <= width:
+            topk_indices_buffer[row, :visible] = torch.arange(visible)
+        else:
+            chosen = scores[row].topk(width).indices
+            topk_indices_buffer[row] = chosen[torch.randperm(width, generator=generator)]
+    return topk_indices_buffer
+
+
 @pytest.fixture
 def vllm_ops(monkeypatch):
     """Stub vLLM leaf modules the patch imports, without vLLM or a GPU."""
@@ -49,8 +63,11 @@ def vllm_ops(monkeypatch):
     qsa = types.ModuleType("qsa_indexer")
     qsa.torch = torch
     exec(_QSA_SOURCE, qsa.__dict__)
+    dsa = types.ModuleType("attention")
+    dsa.sparse_attn_indexer = _sparse_attn_indexer
     made = {}
     for name, leaf in {
+        "vllm.models.deepseek_v32.attention": dsa,
         "vllm.models.glm5next.nvidia.ops.kpool_compress": kpool,
         "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer": qsa,
     }.items():
@@ -64,7 +81,7 @@ def vllm_ops(monkeypatch):
                 setattr(made[".".join(parts[: i - 1])], parts[i - 1], made[prefix])
     monkeypatch.setattr(sparse_topk_order, "_PATCHED", False)
     sparse_topk_order.apply_sparse_topk_order_fix()
-    return kpool, qsa
+    return kpool, qsa, dsa
 
 
 def _assert_sorted_rows(ids):
@@ -74,7 +91,7 @@ def _assert_sorted_rows(ids):
 
 
 def test_glm_pool_order_no_longer_depends_on_topk_slot_order(vllm_ops):
-    kpool, _ = vllm_ops
+    kpool, _, _ = vllm_ops
     seq_lens = torch.tensor([4099, 1003], dtype=torch.int32)  # 1024 pools (sparse) and 250 pools (dense)
     scores = torch.randn(1024, generator=torch.Generator().manual_seed(0))
     chosen = scores.topk(_GROUPS).indices
@@ -96,7 +113,7 @@ def test_glm_pool_order_no_longer_depends_on_topk_slot_order(vllm_ops):
 
 
 def test_qsa_block_order_no_longer_depends_on_topk_slot_order(vllm_ops):
-    _, qsa = vllm_ops
+    _, qsa, _ = vllm_ops
     visible = torch.tensor([1024, 300, 513], dtype=torch.int32)
     logits = torch.randn(3, 1024, generator=torch.Generator().manual_seed(0))
     runs = []
@@ -114,3 +131,23 @@ def test_qsa_block_order_no_longer_depends_on_topk_slot_order(vllm_ops):
         visible_logits = logits[row, : int(visible[row])]
         expected = torch.arange(n_valid) if n_valid < _GROUPS else visible_logits.topk(_GROUPS).indices
         assert set(runs[0][row, :n_valid].tolist()) == set(expected.tolist())
+
+
+def test_dsa_token_order_no_longer_depends_on_topk_slot_order(vllm_ops):
+    _, _, dsa = vllm_ops
+    width = 2048
+    scores = torch.randn(3, 4096, generator=torch.Generator().manual_seed(0))
+    scores[1, 1000:] = float("-inf")  # a short row: vLLM writes its keys in order
+    hidden = torch.empty(3, 8)
+    runs = []
+    for seed in (1, 2):
+        backing = torch.full((5, width), 7, dtype=torch.int32)
+        out = dsa.sparse_attn_indexer(hidden, scores, torch.Generator().manual_seed(seed), topk_indices_buffer=backing)
+        assert out is backing
+        runs.append(backing)
+
+    assert torch.equal(runs[0], runs[1]), "same selected set, different key order handed to attention"
+    _assert_sorted_rows(runs[0][:3])
+    assert set(runs[0][0].tolist()) == set(scores[0].topk(width).indices.tolist())
+    assert runs[0][1, :1000].tolist() == list(range(1000)) and bool((runs[0][1, 1000:] == -1).all())
+    assert bool((runs[0][3:] == 7).all()), "rows past this batch's tokens must not change"
