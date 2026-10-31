@@ -21,7 +21,8 @@ to whichever loop touched it first.
 A session token lasts about an hour, and the connector's keep-alive heartbeat
 can fire after it lapses. Sandbox create then answers ``390112`` with a 200,
 which the SDK doesn't treat as a reason to renew. So the token is renewed here
-every ``RENEW_AFTER_S``, and on demand after a create reports an expired token.
+every ``RENEW_AFTER_S``, and on demand after a create reports an expired token,
+by logging in again when the connector can't renew it in place.
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ def _renew(config: Config, connection: str | None, role: str | None) -> Config:
         renewed = config
     if renewed.resolve_pat() != stale:
         return renewed
-    logger.warning("Couldn't renew the Snowflake session token; logging in again")
+    # refresh_config renews in place only on connectors with a session-renew call, which 5.1.0 lacks.
     fresh = _connect(connection, role)
     # Sandboxes started on the old session may still be using its token, so it stays open until close_sessions.
     if config.connection is not None:
