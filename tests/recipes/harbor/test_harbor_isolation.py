@@ -679,8 +679,13 @@ def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_pat
     assert grade_harbor([], dict(error=message)).exhausted is True
 
 
-@pytest.mark.parametrize("failed", [3, 4])
-def test_a_batch_with_no_successful_rollout_stops_the_run(tmp_path, monkeypatch, failed):
+@pytest.mark.parametrize(
+    ("failed", "outage_attempts", "raises"),
+    [(2, 0, False), (3, 1, False), (3, 9, True)],
+)
+def test_a_batch_where_every_rollout_errors_is_rerun_then_stops_the_run(
+    tmp_path, monkeypatch, failed, outage_attempts, raises
+):
     from arctic_platform.integrations.harness.generator import Grade
     from arctic_platform.integrations.harness.generator import HarnessGenerator
 
@@ -689,13 +694,16 @@ def test_a_batch_with_no_successful_rollout_stops_the_run(tmp_path, monkeypatch,
         "skyrl.train.generators.utils",
         SimpleNamespace(get_rollout_metrics=lambda *args, **kwargs: {}),
     )
+    submitted: list[str] = []
 
     class Adapter:
         def submit(self, request):
+            submitted.append(request.routing_key)
             return request.routing_key
 
         def get_status(self, rollout_id):
-            return "errored" if int(rollout_id[-1]) < failed else "completed"
+            in_outage = len(submitted) <= 4 * outage_attempts
+            return "errored" if in_outage or int(rollout_id[-1]) < failed else "completed"
 
         def collect_output(self, rollout_id):
             return dict(error="sandbox never started") if self.get_status(rollout_id) == "errored" else {}
@@ -709,6 +717,7 @@ def test_a_batch_with_no_successful_rollout_stops_the_run(tmp_path, monkeypatch,
         traj_dir=str(tmp_path),
         adapter=Adapter(),
         grader=lambda episodes, artifacts, request: Grade(reward=0.0, reward_detail=dict(reward=0.0)),
+        all_errored_wait_s=0,
     )
     trajectories = [SimpleNamespace(repetition_id=i, to_string=lambda i=i: f"t{i}") for i in range(4)]
     batch = dict(
@@ -716,12 +725,16 @@ def test_a_batch_with_no_successful_rollout_stops_the_run(tmp_path, monkeypatch,
         env_extras=[dict(instance_id="task")] * 4,
         trajectory_ids=trajectories,
     )
-    if failed == 4:
-        with pytest.raises(RuntimeError, match="(?s)Every train rollout at step 1 errored.*sandbox never started"):
+    saved = tmp_path / "step_1" / "train"
+    if raises:
+        with pytest.raises(RuntimeError, match="(?s)Every train rollout at step 1 errored in 4 attempts.*never started"):
             asyncio.run(generator.generate(batch))
+        assert len(submitted) == 16
+        assert len(list(saved.glob("*.error"))) == 4
     else:
         assert len(asyncio.run(generator.generate(batch))["rewards"]) == 4
-    assert len(list((tmp_path / "step_1" / "train").glob("*.error"))) == failed
+        assert len(submitted) == 4 * (outage_attempts + 1)
+        assert len(list(saved.glob("*.error"))) + len(list(saved.glob("*.json"))) == 4
 
 
 def test_file_editor_is_refused_because_it_bypasses_the_environment(monkeypatch):

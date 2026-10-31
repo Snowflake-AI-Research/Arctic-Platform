@@ -189,8 +189,9 @@ Leave the process up until the run finishes. The log is
 `~/checkpoints/qwen35-4b-openhands-localization`). Each rollout's conversation,
 reward, and submission are saved under `$CKPT_DIR/trajectories/step_<n>/`.
 A rollout that errored is saved as `<instance>_<n>.error` with its traceback. If
-every rollout of a step errors, the run stops with the first one instead of
-training on nothing.
+every rollout of a step errors, the step is rerun up to 3 times, after waits
+of 1, 2, and 4 minutes. If it still errors, the run stops with the first error
+instead of training on nothing.
 
 | Knob | Value |
 | --- | --- |

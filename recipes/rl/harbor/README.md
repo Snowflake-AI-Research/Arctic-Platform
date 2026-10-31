@@ -58,7 +58,7 @@ The agent itself runs on the driver, and only its commands go to the environment
 
 `HARBOR_ENV=host` runs tasks as subprocesses on the driver machine with no isolation. Task `RUN` lines, verifiers, and agent commands can read anything the driver's user can, so it is only for tasks you trust. It needs `HARBOR_ALLOW_HOST_EXEC=1`. Host commands get an allowlisted environment (`PATH`, locale, `TERM`, `TMPDIR`, plus any names in `HARBOR_HOST_ENV_PASSTHROUGH`), never the driver's `ARCTIC_*`, `WANDB_*`, or other credentials. All task paths are resolved and must stay inside the trial directory or the task's `environment/`.
 
-A rollout whose trial ends without a verifier result (the image can't be mirrored, the sandbox never comes up, the agent or the verifier crashes) is an error, not a reward of 0: it is saved as `$CKPT_DIR/trajectories/step_<n>/<phase>/<instance>_<n>.error` with Harbor's traceback and is masked out of the loss. If every rollout of a step errors, the run stops with the first error.
+A rollout whose trial ends without a verifier result (the image can't be mirrored, the sandbox never comes up, the agent or the verifier crashes) is an error, not a reward of 0: it is saved as `$CKPT_DIR/trajectories/step_<n>/<phase>/<instance>_<n>.error` with Harbor's traceback and is masked out of the loss. If every rollout of a step errors, the step is rerun up to 3 times, after waits of 1, 2, and 4 minutes, so a brief sandbox outage doesn't end the run. If it still errors, the run stops with the first error.
 
 ### 2. SWE-smith Code Localization via Harbor
 
