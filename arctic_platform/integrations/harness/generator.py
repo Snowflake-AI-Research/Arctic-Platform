@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,8 @@ from typing import Protocol
 
 from arctic_platform.integrations.harness.episodes import training_sequences
 from arctic_platform.integrations.harness.tokens import masked_row
+
+logger = logging.getLogger(__name__)
 
 _HIDDEN = {"prompt_token_ids", "response_token_ids", "token_ids"}
 _PRIVATE = {"messages", "error", "reward", "reward_detail"}
@@ -127,7 +130,12 @@ class HarnessGenerator:
         grader: Grader,
         error_detail: dict[str, Any] | None = None,
         step_wise: bool = False,
+        all_errored_retries: int = 3,
+        all_errored_wait_s: float = 60.0,
     ) -> None:
+        """``all_errored_retries``: how many times to rerun a batch in which every rollout errored, waiting
+        ``all_errored_wait_s`` and then twice as long each time, before raising. A sandbox service outage of a
+        few minutes then costs a few rollout rounds instead of the run."""
         self._tokenizer = tokenizer
         self._proxy = proxy
         self._traj_dir = traj_dir
@@ -135,6 +143,8 @@ class HarnessGenerator:
         self._grader = grader
         self._error_detail = dict(error_detail or dict(reward=0.0))
         self._step_wise = step_wise
+        self._all_errored_retries = int(all_errored_retries)
+        self._all_errored_wait_s = float(all_errored_wait_s)
 
     async def generate(self, input_batch: dict) -> dict:
         from skyrl.train.generators.utils import get_rollout_metrics
@@ -143,29 +153,51 @@ class HarnessGenerator:
         phase = metadata.training_phase
         if not isinstance(phase, str):
             phase = getattr(phase, "value", str(phase))
-        requests = []
-        for env_extra, trajectory in zip(input_batch["env_extras"], input_batch["trajectory_ids"]):
-            routing_key = f"step{metadata.global_step}-{phase}-{trajectory.to_string()}"
-            api_key = self._proxy.issue(routing_key)
-            requests.append(
-                RolloutRequest(
-                    env_extra=env_extra,
-                    trajectory_id=trajectory,
-                    routing_key=routing_key,
-                    base_url=self._proxy.url_for(routing_key),
-                    api_key=api_key,
-                    phase=phase,
-                    global_step=int(metadata.global_step),
+        for attempt in range(self._all_errored_retries + 1):
+            requests = []
+            for env_extra, trajectory in zip(input_batch["env_extras"], input_batch["trajectory_ids"]):
+                routing_key = f"step{metadata.global_step}-{phase}-{trajectory.to_string()}"
+                api_key = self._proxy.issue(routing_key)
+                requests.append(
+                    RolloutRequest(
+                        env_extra=env_extra,
+                        trajectory_id=trajectory,
+                        routing_key=routing_key,
+                        base_url=self._proxy.url_for(routing_key),
+                        api_key=api_key,
+                        phase=phase,
+                        global_step=int(metadata.global_step),
+                    )
                 )
+            finished = await asyncio.gather(*[self._finish(request) for request in requests])
+            errors = [artifacts.get("error") for _, artifacts, _ in finished]
+            if len(errors) == 0 or not all(errors) or attempt == self._all_errored_retries:
+                break
+            wait_s = self._all_errored_wait_s * 2**attempt
+            logger.warning(
+                "Every %s rollout at step %s errored (attempt %d of %d); rerunning the batch in %.0fs. "
+                "First error:\n%s",
+                phase,
+                metadata.global_step,
+                attempt + 1,
+                self._all_errored_retries + 1,
+                wait_s,
+                errors[0],
             )
-        finished = await asyncio.gather(*[self._finish(request) for request in requests])
+            await asyncio.sleep(wait_s)
+        for request, (_, artifacts, grade) in zip(requests, finished):
+            self._write_trajectory(metadata, phase, request, artifacts, grade)
+        if len(errors) > 0 and all(errors):
+            raise RuntimeError(
+                f"Every {phase} rollout at step {metadata.global_step} errored in "
+                f"{self._all_errored_retries + 1} attempts, so there is nothing to train on. First error:\n{errors[0]}"
+            )
         rows = []
         trajectory_ids = []
         is_last_step = []
         reward_details = []
-        for request, (rollout_rows, artifacts, grade) in zip(requests, finished):
+        for request, (rollout_rows, _, grade) in zip(requests, finished):
             reward_details.append(grade.reward_detail)
-            self._write_trajectory(metadata, phase, request, artifacts, grade)
             for index, row in enumerate(rollout_rows):
                 rows.append(row)
                 trajectory_ids.append(request.trajectory_id)

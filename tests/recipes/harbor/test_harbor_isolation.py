@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import signal
@@ -639,6 +640,105 @@ def test_agent_phase_commands_never_see_the_rollout_key(tmp_path, monkeypatch):
     assert _ForwardingAgent.seen == ["absent,absent"]
 
 
+class _UnstartableEnvironment(HostEnvironment):
+    async def start(self, force_build: bool) -> None:
+        raise RuntimeError("pushing image: unexpected status code 444")
+
+
+class _CrashingAgent(_ForwardingAgent):
+    async def run(self, instruction, environment, context) -> None:
+        await environment.exec("echo hello > /app/output.txt")
+        raise RuntimeError("agent crashed after writing its answer")
+
+
+@pytest.mark.parametrize(
+    ("agent", "env", "message"),
+    [
+        ("_ForwardingAgent", f"{__name__}:_UnstartableEnvironment", "status code 444"),
+        ("_CrashingAgent", "host", "agent crashed"),
+    ],
+)
+def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_path, monkeypatch, agent, env, message):
+    from arctic_platform.integrations.harbor.adapter import HarborTrialError
+    from arctic_platform.integrations.harbor.adapter import grade_harbor
+
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    with pytest.raises(HarborTrialError, match=message):
+        asyncio.run(
+            run_harbor_trial(
+                task_dir=_task(tmp_path),
+                trials_dir=tmp_path / "trials",
+                trial_name="trial",
+                agent=f"{__name__}:{agent}",
+                env=env,
+                model_name="openai/test-model",
+                base_url="http://127.0.0.1:1/v1",
+                api_key="k",
+            )
+        )
+    assert grade_harbor([], dict(error=message)).exhausted is True
+
+
+@pytest.mark.parametrize(
+    ("failed", "outage_attempts", "raises"),
+    [(2, 0, False), (3, 1, False), (3, 9, True)],
+)
+def test_a_batch_where_every_rollout_errors_is_rerun_then_stops_the_run(
+    tmp_path, monkeypatch, failed, outage_attempts, raises
+):
+    from arctic_platform.integrations.harness.generator import Grade
+    from arctic_platform.integrations.harness.generator import HarnessGenerator
+
+    monkeypatch.setitem(
+        sys.modules,
+        "skyrl.train.generators.utils",
+        SimpleNamespace(get_rollout_metrics=lambda *args, **kwargs: {}),
+    )
+    submitted: list[str] = []
+
+    class Adapter:
+        def submit(self, request):
+            submitted.append(request.routing_key)
+            return request.routing_key
+
+        def get_status(self, rollout_id):
+            in_outage = len(submitted) <= 4 * outage_attempts
+            return "errored" if in_outage or int(rollout_id[-1]) < failed else "completed"
+
+        def collect_output(self, rollout_id):
+            return dict(error="sandbox never started") if self.get_status(rollout_id) == "errored" else {}
+
+    proxy = SimpleNamespace(
+        issue=lambda key: "k", url_for=lambda key: "http://x/v1", episodes=lambda key: [], drop=lambda key: None
+    )
+    generator = HarnessGenerator(
+        tokenizer=SimpleNamespace(eos_token_id=0),
+        proxy=proxy,
+        traj_dir=str(tmp_path),
+        adapter=Adapter(),
+        grader=lambda episodes, artifacts, request: Grade(reward=0.0, reward_detail=dict(reward=0.0)),
+        all_errored_wait_s=0,
+    )
+    trajectories = [SimpleNamespace(repetition_id=i, to_string=lambda i=i: f"t{i}") for i in range(4)]
+    batch = dict(
+        batch_metadata=SimpleNamespace(training_phase="train", global_step=1),
+        env_extras=[dict(instance_id="task")] * 4,
+        trajectory_ids=trajectories,
+    )
+    saved = tmp_path / "step_1" / "train"
+    if raises:
+        with pytest.raises(
+            RuntimeError, match="(?s)Every train rollout at step 1 errored in 4 attempts.*never started"
+        ):
+            asyncio.run(generator.generate(batch))
+        assert len(submitted) == 16
+        assert len(list(saved.glob("*.error"))) == 4
+    else:
+        assert len(asyncio.run(generator.generate(batch))["rewards"]) == 4
+        assert len(submitted) == 4 * (outage_attempts + 1)
+        assert len(list(saved.glob("*.error"))) + len(list(saved.glob("*.json"))) == 4
+
+
 def test_file_editor_is_refused_because_it_bypasses_the_environment(monkeypatch):
     pytest.importorskip("openhands.sdk")
     from harbor_rl.agent import _build_openhands_tools
@@ -908,6 +1008,7 @@ def test_closing_the_adapter_cancels_rollouts_and_releases_shared_resources(tmp_
     rid = adapter.submit(_request(_task(tmp_path), "r0"))
     assert started.wait(5)
     loop_thread = adapter._loop_thread
+    gc.collect()
 
     adapter.close()
 
