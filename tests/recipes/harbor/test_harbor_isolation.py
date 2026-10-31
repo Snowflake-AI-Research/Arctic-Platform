@@ -1262,6 +1262,16 @@ def test_the_task_check_runs_the_first_task_and_stops_before_gpus_when_it_fails(
     assert "Traceback" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("value", "skipped"), [("", False), ("0", False), ("false", False), ("1", True), ("yes", True)]
+)
+def test_the_task_check_is_skipped_only_when_asked(monkeypatch, value, skipped):
+    from harbor_rl.check import task_check_skipped
+
+    monkeypatch.setenv("HARBOR_SKIP_TASK_CHECK", value)
+    assert task_check_skipped() is skipped
+
+
 def test_live_sandboxes_from_an_earlier_run_are_counted_and_warned_about(monkeypatch, capsys):
     pytest.importorskip("snowflake.sandbox")
     from harbor_rl.check import warn_live_sandboxes

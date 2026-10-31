@@ -22,6 +22,7 @@ as a step where every rollout errored.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import time
@@ -41,6 +42,10 @@ from arctic_platform.integrations.harbor.adapter import run_harbor_trial
 
 SKIP_CHECK_VAR = "HARBOR_SKIP_TASK_CHECK"
 SANDBOX_LIMIT = 100
+
+
+def task_check_skipped() -> bool:
+    return os.environ.get(SKIP_CHECK_VAR, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class CheckAgent(BaseAgent):

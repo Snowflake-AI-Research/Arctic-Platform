@@ -30,8 +30,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from harbor_rl.check import SKIP_CHECK_VAR
 from harbor_rl.check import check_first_task
+from harbor_rl.check import task_check_skipped
 from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
 from openhands_localization import reward as localization_reward_module
 from openhands_localization.config import validate_openhands_cfg
@@ -256,7 +256,7 @@ def main() -> None:
         cfg.trainer.arctic_rl = ArcticRLTrainerConfig()
     validate_openhands_cfg(cfg)
     validate_cfg(cfg)
-    if not os.environ.get(SKIP_CHECK_VAR):
+    if not task_check_skipped():
         check_first_task(
             cfg.data.train_data[0],
             env=resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV),
