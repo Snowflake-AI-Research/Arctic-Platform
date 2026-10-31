@@ -240,10 +240,12 @@ def _build_model_config(
         optimization_dtype=optimization_dtype,
         reduce_dtype=options.reduce_dtype,
         moe_use_grouped_mm=options.moe_use_grouped_mm,
+        moe_use_sonicmoe=options.moe_use_sonicmoe,
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
         fp32_parity=options.fp32_parity,
+        fp32_routed_weighting=getattr(options, "fp32_routed_weighting", False),
         debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 

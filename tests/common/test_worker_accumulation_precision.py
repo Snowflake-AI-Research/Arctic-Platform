@@ -42,14 +42,23 @@ def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job
 
 
 @pytest.mark.parametrize(
-    "data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}, {"other_setting": True}]
+    "data_types", [{"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32", "other_setting": True}]
 )
 def test_explicit_accumulation_precision_is_preserved(worker, data_types):
     supplied = deepcopy(data_types)
     config = {"data_types": supplied}
     worker.ds_training_config({}, config, {})
     assert config["data_types"] == data_types
-    assert config["data_types"] is supplied
+    assert supplied == data_types
+
+
+@pytest.mark.parametrize("data_types", [None, {}, {"other_setting": True}, {"grad_accum_dtype": None}])
+def test_supplied_block_without_accumulation_precision_gets_worker_fp32_default(worker, data_types):
+    supplied = deepcopy(data_types)
+    config = {"data_types": supplied}
+    worker.ds_training_config({}, config, {})
+    assert config["data_types"] == {**(data_types or {}), "grad_accum_dtype": "fp32"}
+    assert supplied == data_types
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
@@ -97,7 +106,7 @@ def test_deepspeed_resolves_explicit_float32_accumulation_without_changing_model
 
 @require_torch_gpu
 def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
-    """The retained worker default and explicit FP32 must produce identical training metrics."""
+    """The worker default, with or without a supplied ``data_types`` block, matches explicit FP32 exactly."""
     import deepspeed
     import torch.distributed as dist
 
@@ -113,7 +122,7 @@ def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
         )
     measurements = {}
     try:
-        for label in ("worker_default", "explicit_fp32"):
+        for label in ("worker_default", "block_without_dtype", "explicit_fp32"):
             set_seed(17)
             model = torch.nn.Linear(16, 8, bias=False, device="cuda", dtype=torch.bfloat16)
             config = dict(
@@ -126,6 +135,8 @@ def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
             )
             if label == "explicit_fp32":
                 config["data_types"] = dict(grad_accum_dtype="fp32")
+            elif label == "block_without_dtype":
+                config["data_types"] = {}
             worker.ds_training_config({"training_config": {"optimizer": {"torch_adam": True, "lr": 0.01}}}, config, {})
             engine, *_ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
             assert engine.get_data_types() == (torch.bfloat16, torch.float32)
@@ -154,7 +165,8 @@ def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
             del engine, model
         for metric in ("loss", "grad_norm"):
             assert torch.isfinite(measurements["worker_default"][metric]).all()
-            torch_assert_equal(measurements["worker_default"][metric], measurements["explicit_fp32"][metric])
+            for label in ("worker_default", "block_without_dtype"):
+                torch_assert_equal(measurements[label][metric], measurements["explicit_fp32"][metric])
     finally:
         if owns_group:
             dist.destroy_process_group()
