@@ -76,7 +76,7 @@ _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_NOT_FOUND_CODE = "517601"
-_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
+_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled", "terminated")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
