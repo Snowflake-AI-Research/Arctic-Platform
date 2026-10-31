@@ -85,6 +85,7 @@ try:
     from snowflake.sandbox.exceptions import SandboxNotFoundError
     from snowflake.sandbox.exceptions import SandboxRateLimitError
     from snowflake.sandbox.exceptions import SandboxTransportError
+    from snowflake.sandbox.exceptions import SandboxValidationError
 
     from arctic_platform.integrations.harbor.snowflake_sandbox.session import close_sessions
     from arctic_platform.integrations.harbor.snowflake_sandbox.session import get_config
@@ -105,6 +106,9 @@ except ImportError:  # pragma: no cover - exercised only without the SDK
     class SandboxRateLimitError(SandboxError):  # type: ignore[no-redef]
         retry_after: float | None = None
 
+    class SandboxValidationError(SandboxError):  # type: ignore[no-redef]
+        pass
+
     class SandboxExecError(Exception):  # type: ignore[no-redef]
         exit_code: int | None = None
 
@@ -124,6 +128,9 @@ _MEMORY_TIERS: tuple[tuple[int, MemoryTier], ...] = (
 )
 # Preview limit is 100 live sandboxes per owner; leave headroom for other work.
 _DEFAULT_MAX_LIVE = 90
+# The sandbox service recommends 8 to 16 creates in flight at once.
+_DEFAULT_MAX_CREATING = 16
+SANDBOX_NAME_PREFIX = "harbor-rl-"
 # The SDK's own default exec budget is 3600s; agent turns can run longer.
 _DEFAULT_EXEC_TIMEOUT_S = 7200
 # Extra stream budget beyond a command's own timeout, and re-attach attempts
@@ -147,8 +154,20 @@ _sweep_at_exit = False
 _LIVE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]] = (
     weakref.WeakKeyDictionary()
 )
+_CREATE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]] = (
+    weakref.WeakKeyDictionary()
+)
 _LIVE_SLOTS_GUARD = threading.Lock()
 _warned: set[str] = set()
+
+
+def _loop_semaphore(
+    slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]], size: int
+) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _LIVE_SLOTS_GUARD:
+        per_loop = slots.setdefault(loop, {})
+        return per_loop.setdefault(size, asyncio.Semaphore(size))
 
 # Sandbox root has no capabilities, so apt can't drop privileges to `_apt` or
 # write its `_apt`-owned partial dirs. Run apt as root with root-owned cache and
@@ -330,6 +349,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         egress_eai: str | list[str] | None = None,
         emulate_non_root_user: bool | str | None = None,
         max_live: int | str = _DEFAULT_MAX_LIVE,
+        max_creating: int | str = _DEFAULT_MAX_CREATING,
         exec_timeout_sec: int | str = _DEFAULT_EXEC_TIMEOUT_S,
         idle_suspend: str = "24h",
         run_entrypoint: bool | str = True,
@@ -354,6 +374,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 sandbox runtime supports ``setuid`` during startup and falls back
                 to setting ``HOME``/``USER``/``LOGNAME`` when ``setuid`` is blocked.
             max_live: Cap on concurrently live sandboxes in this process.
+            max_creating: Cap on sandbox creates in flight at once in this process.
             exec_timeout_sec: Exec budget when Harbor passes no timeout.
             idle_suspend: Sandbox idle-suspend timeout (platform default is 10m).
             run_entrypoint: Start the image ENTRYPOINT at startup, as Docker does.
@@ -389,6 +410,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             }
         self._can_switch_uid = True
         self._max_live = int(max_live)
+        self._max_creating = int(max_creating)
         self._exec_timeout_sec = int(exec_timeout_sec)
         self._idle_suspend = idle_suspend
         self._image_platform = image_platform
@@ -451,10 +473,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         return self._sandbox
 
     def _slots(self) -> asyncio.Semaphore:
-        loop = asyncio.get_running_loop()
-        with _LIVE_SLOTS_GUARD:
-            per_loop = _LIVE_SLOTS.setdefault(loop, {})
-            return per_loop.setdefault(self._max_live, asyncio.Semaphore(self._max_live))
+        return _loop_semaphore(_LIVE_SLOTS, self._max_live)
 
     def _egress(self) -> Egress:
         assert self.network_policy is not None
@@ -611,49 +630,55 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
             raise
 
     async def _create_sandbox(self, image: str, env: dict[str, str]) -> AsyncSandbox:
+        """Create the trial's sandbox, retrying rate limits, dropped requests, and an expired session.
+
+        Each attempt names its sandbox, so a sandbox that a failed create started anyway is found and terminated.
+        Only a create the service refused (rate limit, invalid request, expired session) skips that lookup.
+        """
         for attempt in range(_CREATE_ATTEMPTS):
             last = attempt == _CREATE_ATTEMPTS - 1
             config = await get_config(self._connection, self._role)
             token = config.resolve_pat()
-            name = f"harbor-rl-{uuid.uuid4().hex[:20]}"
+            name = f"{SANDBOX_NAME_PREFIX}{uuid.uuid4().hex[:20]}"
             try:
-                sandbox = await AsyncSandbox.create(
-                    image=image,
-                    name=name,
-                    connection=config,
-                    memory=memory_tier(self._effective_memory_mb),
-                    cpu=float(self._effective_cpus) if self._effective_cpus else None,
-                    env=env or None,
-                    egress=self._egress(),
-                    idle_suspend=self._idle_suspend,
-                    tags={
-                        "harbor_session": _sandbox_tag(self.session_id),
-                        "harbor_environment": _sandbox_tag(self.environment_name),
-                    },
-                )
+                async with _loop_semaphore(_CREATE_SLOTS, self._max_creating):
+                    sandbox = await AsyncSandbox.create(
+                        image=image,
+                        name=name,
+                        connection=config,
+                        memory=memory_tier(self._effective_memory_mb),
+                        cpu=float(self._effective_cpus) if self._effective_cpus else None,
+                        env=env or None,
+                        egress=self._egress(),
+                        idle_suspend=self._idle_suspend,
+                        tags={
+                            "harbor_session": _sandbox_tag(self.session_id),
+                            "harbor_environment": _sandbox_tag(self.environment_name),
+                        },
+                    )
+            except asyncio.CancelledError:
+                _track(name, self._connection, self._role)
+                raise
             except SandboxRateLimitError as e:
                 if last:
                     raise
                 wait = e.retry_after or _CREATE_BACKOFF_S * 2**attempt
                 logger.warning("Sandbox create was rate-limited (%s); retrying in %.0fs", e, wait)
-            except SandboxTransportError as e:
+            except SandboxValidationError:
+                raise
+            except SandboxError as e:
+                if is_expired_session(e) and not last:
+                    logger.warning("The Snowflake session expired during sandbox create; renewing it")
+                    await renew_config(self._connection, self._role, token)
+                    continue
                 await self._terminate_orphan(config, name)
-                if last:
+                if last or not isinstance(e, SandboxTransportError):
                     raise
                 wait = _CREATE_BACKOFF_S * 2**attempt
                 logger.warning("Sandbox create failed (%s); retrying in %.0fs", e, wait)
-            except SandboxError as e:
-                if last or not is_expired_session(e):
-                    raise
-                logger.warning("The Snowflake session expired during sandbox create; renewing it")
-                await renew_config(self._connection, self._role, token)
-                continue
             except Exception:
                 # A client-side failure (for example in the HTTP/2 stack) can come after the server started the sandbox.
                 await self._terminate_orphan(config, name)
-                raise
-            except asyncio.CancelledError:
-                _track(name, self._connection, self._role)
                 raise
             else:
                 _track(name, self._connection, self._role)
@@ -662,6 +687,7 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         raise AssertionError("unreachable")
 
     async def _terminate_orphan(self, config: Any, name: str) -> None:
+        """Terminate the sandbox a failed create may have started. One that isn't found is left to the sweep."""
         for delay in _ORPHAN_LOOKUP_DELAYS_S:
             await asyncio.sleep(delay)
             try:
@@ -673,10 +699,11 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 continue
             try:
                 await orphan.terminate()
+                return
             except Exception as e:  # noqa: BLE001
                 logger.error("Error terminating sandbox %s left by a failed create: %s", name, e)
-                _track(name, self._connection, self._role)
-            return
+                break
+        _track(name, self._connection, self._role)
 
     async def _replay(self, plan: ReplayPlan) -> None:
         for step in plan.steps:

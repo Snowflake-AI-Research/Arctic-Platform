@@ -560,7 +560,6 @@ def test_sandbox_create_survives_expiry_rate_limits_and_ambiguous_failures(tmp_p
     async def run() -> None:
         created = await env._create_sandbox("image", {})
         assert created.name == names[-1]
-        assert list(sf_env._LIVE_SANDBOXES) == [created.name]
         env._sandbox = created
         await env.stop(delete=True)
 
@@ -569,13 +568,16 @@ def test_sandbox_create_survives_expiry_rate_limits_and_ambiguous_failures(tmp_p
     assert len(set(names)) == len(names) == 5
     # The ReadError create had started a sandbox: it is found by name and terminated, then the run's own one.
     assert terminated == [names[2], names[4]]
-    assert sf_env._LIVE_SANDBOXES == {}
+    # The WriteError create's sandbox never showed up, so the exit sweep looks for it once more.
+    assert list(sf_env._LIVE_SANDBOXES) == [names[3]]
 
 
 def test_a_create_that_never_stops_failing_raises(tmp_path, monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from snowflake.sandbox.exceptions import SandboxError
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
     from snowflake.sandbox.exceptions import SandboxRateLimitError
+    from snowflake.sandbox.exceptions import SandboxValidationError
 
     from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
 
@@ -598,17 +600,88 @@ def test_a_create_that_never_stops_failing_raises(tmp_path, monkeypatch):
         asyncio.run(env._create_sandbox("image", {}))
     assert len(attempts) == sf_env._CREATE_ATTEMPTS
 
-    class NotFound(FakeAsyncSandbox):
+    looked_up: list[str] = []
+
+    class Failed(FakeAsyncSandbox):
         @staticmethod
         async def create(*, name, **kwargs):
             attempts.append(name)
-            raise SandboxError("image not found")
+            raise SandboxError("sandbox failed to start: image pull failed")
+
+        @staticmethod
+        async def connect(name, connection):
+            looked_up.append(name)
+            raise SandboxNotFoundError(name)
 
     attempts.clear()
-    monkeypatch.setattr(sf_env, "AsyncSandbox", NotFound)
-    with pytest.raises(SandboxError, match="image not found"):
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Failed)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0, 0.0))
+    with pytest.raises(SandboxError, match="image pull failed"):
         asyncio.run(env._create_sandbox("image", {}))
+    # Not retried. The sandbox may yet appear, so the exit sweep gets its name.
     assert len(attempts) == 1
+    assert looked_up == [attempts[0], attempts[0]]
+    assert list(sf_env._LIVE_SANDBOXES) == [attempts[0]]
+
+    class Invalid(Failed):
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxValidationError("image must not name a registry host")
+
+    attempts.clear()
+    looked_up.clear()
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Invalid)
+    with pytest.raises(SandboxValidationError):
+        asyncio.run(env._create_sandbox("docker.io/python:3.12", {}))
+    assert len(attempts) == 1
+    assert looked_up == []
+
+
+def test_only_a_reauth_response_code_counts_as_an_expired_session():
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox.session import is_expired_session
+
+    assert is_expired_session(
+        RuntimeError("create returned no container id: {'code': '390112', 'message': 'Your session has expired.'}")
+    )
+    assert is_expired_session(RuntimeError('got 401: {"code": "390114", "message": "expired"}'))
+    assert not is_expired_session(RuntimeError("create returned no container id: {'code': '390144'}"))
+    assert not is_expired_session(RuntimeError("sandbox harbor-rl-390112abc failed to start"))
+
+
+def test_sandbox_creates_in_flight_are_capped(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    in_flight = [0]
+    peak = [0]
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.01)
+            in_flight[0] -= 1
+            return SimpleNamespace(name=name)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "pat")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    envs = []
+    for _ in range(10):
+        env = _sandbox_env(tmp_path, sf_env)
+        env._max_creating = 3
+        envs.append(env)
+
+    async def run() -> list:
+        return await asyncio.gather(*(env._create_sandbox("image", {}) for env in envs))
+
+    assert len(asyncio.run(run())) == 10
+    assert peak[0] == 3
 
 
 def test_a_create_that_fails_in_the_client_terminates_the_sandbox_it_started(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 LOGIN_TIMEOUT_S = 300
 RENEW_AFTER_S = 20 * 60
+_RESPONSE_CODE = re.compile(r"""['"]code['"]\s*:\s*['"]?(\d+)""")
 
 _configs: dict[tuple[str | None, str | None], Config] = {}
 _renewed_at: dict[tuple[str | None, str | None], float] = {}
@@ -50,9 +52,12 @@ _locks_guard = threading.Lock()
 
 
 def is_expired_session(exc: BaseException) -> bool:
-    """Whether ``exc`` reports a Snowflake session token that needs renewing."""
-    text = str(exc)
-    return any(code in text for code in REAUTH_GS_CODES)
+    """Whether ``exc`` carries a response whose ``code`` says the session token needs renewing.
+
+    The SDK raises a plain ``SandboxError`` with the response payload in its message, for example
+    ``create returned no container id: {'code': '390112', 'message': 'Your session has expired. ...'}``.
+    """
+    return any(code in REAUTH_GS_CODES for code in _RESPONSE_CODE.findall(str(exc)))
 
 
 def _connect(connection: str | None, role: str | None) -> Config:
@@ -97,9 +102,7 @@ def _get_or_connect(connection: str | None, role: str | None, stale_pat: str | N
         config = _configs.get(key)
         if config is None:
             config = _connect(connection, role)
-        elif (stale_pat is not None and config.resolve_pat() == stale_pat) or time.monotonic() - _renewed_at.get(
-            key, 0.0
-        ) >= RENEW_AFTER_S:
+        elif _is_due(key) or (stale_pat is not None and config.resolve_pat() == stale_pat):
             config = _renew(config, connection, role)
         else:
             return config
@@ -108,11 +111,15 @@ def _get_or_connect(connection: str | None, role: str | None, stale_pat: str | N
         return config
 
 
+def _is_due(key: tuple[str | None, str | None]) -> bool:
+    return time.monotonic() - _renewed_at.get(key, 0.0) >= RENEW_AFTER_S
+
+
 async def get_config(connection: str | None, role: str | None) -> Config:
     """Return the shared sandbox ``Config`` backed by one live connector session."""
     key = (connection, role)
     cached = _configs.get(key)
-    if cached is not None and time.monotonic() - _renewed_at.get(key, 0.0) < RENEW_AFTER_S:
+    if cached is not None and not _is_due(key):
         return cached
     return await asyncio.to_thread(_get_or_connect, connection, role)
 
