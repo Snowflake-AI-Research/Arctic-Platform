@@ -70,6 +70,7 @@ from arctic_platform.integrations.harbor.snowflake_sandbox.images import ImageRe
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import close_registries
 from arctic_platform.integrations.harbor.snowflake_sandbox.images import get_registry
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import LOST_EXIT
+from arctic_platform.integrations.harbor.snowflake_sandbox.shell import LOST_MARKER
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import TIMED_OUT_MARKER
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import build_exec_argv
 from arctic_platform.integrations.harbor.snowflake_sandbox.shell import is_root
@@ -728,10 +729,11 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         stdout = ""
         stderr = ""
         exit_code = -1
+        lost = False
+        start_argv = argv
         for attempt in range(_MAX_REATTACH + 1):
             try:
                 stdout, stderr, exit_code = await self._read_exec_stream(sandbox, argv, budget)
-                break
             except (SandboxTransportError, SandboxExecError) as e:
                 if isinstance(e, SandboxExecError) and getattr(e, "exit_code", None) != -1:
                     raise
@@ -740,9 +742,17 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
                 logger.warning("Exec stream dropped (%s); re-attaching to %s", e, exec_id)
                 await asyncio.sleep(min(2**attempt, 10))
                 argv = build_exec_argv("", exec_id, reattach=True)
+                continue
+            lost = exit_code == LOST_EXIT and f"{LOST_MARKER} {exec_id}" in stderr
+            if lost and attempt < _MAX_REATTACH:
+                # The stream dropped before the command started. Its start script runs it at most once per exec id.
+                logger.warning("Exec %s never started; sending it again", exec_id)
+                argv = start_argv
+                continue
+            break
         self._finished_execs.append(exec_id)
 
-        if exit_code == LOST_EXIT and "harbor: lost track of exec" in stderr:
+        if lost:
             raise RuntimeError(f"Lost track of command after the exec stream dropped: {command[:200]}")
         if timeout_sec and exit_code in {124, 137} and f"{TIMED_OUT_MARKER} {exec_id}" in stderr:
             raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
