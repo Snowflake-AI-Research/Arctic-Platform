@@ -210,10 +210,12 @@ def check_harbor_env() -> None:
 
     env = resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV)
     kwargs = harbor_env_kwargs()
-    if env == SNOWFLAKE_HARBOR_ENV and not (kwargs.get("image_repo") or kwargs.get("prebuilt_image")):
+    if env == SNOWFLAKE_HARBOR_ENV and not any(kwargs.get(k) for k in ("image_repo", "prebuilt_image", "base_image")):
         raise SystemExit(
             "ERROR: HARBOR_ENV=snowflake needs somewhere to mirror task images. Set, for example,\n        "
-            ' HARBOR_ENV_KWARGS=\'{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}\''
+            ' HARBOR_ENV_KWARGS=\'{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}\'\n'
+            "       or, to replay task Dockerfiles on the sandbox catalog image without mirroring,\n        "
+            ' HARBOR_ENV_KWARGS=\'{"base_image": "sandbox-base", "connection": "MY_CONN"}\''
         )
     if env == HOST_HARBOR_ENV and not host_exec_allowed(kwargs.get("allow_host_exec")):
         raise SystemExit(

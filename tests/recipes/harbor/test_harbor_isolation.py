@@ -826,6 +826,77 @@ def test_a_sandbox_path_prebuilt_image_is_used_without_the_registry(tmp_path, mo
     assert (image, plan) == ("/db/schema/repo/image:tag", None)
 
 
+def test_a_base_image_needs_no_crane_or_image_repo(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from harbor_rl.entrypoint import check_harbor_env
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    monkeypatch.delenv("HARBOR_AGENT", raising=False)
+    monkeypatch.setenv("HARBOR_ENV", "snowflake")
+    monkeypatch.setattr(images.shutil, "which", lambda name: None)
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(base_image="sandbox-base")))
+    check_harbor_env()
+
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(connection="C")))
+    with pytest.raises(SystemExit, match="base_image"):
+        check_harbor_env()
+
+
+@pytest.mark.parametrize("image_repo", [None, "DB.SCHEMA.REPO"])
+def test_a_base_image_replaces_from_and_the_dockerfile_still_replays(tmp_path, monkeypatch, image_repo):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    def no_registry(*args, **kwargs):
+        raise AssertionError("a base_image must not touch the image registry")
+
+    monkeypatch.setattr(sf_env, "get_registry", no_registry)
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "environment" / "Dockerfile").write_text(
+        "FROM python:3.11-slim\nWORKDIR /app\nRUN git clone https://github.com/o/r.git /app/r\n"
+    )
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        base_image="sandbox-base",
+        image_repo=image_repo,
+    )
+    image, plan = asyncio.run(env._resolve_image(force_build=False))
+    assert image == "sandbox-base"
+    assert plan is not None
+    assert any("git clone https://github.com/o/r.git" in getattr(step, "command", "") for step in plan.steps)
+
+
+@pytest.mark.parametrize("has_git", [True, False])
+def test_swe_smith_tasks_install_git_only_where_it_is_missing(tmp_path, has_git):
+    import subprocess
+
+    from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
+
+    task = materialize_harbor_task_from_row(
+        dict(instance_id="o__r.abc1234", repo="o/r", base_commit="abc1234", problem_statement="p"), tmp_path / "t"
+    )
+    lines = (task / "environment" / "Dockerfile").read_text().splitlines()
+    git_step = next(line for line in lines if "apt-get" in line).removeprefix("RUN ")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "apt-calls"
+    stubs = dict(rm="exit 0", **{"apt-get": f'echo "$1" >> {calls}'})
+    if has_git:
+        stubs["git"] = "exit 0"
+    for name, body in stubs.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    shell = subprocess.run(["/bin/sh", "-c", git_step], env=dict(PATH=str(bin_dir)), check=False)
+    assert shell.returncode == 0
+    assert (calls.read_text().split() if calls.exists() else []) == ([] if has_git else ["update", "install"])
+
+
 @pytest.mark.parametrize("installed_agent", ["openhands-sdk", "mini-swe-agent", "claude-code"])
 def test_agents_installed_in_the_environment_are_refused(tmp_path, monkeypatch, installed_agent):
     from harbor_rl.entrypoint import check_harbor_env
