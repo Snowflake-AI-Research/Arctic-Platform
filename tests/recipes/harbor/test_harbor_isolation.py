@@ -1134,6 +1134,138 @@ def test_file_editor_is_refused_because_it_bypasses_the_environment(monkeypatch)
         _build_openhands_tools("harbor_finish", object())
 
 
+@pytest.mark.parametrize(("phase", "hosted", "temperature"), [("train", False, 1.0), ("eval", False, 0.6), (None, True, 0.6)])
+def test_only_harbor_run_uses_the_hosted_endpoint_llm(tmp_path, monkeypatch, phase, hosted, temperature):
+    sdk = pytest.importorskip("openhands.sdk")
+    from harbor_rl import agent as agent_mod
+
+    seen: dict = {}
+
+    class Built(Exception):
+        pass
+
+    def fake_llm(cls_name):
+        def build(**kwargs):
+            seen.update(kwargs, cls=cls_name)
+            raise Built
+
+        return build
+
+    monkeypatch.setattr(sdk, "LLM", fake_llm("LLM"))
+    monkeypatch.setattr(agent_mod, "_hosted_endpoint_llm", lambda: fake_llm("hosted"))
+    with pytest.raises(Built):
+        agent_mod._converse(
+            instruction="fix it",
+            working_dir="/w",
+            terminal=object(),
+            logs_dir=tmp_path,
+            model_name="m",
+            base_url="http://deployment/v1",
+            api_key="k",
+            max_turns=2,
+            training_phase=phase,
+            is_localization=False,
+            instance={},
+            skill_paths=[],
+            stop=agent_mod.ConversationStop(),
+        )
+    assert seen["cls"] == ("hosted" if hosted else "LLM")
+    assert ("litellm_extra_body" in seen) is not hosted
+    assert seen["temperature"] == temperature
+
+
+def test_tool_schemas_are_created_while_the_conversation_is_built(tmp_path):
+    pytest.importorskip("openhands.sdk")
+    from harbor_rl import agent as agent_mod
+    from harbor_rl.terminal import HarborTerminalExecutor
+    from openhands.sdk.tool.tool import _action_types_with_risk
+
+    stop = agent_mod.ConversationStop()
+    stop.stopped.set()  # build the conversation, never call the LLM
+    loop = asyncio.new_event_loop()
+    try:
+        agent_mod._run_openhands_sync(
+            terminal_executor=HarborTerminalExecutor(object(), loop, "/w", stopped=stop.stopped),
+            instruction="fix it",
+            working_dir="/w",
+            logs_dir=tmp_path,
+            model_name="m",
+            base_url="http://127.0.0.1:9/v1",
+            api_key="k",
+            max_turns=2,
+            training_phase="train",
+            is_localization=False,
+            instance={},
+            skill_paths=[],
+            stop=stop,
+        )
+    finally:
+        loop.close()
+    assert {"TerminalAction", "HarborFinishAction"} <= {t.__name__ for t in _action_types_with_risk}
+
+
+def test_the_hosted_endpoint_llm_sends_only_standard_message_fields():
+    pytest.importorskip("openhands.sdk")
+    from harbor_rl.agent import _hosted_endpoint_llm
+    from openhands.sdk import Message
+    from openhands.sdk import TextContent
+
+    from openhands.sdk.llm import MessageToolCall
+
+    def call(call_id: str, arguments: str) -> MessageToolCall:
+        return MessageToolCall(id=call_id, name="think", arguments=arguments, origin="completion")
+
+    llm = _hosted_endpoint_llm()(usage_id="agent", model="openai/m", base_url="http://deployment/v1", api_key="k")
+    system, assistant, tool = llm.format_messages_for_llm(
+        [
+            Message(role="system", content=[TextContent(text="be brief")]),
+            Message(
+                role="assistant",
+                content=[TextContent(text="")],
+                tool_calls=[call("call-1", '{"thought": "ok"}'), call("call-2", '{"thought": "cut off')],
+            ),
+            Message(role="tool", content=[TextContent(text="ok")], tool_call_id="call-1", name="think"),
+        ]
+    )
+    assert system["content"] == "be brief"
+    assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == ['{"thought": "ok"}', "{}"]
+    assert tool["content"] == "ok"
+    assert tool["tool_call_id"] == "call-1"
+    assert "name" not in tool
+
+
+@pytest.mark.parametrize(
+    ("localization", "instance", "expected"),
+    [(None, {}, False), (None, {"file_changes": []}, True), (True, {}, True), (False, {"file_changes": []}, False)],
+)
+def test_harbor_run_can_ask_for_the_localization_mode(tmp_path, monkeypatch, localization, instance, expected):
+    pytest.importorskip("openhands.sdk")
+    from harbor_rl import agent as agent_mod
+
+    seen: dict = {}
+
+    def fake_run(**kwargs):
+        seen.update(kwargs)
+        return [], ([{"file": "a.py"}] if kwargs["is_localization"] else None), 1
+
+    monkeypatch.setattr(agent_mod, "_run_openhands_sync", fake_run)
+
+    class FakeEnvironment:
+        uploads: list[str] = []
+
+        async def exec(self, command, cwd=None, timeout_sec=None):
+            return ExecResult(stdout="/w\n", stderr="", return_code=0)
+
+        async def upload_file(self, source_path, target_path):
+            self.uploads.append(target_path)
+
+    env = FakeEnvironment()
+    agent = agent_mod.OpenHandsHarborAgent(logs_dir=tmp_path, model_name="m", localization=localization, instance=instance)
+    asyncio.run(agent.run("fix it", env, None))
+    assert seen["is_localization"] is expected
+    assert ("/logs/agent/localization_submission.json" in env.uploads) is expected
+
+
 def test_terminal_executor_tracks_cwd_and_reports_timeouts():
     pytest.importorskip("openhands.sdk")
     from harbor_rl.terminal import HarborTerminalExecutor
