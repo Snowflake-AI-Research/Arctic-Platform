@@ -54,8 +54,25 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
+class Qwen4ExpOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for Qwen3.8-Flash-Next: the flash MoE options and its n-gram table's placement."""
+
+    ngram_table_on_host: bool | None = Field(
+        None,
+        description=(
+            "Keep this GPU's shard of the frozen n-gram embedding table in pinned host memory and gather the rows "
+            "each lookup needs over PCIe, freeing its GPU memory (12.8 GB at EP8) for activations. Unset: "
+            "ARL_NGRAM_TABLE_ON_HOST."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
+
+
+class _Qwen4ExpLoadOptions(_FlashLoadOptions):
+    ngram_table_on_host: bool | None = None
 
 
 def _matches(model_type: str):
@@ -135,13 +152,15 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
         )
 
 
-def _load(ctx: LoaderContext, load_model) -> LoadedModel:
+def _load(
+    ctx: LoaderContext, load_model, options_model: type[Qwen3_5MoeOptions] = _FlashLoadOptions
+) -> LoadedModel:
     groups = ctx.parallel_groups or {}
     if groups.get("ep_group") is None:
         raise ValueError("flash MoE requires parallel_groups['ep_group'] from the runtime")
     if ctx.spec.parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
         raise ValueError("flash MoE requires parallel_groups['sp_group'] when sequence_parallel > 1")
-    options = _FlashLoadOptions.model_validate(ctx.spec.loader_options)
+    options = options_model.model_validate(ctx.spec.loader_options)
     assert ctx.spec.attn_implementation is not None
     model = load_model(
         model_name=ctx.spec.model_path_or_name,
@@ -171,10 +190,10 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
 @register_loader(
     "qwen4_exp",
     matches=_matches("qwen4_exp"),
-    options=FlashMoeOptions,
+    options=Qwen4ExpOptions,
     validate_spec=_validate_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model
 
-    return _load(ctx, load_qwen4_exp_model)
+    return _load(ctx, load_qwen4_exp_model, _Qwen4ExpLoadOptions)

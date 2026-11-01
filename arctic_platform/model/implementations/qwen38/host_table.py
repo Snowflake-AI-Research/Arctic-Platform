@@ -32,8 +32,19 @@ import triton.language as tl
 
 HOST_TABLE_ENV = "ARL_NGRAM_TABLE_ON_HOST"
 
+# The job's ``loader_options.ngram_table_on_host`` (the qwen4_exp loader); None leaves ARL_NGRAM_TABLE_ON_HOST in charge.
+_configured: bool | None = None
+
+
+def configure(enabled: bool | None) -> None:
+    """Set this process's choice from the job's loader options; None keeps ``ARL_NGRAM_TABLE_ON_HOST``."""
+    global _configured
+    _configured = enabled
+
 
 def host_table_enabled() -> bool:
+    if _configured is not None:
+        return _configured
     return os.environ.get(HOST_TABLE_ENV, "0") == "1"
 
 
