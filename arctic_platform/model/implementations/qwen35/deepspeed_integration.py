@@ -138,6 +138,8 @@ def _build_iter_full_vllm_weights(model: nn.Module):
     import torch
     import torch.distributed as dist
 
+    from arctic_platform.model.implementations.moe.expert_placement import cat_expert_shards
+
     is_vlm = bool(getattr(model, "_is_vlm", False))
     layer_prefix_pattern = "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
 
@@ -183,7 +185,7 @@ def _build_iter_full_vllm_weights(model: nn.Module):
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_pg))]
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
-                        layer_sd[name] = torch.cat(shards, dim=0)
+                        layer_sd[name] = cat_expert_shards(param, shards)
                 elif is_master:
                     layer_sd[name] = param.data
 

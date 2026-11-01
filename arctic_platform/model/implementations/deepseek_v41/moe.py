@@ -119,6 +119,7 @@ class DeepseekV41MoE(MoE):
             )
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
+        selected, num_tokens_per_expert = self._to_expert_slots(selected, num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend) and getattr(self.experts, "_ep_group", None) is not None:
             plan = self._expert_replica_plan(num_tokens_per_expert, selected)
