@@ -47,6 +47,8 @@ Each rollout runs in its own sandbox (`HARBOR_ENV=snowflake`, the default). `HAR
 - `base_image`: the image each task's `environment/Dockerfile` is replayed on, in place of its `FROM` image. The sandbox catalog image `sandbox-base` is Chainguard Linux with Python 3.11, pip, git, and `apk`, but no `apt-get`, so the Dockerfile's steps must work there. Replay handles one `FROM` stage with `RUN`, `COPY` and `ADD` of local files, `ENV`, `ARG`, `WORKDIR`, `USER`, and `ENTRYPOINT`. It refuses `RUN` flags, `COPY --from`, `ADD` from a URL or of an archive, and `SHELL`, and docker-compose tasks aren't supported.
 - `egress_eai`: a comma-separated list of external access integrations the sandboxes may use. Without one, sandboxes reach Snowflake and public package registries but not GitHub or other hosts.
 
+A run makes one pass over the training tasks, so it trains for at most (number of tasks) / `BATCH_SIZE` steps, whatever `trainer.max_training_steps` says, and then ends with `Training done!`: 100 tasks at the default 8 per step give 12 steps. Append `trainer.epochs=N` to pass over them `N` times.
+
 To stop a run, press Ctrl-C or send the launcher `SIGTERM`. The driver cancels its Cortex jobs at once, then takes up to 2 minutes to stop the rollouts in flight and terminate their sandboxes. A driver killed with `kill -9` can't cancel them: they keep their GPUs until the server reclaims them after 30 idle minutes, unless you cancel them first with `cortex-training cancel`.
 
 Before it provisions any GPUs, the launcher runs the first training task once with an agent that does nothing: the sandbox starts, the Dockerfile replays, a command runs, and the verifier grades the result. If any of that fails, the launcher exits with the cause. For example, a SWE-smith task without GitHub egress fails within seconds with `GitHub egress is not configured for this sandbox`. Set `HARBOR_SKIP_TASK_CHECK=1` to skip this check.
@@ -120,7 +122,7 @@ export ARCTIC_CORTEX_JOB_COMMENT="<your name> harbor localization"
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
 ```
 
-Each task clones its repository from GitHub inside the sandbox, so `egress_eai` must name an external access integration that allows `github.com`; your account administrator creates it. A 25-step run of this example on Snowflake sandboxes averaged a reward of `0.59` over steps 1–10, `1.81` over steps 11–20, and `2.39` over steps 21–25, with a best step of `2.54` (the maximum is `3.0`).
+Each task clones its repository from GitHub inside the sandbox, so `egress_eai` must name an external access integration that allows `github.com`; your account administrator creates it. The export writes 800 training tasks, enough for the 100 steps. A 25-step run of this example on Snowflake sandboxes averaged a reward of `0.59` over steps 1–10, `1.81` over steps 11–20, and `2.39` over steps 21–25, with a best step of `2.54` (the maximum is `3.0`). A 32-step run on the first 256 tasks, with `trainer.eval_before_train=true trainer.eval_interval=10`, averaged `0.74`, `1.77`, and `2.14` over steps 1–10, 11–20, and 21–30, and its eval score rose from `0.47` before training to `1.09`, `1.88`, `1.60`, and `2.04` after steps 10, 20, 30, and 32; 2,047 of 2,048 training rollouts were graded.
 
 ## Two Ways to Customize Your Training Run
 
