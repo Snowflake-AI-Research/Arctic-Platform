@@ -151,6 +151,15 @@ class ZorroTrainPatch(BaseModel):
     logits_compute_in_fp32: bool = Field(False, description="Compute logits in fp32.")
 
 
+def require_zorro_train_parallelism(*, expert_parallel: int, sequence_parallel: int) -> None:
+    """ZoRRo Train runs one expert-parallel rank and one sequence-parallel rank."""
+    if int(expert_parallel) > 1 or int(sequence_parallel) > 1:
+        raise ValueError(
+            "ZoRRo Train requires expert-parallel and sequence-parallel degree 1; "
+            f"got ep_size={expert_parallel} sp_size={sequence_parallel}"
+        )
+
+
 class CompilePatch(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -250,6 +259,11 @@ class ModelSpec(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_loader(self) -> Self:
+        if self.patches.zorro_train is not None:
+            require_zorro_train_parallelism(
+                expert_parallel=self.parallelism.expert_parallel,
+                sequence_parallel=self.parallelism.sequence_parallel,
+            )
         from arctic_platform.model.loader import get_loader_options_model
         from arctic_platform.model.loader import is_registered_loader
         from arctic_platform.model.loader import resolve_loader_name
