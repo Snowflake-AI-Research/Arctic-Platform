@@ -1308,6 +1308,7 @@ def _collect_graph_entries(worker=None):
     diag = {"n_wrappers": 0, "n_entries": 0, "n_managers": 0, "err": None,
             "n_entries_without_graph": 0, "n_wrapper_graphs": 0,
             "n_manager_graphs": 0, "n_gc_fallback_graphs": 0,
+            "gc_scanned": False,
             "complete": False, "incomplete_why": None}
     try:
         import torch
@@ -1390,6 +1391,9 @@ def _collect_graph_entries(worker=None):
                                           f"gc fallback failed: "
                                           f"{type(ex).__name__}: {ex}")
             else:
+                # A clean scan of the whole heap: an empty result after this
+                # is the absence of graphs (eager), not a blind spot.
+                diag["gc_scanned"] = True
                 diag["n_gc_fallback_graphs"] = len(entries) - n_before
                 if entries:
                     diag["complete"], diag["incomplete_why"] = True, None
