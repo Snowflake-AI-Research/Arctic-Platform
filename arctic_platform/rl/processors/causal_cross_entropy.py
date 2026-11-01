@@ -164,7 +164,15 @@ def _causal_cross_entropy_packed_reduction(
             raise ValueError(
                 f"causal_cross_entropy packed microbatch {index} requires tensor input_ids for preflight validation"
             )
-        loss_weights = _validate_context_weights(microbatch, reference)
+        context = microbatch
+        if microbatch.get("cu_seqlens") is not None:
+            reference = _packed_singleton_to_1d(reference)
+            context = {
+                **microbatch,
+                "loss_mask": _packed_singleton_to_1d(microbatch.get("loss_mask")),
+                "labels": _packed_singleton_to_1d(microbatch.get("labels")),
+            }
+        loss_weights = _validate_context_weights(context, reference)
         weights.append(float(loss_weights.sum(dtype=torch.float32).item()))
 
     first = microbatches[0] if microbatches else {}

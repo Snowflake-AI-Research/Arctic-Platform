@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phase A gates: registry hygiene, packed apply, metric pairing, zone names."""
+"""Phase A gates: registry hygiene, packed reduction across GAS calls, metric pairing, zone names."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import torch
 import arctic_platform.rl.processors  # noqa: F401
 import arctic_platform.sft.processor  # noqa: F401
 from arctic_platform.common.registry import DECLARED_SUMMED_METRICS
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
@@ -62,8 +63,20 @@ from arctic_platform.rl.processors.packed_reduction import combine_packed_metric
 from arctic_platform.rl.processors.packed_reduction import metric_is_summed
 from arctic_platform.rl.processors.packed_reduction import resolve_packed_loss_reduction
 from arctic_platform.rl.processors.pipeline import metric_is_summed as pipeline_metric_is_summed
-from arctic_platform.rl.processors.pipeline import run_pipeline
 from arctic_platform.testing_utils import TestCasePlus
+
+
+def _native_worker(engine):
+    from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+
+    worker = object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
+    worker.rank = 0
+    worker.world_size = 1
+    worker.sp_size = 1
+    worker.engine = engine
+    worker._device = torch.device("cpu")
+    worker.cpu_device = torch.device("cpu")
+    return worker
 
 
 class TestA1RegistryHygiene(TestCasePlus):
@@ -274,50 +287,25 @@ class TestA3PackedApply(TestCasePlus):
         self.assertAlmostEqual(combine_packed_losses([0.2, 0.4], additive), 0.6)
         self.assertAlmostEqual(combine_packed_losses([0.2, 0.4], local), 0.25)
 
-    def test_packing_preflight_before_forward(self):
+    def test_unpacked_gas_preflight_before_forward(self):
         class Engine:
             def __call__(self, *args, **kwargs):
                 raise AssertionError("invalid later microbatch must fail before forward")
 
         with self.assertRaises(ValueError):
-            run_pipeline(
+            run_unpacked_gas(
                 Engine(),
-                (),
-                {
+                gas=2,
+                batch_data={
                     "input_ids": torch.tensor([[1, 2], [3, 4]]),
                     "attention_mask": torch.ones(2, 2, dtype=torch.long),
+                    "loss_mask": torch.tensor([[1.0, 0.0], [float("nan"), 0.0]]),
                 },
-                {"loss_mask": torch.tensor([[1.0, 0.0], [float("nan"), 0.0]])},
-                {"loss_fn": "causal_cross_entropy", "post": [], "config": {}},
-                "cpu",
-                max_tokens_per_mb=2,
+                meta_data={"pad_token_id": 0},
+                processing={"loss_fn": "causal_cross_entropy", "post": [], "config": {}},
+                device="cpu",
+                step_fn=lambda: None,
             )
-
-    def test_missing_packed_metadata_rejects_multiple_microbatches(self):
-        @register_loss_fn("_phase_a_no_packed")
-        def _no_packed(model_outputs, batch, meta, config, device):
-            return model_outputs["logprobs"].sum(), {}
-
-        class Engine:
-            def __call__(self, *args, **kwargs):
-                raise AssertionError("missing reduction metadata must fail before forward")
-
-        try:
-            with self.assertRaises(ValueError):
-                run_pipeline(
-                    Engine(),
-                    (),
-                    {
-                        "input_ids": torch.tensor([[1, 2], [3, 4]]),
-                        "attention_mask": torch.ones(2, 2, dtype=torch.long),
-                    },
-                    {},
-                    {"loss_fn": "_phase_a_no_packed", "config": {}},
-                    "cpu",
-                    max_tokens_per_mb=2,
-                )
-        finally:
-            LOSS_FNS.pop("_phase_a_no_packed", None)
 
 
 class TestA4Metrics(TestCasePlus):
@@ -743,7 +731,7 @@ class TestA5Compat(TestCasePlus):
         )
         self.assertAlmostEqual(loss.item(), 5.0 / 3.0)
 
-    def test_packing_honors_cce_and_filters_engine(self):
+    def test_unpacked_gas_honors_cce_and_filters_engine(self):
         class Engine:
             def __init__(self):
                 self.last_kwargs = None
@@ -778,49 +766,44 @@ class TestA5Compat(TestCasePlus):
             "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
             "loss_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0]]),
         }
-        out = run_pipeline(
+        out = run_unpacked_gas(
             engine,
-            (),
-            batch,
-            {"pad_token_id": 0},
-            {"loss_fn": "causal_cross_entropy", "post": [], "config": {}},
-            "cpu",
+            gas=2,
+            batch_data=batch,
+            meta_data={"pad_token_id": 0, "drop_position_ids": True},
+            processing={"loss_fn": "causal_cross_entropy", "post": [], "config": {}},
             backward=True,
-            pack=True,
-            max_tokens_per_mb=3,
+            device="cpu",
+            step_fn=lambda: None,
         )
         self.assertIn("avg_loss", out)
         self.assertTrue(all(scale is False for scale in engine.backward_scale))
         self.assertNotIn("loss_mask", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
 
-    def test_ratio_m2_rejects_split_packing_before_forward(self):
+    def test_native_worker_rejects_split_ratio_m2_before_forward(self):
         class Engine:
-            def __init__(self):
-                self.global_rank = 0
+            global_rank = 0
+
+            def gradient_accumulation_steps(self):
+                return 2
 
             def __call__(self, *args, **kwargs):
                 raise AssertionError("split ratio_m2_threshold request must fail before forward")
 
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
-            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
-            "advantages": torch.ones(2, 4),
-            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
-            "old_log_probs_shifted": torch.zeros(2, 4),
+        request = {
+            "batch": {
+                "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+                "advantages": torch.ones(2, 4),
+                "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+                "old_log_probs_shifted": torch.zeros(2, 4),
+            },
+            "meta": {"pad_token_id": 0},
+            "processing": {"loss_fn": "ap_grpo", "post": [], "config": {"ratio_m2_threshold": 0.1}},
         }
         with self.assertRaisesRegex(ValueError, "requires exactly one synchronized model call"):
-            run_pipeline(
-                Engine(),
-                (),
-                batch,
-                {"pad_token_id": 0},
-                {"loss_fn": "ap_grpo", "post": [], "config": {"ratio_m2_threshold": 0.1}},
-                "cpu",
-                backward=True,
-                pack=True,
-                max_tokens_per_mb=3,
-            )
+            _native_worker(Engine()).forward_backward(request)
 
     def test_cce_packed_resolve_accepts_global_batch_size(self):
         mb0 = {
@@ -837,7 +820,20 @@ class TestA5Compat(TestCasePlus):
         )
         self.assertTrue(reduction.loss_is_additive)
 
-    def _cce_pack_engine(self):
+    def test_cce_packed_resolve_accepts_flat_context_for_singleton_batch(self):
+        reduction = resolve_packed_loss_reduction(
+            {"loss_fn": "causal_cross_entropy", "config": {}},
+            [
+                {
+                    "input_ids": torch.ones(1, 2, dtype=torch.long),
+                    "loss_mask": torch.tensor([0.5, 1.0]),
+                    "cu_seqlens": torch.tensor([0, 2]),
+                }
+            ],
+        )
+        self.assertEqual(reduction.loss_scales, (1.0,))
+
+    def _cce_engine(self):
         class Engine:
             def __init__(self):
                 self.last_kwargs = None
@@ -874,15 +870,30 @@ class TestA5Compat(TestCasePlus):
             "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
             "loss_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0]]),
         }
-        meta = {"pad_token_id": 0, "batch_num_tokens": 5.0, "dp_size": 2, "global_batch_size": 2}
+        meta = {
+            "pad_token_id": 0,
+            "drop_position_ids": True,
+            "batch_num_tokens": 5.0,
+            "dp_size": 2,
+            "global_batch_size": 2,
+        }
         processing = {"loss_fn": "causal_cross_entropy", "post": [], "config": {}}
-        one = run_pipeline(
-            self._cce_pack_engine(), (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=16
-        )
-        split_engine = self._cce_pack_engine()
-        two = run_pipeline(
-            split_engine, (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=3
-        )
+
+        def run(engine, gas):
+            return run_unpacked_gas(
+                engine,
+                gas=gas,
+                batch_data=batch,
+                meta_data=meta,
+                processing=processing,
+                backward=True,
+                device="cpu",
+                step_fn=lambda: None,
+            )
+
+        one = run(self._cce_engine(), 1)
+        split_engine = self._cce_engine()
+        two = run(split_engine, 2)
         self.assertGreater(len(split_engine.backward_losses), 1)
         self.assertAlmostEqual(one["avg_loss"], two["avg_loss"], places=5)
         self.assertTrue(all(scale is False for _, scale in split_engine.backward_losses))

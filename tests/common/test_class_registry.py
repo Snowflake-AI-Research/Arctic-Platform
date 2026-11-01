@@ -383,6 +383,7 @@ def test_pipeline_invokes_class_callbacks_in_execution_order():
             return {
                 "logits": torch.ones(1, 2, 3),
                 "objective_output": torch.ones(1, requires_grad=True),
+                "loss": torch.ones((), requires_grad=True),
             }
 
         def backward(self, loss, scale_wrt_gas=False):
@@ -397,7 +398,6 @@ def test_pipeline_invokes_class_callbacks_in_execution_order():
         {"loss_fn": "_ordered_callbacks", "post": [], "config": {}},
         "cpu",
         backward=True,
-        pack=False,
     )
 
     assert events == [
@@ -411,7 +411,8 @@ def test_pipeline_invokes_class_callbacks_in_execution_order():
     assert result == {"batch": {}, "metrics": {}, "avg_loss": 1.0}
 
 
-def test_packed_pipeline_reuses_one_stateful_loss_for_reduction_and_callbacks():
+def test_unpacked_gas_reuses_one_stateful_loss_for_reduction_and_callbacks():
+    from arctic_platform.common.unpacked_gas import run_unpacked_gas
     from arctic_platform.rl.processors.packed_reduction import local_mean_packed_loss_reduction
 
     events = []
@@ -453,12 +454,13 @@ def test_packed_pipeline_reuses_one_stateful_loss_for_reduction_and_callbacks():
 
     class Engine:
         global_rank = 0
+        micro_steps = 0
 
         def __init__(self):
             self.parameter = torch.tensor(-2.0, requires_grad=True)
 
-        def set_gradient_accumulation_boundary(self, _boundary):
-            pass
+        def gradient_accumulation_steps(self):
+            return 2
 
         def train(self):
             pass
@@ -473,20 +475,20 @@ def test_packed_pipeline_reuses_one_stateful_loss_for_reduction_and_callbacks():
             loss.backward()
 
     engine = Engine()
-    result = run_pipeline(
+    result = run_unpacked_gas(
         engine,
-        (),
-        {
+        gas=2,
+        batch_data={
             "input_ids": torch.tensor([[1, 2], [3, 4]]),
             "attention_mask": torch.ones(2, 2, dtype=torch.long),
+            "position_ids": torch.arange(2).repeat(2, 1),
             "loss_mask": torch.ones(2, 2),
         },
-        {"pad_token_id": 0},
-        {"loss_fn": StatefulPackedLoss.name, "post": [], "config": {}},
-        "cpu",
+        meta_data={"pad_token_id": 0},
+        processing={"loss_fn": StatefulPackedLoss.name, "post": [], "config": {}},
         backward=True,
-        pack=True,
-        max_tokens_per_mb=2,
+        device="cpu",
+        step_fn=lambda: None,
     )
 
     assert len(instances) == 1
