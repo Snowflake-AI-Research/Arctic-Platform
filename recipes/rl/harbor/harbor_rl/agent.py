@@ -23,6 +23,9 @@ Supports both:
 Also loads any OpenHands ``SKILL.md`` files passed via ``HARBOR_SKILL`` or
 Harbor's ``--skill`` flag.
 
+Training picks the localization mode from the dataset row's ground truth. With
+``harbor run``, which passes no row, set it with ``--ak localization=true``.
+
 The ``terminal`` tool runs every command through the trial's Harbor
 environment (:mod:`harbor_rl.terminal`), so the agent works in the same
 filesystem the verifier grades, whichever backend ``HARBOR_ENV`` selects.
@@ -38,6 +41,7 @@ import json
 import os
 import threading
 import warnings
+from collections.abc import Callable
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -51,18 +55,35 @@ try:
 except ImportError:
     AgentCapabilities = None  # type: ignore[assignment,misc]
 
-_FINISH_LOCK = threading.Lock()
+# The pinned OpenHands SDK has no lock around its pydantic classes. Defining a subclass
+# marks every SDK model for a rebuild, and the next model built in any thread runs it;
+# a conversation being built meanwhile in another thread can come out without its
+# fields ("'ConversationState' object has no attribute 'security_analyzer'"). Two
+# definitions of one class leave a duplicate that fails every later conversation in the
+# process ("Duplicate kind detected"). So classes are defined, conversations are built,
+# and the pending rebuild runs, all under this lock: once the first conversations are
+# set up, the running ones never trigger a rebuild.
+_SDK_SETUP_LOCK = threading.Lock()
 _REGISTERED_TOOLS: set[str] = set()
 
 
-def _ensure_tool_registered(name: str, tool_cls: Any) -> None:
+def _settle_sdk_classes() -> None:
+    """Run the rebuild that defining SDK classes left pending. Call with ``_SDK_SETUP_LOCK`` held."""
+    from openhands.sdk.utils.models import _rebuild_if_required
+
+    _rebuild_if_required()
+
+
+def _ensure_tool_registered(name: str, build: Callable[[], Any]) -> None:
+    """Register the tool class ``build()`` returns, building it only on the first call."""
     from openhands.sdk.tool import register_tool
 
-    with _FINISH_LOCK:
+    with _SDK_SETUP_LOCK:
         if name in _REGISTERED_TOOLS:
             return
-        register_tool(name, tool_cls)
+        register_tool(name, build())
         _REGISTERED_TOOLS.add(name)
+        _settle_sdk_classes()
 
 
 def _load_skills(skill_paths: Sequence[str | Path]) -> list[Any]:
@@ -96,6 +117,12 @@ def _load_skills(skill_paths: Sequence[str | Path]) -> list[Any]:
                 )
             )
     return loaded
+
+
+def _localization_finish_tool() -> Any:
+    from openhands_localization.finish import LocalizationFinishTool
+
+    return LocalizationFinishTool
 
 
 @functools.cache
@@ -235,6 +262,41 @@ class ConversationStop:
             threading.Thread(target=conversation.pause, name="harbor-pause", daemon=True).start()
 
 
+def _is_json_object(text: Any) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def _hosted_endpoint_llm() -> type:
+    """The OpenHands ``LLM`` for ``harbor run``, which calls a hosted endpoint, not the training proxy.
+
+    A Cortex model deployment accepts only standard chat-completions messages: string
+    content, no ``name`` on tool results, and tool-call arguments that are a JSON
+    object. The SDK replays a model's malformed arguments as they were sampled; the
+    agent already saw the parse error for that call, so they are sent as ``{}``.
+    """
+    from openhands.sdk import LLM
+
+    class HostedEndpointLLM(LLM):
+        force_string_serializer: bool | None = True
+
+        def format_messages_for_llm(self, messages: list[Any]) -> list[dict]:
+            formatted = super().format_messages_for_llm(messages)
+            for message in formatted:
+                if message.get("role") == "tool":
+                    message.pop("name", None)
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    if not _is_json_object(function.get("arguments")):
+                        function["arguments"] = "{}"
+            return formatted
+
+    return HostedEndpointLLM
+
+
 def _run_openhands_sync(*, terminal_executor: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], Any, int]:
     from harbor_rl.terminal import terminal_tool
 
@@ -252,7 +314,7 @@ def _converse(
     base_url: str,
     api_key: str,
     max_turns: int,
-    training_phase: str,
+    training_phase: str | None,
     is_localization: bool,
     instance: dict[str, Any],
     skill_paths: list[str],
@@ -262,25 +324,25 @@ def _converse(
     from openhands.sdk import Agent
     from openhands.sdk import AgentContext
     from openhands.sdk import Conversation
+    from openhands.sdk.tool.tool import create_action_type_with_risk
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     system_path = logs_dir / "system_prompt.txt"
 
     if is_localization:
         from openhands_localization.events import finish_locations
-        from openhands_localization.finish import LocalizationFinishTool
         from openhands_localization.prompt_text import render_system_prompt
         from openhands_localization.prompt_text import render_user_prompt
 
         system_path.write_text(render_system_prompt(max_turns), encoding="utf-8")
-        _ensure_tool_registered("localization_finish", LocalizationFinishTool)
+        _ensure_tool_registered("localization_finish", _localization_finish_tool)
         finish_tool_name = "localization_finish"
         problem = str(instance.get("problem_statement") or instruction)
         user_prompt = render_user_prompt({"problem_statement": problem}, working_dir)
     else:
         finish_locations = None
         system_path.write_text(GENERAL_HARBOR_SYSTEM_PROMPT.format(max_turns=max_turns), encoding="utf-8")
-        _ensure_tool_registered("harbor_finish", _build_harbor_finish_tool())
+        _ensure_tool_registered("harbor_finish", _build_harbor_finish_tool)
         finish_tool_name = "harbor_finish"
         user_prompt = f"Your working directory is `{working_dir}`.\n\n{instruction}\n"
 
@@ -292,20 +354,24 @@ def _converse(
     skills = _load_skills(skill_paths)
     agent_context = AgentContext(skills=skills) if skills else None
 
-    temperature = 0.6 if training_phase == "eval" else 1.0
+    temperature = 1.0 if training_phase == "train" else 0.6
     llm_model = model_name if model_name.startswith("openai/") else f"openai/{model_name}"
+    llm_cls: type = LLM
+    llm_kwargs: dict[str, Any] = {}
+    if training_phase is not None:
+        llm_kwargs["litellm_extra_body"] = dict(
+            chat_template_kwargs=dict(add_generation_prompt=True, enable_thinking=False),
+        )
+    else:
+        llm_cls = _hosted_endpoint_llm()
     agent_kwargs: dict[str, Any] = dict(
-        llm=LLM(
+        llm=llm_cls(
             usage_id="agent",
             model=llm_model,
             base_url=base_url,
             api_key=api_key,
             temperature=temperature,
-            litellm_extra_body=dict(
-                return_token_ids=True,
-                include_stop_str_in_output=False,
-                chat_template_kwargs=dict(add_generation_prompt=True, enable_thinking=False),
-            ),
+            **llm_kwargs,
         ),
         tools=_build_openhands_tools(finish_tool_name, terminal),
         system_prompt_filename=str(system_path),
@@ -313,16 +379,21 @@ def _converse(
     if agent_context is not None:
         agent_kwargs["agent_context"] = agent_context
 
-    agent = Agent(**agent_kwargs)
     # Local scratch space for the conversation's own state; commands run in the environment.
     scratch = logs_dir / "openhands"
     scratch.mkdir(parents=True, exist_ok=True)
-    conversation = Conversation(
-        agent=agent,
-        max_iteration_per_run=max_turns,
-        visualizer=None,
-        workspace=str(scratch),
-    )
+    with _SDK_SETUP_LOCK:
+        agent = Agent(**agent_kwargs)
+        conversation = Conversation(
+            agent=agent,
+            max_iteration_per_run=max_turns,
+            visualizer=None,
+            workspace=str(scratch),
+        )
+        # The SDK would otherwise define these on the first LLM call, outside the lock.
+        for tool in agent.tools_map.values():
+            create_action_type_with_risk(tool.action_type)
+        _settle_sdk_classes()
     try:
         if stop.attach(conversation):
             conversation.send_message(user_prompt)
@@ -358,7 +429,8 @@ class OpenHandsHarborAgent(BaseAgent):
         base_url: str | None = None,
         api_key: str | None = None,
         max_turns: int = 10,
-        training_phase: str = "train",
+        training_phase: str | None = None,
+        localization: bool | None = None,
         instance: dict[str, Any] | None = None,
         skill_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
@@ -386,7 +458,8 @@ class OpenHandsHarborAgent(BaseAgent):
         )
         self._max_turns = int(max_turns)
         self._terminal_timeout_sec = int(terminal_timeout_sec)
-        self._training_phase = str(training_phase)
+        self._training_phase = training_phase
+        self._localization = localization
         self._instance = dict(instance or {})
         env_skill = os.environ.get("HARBOR_SKILL", "")
         self._skill_paths = list(skill_paths or ([env_skill] if env_skill else []))
@@ -425,6 +498,7 @@ class OpenHandsHarborAgent(BaseAgent):
         )
 
         truth_exists = self._instance.get("file_changes") is not None or self._instance.get("target") is not None
+        is_localization = truth_exists if self._localization is None else bool(self._localization)
 
         try:
             messages, locations, n_turns = await asyncio.to_thread(
@@ -438,7 +512,7 @@ class OpenHandsHarborAgent(BaseAgent):
                 api_key=self._api_key,
                 max_turns=self._max_turns,
                 training_phase=self._training_phase,
-                is_localization=truth_exists,
+                is_localization=is_localization,
                 instance=self._instance,
                 skill_paths=self._skill_paths,
                 stop=stop,
