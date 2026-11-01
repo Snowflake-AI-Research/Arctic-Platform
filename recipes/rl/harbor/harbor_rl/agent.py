@@ -41,6 +41,7 @@ import json
 import os
 import threading
 import warnings
+from collections.abc import Callable
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -58,13 +59,18 @@ _FINISH_LOCK = threading.Lock()
 _REGISTERED_TOOLS: set[str] = set()
 
 
-def _ensure_tool_registered(name: str, tool_cls: Any) -> None:
+def _ensure_tool_registered(name: str, build: Callable[[], Any]) -> None:
+    """Register the tool class ``build()`` returns, building it only on the first call.
+
+    Rollouts start concurrently, and OpenHands rejects a second class with the same kind,
+    so the class is built under the lock too.
+    """
     from openhands.sdk.tool import register_tool
 
     with _FINISH_LOCK:
         if name in _REGISTERED_TOOLS:
             return
-        register_tool(name, tool_cls)
+        register_tool(name, build())
         _REGISTERED_TOOLS.add(name)
 
 
@@ -321,14 +327,14 @@ def _converse(
         from openhands_localization.prompt_text import render_user_prompt
 
         system_path.write_text(render_system_prompt(max_turns), encoding="utf-8")
-        _ensure_tool_registered("localization_finish", LocalizationFinishTool)
+        _ensure_tool_registered("localization_finish", lambda: LocalizationFinishTool)
         finish_tool_name = "localization_finish"
         problem = str(instance.get("problem_statement") or instruction)
         user_prompt = render_user_prompt({"problem_statement": problem}, working_dir)
     else:
         finish_locations = None
         system_path.write_text(GENERAL_HARBOR_SYSTEM_PROMPT.format(max_turns=max_turns), encoding="utf-8")
-        _ensure_tool_registered("harbor_finish", _build_harbor_finish_tool())
+        _ensure_tool_registered("harbor_finish", _build_harbor_finish_tool)
         finish_tool_name = "harbor_finish"
         user_prompt = f"Your working directory is `{working_dir}`.\n\n{instruction}\n"
 

@@ -143,6 +143,8 @@ stop_driver() {
 
 trap stop_driver INT TERM
 
+# data.dataloader.num_workers=0: SkyRL's default of 8 loader processes holds about
+# 1 GB of driver memory each, to read a few parquet rows per step.
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
     --with "${ARCTIC_PLATFORM_SPEC}" \
@@ -171,6 +173,7 @@ uv run --isolated --extra skyrl-train \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \
     data.val_data="['${VAL_FILES}']" \
+    data.dataloader.num_workers=0 \
     trainer.placement.colocate_all=false \
     trainer.placement.policy_num_nodes=1 \
     trainer.placement.policy_num_gpus_per_node="${NUM_TRAIN_GPUS}" \
