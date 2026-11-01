@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 import traceback
 import types
 from pathlib import Path
@@ -487,3 +489,104 @@ def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc)
     assert str(worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))) == (
         "generic\nRoot cause in EngineCore: RuntimeError: x"
     )
+
+
+# An EngineCore as vLLM leaves it after a CUDA illegal memory access in warmup:
+# it records "EngineCore failed to start." and then hangs on the way out
+# instead of exiting, so the front end's wait for it never ends.
+_HUNG_ENGINE_PROCESS = _ENGINE_PROCESS + "import time\ntime.sleep(600)\n"
+
+
+def _spawn_engine_core(script, *args):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [_REPO_ROOT, os.environ.get("PYTHONPATH")]))}
+    # argv[0] is vLLM's process title, which the watchdog looks for.
+    return subprocess.Popen(["VLLM::EngineCore", "-c", script, *args], executable=sys.executable, env=env)
+
+
+def _wait_for_engine_core(proc):
+    """What vLLM's wait_for_engine_startup does without a READY: wait for the EngineCore to exit."""
+    proc.wait()
+    raise RuntimeError(
+        f"Engine core initialization failed. See root cause above. Failed core proc(s): {{'EngineCore': {proc.returncode}}}"
+    )
+
+
+def _watchdog_threads():
+    import threading
+
+    return [thread for thread in threading.enumerate() if thread.name == "ArcticEngineStartupWatchdog"]
+
+
+def test_engine_that_records_its_failure_and_hangs_is_killed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    procs = []
+    root = "Worker failed with error 'Triton Error [CUDA]: an illegal memory access was encountered'"
+
+    def attempt():
+        procs.append(_spawn_engine_core(_HUNG_ENGINE_PROCESS, "EngineCore failed to start.", root))
+        _wait_for_engine_core(procs[-1])
+
+    start = time.monotonic()
+    try:
+        exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+    finally:
+        for proc in procs:
+            proc.kill()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 30
+    assert procs[0].returncode == -signal.SIGKILL
+    assert type(exc) is RuntimeError
+    assert f"Root cause in MainProcess: ValueError: {root}" in str(exc)
+    assert _watchdog_threads() == []
+
+
+def test_slow_engine_startup_without_a_record_is_left_alone(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0")
+    procs = []
+    done = ValueError("engine came up")
+
+    def attempt():
+        procs.append(_spawn_engine_core("import time; time.sleep(2.5)"))
+        procs[-1].wait()
+        raise done
+
+    exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+
+    assert exc is done
+    assert procs[0].returncode == 0
+    assert _watchdog_threads() == []
+
+
+def test_engine_that_exits_after_recording_its_failure_is_not_killed(monkeypatch, tmp_path):
+    procs = []
+
+    def attempt():
+        procs.append(_spawn_engine_core(_ENGINE_PROCESS, "EngineCore failed to start.", "CUDA out of memory."))
+        _wait_for_engine_core(procs[-1])
+
+    exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+
+    assert procs[0].returncode == 0
+    assert "Root cause in MainProcess: ValueError: CUDA out of memory." in str(exc)
+
+
+def test_kill_failed_engine_processes_spares_other_children():
+    engine = _spawn_engine_core("import time; time.sleep(600)")
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    try:
+        deadline = time.monotonic() + 10
+        import psutil
+
+        while "VLLM::EngineCore" not in " ".join(psutil.Process(engine.pid).cmdline()):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        # A recorded pid that is not a descendant (here pid 1) is never signalled.
+        assert worker_mod._kill_failed_engine_processes({1}) == [engine.pid]
+        assert engine.wait(timeout=10) == -signal.SIGKILL
+        assert bystander.poll() is None
+    finally:
+        engine.kill()
+        bystander.kill()
+        engine.wait()
+        bystander.wait()

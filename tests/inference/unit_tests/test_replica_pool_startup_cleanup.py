@@ -207,3 +207,53 @@ def test_shutdown_times_out_hung_workers_and_kills_all(monkeypatch, caplog):
     assert sorted(killed) == list(range(n))
     assert "shutdown RPCs still running for workers [0]" in caplog.text
     assert "shutdown RPCs not yet started for workers [1, 2]" in caplog.text
+
+
+def test_initialize_fails_fast_when_one_worker_dies_while_others_still_start(monkeypatch, caplog):
+    """One worker's init raises (its actor died) while the other's never returns:
+    initialize must raise on the failure, not wait for the healthy-but-slow worker."""
+    killed: list[int] = []
+    never = None
+
+    class ActorDiedError(Exception):
+        pass
+
+    class Actor(_FakeActor):
+        async def _initialize(self, *args, **kwargs):
+            if self.index == 0:
+                await never.wait()
+            await asyncio.sleep(0.05)
+            raise ActorDiedError("The actor died unexpectedly before finishing this task.")
+
+    class WorkerClass(_FakeWorkerClass):
+        def remote(self):
+            actor = Actor(index=len(self.actors), fail_init=False)
+            self.actors.append(actor)
+            return actor
+
+    async def run():
+        nonlocal never
+        never = asyncio.Event()
+        pool = ReplicaPool(worker_cls=worker_cls)
+        config = SimpleNamespace(
+            tensor_parallel_size=1,
+            ray_num_gpus=None,
+            extra_env={},
+            clear_cache_on_weight_sync=True,
+            to_engine_kwargs=lambda: {"model": "test-model"},
+        )
+        start = time.monotonic()
+        with pytest.raises(ActorDiedError):
+            await asyncio.wait_for(pool.initialize(config, model_id="job-1", num_replicas=2), timeout=5)
+        assert time.monotonic() - start < 2
+        assert pool._workers == []
+
+    worker_cls = WorkerClass()
+    monkeypatch.setattr(replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index))
+    caplog.set_level(logging.ERROR, logger="arctic_platform.inference.server")
+
+    asyncio.run(run())
+
+    assert [actor.shutdown_called for actor in worker_cls.actors] == [True, True]
+    assert sorted(killed) == [0, 1]
+    assert "Worker 2/2 initialization failed: ActorDiedError: The actor died unexpectedly" in caplog.text

@@ -86,6 +86,16 @@ def install_startup_error_handler() -> None:
     vllm_logger.addHandler(StartupErrorHandler(directory))
 
 
+def recorded_pids(directory: str) -> set[int]:
+    """The pids of the engine processes that recorded a startup failure in ``directory``."""
+    pids = set()
+    for name in os.listdir(directory):
+        stem, ext = os.path.splitext(name)
+        if ext == ".json" and stem.isdigit():
+            pids.add(int(stem))
+    return pids
+
+
 def earliest_startup_error(directory: str) -> str | None:
     """``Root cause in <process>: <type>: <message>`` for the earliest record, or None.
 

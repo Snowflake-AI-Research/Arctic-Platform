@@ -88,6 +88,36 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
+async def _await_worker_inits(inits: dict[int, Any], total: int) -> None:
+    """Wait for workers' ``initialize`` RPCs, keyed by worker index; raise on the first failure.
+
+    The failure is logged with the worker it came from. The other RPCs are
+    cancelled rather than left running unobserved: the caller tears every
+    worker down next.
+    """
+    tasks = {asyncio.ensure_future(_await_maybe(ref)): idx for idx, ref in inits.items()}
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    failed = sorted(
+        (tasks[task], task.exception())
+        for task in done
+        if not task.cancelled() and task.exception() is not None
+    )
+    if len(failed) == 0:
+        return
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for idx, exc in failed:
+        logger.error("Worker %d/%d initialization failed: %s: %s", idx + 1, total, type(exc).__name__, exc)
+    raise failed[0][1]
+
+
 def _node_slots(node_ids: list[Any]) -> list[tuple[int, int]]:
     """``(slot, replicas in that pod)`` for each worker, in worker order.
 
@@ -753,17 +783,17 @@ class ReplicaPool:
 
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
-            refs = []
+            refs = {}
             for offset, worker in enumerate(batch):
                 worker_idx = start + offset
                 slot, count = slots[worker_idx]
                 logger.info("Initializing worker %d/%d (slot %d of %d in its "
                             "pod)", worker_idx + 1, n, slot, count)
                 worker_env = self._worker_env(slot, count, extra_env, replica_idx=worker_idx)
-                refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
+                refs[worker_idx] = worker.initialize.remote(engine_kwargs, worker_env, self._model_id)
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
-            await asyncio.gather(*refs)
+            await _await_worker_inits(refs, n)
 
     async def initialize(
         self,

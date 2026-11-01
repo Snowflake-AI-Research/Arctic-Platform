@@ -10,6 +10,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -35,6 +36,7 @@ from arctic_platform.inference.vllm.spec_decode_grammar import (
 from arctic_platform.inference.vllm.startup_error import (
     ENV_VAR as _STARTUP_ERROR_DIR_ENV,
     earliest_startup_error,
+    recorded_pids,
 )
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
@@ -342,6 +344,103 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeE
         logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
         return None
     return RuntimeError(f"{exc}\n{root_cause}")
+
+
+# vLLM's title for its engine processes (setproctitle), e.g. "VLLM::EngineCore".
+_VLLM_PROCESS_TITLE = "VLLM::"
+
+
+def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
+    """SIGKILL this process's engine processes after one recorded a startup failure.
+
+    Kills the descendants that recorded a failure and every direct child under
+    vLLM's process title, which is the EngineCore the front end waits on. Only
+    descendants are considered, so a recorded pid that was reused is left alone.
+    Returns the pids signalled.
+    """
+    import psutil
+
+    me = psutil.Process()
+    try:
+        descendants = me.children(recursive=True)
+    except psutil.Error:
+        logger.warning("Could not list this worker's engine processes", exc_info=True)
+        return []
+    killed = []
+    for proc in descendants:
+        try:
+            if proc.pid not in failed_pids and not (
+                proc.ppid() == me.pid and _VLLM_PROCESS_TITLE in " ".join(proc.cmdline())
+            ):
+                continue
+            proc.kill()
+            killed.append(proc.pid)
+        except psutil.Error:
+            continue
+    return killed
+
+
+class _FailedStartupWatchdog:
+    """Fail an engine startup that recorded its failure but never raised.
+
+    vLLM's front end waits for the EngineCore's READY or for its process to
+    exit. An EngineCore that fails in warmup logs ``EngineCore failed to
+    start.``, which the startup error handler records, and normally exits. On a
+    CUDA illegal memory access it can instead hang on the way out, and then
+    ``AsyncLLM.from_vllm_config`` blocks this actor forever. A watchdog thread,
+    because that call also blocks the actor's event loop, sees the record and,
+    once vLLM has had ``grace_s`` to raise on its own, kills the engine
+    processes so the front end's wait ends and startup raises. A startup with
+    no record is never touched, however slow, so a long warmup is safe.
+    """
+
+    def __init__(self, directory: str, grace_s: float, poll_s: float = 1.0) -> None:
+        self._directory = directory
+        self._grace_s = grace_s
+        self._poll_s = poll_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ArcticEngineStartupWatchdog", daemon=True)
+        self.killed: list[int] = []
+
+    def __enter__(self) -> _FailedStartupWatchdog:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        try:
+            self._watch()
+        except Exception:
+            logger.warning("Engine startup watchdog stopped", exc_info=True)
+
+    def _watch(self) -> None:
+        first_seen = None
+        while not self._stop.wait(self._poll_s):
+            failed = recorded_pids(self._directory)
+            if len(failed) == 0:
+                continue
+            if first_seen is None:
+                first_seen = time.monotonic()
+                logger.warning(
+                    "vLLM engine process(es) %s recorded a startup failure; "
+                    "killing the engine in %.1fs unless vLLM raises first",
+                    sorted(failed),
+                    self._grace_s,
+                )
+            if time.monotonic() - first_seen < self._grace_s:
+                continue
+            self.killed = _kill_failed_engine_processes(failed)
+            logger.error(
+                "vLLM engine startup failed but did not exit within %.1fs; killed engine "
+                "processes %s so startup raises. %s",
+                self._grace_s,
+                self.killed,
+                earliest_startup_error(self._directory),
+            )
+            return
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -1007,6 +1106,10 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
+        # vLLM raises within seconds of an engine recording its startup failure:
+        # the EngineCore exits once its executor has stopped the TP workers,
+        # which takes at most ~10s (5s grace, 4s after SIGTERM, then SIGKILL).
+        failed_startup_grace_s = _env_float("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", 30.0)
         for attempt in range(1, max_attempts + 1):
             startup_error_dir = _begin_engine_startup_capture()
             try:
@@ -1044,11 +1147,17 @@ class InferenceWorker(StreamingWorkerMixin):
                 if semi_p:
                     from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
-                else:
+                elif startup_error_dir is None:
                     self.llm = AsyncLLM.from_vllm_config(
                         vllm_config,
                         stat_loggers=[RingStatLogger],
                     )
+                else:
+                    with _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s):
+                        self.llm = AsyncLLM.from_vllm_config(
+                            vllm_config,
+                            stat_loggers=[RingStatLogger],
+                        )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
