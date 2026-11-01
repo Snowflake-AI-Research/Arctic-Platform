@@ -27,6 +27,7 @@ from .layers.moe import LatentMoE
 from .layers.moe import MoE
 from .logging_utils import get_logger
 from .parallel_dims import ParallelDims
+from .runtime_options import apply_moe_runtime_options
 from .vlm import get_language_model
 
 
@@ -393,6 +394,8 @@ def load_moe_model(
         device_type="cuda",
         mesh_dim_names=("ep",),
     )
+    # Before the model is built: the expert-balance modules read these settings from its first forward on.
+    apply_moe_runtime_options(options)
     ep_backend = options.ep_comm_backend
     if not uses_dispatch_ep(ep_backend):
         raise NotImplementedError(f"EP comm backend must be one of ('deepep', 'deepep_v2', 'uccl'), got {ep_backend!r}.")

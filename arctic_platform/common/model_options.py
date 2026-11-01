@@ -154,6 +154,47 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.ultraep_spares",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest"
+            " experts inside the owner's NVLink domain. 0 turns it off."
+        ),
+        source="`loader_options.ultraep_spares`; `ARL_ULTRAEP_SPARES` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.ultraep_ipc_symm",
+        runs_in="trainer",
+        goal="robustness",
+        why=(
+            "Map UltraEP's peer buffers through CUDA IPC handles: torch symmetric memory refuses ranks that each see"
+            " only their own GPU, as DSS runs them."
+        ),
+        source="`loader_options.ultraep_ipc_symm`; `ULTRA_EP_IPC_SYMM` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.expert_replicas",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU for online replicas of the hottest experts, replanned every micro-batch from"
+            " the routed counts. 0 turns them off."
+        ),
+        source="`loader_options.expert_replicas`; `ARL_EXPERT_REPLICAS` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.expert_replicas_ema",
+        runs_in="trainer",
+        goal="speed",
+        why="Weight of the newest micro-batch's routed counts in the online replicas' load estimate.",
+        source="`loader_options.expert_replicas_ema`; `ARL_EXPERT_REPLICAS_EMA` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

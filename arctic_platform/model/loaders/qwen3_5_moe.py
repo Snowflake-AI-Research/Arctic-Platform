@@ -27,6 +27,7 @@ from typing_extensions import Self
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -45,7 +46,7 @@ class DebugModelOptions(BaseModel):
     full_determinism: bool = False
 
 
-class Qwen3_5MoeOptions(BaseModel):
+class Qwen3_5MoeOptions(MoeRuntimeOptions):
     """Validated ``loader_options`` for the qwen3_5_moe loader."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)

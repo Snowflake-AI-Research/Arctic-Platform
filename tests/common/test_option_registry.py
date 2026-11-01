@@ -58,6 +58,10 @@ EXPECTED_KEYS = {
     "moe.comm_backend": ("trainer", "speed"),
     "moe.comm_sms": ("trainer", "speed"),
     "moe.comm_token_chunk": ("trainer", "speed"),
+    "moe.ultraep_spares": ("trainer", "speed"),
+    "moe.ultraep_ipc_symm": ("trainer", "robustness"),
+    "moe.expert_replicas": ("trainer", "speed"),
+    "moe.expert_replicas_ema": ("trainer", "speed"),
     "attention.backend": ("trainer", "speed"),
     "attention.sparse_mla": ("trainer", "speed"),
     "numerics.reduce_dtype": ("trainer", "parity"),
@@ -534,7 +538,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 25 options x 9 profiles = 225 cells, ")
+        assert out[0].startswith("check passed: 29 options x 9 profiles = 261 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

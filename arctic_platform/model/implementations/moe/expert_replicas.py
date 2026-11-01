@@ -15,7 +15,8 @@
 """Online redundant experts: copies of the hottest experts in spare slots on the less-loaded EP ranks.
 
 Every MoE call waits for the EP rank that received the most rows. A permutation of experts over ranks cannot split
-one hot expert, so each rank here also holds ``spares`` extra expert slots (``ARL_EXPERT_REPLICAS``). Before each
+one hot expert, so each rank here also holds ``spares`` extra expert slots (``loader_options.expert_replicas``, or
+``ARL_EXPERT_REPLICAS`` when that is unset). Before each
 micro-batch's forward, the EP group sums the routed-token counts every layer has seen since the last plan, keeps an
 exponential moving average of them, and spreads each expert's expected load over its owner and spare-slot copies
 (``plan_replicas``: a copy can take part or all of an expert's tokens, so this both moves and splits experts). Each
@@ -326,14 +327,36 @@ class ExpertReplicaManager:
 
 
 _MANAGERS: dict[int, ExpertReplicaManager] = {}
+REPLICAS_ENV = "ARL_EXPERT_REPLICAS"
+REPLICAS_EMA_ENV = "ARL_EXPERT_REPLICAS_EMA"
+
+# The job's loader options (``runtime_options.apply_moe_runtime_options``); None leaves the environment in charge.
+_configured_spares: int | None = None
+_configured_ema: float | None = None
+
+
+def configure(spares: int | None, ema: float | None) -> None:
+    """Set this process's spare count and EMA weight from the job's loader options; None for either keeps its
+    environment variable (``ARL_EXPERT_REPLICAS``, ``ARL_EXPERT_REPLICAS_EMA``)."""
+    global _configured_spares, _configured_ema
+    _configured_spares = spares
+    _configured_ema = ema
 
 
 def replica_spares() -> int:
-    return int(os.environ.get("ARL_EXPERT_REPLICAS", "0") or 0)
+    if _configured_spares is not None:
+        return _configured_spares
+    return int(os.environ.get(REPLICAS_ENV, "0") or 0)
+
+
+def replica_ema() -> float:
+    if _configured_ema is not None:
+        return _configured_ema
+    return float(os.environ.get(REPLICAS_EMA_ENV, "0.5"))
 
 
 def manager_for(group) -> ExpertReplicaManager:
     key = id(group)
     if key not in _MANAGERS:
-        _MANAGERS[key] = ExpertReplicaManager(group, replica_spares(), float(os.environ.get("ARL_EXPERT_REPLICAS_EMA", "0.5")))
+        _MANAGERS[key] = ExpertReplicaManager(group, replica_spares(), replica_ema())
     return _MANAGERS[key]

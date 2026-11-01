@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Online redundant experts through UltraEP (https://github.com/Dots-Infra/UltraEP), ``ARL_ULTRAEP_SPARES=S``.
+"""Online redundant experts through UltraEP (https://github.com/Dots-Infra/UltraEP): ``S`` spare slots per GPU, from
+the job's ``loader_options.ultraep_spares`` or, when that is unset, ``ARL_ULTRAEP_SPARES=S``.
 
 Same slot layout as ``expert_replicas.py`` (EP rank r owns physical slots ``r * (L + S) ..``: its L native experts,
 then S spares), but UltraEP plans, routes and moves the copies on the GPU:
@@ -39,12 +40,35 @@ import torch.distributed as dist
 from torch import Tensor
 
 ULTRAEP_SPARES_ENV = "ARL_ULTRAEP_SPARES"
+# Read by UltraEP itself when it allocates its peer buffers (``ultra_ep.symm_mem.symm_alloc``).
+IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 # Placement maps and pointer pools are sized per layer; Qwen3.8 has 48 MoE layers.
 _MAX_LAYERS = 128
 
+# The job's loader options (``runtime_options.apply_moe_runtime_options``); None leaves the environment in charge.
+_configured_spares: int | None = None
+_configured_ipc_symm: bool | None = None
+
+
+def configure(spares: int | None, ipc_symm: bool | None) -> None:
+    """Set this process's spare count and peer-mapping mode from the job's loader options; None for either keeps
+    its environment variable (``ARL_ULTRAEP_SPARES``, ``ULTRA_EP_IPC_SYMM``)."""
+    global _configured_spares, _configured_ipc_symm
+    _configured_spares = spares
+    _configured_ipc_symm = ipc_symm
+
 
 def ultraep_spares() -> int:
+    if _configured_spares is not None:
+        return _configured_spares
     return int(os.environ.get(ULTRAEP_SPARES_ENV, "0") or 0)
+
+
+def _apply_ipc_symm() -> None:
+    """UltraEP takes its peer-mapping mode only from ``ULTRA_EP_IPC_SYMM``, so a configured mode is written there
+    before the first manager allocates."""
+    if _configured_ipc_symm is not None:
+        os.environ[IPC_SYMM_ENV] = "1" if _configured_ipc_symm else "0"
 
 
 class UltraEPState:
@@ -54,6 +78,7 @@ class UltraEPState:
     def __init__(self, group, experts_per_rank: int, spares: int, w1: Tensor, w2: Tensor) -> None:
         import ultra_ep
 
+        _apply_ipc_symm()
         self.group = group
         self.experts_per_rank = experts_per_rank
         self.spares = spares
