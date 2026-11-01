@@ -1232,6 +1232,7 @@ def _train_parquet(path: Path, task_dirs: list[Path]) -> str:
 
 
 def test_the_task_check_runs_the_first_task_and_stops_before_gpus_when_it_fails(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("pyarrow")
     from harbor_rl.check import check_first_task
 
     from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
