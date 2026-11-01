@@ -7,8 +7,9 @@ so EP can span nodes on EFA. GIN needs GDRCopy (``/dev/gdrdrv`` and ``libgdrapi`
 The dispatch uses V2's expanded layout: the received rows come grouped by local expert, one row per (token, expert)
 pair, each with its routing weight, so there is no permutation here and the combine only sums. The buffer is sized
 once for the largest per-rank token count of the first call (agreed over the EP group, as every rank must use the
-same value); ``ARL_DEEPEP_V2_MAX_TOKENS`` sizes it explicitly. ``ARL_DEEPEP_V2_NUM_SMS`` overrides the configured SM
-count, with 0 for the library's own choice.
+same value); the loader option ``deepep_v2_max_tokens`` (or ``ARL_DEEPEP_V2_MAX_TOKENS`` when it is unset) sizes it
+explicitly. ``deepep_v2_num_sms`` (or ``ARL_DEEPEP_V2_NUM_SMS``) overrides the configured SM count, with 0 for the
+library's own choice (``moe/runtime_options.py``).
 """
 
 import filecmp
@@ -66,7 +67,9 @@ class _Handle:
 
 def configure_num_sms(num_sms: int) -> None:
     global _num_sms
-    _num_sms = int(os.environ.get("ARL_DEEPEP_V2_NUM_SMS", num_sms))
+    from ..runtime_options import deepep_v2_num_sms
+
+    _num_sms = deepep_v2_num_sms(num_sms)
 
 
 def _get_buffer(group: ProcessGroup, num_tokens: int, hidden: int, num_topk: int):
@@ -74,7 +77,9 @@ def _get_buffer(group: ProcessGroup, num_tokens: int, hidden: int, num_topk: int
     entry = _buffers.get(key)
     if entry is None:
         # The buffer reuses torch's NCCL communicator for the group, which torch creates at its first collective.
-        max_tokens = torch.tensor([int(os.environ.get("ARL_DEEPEP_V2_MAX_TOKENS", num_tokens))], device="cuda")
+        from ..runtime_options import deepep_v2_max_tokens
+
+        max_tokens = torch.tensor([deepep_v2_max_tokens(num_tokens)], device="cuda")
         torch.distributed.all_reduce(max_tokens, op=torch.distributed.ReduceOp.MAX, group=group)
         max_tokens = int(max_tokens.item())
         buffer = _BufferType(group, num_max_tokens_per_rank=max_tokens, hidden=hidden, num_topk=num_topk)
@@ -82,8 +87,8 @@ def _get_buffer(group: ProcessGroup, num_tokens: int, hidden: int, num_topk: int
     buffer, max_tokens = entry
     if num_tokens > max_tokens:
         raise ValueError(
-            f"DeepEP V2 buffer holds {max_tokens} tokens per rank, this call has {num_tokens}; set "
-            "ARL_DEEPEP_V2_MAX_TOKENS to the largest per-rank token count of any MoE call"
+            f"DeepEP V2 buffer holds {max_tokens} tokens per rank, this call has {num_tokens}; set the loader option "
+            "deepep_v2_max_tokens (or ARL_DEEPEP_V2_MAX_TOKENS) to the largest per-rank token count of any MoE call"
         )
     return buffer
 

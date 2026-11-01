@@ -203,3 +203,30 @@ def test_load_moe_model_applies_the_options_before_it_builds_the_model(monkeypat
         device_mesh_type=Mesh,
     )
     assert order == [("config", 2), ("load", 2)]
+
+
+def test_deepep_v2_settings_take_the_option_then_the_environment_then_the_default(monkeypatch):
+    from arctic_platform.model.implementations.moe import runtime_options
+
+    monkeypatch.delenv("ARL_DEEPEP_V2_NUM_SMS", raising=False)
+    monkeypatch.delenv("ARL_DEEPEP_V2_MAX_TOKENS", raising=False)
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (32, 8192)
+    monkeypatch.setenv("ARL_DEEPEP_V2_NUM_SMS", "0")
+    monkeypatch.setenv("ARL_DEEPEP_V2_MAX_TOKENS", "16384")
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (0, 16384)
+    apply_moe_runtime_options(GenericMoeOptions(deepep_v2_num_sms=24, deepep_v2_max_tokens=20000))
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (24, 20000)
+    apply_moe_runtime_options(GenericMoeOptions(deepep_v2_num_sms=0))
+    assert runtime_options.deepep_v2_num_sms(32) == 0
+
+
+@pytest.mark.parametrize("fields", [{"deepep_v2_num_sms": -1}, {"deepep_v2_max_tokens": 0}])
+def test_bad_deepep_v2_settings_are_refused(fields):
+    with pytest.raises(ValidationError):
+        GenericMoeOptions(**fields)
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_takes_the_deepep_v2_settings(options_cls):
+    assert options_cls(deepep_v2_num_sms=0, deepep_v2_max_tokens=4096).deepep_v2_num_sms == 0
