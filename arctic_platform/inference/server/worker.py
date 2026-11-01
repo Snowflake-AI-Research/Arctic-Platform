@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextlib
 import logging
 import os
 import random
@@ -353,26 +354,30 @@ _VLLM_PROCESS_TITLE = "VLLM::"
 def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
     """SIGKILL this process's engine processes after one recorded a startup failure.
 
-    Kills the descendants that recorded a failure and every direct child under
-    vLLM's process title, which is the EngineCore the front end waits on. Only
+    Kills every descendant under vLLM's process title (the EngineCore the front
+    end waits on and its TP workers, which can be wedged on the GPU too) and every
+    descendant that recorded a failure. The tree is listed before anything is
+    signalled, so a TP worker cannot be reparented out of reach first, and only
     descendants are considered, so a recorded pid that was reused is left alone.
     Returns the pids signalled.
     """
     import psutil
 
-    me = psutil.Process()
     try:
-        descendants = me.children(recursive=True)
+        descendants = psutil.Process().children(recursive=True)
     except psutil.Error:
         logger.warning("Could not list this worker's engine processes", exc_info=True)
         return []
-    killed = []
+    targets = []
     for proc in descendants:
         try:
-            if proc.pid not in failed_pids and not (
-                proc.ppid() == me.pid and _VLLM_PROCESS_TITLE in " ".join(proc.cmdline())
-            ):
-                continue
+            if proc.pid in failed_pids or _VLLM_PROCESS_TITLE in " ".join(proc.cmdline()):
+                targets.append(proc)
+        except psutil.Error:
+            continue
+    killed = []
+    for proc in targets:
+        try:
             proc.kill()
             killed.append(proc.pid)
         except psutil.Error:
@@ -400,7 +405,6 @@ class _FailedStartupWatchdog:
         self._poll_s = poll_s
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="ArcticEngineStartupWatchdog", daemon=True)
-        self.killed: list[int] = []
 
     def __enter__(self) -> _FailedStartupWatchdog:
         self._thread.start()
@@ -417,30 +421,32 @@ class _FailedStartupWatchdog:
             logger.warning("Engine startup watchdog stopped", exc_info=True)
 
     def _watch(self) -> None:
-        first_seen = None
+        kill_at = None
         while not self._stop.wait(self._poll_s):
             failed = recorded_pids(self._directory)
             if len(failed) == 0:
                 continue
-            if first_seen is None:
-                first_seen = time.monotonic()
+            if kill_at is None:
+                kill_at = time.monotonic() + self._grace_s
                 logger.warning(
                     "vLLM engine process(es) %s recorded a startup failure; "
                     "killing the engine in %.1fs unless vLLM raises first",
                     sorted(failed),
                     self._grace_s,
                 )
-            if time.monotonic() - first_seen < self._grace_s:
+            if time.monotonic() < kill_at:
                 continue
-            self.killed = _kill_failed_engine_processes(failed)
+            killed = _kill_failed_engine_processes(failed)
             logger.error(
                 "vLLM engine startup failed but did not exit within %.1fs; killed engine "
                 "processes %s so startup raises. %s",
                 self._grace_s,
-                self.killed,
+                killed,
                 earliest_startup_error(self._directory),
             )
-            return
+            # Keep watching: if the front end is still waiting (nothing was left
+            # to kill, or it waits on something else), try again and say so.
+            kill_at = time.monotonic() + self._grace_s
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -1147,13 +1153,13 @@ class InferenceWorker(StreamingWorkerMixin):
                 if semi_p:
                     from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
-                elif startup_error_dir is None:
-                    self.llm = AsyncLLM.from_vllm_config(
-                        vllm_config,
-                        stat_loggers=[RingStatLogger],
-                    )
                 else:
-                    with _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s):
+                    watchdog = (
+                        contextlib.nullcontext()
+                        if startup_error_dir is None
+                        else _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s)
+                    )
+                    with watchdog:
                         self.llm = AsyncLLM.from_vllm_config(
                             vllm_config,
                             stat_loggers=[RingStatLogger],

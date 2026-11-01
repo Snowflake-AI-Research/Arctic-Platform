@@ -91,9 +91,9 @@ async def _await_maybe(value: Any) -> Any:
 async def _await_worker_inits(inits: dict[int, Any], total: int) -> None:
     """Wait for workers' ``initialize`` RPCs, keyed by worker index; raise on the first failure.
 
-    The failure is logged with the worker it came from. The other RPCs are
-    cancelled rather than left running unobserved: the caller tears every
-    worker down next.
+    The failure is logged with the worker it came from. The waits on the other
+    RPCs are cancelled rather than left unobserved; the RPCs themselves end
+    when the caller tears every worker down next.
     """
     tasks = {asyncio.ensure_future(_await_maybe(ref)): idx for idx, ref in inits.items()}
     try:
@@ -104,9 +104,9 @@ async def _await_worker_inits(inits: dict[int, Any], total: int) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     failed = sorted(
-        (tasks[task], task.exception())
+        (tasks[task], asyncio.CancelledError() if task.cancelled() else task.exception())
         for task in done
-        if not task.cancelled() and task.exception() is not None
+        if task.cancelled() or task.exception() is not None
     )
     if len(failed) == 0:
         return

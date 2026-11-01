@@ -534,7 +534,7 @@ def test_engine_that_records_its_failure_and_hangs_is_killed(monkeypatch, tmp_pa
             proc.kill()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 30
+    assert elapsed < 10
     assert procs[0].returncode == -signal.SIGKILL
     assert type(exc) is RuntimeError
     assert f"Root cause in MainProcess: ValueError: {root}" in str(exc)
@@ -558,7 +558,43 @@ def test_slow_engine_startup_without_a_record_is_left_alone(monkeypatch, tmp_pat
     assert _watchdog_threads() == []
 
 
+def test_hung_engine_kill_takes_its_tp_workers_too(monkeypatch, tmp_path):
+    """A TP worker wedged on the GPU records nothing; killing only the
+    EngineCore would orphan it with the GPU memory it holds."""
+    import psutil
+
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    pid_file = tmp_path / "tp_worker.pid"
+    script = (
+        "import subprocess\n"
+        # sys.executable is empty in a process started under a title, so pass this one's.
+        f"tp = subprocess.Popen(['VLLM::Worker_TP1', '-c', 'import time; time.sleep(600)'], executable={sys.executable!r})\n"
+        f"open({str(pid_file)!r}, 'w').write(str(tp.pid))\n"
+    ) + _HUNG_ENGINE_PROCESS
+    procs = []
+
+    def attempt():
+        procs.append(_spawn_engine_core(script, "EngineCore failed to start.", "illegal memory access"))
+        _wait_for_engine_core(procs[-1])
+
+    try:
+        exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+    finally:
+        for proc in procs:
+            proc.kill()
+    tp_worker = int(pid_file.read_text())
+
+    assert procs[0].returncode == -signal.SIGKILL
+    assert "illegal memory access" in str(exc)
+    deadline = time.monotonic() + 10
+    while psutil.pid_exists(tp_worker) and psutil.Process(tp_worker).status() != psutil.STATUS_ZOMBIE:
+        assert time.monotonic() < deadline, "the TP worker outlived its EngineCore"
+        time.sleep(0.05)
+
+
 def test_engine_that_exits_after_recording_its_failure_is_not_killed(monkeypatch, tmp_path):
+    # Shorter than the default so a kill would have time to land, longer than the exit takes.
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "2")
     procs = []
 
     def attempt():

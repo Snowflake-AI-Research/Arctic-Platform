@@ -209,11 +209,13 @@ def test_shutdown_times_out_hung_workers_and_kills_all(monkeypatch, caplog):
     assert "shutdown RPCs not yet started for workers [1, 2]" in caplog.text
 
 
-def test_initialize_fails_fast_when_one_worker_dies_while_others_still_start(monkeypatch, caplog):
+def test_initialize_names_the_failed_worker_and_stops_waiting_on_the_rest(monkeypatch, caplog):
     """One worker's init raises (its actor died) while the other's never returns:
-    initialize must raise on the failure, not wait for the healthy-but-slow worker."""
+    initialize raises on the failure, names that worker, and cancels its wait on
+    the healthy-but-slow one instead of leaving it unobserved."""
     killed: list[int] = []
     never = None
+    waits_cancelled: list[int] = []
 
     class ActorDiedError(Exception):
         pass
@@ -221,7 +223,11 @@ def test_initialize_fails_fast_when_one_worker_dies_while_others_still_start(mon
     class Actor(_FakeActor):
         async def _initialize(self, *args, **kwargs):
             if self.index == 0:
-                await never.wait()
+                try:
+                    await never.wait()
+                except asyncio.CancelledError:
+                    waits_cancelled.append(self.index)
+                    raise
             await asyncio.sleep(0.05)
             raise ActorDiedError("The actor died unexpectedly before finishing this task.")
 
@@ -256,4 +262,5 @@ def test_initialize_fails_fast_when_one_worker_dies_while_others_still_start(mon
 
     assert [actor.shutdown_called for actor in worker_cls.actors] == [True, True]
     assert sorted(killed) == [0, 1]
+    assert waits_cancelled == [0]
     assert "Worker 2/2 initialization failed: ActorDiedError: The actor died unexpectedly" in caplog.text
