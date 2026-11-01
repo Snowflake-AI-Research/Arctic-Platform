@@ -2902,6 +2902,36 @@ def _semip_prepare_graph_reuse_snapshot(worker):
         return {"available": True, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _semip_cudagraphs_disabled(worker):
+    """True when vLLM was configured to capture no CUDA graphs at all.
+
+    ``enforce_eager`` is the catalog spelling (GLM-5.3 standard); vLLM turns it
+    into ``compilation_config.cudagraph_mode = NONE``, which is also reachable
+    directly, so both are read."""
+    cfg = getattr(worker, "vllm_config", None)
+    if getattr(getattr(cfg, "model_config", None), "enforce_eager", False):
+        return True
+    mode = getattr(getattr(cfg, "compilation_config", None),
+                   "cudagraph_mode", None)
+    return getattr(mode, "name", mode) == "NONE"
+
+
+def _semip_confirmed_graphless(worker):
+    """The census, if it proves this rank holds no captured graph; else None.
+
+    The config alone is not proof: it says what vLLM was asked for, not what
+    the process holds.  The census walks both registries and then the heap, so
+    zero from a scan that completed is the absence of a graph.  ``gc_scanned``
+    tells that apart from a heap scan that raised, whose zero proves nothing.
+    """
+    census = ca_graph_rebind.graph_exec_census(worker)
+    disc = census.get("discovery") or {}
+    if (census.get("ok") and census.get("n_graphs") == 0
+            and disc.get("gc_scanned")):
+        return census
+    return None
+
+
 def _semip_rebind_graphs(worker):
     """Repair preserved CUDA graphs against the post-restore runtime by rewriting
     the moved CustomAllreduce addresses (ca_graph_rebind).  No capture_model().
@@ -2914,6 +2944,13 @@ def _semip_rebind_graphs(worker):
     new addresses -- 144126 kernel argument slots and 16014 memcpy pointers per
     rank on that run.  No amount of dump-time warming can pre-empt that; the
     addresses only go stale after the restore.
+
+    An eager engine (``enforce_eager``, cudagraph mode NONE) has no graphs, so
+    nothing holds a pre-restore address: its all-reduces read the CA object
+    ``reinit_nccl`` just built.  The rebind would find nothing to patch and
+    report that as failure, so it is skipped -- but only once the census
+    confirms zero graphs.  A config that says eager while a graph exists goes
+    through the rebind and is judged by it like any other.
     """
     if _semip_tp_size(worker) <= 1:
         torch.cuda.synchronize()
@@ -2923,6 +2960,14 @@ def _semip_rebind_graphs(worker):
     if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
         return {"ok": False, "error": "ca_graph_rebind unavailable",
                 "rank": getattr(worker, "rank", "?")}
+    if _semip_cudagraphs_disabled(worker):
+        census = _semip_confirmed_graphless(worker)
+        if census is not None:
+            torch.cuda.synchronize()
+            return {"ok": True, "recaptured": False,
+                    "skipped": "no_cuda_graphs",
+                    "n_graphs": census.get("n_graphs"),
+                    "rank": getattr(worker, "rank", "?")}
     ca_rebind = ca_graph_rebind.rebind_after_reinit(worker)
     torch.cuda.synchronize()
     return {"ok": bool(ca_rebind.get("ok")), "recaptured": False,
@@ -5058,9 +5103,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 # there was no way to see what it thought it had done.
                 for _r in results:
                     if isinstance(_r, dict):
-                        log.info("    rebind rank=%s ok=%s ca_rebind=%s",
+                        log.info("    rebind rank=%s ok=%s skipped=%s ca_rebind=%s",
                                  _r.get("rank", "?"), _r.get("ok"),
-                                 _r.get("ca_rebind"))
+                                 _r.get("skipped"), _r.get("ca_rebind"))
                 # Verify the rebind before live traffic sees it.  This used to
                 # be a warmup, on the premise that "restore drops most
                 # cudaGraphExec handles" and they had to be re-instantiated in
