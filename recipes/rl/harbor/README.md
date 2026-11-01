@@ -47,15 +47,37 @@ Each rollout runs in its own sandbox (`HARBOR_ENV=snowflake`, the default). `HAR
 - `base_image`: the image each task's `environment/Dockerfile` is replayed on, in place of its `FROM` image. The sandbox catalog image `sandbox-base` is Chainguard Linux with Python 3.11, pip, git, and `apk`, but no `apt-get`, so the Dockerfile's steps must work there. Replay handles one `FROM` stage with `RUN`, `COPY` and `ADD` of local files, `ENV`, `ARG`, `WORKDIR`, `USER`, and `ENTRYPOINT`. It refuses `RUN` flags, `COPY --from`, `ADD` from a URL or of an archive, and `SHELL`, and docker-compose tasks aren't supported.
 - `egress_eai`: a comma-separated list of external access integrations the sandboxes may use. Without one, sandboxes reach Snowflake and public package registries but not GitHub or other hosts.
 
+To stop a run, press Ctrl-C or send the launcher `SIGTERM`. The driver cancels its Cortex jobs at once, then takes up to 2 minutes to stop the rollouts in flight and terminate their sandboxes. A driver killed with `kill -9` can't cancel them: they keep their GPUs until the server reclaims them after 30 idle minutes, unless you cancel them first with `cortex-training cancel`.
+
 Before it provisions any GPUs, the launcher runs the first training task once with an agent that does nothing: the sandbox starts, the Dockerfile replays, a command runs, and the verifier grades the result. If any of that fails, the launcher exits with the cause. For example, a SWE-smith task without GitHub egress fails within seconds with `GitHub egress is not configured for this sandbox`. Set `HARBOR_SKIP_TASK_CHECK=1` to skip this check.
 
-To evaluate on the same environment, pass its import path to `harbor run`. From the repository root, `uv run --extra harbor` provides the pinned `harbor` CLI with the environment importable:
+#### Evaluate
+
+The launcher runs no evaluation unless you ask for one. Append `trainer.eval_before_train=true trainer.eval_interval=10` to evaluate the model on `EVAL_HARBOR_TASKS` before the first step and every 10 steps after it, one rollout per task at temperature 0.6. Each evaluation prints `eval/all/avg_score` in the log and saves its rollouts under `$CKPT_DIR/trajectories/step_<n>/eval/`. On the 32 SWE-smith eval tasks one evaluation takes about 3 minutes. `EVAL_HARBOR_TASKS` defaults to the training tasks, so set it before turning evaluation on.
+
+To evaluate outside training, pass the environment's import path to `harbor run`. From the repository root, `uv run --extra harbor` provides the pinned `harbor` CLI with the environment importable:
 
 ```bash
 uv run --extra harbor harbor run -p "$EVAL_HARBOR_TASKS" -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
   --ek base_image=sandbox-base --ek connection=MY_CONN --ek role=MY_ROLE
 ```
+
+To evaluate the model you trained with the agent you trained it in, [deploy its checkpoint](https://github.com/snowflakedb/cortex-training/blob/main/docs/guides/inference/deploy-model.md) and point the recipe's agent at the deployment. A run ends with a `weights-only` checkpoint: `cortex-training checkpoints JOB_UUID` lists it, where `JOB_UUID` is the `training=` job ID that the run logs, without the `:training:0` suffix. Use the deployment's `base_url`, its `sf-ct-...` ID as the model, and your PAT as the key. `--ak localization=true` makes the agent submit SWE-smith localization answers as it does in training; leave it out for other tasks.
+
+```bash
+export OPENAI_BASE_URL=<deployment base_url> OPENAI_API_KEY="$ARCTIC_CORTEX_PAT"
+sdk="git+https://github.com/OpenHands/software-agent-sdk.git@85ecfd9333d2d2cc4404dd460fd38868d9b978e2"
+PYTHONPATH=recipes/rl/harbor:recipes/rl/openhands/code_localization \
+uv run --extra harbor --with "openhands-sdk @ $sdk#subdirectory=openhands-sdk" \
+  --with "openhands-tools @ $sdk#subdirectory=openhands-tools" \
+  harbor run -p "$EVAL_HARBOR_TASKS" -a harbor_rl.agent:OpenHandsHarborAgent -m sf-ct-DEPLOYMENT_UUID \
+  --ak localization=true -n 8 \
+  --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
+  --ek base_image=sandbox-base --ek connection=MY_CONN --ek role=MY_ROLE --ek egress_eai=MY_GITHUB_EAI
+```
+
+On the 32 SWE-smith eval tasks this scored a mean reward of `0.31` for the `Qwen/Qwen3.5-4B` base model and `2.10` for the checkpoint of the 25-step run below, in under 3 minutes each.
 
 Snowflake allows 100 live sandboxes per owner, and suspended ones count. The environment creates at most 16 sandboxes at a time and keeps at most 90 live. It renews its Snowflake session while the run lasts, retries rate-limited creates, and terminates every sandbox it started when the run ends, including when the run fails. A driver that is killed outright can't do that, and the next launch warns when sandboxes it left behind would push you past the limit. When no other run is using the connection, terminate them:
 
@@ -67,9 +89,11 @@ for s in Sandbox.list(connection='MY_CONN'):
         s.terminate()"
 ```
 
-#### Tasks with their own images (not tested end to end in this release)
+#### Tasks with their own images
 
-The environment can also mirror each task's `FROM` image, or the `docker_image` in its `task.toml`, into a Snowflake image repository (`image_repo=DATABASE.SCHEMA.REPOSITORY`), or run every task on one `prebuilt_image`. Mirroring needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH`, WRITE on the repository for `role`, and a registry that accepts pushes from the driver's network. A `prebuilt_image` or `docker_image` that is already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) is used as is, with no mirroring. These paths have unit tests but were not run end to end for this release. The check above shows within a minute whether they work for your tasks, before any GPUs are provisioned.
+A task whose `task.toml` sets `[environment] docker_image` to a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`, an image already in a Snowflake image repository) runs on that image as is, even when `base_image` is set, and needs no `environment/Dockerfile`. The image's `WORKDIR`, `USER`, and `ENV` are not applied, so commands run as the sandbox's default user in its default directory. `prebuilt_image=/DB/SCHEMA/REPO/IMAGE:TAG` runs every task on one such image. Tasks with their own `docker_image` were run end to end with `harbor run` and in training, and `prebuilt_image` with `harbor run`.
+
+The environment can also mirror each task's `FROM` image, or a `docker_image` from another registry, into a Snowflake image repository (`image_repo=DATABASE.SCHEMA.REPOSITORY`), and then applies the image's `WORKDIR`, `USER`, and `ENV`. Mirroring needs [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md) on the driver's `PATH`, WRITE on the repository for `role`, and a registry that accepts pushes from the driver's network. It has unit tests but was not run end to end for this release. The check above shows within a minute whether it works for your tasks, before any GPUs are provisioned.
 
 ### Where Rollouts Run
 
@@ -127,4 +151,4 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | **Learning rate & RL loss** | `LR` / Hydra CLI args | `1.0e-6` (`gspo`) | `LR=5e-7 trainer.algorithm.policy_loss_type=grpo` |
 | **Attention & weight sync** | `ATTN_IMPLEMENTATION` / `WEIGHT_SYNC_BACKEND` | `flash_attention_3` / `nccl` | `flash_attention_2` (non-Hopper GPUs) |
 
-This release was run end to end with the defaults above, on Snowflake sandboxes with `base_image` and on `host`. The launcher also accepts Harbor's other environments (`docker`, `modal`, `daytona`, `e2b`), other models, and other GPU counts, but those weren't tested with this recipe.
+This release was run end to end on Snowflake sandboxes with `base_image` and on `host`, with the defaults above and with `8` + `8` GPUs at `16` $\times$ `8` rollouts, and with evaluation during training. The launcher also accepts Harbor's other environments (`docker`, `modal`, `daytona`, `e2b`) and other models, but those weren't tested with this recipe.
