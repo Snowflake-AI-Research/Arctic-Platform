@@ -30,8 +30,9 @@ expert``, so that every node and rank receives about the same routed load. Only 
 - every export of EP-sharded expert tensors gathers them back into logical order (``cat_expert_shards``,
   ``expert_export_rows``). Resumable checkpoints keep slot order and resume only under the same placement.
 
-``ARL_EXPERT_PLACEMENT`` is a JSON file path, or the JSON itself: ``{"ep_size": ep, "gpus_per_node": g (optional),
-"layers": {"<decoder layer index>": perm, ...}}``, fitted offline from router histograms (DSS
+The placement is the job's ``loader_options.expert_placement`` or, when that is unset, ``ARL_EXPERT_PLACEMENT``: a
+JSON file path, the JSON itself, or (loader options only) the parsed object: ``{"ep_size": ep, "gpus_per_node": g
+(optional), "layers": {"<decoder layer index>": perm, ...}}``, fitted offline from router histograms (DSS
 ``debug.router_tokens_per_expert``). Layers the file omits keep the contiguous placement; a listed layer that is not a
 ``MoE`` layer of the model is an error. With ``gpus_per_node`` the loader checks that EP rank ``r`` sits on node
 ``r // gpus_per_node``, the layout a node-balanced placement was fitted for.
@@ -56,11 +57,33 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _SLOT_ATTR = "_arl_expert_slot"
 
 
-def read_placement(value: str) -> dict:
-    text = value if value.lstrip().startswith("{") else Path(value).read_text()
-    spec = json.loads(text)
+# The job's ``loader_options.expert_placement`` (``runtime_options.apply_moe_runtime_options``); None leaves
+# ``ARL_EXPERT_PLACEMENT`` in charge.
+_configured: str | dict | None = None
+
+
+def configure(value: str | dict | None) -> None:
+    """Set this process's placement from the job's loader options; None keeps ``ARL_EXPERT_PLACEMENT``."""
+    global _configured
+    _configured = value
+
+
+def placement_value() -> str | dict | None:
+    """The placement this process applies: the configured one, else ``ARL_EXPERT_PLACEMENT``, else None."""
+    if _configured is not None:
+        return _configured
+    return os.environ.get(PLACEMENT_ENV) or None
+
+
+def read_placement(value: str | dict) -> dict:
+    """The placement object of ``value``: a JSON file path, the JSON text, or the object itself."""
+    if isinstance(value, dict):
+        spec = value
+    else:
+        text = value if value.lstrip().startswith("{") else Path(value).read_text()
+        spec = json.loads(text)
     if not isinstance(spec, dict) or not isinstance(spec.get("layers"), dict):
-        raise ValueError(f"{PLACEMENT_ENV} must hold {{'layers': {{layer: perm}}}}, got {type(spec).__name__}")
+        raise ValueError(f"an expert placement must hold {{'layers': {{layer: perm}}}}, got {type(spec).__name__}")
     return spec
 
 
@@ -125,18 +148,18 @@ def _check_nodes(spec: dict, group, device: torch.device, logger) -> None:
     node_of = [ids.setdefault(int(h), len(ids)) for h in hosts]
     if node_of != [r // int(gpus) for r in range(ep)] and logger is not None:
         logger.warning(
-            f"{PLACEMENT_ENV} balances nodes of {gpus} consecutive EP ranks, but the EP ranks' nodes are {node_of}: "
+            f"the expert placement balances nodes of {gpus} consecutive EP ranks, but the EP ranks' nodes are {node_of}: "
             "the placement is still exact, but its node balance does not hold"
         )
 
 
 @torch.no_grad()
 def apply_expert_placement(model: nn.Module, logger=None) -> int:
-    """Install the ``ARL_EXPERT_PLACEMENT`` placement on the loaded model; returns the number of MoE layers placed.
+    """Install the job's placement (``placement_value``) on the loaded model; returns the number of MoE layers placed.
 
     Runs after the expert weights are loaded (contiguous, local tensors) and before PEFT adapters or the optimizer
     exist, on every rank in lockstep (the weight moves are EP-group collectives)."""
-    value = os.environ.get(PLACEMENT_ENV)
+    value = placement_value()
     if not value:
         return 0
     from .distributed.expert_parallel import get_ep_group
@@ -147,7 +170,7 @@ def apply_expert_placement(model: nn.Module, logger=None) -> int:
     layers = _moe_layers(model)
     unknown = sorted(set(rows) - {layer for layer, _ in layers})
     if unknown:
-        raise ValueError(f"{PLACEMENT_ENV} places layers {unknown}, which are not MoE layers of this model")
+        raise ValueError(f"the expert placement places layers {unknown}, which are not MoE layers of this model")
     placed, group, device = 0, None, None
     for layer, block in layers:
         row = rows.get(layer)
@@ -161,10 +184,10 @@ def apply_expert_placement(model: nn.Module, logger=None) -> int:
             raise ValueError(f"expert placement row of layer {layer} is not a permutation of {num_experts} experts")
         group = get_ep_group(experts)
         if group is None:
-            raise ValueError(f"{PLACEMENT_ENV} needs expert parallelism; layer {layer} has no EP group")
+            raise ValueError(f"an expert placement needs expert parallelism; layer {layer} has no EP group")
         ep = dist.get_world_size(group)
         if int(spec.get("ep_size", ep)) != ep:
-            raise ValueError(f"{PLACEMENT_ENV} was fitted for EP {spec['ep_size']}, the job runs EP {ep}")
+            raise ValueError(f"the expert placement was fitted for EP {spec['ep_size']}, the job runs EP {ep}")
         slot_expert = torch.tensor(row, dtype=torch.long)
         expert_slot = inverse(slot_expert)
         tensors = _expert_tensors(experts, num_experts // ep)
@@ -180,7 +203,7 @@ def apply_expert_placement(model: nn.Module, logger=None) -> int:
     if group is not None:
         _check_nodes(spec, group, device, logger)
     if logger is not None:
-        logger.info(f"Expert placement from {PLACEMENT_ENV}: {placed} MoE layers placed")
+        logger.info(f"Expert placement: {placed} MoE layers placed")
     return placed
 
 

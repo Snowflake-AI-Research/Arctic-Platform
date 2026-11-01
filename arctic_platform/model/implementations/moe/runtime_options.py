@@ -23,12 +23,14 @@ model load, before the model is built.
 
 from __future__ import annotations
 
+import json
 from os import environ
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
@@ -89,6 +91,38 @@ class MoeRuntimeOptions(BaseModel):
         ),
     )
 
+    expert_placement: str | dict[str, Any] | None = Field(
+        None,
+        description=(
+            "A static placement of each MoE layer's experts over the EP ranks, fitted offline from router histograms "
+            "(moe/expert_placement.py): a JSON file path on the workers, the JSON text, or the object itself, "
+            '{"ep_size": ep, "gpus_per_node": g, "layers": {"<layer>": [expert per slot, ...]}}. Unset: '
+            "ARL_EXPERT_PLACEMENT."
+        ),
+    )
+
+    @field_validator("expert_placement")
+    @classmethod
+    def _check_placement(cls, value: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
+        """Refuse what can be refused without the workers' files: an empty path, malformed inline JSON, or an
+        object without its ``layers`` map. The permutations are checked against the model when it loads."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("expert_placement must be a file path, the placement JSON, or its object")
+            if not value.lstrip().startswith("{"):
+                return value
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"expert_placement is not valid JSON: {error}") from None
+        else:
+            parsed = value
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("layers"), dict):
+            raise ValueError("expert_placement must hold {'layers': {layer: [expert per slot, ...]}}")
+        return value
+
     @model_validator(mode="after")
     def _one_spare_planner(self) -> Self:
         if (self.ultraep_spares or 0) > 0 and (self.expert_replicas or 0) > 0:
@@ -124,6 +158,7 @@ def apply_moe_runtime_options(options: Any) -> None:
     """Hand ``options``' runtime fields to the modules that read them; a field the options model lacks counts as
     unset. Every load sets every field, so a value from an earlier load in the same process never leaks into this
     one."""
+    from . import expert_placement
     from . import expert_replicas
     from . import ultraep_replicas
 
@@ -138,3 +173,4 @@ def apply_moe_runtime_options(options: Any) -> None:
         spares=getattr(options, "expert_replicas", None),
         ema=getattr(options, "expert_replicas_ema", None),
     )
+    expert_placement.configure(getattr(options, "expert_placement", None))

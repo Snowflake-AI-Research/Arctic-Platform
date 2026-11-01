@@ -56,6 +56,23 @@ def test_read_placement_accepts_a_path_or_the_json(tmp_path):
         placement.read_placement(json.dumps({"ep_size": EP}))
 
 
+def test_the_loader_options_placement_wins_and_the_environment_is_the_fallback(monkeypatch):
+    from arctic_platform.model.implementations.moe.runtime_options import apply_moe_runtime_options
+    from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
+
+    other = json.loads(_spec({0: list(range(E))}))
+    monkeypatch.setenv(placement.PLACEMENT_ENV, _spec())
+    try:
+        apply_moe_runtime_options(GenericMoeOptions(expert_placement=other))
+        assert placement.read_placement(placement.placement_value()) == other
+        apply_moe_runtime_options(GenericMoeOptions())
+        assert placement.placement_value() == _spec()
+        monkeypatch.delenv(placement.PLACEMENT_ENV)
+        assert placement.placement_value() is None
+    finally:
+        placement.configure(None)
+
+
 def _placed_shards(full: torch.Tensor, perm: list[int], dim: int = 0, k: int = 1) -> list[torch.Tensor]:
     """What each EP rank holds of ``full`` (experts in logical order along ``dim``, ``k`` entries each) under
     ``perm``."""
@@ -187,7 +204,7 @@ def _v41_moes():
     return [_init(DeepseekV41MoE(_tiny_v41_config(), layer_idx=i)) for i in PERMS]
 
 
-def _dcp_worker(rank, ckpt):
+def _dcp_worker(rank, ckpt, source):
     from safetensors.torch import load_file
     from torch.distributed.checkpoint import HuggingFaceStorageReader
     from torch.distributed.checkpoint import load as dcp_load
@@ -204,7 +221,13 @@ def _dcp_worker(rank, ckpt):
     state = {name: t for name, t in model.state_dict().items() if ".experts." in name}
     dcp_load(state, storage_reader=HuggingFaceStorageReader(path=ckpt), process_group=dist.group.WORLD)
     convert_dtensors_to_local(model)
-    os.environ[placement.PLACEMENT_ENV] = _spec()
+    if source == "environment":
+        os.environ[placement.PLACEMENT_ENV] = _spec()
+    else:
+        from arctic_platform.model.implementations.moe.runtime_options import apply_moe_runtime_options
+        from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
+
+        apply_moe_runtime_options(GenericMoeOptions(expert_placement=json.loads(_spec())))
     assert placement.apply_expert_placement(model) == len(PERMS)
     with pytest.raises(RuntimeError, match="already placed"):  # a second placement must not permute the rows again
         placement.apply_expert_placement(model)
@@ -217,7 +240,8 @@ def _dcp_worker(rank, ckpt):
     return True
 
 
-def test_dcp_load_then_placement_puts_each_slots_expert_on_its_rank(tmp_path):
+@pytest.mark.parametrize("source", ["environment", "loader_options"])
+def test_dcp_load_then_placement_puts_each_slots_expert_on_its_rank(tmp_path, source):
     from safetensors.torch import save_file
 
     ckpt = tmp_path / "ckpt"
@@ -226,7 +250,7 @@ def test_dcp_load_then_placement_puts_each_slots_expert_on_its_rank(tmp_path):
     for name in state:  # distinct rows per expert
         state[name] = torch.randn_like(state[name])
     save_file(state, str(ckpt / "model.safetensors"))
-    assert all(_run(_dcp_worker, tmp_path, str(ckpt)).values())
+    assert all(_run(_dcp_worker, tmp_path, str(ckpt), source).values())
 
 
 # A dispatch/combine with the DeepEP interface over the gloo group: each (token, choice) row goes to the rank owning

@@ -195,6 +195,18 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.expert_placement",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "A static placement of each MoE layer's experts over the EP ranks, fitted offline from router histograms"
+            " so that every node and GPU receives about the same routed load: a JSON file path, the JSON, or its"
+            " object."
+        ),
+        source="`loader_options.expert_placement`; `ARL_EXPERT_PLACEMENT` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

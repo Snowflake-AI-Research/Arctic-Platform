@@ -25,6 +25,7 @@ each loader's own validation. The reasons follow the table.
 | `moe.comm_backend` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.comm_sms` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.expert_placement` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.expert_replicas` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.expert_replicas_ema` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
@@ -57,6 +58,7 @@ each loader's own validation. The reasons follow the table.
 - `moe.comm_backend`: The expert-parallel all-to-all backend. Today: `loader_options.ep_comm_backend`.
 - `moe.comm_sms`: Streaming multiprocessors reserved for expert-parallel communication. Today: `loader_options.deepep_num_sms`.
 - `moe.comm_token_chunk`: Token chunk size of the expert-parallel dispatch. Today: `loader_options.deepep_token_chunk_size`.
+- `moe.expert_placement`: A static placement of each MoE layer's experts over the EP ranks, fitted offline from router histograms so that every node and GPU receives about the same routed load: a JSON file path, the JSON, or its object. Today: `loader_options.expert_placement`; `ARL_EXPERT_PLACEMENT` when unset.
 - `moe.expert_replicas`: Spare expert slots per GPU for online replicas of the hottest experts, replanned every micro-batch from the routed counts. 0 turns them off. Today: `loader_options.expert_replicas`; `ARL_EXPERT_REPLICAS` when unset.
 - `moe.expert_replicas_ema`: Weight of the newest micro-batch's routed counts in the online replicas' load estimate. Today: `loader_options.expert_replicas_ema`; `ARL_EXPERT_REPLICAS_EMA` when unset.
 - `moe.grouped_mm`: Run the experts as one grouped matmul. Today: `loader_options.moe_use_grouped_mm`.
@@ -76,7 +78,7 @@ each loader's own validation. The reasons follow the table.
 
 Extends `generic_moe`.
 
-8 of 29 options unsupported.
+8 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -92,7 +94,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-8 of 29 options unsupported.
+8 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -106,7 +108,7 @@ Extends `generic_moe`.
 
 ## `dflash2`
 
-17 of 29 options unsupported.
+17 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -122,6 +124,7 @@ Extends `generic_moe`.
 - `moe.comm_backend` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.comm_sms` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.expert_placement` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.expert_replicas` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.expert_replicas_ema` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the loader rejects expert parallelism and has no expert options
@@ -138,7 +141,7 @@ Extends `generic_moe`.
 
 ## `generic_moe`
 
-8 of 29 options unsupported.
+8 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -154,7 +157,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 29 options unsupported.
+6 of 30 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -165,7 +168,7 @@ Extends `generic_moe`.
 
 ## `glm_moe_dsa`
 
-8 of 29 options unsupported.
+8 of 30 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -178,7 +181,7 @@ Extends `generic_moe`.
 
 ## `huggingface`
 
-7 of 29 options unsupported.
+7 of 30 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -187,6 +190,7 @@ Extends `generic_moe`.
 - `moe.comm_backend` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_sms` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the huggingface loader rejects expert parallelism and has no expert options
+- `moe.expert_placement` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.expert_replicas` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.expert_replicas_ema` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
@@ -199,7 +203,7 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-7 of 29 options unsupported.
+7 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -214,7 +218,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 29 options unsupported.
+6 of 30 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
