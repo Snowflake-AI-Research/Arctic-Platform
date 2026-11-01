@@ -55,23 +55,35 @@ try:
 except ImportError:
     AgentCapabilities = None  # type: ignore[assignment,misc]
 
-_FINISH_LOCK = threading.Lock()
+# The pinned OpenHands SDK has no lock around its pydantic classes. Defining a subclass
+# marks every SDK model for a rebuild, and the next model built in any thread runs it;
+# a conversation being built meanwhile in another thread can come out without its
+# fields ("'ConversationState' object has no attribute 'security_analyzer'"). Two
+# definitions of one class leave a duplicate that fails every later conversation in the
+# process ("Duplicate kind detected"). So classes are defined, conversations are built,
+# and the pending rebuild runs, all under this lock: once the first conversations are
+# set up, the running ones never trigger a rebuild.
+_SDK_SETUP_LOCK = threading.Lock()
 _REGISTERED_TOOLS: set[str] = set()
 
 
-def _ensure_tool_registered(name: str, build: Callable[[], Any]) -> None:
-    """Register the tool class ``build()`` returns, building it only on the first call.
+def _settle_sdk_classes() -> None:
+    """Run the rebuild that defining SDK classes left pending. Call with ``_SDK_SETUP_LOCK`` held."""
+    from openhands.sdk.utils.models import _rebuild_if_required
 
-    Rollouts start concurrently, and OpenHands rejects a second class with the same kind,
-    so the class is built under the lock too.
-    """
+    _rebuild_if_required()
+
+
+def _ensure_tool_registered(name: str, build: Callable[[], Any]) -> None:
+    """Register the tool class ``build()`` returns, building it only on the first call."""
     from openhands.sdk.tool import register_tool
 
-    with _FINISH_LOCK:
+    with _SDK_SETUP_LOCK:
         if name in _REGISTERED_TOOLS:
             return
         register_tool(name, build())
         _REGISTERED_TOOLS.add(name)
+        _settle_sdk_classes()
 
 
 def _load_skills(skill_paths: Sequence[str | Path]) -> list[Any]:
@@ -105,6 +117,12 @@ def _load_skills(skill_paths: Sequence[str | Path]) -> list[Any]:
                 )
             )
     return loaded
+
+
+def _localization_finish_tool() -> Any:
+    from openhands_localization.finish import LocalizationFinishTool
+
+    return LocalizationFinishTool
 
 
 @functools.cache
@@ -212,15 +230,6 @@ GENERAL_HARBOR_SYSTEM_PROMPT = (
 )
 
 
-# The pinned OpenHands SDK creates pydantic classes lazily and without a lock: each
-# tool's `<Action>WithRisk` schema on its first LLM call, and the model rebuilds that
-# triggers. Two rollouts doing that at once leave a duplicate class behind, and every
-# later conversation in the process fails with "Duplicate kind detected" (or, mid-rebuild,
-# "'ConversationState' object has no attribute 'security_analyzer'"). Conversations are
-# built under this lock and create those schemas before any of them calls the LLM.
-_SDK_SETUP_LOCK = threading.Lock()
-
-
 class ConversationStop:
     """Lets a cancelled rollout pause the conversation running on its worker thread.
 
@@ -322,12 +331,11 @@ def _converse(
 
     if is_localization:
         from openhands_localization.events import finish_locations
-        from openhands_localization.finish import LocalizationFinishTool
         from openhands_localization.prompt_text import render_system_prompt
         from openhands_localization.prompt_text import render_user_prompt
 
         system_path.write_text(render_system_prompt(max_turns), encoding="utf-8")
-        _ensure_tool_registered("localization_finish", lambda: LocalizationFinishTool)
+        _ensure_tool_registered("localization_finish", _localization_finish_tool)
         finish_tool_name = "localization_finish"
         problem = str(instance.get("problem_statement") or instruction)
         user_prompt = render_user_prompt({"problem_statement": problem}, working_dir)
@@ -382,8 +390,10 @@ def _converse(
             visualizer=None,
             workspace=str(scratch),
         )
+        # The SDK would otherwise define these on the first LLM call, outside the lock.
         for tool in agent.tools_map.values():
             create_action_type_with_risk(tool.action_type)
+        _settle_sdk_classes()
     try:
         if stop.attach(conversation):
             conversation.send_message(user_prompt)

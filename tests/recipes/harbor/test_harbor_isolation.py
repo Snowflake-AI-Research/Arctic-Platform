@@ -1134,7 +1134,9 @@ def test_file_editor_is_refused_because_it_bypasses_the_environment(monkeypatch)
         _build_openhands_tools("harbor_finish", object())
 
 
-@pytest.mark.parametrize(("phase", "hosted", "temperature"), [("train", False, 1.0), ("eval", False, 0.6), (None, True, 0.6)])
+@pytest.mark.parametrize(
+    ("phase", "hosted", "temperature"), [("train", False, 1.0), ("eval", False, 0.6), (None, True, 0.6)]
+)
 def test_only_harbor_run_uses_the_hosted_endpoint_llm(tmp_path, monkeypatch, phase, hosted, temperature):
     sdk = pytest.importorskip("openhands.sdk")
     from harbor_rl import agent as agent_mod
@@ -1204,49 +1206,73 @@ def test_tool_schemas_are_created_while_the_conversation_is_built(tmp_path):
     assert {"TerminalAction", "HarborFinishAction"} <= {t.__name__ for t in _action_types_with_risk}
 
 
-_CONCURRENT_FIRST_ROLLOUTS = """
-import asyncio, sys, tempfile, threading
+_FIRST_ROLLOUTS = """
+import asyncio, pathlib, sys, tempfile, threading
 from harbor_rl import agent as agent_mod
 from harbor_rl.terminal import HarborTerminalExecutor
+from openhands.sdk.utils import models
 
-barrier = threading.Barrier(8)
 errors = []
+pending_at_attach = []
+attach = agent_mod.ConversationStop.attach
 
-def rollout():
+def recording_attach(self, conversation):
+    # Called right after the setup lock is released, where a real rollout starts running.
+    pending_at_attach.append(models._rebuild_required)
+    return attach(self, conversation)
+
+agent_mod.ConversationStop.attach = recording_attach
+
+def rollout(is_localization, barrier=None):
     stop = agent_mod.ConversationStop()
     stop.stopped.set()
     loop = asyncio.new_event_loop()
-    barrier.wait()
+    if barrier is not None:
+        barrier.wait()
     try:
         agent_mod._run_openhands_sync(
             terminal_executor=HarborTerminalExecutor(object(), loop, "/w", stopped=stop.stopped),
-            instruction="fix it", working_dir="/w", logs_dir=__import__("pathlib").Path(tempfile.mkdtemp()),
+            instruction="fix it", working_dir="/w", logs_dir=pathlib.Path(tempfile.mkdtemp()),
             model_name="m", base_url="http://127.0.0.1:9/v1", api_key="k", max_turns=2,
-            training_phase="train", is_localization=False, instance={}, skill_paths=[], stop=stop,
+            training_phase="train", is_localization=is_localization, instance={}, skill_paths=[], stop=stop,
         )
     except Exception as e:
         errors.append(repr(e))
     finally:
         loop.close()
 
-threads = [threading.Thread(target=rollout) for _ in range(8)]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
+if sys.argv[1] == "sequential":
+    for is_localization in (False, True):
+        rollout(is_localization)
+else:
+    barrier = threading.Barrier(8)
+    threads = [threading.Thread(target=rollout, args=(i % 2 == 0, barrier)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+if any(pending_at_attach):
+    errors.append(f"a model rebuild was left pending for a running conversation: {pending_at_attach}")
 if errors:
     sys.exit("\\n".join(errors))
 """
 
 
-def test_concurrent_first_rollouts_share_one_finish_tool_class():
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+def test_first_rollouts_leave_no_sdk_class_race(mode):
+    """Run in a fresh process: the SDK's class registry and rebuild flag are process-wide."""
     pytest.importorskip("openhands.sdk")
     import subprocess
 
-    harbor_dir = Path(__file__).resolve().parents[3] / "recipes" / "rl" / "harbor"
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(harbor_dir), os.environ.get("PYTHONPATH", "")]))
+    recipes = Path(__file__).resolve().parents[3] / "recipes" / "rl"
+    paths = [
+        str(recipes / "harbor"),
+        str(recipes / "openhands" / "code_localization"),
+        os.environ.get("PYTHONPATH", ""),
+    ]
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(paths))
     result = subprocess.run(
-        [sys.executable, "-c", _CONCURRENT_FIRST_ROLLOUTS], env=env, capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", _FIRST_ROLLOUTS, mode], env=env, capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stderr[-2000:]
 
@@ -1256,7 +1282,6 @@ def test_the_hosted_endpoint_llm_sends_only_standard_message_fields():
     from harbor_rl.agent import _hosted_endpoint_llm
     from openhands.sdk import Message
     from openhands.sdk import TextContent
-
     from openhands.sdk.llm import MessageToolCall
 
     def call(call_id: str, arguments: str) -> MessageToolCall:
@@ -1307,7 +1332,9 @@ def test_harbor_run_can_ask_for_the_localization_mode(tmp_path, monkeypatch, loc
             self.uploads.append(target_path)
 
     env = FakeEnvironment()
-    agent = agent_mod.OpenHandsHarborAgent(logs_dir=tmp_path, model_name="m", localization=localization, instance=instance)
+    agent = agent_mod.OpenHandsHarborAgent(
+        logs_dir=tmp_path, model_name="m", localization=localization, instance=instance
+    )
     asyncio.run(agent.run("fix it", env, None))
     assert seen["is_localization"] is expected
     assert ("/logs/agent/localization_submission.json" in env.uploads) is expected
