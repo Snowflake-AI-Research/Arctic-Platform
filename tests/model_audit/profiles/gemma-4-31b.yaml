@@ -61,7 +61,7 @@ known_issues:
       layer_scalar buffer of every decoder layer (the MoE contract exports buffers). A checkpoint written from it
       loads with 1.0 there; the real model's values span 0.036-0.99
   optimizer.clip_scale_exact:
-    issue: upstream (DeepSpeed)
+    issue: https://github.com/deepspeedai/DeepSpeed/pull/8970
     summary: >-
       with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
       with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.30% low here, up to 0.39%)
