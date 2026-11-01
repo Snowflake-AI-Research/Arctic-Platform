@@ -121,7 +121,11 @@ def materialize_harbor_task_from_row(
     repo_dir = f"{repo.replace('/', '_')}_{instance_id}"
     df_lines = [
         "FROM python:3.11-slim",
-        "RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*",
+        # Images that already ship git (such as the Snowflake sandbox catalog image) have no apt-get.
+        (
+            "RUN command -v git >/dev/null 2>&1"
+            " || (apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*)"
+        ),
         "WORKDIR /app",
         f"RUN git clone {shlex.quote(f'https://github.com/{repo}.git')} {shlex.quote(f'/app/{repo_dir}')}",
         f"WORKDIR /app/{repo_dir}",

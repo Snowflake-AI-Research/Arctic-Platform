@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import signal
@@ -393,6 +394,389 @@ def test_registry_logs_in_on_a_freshly_booted_host(monkeypatch):
     assert logins == ["org-acct.registry.snowflakecomputing.com"]
 
 
+class _FakeRest:
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+
+class _FakeConnection:
+    def __init__(self, token: str) -> None:
+        self.rest = _FakeRest(token)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConfig:
+    def __init__(self, connection: _FakeConnection) -> None:
+        self.connection = connection
+
+    def resolve_pat(self) -> str:
+        return self.connection.rest.token
+
+
+@pytest.mark.parametrize("renewable", [True, False])
+def test_the_shared_snowflake_session_is_renewed_before_its_token_expires(monkeypatch, renewable):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import session
+
+    now = [0.0]
+    logins: list[_FakeConnection] = []
+    renewals: list[str] = []
+
+    def fake_connect(connection, role):
+        logins.append(_FakeConnection(f"login-{len(logins)}"))
+        return _FakeConfig(logins[-1])
+
+    def fake_refresh(config, stale):
+        renewals.append(stale)
+        if renewable:
+            config.connection.rest.token = f"renewed-{len(renewals)}"
+        return config
+
+    monkeypatch.setattr(session, "_connect", fake_connect)
+    monkeypatch.setattr(session, "refresh_config", fake_refresh)
+    monkeypatch.setattr(session.time, "monotonic", lambda: now[0])
+    for name in ("_configs", "_renewed_at", "_locks"):
+        monkeypatch.setattr(session, name, {})
+    monkeypatch.setattr(session, "_retired", [])
+
+    first = asyncio.run(session.get_config("conn", None))
+    now[0] = session.RENEW_AFTER_S - 1
+    assert asyncio.run(session.get_config("conn", None)) is first and renewals == []
+
+    now[0] = session.RENEW_AFTER_S
+    renewed = asyncio.run(session.get_config("conn", None))
+    assert renewals == ["login-0"]
+    if renewable:
+        assert renewed is first and renewed.resolve_pat() == "renewed-1" and len(logins) == 1
+    else:
+        assert renewed.resolve_pat() == "login-1" and not logins[0].closed
+    session.close_sessions()
+    assert all(conn.closed for conn in logins)
+
+
+def test_creates_refused_with_an_expired_token_renew_the_session_once(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import session
+
+    connection = _FakeConnection("stale")
+    renewals: list[str] = []
+
+    def fake_refresh(config, stale):
+        renewals.append(stale)
+        time.sleep(0.05)
+        config.connection.rest.token = "fresh"
+        return config
+
+    monkeypatch.setattr(session, "refresh_config", fake_refresh)
+    monkeypatch.setattr(session, "_configs", {("conn", None): _FakeConfig(connection)})
+    monkeypatch.setattr(session, "_renewed_at", {("conn", None): time.monotonic()})
+    monkeypatch.setattr(session, "_locks", {})
+
+    async def many() -> set[str]:
+        configs = await asyncio.gather(*(session.renew_config("conn", None, "stale") for _ in range(8)))
+        return {c.resolve_pat() for c in configs}
+
+    assert asyncio.run(many()) == {"fresh"}
+    assert renewals == ["stale"]
+    assert session.is_expired_session(RuntimeError("{'code': '390112', 'message': 'Your session has expired.'}"))
+    assert not session.is_expired_session(RuntimeError("image not found"))
+
+
+def _sandbox_env(tmp_path, sf_env):
+    (tmp_path / "environment").mkdir(exist_ok=True)
+    (tmp_path / "trial").mkdir(exist_ok=True)
+    return sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+
+
+def test_sandbox_create_survives_expiry_rate_limits_and_ambiguous_failures(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxError
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+    from snowflake.sandbox.exceptions import SandboxRateLimitError
+    from snowflake.sandbox.exceptions import SandboxTransportError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    token = ["stale"]
+    renewals: list[str | None] = []
+    names: list[str] = []
+    started: dict[str, SimpleNamespace] = {}
+    terminated: list[str] = []
+    failures = [
+        SandboxError("create returned no container id: {'code': '390112', 'message': 'Your session has expired.'}"),
+        SandboxRateLimitError("rate-limited after 4 retries"),
+        SandboxTransportError("POST containers failed after the request was sent (ReadError: )"),
+        SandboxTransportError("POST containers failed after the request was sent (WriteError: )"),
+    ]
+
+    def sandbox(name: str) -> SimpleNamespace:
+        async def terminate() -> None:
+            terminated.append(name)
+
+        return SimpleNamespace(id=f"id-{name}", name=name, terminate=terminate)
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            names.append(name)
+            failure = failures.pop(0) if failures else None
+            if failure is None or "ReadError" in str(failure):
+                started[name] = sandbox(name)
+            if failure is not None:
+                raise failure
+            return started[name]
+
+        @staticmethod
+        async def connect(name, connection):
+            if name not in started:
+                raise SandboxNotFoundError(name)
+            return started[name]
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: token[0])
+
+    async def fake_renew(connection, role, stale):
+        renewals.append(stale)
+        token[0] = "fresh"
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "renew_config", fake_renew)
+    monkeypatch.setattr(sf_env, "_CREATE_BACKOFF_S", 0.0)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {})
+    monkeypatch.setattr(sf_env, "_sweep_at_exit", True)
+    env = _sandbox_env(tmp_path, sf_env)
+
+    async def run() -> None:
+        created = await env._create_sandbox("image", {})
+        assert created.name == names[-1]
+        env._sandbox = created
+        await env.stop(delete=True)
+
+    asyncio.run(run())
+    assert renewals == ["stale"]
+    assert len(set(names)) == len(names) == 5
+    # The ReadError create had started a sandbox: it is found by name and terminated, then the run's own one.
+    assert terminated == [names[2], names[4]]
+    # The WriteError create's sandbox never showed up, so the exit sweep looks for it once more.
+    assert list(sf_env._LIVE_SANDBOXES) == [names[3]]
+
+
+def test_a_create_that_never_stops_failing_raises(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxError
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+    from snowflake.sandbox.exceptions import SandboxRateLimitError
+    from snowflake.sandbox.exceptions import SandboxValidationError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    attempts: list[str] = []
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxRateLimitError("rate-limited after 4 retries")
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "_CREATE_BACKOFF_S", 0.0)
+    env = _sandbox_env(tmp_path, sf_env)
+    with pytest.raises(SandboxRateLimitError):
+        asyncio.run(env._create_sandbox("image", {}))
+    assert len(attempts) == sf_env._CREATE_ATTEMPTS
+
+    looked_up: list[str] = []
+
+    class Failed(FakeAsyncSandbox):
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxError("sandbox failed to start: image pull failed")
+
+        @staticmethod
+        async def connect(name, connection):
+            looked_up.append(name)
+            raise SandboxNotFoundError(name)
+
+    attempts.clear()
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Failed)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0, 0.0))
+    with pytest.raises(SandboxError, match="image pull failed"):
+        asyncio.run(env._create_sandbox("image", {}))
+    # Not retried. The sandbox may yet appear, so the exit sweep gets its name.
+    assert len(attempts) == 1
+    assert looked_up == [attempts[0], attempts[0]]
+    assert list(sf_env._LIVE_SANDBOXES) == [attempts[0]]
+
+    class Invalid(Failed):
+        @staticmethod
+        async def create(*, name, **kwargs):
+            attempts.append(name)
+            raise SandboxValidationError("image must not name a registry host")
+
+    attempts.clear()
+    looked_up.clear()
+    monkeypatch.setattr(sf_env, "AsyncSandbox", Invalid)
+    with pytest.raises(SandboxValidationError):
+        asyncio.run(env._create_sandbox("docker.io/python:3.12", {}))
+    assert len(attempts) == 1
+    assert looked_up == []
+
+
+def test_only_a_reauth_response_code_counts_as_an_expired_session():
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox.session import is_expired_session
+
+    assert is_expired_session(
+        RuntimeError("create returned no container id: {'code': '390112', 'message': 'Your session has expired.'}")
+    )
+    assert is_expired_session(RuntimeError('got 401: {"code": "390114", "message": "expired"}'))
+    assert not is_expired_session(RuntimeError("create returned no container id: {'code': '390144'}"))
+    assert not is_expired_session(RuntimeError("sandbox harbor-rl-390112abc failed to start"))
+
+
+def test_sandbox_creates_in_flight_are_capped(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    in_flight = [0]
+    peak = [0]
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+            await asyncio.sleep(0.01)
+            in_flight[0] -= 1
+            return SimpleNamespace(name=name)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "pat")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    envs = []
+    for _ in range(10):
+        env = _sandbox_env(tmp_path, sf_env)
+        env._max_creating = 3
+        envs.append(env)
+
+    async def run() -> list:
+        return await asyncio.gather(*(env._create_sandbox("image", {}) for env in envs))
+
+    assert len(asyncio.run(run())) == 10
+    assert peak[0] == 3
+
+
+def test_a_create_that_fails_in_the_client_terminates_the_sandbox_it_started(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    names: list[str] = []
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, name, **kwargs):
+            names.append(name)
+            raise KeyError(5)
+
+        @staticmethod
+        async def connect(name, connection):
+            async def terminate() -> None:
+                terminated.append(name)
+
+            return SimpleNamespace(name=name, terminate=terminate)
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "_ORPHAN_LOOKUP_DELAYS_S", (0.0,))
+    env = _sandbox_env(tmp_path, sf_env)
+    with pytest.raises(KeyError):
+        asyncio.run(env._create_sandbox("image", {}))
+    assert terminated == names and len(names) == 1
+
+
+def test_a_cancelled_rollout_still_terminates_its_sandbox(tmp_path, monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def terminate() -> None:
+            await release.wait()
+            terminated.append("harbor-1")
+
+        monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {"harbor-1": (None, None)})
+        env = _sandbox_env(tmp_path, sf_env)
+        env._sandbox = SimpleNamespace(id="id-1", name="harbor-1", terminate=terminate)
+        stopping = asyncio.ensure_future(env.stop(delete=True))
+        await asyncio.sleep(0)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        release.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert terminated == ["harbor-1"]
+    assert sf_env._LIVE_SANDBOXES == {}
+
+
+def test_sandboxes_left_running_are_terminated_when_shared_resources_close(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from snowflake.sandbox.exceptions import SandboxNotFoundError
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    order: list[str] = []
+
+    class FakeSandbox:
+        @staticmethod
+        def connect(name, connection):
+            if name == "harbor-gone":
+                raise SandboxNotFoundError(name)
+            return SimpleNamespace(terminate=lambda: terminated.append((name, connection)))
+
+    monkeypatch.setattr(sf_env, "Sandbox", FakeSandbox)
+    monkeypatch.setattr(sf_env, "get_config_sync", lambda connection, role: f"{connection}/{role}")
+    monkeypatch.setattr(sf_env, "close_registries", lambda: order.append("registries"))
+    monkeypatch.setattr(sf_env, "close_sessions", lambda: order.append("sessions"))
+    monkeypatch.setattr(
+        sf_env,
+        "_LIVE_SANDBOXES",
+        {"harbor-a": ("conn", None), "harbor-gone": ("conn", None), "harbor-b": ("other", "ROLE")},
+    )
+    sf_env.SnowflakeSandboxEnvironment.close_shared_resources()
+    assert terminated == [("harbor-a", "conn/None"), ("harbor-b", "other/ROLE")]
+    assert order == ["registries", "sessions"] and sf_env._LIVE_SANDBOXES == {}
+
+
 def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
@@ -401,6 +785,7 @@ def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, 
 
     class FakeSandbox:
         id = "sb-1"
+        name = "harbor-1"
 
         async def terminate(self) -> None:
             terminated.append(self.id)
@@ -411,7 +796,7 @@ def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, 
             return FakeSandbox()
 
     async def fake_get_config(connection, role):
-        return None
+        return SimpleNamespace(resolve_pat=lambda: "token")
 
     monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
     monkeypatch.setattr(sf_env, "get_config", fake_get_config)
@@ -639,6 +1024,107 @@ def test_agent_phase_commands_never_see_the_rollout_key(tmp_path, monkeypatch):
     assert _ForwardingAgent.seen == ["absent,absent"]
 
 
+class _UnstartableEnvironment(HostEnvironment):
+    async def start(self, force_build: bool) -> None:
+        raise RuntimeError("pushing image: unexpected status code 444")
+
+
+class _CrashingAgent(_ForwardingAgent):
+    async def run(self, instruction, environment, context) -> None:
+        await environment.exec("echo hello > /app/output.txt")
+        raise RuntimeError("agent crashed after writing its answer")
+
+
+@pytest.mark.parametrize(
+    ("agent", "env", "message"),
+    [
+        ("_ForwardingAgent", f"{__name__}:_UnstartableEnvironment", "status code 444"),
+        ("_CrashingAgent", "host", "agent crashed"),
+    ],
+)
+def test_a_trial_without_a_verifier_result_is_an_error_not_a_zero_reward(tmp_path, monkeypatch, agent, env, message):
+    from arctic_platform.integrations.harbor.adapter import HarborTrialError
+    from arctic_platform.integrations.harbor.adapter import grade_harbor
+
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    with pytest.raises(HarborTrialError, match=message) as raised:
+        asyncio.run(
+            run_harbor_trial(
+                task_dir=_task(tmp_path),
+                trials_dir=tmp_path / "trials",
+                trial_name="trial",
+                agent=f"{__name__}:{agent}",
+                env=env,
+                model_name="openai/test-model",
+                base_url="http://127.0.0.1:1/v1",
+                api_key="k",
+            )
+        )
+    assert raised.value.reason.startswith("RuntimeError: ") and message in raised.value.reason
+    assert "Traceback" not in raised.value.reason and "Traceback" in str(raised.value)
+    assert grade_harbor([], dict(error=message)).exhausted is True
+
+
+@pytest.mark.parametrize(
+    ("failed", "outage_attempts", "raises"),
+    [(2, 0, False), (3, 1, False), (3, 9, True)],
+)
+def test_a_batch_where_every_rollout_errors_is_rerun_then_stops_the_run(
+    tmp_path, monkeypatch, failed, outage_attempts, raises
+):
+    from arctic_platform.integrations.harness.generator import Grade
+    from arctic_platform.integrations.harness.generator import HarnessGenerator
+
+    monkeypatch.setitem(
+        sys.modules,
+        "skyrl.train.generators.utils",
+        SimpleNamespace(get_rollout_metrics=lambda *args, **kwargs: {}),
+    )
+    submitted: list[str] = []
+
+    class Adapter:
+        def submit(self, request):
+            submitted.append(request.routing_key)
+            return request.routing_key
+
+        def get_status(self, rollout_id):
+            in_outage = len(submitted) <= 4 * outage_attempts
+            return "errored" if in_outage or int(rollout_id[-1]) < failed else "completed"
+
+        def collect_output(self, rollout_id):
+            return dict(error="sandbox never started") if self.get_status(rollout_id) == "errored" else {}
+
+    proxy = SimpleNamespace(
+        issue=lambda key: "k", url_for=lambda key: "http://x/v1", episodes=lambda key: [], drop=lambda key: None
+    )
+    generator = HarnessGenerator(
+        tokenizer=SimpleNamespace(eos_token_id=0),
+        proxy=proxy,
+        traj_dir=str(tmp_path),
+        adapter=Adapter(),
+        grader=lambda episodes, artifacts, request: Grade(reward=0.0, reward_detail=dict(reward=0.0)),
+        all_errored_wait_s=0,
+    )
+    trajectories = [SimpleNamespace(repetition_id=i, to_string=lambda i=i: f"t{i}") for i in range(4)]
+    batch = dict(
+        batch_metadata=SimpleNamespace(training_phase="train", global_step=1),
+        env_extras=[dict(instance_id="task")] * 4,
+        trajectory_ids=trajectories,
+    )
+    saved = tmp_path / "step_1" / "train"
+    if raises:
+        with pytest.raises(
+            RuntimeError, match="(?s)Every train rollout at step 1 errored in 4 attempts.*never started"
+        ):
+            asyncio.run(generator.generate(batch))
+        assert len(submitted) == 16
+        assert len(list(saved.glob("*.error"))) == 4
+    else:
+        assert len(asyncio.run(generator.generate(batch))["rewards"]) == 4
+        assert len(submitted) == 4 * (outage_attempts + 1)
+        assert len(list(saved.glob("*.error"))) + len(list(saved.glob("*.json"))) == 4
+
+
 def test_file_editor_is_refused_because_it_bypasses_the_environment(monkeypatch):
     pytest.importorskip("openhands.sdk")
     from harbor_rl.agent import _build_openhands_tools
@@ -735,7 +1221,81 @@ def test_stopping_a_conversation_never_blocks_the_caller():
     assert not late.attach(ConversationMidStep())
 
 
-def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(monkeypatch):
+def _train_parquet(path: Path, task_dirs: list[Path]) -> str:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table(dict(instance_id=[t.name for t in task_dirs], harbor_task_dir=[str(t) for t in task_dirs])), path
+    )
+    return str(path)
+
+
+def test_the_task_check_runs_the_first_task_and_stops_before_gpus_when_it_fails(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("pyarrow")
+    from harbor_rl.check import check_first_task
+
+    from arctic_platform.integrations.harbor.adapter import HOST_HARBOR_ENV
+
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    good = _task(tmp_path, name="good")
+    check_first_task(
+        _train_parquet(tmp_path / "good.parquet", [good]),
+        env=HOST_HARBOR_ENV,
+        env_kwargs={},
+        rollouts=1,
+        prepare_task_fn=lambda row, root: pytest.fail("rows with harbor_task_dir are used as is"),
+    )
+    assert "Task good ran and was graded" in capsys.readouterr().out
+
+    broken = _task(tmp_path, name="broken")
+    (broken / "tests" / "test.sh").write_text("#!/usr/bin/env bash\necho no reward file; exit 3\n", encoding="utf-8")
+    with pytest.raises(
+        SystemExit, match=r"(?s)task broken failed on HostEnvironment.*HARBOR_SKIP_TASK_CHECK=1"
+    ) as raised:
+        check_first_task(
+            _train_parquet(tmp_path / "broken.parquet", [broken, good]),
+            env=HOST_HARBOR_ENV,
+            env_kwargs={},
+            rollouts=1,
+            prepare_task_fn=lambda row, root: None,
+        )
+    assert "Traceback" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("value", "skipped"), [("", False), ("0", False), ("false", False), ("1", True), ("yes", True)]
+)
+def test_the_task_check_is_skipped_only_when_asked(monkeypatch, value, skipped):
+    from harbor_rl.check import task_check_skipped
+
+    monkeypatch.setenv("HARBOR_SKIP_TASK_CHECK", value)
+    assert task_check_skipped() is skipped
+
+
+def test_live_sandboxes_from_an_earlier_run_are_counted_and_warned_about(monkeypatch, capsys):
+    pytest.importorskip("snowflake.sandbox")
+    from harbor_rl.check import warn_live_sandboxes
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    listed = [SimpleNamespace(name=f"harbor-rl-{i}", status="ready" if i % 2 else "pending") for i in range(50)] + [
+        SimpleNamespace(name="harbor-rl-dead", status="dead"),
+        SimpleNamespace(name="someone-else", status="ready"),
+        SimpleNamespace(name=None, status="ready"),
+    ]
+    monkeypatch.setattr(sf_env, "get_config_sync", lambda connection, role: (connection, role))
+    # The session already carries the role; Sandbox.list refuses a role for a logged-in Config.
+    monkeypatch.setattr(sf_env.Sandbox, "list", lambda connection: listed)
+    assert len(sf_env.SnowflakeSandboxEnvironment.live_sandboxes(connection="C", role="R")) == 50
+
+    warn_live_sandboxes(dict(connection="C", role="R"), rollouts=40)
+    assert capsys.readouterr().err == ""
+    warn_live_sandboxes(dict(connection="C", role="R"), rollouts=64)
+    assert "50 sandboxes from an earlier Harbor run" in capsys.readouterr().err
+
+
+def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image(monkeypatch):
     from harbor.environments.factory import EnvironmentFactory
     from harbor_rl.entrypoint import check_harbor_env
     from harbor_rl.entrypoint import harbor_env_kwargs
@@ -754,7 +1314,7 @@ def test_env_kwargs_reach_the_environment_and_snowflake_requires_an_image_repo(m
     monkeypatch.delenv("HARBOR_AGENT", raising=False)
     monkeypatch.setenv("HARBOR_ENV", "snowflake")
     monkeypatch.delenv("HARBOR_ENV_KWARGS", raising=False)
-    with pytest.raises(SystemExit, match="image_repo"):
+    with pytest.raises(SystemExit, match="base_image"):
         check_harbor_env()
     monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(image_repo="DB.SCHEMA.REPO", role="R")))
     check_harbor_env()
@@ -824,6 +1384,77 @@ def test_a_sandbox_path_prebuilt_image_is_used_without_the_registry(tmp_path, mo
     )
     image, plan = asyncio.run(env._resolve_image(force_build=False))
     assert (image, plan) == ("/db/schema/repo/image:tag", None)
+
+
+def test_a_base_image_needs_no_crane_or_image_repo(monkeypatch):
+    pytest.importorskip("snowflake.sandbox")
+    from harbor_rl.entrypoint import check_harbor_env
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import images
+
+    monkeypatch.delenv("HARBOR_AGENT", raising=False)
+    monkeypatch.setenv("HARBOR_ENV", "snowflake")
+    monkeypatch.setattr(images.shutil, "which", lambda name: None)
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(base_image="sandbox-base")))
+    check_harbor_env()
+
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", json.dumps(dict(connection="C")))
+    with pytest.raises(SystemExit, match="base_image"):
+        check_harbor_env()
+
+
+@pytest.mark.parametrize("image_repo", [None, "DB.SCHEMA.REPO"])
+def test_a_base_image_replaces_from_and_the_dockerfile_still_replays(tmp_path, monkeypatch, image_repo):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    def no_registry(*args, **kwargs):
+        raise AssertionError("a base_image must not touch the image registry")
+
+    monkeypatch.setattr(sf_env, "get_registry", no_registry)
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "environment" / "Dockerfile").write_text(
+        "FROM python:3.11-slim\nWORKDIR /app\nRUN git clone https://github.com/o/r.git /app/r\n"
+    )
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        base_image="sandbox-base",
+        image_repo=image_repo,
+    )
+    image, plan = asyncio.run(env._resolve_image(force_build=False))
+    assert image == "sandbox-base"
+    assert plan is not None
+    assert any("git clone https://github.com/o/r.git" in getattr(step, "command", "") for step in plan.steps)
+
+
+@pytest.mark.parametrize("has_git", [True, False])
+def test_swe_smith_tasks_install_git_only_where_it_is_missing(tmp_path, has_git):
+    import subprocess
+
+    from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
+
+    task = materialize_harbor_task_from_row(
+        dict(instance_id="o__r.abc1234", repo="o/r", base_commit="abc1234", problem_statement="p"), tmp_path / "t"
+    )
+    lines = (task / "environment" / "Dockerfile").read_text().splitlines()
+    git_step = next(line for line in lines if "apt-get" in line).removeprefix("RUN ")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "apt-calls"
+    stubs = dict(rm="exit 0", **{"apt-get": f'echo "$1" >> {calls}'})
+    if has_git:
+        stubs["git"] = "exit 0"
+    for name, body in stubs.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    shell = subprocess.run(["/bin/sh", "-c", git_step], env=dict(PATH=str(bin_dir)), check=False)
+    assert shell.returncode == 0
+    assert (calls.read_text().split() if calls.exists() else []) == ([] if has_git else ["update", "install"])
 
 
 @pytest.mark.parametrize("installed_agent", ["openhands-sdk", "mini-swe-agent", "claude-code"])
@@ -908,6 +1539,7 @@ def test_closing_the_adapter_cancels_rollouts_and_releases_shared_resources(tmp_
     rid = adapter.submit(_request(_task(tmp_path), "r0"))
     assert started.wait(5)
     loop_thread = adapter._loop_thread
+    gc.collect()
 
     adapter.close()
 
@@ -1153,11 +1785,15 @@ def test_image_platform_reaches_every_crane_call(monkeypatch):
     registry.close()
 
 
-def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch):
+@pytest.mark.parametrize("drop", ["sdk", "h2"])
+def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch, drop):
     pytest.importorskip("snowflake.sandbox")
     from snowflake.sandbox.exceptions import SandboxTransportError
 
     from arctic_platform.integrations.harbor.snowflake_sandbox import transfer
+
+    # A reset HTTP/2 stream can surface from h2 as a bare KeyError of its stream id.
+    error = SandboxTransportError("transport error mid-transfer: ") if drop == "sdk" else KeyError(3881)
 
     async def no_sleep(_):
         return None
@@ -1172,16 +1808,28 @@ def test_a_dropped_transfer_stream_is_retried(tmp_path, monkeypatch):
         async def download_file(self, remote, local):
             self.calls += 1
             if self.calls <= self.drops:
-                raise SandboxTransportError("transport error mid-download: ")
+                raise error
             Path(local).write_text("reward", encoding="utf-8")
+
+        async def upload_file(self, local, remote):
+            self.calls += 1
+            if self.calls <= self.drops:
+                raise error
 
     monkeypatch.setattr(transfer.asyncio, "sleep", no_sleep)
     flaky = FlakyTransport(drops=1)
     asyncio.run(transfer.download_path(flaky, exec_fn, "/logs/verifier/reward.txt", tmp_path / "reward.txt"))
     assert (tmp_path / "reward.txt").read_text() == "reward" and flaky.calls == 2
 
+    agent_logs = tmp_path / "agent"
+    agent_logs.mkdir()
+    (agent_logs / "localization_submission.json").write_text("[]", encoding="utf-8")
+    flaky = FlakyTransport(drops=1)
+    asyncio.run(transfer.upload_dir(flaky, exec_fn, agent_logs, "/logs/agent"))
+    assert flaky.calls == 2
+
     dead = FlakyTransport(drops=99)
-    with pytest.raises(SandboxTransportError):
+    with pytest.raises(type(error)):
         asyncio.run(transfer.download_path(dead, exec_fn, "/logs/verifier/reward.txt", tmp_path / "other.txt"))
     assert dead.calls == transfer.TRANSFER_ATTEMPTS
 
