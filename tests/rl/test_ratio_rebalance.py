@@ -46,7 +46,6 @@ from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors.functional import RatioMasks
 from arctic_platform.rl.processors.grpo import grpo_loss
-from arctic_platform.rl.processors.pipeline import run_pipeline
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import torch_assert_close
 
@@ -539,35 +538,40 @@ class TestRatioRebalance(TestCasePlus):
         with self.assertRaisesRegex(ValueError, "^ratio_m2_threshold requires exactly one"):
             loss_object.model_call_count_callback([2, 2], {"ratio_m2_threshold": 0.5, FLAG: False})
 
-    def test_native_pipeline_rejects_a_split_request_before_any_forward(self):
+    def test_native_worker_rejects_a_split_request_before_any_forward(self):
+        from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+
         class Engine:
             global_rank = 0
+
+            def gradient_accumulation_steps(self):
+                return 2
 
             def __call__(self, *args, **kwargs):
                 raise AssertionError("a split ratio_mask_rebalance request must fail before forward")
 
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
-            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
-            "advantages": torch.ones(2, 4),
-            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
-            "old_log_probs_shifted": torch.zeros(2, 4),
+        worker = object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
+        worker.rank = 0
+        worker.world_size = 1
+        worker.sp_size = 1
+        worker.engine = Engine()
+        worker._device = torch.device("cpu")
+        worker.cpu_device = torch.device("cpu")
+        request = {
+            "batch": {
+                "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+                "advantages": torch.ones(2, 4),
+                "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+                "old_log_probs_shifted": torch.zeros(2, 4),
+            },
+            "meta": {"pad_token_id": 0},
+            "processing": {
+                "loss_fn": "ap_grpo",
+                "post": [],
+                "config": {"use_cispo_loss": True, "is_weight_clip_max": 5.0, FLAG: True, **RATIO_GATES},
+            },
         }
-        processing = {
-            "loss_fn": "ap_grpo",
-            "post": [],
-            "config": {"use_cispo_loss": True, "is_weight_clip_max": 5.0, FLAG: True, **RATIO_GATES},
-        }
-        # max_tokens_per_mb=3 splits the two rows into two microbatches, i.e. two model calls on this worker.
+        # GAS 2 splits the two rows into two model calls on this worker.
         with self.assertRaisesRegex(ValueError, counts_message([2])):
-            run_pipeline(
-                Engine(),
-                (),
-                batch,
-                {"pad_token_id": 0},
-                processing,
-                "cpu",
-                backward=True,
-                pack=True,
-                max_tokens_per_mb=3,
-            )
+            worker.forward_backward(request)

@@ -235,8 +235,8 @@ def to_cortex_fwd_bwd_payload(
     ``packed`` is whether the training job packs rows (see
     :func:`arctic_platform.client.config.cortex_job_packs`); ``None`` infers it
     from ``meta['zorro_train_enable']``. The caller's ``loss_fn`` and ``post``
-    survive only on an unpacked job, whose executor runs on-prem's
-    ``run_pipeline(pack=False)``: ZoRRo keeps ``verl_grpo`` (see
+    survive only on an unpacked job, whose executor runs on-prem's unpacked
+    ``run_pipeline``: ZoRRo keeps ``verl_grpo`` (see
     :func:`_to_cortex_zorro_verl_grpo`), and an unpacked job without ZoRRo
     requires ``verl_grpo`` (see :func:`_to_cortex_unpacked_verl_grpo`). The
     packed executor credits log-probs only to the literal post
@@ -472,7 +472,7 @@ def _to_cortex_unpacked_verl_grpo(
 ) -> dict:
     """The on-prem ``verl_grpo`` request on the Cortex wire, for an unpacked job without ZoRRo.
 
-    DSS runs the stock forward through the same ``run_pipeline(pack=False)``
+    DSS runs the stock forward through the same unpacked ``run_pipeline``
     call as on-prem. Unlike ZoRRo, nothing here is sliced at
     ``max_prompt_len``: the generic unpad flattens every ``[B, S]`` tensor by
     ``attention_mask``, and ``compute_packing_info_for_batch`` derives each

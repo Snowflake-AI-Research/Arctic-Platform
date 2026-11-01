@@ -68,9 +68,11 @@ class OptimizerSettings(BaseModel):
 class TrainingEngineSpec(BaseModel):
     """Engine inputs that do not depend on a training service.
 
+    ``managed_gradient_accumulation`` records whether DeepSpeed's configured
+    micro-step counter or the service's explicit final step owns the boundary.
     ``fp32_masters`` and ``zero_bucket_size`` come from the caller's job config.
-    ``ds_overrides`` is shallow-merged last, matching a client DeepSpeed
-    override block.
+    ``ds_overrides`` is shallow-merged, except that accumulation ownership is
+    kept authoritative.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -78,6 +80,7 @@ class TrainingEngineSpec(BaseModel):
     dtype: str = "bfloat16"
     world_size: int
     sequence_parallel: int = 1
+    managed_gradient_accumulation: bool = True
     gradient_clipping: float = 1.0
     seed: int | None = None
     ds_overrides: dict[str, Any] | None = None
@@ -89,10 +92,10 @@ class TrainingEngineSpec(BaseModel):
 def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     """Build the config dict consumed by ``deepspeed.initialize``.
 
-    The caller steps after each microbatch, so the microbatch size and the
-    accumulation count are both 1. Sequence parallelism reduces the
-    data-parallel degree, and therefore ``train_batch_size``, to
-    ``world_size // sequence_parallel``.
+    The configured microbatch size and accumulation count both default to 1.
+    An unmanaged engine may execute a request-sized number of backwards before
+    its caller's single final step. Sequence parallelism reduces the data-parallel
+    degree, and therefore ``train_batch_size``, to ``world_size // sequence_parallel``.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -104,6 +107,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         "train_micro_batch_size_per_gpu": 1,
         "train_batch_size": _data_parallel_size(spec.world_size, spec.sequence_parallel),
         "gradient_accumulation_steps": 1,
+        "managed_gradient_accumulation": spec.managed_gradient_accumulation,
         "gradient_clipping": spec.gradient_clipping,
         "bf16": {
             "enabled": is_bf16,
@@ -127,6 +131,9 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
+    # Accumulation ownership is chosen by the service's execution contract,
+    # not by an opaque DeepSpeed override supplied by its client.
+    ds_config["managed_gradient_accumulation"] = spec.managed_gradient_accumulation
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
