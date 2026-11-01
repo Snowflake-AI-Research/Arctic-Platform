@@ -5,10 +5,10 @@
 #   1. TRAIN_HARBOR_TASKS=/path/to/train_harbor_tasks
 #   2. EVAL_HARBOR_TASKS=/path/to/eval_harbor_tasks  (defaults to TRAIN_HARBOR_TASKS)
 # plus where the tasks run:
-#   - HARBOR_ENV=snowflake (default; Snowflake Cortex Sandboxes), docker, modal, daytona, ...
-#     or host, which runs tasks on this machine and also needs HARBOR_ALLOW_HOST_EXEC=1
-#   - HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}'
-#     (a JSON object passed to the environment, like `harbor run --ek`)
+#   - HARBOR_ENV=snowflake (default; Snowflake Cortex Sandboxes), or host, which runs tasks on
+#     this machine and also needs HARBOR_ALLOW_HOST_EXEC=1
+#   - HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE"}'
+#     (a JSON object passed to the environment, like `harbor run --ek`; see README.md)
 # and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
 #   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or your own driver-side Harbor BaseAgent; installed agents are refused)

@@ -31,11 +31,6 @@ from harbor.environments.tar_transfer import extract_dir_from_file
 from harbor.environments.tar_transfer import pack_dir_to_file
 from harbor.environments.tar_transfer import remote_pack_command
 
-try:
-    from snowflake.sandbox.exceptions import SandboxTransportError
-except ImportError:  # pragma: no cover - the SDK is part of the harbor extra
-    SandboxTransportError = OSError  # type: ignore[assignment,misc]
-
 CHUNK_BYTES = 24 * 1024 * 1024
 REMOTE_STAGING = "/var/tmp/harbor-transfer"
 TRANSFER_ATTEMPTS = 3
@@ -62,12 +57,14 @@ def remote_unpack_command(archive_path: str, target_dir: str) -> str:
 
 async def _retrying(call: Callable[[], Awaitable[None]]) -> None:
     # The SDK only retries HTTP 502; a stream can also drop mid-transfer when
-    # several sandboxes transfer at once. Every call here targets a fresh
-    # staging path or only reads, so repeating it is safe.
+    # several sandboxes transfer at once. Not every drop arrives as a
+    # SandboxTransportError: httpx's HTTP/2 client can raise a bare KeyError
+    # from h2 when a stream is reset. Every call here targets a fresh staging
+    # path or only reads, so repeating it on any failure is safe.
     for attempt in range(1, TRANSFER_ATTEMPTS + 1):
         try:
             return await call()
-        except SandboxTransportError:
+        except Exception:  # noqa: BLE001
             if attempt == TRANSFER_ATTEMPTS:
                 raise
             await asyncio.sleep(attempt)

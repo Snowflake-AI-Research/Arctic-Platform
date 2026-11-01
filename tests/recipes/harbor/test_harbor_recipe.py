@@ -221,3 +221,60 @@ def test_snowflake_sandbox_shell_and_detached_exec_reattach(tmp_path: Path, monk
     )
     assert lost.returncode == LOST_EXIT
     assert "lost track" in lost.stderr
+
+
+@pytest.mark.parametrize("started_before_the_drop", [False, True])
+def test_a_dropped_exec_stream_runs_the_command_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_before_the_drop: bool
+) -> None:
+    pytest.importorskip("snowflake.sandbox")
+    import asyncio
+
+    from harbor.models.task.config import EnvironmentConfig
+    from harbor.models.trial.paths import TrialPaths
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    monkeypatch.setattr(sf_shell, "EXEC_ROOT", str(tmp_path / "harbor-exec"))
+    calls: list[list[str]] = []
+
+    class Stream:
+        def __init__(self, argv: list[str]) -> None:
+            calls.append(argv)
+            dropped = len(calls) == 1
+            if dropped and not started_before_the_drop:
+                self.lines, self.exit_code = [], None
+                return
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            if dropped:
+                self.lines, self.exit_code = [], None
+                return
+            out = [SimpleNamespace(stream="stdout", data=line) for line in proc.stdout.splitlines()]
+            err = [SimpleNamespace(stream="stderr", data=line) for line in proc.stderr.splitlines()]
+            self.lines, self.exit_code = out + err, proc.returncode
+
+        def __aiter__(self):
+            return self._lines()
+
+        async def _lines(self):
+            for line in self.lines:
+                yield line
+
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+    env._sandbox = SimpleNamespace(exec_stream=lambda argv, timeout: Stream(argv))
+    marker = tmp_path / "count"
+
+    result = asyncio.run(env.exec(f"echo x >> {marker}; echo done", user="root"))
+
+    assert (result.return_code, result.stdout) == (0, "done\n")
+    assert marker.read_text() == "x\n"
+    assert len(calls) == (2 if started_before_the_drop else 3)

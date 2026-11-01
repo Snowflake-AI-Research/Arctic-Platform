@@ -27,6 +27,7 @@ _EXEC_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 EXEC_ROOT = "/var/tmp/harbor-exec"
 LOST_EXIT = 255
 TIMED_OUT_MARKER = "harbor: command timed out"
+LOST_MARKER = "harbor: lost track of exec"
 
 _LAUNCHER = 'if command -v bash >/dev/null 2>&1; then exec bash "$0"; else exec sh "$0"; fi'
 _SHELL_EXEC = 'if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; else exec sh -c "$1"; fi'
@@ -115,9 +116,7 @@ def build_exec_argv(
     if cleanup:
         lines.append("rm -rf " + " ".join(shlex.quote(f"{EXEC_ROOT}/{i}") for i in cleanup))
     if reattach:
-        lines.append(
-            f'[ -e "$d/started" ] || {{ echo "harbor: lost track of exec {exec_id}" >&2; exit {LOST_EXIT}; }}'
-        )
+        lines.append(f'[ -e "$d/started" ] || {{ echo "{LOST_MARKER} {exec_id}" >&2; exit {LOST_EXIT}; }}')
     else:
         script = build_script(
             command,
