@@ -75,12 +75,7 @@ from arctic_platform.rl.utils.debug import see_memory_usage
 
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss
-from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
-from .packed_reduction import apply_packed_loss_reduction
-from .packed_reduction import combine_packed_losses
-from .packed_reduction import combine_packed_metrics
 from .packed_reduction import metric_is_summed  # noqa: F401  # re-exported
-from .packed_reduction import resolve_packed_loss_reduction
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -135,6 +130,39 @@ _ENGINE_FWD_BLOCKED_KEYS = (
         "processing",
     }
 ) - _ENGINE_FWD_KEYS
+
+
+def _is_liger_patched_engine(engine) -> bool:
+    """Detect a Liger causal-LM forward through its owning module.
+
+    DeepSpeed exposes the wrapped model on ``module``. Liger replaces that
+    model's forward with a function defined under ``liger_kernel`` for both
+    class-level and instance-level patching.
+    """
+    model = getattr(engine, "module", engine)
+    forward = getattr(model, "forward", None)
+    module_name = getattr(forward, "__module__", "") or ""
+    return module_name.startswith("liger_kernel")
+
+
+def _normalize_liger_forward_kwargs(
+    engine,
+    kwargs: dict,
+    *,
+    already_packed: bool,
+    zorro_train_enable: bool,
+) -> None:
+    """Keep RL token outputs available without service-side engine wrappers."""
+    if zorro_train_enable or not _is_liger_patched_engine(engine):
+        return
+    # Liger's fused loss skips logits while training when labels are present.
+    # AP objectives and posts consume token logits/logprobs instead.
+    kwargs["skip_logits"] = False
+    if not already_packed:
+        # Padded RL keeps labels on the AP batch for its objective/post, but the
+        # model need not run its unrelated fused cross-entropy.
+        kwargs.pop("labels", None)
+        kwargs.pop("shift_labels", None)
 
 
 def _fwd_meta_key_missing_from_batch(key: str, batch: dict, meta: dict) -> bool:
@@ -417,8 +445,6 @@ def run_pipeline(
     device: str,
     *,
     backward: bool | str = True,
-    pack: bool = True,
-    max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
     validate_loss_callback: bool = True,
     loss_object: BaseLoss | None = None,
@@ -433,7 +459,9 @@ def run_pipeline(
     args
         Positional arguments passed directly to ``engine()``.
     batch
-        Dict with tensors belonging to this microbatch
+        Dict with tensors belonging to this microbatch: padded ``[B, S]`` rows
+        with ``attention_mask`` (unpadded into one varlen call, ``pad_token_id``
+        on meta), or one already-packed ``[1, T]`` call with ``cu_seqlens`` on meta.
     meta
         Extra batch data - flags and some tensors that shouldn't have been sharded
         (labels, advantages, ...) available to the model, post-processors and loss functions
@@ -448,21 +476,6 @@ def run_pipeline(
         Set to ``"loss_only"`` to compute the loss in train mode and return
         the raw loss tensor (requires_grad=True) without calling backward —
         the caller is responsible for scaling and calling engine.backward().
-    pack
-        If *True* (default), automatically handle sequence packing for flash
-        attention: splits the input into microbatches by token budget, packs
-        each microbatch from ``[B_mb, S]`` to ``[1, T]``, runs the pipeline,
-        then unpacks and concatenates the results.  The caller passes padded
-        ``[B, S]`` tensors and receives ``[B, S]`` outputs — packing is
-        fully transparent.  Requires ``attention_mask`` in ``batch``.
-        Auto-detects already-packed input: ``cu_seqlens`` is added by
-        ``pack_for_dss`` and is the definitive sign that packing already
-        happened — skip to avoid double-packing. ``pack=True`` is therefore
-        safe to pass unconditionally.
-    max_tokens_per_mb
-        Token budget per microbatch when ``pack=True``.  Sequences are
-        grouped by a first-fit-decreasing algorithm so no microbatch
-        exceeds this limit.
     validate_loss_callback
         Invoke the selected loss's public validation callback before model
         execution. Callers that repeat an already validated packed window
@@ -498,25 +511,6 @@ def run_pipeline(
     if loss_object is None and loss_fn_name is not None:
         loss_object = resolve_loss(loss_fn_name)
 
-    if pack:
-        # Auto-detect already-packed input: pack_for_dss adds cu_seqlens as the
-        # definitive signal that packing already happened — skip to avoid
-        # double-packing. Any other case (including missing attention_mask) falls
-        # through to packing, which will fail fast with a clear assertion error.
-        if "cu_seqlens" not in meta:
-            return _run_pipeline_with_packing(
-                engine,
-                args,
-                batch,
-                meta,
-                processing,
-                device,
-                backward=backward,
-                max_tokens_per_mb=max_tokens_per_mb,
-                validate_loss_callback=validate_loss_callback,
-                loss_object=loss_object,
-            )
-
     rank = _engine_rank(engine)
     tname_e2e = timers.start(f"run_pipeline e2e {rank}")
     see_memory_usage("before fwd", force=True)
@@ -547,8 +541,8 @@ def run_pipeline(
     pack_with_unpad = True  # XXX: make configurable?
     already_packed = "cu_seqlens" in meta
     if already_packed:
-        # Inner packing call and pack_for_dss already flattened sequences.
-        # Unpad expects attention_mask / prompts that packed mb_kwargs omit.
+        # The client already flattened the sequences into one [1, T] call.
+        # Unpad expects attention_mask / prompts that a packed call omits.
         pack_with_unpad = False
 
     # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
@@ -575,12 +569,30 @@ def run_pipeline(
     if pack_with_unpad:
         if "attention_mask" not in batch or "pad_token_id" not in meta:
             raise ValueError(
-                "pack=False without cu_seqlens requires attention_mask in batch and "
+                "a batch without cu_seqlens requires attention_mask in batch and "
                 "pad_token_id in meta so the 2D batch can be unpadded; send cu_seqlens "
                 "on meta if the input is already packed"
             )
         pad_token = meta["pad_token_id"]
         attention_mask_2d_bool = batch["attention_mask"].bool()
+        if "position_ids" not in batch:
+            if not meta.get("drop_position_ids", False):
+                raise ValueError(
+                    "padded inputs require position_ids so flattened rows retain "
+                    "their model-attention boundaries; set drop_position_ids=true "
+                    "only for canonical positions derivable from attention_mask"
+                )
+            from arctic_platform.common.utils.batch import reconstruct_position_ids_
+
+            reconstruct_position_ids_(batch)
+        # The rows become one [1, T] call. Losses that reduce per sequence read
+        # the row boundaries from cu_seqlens; without them every row is one sequence.
+        row_lens = attention_mask_2d_bool.sum(dim=1, dtype=torch.int32)
+        meta = {
+            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(row_lens, dim=0, dtype=torch.int32), (1, 0)),
+            "packed_loss_scale_factor": int(attention_mask_2d_bool.shape[1]),
+            **meta,
+        }
         batch = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, attention_mask_2d_bool)
 
     log_dp_shard_tokens(
@@ -603,6 +615,12 @@ def run_pipeline(
             if validate_loss_callback:
                 loss_object.validation_callback(context, config)
             loss_object.model_forward_callback(fwd_kwargs, context, config, output_keys)
+        _normalize_liger_forward_kwargs(
+            engine,
+            fwd_kwargs,
+            already_packed=already_packed,
+            zorro_train_enable=zorro_train_enable,
+        )
         if backward is False:
             engine.eval()
             with torch.no_grad():
@@ -659,6 +677,9 @@ def run_pipeline(
         prof_loss.report()
 
         loss_object.output_callback(model_outputs)
+        # The selected AP objective owns the scalar loss. A model's incidental
+        # HF/Liger loss has no token axis and must not enter row re-padding.
+        model_outputs.pop("loss", None)
         batch = dict(model_outputs)
 
         if backward is True:
@@ -720,134 +741,6 @@ def run_pipeline(
     timers.stop_and_print_elapsed(tname_e2e)
 
     return pipeline_outputs
-
-
-def _run_pipeline_with_packing(
-    engine,
-    args: tuple,
-    batch: dict,
-    meta: dict,
-    processing: dict,
-    device: str,
-    *,
-    backward: bool | str,
-    max_tokens_per_mb: int,
-    validate_loss_callback: bool,
-    loss_object: BaseLoss | None,
-) -> dict:
-    """Run the pipeline with automatic sequence packing/unpacking.
-
-    Splits batch into microbatches, packs each to [1, T] for flash
-    attention, runs the pipeline on each, then unpacks and concatenates.
-    """
-    from .microbatch import MicroBatchSpec
-    from .microbatch import split_padded_tensor_dict_into_mb_list
-    from .packing import pack_sequences
-    from .packing import unpack_sequences
-
-    # Combine for splitting — meta tensors are split the same way as batch
-    all_input = {**meta, **batch}  # batch takes priority on key collision
-    mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
-    mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
-    n_mbs = len(mb_list.mbs)
-    if loss_object is not None:
-        loss_object.model_call_count_callback([n_mbs], processing.get("config") or {})
-
-    reduction = resolve_packed_loss_reduction(
-        processing,
-        mb_list.mbs,
-        loss_object=loss_object,
-    )
-    captured_losses: list[float] = []
-    captured_loss_tensors: list[torch.Tensor] = []
-    captured_metrics: list[dict] = []
-    collected_batch: dict[str, list[torch.Tensor]] = {}
-
-    for i, mb in enumerate(mb_list.mbs):
-        packed = pack_sequences(mb)
-        pack_meta = packed.pop("_pack_meta")
-
-        # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
-        mb_1d = {
-            k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
-        }
-        mb_1d["packed_loss_scale_factor"] = pack_meta["S"]
-
-        # Model receives packed [1, T] keys that were on the original batch.
-        # A model input that exists only on meta must not reach the engine:
-        # meta is replicated, so that tensor would be the unsharded full batch.
-        # position_ids are regenerated by pack_sequences. use_cache defaults
-        # off unless the caller put it on batch.
-        if "use_cache" in batch and "use_cache" in packed:
-            mb_kwargs = {"use_cache": packed["use_cache"]}
-        else:
-            mb_kwargs = {"use_cache": False}
-        for key in _ENGINE_FWD_KEYS:
-            if key in packed and key in batch:
-                mb_kwargs[key] = packed[key]
-        if "position_ids" in packed:
-            mb_kwargs["position_ids"] = packed["position_ids"]
-
-        if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
-            engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
-
-        inner_backward = "loss_only" if backward is True else backward
-        result = run_pipeline(
-            engine,
-            args,
-            mb_kwargs,
-            mb_1d,
-            processing,
-            device,
-            backward=inner_backward,
-            pack=False,
-            return_tensors=True,
-            validate_loss_callback=validate_loss_callback,
-            loss_object=loss_object,
-        )
-
-        if "avg_loss" in result:
-            captured_losses.append(result["avg_loss"])
-            loss_tensor = result.pop("loss_tensor", None)
-            if loss_tensor is not None:
-                scaled = apply_packed_loss_reduction(
-                    engine,
-                    loss_tensor,
-                    reduction.loss_scales[i],
-                    backward=backward,
-                )
-                if scaled is not None:
-                    captured_loss_tensors.append(scaled)
-            captured_metrics.append(result.get("metrics") or {})
-
-        for k, v in result.get("batch", {}).items():
-            if torch.is_tensor(v):
-                v_1d = v.squeeze(0) if v.ndim == 2 and v.shape[0] == 1 else v
-                unpacked = unpack_sequences(v_1d, pack_meta)
-                collected_batch.setdefault(k, []).append(unpacked)
-
-    # Restore original sequence order if microbatches were reordered
-    idx = None
-    if mb_list.backward_indices is not None:
-        idx = torch.tensor(mb_list.backward_indices, dtype=torch.long)
-
-    def _concat(tensors: list[torch.Tensor]) -> torch.Tensor:
-        cat = torch.cat(tensors, dim=0)
-        return cat[idx] if idx is not None else cat
-
-    batch_out = {k: _concat(v) for k, v in collected_batch.items()}
-
-    if captured_losses:
-        avg_loss = combine_packed_losses(captured_losses, reduction)
-        averaged_metrics = combine_packed_metrics(captured_metrics, reduction.reporting_weights)
-        result = {"avg_loss": avg_loss, "metrics": averaged_metrics}
-        if batch_out:
-            result["batch"] = detensorize(batch_out)
-        if backward == "loss_only" and captured_loss_tensors:
-            result["loss_tensor"] = sum(captured_loss_tensors)
-        return result
-
-    return {"batch": detensorize(batch_out), "metrics": {}}
 
 
 # ---------------------------------------------------------------------------
