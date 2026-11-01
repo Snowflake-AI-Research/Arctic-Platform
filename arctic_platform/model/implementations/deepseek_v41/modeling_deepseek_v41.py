@@ -233,6 +233,23 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
         del layer_idx
         return self.convert_to_hf(state_dict)
 
+    def convert_layer_to_hf(  # type: ignore[override]
+        self, state_dict: dict[str, Tensor], layer_idx: int
+    ) -> dict[str, Tensor]:
+        """One export group in the published names, in place: decoder layer ``layer_idx``, or the top-level group
+        (embedding, final norm, LM head) for ``-1``.
+
+        Every op of the chain skips keys the group does not hold, so each group goes through the whole chain. The
+        experts arrive gathered over EP in logical order (``build_iter_full_hf_weights`` undoes a static placement).
+        Packed MXFP4 experts (LoRA on the official checkpoint) get their UE8M0 scales back, as published.
+        """
+        del layer_idx
+        if packs_experts(self.config):
+            for key, value in list(state_dict.items()):
+                if ".mlp.experts." in key and key.endswith("_scale_inv") and value.dtype != torch.float8_e8m0fnu:
+                    state_dict[key] = value.to(dtype=torch.float8_e8m0fnu)
+        return self.convert_to_hf(state_dict)
+
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
         """Write the converted cache shard by shard. The full snapshot never sits in memory."""
         write_streaming_prime_cache(

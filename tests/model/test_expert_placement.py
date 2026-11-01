@@ -432,8 +432,6 @@ def _export_worker(rank, stream):
     for placed in (False, True):
         torch.manual_seed(0)
         model = DeepseekV41ForCausalLM(_tiny_v41_config())
-        # V4.1 has no per-layer HF conversion of its own yet; V4's is this.
-        model.convert_layer_to_hf = lambda state, index, model=model: model.convert_to_hf(state)
         if placed:
             stack = model.model
             _shard_experts(stack, dist.group.WORLD)

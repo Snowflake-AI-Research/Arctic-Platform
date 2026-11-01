@@ -188,6 +188,14 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
+    def _shard_rows(local: torch.Tensor, world: int, ep_group, device: torch.device) -> list[int]:
+        """Rows of every EP rank's shard of ``local``. DTensor's ``Shard(0)`` uses ceil chunks, so a table whose rows
+        the group does not divide (DeepSeek-V4.1's Engram tables) has a short last shard."""
+        mine = torch.tensor([local.shape[0]], dtype=torch.long, device=device)
+        counts = [torch.empty_like(mine) for _ in range(world)]
+        dist.all_gather(counts, mine, group=ep_group)
+        return [int(count) for count in counts]
+
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool, dest: torch.Tensor | None):
         """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere), gathered row ``i`` at
         row ``dest[i]`` when given (a static expert placement's logical order, ``expert_export_rows``).
@@ -195,7 +203,8 @@ def build_iter_full_hf_weights(model: nn.Module):
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
         ``local`` may live in host memory (a table moved there by ARL_NGRAM_TABLE_ON_HOST); each slice is copied to
-        this rank's GPU for the gather.
+        this rank's GPU for the gather. Shards shorter than the longest are padded for the collectives and the padding
+        is dropped on the master.
         """
         # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
         if local.dtype != torch.uint8:
@@ -204,25 +213,35 @@ def build_iter_full_hf_weights(model: nn.Module):
         # A shard in pinned host memory (Qwen3.8's n-gram table under ARL_NGRAM_TABLE_ON_HOST) is gathered through
         # this rank's GPU, a slice at a time; any other shard is gathered where it lives (the CPU tests' gloo groups).
         device = torch.device("cuda", torch.cuda.current_device()) if local.is_pinned() else local.device
-        rows = local.shape[0]
+        counts = _shard_rows(local, world, ep_group, device)
+        rows, total = max(counts), sum(counts)
+        if dest is not None and min(counts) != rows:
+            raise RuntimeError(f"an expert placement needs equal EP shards, got rows {counts}")
+        offsets = [sum(counts[:r]) for r in range(world)]
+        if local.shape[0] < rows:
+            local = torch.cat([local, local.new_zeros((rows - local.shape[0], *local.shape[1:]))])
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
             local = local.to(device)
             if is_master:
-                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
-                gather_list = list(full.chunk(world, dim=0))
+                padded = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
+                gather_list = list(padded.chunk(world, dim=0))
             else:
-                full = None
+                padded = None
                 gather_list = None
             dist.gather(local, gather_list, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(local)
-            if full is not None and dest is not None:
+                return None
+            full = padded
+            if total != world * rows:
+                full = torch.cat([padded[r * rows:r * rows + counts[r]] for r in range(world)])
+            if dest is not None:
                 full = torch.empty_like(full).index_copy_(0, dest.to(full.device), full)
             return full
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
         if is_master:
-            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
+            full = torch.empty((total, *local.shape[1:]), dtype=local.dtype, device="cpu")
             buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=device)
         else:
             full = None
@@ -236,8 +255,11 @@ def build_iter_full_hf_weights(model: nn.Module):
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
+                    valid = min(n, counts[r] - start)
+                    if valid <= 0:
+                        continue
                     if dest is None:
-                        full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                        full[offsets[r] + start:offsets[r] + start + valid].copy_(buffer[r, :valid])
                         continue
                     for j in range(n):  # placed experts: one expert row per copy
                         full[int(dest[r * rows + start + j])].copy_(buffer[r, j])
