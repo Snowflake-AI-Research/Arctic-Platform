@@ -478,53 +478,27 @@ class DeepSpeedWorker:
         if use_sft_pipeline:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
 
-        loss_reduction = None
-        if not use_sft_pipeline:
-            from arctic_platform.rl.processors import resolve_packed_loss_reduction
-
-            loss_reduction = resolve_packed_loss_reduction(
-                processing,
-                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
-                require_declared=False,
-                loss_object=loss_object,
-            )
-
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
-        for i, micro_batch in enumerate(micro_batch_data):
+        if use_sft_pipeline:
+            from arctic_platform.common.unpacked_gas import _require_aligned_cycle
+            from arctic_platform.sft.processor import run_sft_pipeline
 
-            # time.sleep(1)
-            # pr0(f"{i=}")
-            # pr0(f"{micro_batch.keys()=}")
+            # Same contract as the RL loop: gas microbatches, gas-1 between-chunk
+            # steps, and DeepSpeed's micro-step counter marks the last one.
+            _require_aligned_cycle(self.engine, grad_accum_steps, backward=backward)
 
-            log_dp_shard_tokens(
-                self.rank,
-                f"{tag} micro_batch {i}/{num_micro_batches}",
-                micro_batch,
-                meta_data,
-            )
-
-            DEBUG = False
-            if DEBUG:
-                from arctic_platform.rl.zorro_train import analyze_normal_batch_via_attention_mask
-
-                analyze_normal_batch_via_attention_mask(
-                    micro_batch["input_ids"], micro_batch["attention_mask"], response_len=meta_data["max_response_len"]
+            pipeline_micro_batch_outputs = []
+            for i, micro_batch in enumerate(micro_batch_data):
+                log_dp_shard_tokens(
+                    self.rank,
+                    f"{tag} micro_batch {i}/{num_micro_batches}",
+                    micro_batch,
+                    meta_data,
                 )
-
-            # die
-            see_memory_usage(f"_forward_maybe_backward mb {i=}", force=True)
-            if i == 0:
-                pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
-
-            if use_sft_pipeline:
-                from arctic_platform.sft.processor import run_sft_pipeline
-
-                # Match the GRPO packed path: only the last microbatch is an
-                # accumulation boundary so DeepSpeed does not all-reduce grads
-                # (or run optimizer bookkeeping) on every microbatch when gas>1.
-                if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
-                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+                see_memory_usage(f"_forward_maybe_backward mb {i=}", force=True)
+                if i == 0:
+                    pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
                 micro_batch_output = run_sft_pipeline(
                     self.engine,
@@ -534,63 +508,69 @@ class DeepSpeedWorker:
                     device=self._device,
                     backward=backward,
                 )
-            else:
-                from arctic_platform.rl.processors import apply_packed_loss_reduction
-                from arctic_platform.rl.processors import run_pipeline
+                if i == 0:
+                    pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
+                pipeline_micro_batch_outputs.append(micro_batch_output)
+                # DS requires matching steps for backward pass
+                if backward and i < num_micro_batches - 1:
+                    self._engine_step()
 
-                pipeline_backward = "loss_only" if backward and loss_reduction is not None else backward
-                micro_batch_output = run_pipeline(
-                    self.engine,
-                    args,
+            pipeline_outputs = dict()
+            for k, v in pipeline_micro_batch_outputs[0].items():
+                if k == "metrics" and isinstance(v, dict):
+                    pipeline_outputs[k] = combine_metric_microbatches(
+                        [r[k] for r in pipeline_micro_batch_outputs]
+                    )
+                elif isinstance(v, dict):
+                    pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
+                elif isinstance(v, numbers.Number):
+                    values = [r[k] for r in pipeline_micro_batch_outputs]
+                    pipeline_outputs[k] = sum(values) / len(values)
+        else:
+            from arctic_platform.common.payload import APPayload
+            from arctic_platform.common.payload import execute_payload
+            from arctic_platform.common.unpacked_gas import clear_gradient_accumulation_boundary_override
+            # A prior path may have left the sticky boundary override set.
+            # The shared loop follows DeepSpeed's own counter and refuses it.
+            clear_gradient_accumulation_boundary_override(self.engine)
+
+            payload = APPayload(
+                batch_data=micro_batch_data,
+                meta_data=meta_data,
+                processing=processing,
+                loss_object=loss_object,
+                args=args,
+            )
+
+            seen = {"i": 0}
+
+            def prepare_call(micro_batch, _meta):
+                i = seen["i"]
+                seen["i"] += 1
+                log_dp_shard_tokens(
+                    self.rank,
+                    f"{tag} micro_batch {i}/{num_micro_batches}",
                     micro_batch,
                     meta_data,
-                    processing,
-                    device=self._device,
-                    backward=pipeline_backward,
-                    pack=False,
-                    return_tensors=return_tensors,
-                    loss_object=loss_object,
                 )
-                if backward and loss_reduction is not None:
-                    apply_packed_loss_reduction(
-                        self.engine,
-                        micro_batch_output.pop("loss_tensor"),
-                        loss_reduction.loss_scales[i],
-                        backward=True,
+                see_memory_usage(f"_forward_maybe_backward mb {i=}", force=True)
+                if i == 0:
+                    pr0(
+                        f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} "
+                        f"{meta_data.keys()=} {processing.keys()=}"
                     )
+                return micro_batch
 
-            if i == 0:
-                pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
-            pipeline_micro_batch_outputs.append(micro_batch_output)
-
-            # DS requires matching steps for backward pass
-            if backward and i < num_micro_batches - 1:
-                self._engine_step()
-
-        pipeline_outputs = dict()
-        for k, v in pipeline_micro_batch_outputs[0].items():
-            if k == "metrics" and isinstance(v, dict):
-                if loss_reduction is None:
-                    # Legacy losses without packed metadata retain the
-                    # historical GAS metric combiner.
-                    pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
-                else:
-                    from arctic_platform.rl.processors import combine_packed_metrics
-
-                    pipeline_outputs[k] = combine_packed_metrics(
-                        [r[k] for r in pipeline_micro_batch_outputs],
-                        loss_reduction.reporting_weights,
-                    )
-            elif isinstance(v, dict):
-                pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
-            elif isinstance(v, numbers.Number):
-                values = [r[k] for r in pipeline_micro_batch_outputs]
-                if k == "avg_loss" and loss_reduction is not None:
-                    from arctic_platform.rl.processors import combine_packed_losses
-
-                    pipeline_outputs[k] = combine_packed_losses(values, loss_reduction)
-                else:
-                    pipeline_outputs[k] = sum(values) / len(values)
+            pipeline_outputs = execute_payload(
+                self.engine,
+                payload,
+                loop_count=num_micro_batches,
+                backward=backward,
+                device=self._device,
+                return_tensors=return_tensors,
+                step_fn=self._engine_step,
+                prepare_call=prepare_call,
+            )
 
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 

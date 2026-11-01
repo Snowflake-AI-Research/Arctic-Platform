@@ -382,15 +382,11 @@ This version requires exactly one synchronized model call per worker: a request
 with more than one model call on any worker is rejected before any forward, with
 a message that names `ratio_mask_rebalance` and the per-worker counts. DSS checks
 it once, when it prepares the request, on the counts of all workers, and gives
-every worker the same request-wide count. The native worker and
-`run_pipeline(pack=True)` check it on each worker, before their first forward,
-and do not exchange the verdict: the worker passes its number of
-gradient-accumulation microbatches, the pipeline its number of packed
-microbatches, which the splitter first raises to the maximum over the ranks when
-`torch.distributed` is initialised (a rank with fewer rows than that maximum
-fails in the splitter instead). Under data parallelism every worker must
-therefore see a count of one, that is one gradient-accumulation step and, with
-`pack=True`, every worker's tokens within `max_tokens_per_mb`: a worker that
+every worker the same request-wide count. The native worker checks it on each
+worker, before its first forward, and does not exchange the verdict: it passes
+its number of gradient-accumulation microbatches. Under data parallelism every
+worker must therefore see a count of one, that is one gradient-accumulation
+step: a worker that
 rejects the request while a peer has passed the check leaves that peer waiting in
 the restoration's world collective until the process-group timeout, instead of
 the request failing. Exact multi-microbatch support requires a request-wide
