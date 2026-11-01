@@ -670,3 +670,69 @@ def test_kill_failed_engine_processes_spares_other_children():
         bystander.kill()
         engine.wait()
         bystander.wait()
+
+
+def test_kill_does_not_read_cmdline(monkeypatch, tmp_path):
+    """Reading /proc/<pid>/cmdline can block on a wedged process, and psutil's
+    name() falls back to it for vLLM's 15-char titles; the kill must not touch it."""
+    import psutil
+
+    def no_cmdline(self):
+        raise AssertionError("cmdline() read")
+
+    monkeypatch.setattr(psutil.Process, "cmdline", no_cmdline)
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    pid_file = tmp_path / "tp_worker.pid"
+    script = _spawn_child("VLLM::Worker_TP1", _SLEEP) + _HUNG_ENGINE_PROCESS
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch,
+        tmp_path,
+        lambda: _spawn_engine_core(script, "EngineCore failed to start.", "illegal memory access", str(pid_file)),
+    )
+
+    assert elapsed < 10
+    assert engine.returncode == -signal.SIGKILL
+    _wait_gone(int(pid_file.read_text()))
+
+
+def test_watchdog_retries_the_kill_while_vllm_has_not_raised(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    real_kill = worker_mod._kill_failed_engine_processes
+    calls = []
+
+    def kill_on_second_try(failed):
+        calls.append(sorted(failed))
+        return [] if len(calls) == 1 else real_kill(failed)
+
+    monkeypatch.setattr(worker_mod, "_kill_failed_engine_processes", kill_on_second_try)
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch, tmp_path, lambda: _spawn_engine_core(_HUNG_ENGINE_PROCESS, "EngineCore failed to start.", "x")
+    )
+
+    assert len(calls) == 2
+    assert engine.returncode == -signal.SIGKILL
+    assert elapsed < 15
+
+
+def test_stuck_watchdog_does_not_hold_startup(monkeypatch, tmp_path, caplog):
+    import threading
+
+    caplog.set_level(logging.WARNING, logger=worker_mod.logger.name)
+    release = threading.Event()
+
+    def stuck(directory):
+        release.wait(30)  # like a read of a wedged process's /proc entry
+        return set()
+
+    monkeypatch.setattr(worker_mod, "recorded_pids", stuck)
+    monkeypatch.setattr(worker_mod, "_WATCHDOG_JOIN_SLACK_S", 0.2)
+    try:
+        start = time.monotonic()
+        with worker_mod._FailedStartupWatchdog(str(tmp_path), grace_s=0.0, poll_s=0.05):
+            time.sleep(0.2)
+        assert time.monotonic() - start < 2
+        assert "watchdog did not stop" in caplog.text
+    finally:
+        release.set()

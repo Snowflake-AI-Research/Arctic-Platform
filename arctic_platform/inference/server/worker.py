@@ -349,6 +349,21 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeE
 
 # vLLM's title for its engine processes (setproctitle), e.g. "VLLM::EngineCore".
 _VLLM_PROCESS_TITLE = "VLLM::"
+# How long past one poll interval the watchdog may take to stop.
+_WATCHDOG_JOIN_SLACK_S = 5.0
+
+
+def _process_title(proc: Any) -> str:
+    """A process's title as setproctitle leaves it in ``/proc/<pid>/comm`` (15 chars).
+
+    Read directly: psutil's ``name()`` falls back to ``cmdline()`` for a
+    15-char comm, and reading ``/proc/<pid>/cmdline`` can block on a process
+    stuck in uninterruptible sleep, which is what a wedged engine process can be.
+    """
+    if not os.path.isdir("/proc"):
+        return proc.name()  # no procfs (macOS): nothing here can block that way
+    with open(f"/proc/{proc.pid}/comm", encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 
 def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
@@ -371,12 +386,9 @@ def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
     targets = []
     for proc in descendants:
         try:
-            # name() is /proc/<pid>/comm, which setproctitle sets to the
-            # (truncated) title; unlike cmdline() it cannot block on a process
-            # stuck in uninterruptible sleep.
-            if proc.pid in failed_pids or proc.name().startswith(_VLLM_PROCESS_TITLE):
+            if proc.pid in failed_pids or _process_title(proc).startswith(_VLLM_PROCESS_TITLE):
                 targets.append(proc)
-        except psutil.Error:
+        except (OSError, psutil.Error):
             continue
     killed = []
     for proc in targets:
@@ -400,6 +412,12 @@ class _FailedStartupWatchdog:
     once vLLM has had ``grace_s`` to raise on its own, kills the engine
     processes so the front end's wait ends and startup raises. A startup with
     no record is never touched, however slow, so a long warmup is safe.
+
+    Only the local multiprocessing engine is covered: the EngineCore and its
+    TP workers are this actor's descendants. Engine processes this actor does
+    not parent (Ray data-parallel engine actors, whose wait has no process
+    sentinels, and TP ranks on other nodes under Ray's executor) are left to
+    the caller's own bound on initialize, which dss-platform sets.
     """
 
     def __init__(self, directory: str, grace_s: float, poll_s: float = 1.0) -> None:
@@ -416,7 +434,11 @@ class _FailedStartupWatchdog:
 
     def __exit__(self, *exc_info: Any) -> None:
         self._stop.set()
-        self._thread.join()
+        # Bounded: a watchdog stuck reading a wedged process must not keep
+        # startup from returning or raising once vLLM has done so.
+        self._thread.join(timeout=self._poll_s + _WATCHDOG_JOIN_SLACK_S)
+        if self._thread.is_alive():
+            logger.warning("Engine startup watchdog did not stop; leaving it behind as a daemon thread")
 
     def _run(self) -> None:
         try:
