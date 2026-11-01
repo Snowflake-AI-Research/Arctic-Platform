@@ -371,7 +371,10 @@ def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
     targets = []
     for proc in descendants:
         try:
-            if proc.pid in failed_pids or _VLLM_PROCESS_TITLE in " ".join(proc.cmdline()):
+            # name() is /proc/<pid>/comm, which setproctitle sets to the
+            # (truncated) title; unlike cmdline() it cannot block on a process
+            # stuck in uninterruptible sleep.
+            if proc.pid in failed_pids or proc.name().startswith(_VLLM_PROCESS_TITLE):
                 targets.append(proc)
         except psutil.Error:
             continue
@@ -405,6 +408,7 @@ class _FailedStartupWatchdog:
         self._poll_s = poll_s
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="ArcticEngineStartupWatchdog", daemon=True)
+        self.killed: list[int] = []
 
     def __enter__(self) -> _FailedStartupWatchdog:
         self._thread.start()
@@ -437,6 +441,7 @@ class _FailedStartupWatchdog:
             if time.monotonic() < kill_at:
                 continue
             killed = _kill_failed_engine_processes(failed)
+            self.killed.extend(killed)
             logger.error(
                 "vLLM engine startup failed but did not exit within %.1fs; killed engine "
                 "processes %s so startup raises. %s",
@@ -1118,6 +1123,7 @@ class InferenceWorker(StreamingWorkerMixin):
         failed_startup_grace_s = _env_float("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", 30.0)
         for attempt in range(1, max_attempts + 1):
             startup_error_dir = _begin_engine_startup_capture()
+            watchdog: _FailedStartupWatchdog | None = None
             try:
                 attempt_kwargs = dict(engine_kwargs)
                 engine_args = _create_async_engine_args(
@@ -1154,12 +1160,9 @@ class InferenceWorker(StreamingWorkerMixin):
                     from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
                 else:
-                    watchdog = (
-                        contextlib.nullcontext()
-                        if startup_error_dir is None
-                        else _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s)
-                    )
-                    with watchdog:
+                    if startup_error_dir is not None:
+                        watchdog = _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s)
+                    with watchdog or contextlib.nullcontext():
                         self.llm = AsyncLLM.from_vllm_config(
                             vllm_config,
                             stat_loggers=[RingStatLogger],
@@ -1173,6 +1176,11 @@ class InferenceWorker(StreamingWorkerMixin):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
+                    if watchdog is not None and len(watchdog.killed) > 0:
+                        target.add_note(
+                            "The engine recorded its startup failure but did not exit; "
+                            f"the startup watchdog killed engine processes {watchdog.killed}"
+                        )
                     if len(tail) > 0:
                         target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     if startup_exc is not None:
