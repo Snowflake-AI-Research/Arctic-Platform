@@ -366,7 +366,7 @@ def _process_title(proc: Any) -> str:
         return f.read()
 
 
-def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
+def _kill_failed_engine_processes(failed_pids: set[int], stop: threading.Event | None = None) -> list[int]:
     """SIGKILL this process's engine processes after one recorded a startup failure.
 
     Kills every descendant under vLLM's process title (the EngineCore the front
@@ -374,9 +374,13 @@ def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
     descendant that recorded a failure. The tree is listed before anything is
     signalled, so a TP worker cannot be reparented out of reach first, and only
     descendants are considered, so a recorded pid that was reused is left alone.
-    Returns the pids signalled.
+    Stops as soon as ``stop`` is set: a watchdog that outlived its startup
+    attempt must not kill a later attempt's processes. Returns the pids signalled.
     """
     import psutil
+
+    if stop is not None and stop.is_set():
+        return []
 
     try:
         descendants = psutil.Process().children(recursive=True)
@@ -392,6 +396,8 @@ def _kill_failed_engine_processes(failed_pids: set[int]) -> list[int]:
             continue
     killed = []
     for proc in targets:
+        if stop is not None and stop.is_set():
+            break
         try:
             proc.kill()
             killed.append(proc.pid)
@@ -462,7 +468,7 @@ class _FailedStartupWatchdog:
                 )
             if time.monotonic() < kill_at:
                 continue
-            killed = _kill_failed_engine_processes(failed)
+            killed = _kill_failed_engine_processes(failed, self._stop)
             self.killed.extend(killed)
             logger.error(
                 "vLLM engine startup failed but did not exit within %.1fs; killed engine "

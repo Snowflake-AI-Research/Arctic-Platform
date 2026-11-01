@@ -701,9 +701,9 @@ def test_watchdog_retries_the_kill_while_vllm_has_not_raised(monkeypatch, tmp_pa
     real_kill = worker_mod._kill_failed_engine_processes
     calls = []
 
-    def kill_on_second_try(failed):
+    def kill_on_second_try(failed, stop=None):
         calls.append(sorted(failed))
-        return [] if len(calls) == 1 else real_kill(failed)
+        return [] if len(calls) == 1 else real_kill(failed, stop)
 
     monkeypatch.setattr(worker_mod, "_kill_failed_engine_processes", kill_on_second_try)
 
@@ -736,3 +736,25 @@ def test_stuck_watchdog_does_not_hold_startup(monkeypatch, tmp_path, caplog):
         assert "watchdog did not stop" in caplog.text
     finally:
         release.set()
+
+
+def test_kill_pass_signals_nothing_once_the_watchdog_is_stopped():
+    """A watchdog that outlived its attempt must not kill a later attempt's engine."""
+    import threading
+
+    import psutil
+
+    engine = _spawn_engine_core(_SLEEP)
+    try:
+        deadline = time.monotonic() + 10
+        while not psutil.Process(engine.pid).name().startswith("VLLM::"):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        stop = threading.Event()
+        stop.set()
+        assert worker_mod._kill_failed_engine_processes({engine.pid}, stop) == []
+        time.sleep(0.2)
+        assert engine.poll() is None
+    finally:
+        engine.kill()
+        engine.wait()
