@@ -361,6 +361,35 @@ def _add_into_rows(out: torch.Tensor, delta: torch.Tensor, rows: int, cols: slic
     return _AddIntoRows.apply(out, delta, rows, cols.start, cols.stop)
 
 
+class _Fp32GradSum(torch.autograd.Function):
+    """The gradients of every ``_WeightUse`` of ``weight``, summed in FP32 and cast to ``weight``'s dtype once.
+
+    Autograd sums the gradients reaching a tensor in that tensor's dtype, so this output is FP32; it is an expanded
+    zero, so forward allocates nothing.
+    """
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor) -> torch.Tensor:
+        ctx.dtype = weight.dtype
+        return weight.new_zeros((), dtype=torch.float32).expand(weight.shape)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        return grad.to(ctx.dtype)
+
+
+class _WeightUse(torch.autograd.Function):
+    """``weight`` itself in forward; in backward its gradient goes to ``grad_sum``, an ``_Fp32GradSum`` of it."""
+
+    @staticmethod
+    def forward(ctx, grad_sum: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return weight.view_as(weight)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad.float(), None
+
+
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -489,7 +518,11 @@ class GroupedExperts(nn.Module):
         return out if scores is None else apply_routing_weights(out, scores)
 
     def _forward_deepep(
-        self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        scores: torch.Tensor | None = None,
+        weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can,
         # and so do BF16 experts with fp32_routed_weighting; the other paths scale their outputs here.
@@ -497,7 +530,7 @@ class GroupedExperts(nn.Module):
             self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda
         )
         if scores is not None and not folds_scores:
-            return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
+            return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert, weights=weights), scores)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
             from arctic_platform.model.implementations.fp8 import grouped_fp8_mm
@@ -562,9 +595,9 @@ class GroupedExperts(nn.Module):
             if n_pad:
                 out = torch.vstack((out, out.new_zeros((n_pad, out.shape[-1]))))
             return out
-        w1 = _maybe_to_local(self.w1)
-        w2 = _maybe_to_local(self.w2)
-        w3 = _maybe_to_local(self.w3)
+        if weights is None:
+            weights = [_maybe_to_local(self.w1), _maybe_to_local(self.w2), _maybe_to_local(self.w3)]
+        w1, w2, w3 = weights
         if self.use_grouped_mm:
             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
@@ -575,13 +608,15 @@ class GroupedExperts(nn.Module):
         num_tokens_per_expert: torch.Tensor | None,
         scores: torch.Tensor | None = None,
         expert_indices: torch.Tensor | None = None,
+        weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs (from
         the down projection's FP32 accumulator with ``fp32_routed_weighting``).
 
         With ``expert_indices`` the rows are the EP receive buffer as delivered instead (one row per token, ``[tokens,
         top_k]`` local expert ids, ``-1`` elsewhere, and their scores), run through SonicMoE. Called through the PEFT
-        wrappers, so LoRA-trained experts see their merged weights here.
+        wrappers, so LoRA-trained experts see their merged weights here. BF16 experts compute with ``weights``, when
+        given, in place of ``[w1, w2, w3]``.
         """
         if expert_indices is not None:
             return sonic_routed_experts(self, x, expert_indices, scores)
@@ -589,7 +624,7 @@ class GroupedExperts(nn.Module):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
             )
-        return self._forward_deepep(x, num_tokens_per_expert, scores)
+        return self._forward_deepep(x, num_tokens_per_expert, scores, weights)
 
     def init_weights(self, init_std: float):
         if self.fp8_block_size is not None:
@@ -829,8 +864,11 @@ class MoE(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         scores: torch.Tensor | None = None,
+        weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        return self.experts(x, num_tokens_per_expert, scores)
+        if weights is None:  # Only GroupedExperts takes weights.
+            return self.experts(x, num_tokens_per_expert, scores)
+        return self.experts(x, num_tokens_per_expert, scores, weights=weights)
 
     def _run_routed_experts(
         self,
@@ -909,7 +947,8 @@ class MoE(nn.Module):
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
             scores = dispatch_state.permuted_scores
-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
+            chunk_weights = None if weights is None else [_WeightUse.apply(s, w) for s, w in zip(grad_sums, weights)]
+            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores, chunk_weights)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
             return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
@@ -928,6 +967,13 @@ class MoE(nn.Module):
             num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
             torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
             num_chunks = int(num_chunks_tensor.item())
+        # Every chunk runs the same expert weights, and autograd sums the chunks' gradients in the weights' dtype, so a
+        # BF16 gradient would be rounded once per chunk. Each chunk reads them through a _WeightUse instead, which
+        # sums in FP32 and rounds once, as the chunked LM head's backward does with its tiles.
+        weights = grad_sums = None
+        if num_chunks > 1 and not use_sonic and experts.w1.requires_grad and torch.is_grad_enabled():
+            weights = [_maybe_to_local(experts.w1), _maybe_to_local(experts.w2), _maybe_to_local(experts.w3)]
+            grad_sums = [_Fp32GradSum.apply(w) for w in weights]
 
         chunk_bounds = [(start, min(start + chunk_size, x.shape[0])) for start in range(0, x.shape[0], chunk_size)]
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
