@@ -35,6 +35,7 @@ from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.stochastic_rounding import stochastic_round_to_bf16
+from arctic_platform.model.weight_export import iter_model_weights
 from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import single_rank_process_group
 
@@ -183,6 +184,22 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
             )
             with open(out, "w") as file:
                 json.dump(summary, file)
+        for weight_format in ("hf", "vllm"):
+            exported = dict(iter_model_weights(engine.module, weight_format, is_master=True, is_zero3=False))
+            for name, parameter in engine.module.named_parameters():
+                assert torch.equal(exported[name], parameter), (weight_format, name)
+        if stochastic:
+            checkpoint_dir = init_file + "_checkpoint"
+            engine.save_checkpoint(checkpoint_dir, tag="saved")
+            engine.backward((weight.float() * model.gradient).sum() + kept.sum())
+            engine.step()
+            uninterrupted = weight.detach().clone()
+            engine.load_checkpoint(checkpoint_dir, tag="saved")
+            assert engine.global_steps == _STEPS
+            assert torch.equal(weight, served[-1])
+            engine.backward((weight.float() * model.gradient).sum() + kept.sum())
+            engine.step()
+            assert torch.equal(weight, uninterrupted)
     finally:
         dist.destroy_process_group()
 
