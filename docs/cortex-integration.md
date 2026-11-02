@@ -42,6 +42,26 @@ constrains what runs correctly here:
 
 ## Operational limits
 
+### Router-replay Wire Contract
+
+**Replay coordination belongs to DSSST1 frame metadata, not the model batch.** For both `forward` and `forward-backward`, serialize `router_replay` next to `response_options` in the frame metadata. Keep tensor inputs and per-row `rr_sample_ids`, `rr_replay_meta` and `rr_discard` in the model payload. Chunk envelopes wrap that completed frame without changing its metadata.
+
+```python
+frame = wire.dumps(
+    batch,
+    metadata=dict(
+        response_options=dict(format="dssst1", delivery="chunked"),
+        router_replay=dict(sampling_job_id="zone-sampling-id", identity_version=1),
+    ),
+)
+```
+
+**The sampler ID is the zone ID returned by successful bootstrap.** `bootstrap-router-replay` accepts public source and target sub-job IDs and returns `sampling_job_id`. Forward requests must use that returned sampler ID for the bootstrapped training/sampling pair, not assume that the public sampler token equals the zone ID. Client transports that cache the mapping must scope it to both public IDs and must not mutate the caller's batch or replay descriptor.
+
+**The consuming zone implements this contract.** Its [metadata reader](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L995) extracts `router_replay.sampling_job_id`; its [forward/backward handler](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L2529) resolves the zone pair from that metadata, and its [bootstrap response](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L3343) returns the sampler ID. `tests/client/test_cortex_forward.py` decodes single and multi-chunk transmitted frames and verifies metadata, per-row replay fields and input immutability.
+
+### Resource And Delivery Limits
+
 * **8 GPUs per account.** The GSM8K recipe asks for 4 training + 4 sampling,
   which is exactly the cap, so two runs cannot coexist.
 * **A response is capped at 128 MiB.** `post=["compute_logprobs"]` returns a
