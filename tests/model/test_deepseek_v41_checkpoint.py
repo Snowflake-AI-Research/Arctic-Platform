@@ -289,6 +289,27 @@ def test_published_keys_convert_and_round_trip(caplog):
     assert torch.equal(counts, torch.zeros_like(counts))
 
 
+def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    model = DeepseekV41ForCausalLM(_convert_config())
+
+    exported = dict(build_iter_full_hf_weights(model)(include_skipped=True))
+    assert not [name for name in exported if name.startswith("model.")]
+    assert "head.weight" in exported and "embed.weight" in exported
+    assert "layers.1.attn.compressor.wgate.weight" in exported
+    assert "layers.0.engram.embed.weight" in exported
+
+    expected = dict(named_weight_sync_tensors(model))
+    loaded = apply_hf_to_prime(dict(exported), model.conversion_chain(model.config))
+    assert sorted(loaded) == sorted(expected)
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor), name
+
+
 def test_source_only_and_unknown_keys_are_rejected():
     model = DeepseekV41ForCausalLM(_convert_config())
     surprises = {

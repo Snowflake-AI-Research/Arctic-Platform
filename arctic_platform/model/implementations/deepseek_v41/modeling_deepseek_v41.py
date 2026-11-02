@@ -217,6 +217,12 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
         return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
 
+    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:  # type: ignore[override]
+        # The chain skips keys a group does not hold, so one decoder layer or the
+        # top-level group (``layer_idx == -1``) goes through it whole. No layer has a hash router to restore.
+        del layer_idx
+        return self.convert_to_hf(state_dict)
+
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
         """Write the converted cache shard by shard. The full snapshot never sits in memory."""
         write_streaming_prime_cache(
