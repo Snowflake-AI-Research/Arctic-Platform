@@ -36,9 +36,10 @@ def _run(layer, x, upstream, chunk_size, checkpointed=False):
 
 
 @pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("trainable", [("w1", "w2", "w3"), ("w1",), ("w2", "w3")])
 @pytest.mark.parametrize(("use_grouped_mm", "fp32_routed_weighting"), [(True, False), (True, True), (False, False)])
 def test_chunked_expert_weight_gradients_are_rounded_once(
-    monkeypatch, use_grouped_mm, fp32_routed_weighting, checkpointed
+    monkeypatch, use_grouped_mm, fp32_routed_weighting, checkpointed, trainable
 ):
     histc = torch.histc
     monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
@@ -61,7 +62,9 @@ def test_chunked_expert_weight_gradients_are_rounded_once(
         for parameter in layer.parameters():
             parameter.normal_(std=0.5)
     layer = layer.to(torch.bfloat16)
-    weights = {name: getattr(layer.experts, name) for name in ("w1", "w2", "w3")}
+    for name in ("w1", "w2", "w3"):
+        getattr(layer.experts, name).requires_grad_(name in trainable)
+    weights = {name: getattr(layer.experts, name) for name in trainable}
     x = torch.randn(NUM_CHUNKS * CHUNK, DIM).to(torch.bfloat16)
     upstream = torch.randn(NUM_CHUNKS * CHUNK, DIM)
 

@@ -365,7 +365,7 @@ class _Fp32GradSum(torch.autograd.Function):
     """The gradients of every ``_WeightUse`` of ``weight``, summed in FP32 and cast to ``weight``'s dtype once.
 
     Autograd sums the gradients reaching a tensor in that tensor's dtype, so this output is FP32; it is an expanded
-    zero, so forward allocates nothing.
+    zero, so forward allocates only a scalar.
     """
 
     @staticmethod
@@ -967,11 +967,14 @@ class MoE(nn.Module):
             num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
             torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
             num_chunks = int(num_chunks_tensor.item())
-        # Every chunk runs the same expert weights, and autograd sums the chunks' gradients in the weights' dtype, so a
-        # BF16 gradient would be rounded once per chunk. Each chunk reads them through a _WeightUse instead, which
-        # sums in FP32 and rounds once, as the chunked LM head's backward does with its tiles.
+        # Fold chunk gradients in FP32 and round once, as the chunked LM head does with its tiles.
         weights = grad_sums = None
-        if num_chunks > 1 and not use_sonic and experts.w1.requires_grad and torch.is_grad_enabled():
+        if (
+            num_chunks > 1
+            and not use_sonic
+            and torch.is_grad_enabled()
+            and any(w.requires_grad for w in (experts.w1, experts.w2, experts.w3))
+        ):
             weights = [_maybe_to_local(experts.w1), _maybe_to_local(experts.w2), _maybe_to_local(experts.w3)]
             grad_sums = [_Fp32GradSum.apply(w) for w in weights]
 
