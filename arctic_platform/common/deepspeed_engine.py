@@ -64,9 +64,9 @@ _OPTIMIZER_ALIASES = {
 class TrainingEngineSpec(BaseModel):
     """Engine inputs that do not depend on a training service.
 
-    ``fp32_masters`` and ``zero_bucket_size`` come from the caller's job config.
-    ``ds_overrides`` is shallow-merged last, matching a client DeepSpeed
-    override block.
+    ``fp32_masters``, ``zero_bucket_size`` and ``stochastic_round_bf16_params``
+    come from the caller's job config. ``ds_overrides`` is shallow-merged last,
+    matching a client DeepSpeed override block.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -80,6 +80,8 @@ class TrainingEngineSpec(BaseModel):
     fp32_masters: bool = False
     zero_bucket_size: int | None = None
     optimizer: OptimizerSettings | None = None
+    # Round the bf16 parameters from their fp32 masters stochastically instead of to nearest; see stochastic_rounding.
+    stochastic_round_bf16_params: bool = False
 
 
 def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
@@ -157,6 +159,7 @@ def initialize_training_engine(
     mpu,
     model_path: str,
     rank: int,
+    stochastic_round_bf16_params: bool = False,
 ):
     """Build the optimizer, keep FP8 storage, and call ``deepspeed.initialize``.
 
@@ -164,6 +167,8 @@ def initialize_training_engine(
     ``optimizer_choice`` are ``None`` when the job has no optimizer.
     ``mpu`` is forwarded only when it is set, so ZeRO reduces sequence-parallel
     gradients over the sequence-data-parallel group.
+    ``stochastic_round_bf16_params`` refuses an engine that is not ZeRO-1/2
+    with fp32 masters behind bf16 parameters.
     """
     built = None
     choice = None
@@ -194,6 +199,10 @@ def initialize_training_engine(
     else:
         engine, *_ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         built = None
+    if stochastic_round_bf16_params:
+        from arctic_platform.common.stochastic_rounding import round_bf16_params_stochastically
+
+        round_bf16_params_stochastically(engine, seed=int(ds_config.get("seed", 0)))
     return engine, built, choice
 
 
