@@ -161,6 +161,26 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
             engine.optimizer.update_lp_params()
             restored_draw = torch.equal(weight.detach(), served[-1])
             restored_kept = torch.equal(kept.detach(), kept_master)
+            engine.optimizer.check_grad_overflow = True
+            engine.backward(weight.float().sum() * float("inf") + kept.sum())
+            engine.step()
+            assert engine.optimizer.overflow and engine.skipped_steps == 1
+            assert torch.equal(weight.detach(), served[-1])
+            engine.optimizer.update_lp_params()
+            assert torch.equal(weight.detach(), served[-1])
+            # A module-only universal load starts at zero with potentially fractional masters.
+            engine.global_steps = engine.skipped_steps = 0
+            engine.optimizer.update_lp_params()
+            initial_draw = weight.detach().clone()
+            for group in engine.optimizer.optimizer.param_groups:
+                group["lr"] = 0.0
+            engine.backward(weight.float().sum() + kept.sum())
+            engine.step()
+            assert not engine.optimizer.overflow
+            assert not torch.equal(weight.detach(), initial_draw)
+            completed_draw = weight.detach().clone()
+            engine.optimizer.update_lp_params()
+            assert torch.equal(weight.detach(), completed_draw)
         if rank == 0:
             q, theta = [s.double() for s in served], masters
             spacing = _bf16_spacing(served[0])

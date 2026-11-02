@@ -51,7 +51,7 @@ def round_bf16_params_stochastically(engine, seed: int) -> None:
     After DeepSpeed's own step, each rank rounds its fp32 master partition into its bf16 partition and the bf16
     groups are all-gathered again, as ``update_lp_params`` does. That method is replaced too, since DeepSpeed calls
     it to re-derive the bf16 parameters after loading a universal checkpoint. A step skipped on overflow draws nothing.
-    Each draw is seeded by ``seed``, the engine's global step, the group and the global rank.
+    Each draw is seeded by ``seed``, the number of successful steps, the group and the global rank.
 
     Raises ``ValueError`` unless the engine is a ZeRO-1/2 optimizer whose bf16 parameter groups have fp32 masters.
     """
@@ -75,9 +75,9 @@ def round_bf16_params_stochastically(engine, seed: int) -> None:
 
     @torch.no_grad()
     def update_lp_params(draw_step=None):
-        # Engine.step increments global_steps after optimizer.step; checkpoint loads restore the completed count.
+        # Both counters advance after optimizer.step; loads restore them, including trailing skipped steps.
         if draw_step is None:
-            draw_step = max(0, engine.global_steps - 1)
+            draw_step = engine.global_steps - engine.skipped_steps
         for i, master in enumerate(optimizer.single_partition_of_fp32_groups):
             partition_id = dist.get_rank(group=optimizer.real_dp_process_group[i])
             bf16 = optimizer.parallel_partitioned_bit16_groups[i][partition_id]
@@ -106,7 +106,7 @@ def round_bf16_params_stochastically(engine, seed: int) -> None:
     def step_then_round(*args, **kwargs):
         step(*args, **kwargs)
         if not optimizer.overflow:
-            update_lp_params(engine.global_steps)
+            update_lp_params(engine.global_steps - engine.skipped_steps + 1)
 
     optimizer.step = step_then_round
     optimizer.update_lp_params = update_lp_params
