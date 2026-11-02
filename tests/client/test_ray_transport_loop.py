@@ -22,6 +22,7 @@ from concurrent.futures import CancelledError
 
 import pytest
 
+from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
 
@@ -73,6 +74,77 @@ def test_run_on_loop_from_the_loop_thread_raises():
 
         assert transport._run_on_loop(_value()) == 7
     finally:
+        transport.shutdown()
+
+
+def test_acall_runs_on_the_private_loop_not_the_caller_loop():
+    transport = _transport()
+
+    class _Server:
+        def __init__(self):
+            self.loop = None
+            self.thread = None
+
+        async def wake_inference(self, job_id, body):
+            self.loop = asyncio.get_running_loop()
+            self.thread = threading.current_thread()
+            return {"job": job_id, "body": body}
+
+    server = _Server()
+    transport._server = server
+    caller_loop = None
+
+    async def _go():
+        nonlocal caller_loop
+        caller_loop = asyncio.get_running_loop()
+        return await transport.acall(Request("wake-inference", "job-1", {"n": 1}))
+
+    try:
+        assert asyncio.run(_go()) == {"job": "job-1", "body": {"n": 1}}
+        assert caller_loop is not transport._loop
+        assert server.loop is transport._loop
+        assert server.thread is transport._loop_thread
+    finally:
+        transport.shutdown()
+
+
+def test_call_and_acall_see_the_same_loop():
+    transport = _transport()
+    seen = []
+
+    class _Server:
+        async def wake_inference(self, job_id, body):
+            del job_id, body
+            seen.append(asyncio.get_running_loop())
+            return {}
+
+    transport._server = _Server()
+    try:
+        transport.call(Request("wake-inference", "job-1", {}))
+        asyncio.run(transport.acall(Request("wake-inference", "job-1", {})))
+        assert seen == [transport._loop, transport._loop]
+    finally:
+        transport.shutdown()
+
+
+def test_cancel_pending_propagates_errors_other_than_timeout():
+    transport = _transport()
+
+    class _Future:
+        def result(self, timeout=None):
+            del timeout
+            raise ValueError("cancel failed")
+
+    def _submit(coro):
+        coro.close()
+        return _Future()
+
+    transport._submit = _submit
+    try:
+        with pytest.raises(ValueError, match="cancel failed"):
+            transport._cancel_pending()
+    finally:
+        del transport._submit
         transport.shutdown()
 
 

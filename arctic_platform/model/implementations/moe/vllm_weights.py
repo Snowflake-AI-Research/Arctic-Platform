@@ -8,12 +8,21 @@ import torch
 import torch.nn as nn
 
 
-def named_weight_sync_tensors(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield parameters, expert biases and module-declared persistent buffers."""
+def named_weight_sync_tensors(
+    model: nn.Module, *, include_export_buffers: bool = True
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield parameters, expert biases and module-declared persistent buffers.
+
+    Weight sync passes ``include_export_buffers=False``: declared buffers are constant
+    checkpoint state the sampler loads with the model, and the receiver only accepts
+    parameter destinations.
+    """
     yield from model.named_parameters()
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
+            continue
+        if not include_export_buffers:
             continue
         module_name, _, buffer_name = name.rpartition(".")
         owning_module = model.get_submodule(module_name)
@@ -209,7 +218,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
     def _iter():
         is_master = dist.get_rank() == 0
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
             by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
         ordered_layers: list[int] = []

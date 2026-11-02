@@ -22,43 +22,21 @@ pytest.importorskip("transformers.models.qwen4_exp")
 # Row-B positions restart at 0, restart at an offset, or continue row A (only varlen metadata can split it).
 @pytest.mark.parametrize("layout", ["zero", "offset", "continuous_with_cu_seqlens"])
 def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
 
     from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
 
     torch.set_num_threads(1)
     torch.manual_seed(19)
-    config = Qwen4ExpTextConfig(
-        vocab_size=32,
-        hidden_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=4,
-        moe_intermediate_size=8,
-        shared_expert_intermediate_size=8,
-        num_experts=2,
-        num_experts_per_tok=1,
-        hc_count=2,
-        hc_lowrank=4,
-        layer_types=["qwen_sparse_attention"],
-        indexer_n_heads=1,
-        indexer_kv_heads=1,
-        indexer_head_dim=4,
-        indexer_budget=2,
-        indexer_compress_ratio=2,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000, "mrope_section": [1, 1, 0]},
-    )
-    qsa.register_qsa_flex_backend()
-    config._attn_implementation = "qsa_flex"
-    model = Qwen4ExpForCausalLM(config).to(torch.bfloat16).eval()
+    model = Qwen4ExpForCausalLM(_config("qsa_flex")).to(torch.bfloat16).eval()
     qsa.apply_qsa_flex(model)
     # Exercise the real attention implementation on CPU; replace only its CUDA/BF16 entry guard.
     monkeypatch.setattr(
         qsa,
         "flex_sparse_gqa_attention",
-        lambda q, k, v, ids, softmax_scale: qsa._SparseGQAAttention.apply(q, k, v, ids, softmax_scale, 128),
+        lambda q, k, v, ids, softmax_scale, fp32_parity: qsa._SparseGQAAttention.apply(
+            q, k, v, ids, softmax_scale, 128, fp32_parity
+        ),
     )
 
     for lengths in ((2, 4), (3, 5), (1, 3)):
@@ -98,6 +76,74 @@ def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
         explicit = model(input_ids=ids, position_ids=torch.arange(3)[None].expand(2, -1), use_cache=False).logits
         torch.testing.assert_close(implicit, explicit)
         torch.testing.assert_close(broadcast, explicit)
+
+
+def _config(attn_implementation, **overrides):
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    fields = dict(
+        vocab_size=32,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+        hc_count=2,
+        hc_lowrank=4,
+        layer_types=["qwen_sparse_attention"],
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=4,
+        indexer_budget=2,
+        indexer_compress_ratio=2,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000, "mrope_section": [1, 1, 0]},
+    )
+    config = Qwen4ExpTextConfig(**(fields | overrides))
+    qsa.register_qsa_flex_backend()
+    config._attn_implementation = attn_implementation
+    return config
+
+
+def test_qsa_gradients_match_transformers_at_sp1(monkeypatch):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    torch.set_num_threads(1)
+    torch.manual_seed(23)
+    # Two KV heads: with one, K transposed out of RoPE's (B, H, T, D) output is still contiguous.
+    models = []
+    for attn_implementation in ("eager", "qsa_flex"):
+        config = _config(attn_implementation, num_attention_heads=4, num_key_value_heads=2, indexer_budget=8)
+        config._experts_implementation = "eager"  # CPU grouped_mm has no float64 kernel
+        models.append(Qwen4ExpForCausalLM(config).double())
+    reference, model = models
+    model.load_state_dict(reference.state_dict())
+    qsa.apply_qsa_flex(model)
+    monkeypatch.setattr(
+        qsa,
+        "flex_sparse_gqa_attention",
+        lambda q, k, v, ids, softmax_scale, fp32_parity: qsa._SparseGQAAttention.apply(
+            q, k, v, ids, softmax_scale, 128, fp32_parity
+        ),
+    )
+
+    ids = torch.arange(6)[None] + 1
+    for each in models:
+        each(input_ids=ids, use_cache=False).logits.square().sum().backward()
+
+    def grads(module):
+        return {name: torch.zeros_like(p) if p.grad is None else p.grad for name, p in module.named_parameters()}
+
+    expected = grads(reference)
+    mismatched = [name for name, grad in grads(model).items() if not torch.allclose(grad, expected[name], 1e-5, 1e-8)]
+    assert not mismatched, f"gradients differ from transformers: {mismatched}"
 
 
 def test_qwen38_packed_boundaries_isolate_padded_tail():
@@ -165,3 +211,49 @@ def test_qwen38_cp_uses_explicit_global_packed_boundaries(monkeypatch):
 
     assert observed["global_cu_seqlens"] is boundaries
     assert getattr(linear, context_parallel._GLOBAL_CU_SEQLENS) is boundaries
+
+
+def test_qsa_backward_sums_key_and_value_gradients_exactly():
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    # Equal scores: each query adds +1/-1 to keys 0/1's dK and 0.5 to their dV; the totals are exact in bf16.
+    # CPU scatter_add_ rounds once per 128-query call, so a bf16 sum only loses adds past 256 calls.
+    queries = 300 * 128
+    query = torch.ones(1, queries, 1, 2, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.tensor([1.0, -1.0], dtype=torch.bfloat16)[None, :, None, None].repeat(1, 1, 1, 2).requires_grad_()
+    routes = torch.tensor([0, 1], dtype=torch.int32).expand(1, queries, 2).contiguous()
+
+    output = qsa._SparseGQAAttention.apply(query, key, value, routes, 1.0, 128, True)
+    output.backward(torch.ones_like(output))
+
+    assert key.grad.dtype == value.grad.dtype == torch.bfloat16
+    expected_key = torch.tensor([queries, -queries], dtype=torch.float32)[None, :, None, None].expand_as(key)
+    torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA FlexAttention entry requires CUDA")
+def test_qsa_cuda_entry_sums_key_and_value_gradients_exactly():
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    # The production entry only accepts CUDA bf16. Its scatter_add_ rounds every atomic add, so a bf16
+    # accumulator stops at 256 here; the returned totals are exact bf16 values once the sum is fp32.
+    queries = 300 * qsa._QSA_ATTENTION_CHUNK_ROWS
+    query = torch.ones(1, queries, 1, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros(1, 2, 1, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    value = (
+        torch.tensor([1.0, -1.0], device="cuda", dtype=torch.bfloat16)[None, :, None, None]
+        .repeat(1, 1, 1, 2)
+        .requires_grad_()
+    )
+    routes = torch.tensor([0, 1], device="cuda", dtype=torch.int32).expand(1, queries, 2).contiguous()
+
+    output = qsa.flex_sparse_gqa_attention(query, key, value, routes, softmax_scale=1.0)
+    output.backward(torch.ones_like(output))
+
+    assert key.grad.dtype == value.grad.dtype == torch.bfloat16
+    key_totals = torch.tensor([queries, -queries], device="cuda", dtype=torch.float32)
+    expected_key = key_totals[None, :, None, None].expand_as(key)
+    torch.testing.assert_close(key.grad.float(), expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value.grad.float(), torch.full(value.shape, queries / 2, device="cuda"), rtol=0, atol=0)
