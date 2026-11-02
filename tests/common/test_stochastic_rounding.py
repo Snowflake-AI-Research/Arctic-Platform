@@ -151,36 +151,7 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
             masters.append(safe_get_full_fp32_param(weight).double())
         gathered = [torch.empty(_NUMEL) for _ in range(_WORLD)]
         dist.all_gather(gathered, weight.detach().float())
-        kept_master = safe_get_full_fp32_param(kept)
-        kept_matches_master = torch.equal(kept.detach(), kept_master)
-        restored_draw = restored_kept = True
-        if stochastic:
-            with torch.no_grad():
-                weight.zero_()
-                kept.zero_()
-            engine.optimizer.update_lp_params()
-            restored_draw = torch.equal(weight.detach(), served[-1])
-            restored_kept = torch.equal(kept.detach(), kept_master)
-            engine.optimizer.check_grad_overflow = True
-            engine.backward(weight.float().sum() * float("inf") + kept.sum())
-            engine.step()
-            assert engine.optimizer.overflow and engine.skipped_steps == 1
-            assert torch.equal(weight.detach(), served[-1])
-            engine.optimizer.update_lp_params()
-            assert torch.equal(weight.detach(), served[-1])
-            # A module-only universal load starts at zero with potentially fractional masters.
-            engine.global_steps = engine.skipped_steps = 0
-            engine.optimizer.update_lp_params()
-            initial_draw = weight.detach().clone()
-            for group in engine.optimizer.optimizer.param_groups:
-                group["lr"] = 0.0
-            engine.backward(weight.float().sum() + kept.sum())
-            engine.step()
-            assert not engine.optimizer.overflow
-            assert not torch.equal(weight.detach(), initial_draw)
-            completed_draw = weight.detach().clone()
-            engine.optimizer.update_lp_params()
-            assert torch.equal(weight.detach(), completed_draw)
+        kept_matches_master = torch.equal(kept.detach(), safe_get_full_fp32_param(kept))
         if rank == 0:
             q, theta = [s.double() for s in served], masters
             spacing = _bf16_spacing(served[0])
@@ -196,8 +167,6 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
                 dtype=str(weight.dtype),
                 kept_dtype=str(kept.dtype),
                 kept_equals_master=bool(kept_matches_master),
-                restored_draw=bool(restored_draw),
-                restored_kept=bool(restored_kept),
                 ranks_identical=all(torch.equal(g, gathered[0]) for g in gathered),
                 q0_on_master=bool(torch.equal(q[0], theta[0])),
                 served_is_nearest=bool(torch.equal(served[-1], theta[-1].float().to(torch.bfloat16))),
@@ -251,8 +220,6 @@ def test_round_to_nearest_leaves_the_bf16_copy_behind_its_master(tmp_path, offlo
 @pytest.mark.parametrize("offload", sorted(_OFFLOAD))
 def test_stochastic_rounding_keeps_the_bf16_copy_unbiased(tmp_path, offload):
     summary = _run_engine(tmp_path, offload, stochastic=True)
-    assert summary["restored_kept"], summary
-    assert summary["restored_draw"], summary
     assert abs(summary["lag_mean"]) < 5 * summary["lag_standard_error"], summary
     served, master = summary["served_move_mean"], summary["master_move_mean"]
     assert abs(served - master) < 5 * summary["served_move_standard_error"], summary

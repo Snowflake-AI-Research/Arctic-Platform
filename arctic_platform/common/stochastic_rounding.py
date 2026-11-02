@@ -14,6 +14,8 @@
 # limitations under the License.
 """Stochastic rounding of ZeRO-1/2's bf16 parameters from their fp32 master weights.
 
+Implements the stochastic-rounding variant of Fair Cast from Andrew Gao and William Gao, "bf16 Rounding Silently
+Discards Most RL Policy Updates: A Hidden Training-Inference Mismatch and an Unbiased One-Line Fix" (arXiv:2610.41073).
 After each optimizer step ZeRO-1/2 copies every rank's fp32 master partition into its bf16 partition with
 round-to-nearest and all-gathers the bf16 parameters, which the forward pass and every weight export read. A master
 can move without changing its bf16 copy when an update does not cross a rounding midpoint. Rounding up with
@@ -48,10 +50,10 @@ def stochastic_round_to_bf16(x: torch.Tensor, generator: torch.Generator) -> tor
 def round_bf16_params_stochastically(engine, seed: int) -> None:
     """Re-derive ``engine``'s bf16 parameters from their fp32 masters by stochastic rounding after every step.
 
-    After DeepSpeed's own step, each rank rounds its fp32 master partition into its bf16 partition and the bf16
-    groups are all-gathered again, as ``update_lp_params`` does. That method is replaced too, since DeepSpeed calls
-    it to re-derive the bf16 parameters after loading a universal checkpoint. A step skipped on overflow draws nothing.
-    Each draw is seeded by ``seed``, the number of successful steps, the group and the global rank.
+    After each DeepSpeed step that updates the masters, each rank rounds its fp32 master partition into its bf16
+    partition and the bf16 groups are all-gathered again. A step skipped on overflow draws nothing. Each draw is seeded
+    by ``seed``, the engine's step counter, the group and the global rank. Loads are DeepSpeed's own: a ZeRO checkpoint
+    restores the saved bf16 parameters, and a universal checkpoint rounds them to nearest until the next step.
 
     Raises ``ValueError`` unless the engine is a ZeRO-1/2 optimizer whose bf16 parameter groups have fp32 masters.
     """
@@ -72,41 +74,33 @@ def round_bf16_params_stochastically(engine, seed: int) -> None:
             " (bf16.bf16_master_weights_and_grads false); the bf16 groups' masters are"
             f" {sorted(map(str, master_dtypes))}"
         )
-
-    @torch.no_grad()
-    def update_lp_params(draw_step=None):
-        # Both counters advance after optimizer.step; loads restore them, including trailing skipped steps.
-        if draw_step is None:
-            draw_step = engine.global_steps - engine.skipped_steps
-        for i, master in enumerate(optimizer.single_partition_of_fp32_groups):
-            partition_id = dist.get_rank(group=optimizer.real_dp_process_group[i])
-            bf16 = optimizer.parallel_partitioned_bit16_groups[i][partition_id]
-            if i not in groups:
-                bf16.copy_(master)
-                continue
-            entropy = np.random.SeedSequence([seed, draw_step, i, dist.get_rank()])
-            generator = torch.Generator(device=bf16.device)
-            generator.manual_seed(int(entropy.generate_state(1, np.uint64)[0]))
-            for start in range(0, master.numel(), _CHUNK_NUMEL):
-                n = min(_CHUNK_NUMEL, master.numel() - start)
-                # With an offloaded optimizer the master is on the CPU: round each chunk on the bf16 copy's device.
-                chunk = master.narrow(0, start, n).to(bf16.device)
-                bf16.narrow(0, start, n).copy_(stochastic_round_to_bf16(chunk, generator))
-        # Looked up on the module at call time, so a replacement installed there after this hook is used too.
-        stage_1_and_2.all_gather_dp_groups(
-            groups_flat=optimizer.bit16_groups_flat,
-            partitioned_param_groups=optimizer.parallel_partitioned_bit16_groups,
-            dp_process_group=optimizer.real_dp_process_group,
-            start_alignment_factor=optimizer.nccl_start_alignment_factor,
-            allgather_bucket_size=optimizer.allgather_bucket_size,
-        )
-
     step = optimizer.step
 
     def step_then_round(*args, **kwargs):
         step(*args, **kwargs)
-        if not optimizer.overflow:
-            update_lp_params(engine.global_steps - engine.skipped_steps + 1)
+        if optimizer.overflow:
+            return
+        with torch.no_grad():
+            for i in groups:
+                master = optimizer.single_partition_of_fp32_groups[i]
+                partition_id = dist.get_rank(group=optimizer.real_dp_process_group[i])
+                bf16 = optimizer.parallel_partitioned_bit16_groups[i][partition_id]
+                # The engine counts every attempted step, skipped ones included, after this returns.
+                entropy = np.random.SeedSequence([seed, engine.global_steps, i, dist.get_rank()])
+                generator = torch.Generator(device=bf16.device)
+                generator.manual_seed(int(entropy.generate_state(1, np.uint64)[0]))
+                for start in range(0, master.numel(), _CHUNK_NUMEL):
+                    n = min(_CHUNK_NUMEL, master.numel() - start)
+                    # With an offloaded optimizer the master is on the CPU: round each chunk on the bf16 copy's device.
+                    chunk = master.narrow(0, start, n).to(bf16.device)
+                    bf16.narrow(0, start, n).copy_(stochastic_round_to_bf16(chunk, generator))
+            # Looked up on the module at call time, so a replacement installed there after this hook is used too.
+            stage_1_and_2.all_gather_dp_groups(
+                groups_flat=[optimizer.bit16_groups_flat[i] for i in groups],
+                partitioned_param_groups=[optimizer.parallel_partitioned_bit16_groups[i] for i in groups],
+                dp_process_group=[optimizer.real_dp_process_group[i] for i in groups],
+                start_alignment_factor=optimizer.nccl_start_alignment_factor,
+                allgather_bucket_size=optimizer.allgather_bucket_size,
+            )
 
     optimizer.step = step_then_round
-    optimizer.update_lp_params = update_lp_params
