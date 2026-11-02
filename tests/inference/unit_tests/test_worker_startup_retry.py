@@ -418,6 +418,26 @@ def test_initialize_failure_without_a_record_is_raised_unchanged(monkeypatch, tm
     assert any("no engine process recorded a failure" in record.getMessage() for record in caplog.records)
 
 
+def test_initialize_failure_takes_the_worker_type_from_a_failed_rpc(monkeypatch, tmp_path):
+    """A warmup fault: the worker's RPC failure, not the EngineCore's wrapper, is the root."""
+    original = RuntimeError(_GENERIC_STARTUP_ERROR)
+    root = "Triton Error [CUDA]: an illegal memory access was encountered"
+
+    def attempt():
+        _run_engine_process("WorkerProc hit an exception.", root)
+        _run_engine_process(
+            "EngineCore failed to start.",
+            f"Worker failed with error '{root}', please check the stack trace above for the root cause",
+        )
+        raise original
+
+    exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+
+    assert type(exc) is EngineStartupError
+    assert str(exc) == f"{_GENERIC_STARTUP_ERROR}\nRoot cause in MainProcess: ValueError: {root}"
+    assert (exc.root_type, exc.root_message) == ("ValueError", root)
+
+
 def test_unreadable_record_keeps_the_original_error(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=worker_mod.logger.name)
 

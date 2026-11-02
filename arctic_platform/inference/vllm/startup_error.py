@@ -50,6 +50,12 @@ _WORKER_RPC_FAILURE = "WorkerProc hit an exception."
 # Suffix of a worker RPC failure's record. Its stem is not a pid, so
 # ``recorded_pids`` (the startup watchdog's signal) leaves it out.
 _RPC_SUFFIX = ".rpc"
+# How the EngineCore's error starts when a worker RPC failed
+# (multiproc_executor.py collective_rpc); ``str()`` of the worker's error follows.
+_WORKER_FAILED_PREFIX = "Worker failed with error '"
+# Enough of a worker's message to find it in the EngineCore's, which MAX_CHARS
+# truncates after the prefix.
+_RPC_MATCH_CHARS = 1000
 
 
 def _type_name(cls: type) -> str:
@@ -71,13 +77,18 @@ def _origin(tb: TracebackType | None) -> str | None:
 
 
 class StartupErrorHandler(logging.Handler):
-    """Write the startup failure this process logs to ``<directory>/<pid>.json``."""
+    """Write the startup failure this process logs to ``<directory>/<pid>.json``.
+
+    A worker's first RPC failure while the directory exists goes to
+    ``<directory>/<pid>.rpc.json``.
+    """
 
     def __init__(self, directory: str) -> None:
         super().__init__(level=logging.ERROR)
         self.directory = directory
 
     def emit(self, record: logging.LogRecord) -> None:
+        rpc = False
         try:
             if not isinstance(record.msg, str) or record.exc_info is None:
                 return
@@ -89,6 +100,7 @@ class StartupErrorHandler(logging.Handler):
                 # keeps later RPC failures out. The first failure is the root.
                 if not os.path.isdir(self.directory):
                     return
+                rpc = True
                 path = os.path.join(self.directory, f"{os.getpid()}{_RPC_SUFFIX}.json")
                 if os.path.exists(path):
                     return
@@ -107,6 +119,10 @@ class StartupErrorHandler(logging.Handler):
             with open(f"{path}.tmp", "w", encoding="utf-8") as f:
                 json.dump(entry, f)
             os.replace(f"{path}.tmp", path)
+        except (FileNotFoundError, NotADirectoryError):
+            if not rpc:
+                self.handleError(record)
+            # Otherwise startup ended after the check above: nothing to record.
         except Exception:
             # Best effort: without a record, InferenceWorker raises vLLM's error unchanged.
             self.handleError(record)
@@ -134,13 +150,18 @@ def recorded_pids(directory: str) -> set[int]:
 
 
 def earliest_startup_record(directory: str) -> dict[str, Any] | None:
-    """The earliest record in ``directory`` (process, type, message, origin), or None.
+    """The root of a failed startup recorded in ``directory`` (process, type, message, origin), or None.
 
-    A worker that fails while starting, or fails an RPC the EngineCore sends while
-    starting, logs its own failure seconds before the EngineCore logs the generic
-    one it caused, so the earliest record is the root.
+    A worker that fails while starting logs its own failure seconds before the
+    EngineCore logs the generic one it caused, so the earliest startup record is
+    the root. When that record is the EngineCore's ``Worker failed with error
+    '<message>'``, the worker RPC failure with that message is the root instead:
+    it has the worker's own type. An RPC failure the EngineCore does not name
+    is never the root, so one that startup survived cannot claim a later,
+    unrelated failure.
     """
-    records = []
+    startup = []
+    rpc = []
     for name in os.listdir(directory):
         if not name.endswith(".json"):
             continue
@@ -148,21 +169,29 @@ def earliest_startup_record(directory: str) -> dict[str, Any] | None:
             with open(os.path.join(directory, name), encoding="utf-8") as f:
                 entry = json.load(f)
             origin = entry.get("origin")
-            records.append(
-                {
-                    "time": float(entry["time"]),
-                    "process": str(entry["process"]),
-                    "type": str(entry["type"]),
-                    "message": str(entry["message"]),
-                    "origin": origin if isinstance(origin, str) else None,
-                }
-            )
+            record = {
+                "time": float(entry["time"]),
+                "process": str(entry["process"]),
+                "type": str(entry["type"]),
+                "message": str(entry["message"]),
+                "origin": origin if isinstance(origin, str) else None,
+            }
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.info("Skipping unreadable engine startup record %s: %s", name, exc)
             continue
-    if len(records) == 0:
+        (rpc if name.endswith(f"{_RPC_SUFFIX}.json") else startup).append(record)
+    if len(startup) == 0:
         return None
-    return min(records, key=lambda record: record["time"])
+    root = min(startup, key=lambda record: record["time"])
+    if root["message"].startswith(_WORKER_FAILED_PREFIX):
+        named = [
+            record
+            for record in rpc
+            if len(record["message"]) > 0 and record["message"][:_RPC_MATCH_CHARS] in root["message"]
+        ]
+        if len(named) > 0:
+            return min(named, key=lambda record: record["time"])
+    return root
 
 
 def format_root_cause(record: dict[str, Any]) -> str:

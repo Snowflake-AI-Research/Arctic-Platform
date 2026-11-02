@@ -21,10 +21,12 @@ vLLM's front end replaces an engine process's own failure with a generic
 failure as fields, so a caller across a Ray actor boundary can classify it
 without reading the message.
 
-This module is the contract. Callers that cannot import Arctic-Platform (or
-run against an older pin that raises a plain ``RuntimeError``) read the
-fields duck-typed, by the names in ``FIELDS``, from the exception or from the
-``.cause`` a ``RayTaskError`` keeps it on. Keep the names and their meaning
+This module is the contract. Callers read the fields duck-typed, by the names
+in ``FIELDS``, from the exception or from the ``.cause`` a ``RayTaskError``
+keeps it on, so one code path also handles an older Arctic-Platform that
+raises a plain ``RuntimeError``. The class is pickled by reference: the
+process that unpickles it (the caller of ``ray.get``) needs an
+Arctic-Platform that has this module. Keep the names and their meaning
 stable; add fields rather than renaming them. No imports beyond the standard
 library, so importing it never pulls in vLLM or torch.
 """

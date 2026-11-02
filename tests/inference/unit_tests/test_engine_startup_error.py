@@ -118,6 +118,32 @@ def test_worker_rpc_failure_during_startup_is_the_root(tmp_path):
     assert startup_error.recorded_pids(str(tmp_path)) == {999999}
 
 
+def test_worker_rpc_failure_the_engine_core_does_not_name_is_not_the_root(tmp_path):
+    """An RPC failure startup survived must not claim a later, unrelated failure."""
+    startup_error.StartupErrorHandler(str(tmp_path)).handle(_worker_rpc_failure("tolerated"))
+    _write(tmp_path, 999999, process="EngineCore", type="RuntimeError", message="unrelated", time=1e12)
+
+    assert startup_error.earliest_startup_error(str(tmp_path)) == "Root cause in EngineCore: RuntimeError: unrelated"
+
+
+def test_worker_rpc_failure_alone_is_not_a_root(tmp_path):
+    startup_error.StartupErrorHandler(str(tmp_path)).handle(_worker_rpc_failure("no engine process failed to start"))
+    (tmp_path / "7.rpc.json.tmp").write_text("{")
+
+    assert startup_error.earliest_startup_record(str(tmp_path)) is None
+
+
+def test_worker_rpc_failure_racing_the_directory_removal_is_dropped(tmp_path, monkeypatch):
+    handler = startup_error.StartupErrorHandler(str(tmp_path / "removed"))
+    reported = []
+    handler.handleError = reported.append
+    monkeypatch.setattr(startup_error.os.path, "isdir", lambda path: True)  # removed after the check
+
+    handler.handle(_worker_rpc_failure("while startup ended"))
+
+    assert reported == []
+
+
 def test_worker_rpc_failure_after_startup_is_not_recorded(tmp_path):
     """InferenceWorker removes the directory when startup ends; a worker still has it in its environment."""
     handler = startup_error.StartupErrorHandler(str(tmp_path / "removed"))
