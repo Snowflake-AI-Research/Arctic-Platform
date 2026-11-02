@@ -148,6 +148,47 @@ def sparse_mla_apply(q, kv, indices, sm_scale):
     return _SparseMLATilelang.apply(q, kv, indices, sm_scale, backend == "flashmla_tilelang")
 
 
+def _exchange(tensors: list[torch.Tensor], peer: int, group: dist.ProcessGroup) -> list[torch.Tensor]:
+    """Swap same-shaped tensors with CP rank ``peer`` (point to point)."""
+    received = [torch.empty_like(t) for t in tensors]
+    global_peer = dist.get_global_rank(group, peer)
+    ops = [dist.P2POp(dist.isend, t.contiguous(), global_peer, group) for t in tensors]
+    ops += [dist.P2POp(dist.irecv, r, global_peer, group) for r in received]
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    return received
+
+
+def _cp_balanced_indexer(q_idx, k_idx, w, ks, ke, index_topk, weight_scale, group, rank, world):
+    """The indexer's top-k for this CP rank's queries, with the causal work split evenly across ranks.
+
+    A query scores every key before it, so with contiguous CP shards the last rank's indexer costs ~15x the first's
+    at 256K (2.76 s against 0.20 s of logits per step on GLM-5.3) and every rank waits for it at the next
+    collective. Ranks ``r`` and ``world - 1 - r`` swap the second halves of their queries, compute top-k for their
+    own first half and the partner's second half, and swap the results back: each pair then holds the same work,
+    ``(r + 0.25) + (world - 1 - r + 0.75)`` shards' worth, on every rank. The indices are the same as unbalanced.
+    """
+    tokens = q_idx.shape[0]
+    local = slice(rank * tokens, (rank + 1) * tokens)
+    partner = world - 1 - rank
+    half = tokens // 2
+    if partner == rank or half == 0:
+        return fp8_indexer(q_idx, k_idx, w, ks[local], ke[local], index_topk, weight_scale)
+    theirs = slice(partner * tokens + half, (partner + 1) * tokens)
+    their_q, their_w = _exchange([q_idx[half:], w[half:]], partner, group)
+    indices = fp8_indexer(
+        torch.cat([q_idx[:half], their_q]),
+        k_idx,
+        torch.cat([w[:half], their_w]),
+        torch.cat([ks[local][:half], ks[theirs]]),
+        torch.cat([ke[local][:half], ke[theirs]]),
+        index_topk,
+        weight_scale,
+    )
+    (mine,) = _exchange([indices[half:]], partner, group)
+    return torch.cat([indices[:half], mine])
+
+
 class Indexer(nn.Module):
     def __init__(self, args: SparseMlaAttentionArgs):
         super().__init__()
@@ -206,10 +247,9 @@ class Indexer(nn.Module):
         if fp8_indexer is None:
             raise ImportError("triton is required for the GLM-5.2 FP8 indexer")
         if cp is not None:
-            group, rank, _world = cp
+            group, rank, world = cp
             k_idx = gather_for_cp(k_idx.unsqueeze(0), group).squeeze(0)
-            local = slice(rank * q_idx.shape[0], (rank + 1) * q_idx.shape[0])
-            indices = fp8_indexer(q_idx, k_idx, w, ks[local], ke[local], index_topk, self.weight_scale)
+            indices = _cp_balanced_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale, group, rank, world)
         else:
             indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
         return indices.view(1, total_tokens, 1, index_topk)
