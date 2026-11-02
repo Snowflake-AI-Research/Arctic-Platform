@@ -122,6 +122,8 @@ def manager_methods(monkeypatch):
         ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
+        ("glm5next_lora", "ensure_glm5next_lora"),
+        ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)
