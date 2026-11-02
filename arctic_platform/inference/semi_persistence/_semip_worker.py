@@ -97,7 +97,7 @@ class SemipGPUWorker(Worker):
         info = ca_graph_rebind.install_fi_ar_workspace_probe()
         print(f"[fi-ar-probe] install({where}): patched={info['patched']} "
               f"missing={info['missing']} suppress={info['suppress']} "
-              f"err={info['err']}", flush=True)
+              f"latched={info.get('latched')} err={info['err']}", flush=True)
 
     def _semip_install_force_copy(self, where):
         """Install the CustomAllreduce copy-path patch and say what stuck.
