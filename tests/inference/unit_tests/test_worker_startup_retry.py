@@ -503,9 +503,55 @@ def _titled(title, script):
     return f"import setproctitle\nsetproctitle.setproctitle({title!r})\n" + script
 
 
+# Every process a test here starts, so the fixture below can reap it.
+_SPAWNED: list = []
+
+
+def _spawn(argv, **kwargs):
+    proc = subprocess.Popen(argv, **kwargs)
+    _SPAWNED.append(proc)
+    return proc
+
+
+@pytest.fixture(autouse=True)
+def _reap_spawned_processes():
+    """Kill and wait on every process a test started, and their descendants,
+    even when the test fails: a leftover ``VLLM::`` process would be seen,
+    and killed, by a later test's kill pass."""
+    import psutil
+
+    yield
+    procs = []
+    for popen in _SPAWNED:
+        try:
+            root = psutil.Process(popen.pid)
+            procs.extend(root.children(recursive=True))
+            procs.append(root)
+        except psutil.Error:
+            pass
+    for proc in procs:
+        try:
+            proc.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=10)
+    for popen in _SPAWNED:
+        popen.kill()
+        popen.wait()
+    _SPAWNED.clear()
+    # When pytest is a subreaper (e.g. PID 1 in a container), a grandchild
+    # orphaned by an engine's kill is reparented here; reap it.
+    for child in psutil.Process().children():
+        try:
+            if child.status() == psutil.STATUS_ZOMBIE:
+                os.waitpid(child.pid, os.WNOHANG)
+        except (psutil.Error, ChildProcessError):
+            pass
+
+
 def _spawn_engine_core(script, *args):
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [_REPO_ROOT, os.environ.get("PYTHONPATH")]))}
-    return subprocess.Popen([sys.executable, "-c", _titled("VLLM::EngineCore", script), *args], env=env)
+    return _spawn([sys.executable, "-c", _titled("VLLM::EngineCore", script), *args], env=env)
 
 
 def _spawn_child(title, script, *args):
@@ -655,14 +701,18 @@ def test_kill_failed_engine_processes_spares_other_children():
     import psutil
 
     engine = _spawn_engine_core(_SLEEP)
-    bystander = subprocess.Popen([sys.executable, "-c", _SLEEP])
+    bystander = _spawn([sys.executable, "-c", _SLEEP])
     try:
         deadline = time.monotonic() + 10
         while not psutil.Process(engine.pid).name().startswith("VLLM::"):
             assert time.monotonic() < deadline
             time.sleep(0.05)
         # A recorded pid that is not a descendant (here pid 1) is never signalled.
-        assert worker_mod._kill_failed_engine_processes({1}) == [engine.pid]
+        # Asserted only about this test's own processes: anything else under
+        # vLLM's title in this process tree would be killed too, by design.
+        killed = worker_mod._kill_failed_engine_processes({1})
+        assert engine.pid in killed
+        assert bystander.pid not in killed and 1 not in killed
         assert engine.wait(timeout=10) == -signal.SIGKILL
         assert bystander.poll() is None
     finally:
@@ -758,3 +808,30 @@ def test_kill_pass_signals_nothing_once_the_watchdog_is_stopped():
     finally:
         engine.kill()
         engine.wait()
+
+
+def test_kill_pass_skips_zombie_descendants():
+    """Under a subreaper, an exited engine process can sit here as a zombie
+    descendant; it holds nothing and is not reported as killed."""
+    import ctypes
+
+    import psutil
+
+    pr_set_child_subreaper = 36
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
+        pytest.skip("needs prctl(PR_SET_CHILD_SUBREAPER)")
+    try:
+        # The parent exits at once, leaving its titled child, which exits too,
+        # reparented to this (subreaper) process as an unreaped zombie.
+        parent = _spawn([sys.executable, "-c", _spawn_child("VLLM::Worker_TP0", "import time; time.sleep(0.5)"), "/dev/null"])
+        parent.wait()
+        deadline = time.monotonic() + 10
+        while not [c for c in psutil.Process().children() if c.status() == psutil.STATUS_ZOMBIE
+                   and c.pid != parent.pid]:
+            assert time.monotonic() < deadline, "no zombie descendant appeared"
+            time.sleep(0.05)
+
+        assert worker_mod._kill_failed_engine_processes(set()) == []
+    finally:
+        libc.prctl(pr_set_child_subreaper, 0, 0, 0, 0)

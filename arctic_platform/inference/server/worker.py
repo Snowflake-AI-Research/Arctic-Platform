@@ -366,6 +366,16 @@ def _process_title(proc: Any) -> str:
         return f.read()
 
 
+def _is_zombie(proc: Any) -> bool:
+    """Whether ``proc`` has exited and awaits reaping, from ``/proc/<pid>/stat``."""
+    if not os.path.isdir("/proc"):
+        import psutil
+
+        return proc.status() == psutil.STATUS_ZOMBIE
+    with open(f"/proc/{proc.pid}/stat", "rb") as f:
+        return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+
+
 def _kill_failed_engine_processes(failed_pids: set[int], stop: threading.Event | None = None) -> list[int]:
     """SIGKILL this process's engine processes after one recorded a startup failure.
 
@@ -390,6 +400,10 @@ def _kill_failed_engine_processes(failed_pids: set[int], stop: threading.Event |
     targets = []
     for proc in descendants:
         try:
+            # A zombie holds nothing and cannot be killed; it is a descendant
+            # only when this process is a subreaper (e.g. PID 1 in a container).
+            if _is_zombie(proc):
+                continue
             if proc.pid in failed_pids or _process_title(proc).startswith(_VLLM_PROCESS_TITLE):
                 targets.append(proc)
         except (OSError, psutil.Error):
