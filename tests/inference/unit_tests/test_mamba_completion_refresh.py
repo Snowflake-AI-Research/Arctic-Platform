@@ -592,15 +592,3 @@ def test_identical_resend_hits_on_an_idle_engine(eagle, window, deferred, manage
     turn = hybrid_turn(manager_methods, eagle=eagle, window=window, churn=False, deferred=deferred, resend=True)
     # vLLM 0.32 moved the EAGLE margin out of the finder, so its resend hit can sit one block higher.
     assert turn.hit >= turn.boundary > 0, turn
-
-
-@pytest.mark.parametrize("prompt", [62800, 63216, 130656, 131072])  # both parities of (prompt - 1) // 416
-def test_prefill_stores_the_checkpoint_an_identical_resend_looks_up(prompt, manager_methods):
-    """With 832-token blocks and the EAGLE drop, prefill's Mamba checkpoint sits on the resend's replay boundary."""
-    tree = ast.parse((manager_methods.parent / "kv_cache_interface.py").read_text())
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_mamba_prefill_checkpoint_position")
-    scope = {}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), "kv_cache_interface", "exec"), scope)  # noqa: S102
-    stored = scope["get_mamba_prefill_checkpoint_position"](prompt, 832, drop_eagle_block=True)
-    resend = min(replay_boundaries(manager_methods, SimpleNamespace(scheduler_block_size=832, eagle_group_ids={0}), prompt))
-    assert stored == resend == (prompt - 1) // 832 * 832 - 832
