@@ -38,29 +38,60 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
 }
 
 
-def zero_logprobs_like(batch: dict) -> torch.Tensor:
-    """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
+def to_cortex_fwd_payload(batch: dict) -> dict:
+    """On-prem SkyRL ``{batch, meta}`` → Cortex ``{args, kwargs, context, processing}``.
 
-    Cortex has no ``/forward``, so a caller asking for log-probs has nothing to
-    call. Zeros are sound only because nothing reads them: this lowering drops
-    ``old_log_probs`` and the server re-derives π_old from the live forward. A
-    reference-model request is refused in ``_CortexClientShim.fwd_no_grad``
-    instead, where zeros would quietly reduce the KL to a function of π_new.
-
-    Re-deriving π_old also makes the ratio exactly 1, so ``eps_clip`` never
-    binds. That is sound as long as the caller takes one optimizer step per
-    collected batch, which is what SkyRL's Arctic trainer does; a caller that
-    stepped several times per batch would be running uncorrected off-policy
-    updates.
+    The on-prem client measures ``max_prompt_len`` and sends it with
+    ``zorro_train_enable``, ``max_response_len``, ``pad_token_id``, and the
+    row tensors (including ``prompts``). Those scalars stay on context. ZoRRo
+    rows stay in the layout the client built. Every other request is
+    left-aligned, because Cortex's packer rejects leading padding.
     """
     import torch
 
-    body = batch.get("batch") if isinstance(batch, dict) else None
-    if not isinstance(body, dict):
-        body = batch if isinstance(batch, dict) else {}
-    ids = body.get("input_ids")
-    b, t = (int(ids.shape[0]), int(ids.shape[-1])) if torch.is_tensor(ids) else (1, 1)
-    return torch.zeros((b, max(t, 1)), dtype=torch.float32)
+    payload = dict(batch)
+    payload.pop("processing", None)
+    payload.pop("router_replay", None)
+    if "batch" in payload and isinstance(payload["batch"], dict):
+        tensors = dict(payload["batch"])
+        meta = dict(payload.get("meta") or {})
+    else:
+        tensors = dict(payload)
+        meta = dict(tensors.pop("context", None) or {})
+
+    input_ids = tensors.get("input_ids")
+    attention_mask = tensors.get("attention_mask")
+    if input_ids is None or attention_mask is None:
+        raise ValueError("cortex /forward requires input_ids and attention_mask")
+
+    if meta.get("zorro_train_enable"):
+        missing = _missing_zorro_meta_keys(meta)
+        if missing:
+            raise ValueError("ZoRRo meta is missing " + ", ".join(missing))
+        prompts = tensors.get("prompts")
+        if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
+            raise ValueError("ZoRRo forward requires batch['prompts'] with width max_prompt_len")
+    else:
+        aligned, _, attention_mask = _left_align_batch(tensors, attention_mask, {})
+        tensors = {**aligned, "attention_mask": attention_mask}
+        input_ids = tensors["input_ids"]
+
+    kwargs = {key: value for key, value in tensors.items() if torch.is_tensor(value)}
+    context = {
+        key: value
+        for key, value in meta.items()
+        if key != "dp_size" and not torch.is_tensor(value)
+    }
+    context["input_ids"] = input_ids
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
+    return {
+        "args": (),
+        "kwargs": kwargs,
+        "context": context,
+        "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+    }
 
 
 # Padding sentinel per tensor. `labels` uses HF's ignore_index so a padded
@@ -108,6 +139,18 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     )
 
 
+def _missing_zorro_meta_keys(meta: dict) -> list[str]:
+    """Keys the worker indexes directly once ZoRRo is on.
+
+    ``run_pipeline`` reads ``max_prompt_len`` when ``zorro_train_enable`` is set.
+    """
+    missing: list[str] = []
+    if meta.get("zorro_train_enable"):
+        if "max_prompt_len" not in meta:
+            missing.append("max_prompt_len")
+    return missing
+
+
 def to_cortex_fwd_bwd_payload(
     batch: dict,
     *,
@@ -130,9 +173,10 @@ def to_cortex_fwd_bwd_payload(
     Cortex's packer rejects any other layout. ZoRRo rows stay in the client
     layout: left-aligning them moves response tokens into the prompt slice the
     unpacked worker reads. A packed job that asks for ZoRRo is refused. ZoRRo
-    sends ``prompt_group_ids`` derived from the original ``prompts`` block.
-    Both paths drop ``old_log_probs``. The server re-derives π_old. Only a
-    real ``True`` selects the ZoRRo path.
+    sends ``prompt_group_ids`` derived from the original ``prompts`` block and
+    keeps the ``old_log_probs`` snapshot on those same columns. The non-ZoRRo
+    path drops ``old_log_probs`` and the server re-derives π_old. Only a real
+    ``True`` selects the ZoRRo path.
     """
     import torch
 
@@ -165,7 +209,7 @@ def to_cortex_fwd_bwd_payload(
     advantages = tensors.pop("advantages", None)
     if advantages is None:
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
-    tensors.pop("old_log_probs", None)
+    old_log_probs = tensors.pop("old_log_probs", None)
 
     if meta.get("zorro_train_enable") is True:
         return _to_cortex_zorro_fwd_bwd(
@@ -176,6 +220,7 @@ def to_cortex_fwd_bwd_payload(
             attention_mask,
             advantages,
             loss_mask,
+            old_log_probs,
         )
 
     forwarded = {"input_ids": input_ids}
@@ -250,6 +295,7 @@ def _to_cortex_zorro_fwd_bwd(
     attention_mask,
     advantages,
     loss_mask,
+    old_log_probs,
 ) -> dict:
     """ZoRRo wire shape. Rows stay in the client layout.
 
@@ -258,7 +304,8 @@ def _to_cortex_zorro_fwd_bwd(
     the loss, so rows are sent as the client built them. A packed job that asks
     for ZoRRo is refused before this runs. ``prompts`` is the original prompt
     block. When the caller did not send ``prompt_group_ids``, they are derived
-    from that block. ``old_log_probs`` is dropped, and the server re-derives π_old.
+    from that block. The ``old_log_probs`` snapshot stays on the caller's
+    columns so it scores the same tokens.
     """
     import torch
 
@@ -276,6 +323,8 @@ def _to_cortex_zorro_fwd_bwd(
         kwargs_out["position_ids"] = tensors["position_ids"]
     if torch.is_tensor(tensors.get("labels")):
         kwargs_out["labels"] = tensors["labels"]
+    if torch.is_tensor(old_log_probs):
+        kwargs_out["old_log_probs"] = old_log_probs
 
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
