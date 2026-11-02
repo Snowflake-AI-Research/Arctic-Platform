@@ -327,6 +327,12 @@ def _end_engine_startup_capture(directory: str | None) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+# How vLLM's generic startup error starts (vllm/v1/engine/utils.py wait_for_engine_startup).
+# Only that error is converted: another RuntimeError raised during the attempt,
+# such as semi_p's restore mismatch, is not the engine failure a record explains.
+_VLLM_STARTUP_FAILED = "Engine core initialization failed."
+
+
 def _engine_startup_error(exc: BaseException, directory: str | None) -> EngineStartupError | None:
     """vLLM's generic startup error as an ``EngineStartupError`` built from the earliest record.
 
@@ -334,12 +340,14 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> EngineSt
     fields carry the engine process's own type, message and origin for a
     classifier across the actor boundary; its message is vLLM's with the root
     appended, as before, for one that matches on ``str()``, which leaves out
-    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic
-    error, is replaced, so every other type keeps the type a classifier matches
-    on. Returns None, so the original is raised as it is, for any other type,
-    when there is no record, or when reading one fails; the last two are logged.
+    ``__notes__``. Only vLLM's generic error, a plain ``RuntimeError`` with
+    vLLM's message, is replaced, so every other error keeps the type a
+    classifier matches on and no record is attached to an error it does not
+    explain. Returns None, so the original is raised as it is, for any other
+    error, when there is no record, or when reading one fails; the last two are
+    logged.
     """
-    if directory is None or type(exc) is not RuntimeError:
+    if directory is None or type(exc) is not RuntimeError or not str(exc).startswith(_VLLM_STARTUP_FAILED):
         return None
     try:
         record = earliest_startup_record(directory)
@@ -355,6 +363,7 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> EngineSt
         root_message=record["message"],
         process=record["process"],
         origin=record["origin"],
+        cuda_error_code=record["cuda_error_code"],
     )
 
 

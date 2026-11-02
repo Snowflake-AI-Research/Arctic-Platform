@@ -513,15 +513,24 @@ def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc)
     (tmp_path / "1.json").write_text('{"process": "EngineCore", "type": "RuntimeError", "message": "x", "time": 1.0}')
 
     assert worker_mod._engine_startup_error(exc, str(tmp_path)) is None
-    converted = worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))
-    assert str(converted) == "generic\nRoot cause in EngineCore: RuntimeError: x"
-    # A record written before ``origin`` existed still converts.
-    assert (converted.root_type, converted.root_message, converted.process, converted.origin) == (
-        "RuntimeError",
-        "x",
-        "EngineCore",
-        None,
-    )
+    converted = worker_mod._engine_startup_error(RuntimeError(_GENERIC_STARTUP_ERROR), str(tmp_path))
+    assert str(converted) == f"{_GENERIC_STARTUP_ERROR}\nRoot cause in EngineCore: RuntimeError: x"
+    # A record written before ``origin`` and ``cuda_error_code`` existed still converts.
+    assert (
+        converted.root_type,
+        converted.root_message,
+        converted.process,
+        converted.origin,
+        converted.cuda_error_code,
+    ) == ("RuntimeError", "x", "EngineCore", None, None)
+
+
+def test_engine_startup_error_converts_only_vllms_message(tmp_path):
+    """semi_p's own restore mismatch is a plain RuntimeError too; a record does not explain it."""
+    (tmp_path / "1.json").write_text('{"process": "EngineCore", "type": "RuntimeError", "message": "x", "time": 1.0}')
+
+    mismatch = RuntimeError("semi_p: restored engine core does not match the requested config")
+    assert worker_mod._engine_startup_error(mismatch, str(tmp_path)) is None
 
 
 # An EngineCore as vLLM leaves it after a CUDA illegal memory access in warmup:

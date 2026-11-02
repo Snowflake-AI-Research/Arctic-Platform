@@ -64,6 +64,12 @@ def _type_name(cls: type) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def _cuda_error_code(exc: BaseException) -> int | None:
+    """The CUDA error code torch sets on a ``torch.AcceleratorError`` instance, or None."""
+    code = getattr(exc, "error_code", None)
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def _origin(tb: TracebackType | None) -> str | None:
     """``<module>.<qualname>`` of the innermost frame of ``tb``, the code that raised."""
     if tb is None:
@@ -114,6 +120,7 @@ class StartupErrorHandler(logging.Handler):
                 "type": _type_name(type(exc)),
                 "message": str(exc)[:MAX_CHARS],
                 "origin": _origin(exc.__traceback__),
+                "cuda_error_code": _cuda_error_code(exc),
                 "time": record.created,
             }
             with open(f"{path}.tmp", "w", encoding="utf-8") as f:
@@ -150,7 +157,7 @@ def recorded_pids(directory: str) -> set[int]:
 
 
 def earliest_startup_record(directory: str) -> dict[str, Any] | None:
-    """The root of a failed startup recorded in ``directory`` (process, type, message, origin), or None.
+    """The root of a failed startup recorded in ``directory`` (process, type, message, origin, code), or None.
 
     A worker that fails while starting logs its own failure seconds before the
     EngineCore logs the generic one it caused, so the earliest startup record is
@@ -169,12 +176,14 @@ def earliest_startup_record(directory: str) -> dict[str, Any] | None:
             with open(os.path.join(directory, name), encoding="utf-8") as f:
                 entry = json.load(f)
             origin = entry.get("origin")
+            code = entry.get("cuda_error_code")
             record = {
                 "time": float(entry["time"]),
                 "process": str(entry["process"]),
                 "type": str(entry["type"]),
                 "message": str(entry["message"]),
                 "origin": origin if isinstance(origin, str) else None,
+                "cuda_error_code": code if isinstance(code, int) and not isinstance(code, bool) else None,
             }
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.info("Skipping unreadable engine startup record %s: %s", name, exc)

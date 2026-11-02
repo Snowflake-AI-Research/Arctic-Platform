@@ -47,7 +47,10 @@ PROCESS = "process"
 # ``vllm.v1.core.kv_cache_utils._check_enough_kv_cache_memory``, or None when
 # the record had no traceback. Identifies errors vLLM raises as bare builtins.
 ORIGIN = "origin"
-FIELDS = (ROOT_TYPE, ROOT_MESSAGE, PROCESS, ORIGIN)
+# The CUDA runtime error code torch puts on a ``torch.AcceleratorError``
+# instance as ``error_code`` (e.g. 700 for an illegal address), or None.
+CUDA_ERROR_CODE = "cuda_error_code"
+FIELDS = (ROOT_TYPE, ROOT_MESSAGE, PROCESS, ORIGIN, CUDA_ERROR_CODE)
 
 
 class EngineStartupError(RuntimeError):
@@ -62,10 +65,11 @@ class EngineStartupError(RuntimeError):
     def __init__(
         self,
         message: str,
-        root_type: str,
-        root_message: str,
-        process: str,
+        root_type: str = "",
+        root_message: str = "",
+        process: str = "",
         origin: str | None = None,
+        cuda_error_code: int | None = None,
     ) -> None:
         super().__init__(message)
         # Instance attributes only, never class-level defaults: Ray's
@@ -75,12 +79,20 @@ class EngineStartupError(RuntimeError):
         self.root_message = root_message
         self.process = process
         self.origin = origin
+        self.cuda_error_code = cuda_error_code
 
     def __reduce__(self) -> tuple[Any, ...]:
         # BaseException's reduce re-calls the class with ``args`` only, which
         # loses the fields. The state dict carries ``__notes__`` and the fields.
         return (
             type(self),
-            (self.args[0] if self.args else "", self.root_type, self.root_message, self.process, self.origin),
+            (
+                self.args[0] if self.args else "",
+                self.root_type,
+                self.root_message,
+                self.process,
+                self.origin,
+                self.cuda_error_code,
+            ),
             self.__dict__,
         )

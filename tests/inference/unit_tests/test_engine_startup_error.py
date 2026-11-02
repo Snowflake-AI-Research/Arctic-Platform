@@ -31,6 +31,7 @@ def test_handler_records_a_startup_failure(tmp_path, msg):
         "type": "ValueError",
         "message": "Field 'x' not found in VllmConfig.",
         "origin": None,  # never raised, so no traceback
+        "cuda_error_code": None,
         "time": record.created,
     }
 
@@ -77,6 +78,20 @@ def test_handler_records_where_the_exception_was_raised(tmp_path):
     record = startup_error.earliest_startup_record(str(tmp_path))
     assert record["origin"] == f"{__name__}._check_enough_kv_cache_memory"
     assert record["type"] == "ValueError"
+
+
+def test_handler_records_the_cuda_error_code(tmp_path):
+    class AcceleratorError(RuntimeError):
+        pass
+
+    AcceleratorError.__module__ = "torch"
+    AcceleratorError.__qualname__ = "AcceleratorError"
+    exc = AcceleratorError("CUDA error: an illegal memory access was encountered")
+    exc.error_code = 700  # what torch sets on the instance it raises
+    startup_error.StartupErrorHandler(str(tmp_path)).handle(_record("EngineCore failed to start.", exc))
+
+    record = startup_error.earliest_startup_record(str(tmp_path))
+    assert (record["type"], record["cuda_error_code"]) == ("torch.AcceleratorError", 700)
 
 
 def _worker_rpc_failure(message):

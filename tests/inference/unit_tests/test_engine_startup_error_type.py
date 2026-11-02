@@ -21,6 +21,7 @@ _FIELDS = {
     "root_message": "CUDA out of memory. Tried to allocate 2.00 GiB.",
     "process": "Worker_TP0",
     "origin": "torch.nn.modules.linear.Linear.forward",
+    "cuda_error_code": None,
 }
 
 
@@ -35,7 +36,7 @@ def _fields(exc):
 
 
 def test_contract_names_the_fields():
-    assert engine_startup_error.FIELDS == ("root_type", "root_message", "process", "origin")
+    assert engine_startup_error.FIELDS == ("root_type", "root_message", "process", "origin", "cuda_error_code")
     assert _fields(_error()) == _FIELDS
 
 
@@ -55,9 +56,20 @@ def test_survives_pickling(protocol):
     assert restored.__notes__ == _error().__notes__
 
 
-def test_origin_is_optional():
+def test_origin_and_code_are_optional():
     restored = pickle.loads(pickle.dumps(EngineStartupError("m", "ValueError", "x", "EngineCore")))
-    assert restored.origin is None
+    assert (restored.origin, restored.cuda_error_code) == (None, None)
+
+
+def test_cuda_error_code_survives_pickling():
+    exc = EngineStartupError("m", "torch.AcceleratorError", "CUDA error: x", "Worker_TP0", cuda_error_code=700)
+    assert pickle.loads(pickle.dumps(exc)).cuda_error_code == 700
+
+
+def test_rebuilds_from_its_args():
+    """Code that re-raises ``type(exc)(*exc.args)`` must not fail inside error handling."""
+    rebuilt = type(_error())(*_error().args)
+    assert str(rebuilt) == _MESSAGE
 
 
 @pytest.fixture(scope="module")
