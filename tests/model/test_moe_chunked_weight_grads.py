@@ -36,10 +36,11 @@ def _run(layer, x, upstream, chunk_size, checkpointed=False):
 
 
 @pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("trainable", [("w1", "w2", "w3"), ("w1",), ("w2", "w3")])
 @pytest.mark.parametrize(("use_grouped_mm", "fp32_routed_weighting"), [(True, False), (True, True), (False, False)])
 def test_chunked_expert_weight_gradients_are_rounded_once(
-    monkeypatch, use_grouped_mm, fp32_routed_weighting, checkpointed, trainable
+    monkeypatch, use_grouped_mm, fp32_routed_weighting, checkpointed, trainable, lora
 ):
     histc = torch.histc
     monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
@@ -62,9 +63,24 @@ def test_chunked_expert_weight_gradients_are_rounded_once(
         for parameter in layer.parameters():
             parameter.normal_(std=0.5)
     layer = layer.to(torch.bfloat16)
+    if lora:
+        from peft import LoraConfig
+        from peft import get_peft_model
+
+        get_peft_model(
+            layer,
+            LoraConfig(
+                r=4,
+                target_modules=[],
+                target_parameters=["experts.w1", "experts.w2", "experts.w3"],
+                init_lora_weights=False,
+            ),
+            autocast_adapter_dtype=False,
+        )
+    experts = moe._unwrap_experts(layer.experts)
     for name in ("w1", "w2", "w3"):
-        getattr(layer.experts, name).requires_grad_(name in trainable)
-    weights = {name: getattr(layer.experts, name) for name in trainable}
+        getattr(experts, name).requires_grad_(name in trainable)
+    weights = {name: getattr(experts, name) for name in trainable}
     x = torch.randn(NUM_CHUNKS * CHUNK, DIM).to(torch.bfloat16)
     upstream = torch.randn(NUM_CHUNKS * CHUNK, DIM)
 
@@ -74,6 +90,7 @@ def test_chunked_expert_weight_gradients_are_rounded_once(
     out, input_grad = _run(layer, x, upstream, CHUNK, checkpointed)
     assert fires == dict.fromkeys(weights, 1)
     grads = {name: weight.grad for name, weight in weights.items()}
+    adapter_grads = {name: p.grad for name, p in layer.named_parameters() if "lora_" in name}
 
     exact = dict.fromkeys(weights, 0)
     for start in range(0, len(x), CHUNK):
@@ -89,3 +106,6 @@ def test_chunked_expert_weight_gradients_are_rounded_once(
     frozen_out, frozen_input_grad = _run(layer, x, upstream, CHUNK, checkpointed)
     torch.testing.assert_close(out, frozen_out, rtol=0, atol=0)
     torch.testing.assert_close(input_grad, frozen_input_grad, rtol=0, atol=0)
+    for name, parameter in layer.named_parameters():
+        if name in adapter_grads:
+            torch.testing.assert_close(parameter.grad, adapter_grads[name], rtol=0, atol=0)
