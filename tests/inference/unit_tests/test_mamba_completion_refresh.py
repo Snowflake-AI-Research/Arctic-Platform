@@ -423,8 +423,8 @@ def replay_boundaries(root, coordinator, num_prompt_tokens):
     return scope["get_replay_boundaries"](coordinator, SimpleNamespace(num_prompt_tokens=num_prompt_tokens))
 
 
-def hybrid_turn(root, *, eagle, window, churn, deferred):
-    """One finished turn of a hybrid request; returns what the next, longer turn can reuse.
+def hybrid_turn(root, *, eagle, window, churn, deferred, resend=False):
+    """One finished turn of a hybrid request; returns what the next, longer turn (or an identical resend) can reuse.
 
     Real vLLM retention masks, retirement, allocation, completion release, per-group hit
     finders and hybrid reconciliation; positions are tokens (block size 1). Decode runs
@@ -551,10 +551,13 @@ def hybrid_turn(root, *, eagle, window, churn, deferred):
     everything = [*others, *attention_blocks, *itertools.chain(*owned.values())]
     assert pool.get_num_free_blocks() == len(everything) - len(taken)
     assert all(b.ref_cnt == 0 for b in everything if b not in taken)
-    hit = scope["hybrid_hit"](coordinator, list(range(DECODED + 2)), DECODED + 1)[1]
+    if resend:  # the identical prompt again: hashes of the prompt only, capped one token short
+        hit = scope["hybrid_hit"](coordinator, list(range(PROMPT)), PROMPT - 1)[1]
+    else:
+        hit = scope["hybrid_hit"](coordinator, list(range(DECODED + 2)), DECODED + 1)[1]
     return SimpleNamespace(
         hit=hit,
-        boundary=max(boundaries),
+        boundary=min(boundaries) if resend else max(boundaries),
         held=held,
         live_window=live_window,
         tail=window_cls._contiguous_blocks_for_hit(WINDOW, 1, eagle),
@@ -580,3 +583,23 @@ def test_hybrid_turn_holds_at_most_one_boundary_per_group(eagle, window, manager
         assert turn.held[2] <= turn.tail, turn
         # vLLM's admission invariant: a request's real-held window blocks stay within its cap.
         assert turn.live_window + turn.held[2] <= turn.window_cap, turn
+
+
+@pytest.mark.parametrize("eagle,window", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_identical_resend_hits_on_an_idle_engine(eagle, window, deferred, manager_methods):
+    """An identical prompt sent again after the first finished reuses the prefix up to its replay boundary."""
+    turn = hybrid_turn(manager_methods, eagle=eagle, window=window, churn=False, deferred=deferred, resend=True)
+    assert turn.hit == turn.boundary, turn
+
+
+@pytest.mark.parametrize("prompt", [62800, 63216, 130656, 131072])  # both parities of (prompt - 1) // 416
+def test_prefill_stores_the_checkpoint_an_identical_resend_looks_up(prompt, manager_methods):
+    """With 832-token blocks and the EAGLE drop, prefill's Mamba checkpoint sits on the resend's replay boundary."""
+    tree = ast.parse((manager_methods.parent / "kv_cache_interface.py").read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_mamba_prefill_checkpoint_position")
+    scope = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), "kv_cache_interface", "exec"), scope)  # noqa: S102
+    stored = scope["get_mamba_prefill_checkpoint_position"](prompt, 832, drop_eagle_block=True)
+    resend = min(replay_boundaries(manager_methods, SimpleNamespace(scheduler_block_size=832, eagle_group_ids={0}), prompt))
+    assert stored == resend == (prompt - 1) // 832 * 832 - 832
