@@ -30,6 +30,7 @@ def test_handler_records_a_startup_failure(tmp_path, msg):
         "process": "Worker_TP0",
         "type": "ValueError",
         "message": "Field 'x' not found in VllmConfig.",
+        "origin": None,  # never raised, so no traceback
         "time": record.created,
     }
 
@@ -37,8 +38,6 @@ def test_handler_records_a_startup_failure(tmp_path, msg):
 @pytest.mark.parametrize(
     "record",
     [
-        # A worker that fails during an RPC: the EngineCore records the failure it raises.
-        _record("WorkerProc hit an exception.", RuntimeError("block_kv == 64")),
         _record("EngineCore encountered a fatal error.", RuntimeError("after startup")),
         _record("EngineCore failed to start."),
         _record({"msg": "not a string"}, RuntimeError("x")),
@@ -63,6 +62,72 @@ def test_handler_names_the_type_as_tracebacks_do(tmp_path):
     assert startup_error.earliest_startup_error(str(tmp_path)) == (
         "Root cause in MainProcess: torch.OutOfMemoryError: CUDA out of memory."
     )
+
+
+def _check_enough_kv_cache_memory():
+    raise ValueError("36.21 GiB KV cache is needed, which is larger than the available KV cache memory")
+
+
+def test_handler_records_where_the_exception_was_raised(tmp_path):
+    try:
+        _check_enough_kv_cache_memory()
+    except ValueError as exc:
+        startup_error.StartupErrorHandler(str(tmp_path)).handle(_record("EngineCore failed to start.", exc))
+
+    record = startup_error.earliest_startup_record(str(tmp_path))
+    assert record["origin"] == f"{__name__}._check_enough_kv_cache_memory"
+    assert record["type"] == "ValueError"
+
+
+def _worker_rpc_failure(message):
+    class AcceleratorError(RuntimeError):
+        pass
+
+    AcceleratorError.__module__ = "torch"
+    AcceleratorError.__qualname__ = "AcceleratorError"
+    try:
+        raise AcceleratorError(message)
+    except AcceleratorError as exc:
+        return _record("WorkerProc hit an exception.", exc, vllm_process_name="Worker_TP1")
+
+
+def test_worker_rpc_failure_during_startup_is_the_root(tmp_path):
+    """A warmup fault: the worker's own type, not the EngineCore's ``Worker failed with error``."""
+    handler = startup_error.StartupErrorHandler(str(tmp_path))
+    rpc = _worker_rpc_failure("CUDA error: an illegal memory access was encountered")
+    handler.handle(rpc)
+    handler.handle(_worker_rpc_failure("a later RPC failure"))
+    _write(
+        tmp_path,
+        999999,
+        process="EngineCore",
+        type="RuntimeError",
+        message="Worker failed with error 'CUDA error: an illegal memory access was encountered'",
+        time=rpc.created + 1.0,
+    )
+
+    assert os.path.exists(tmp_path / f"{os.getpid()}.rpc.json")
+    record = startup_error.earliest_startup_record(str(tmp_path))
+    assert (record["process"], record["type"], record["message"]) == (
+        "Worker_TP1",
+        "torch.AcceleratorError",
+        "CUDA error: an illegal memory access was encountered",
+    )
+    assert record["origin"] == f"{__name__}._worker_rpc_failure"
+    # The startup watchdog keys on processes that failed to start, not on RPC failures.
+    assert startup_error.recorded_pids(str(tmp_path)) == {999999}
+
+
+def test_worker_rpc_failure_after_startup_is_not_recorded(tmp_path):
+    """InferenceWorker removes the directory when startup ends; a worker still has it in its environment."""
+    handler = startup_error.StartupErrorHandler(str(tmp_path / "removed"))
+    reported = []
+    handler.handleError = reported.append
+
+    handler.handle(_worker_rpc_failure("after READY"))
+
+    assert reported == []
+    assert os.listdir(tmp_path) == []
 
 
 def test_handler_write_failure_goes_to_handle_error(tmp_path):

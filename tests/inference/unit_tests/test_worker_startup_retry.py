@@ -42,6 +42,7 @@ if "vllm" not in sys.modules:
         module.__path__ = []
         sys.modules[name] = module
 
+from arctic_platform.inference.engine_startup_error import EngineStartupError
 from arctic_platform.inference.server import worker as worker_mod
 from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
@@ -388,8 +389,14 @@ def test_initialize_failure_carries_the_engine_root_cause(monkeypatch, tmp_path)
         monkeypatch, tmp_path, [_engine_fails("WorkerProc failed to start.", root, original)]
     )
 
-    assert type(exc) is RuntimeError
+    assert type(exc) is EngineStartupError
     assert str(exc) == f"{_GENERIC_STARTUP_ERROR}\nRoot cause in MainProcess: ValueError: {root}"
+    assert (exc.root_type, exc.root_message, exc.process, exc.origin) == (
+        "ValueError",
+        root,
+        "MainProcess",
+        "__main__.<module>",
+    )
     assert exc.__cause__ is original
     assert not getattr(original, "__notes__", None)
     # #196's console tail goes on the raised error, so it is rendered once, after the root.
@@ -417,7 +424,7 @@ def test_unreadable_record_keeps_the_original_error(monkeypatch, tmp_path, caplo
     def unreadable(directory):
         raise PermissionError(13, "Permission denied", directory)
 
-    monkeypatch.setattr(worker_mod, "earliest_startup_error", unreadable)
+    monkeypatch.setattr(worker_mod, "earliest_startup_record", unreadable)
     original = RuntimeError(_GENERIC_STARTUP_ERROR)
 
     exc, _ = _initialize_with_engine_attempts(
@@ -486,8 +493,14 @@ def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc)
     (tmp_path / "1.json").write_text('{"process": "EngineCore", "type": "RuntimeError", "message": "x", "time": 1.0}')
 
     assert worker_mod._engine_startup_error(exc, str(tmp_path)) is None
-    assert str(worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))) == (
-        "generic\nRoot cause in EngineCore: RuntimeError: x"
+    converted = worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))
+    assert str(converted) == "generic\nRoot cause in EngineCore: RuntimeError: x"
+    # A record written before ``origin`` existed still converts.
+    assert (converted.root_type, converted.root_message, converted.process, converted.origin) == (
+        "RuntimeError",
+        "x",
+        "EngineCore",
+        None,
     )
 
 
@@ -620,7 +633,7 @@ def test_engine_that_records_its_failure_and_hangs_is_killed(monkeypatch, tmp_pa
 
     assert elapsed < 10
     assert engine.returncode == -signal.SIGKILL
-    assert type(exc) is RuntimeError
+    assert type(exc) is EngineStartupError
     assert f"Root cause in MainProcess: ValueError: {root}" in str(exc)
     assert any(f"watchdog killed engine processes [{engine.pid}]" in note for note in exc.__notes__)
     assert _watchdog_threads() == []

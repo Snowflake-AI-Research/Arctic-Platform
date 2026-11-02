@@ -19,8 +19,9 @@ vLLM's front end raises only "Engine core initialization failed. See root cause
 above."; the root stays in the EngineCore or worker process that logged it.
 InferenceWorker points ``ARCTIC_ENGINE_STARTUP_ERROR_DIR`` at a fresh directory
 for each startup attempt, the Arctic plugin installs ``StartupErrorHandler`` in
-every engine process it loads in, and InferenceWorker appends the earliest
-record to the error it raises.
+every engine process it loads in, and InferenceWorker raises the earliest
+record as an ``EngineStartupError``
+(``arctic_platform.inference.engine_startup_error``).
 
 Remove this once vLLM carries the failure in its startup handshake.
 """
@@ -30,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from types import TracebackType
+from typing import Any
 
 ENV_VAR = "ARCTIC_ENGINE_STARTUP_ERROR_DIR"
 MAX_CHARS = 2000
@@ -39,6 +42,32 @@ logger = logging.getLogger(__name__)
 # What vLLM 0.32 logs, with the exception, when an EngineCore or a worker dies
 # before it is ready (core.py run_engine_core, multiproc_executor.py worker_main).
 _STARTUP_FAILURES = frozenset({"EngineCore failed to start.", "WorkerProc failed to start."})
+# What a worker logs, with the exception, when an RPC from the EngineCore fails
+# (multiproc_executor.py _execute_worker_rpc). The EngineCore then raises only
+# ``RuntimeError("Worker failed with error '<str>'...")``, so during startup
+# (profile run, KV cache init, warmup) this is the only record of the real type.
+_WORKER_RPC_FAILURE = "WorkerProc hit an exception."
+# Suffix of a worker RPC failure's record. Its stem is not a pid, so
+# ``recorded_pids`` (the startup watchdog's signal) leaves it out.
+_RPC_SUFFIX = ".rpc"
+
+
+def _type_name(cls: type) -> str:
+    if cls.__module__ in ("builtins", "__main__"):
+        return cls.__qualname__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _origin(tb: TracebackType | None) -> str | None:
+    """``<module>.<qualname>`` of the innermost frame of ``tb``, the code that raised."""
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    module = tb.tb_frame.f_globals.get("__name__")
+    name = getattr(code, "co_qualname", code.co_name)
+    return f"{module}.{name}" if module else name
 
 
 class StartupErrorHandler(logging.Handler):
@@ -50,23 +79,31 @@ class StartupErrorHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            if not isinstance(record.msg, str) or record.msg not in _STARTUP_FAILURES or record.exc_info is None:
+            if not isinstance(record.msg, str) or record.exc_info is None:
+                return
+            if record.msg in _STARTUP_FAILURES:
+                path = os.path.join(self.directory, f"{os.getpid()}.json")
+            elif record.msg == _WORKER_RPC_FAILURE:
+                # A worker keeps the directory in its environment after startup;
+                # InferenceWorker removes it once startup ends, which is what
+                # keeps later RPC failures out. The first failure is the root.
+                if not os.path.isdir(self.directory):
+                    return
+                path = os.path.join(self.directory, f"{os.getpid()}{_RPC_SUFFIX}.json")
+                if os.path.exists(path):
+                    return
+            else:
                 return
             exc = record.exc_info[1]
             if exc is None:
                 return
-            cls = type(exc)
-            if cls.__module__ in ("builtins", "__main__"):
-                type_name = cls.__qualname__
-            else:
-                type_name = f"{cls.__module__}.{cls.__qualname__}"
             entry = {
                 "process": getattr(record, "vllm_process_name", None) or record.processName,
-                "type": type_name,
+                "type": _type_name(type(exc)),
                 "message": str(exc)[:MAX_CHARS],
+                "origin": _origin(exc.__traceback__),
                 "time": record.created,
             }
-            path = os.path.join(self.directory, f"{os.getpid()}.json")
             with open(f"{path}.tmp", "w", encoding="utf-8") as f:
                 json.dump(entry, f)
             os.replace(f"{path}.tmp", path)
@@ -96,11 +133,12 @@ def recorded_pids(directory: str) -> set[int]:
     return pids
 
 
-def earliest_startup_error(directory: str) -> str | None:
-    """``Root cause in <process>: <type>: <message>`` for the earliest record, or None.
+def earliest_startup_record(directory: str) -> dict[str, Any] | None:
+    """The earliest record in ``directory`` (process, type, message, origin), or None.
 
-    A worker that fails while starting logs its own failure seconds before the
-    EngineCore logs the generic one it caused, so the earliest record is the root.
+    A worker that fails while starting, or fails an RPC the EngineCore sends while
+    starting, logs its own failure seconds before the EngineCore logs the generic
+    one it caused, so the earliest record is the root.
     """
     records = []
     for name in os.listdir(directory):
@@ -109,11 +147,30 @@ def earliest_startup_error(directory: str) -> str | None:
         try:
             with open(os.path.join(directory, name), encoding="utf-8") as f:
                 entry = json.load(f)
-            records.append((float(entry["time"]), entry["process"], entry["type"], entry["message"]))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+            origin = entry.get("origin")
+            records.append(
+                {
+                    "time": float(entry["time"]),
+                    "process": str(entry["process"]),
+                    "type": str(entry["type"]),
+                    "message": str(entry["message"]),
+                    "origin": origin if isinstance(origin, str) else None,
+                }
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.info("Skipping unreadable engine startup record %s: %s", name, exc)
             continue
     if len(records) == 0:
         return None
-    _, process, type_name, message = min(records, key=lambda record: record[0])
-    return f"Root cause in {process}: {type_name}: {message}"[:MAX_CHARS]
+    return min(records, key=lambda record: record["time"])
+
+
+def format_root_cause(record: dict[str, Any]) -> str:
+    """``Root cause in <process>: <type>: <message>``, the line older classifiers match."""
+    return f"Root cause in {record['process']}: {record['type']}: {record['message']}"[:MAX_CHARS]
+
+
+def earliest_startup_error(directory: str) -> str | None:
+    """``Root cause in <process>: <type>: <message>`` for the earliest record, or None."""
+    record = earliest_startup_record(directory)
+    return None if record is None else format_root_cause(record)

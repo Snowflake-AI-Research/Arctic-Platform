@@ -29,6 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _INFERENCE = os.path.dirname(os.path.dirname(_HERE))
 _WORKER = os.path.join(_INFERENCE, "server", "worker.py")
 _STARTUP_ERROR = os.path.join(_INFERENCE, "vllm", "startup_error.py")
+_ENGINE_STARTUP_ERROR = os.path.join(_INFERENCE, "engine_startup_error.py")
 
 _RING = object()
 _ADDRESS_IN_USE = RuntimeError("DistNetworkError: EADDRINUSE address already in use")
@@ -114,6 +115,8 @@ def env(monkeypatch):
     noop = lambda *a, **k: None  # noqa: E731
     stubs = {
         "ray": _module("ray", remote=_remote),
+        "arctic_platform.inference.engine_startup_error": _load(
+            "arctic_platform.inference.engine_startup_error", _ENGINE_STARTUP_ERROR),
         "arctic_platform.inference.envs": _module(
             "envs", arctic_inference_effective_enabled=lambda *a: False),
         "arctic_platform.inference.server.chat": _module(
