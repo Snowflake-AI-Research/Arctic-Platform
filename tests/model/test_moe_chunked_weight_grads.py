@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BF16 experts run once per expert-parallel token chunk; their weight gradient is the FP32 sum of the chunks' rounded
-once, through the production dispatch path with only the cross-rank exchange replaced."""
+"""BF16 experts run once per expert-parallel token chunk; their weight gradient is the sum of the chunks' gradients
+rounded once, through the production dispatch path with only the cross-rank exchange replaced."""
 
 import pytest
 import torch
@@ -77,7 +77,7 @@ def test_chunked_expert_weight_gradients_are_rounded_once(
         _run(layer, x[start : start + CHUNK], upstream[start : start + CHUNK], None)
         for name, weight in weights.items():
             exact[name] = exact[name] + weight.grad.double()
-    for name in weights:  # FP32 holds these sums of eight BF16 values exactly, so this is also their FP32 sum
+    for name in weights:  # FP32 summation error is far below a BF16 rounding: the exact sum, rounded once
         torch.testing.assert_close(grads[name], exact[name].to(torch.bfloat16), rtol=0, atol=0)
 
     # The forward and the input gradient are those of the experts read directly, as without chunks.
