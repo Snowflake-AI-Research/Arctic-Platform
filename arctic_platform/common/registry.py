@@ -55,6 +55,7 @@ PUBLIC_LOSS_FNS = frozenset(
         "sft",
         "sft_ce",
         "verl_grpo",
+        "weighted_logprob_sum",
         "causal_cross_entropy",
     }
 )
