@@ -22,9 +22,14 @@ import math
 import pytest
 import torch
 
+from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
+from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
 from arctic_platform.rl.processors import LOSS_FNS
 from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors import run_pipeline
+from arctic_platform.rl.processors.grouped_distillation import Divergence
+from arctic_platform.rl.processors.grouped_distillation import grouped_divergence
+from arctic_platform.testing_utils import set_seed
 
 _B, _S, _V, _M = 2, 6, 40, 4
 _KD_COEF = 0.7
@@ -1040,3 +1045,43 @@ def test_native_unpad_round_trips_token_outputs_with_trailing_dimensions():
     expected_response = torch.zeros_like(padded)
     expected_response[:, 1:][response_mask] = padded[:, 1:][response_mask]
     assert torch.equal(restored_response, expected_response)
+
+
+@pytest.mark.parametrize("beta", [0.0, 1.0])
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(beta, kind):
+    """Both heads keep KL's zero gradient at a near-certain match; the head's float32 q * sum(grad) left 1.3e-5."""
+    set_seed(0)
+    vocab = 2 * 8192 + 37
+    weight = torch.zeros(vocab, 2)
+    weight[8192, 0] = 20.0
+    weight[:, 1] = 0.1 * torch.randn(vocab)
+    hidden = torch.ones(1, 1, 2, requires_grad=True)
+    ids = torch.tensor([[[8192, 5, 6, 7]]])
+    if kind == "dense":
+        _, groups = chunked_lm_head_logprobs(
+            hidden,
+            weight,
+            ids[..., 0],
+            token_chunk_size=2,
+            vocab_chunk_size=5000,
+            fp32_lm_head=True,
+            group_token_ids=ids,
+        )
+    else:
+        head = FusedOutputLinear(2, vocab, 2, fp32_lm_head=True)
+        groups = torch.func.functional_call(head, {"weight": weight}, (hidden, ids[..., 0]), {"group_token_ids": ids})[
+            "group_log_probs"
+        ]
+
+    logits = (hidden @ weight.T).detach().double()[0, 0]
+    outside = torch.ones(vocab, dtype=torch.bool)
+    outside[ids[0, 0]] = False
+    teacher = torch.cat([logits[ids[0, 0]], logits[outside].logsumexp(0, keepdim=True)]).log_softmax(0)
+    context = dict(
+        teacher_token_ids=ids, teacher_log_probs=teacher[None, None, :-1], teacher_tail_log_prob=teacher[-1:][None]
+    )
+    kd_sum, _ = grouped_divergence({"group_log_probs": groups}, context, torch.ones(1, 1), Divergence.KL, beta)
+    kd_sum.backward()
+
+    assert hidden.grad.abs().max() < 1e-8

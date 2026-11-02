@@ -50,6 +50,9 @@ _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY = "router_replay_max_cache_bytes"
+_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY = "router_replay_cache_device"
+_ROUTER_REPLAY_CACHE_DEVICES = ("cuda", "cpu")
+_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY = "router_replay_staging_bytes"
 _ENABLE_THINKING_PARAM_KEY = "enable_thinking"
 _RETURN_ACTION_MASKS_PARAM_KEY = "return_action_masks"
 _ADDRESS_IN_USE_MARKERS = (
@@ -70,21 +73,6 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     replaces xgrammar's stop set rather than extending it.
     """
     eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
-    return _stop_token_ids(eos, tokenizer)
-
-
-def _semip_grammar_stop_token_ids(model: str, tokenizer: Any) -> tuple[int, ...]:
-    """``_grammar_stop_token_ids`` for a restored engine, which has no vllm_config.
-
-    Reads the same generation config vLLM's default ``generation_config="auto"``
-    does.
-    """
-    from transformers import GenerationConfig
-
-    try:
-        eos = GenerationConfig.from_pretrained(model).eos_token_id
-    except OSError:
-        eos = None
     return _stop_token_ids(eos, tokenizer)
 
 
@@ -491,12 +479,42 @@ def _create_async_engine_args(
         )
 
 
+def _validate_mla_lora_targets(model_config: Any, peft_config: dict[str, Any] | None) -> None:
+    # vLLM's MLA attention calls the unwrapped kv_b_proj it was built with and decodes with weights absorbed from it.
+    targets = (peft_config or {}).get("target_modules", [])
+    names = [targets] if isinstance(targets, str) else targets
+    if any("kv_b_proj" in name or name == "all-linear" for name in names) and model_config.use_mla:
+        raise ValueError(
+            "LoRA target kv_b_proj is absorbed into MLA attention weights and cannot be served; "
+            "remove it from the training and sampling LoRA targets and retrain the adapter."
+        )
+
+
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
-        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(
-            _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY
+    for key in (
+        _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
+        _ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY,
+        _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY,
+    ):
+        if key in engine_kwargs:
+            out[key] = engine_kwargs.pop(key)
+    device = out.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY)
+    if device is not None and device not in _ROUTER_REPLAY_CACHE_DEVICES:
+        raise ValueError(
+            f"{_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY} must be one of "
+            f"{list(_ROUTER_REPLAY_CACHE_DEVICES)}, got {device!r}"
         )
+    staging_bytes = out.get(_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY)
+    if staging_bytes is not None:
+        # JSON transports (Cortex Training among them) can deliver an integer as a whole float.
+        if isinstance(staging_bytes, float) and staging_bytes.is_integer():
+            staging_bytes = int(staging_bytes)
+        if isinstance(staging_bytes, bool) or not isinstance(staging_bytes, int) or staging_bytes <= 0:
+            raise ValueError(
+                f"{_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY} must be a positive integer, got {staging_bytes!r}"
+            )
+        out[_ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY] = staging_bytes
     return out
 
 
@@ -655,6 +673,10 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+
+    spec = getattr(choice, "spec_decode_metrics", None)
+    if spec is not None:
+        result["spec_decode_metrics"] = spec.to_dict()
 
     if final_output.prompt_logprobs is not None:
         # The dense patch leaves tensors here instead of one dict per position;
@@ -842,6 +864,8 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._router_replay_tx_on_host = False
+        self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
         self._router_replay_shm_entry: dict[str, Any] | None = None
@@ -927,10 +951,16 @@ class InferenceWorker(StreamingWorkerMixin):
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+        lora_peft_config = engine_kwargs.pop("lora_peft_config", None)
+        checkpoint_peft_config = None
+        if lora_adapter_path:
+            import json
+            with open(os.path.join(lora_adapter_path, "adapter_config.json")) as adapter_file:
+                checkpoint_peft_config = json.load(adapter_file)
 
         # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
         # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
-        # kwargs); if set, build the Instance-backed adapter and return early.
+        # kwargs); if set, the loop below restores where it would build.
         semi_p = bool(engine_kwargs.pop("semi_p", False))
         # Popped unconditionally even though it is no longer a config field: a
         # dss that predates the derived image cache still sends it, and
@@ -940,34 +970,9 @@ class InferenceWorker(StreamingWorkerMixin):
         # same way and for the same reason: AsyncEngineArgs rejects what it
         # does not know, and Ray actor handles are certainly that.
         semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
-        if semi_p:
-            # A restored engine has neither, and serving without them returns
-            # plausible output that is wrong, so refuse before restoring.
-            if lora_adapter_path:
-                raise ValueError(
-                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
-                    "a restored engine serves the base weights it was dumped "
-                    "with. Disable semi_p for this job.")
-            if engine_kwargs.get("enable_return_routed_experts"):
-                raise ValueError(
-                    "semi_p does not capture routed experts, so router replay "
-                    "would get none. Disable semi_p for this job.")
-            from arctic_platform.inference.server.semip_engine import restore_and_wrap
-            self.llm = await asyncio.to_thread(
-                restore_and_wrap, engine_kwargs, semi_p_agents)
-            if not engine_kwargs.get("skip_tokenizer_init"):
-                self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
-                    engine_kwargs["model"], self.llm.get_tokenizer())
-            self.state = WorkerLifecycleState.READY
-            self._maybe_init_reasoning_parser(reasoning_parser_name)
-            logger.info(
-                "Worker %d initialized via semi_p restore: model=%s",
-                os.getpid(), engine_kwargs.get("model"),
-            )
-            return
 
         from arctic_platform.inference.semi_persistence import matched_baseline
-        if matched_baseline.requested():
+        if not semi_p and matched_baseline.requested():
             changed = matched_baseline.apply(engine_kwargs)
             logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
                         matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
@@ -1027,6 +1032,8 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                _validate_mla_lora_targets(vllm_config.model_config, lora_peft_config)
+                _validate_mla_lora_targets(vllm_config.model_config, checkpoint_peft_config)
                 self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
                     vllm_config, chat_reasoning_parser, tool_call_parser
                 )
@@ -1034,14 +1041,20 @@ class InferenceWorker(StreamingWorkerMixin):
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
-                self.llm = AsyncLLM.from_vllm_config(
-                    vllm_config,
-                    stat_loggers=[RingStatLogger],
-                )
+                if semi_p:
+                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
+                else:
+                    self.llm = AsyncLLM.from_vllm_config(
+                        vllm_config,
+                        stat_loggers=[RingStatLogger],
+                    )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
-                if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                # semi_p is not retried here: the restore retries its own
+                # ports, so another attempt would only repeat a whole restore.
+                if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
@@ -1207,8 +1220,17 @@ class InferenceWorker(StreamingWorkerMixin):
         from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
         import torch
 
-        # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
-        if _ray_blanked_cuda_visible_devices():
+        router_replay_engine_kwargs = router_replay_engine_kwargs or {}
+        self._router_replay_tx_on_host = (
+            router_replay_engine_kwargs.get(_ROUTER_REPLAY_CACHE_DEVICE_ENGINE_KEY, "cuda") == "cpu"
+        )
+        self._router_replay_staging_bytes = router_replay_engine_kwargs.get(
+            _ROUTER_REPLAY_STAGING_BYTES_ENGINE_KEY
+        )
+        if self._router_replay_tx_on_host:
+            tx_device = torch.device("cpu")
+        elif _ray_blanked_cuda_visible_devices():
+            # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
             tx_device = torch.device("cpu")
             logger.warning(
                 "router-replay TX cache on CPU (CUDA_VISIBLE_DEVICES=%r)",
@@ -1217,7 +1239,7 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             tx_device = torch.device("cuda:0")
         max_bytes = int(
-            (router_replay_engine_kwargs or {}).get(
+            router_replay_engine_kwargs.get(
                 _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY,
                 16 * 1024**3,
             )
@@ -1227,7 +1249,11 @@ class InferenceWorker(StreamingWorkerMixin):
             max_bytes=max_bytes,
         )
         self._replica_label = f"pid={os.getpid()}"
-        logger.info("router-replay TX cache initialized max_bytes=%d", max_bytes)
+        logger.info(
+            "router-replay TX cache initialized max_bytes=%d device=%s",
+            max_bytes,
+            "host" if self._router_replay_tx_on_host else tx_device,
+        )
 
     def _register_router_replay_shm(
         self,
@@ -1445,7 +1471,7 @@ class InferenceWorker(StreamingWorkerMixin):
         }
 
     def drain_metrics(self) -> dict[str, Any]:
-        """Return and clear the buffered per-step replica snapshots."""
+        """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
             action_mask_replay_cache_stats,
         )
@@ -1453,6 +1479,8 @@ class InferenceWorker(StreamingWorkerMixin):
         return {
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
+            "engine_totals": get_collector().totals(),
+            "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
@@ -1499,7 +1527,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 f"is_available={torch.cuda.is_available()})"
             )
         tx_device = torch.device("cuda:0")
-        if self._router_replay_tx.device != tx_device:
+        if not self._router_replay_tx_on_host and self._router_replay_tx.device != tx_device:
             max_bytes = self._router_replay_tx.max_bytes
             self._router_replay_tx = RouterReplayCacheTX(
                 device=tx_device,
@@ -1517,6 +1545,7 @@ class InferenceWorker(StreamingWorkerMixin):
             master_port=master_port,
             device=tx_device,
             is_server=is_server,
+            staging_bytes=self._router_replay_staging_bytes,
         )
         return {"status": "ok", "rank": rank, "world_size": world_size}
 

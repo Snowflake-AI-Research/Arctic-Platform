@@ -109,7 +109,12 @@ class DummyWorker:
         }
 
     def drain_metrics(self) -> dict[str, Any]:
-        return {"pid": os.getpid(), "snapshots": []}
+        return {
+            "pid": os.getpid(),
+            "snapshots": [],
+            "engine_totals": {},
+            "spec_decoding": {},
+        }
 
     def set_replica_id(self, replica_id: int) -> None:
         return None

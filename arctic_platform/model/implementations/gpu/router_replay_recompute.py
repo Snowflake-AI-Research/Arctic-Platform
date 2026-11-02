@@ -151,6 +151,8 @@ def _wrap_router(router) -> bool:
         expert_indices = expert_indices.detach()
         if torch.is_grad_enabled():
             # Only capture graph-building (checkpointed) forwards; eval/no_grad forwards are never recomputed.
+            # Anything still queued belongs to an aborted step, as on the fresh-routing path above.
+            replay_queue.clear()
             replay_queue.append(expert_indices)
         return original(x, expert_bias, routed_experts=expert_indices)
 

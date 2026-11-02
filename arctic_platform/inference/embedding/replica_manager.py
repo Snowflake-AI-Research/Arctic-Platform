@@ -56,7 +56,7 @@ os.environ["VLLM_PLUGINS"] = ""
 
 # vLLM imports – *lazy* import inference protos to avoid import-time failures.
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Ensure repo root is on the path so ``python -m`` works from anywhere.
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent

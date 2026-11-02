@@ -18,8 +18,11 @@
 For each engine the semi_p server logs ``semi_p: resolved model_dir``, then
 either ``cache miss`` (a cold start that dumps) or ``materialized`` and
 ``reading weights in place`` (a restore from the published image), then
-``restoring image`` and ``restore complete``. vLLM's own cold start logs the
-weight load, torch.compile, profiling, graph capture and the engine-init total.
+``restoring image``, ``restore complete`` and ``front end attached``, after
+which the engine serves; key-to-ready runs to that last line, or to ``restore
+complete`` in logs from before the AsyncLLM front end. vLLM's own cold start
+logs the weight load, torch.compile, profiling, graph capture and the
+engine-init total.
 
 Two line formats carry these markers. The sub-job log tags each engine's lines
 with its worker process, ``(InferenceWorker pid=P, ip=A) YYYY-MM-DD HH:MM:SS,mmm``;
@@ -31,6 +34,7 @@ directory of its model_dir. Logs saved from the GPU pod instead tag lines
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from datetime import datetime
@@ -47,9 +51,14 @@ STAMP = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),(\d{3})")
 SUBDIR = re.compile(r"model_dir=\S*?/((?:replica|node)\d+)\b")
 NOT_RESTORE_STEPS = {"teardown"}
 MARK = re.compile(r"semi_p: (?:multi-node )?(resolved model_dir|cache miss|materialized|"
-                  r"reading weights in place|dump complete|restoring image|restore of|restore complete)")
+                  r"reading weights in place|dump complete|restoring image|restore of|restore complete|"
+                  r"front end attached)")
 STEP = re.compile(r"<<< (\w+) (OK|FAILED) \(([0-9.]+)s\)")
+# The child's step that hands the restored core to the AsyncLLM front end, after
+# ``restore complete`` and before ``front end attached``.
+ATTACH_STEPS = {"serve_core"}
 DUMP_SECONDS = re.compile(r"dump complete .*? in ([0-9.]+)s")
+ATTACH_SECONDS = re.compile(r"front end attached in ([0-9.]+)s")
 VLLM_PHASES = {
     "load_weights_s": re.compile(r"Loading weights took ([0-9.]+) seconds"),
     "model_loading_s": re.compile(r"Model loading took [0-9.]+ GiB(?: memory)? and ([0-9.]+) seconds"),
@@ -60,19 +69,36 @@ VLLM_PHASES = {
 }
 
 
+def start_cursor(client: Any, job_id: str) -> str | None:
+    """A ``tail_logs`` cursor at the job's creation, or None if it has no
+    ``created_at``. Without a cursor the first page is the log's newest lines,
+    so a long log (many replicas) loses its start, where the restore markers are.
+    The service's cursor is an unpadded base64 RFC 3339 timestamp."""
+    created = client.get_job(job_id).get("created_at")
+    return base64.b64encode(str(created).encode()).decode().rstrip("=") if created else None
+
+
 def read_sub_job_log(client: Any, job_id: str, max_pages: int = 200) -> list[str]:
-    """The sub-job log so far. Pages until one comes back empty: a running job's
-    log never reports ``eof``, so ``stream_logs(follow=False)`` would not return."""
-    lines: list[str] = []
-    cursor = None
-    for _ in range(max_pages):
+    """The sub-job log so far, from the job's start. Pages until one comes back
+    empty: a running job's log never reports ``eof``, so
+    ``stream_logs(follow=False)`` would not return."""
+    try:
+        cursor = start_cursor(client, job_id)
         page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
+    except Exception as exc:  # noqa: BLE001 - fall back to the newest lines
+        logger.warning("sub-job log for %s from its start unavailable (%s); reading the newest lines", job_id, exc)
+        cursor, page = None, None
+    lines: list[str] = []
+    for _ in range(max_pages):
+        if page is None:
+            page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
         entries = page.get("entries") or []
         for entry in entries:
             lines.extend(log_text(entry).splitlines())
         cursor = page.get("next_cursor", cursor)
         if not entries or page.get("eof"):
             break
+        page = None
     return lines
 
 
@@ -172,7 +198,7 @@ def _collect(lines: list[str], prefix: str = "") -> dict[str, dict]:
         if not tagged:
             continue
         rep, ts, proc = tagged
-        r = replicas.setdefault(prefix + rep, {"marks": {}, "steps": [], "dump_s": None})
+        r = replicas.setdefault(prefix + rep, {"marks": {}, "steps": [], "dump_s": None, "attach_s": None})
         mark = MARK.search(line)
         if mark:
             name = "restoring image" if mark.group(1) == "restore of" else mark.group(1)
@@ -180,12 +206,17 @@ def _collect(lines: list[str], prefix: str = "") -> dict[str, dict]:
             if name == "dump complete":
                 d = DUMP_SECONDS.search(line)
                 r["dump_s"] = float(d.group(1)) if d else None
+            if name == "front end attached":
+                a = ATTACH_SECONDS.search(line)
+                r["attach_s"] = float(a.group(1)) if a else None
             continue
         step = STEP.search(line)
         # Steps count once a restore has begun; a pod holding only a later
         # node-partition logs no engine markers, so its steps always count.
         restoring = "restoring image" in r["marks"] and "restore complete" not in r["marks"]
-        if step and proc in ("worker", "child") and (restoring or not r["marks"]):
+        attaching = (step is not None and step.group(1) in ATTACH_STEPS
+                     and "restore complete" in r["marks"] and "front end attached" not in r["marks"])
+        if step and proc in ("worker", "child") and (restoring or attaching or not r["marks"]):
             if step.group(1) in NOT_RESTORE_STEPS:
                 continue
             entry = (step.group(1), float(step.group(3)), step.group(2) == "OK")
@@ -220,7 +251,10 @@ def _summarize(replicas: dict[str, dict]) -> dict:
         if "restore complete" in mk:
             start = mk.get("restoring image", mk.get("materialized", t0))
             info["restore_s"] = round(mk["restore complete"] - start, 1)
-            info["key_to_ready_s"] = round(mk["restore complete"] - t0, 1)
+            ready = mk.get("front end attached", mk["restore complete"])
+            info["key_to_ready_s"] = round(ready - t0, 1)
+        if "front end attached" in mk:
+            info["attach_s"] = replicas[rep]["attach_s"]
         info["steps"] = {name: secs for name, secs, _ in replicas[rep]["steps"]}
         info["failed_steps"] = [name for name, _, ok in replicas[rep]["steps"] if not ok]
         out["replicas"][rep] = info

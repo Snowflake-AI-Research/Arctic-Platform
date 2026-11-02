@@ -76,7 +76,7 @@ _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_NOT_FOUND_CODE = "517601"
-_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
+_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled", "terminated")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
@@ -500,6 +500,14 @@ def _response_error_code(body: Any) -> str | None:
     return None
 
 
+def _response_error_message(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return None
+
+
 async def _raise_for_status(resp: Any) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
@@ -507,6 +515,9 @@ async def _raise_for_status(resp: Any) -> None:
     line, which turns an actionable rejection into a guessing game. Stays a
     `ClientResponseError` (carrying `status`) so `_is_transient` keeps classifying
     it. A chunk-group error raises `_ChunkGroupError` instead.
+
+    The error also carries the body's ``error_code`` and ``error_message``, so a
+    caller can report the server's explanation without the request URL.
     """
     import aiohttp
 
@@ -523,6 +534,7 @@ async def _raise_for_status(resp: Any) -> None:
         headers=resp.headers,
     )
     error.error_code = _response_error_code(body)
+    error.error_message = _response_error_message(body)
     raise error
 
 

@@ -92,3 +92,57 @@ def test_grouped_fp8_decoded_mm_matches_decoded_weights_and_zeroes_padding_rows(
     assert _rel(out[:routed], expected) < 1e-2
     assert _rel(x.grad[:routed], expected_dx) < 1e-2
     assert (out[routed:] == 0).all() and (x.grad[routed:] == 0).all()
+
+
+def test_grouped_fp8_decoded_mm_stacks_side_by_side():
+    torch.manual_seed(0)
+    w1, s1 = _quantized(4, 256, 768)
+    w3, s3 = _quantized(4, 384, 768)
+    counts = torch.tensor([100, 0, 37, 255], device="cuda")
+    offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+    routed = int(counts.sum())
+    x = torch.randn(routed + 9, 768, device="cuda").bfloat16().requires_grad_(True)
+    out = fp8.grouped_fp8_decoded_mm(x, (w1, w3), (s1, s3), offsets, routed, 128)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    stacked_dx = x.grad.clone()
+
+    x.grad = None
+    gate = fp8.grouped_fp8_decoded_mm(x, w1, s1, offsets, routed, 128)
+    up = fp8.grouped_fp8_decoded_mm(x, w3, s3, offsets, routed, 128)
+    (gate * grad[:, :256]).sum().add((up * grad[:, 256:]).sum()).backward()
+
+    assert out.shape == (routed + 9, 640)
+    assert _rel(out[:routed], torch.cat([gate, up], 1)[:routed]) < 1e-3
+    assert _rel(stacked_dx[:routed], x.grad[:routed]) < 1e-2
+    assert (out[routed:] == 0).all() and (stacked_dx[routed:] == 0).all()
+
+
+@pytest.mark.parametrize("rows, cols", [(1001, 384), (4096, 2048)])
+def test_mn_major_activation_quant_matches_the_per_group_kernel_and_layout(rows, cols):
+    deep_gemm = pytest.importorskip("deep_gemm")
+    from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8
+    from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8_mn_major
+
+    torch.manual_seed(0)
+    x = (torch.randn(rows, cols, device="cuda") * 3).bfloat16()
+    x[5] = 0  # all-zero groups take the eps floor
+    q_ref, s_ref = per_token_group_quant_fp8(x, 128, use_ue8m0=False)
+    s_ref = deep_gemm.get_mn_major_tma_aligned_tensor(s_ref)
+    q, s = per_token_group_quant_fp8_mn_major(x, 128)
+
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s, s_ref) and s.stride() == s_ref.stride()
+
+
+def test_decodes_reuse_one_workspace_per_device():
+    torch.manual_seed(0)
+    small, small_scale = _quantized(2, 256, 384)
+    large, large_scale = _quantized(2, 512, 768)
+    first = fp8._decode_fp8_to_bf16(large, large_scale, 128)
+    expected = fp8.dequantize_from_fp8_blockwise(small, small_scale, dtype=torch.float32)
+    second = fp8._decode_fp8_to_bf16(small, small_scale, 128)
+
+    # The smaller decode lands in the buffer the larger one grew; each result is right when it is used.
+    assert second.data_ptr() == first.data_ptr()
+    torch.testing.assert_close(second.float(), expected, rtol=8e-3, atol=1e-6)

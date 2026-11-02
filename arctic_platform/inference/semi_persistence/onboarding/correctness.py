@@ -43,6 +43,7 @@ QUESTION = "What is the capital of France? Answer in one word."
 GUIDED_SCHEMA = {"type": "object", "properties": {"capital": {"type": "string"}}, "required": ["capital"]}
 COMPARED_FIELDS = ("token_ids", "text", "finish_reason", "prompt_len", "generation_len")
 DEFAULTS = {"greedy_prompts": 8, "max_tokens": 48, "logprob_atol": 1e-3, "batched_prompts": 16}
+MATCHED = "off_matched"
 
 
 def answer(result: dict) -> tuple:
@@ -60,6 +61,17 @@ def first_difference(a: dict, b: dict) -> str:
                 return f"token_ids differ at position {idx}"
             return f"{f}: {a.get(f)!r} vs {b.get(f)!r}"
     return ""
+
+
+def apply_guided_parse_rule(check: dict, parses: bool) -> None:
+    """Fail guided JSON whose reference does not parse, unless plain vLLM with
+    semi_p's collective setup gives the same text: a reasoning model's schema
+    applies only after its reasoning ends, so a short answer is free text."""
+    matched = check["variants"].get(MATCHED) or {}
+    if not parses and not matched.get("passed"):
+        check["passed"] = False
+        if not matched:
+            check["detail"] = "; ".join(filter(None, [check["detail"], f"no {MATCHED} job to compare with"]))
 
 
 class Checker:
@@ -184,7 +196,7 @@ def run(client: Any, jobs: dict[str, str], reference: str, gated: set[str], repl
             f"{len(r[0].get('prompt_logprobs') or [])} vs {len(ref_plp or [])} positions")
         for v, r in res.items() if v != reference})
 
-    # Guided JSON: identical text, and the reference's parses.
+    # Guided JSON: identical text, and the reference's parses or plain matched gives the same text.
     res = c.send([QUESTION], {"max_tokens": max(16, min(40, c.max_tokens)), "temperature": 0.0,
                               "guided_json": GUIDED_SCHEMA})
     try:
@@ -193,8 +205,7 @@ def run(client: Any, jobs: dict[str, str], reference: str, gated: set[str], repl
         parses = False
     c.compare_answers("guided JSON", res, reference_detail=f"reference {'parses' if parses else 'does not parse'}: "
                                                            f"{res[reference][0].get('text', '')[:60]!r}")
-    if not parses:
-        c.checks[-1]["passed"] = False
+    apply_guided_parse_rule(c.checks[-1], parses)
 
     # Stop strings.
     c.compare_answers("stop strings", c.send([f"Write a short paragraph about {TOPICS[0]}."],

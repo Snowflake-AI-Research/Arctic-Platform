@@ -186,3 +186,34 @@ def test_labels_all_inside_the_vocabulary_reproduce_the_dense_log_softmax():
     torch.testing.assert_close(out["entropy"], expected_entropy, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(hidden.grad, hidden_ref.grad, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(head.weight.grad, weight_ref.grad, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("weight_trainable", [True, False])
+def test_fused_logprob_backward_matches_dense_and_skips_a_frozen_weight(device, weight_trainable):
+    from arctic_platform.model.implementations.moe.layers.lm_head import _SequenceChunkedLogProbEntropyFn
+
+    torch.manual_seed(0)
+    tokens, hidden_size, vocab = 37, 16, 20000  # several token chunks and vocab tiles, a partial last tile
+    hidden = torch.randn(tokens, hidden_size, device=device, requires_grad=True)
+    weight = torch.randn(vocab, hidden_size, device=device).mul_(0.3).requires_grad_(weight_trainable)
+    labels = torch.randint(0, vocab, (tokens,), device=device)
+    inv_t = torch.full((tokens,), 1 / 0.7, device=device)
+    upstream = torch.randn(tokens, device=device)
+
+    logprobs, _ = _SequenceChunkedLogProbEntropyFn.apply(hidden, weight, labels, inv_t, 16, True)
+    (logprobs * upstream).sum().backward()
+
+    ref_hidden = hidden.detach().clone().requires_grad_(True)
+    ref_weight = weight.detach().clone().requires_grad_(True)
+    dense = (
+        torch.log_softmax((ref_hidden @ ref_weight.T) * inv_t[:, None], dim=-1).gather(1, labels[:, None]).squeeze(1)
+    )
+    (dense * upstream).sum().backward()
+
+    torch.testing.assert_close(logprobs.detach(), dense.detach(), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=1e-4, atol=1e-4)
+    if weight_trainable:
+        torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=1e-4, atol=1e-4)
+    else:
+        assert weight.grad is None
