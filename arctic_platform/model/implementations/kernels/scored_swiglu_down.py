@@ -94,10 +94,10 @@ def _scored_swiglu_bwd_kernel(
     tl.store(ds_ptr + row, tl.sum(acc, axis=0))
 
 
-def _down_weight(weight: torch.Tensor, scale: torch.Tensor | None, block_size: int | None) -> torch.Tensor:
+def _down_weight(weight: torch.Tensor, scale, block_size: int | None) -> torch.Tensor:
     if scale is None:
         return weight.bfloat16()
-    if block_size is None:
+    if block_size is None and weight.dtype == torch.float8_e4m3fn:
         raise ValueError("block FP8 down-projection decode requires block_size")
     from arctic_platform.model.implementations.fp8 import _decode_fp8_to_bf16
 
