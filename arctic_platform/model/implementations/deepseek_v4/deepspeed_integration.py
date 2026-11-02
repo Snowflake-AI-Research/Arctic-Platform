@@ -24,12 +24,21 @@ installed on this model directly.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from functools import partial
+
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
-from arctic_platform.model.implementations.qwen35.deepspeed_integration import load_generic_moe_model
+from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+
+def _build_model_config(*args, dequantize_checkpoint: bool, **kwargs) -> ModelConfig:
+    return replace(qwen_ds._build_model_config(*args, **kwargs), dequantize_checkpoint=dequantize_checkpoint)
 
 
 def _install_context_parallel(model: nn.Module, sp_group, sp_size: int) -> None:
@@ -103,8 +112,16 @@ def load_deepseek_v4_model(
     sp_group=None,
     ep_group=None,
     options: Qwen3_5MoeOptions,
+    dequantize_checkpoint: bool = False,
 ) -> nn.Module:
-    model = load_generic_moe_model(
+    """Load DeepSeek-V4-Flash; ``dequantize_checkpoint`` trains the official FP8/MXFP4 weights in bf16."""
+    adapter = replace(
+        qwen_ds._generic_adapter(),
+        build_model_config=partial(_build_model_config, dequantize_checkpoint=dequantize_checkpoint),
+    )
+    model = qwen_ds._load_moe_model(
+        adapter,
+        qwen_ds.load_generic_moe_model_for_deepspeed,
         model_name=model_name,
         optimization_dtype=optimization_dtype,
         attn_implementation=attn_implementation,
@@ -113,7 +130,10 @@ def load_deepseek_v4_model(
         sp_group=None,
         ep_group=ep_group,
         options=options,
+        patch_moe_detection=qwen_ds.patch_deepspeed_moe_detection,
+        device_mesh_type=DeviceMesh,
     )
+    qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
     if sp_size > 1:
         _install_context_parallel(model, sp_group, sp_size)
     return model

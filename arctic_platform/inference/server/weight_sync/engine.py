@@ -271,7 +271,7 @@ class NCCLEngine:
         self._send_pair(idx, nccl_s)
         self._send_events[idx].record(nccl_s)
 
-    @torch.no_grad()
+    # Not @torch.no_grad(): its generator wrapper holds the last yield through the next rebuild (no autograd here).
     def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pipelined receive: prefetch next bucket while caller processes current.
 
@@ -369,6 +369,8 @@ class NCCLEngine:
                 if end == tensor_nbytes:
                     del partial_tensors[name]
                     yield name, tensor
+                    # Holding the rebuilt tensor here would keep it alive through the next rebuild: two full copies.
+                    tensor = state = None
                 else:
                     partial_tensors[name] = (tensor, end, tensor_nbytes)
 
