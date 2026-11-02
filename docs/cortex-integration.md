@@ -21,21 +21,27 @@ use the training `forward` operation. There is no reference forward, no
 disk-shared weight reload, and no colocation lifecycle. That constrains what
 runs correctly here:
 
-* **Single-epoch on-policy GRPO.** With `context.old_log_probs_shifted`
-  absent, the server-side GRPO loss defaults `old_log_probs =
-  logprobs.detach()`, restoring π_old ≡ π_new. Multi-epoch PPO needs the
-  rollout-time snapshot, which this backend cannot provide.
+* **`fwd_no_grad` returns the server logprobs in the caller's layout.**
+  Non-ZoRRo rows are left-aligned on the way out, because the packer rejects
+  leading padding, and the response is scattered back onto the caller's
+  left-padded columns. Padding comes back as `0`. ZoRRo rows stay in the
+  client layout. The logprobs come back under `batch["logprobs"]` and
+  `batch["log_probs"]`.
+* **Log-prob calls keep arrival order.** `to_cortex_fwd_payload` stamps
+  `balance_batch` false and does not send `prompt_group_ids`.
+* **Non-ZoRRo clipping stays inert.** That training request drops
+  `old_log_probs`, so the server re-derives π_old from the live forward.
+  The returned logprobs are the caller's snapshot; they are not sent back
+  as `old_log_probs_shifted`.
+* **ZoRRo training sends that snapshot.** `fwd_bwd` places it on
+  `context.old_log_probs_shifted`, in the caller's columns and unshifted,
+  because ZoRRo log-probs sit on the response token they score. There is
+  still no reference forward, so a multi-epoch update against a frozen
+  policy is not available.
 * **No KL-to-reference.** There are no reference log-probs to build the term
   from, so `use_kl_loss` / `use_kl_in_reward` must be off. Asking for them
   raises from `_CortexClientShim.fwd_no_grad` rather than substituting zeros,
   which would reduce the KL to a function of the current policy alone.
-* **`fwd_no_grad` returns the server logprobs.** Non-ZoRRo rows are left-aligned
-  so the packer accepts them. ZoRRo rows stay in the client layout. Log-prob
-  calls stamp ``balance_batch`` false, so ``prompt_group_ids`` are not sent.
-  The logprobs come back under ``batch["logprobs"]`` and ``batch["log_probs"]``.
-* **Non-ZoRRo clipping stays inert.** That path still drops ``old_log_probs``
-  and the server re-derives π_old. ZoRRo ``fwd_bwd`` keeps the snapshot from
-  ``fwd_no_grad`` and does not left-align the rows.
 * **Weight sync via NCCL only.** `save_weights` (SkyRL's disk-based reload)
   raises; use `sync_weights()` or `save_checkpoint()`.
 * **`wake_*` / `sleep_*` are no-ops.** Cortex sub-jobs are always awake; the

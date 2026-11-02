@@ -1125,10 +1125,15 @@ class TestCortexSharedHelper:
         ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
         attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
         out = to_cortex_fwd_payload(
-            {"batch": {"input_ids": ids, "attention_mask": attn}, "meta": {"zorro_train_enable": False}}
+            {
+                "batch": {"input_ids": ids, "attention_mask": attn, "prompt_group_ids": torch.tensor([0, 0])},
+                "meta": {"zorro_train_enable": False, "balance_batch": True},
+            }
         )
         assert out["kwargs"]["input_ids"][0].tolist() == [1, 2, 0, 0]
         assert out["kwargs"]["attention_mask"][0].tolist() == [1, 1, 0, 0]
+        assert out["context"]["balance_batch"] is False
+        assert "prompt_group_ids" not in out["context"]
 
     def test_zorro_fwd_bwd_keeps_client_layout_and_names_prompt_groups(self):
         import torch
@@ -1162,7 +1167,8 @@ class TestCortexSharedHelper:
         assert torch.equal(out["kwargs"]["attention_mask"], attn)
         assert torch.equal(out["kwargs"]["prompts"], prompts)
         assert torch.equal(out["kwargs"]["response_mask"], torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]))
-        assert torch.equal(out["kwargs"]["old_log_probs"], old)
+        assert "old_log_probs" not in out["kwargs"]
+        assert torch.equal(out["context"]["old_log_probs_shifted"], old)
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
         assert out["context"]["temperature"] == 0.7
@@ -1267,15 +1273,26 @@ class TestCortexShimForwardsLikeOnPrem:
         assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
         assert out["batch"]["logprobs"].shape == (2, 4)
 
-    def test_forward_returns_the_server_logprobs(self):
+    def test_forward_returns_the_server_logprobs_on_the_caller_columns(self):
         import asyncio
 
         import torch
 
         class Client:
             async def fwd_no_grad(self, payload):
-                return {"logprobs": torch.ones((2, 5))}
+                sent = payload["kwargs"]["input_ids"]
+                # Distinct value per aligned column, including the padding tail.
+                return {"logprobs": torch.arange(1, sent.numel() + 1, dtype=torch.float32).reshape_as(sent)}
 
-        out = asyncio.run(self._shim(Client()).fwd_no_grad(self._batch(), reference_model=False))
-        assert out["batch"]["logprobs"].shape == (2, 5)
-        assert float(out["batch"]["logprobs"].sum()) == 10.0
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "batch": {"input_ids": ids, "attention_mask": attn},
+            "meta": {"pad_token_id": 0, "zorro_train_enable": False},
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        # The aligned row is [1, 2, 0, 0], so the server's [1, 2, 3, 4] puts
+        # 1 and 2 on the caller's real columns and 0 on its padding.
+        assert out["batch"]["logprobs"][0].tolist() == [0, 0, 1, 2]
+        assert out["batch"]["logprobs"][1].tolist() == [5, 6, 7, 8]
+        assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])

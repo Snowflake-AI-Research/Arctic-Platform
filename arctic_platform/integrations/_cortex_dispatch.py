@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from arctic_platform.integrations._cortex_shared import restore_left_aligned_logprobs
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
 from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
@@ -190,6 +191,12 @@ class _CortexClientShim:
                 "cortex forward returned no logprobs; "
                 f"got keys={list(result) if isinstance(result, dict) else type(result).__name__}"
             )
+        # Non-ZoRRo requests were left-aligned on the way out. SkyRL's rows are
+        # left-padded, so the response has to come back on those columns.
+        body = batch.get("batch") if isinstance(batch, dict) and isinstance(batch.get("batch"), dict) else batch
+        meta = batch.get("meta") if isinstance(batch, dict) and isinstance(batch.get("meta"), dict) else {}
+        if isinstance(body, dict) and not meta.get("zorro_train_enable"):
+            logprobs = restore_left_aligned_logprobs(logprobs, body.get("attention_mask"))
         # SkyRL reads logprobs and log_probs at different call sites.
         return {"batch": {"logprobs": logprobs, "log_probs": logprobs}}
 

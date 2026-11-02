@@ -83,6 +83,9 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         if key != "dp_size" and not torch.is_tensor(value)
     }
     context["input_ids"] = input_ids
+    # A log-prob call is a snapshot of the caller's rows. Balancing would
+    # reorder them, and the returned logprobs have to land on those same columns.
+    meta["balance_batch"] = False
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
     apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
@@ -139,6 +142,36 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     )
 
 
+def restore_left_aligned_logprobs(logprobs, attention_mask):
+    """Scatter a left-aligned ``[B, T]`` response back onto the caller's columns.
+
+    :func:`_left_align_batch` moved each row's real tokens to the front. The
+    server's logprobs follow that order. Padding in the caller's layout is
+    written as ``0``: it is not a scored token.
+    """
+    import torch
+
+    if not torch.is_tensor(logprobs) or logprobs.dim() != 2 or not torch.is_tensor(attention_mask):
+        raise RuntimeError(
+            "cortex forward logprobs must be a [B, T] tensor matching attention_mask, "
+            f"got logprobs={type(logprobs).__name__} attention_mask={type(attention_mask).__name__}"
+        )
+    if tuple(logprobs.shape) != tuple(attention_mask.shape):
+        raise RuntimeError(
+            "cortex forward logprobs do not match the caller's attention_mask: "
+            f"logprobs {tuple(logprobs.shape)} attention_mask {tuple(attention_mask.shape)}"
+        )
+    mask = attention_mask.to(device=logprobs.device, dtype=torch.bool)
+    width = int(mask.shape[-1])
+    lengths = mask.sum(dim=1)
+    valid = torch.arange(width, device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
+    if torch.equal(mask, valid):
+        return logprobs
+    order = torch.argsort((~mask).to(torch.int8), dim=1, stable=True)
+    restored = torch.zeros_like(logprobs).scatter(1, order, logprobs)
+    return torch.where(mask, restored, torch.zeros_like(restored))
+
+
 def _missing_zorro_meta_keys(meta: dict) -> list[str]:
     """Keys the worker indexes directly once ZoRRo is on.
 
@@ -174,9 +207,9 @@ def to_cortex_fwd_bwd_payload(
     layout: left-aligning them moves response tokens into the prompt slice the
     unpacked worker reads. A packed job that asks for ZoRRo is refused. ZoRRo
     sends ``prompt_group_ids`` derived from the original ``prompts`` block and
-    keeps the ``old_log_probs`` snapshot on those same columns. The non-ZoRRo
-    path drops ``old_log_probs`` and the server re-derives π_old. Only a real
-    ``True`` selects the ZoRRo path.
+    the snapshot as ``context["old_log_probs_shifted"]`` in the caller's
+    columns. The non-ZoRRo path drops ``old_log_probs`` and the server
+    re-derives π_old. Only a real ``True`` selects the ZoRRo path.
     """
     import torch
 
@@ -304,8 +337,8 @@ def _to_cortex_zorro_fwd_bwd(
     the loss, so rows are sent as the client built them. A packed job that asks
     for ZoRRo is refused before this runs. ``prompts`` is the original prompt
     block. When the caller did not send ``prompt_group_ids``, they are derived
-    from that block. The ``old_log_probs`` snapshot stays on the caller's
-    columns so it scores the same tokens.
+    from that block. The snapshot is sent as ``context["old_log_probs_shifted"]``
+    in the caller's columns.
     """
     import torch
 
@@ -323,8 +356,6 @@ def _to_cortex_zorro_fwd_bwd(
         kwargs_out["position_ids"] = tensors["position_ids"]
     if torch.is_tensor(tensors.get("labels")):
         kwargs_out["labels"] = tensors["labels"]
-    if torch.is_tensor(old_log_probs):
-        kwargs_out["old_log_probs"] = old_log_probs
 
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
@@ -338,6 +369,8 @@ def _to_cortex_zorro_fwd_bwd(
         "loss_mask": loss_mask,
         **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
     }
+    if torch.is_tensor(old_log_probs):
+        context["old_log_probs_shifted"] = old_log_probs.to(torch.float32)
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
     _copy_batch_prompt_group_ids(meta, tensors)
