@@ -39,7 +39,7 @@ from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import single_rank_process_group
 
 _WORLD = 2
-_NUMEL = 1 << 16
+_NUMEL = (1 << 16) + 1
 _STEPS = 8
 _LR = 1e-4  # 8 steps move a master 8e-4: below half the bf16 spacing (9.8e-4) of every |w| in [0.25, 1).
 
@@ -152,6 +152,15 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
         gathered = [torch.empty(_NUMEL) for _ in range(_WORLD)]
         dist.all_gather(gathered, weight.detach().float())
         kept_master = safe_get_full_fp32_param(kept)
+        kept_matches_master = torch.equal(kept.detach(), kept_master)
+        restored_draw = restored_kept = True
+        if stochastic:
+            with torch.no_grad():
+                weight.zero_()
+                kept.zero_()
+            engine.optimizer.update_lp_params()
+            restored_draw = torch.equal(weight.detach(), served[-1])
+            restored_kept = torch.equal(kept.detach(), kept_master)
         if rank == 0:
             q, theta = [s.double() for s in served], masters
             spacing = _bf16_spacing(served[0])
@@ -166,7 +175,9 @@ def _engine_worker(rank, init_file, out, ds_overrides, stochastic):
                 cpu_offload=bool(engine.optimizer.cpu_offload),
                 dtype=str(weight.dtype),
                 kept_dtype=str(kept.dtype),
-                kept_equals_master=bool(torch.equal(kept.detach(), kept_master)),
+                kept_equals_master=bool(kept_matches_master),
+                restored_draw=bool(restored_draw),
+                restored_kept=bool(restored_kept),
                 ranks_identical=all(torch.equal(g, gathered[0]) for g in gathered),
                 q0_on_master=bool(torch.equal(q[0], theta[0])),
                 served_is_nearest=bool(torch.equal(served[-1], theta[-1].float().to(torch.bfloat16))),
@@ -220,6 +231,8 @@ def test_round_to_nearest_leaves_the_bf16_copy_behind_its_master(tmp_path, offlo
 @pytest.mark.parametrize("offload", sorted(_OFFLOAD))
 def test_stochastic_rounding_keeps_the_bf16_copy_unbiased(tmp_path, offload):
     summary = _run_engine(tmp_path, offload, stochastic=True)
+    assert summary["restored_kept"], summary
+    assert summary["restored_draw"], summary
     assert abs(summary["lag_mean"]) < 5 * summary["lag_standard_error"], summary
     served, master = summary["served_move_mean"], summary["master_move_mean"]
     assert abs(served - master) < 5 * summary["served_move_standard_error"], summary
