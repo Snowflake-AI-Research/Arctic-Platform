@@ -48,6 +48,45 @@ class MoEDeepSpeedAdapter:
 _EXPORT_GATHER_BYTES = 1 << 30
 
 
+def _broadcast_row_shards(local: torch.Tensor, names: list[str], ep_group, is_master: bool):
+    """Yield ``(name, host block)`` for each block of ``torch.chunk(full, len(names))`` on the master, nothing elsewhere.
+
+    ``full`` is the EP group's dim-0 shards of ``local`` in group-rank order; shards may differ in length. Every rank
+    of ``ep_group`` must drain the generator: each block's rows are broadcast over ``ep_group`` from the ranks that own
+    them, in the same order on every rank, so the master holds one block at a time instead of ``full``.
+    """
+    import torch.distributed as dist
+
+    ranks = dist.get_process_group_ranks(ep_group)
+    row_counts = [torch.zeros(1, dtype=torch.long, device=local.device) for _ in ranks]
+    dist.all_gather(row_counts, torch.tensor([local.shape[0]], dtype=torch.long, device=local.device), group=ep_group)
+    starts = [0]
+    for count in row_counts:
+        starts.append(starts[-1] + int(count.item()))
+    total = starts[-1]
+    if total == 0:
+        return
+    own = dist.get_rank(group=ep_group)
+    block = -(-total // len(names))  # torch.chunk's split size: its last block is the short one
+    for name, begin in zip(names, range(0, total, block)):
+        end = min(begin + block, total)
+        out = torch.empty((end - begin, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        for owner, src in enumerate(ranks):
+            lo, hi = max(begin, starts[owner]), min(end, starts[owner + 1])
+            if lo >= hi:
+                continue
+            if owner == own:
+                piece = local[lo - starts[owner] : hi - starts[owner]]
+            else:
+                piece = torch.empty((hi - lo, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            dist.broadcast(piece, src=src, group=ep_group)
+            if out is not None:
+                out[lo - begin : hi - begin].copy_(piece)
+            del piece
+        if out is not None:
+            yield name, out
+
+
 def patch_deepspeed_moe_detection() -> None:
     import deepspeed.runtime.engine as ds_engine
 
@@ -159,6 +198,8 @@ def build_iter_full_hf_weights(model: nn.Module):
         raise RuntimeError(f"build_iter_full_hf_weights requires {model_type.__name__}.convert_layer_to_hf")
     # Bound from the instance so a family whose layer mapping depends on its config can read it.
     convert_layer_to_hf = model.convert_layer_to_hf
+    # Optional: names of the dim-0 shards a tensor is published as in the HF checkpoint (``None`` to export it whole).
+    row_shards = getattr(model, "hf_export_row_shards", None)
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
@@ -178,8 +219,9 @@ def build_iter_full_hf_weights(model: nn.Module):
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
         """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
 
-        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
-        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
+        A gather larger than ``_EXPORT_GATHER_BYTES`` goes in row slices through one small device buffer into master
+        host memory, so no GPU ever holds the whole tensor. The master still holds it whole on the host; a tensor the
+        family exports as HF row shards (``hf_export_row_shards``) goes through ``_broadcast_row_shards`` instead.
         """
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
@@ -233,6 +275,9 @@ def build_iter_full_hf_weights(model: nn.Module):
         for index in ordered_layers:
             layer_state: dict[str, torch.Tensor] = {}
             for name, tensor in by_layer[index]:
+                shard_names = (
+                    row_shards(name.replace("._checkpoint_wrapped_module", "")) if row_shards is not None else None
+                )
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     # Only the master consumes the export: gather its EP group's shards straight into one output
@@ -240,11 +285,17 @@ def build_iter_full_hf_weights(model: nn.Module):
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
                     local = tensor.data.contiguous()
+                    if shard_names is not None:
+                        yield from _broadcast_row_shards(local, shard_names, ep_group, is_master)
+                        continue
                     world = dist.get_world_size(group=ep_group)
                     full = _gather_to_master(local, world, ep_group, is_master)
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
+                    if shard_names is not None:
+                        yield from zip(shard_names, torch.chunk(tensor.data, len(shard_names), dim=0))
+                        continue
                     layer_state[name] = tensor.data
 
             if not is_master:

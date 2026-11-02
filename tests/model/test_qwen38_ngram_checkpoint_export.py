@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint export of Qwen3.8's EP-sharded frozen n-gram table: exact bytes, bounded per-rank memory (gloo, CPU)."""
+"""Checkpoint export of Qwen3.8's EP-sharded frozen n-gram table: exact bytes in the published HF shard layout, and
+per-rank memory bounded by a few shards on every rank, the master included (gloo, CPU)."""
 
 import copy
 import json
@@ -35,6 +36,9 @@ pytest.importorskip("deepspeed")
 
 _WORLD, _EP = 4, 2  # two EP groups, {0, 1} and {2, 3}, as with expert data parallelism
 _NGRAM = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
+# Enough shards that one is a small part of the table; with this table, shard 7 straddles the two EP ranks' rows.
+_PARTS = 16
+_SHARDS = [_NGRAM.removesuffix(".weight") + f".shard_{index}.weight" for index in range(_PARTS)]
 
 
 class _PeakAllocatedBytes(TorchDispatchMode):
@@ -95,7 +99,7 @@ def _config():
         heads_per_ngram=1,
         ngram_vocab_size_base=100_000,  # the table dwarfs every other tensor, as in Flash-Next (51.2B of 180B params)
         make_ngram_vocab_size_divisible_by=4,
-        split_ngram_parts=2,
+        split_ngram_parts=_PARTS,
         indexer_n_heads=1,
         indexer_kv_heads=1,
         indexer_head_dim=4,
@@ -171,8 +175,14 @@ def _worker(rank: int, rendezvous: str, out_dir: str) -> None:
     assert model.get_parameter(_NGRAM).shape[0] * _EP == table.shape[0]
 
     expected = dict(iter_model_weights(reference, "hf", is_master=True, is_zero3=False, include_skipped=True))
+    if rank == 0:  # the iterator yields on global rank 0 only
+        # The unsharded export writes the published layout: torch.chunk of the table, under the shard names.
+        assert _NGRAM not in expected
+        assert [name for name in expected if ".ngram_embedding." in name] == _SHARDS
+        for name, block in zip(_SHARDS, table.chunk(_PARTS), strict=True):
+            assert torch.equal(expected[name], block), name
     exported_names = []
-    table_ref = None
+    shard_refs = []
     # Consume as the streaming checkpointer does, releasing each tensor after writing it.
     with _PeakAllocatedBytes() as memory:
         for name, actual in iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True):
@@ -180,29 +190,62 @@ def _worker(rank: int, rendezvous: str, out_dir: str) -> None:
             wanted = expected[name]
             assert actual.dtype == wanted.dtype and actual.shape == wanted.shape, name
             assert torch.equal(actual.view(torch.uint8), wanted.contiguous().view(torch.uint8)), name
-            if name == _NGRAM:
-                table_ref = weakref.ref(actual)
-            elif table_ref is not None and ".layers.1." in name:
-                assert table_ref() is None, "export iterator retained the previous layer's n-gram table"
+            if name in _SHARDS:
+                shard_refs.append(weakref.ref(actual))
+            elif shard_refs and ".layers.1." in name:
+                assert all(ref() is None for ref in shard_refs), "export iterator retained n-gram shards"
     if rank == 0:
         assert exported_names == list(expected)
-        assert _NGRAM in exported_names
     else:
         assert exported_names == []
-    # Rank 0's exported table is the output; anything else is transient.
-    transient = memory.peak - (table_bytes if rank == 0 else 0)
     with open(os.path.join(out_dir, f"rank{rank}.json"), "w") as f:
-        json.dump(dict(transient_tables=transient / table_bytes), f)
+        json.dump(dict(peak_tables=memory.peak / table_bytes), f)
     dist.destroy_process_group()
+
+
+def test_hf_export_loads_in_transformers() -> None:
+    """The exported shards are what Transformers' loader concatenates back into the n-gram table."""
+    from safetensors.torch import save_file
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+
+    from arctic_platform.model import iter_model_weights
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dist.init_process_group("gloo", init_method=f"file://{tmp}/rendezvous", rank=0, world_size=1)
+        try:
+            torch.manual_seed(0)
+            config = _config()
+            model = Qwen4ExpForConditionalGenerationPrimeRL(config)
+            register_weight_export(model, WeightExportContract(hf=build_iter_full_hf_weights, vllm=None))
+            exported = {
+                name: tensor.contiguous()
+                for name, tensor in iter_model_weights(
+                    model, "hf", is_master=True, is_zero3=False, include_skipped=True
+                )
+            }
+        finally:
+            dist.destroy_process_group()
+        out_dir = os.path.join(tmp, "export")
+        os.makedirs(out_dir)
+        save_file(exported, os.path.join(out_dir, "model.safetensors"), metadata={"format": "pt"})
+        config.save_pretrained(out_dir)
+        loaded, info = Qwen4ExpForConditionalGeneration.from_pretrained(out_dir, output_loading_info=True)
+    assert not any(".ngram_embedding." in name for name in {*info["missing_keys"], *info["unexpected_keys"]}), info
+    assert torch.equal(loaded.get_parameter(_NGRAM), model.get_parameter(_NGRAM))
 
 
 def test_ngram_table_export_is_exact_and_rank_memory_is_bounded() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mp.spawn(_worker, args=(f"file://{tmp}/rendezvous", tmp), nprocs=_WORLD, join=True)
-        transient = []
+        peaks = []
         for rank in range(_WORLD):
             with open(os.path.join(tmp, f"rank{rank}.json")) as f:
-                transient.append(json.load(f)["transient_tables"])
-    report = ", ".join(f"rank {rank} {value:.2f}" for rank, value in enumerate(transient))
-    # Each rank keeps one EP-sized piece; rank 0 additionally keeps the exported table.
-    assert max(transient) <= 1.1 / (_EP * _EP), f"transient memory in tables: {report}"
+                peaks.append(json.load(f)["peak_tables"])
+    report = ", ".join(f"rank {rank} {value:.3f}" for rank, value in enumerate(peaks))
+    # At most three shards are alive on any rank, the master included: the one the consumer still holds, the one
+    # being assembled, and one received piece of it. No rank ever holds the whole table.
+    assert max(peaks) <= 3.3 / _PARTS, f"peak memory in tables: {report}"

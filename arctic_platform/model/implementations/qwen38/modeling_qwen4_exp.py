@@ -45,6 +45,7 @@ from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
 from .converting_qwen4_exp import convert_prime_layer_to_hf
 from .converting_qwen4_exp import convert_prime_to_hf
+from .converting_qwen4_exp import ple_shard_names
 
 
 class EPShardedEmbedding(nn.Embedding):
@@ -436,6 +437,10 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         layer_idx: int,
     ) -> dict[str, Tensor]:
         return convert_prime_layer_to_hf(state_dict, layer_idx)
+
+    def hf_export_row_shards(self, name: str) -> list[str] | None:
+        """Names of the dim-0 shards an HF export writes ``name`` as, or ``None`` to write it whole."""
+        return ple_shard_names(name, self.config.text_config.split_ngram_parts)
 
     @classmethod
     def convert_layer_to_prime(
