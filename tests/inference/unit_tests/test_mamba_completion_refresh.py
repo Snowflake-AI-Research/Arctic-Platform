@@ -588,9 +588,10 @@ def test_hybrid_turn_holds_at_most_one_boundary_per_group(eagle, window, manager
 @pytest.mark.parametrize("eagle,window", [(False, False), (False, True), (True, True)])
 @pytest.mark.parametrize("deferred", [False, True])
 def test_identical_resend_hits_on_an_idle_engine(eagle, window, deferred, manager_methods):
-    """An identical prompt sent again after the first finished reuses the prefix up to its replay boundary."""
+    """An identical prompt sent again after the first finished reuses at least its replay boundary."""
     turn = hybrid_turn(manager_methods, eagle=eagle, window=window, churn=False, deferred=deferred, resend=True)
-    assert turn.hit == turn.boundary, turn
+    # vLLM 0.32 moved the EAGLE margin out of the finder, so its resend hit can sit one block higher.
+    assert turn.hit >= turn.boundary > 0, turn
 
 
 @pytest.mark.parametrize("prompt", [62800, 63216, 130656, 131072])  # both parities of (prompt - 1) // 416
