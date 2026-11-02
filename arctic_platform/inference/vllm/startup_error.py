@@ -183,15 +183,23 @@ def earliest_startup_record(directory: str) -> dict[str, Any] | None:
     if len(startup) == 0:
         return None
     root = min(startup, key=lambda record: record["time"])
-    if root["message"].startswith(_WORKER_FAILED_PREFIX):
-        named = [
-            record
-            for record in rpc
-            if len(record["message"]) > 0 and record["message"][:_RPC_MATCH_CHARS] in root["message"]
-        ]
-        if len(named) > 0:
-            return min(named, key=lambda record: record["time"])
+    named = [record for record in rpc if _names_rpc_failure(root["message"], record["message"])]
+    if len(named) > 0:
+        return min(named, key=lambda record: record["time"])
     return root
+
+
+def _names_rpc_failure(engine_message: str, worker_message: str) -> bool:
+    """Whether the EngineCore's ``Worker failed with error '<message>'`` quotes ``worker_message``."""
+    if not engine_message.startswith(_WORKER_FAILED_PREFIX) or len(worker_message) == 0:
+        return False
+    quoted = engine_message[len(_WORKER_FAILED_PREFIX) :]
+    head = worker_message[:_RPC_MATCH_CHARS]
+    if not quoted.startswith(head):
+        return False
+    # The whole message, not a prefix of another: its closing quote follows,
+    # unless MAX_CHARS cut either one first.
+    return len(worker_message) > len(head) or len(quoted) == len(head) or quoted[len(head)] == "'"
 
 
 def format_root_cause(record: dict[str, Any]) -> str:

@@ -126,6 +126,41 @@ def test_worker_rpc_failure_the_engine_core_does_not_name_is_not_the_root(tmp_pa
     assert startup_error.earliest_startup_error(str(tmp_path)) == "Root cause in EngineCore: RuntimeError: unrelated"
 
 
+@pytest.mark.parametrize("other", ["error", "CUDA error", "Worker failed"])
+def test_only_the_quoted_worker_failure_is_the_root(tmp_path, other):
+    """Another rank's message that is vLLM's own text, or a prefix of the quoted one, is not it."""
+    _write(tmp_path, "1.rpc", process="Worker_TP1", type="RuntimeError", message=other, time=1.0)
+    _write(
+        tmp_path,
+        "2.rpc",
+        process="Worker_TP0",
+        type="torch.AcceleratorError",
+        message="CUDA error: an illegal memory access was encountered",
+        time=2.0,
+    )
+    _write(
+        tmp_path,
+        3,
+        process="EngineCore",
+        type="RuntimeError",
+        message="Worker failed with error 'CUDA error: an illegal memory access was encountered', please "
+        "check the stack trace above for the root cause",
+        time=3.0,
+    )
+
+    record = startup_error.earliest_startup_record(str(tmp_path))
+    assert (record["process"], record["type"]) == ("Worker_TP0", "torch.AcceleratorError")
+
+
+def test_a_worker_failure_cut_at_max_chars_is_still_named(tmp_path):
+    worker = "x" * 5000
+    engine = f"Worker failed with error '{worker}', please check the stack trace above"
+    _write(tmp_path, "1.rpc", process="Worker_TP0", type="ValueError", message=worker[: startup_error.MAX_CHARS], time=1.0)
+    _write(tmp_path, 2, process="EngineCore", type="RuntimeError", message=engine[: startup_error.MAX_CHARS], time=2.0)
+
+    assert startup_error.earliest_startup_record(str(tmp_path))["process"] == "Worker_TP0"
+
+
 def test_worker_rpc_failure_alone_is_not_a_root(tmp_path):
     startup_error.StartupErrorHandler(str(tmp_path)).handle(_worker_rpc_failure("no engine process failed to start"))
     (tmp_path / "7.rpc.json.tmp").write_text("{")
