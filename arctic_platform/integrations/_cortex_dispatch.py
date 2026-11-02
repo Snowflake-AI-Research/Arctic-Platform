@@ -191,7 +191,8 @@ class _CortexClientShim:
                 "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
                 "See docs/cortex-integration.md#supported-recipes."
             )
-        payload = to_cortex_fwd_payload(batch, packed=self._job_packs())
+        packed = self._job_packs()
+        payload = to_cortex_fwd_payload(batch, packed=packed)
         result = await self._client.fwd_no_grad(payload)
         logprobs = result.get("logprobs") if isinstance(result, dict) else None
         if logprobs is None and isinstance(result, dict):
@@ -203,9 +204,9 @@ class _CortexClientShim:
                 "cortex forward returned no logprobs; "
                 f"got keys={list(result) if isinstance(result, dict) else type(result).__name__}"
             )
-        # Restore only when the sent mask differs from the caller's. ZoRRo and an
-        # already left-aligned row keep the caller layout, including a flat batch
-        # whose meta lives under context.
+        # Packed rows were left-aligned on the way out. Unpacked and ZoRRo rows
+        # stay in the caller's layout, so only a changed mask needs the scatter.
+        # A flat batch, whose meta lives under context, follows the same rule.
         body = batch.get("batch") if isinstance(batch, dict) and isinstance(batch.get("batch"), dict) else batch
         sent_mask = payload["kwargs"].get("attention_mask") if isinstance(payload, dict) else None
         caller_mask = body.get("attention_mask") if isinstance(body, dict) else None
