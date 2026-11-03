@@ -49,6 +49,10 @@ class MoEDeepSpeedAdapter:
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
     hf_weight_export: Callable[[nn.Module], Callable] | None = None
+    # ``(config) -> source dir`` and ``(model, config, source, *, rank, local_rank) -> cache dir | None``: the
+    # conversion half of ``load_dcp_from_hf``, callable without a process group.
+    resolve_weight_source: Callable[[Any], Path] | None = None
+    prepare_weight_conversion: Callable[..., Path | None] | None = None
 
 
 def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
@@ -298,6 +302,9 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+_EXPORT_GATHER_BYTES = 64 * 1024 * 1024
+
+
 def _gather_ep_weight_to_cpu(
     tensor: torch.Tensor,
     ep_group,
@@ -313,6 +320,15 @@ def _gather_ep_weight_to_cpu(
         raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
     if max_gather_bytes < ep_size * local.element_size():
         raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
+    # Collect exact bytes so NCCL/Gloo need no support for packed or float8 export dtypes.
+    if local.dtype != torch.uint8:
+        gathered = _gather_ep_weight_to_cpu(
+            local.view(torch.uint8), ep_group, is_master=is_master, max_gather_bytes=max_gather_bytes
+        )
+        return None if gathered is None else gathered.view(local.dtype)
 
     full = None
     if is_master:
@@ -343,6 +359,8 @@ def _gather_ep_weight_to_cpu(
             dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
         else:
             dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if not is_master:
+            wait_for_export_collective(inputs)
         if full_shards is not None:
             for rank, shard in enumerate(outputs.view(ep_size, count)):
                 full_shards[rank, offset : offset + count].copy_(shard)
@@ -424,6 +442,8 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    if 0 not in dist.get_process_group_ranks(ep_group):
+                        continue
                     if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
                         # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
                         local = tensor.data.contiguous()
@@ -432,7 +452,9 @@ def build_iter_full_hf_weights(model: nn.Module):
                             layer_state[name] = full
                         del full
                         continue
-                    full = _gather_ep_weight_to_cpu(tensor, ep_group, is_master=is_master)
+                    full = _gather_ep_weight_to_cpu(
+                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                    )
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -534,6 +556,47 @@ def load_moe_model_for_deepspeed(
         ),
     )
     return model
+
+
+def prepare_moe_weights(
+    adapter: MoEDeepSpeedAdapter,
+    *,
+    model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
+    ep_size: int,
+    world_size: int,
+    options: Any,
+    rank: int,
+    local_rank: int,
+) -> Path | None:
+    """Fill the converted-weight cache that ``load_moe_model`` with the same arguments loads from.
+
+    Runs without a process group, on a meta-device model, so one process per node can convert before the training
+    job starts and the distributed load then finds a ready cache. Returns the cache path, or None when the family
+    has no conversion step, the checkpoint already matches the model's format, or the model is randomly initialized.
+    """
+    if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
+        return None
+    if world_size % ep_size:
+        raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+    model_config = adapter.build_model_config(
+        model_name,
+        ep_size,
+        world_size // ep_size,
+        optimization_dtype,
+        attn_implementation,
+        options,
+    )
+    if model_config.debug.random_init:
+        return None
+    model = adapter.get_model(
+        model_config,
+        device=torch.device("meta"),
+        dtype=adapter.dtype_map[model_config.optimization_dtype],
+    )
+    source_path = adapter.resolve_weight_source(model_config)
+    return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
 
 def load_moe_model(

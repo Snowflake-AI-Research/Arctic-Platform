@@ -989,7 +989,8 @@ def test_qwen38_qsa_compresses_after_gather_for_unaligned_cp_shards(monkeypatch)
     assert routes.shape == (1, 3, 3)
 
 
-def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
+@pytest.mark.parametrize("fp32_parity", [True, False])
+def test_qwen38_sparse_gqa_custom_backward_matches_autograd(fp32_parity):
     from arctic_platform.model.implementations.qwen38.qsa_flex import _sparse_gqa_chunk
     from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
 
@@ -999,12 +1000,12 @@ def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
     value = torch.randn(1, 5, 2, 2, dtype=torch.double, requires_grad=True)
     routes = torch.tensor([[[0, 1, -1], [1, 2, 3], [0, 3, 4]]], dtype=torch.int32)
 
-    expected, *_ = _sparse_gqa_chunk(query, key, value, routes, 0.5)
+    expected, *_ = _sparse_gqa_chunk(query, key, value, routes, 0.5, fp32_parity)
     expected.sum().backward()
     expected_grads = tuple(tensor.grad.clone() for tensor in (query, key, value))
 
     actual_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in (query, key, value))
-    actual = _SparseGQAAttention.apply(*actual_inputs, routes, 0.5, 2)
+    actual = _SparseGQAAttention.apply(*actual_inputs, routes, 0.5, 2, fp32_parity)
     actual.sum().backward()
 
     torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)

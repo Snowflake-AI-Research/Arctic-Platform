@@ -126,7 +126,7 @@ def load_qwen4_exp_model_for_deepspeed(
         sp_size=sp_size,
         sp_group=sp_group,
     )
-    apply_qsa_flex(model)
+    apply_qsa_flex(model, fp32_parity=model_config.fp32_parity)
     return model
 
 

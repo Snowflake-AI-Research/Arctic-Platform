@@ -310,18 +310,47 @@ def _expert_parallel_group(parameter: Any):
     return ds_groups._get_expert_parallel_group(parameter.group_name)
 
 
-def _gather_ep_parameter(parameter: Any, *, dim: int) -> torch.Tensor:
+def wait_for_export_collective(tensor: torch.Tensor) -> None:
+    """Block until the collective that sends ``tensor`` has completed on this rank.
+
+    An NCCL collective returns once it is queued, and its watchdog timeout starts counting then. A rank that only
+    contributes shards to the master's export would queue every collective of the export at once while the master
+    converts and sends layer by layer, so any export longer than the group timeout aborts the job.
+    """
+    if tensor.is_cuda:
+        torch.cuda.current_stream(tensor.device).synchronize()
+
+
+def _gather_ep_shards(parameter: Any) -> list[torch.Tensor]:
     import torch.distributed as dist
 
     group = _expert_parallel_group(parameter)
     local = parameter.data.contiguous()
     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
     dist.all_gather(shards, local, group=group)
-    return torch.cat(shards, dim=dim)
+    wait_for_export_collective(local)
+    return shards
 
 
-def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
-    """Gather adapter tensors with live module names for PEFT's selection."""
+def _gather_ep_expert_lora(parameter: Any, *, kind: str, rank: int) -> torch.Tensor:
+    """Gather an EP-sharded expert LoRA factor in PEFT's global ``ParamWrapper`` layout.
+
+    ``lora_A`` is ``[experts * r, in]`` (expert-major), so the rank shards stack. ``lora_B`` is ``[out, r * experts]``
+    with the expert index fastest, so each rank's experts interleave into the global tensor.
+    """
+    shards = _gather_ep_shards(parameter)
+    if kind == "A":
+        return torch.cat(shards, dim=0)
+    return torch.cat([shard.view(shard.shape[0], rank, -1) for shard in shards], dim=2).flatten(1)
+
+
+def gather_peft_adapter_state_dict(
+    model: nn.Module, *, rank: int, is_zero3: bool, keep_checkpoint_wrappers: bool = False
+) -> dict[str, torch.Tensor]:
+    """Gather adapter tensors on rank zero, stripping checkpoint wrappers by default.
+
+    ``keep_checkpoint_wrappers`` preserves live module names for PEFT's adapter selection during saving.
+    """
     adapter_parameters = [
         (name, parameter) for name, parameter in model.named_parameters() if is_peft_adapter_tensor_name(name)
     ]
@@ -339,59 +368,70 @@ def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: boo
         with deepspeed.zero.GatheredParameters(parameters, modifier_rank=0):
             if rank != 0:
                 return {}
-            return {name: parameter.detach().cpu().contiguous() for name, parameter in adapter_parameters}
+            return {
+                name if keep_checkpoint_wrappers else strip_activation_checkpoint_segments(name): (
+                    parameter.detach().cpu().contiguous()
+                )
+                for name, parameter in adapter_parameters
+            }
 
     output: dict[str, torch.Tensor] = {}
     for name, parameter in adapter_parameters:
+        export_name = name if keep_checkpoint_wrappers else strip_activation_checkpoint_segments(name)
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
             if not dist.is_initialized():
                 raise RuntimeError(f"EP-sharded LoRA parameter {name!r} needs a process group")
-            gather_dim = 1 if "lora_B" in name.split(".") else 0
-            gathered = _gather_ep_parameter(parameter, dim=gather_dim)
+            kind = "B" if "lora_B" in export_name.split(".") else "A"
+            gathered = _gather_ep_expert_lora(parameter, kind=kind, rank=_peft_adapter_rank(model, name))
             if rank == 0:
-                output[name] = gathered.detach().cpu().contiguous()
+                output[export_name] = gathered.detach().cpu().contiguous()
         elif rank == 0:
-            output[name] = parameter.detach().cpu().contiguous()
+            output[export_name] = parameter.detach().cpu().contiguous()
     return output
 
 
 def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool = False) -> None:
-    """Collectively write a PEFT adapter pack under ``checkpoint_dir/default``."""
+    """Collectively write a PEFT adapter pack under ``checkpoint_dir/default``.
+
+    The layout is ``PeftModel.save_pretrained``'s: the ``default`` adapter in that directory, any other adapter in a
+    subdirectory named after it.
+    """
     if not is_peft_model(model):
         return
     import torch.distributed as dist
+    from safetensors import safe_open
+    from safetensors.torch import save_file
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3)
+    state = gather_peft_adapter_state_dict(model, rank=rank, is_zero3=is_zero3, keep_checkpoint_wrappers=True)
     if rank != 0:
         return
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
-    model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True)
+    model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
     # PEFT must select against live wrapped names before we make the pack portable.
-    if any(strip_activation_checkpoint_segments(name) != name for name in state):
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        for adapter_name in model.peft_config:
-            output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
-            weights_path = os.path.join(output_dir, "adapter_model.safetensors")
-            with safe_open(weights_path, framework="pt") as handle:
-                metadata = handle.metadata()
-                portable = {}
-                for name in handle.keys():
-                    export_name = strip_activation_checkpoint_segments(name)
-                    if export_name in portable:
-                        raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
-                    portable[export_name] = handle.get_tensor(name)
-            if not portable:
-                raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
-            with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
-                temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
-                save_file(portable, temporary_path, metadata=metadata)
-                os.replace(temporary_path, weights_path)
+    for adapter_name in model.peft_config:
+        output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
+        weights_path = os.path.join(output_dir, "adapter_model.safetensors")
+        with safe_open(weights_path, framework="pt") as handle:
+            metadata = handle.metadata()
+            saved_names = list(handle.keys())
+            portable = {}
+            for name in saved_names:
+                export_name = strip_activation_checkpoint_segments(name)
+                if export_name in portable:
+                    raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                portable[export_name] = handle.get_tensor(name)
+        if len(portable) == 0:
+            raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
+        if all(strip_activation_checkpoint_segments(name) == name for name in saved_names):
+            continue
+        with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+            temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
+            save_file(portable, temporary_path, metadata=metadata)
+            os.replace(temporary_path, weights_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -437,6 +477,23 @@ def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:
         )
 
 
+def validate_full_weight_sync_source(model: nn.Module, weight_format: WeightFormat) -> None:
+    """Refuse a full-weight sync stream from a model that trains LoRA adapters.
+
+    A ``"vllm"`` or ``"hf"`` receiver writes tensors onto vLLM parameters by name. The sampler keeps adapters in its
+    LoRA manager, so the adapter factors reach no parameter and the sampler keeps serving the base model.
+    """
+    from arctic_platform.model.patches.peft import is_peft_lora_param
+
+    adapters = [name for name, parameter in model.named_parameters() if is_peft_lora_param(name, parameter)]
+    if adapters:
+        raise ValueError(
+            f"weight_format={weight_format!r} cannot sync a model with {len(adapters)} trainable LoRA parameter(s) "
+            f"(e.g. {adapters[0]}): the sampler serves adapters through its LoRA manager, so they would reach no "
+            "parameter and the sampler would keep the base model. Sync a PEFT model with weight_format='lora'."
+        )
+
+
 def _peft_lora_parameter_to_vllm_name(name: str) -> str:
     parts = strip_activation_checkpoint_segments(name).split(".")
     if len(parts) >= 3 and parts[-1] == "weight" and parts[-3] in ("lora_A", "lora_B"):
@@ -473,13 +530,23 @@ def _expert_lora_vllm_key(experts_prefix: str, weight_name: str, kind: str) -> s
     return f"{experts_prefix}.{weight_name}.lora_{kind}.weight"
 
 
-def _peft_adapter_rank(model: nn.Module) -> int:
+def _peft_adapter_rank(model: nn.Module, parameter_name: str | None = None) -> int:
+    """``r`` of the adapter that owns ``parameter_name``, or of the only adapter when the name is omitted."""
     peft_config = getattr(model, "peft_config", None)
     if isinstance(peft_config, dict) and peft_config:
-        rank = getattr(next(iter(peft_config.values())), "r", None)
-        if rank is not None and int(rank) > 0:
-            return int(rank)
-    raise RuntimeError("LoRA export requires model.peft_config[*].r")
+        if parameter_name is not None:
+            parts = parameter_name.split(".")
+            for index, part in enumerate(parts[:-1]):
+                adapter_name = parts[index + 1]
+                if part in ("lora_A", "lora_B") and adapter_name in peft_config:
+                    rank = getattr(peft_config[adapter_name], "r", None)
+                    if rank is not None and int(rank) > 0:
+                        return int(rank)
+        if len(peft_config) == 1 or parameter_name is None:
+            rank = getattr(next(iter(peft_config.values())), "r", None)
+            if rank is not None and int(rank) > 0:
+                return int(rank)
+    raise RuntimeError(f"LoRA export requires model.peft_config[*].r for {parameter_name or 'the adapter'}")
 
 
 def _iter_param_wrapper_expert_loras(model: nn.Module):
@@ -497,10 +564,14 @@ def _iter_param_wrapper_expert_loras(model: nn.Module):
         if not (experts_prefix.endswith(".experts") or experts_prefix == "experts"):
             continue
         for kind, bucket in (("A", module.lora_A), ("B", module.lora_B)):
-            if bucket:
-                weight = getattr(bucket[next(iter(bucket))], "weight", None)
-                if weight is not None:
-                    yield experts_prefix, weight_name, kind, weight
+            if not bucket:
+                continue
+            for adapter_name, layer in bucket.items():
+                weight = getattr(layer, "weight", None)
+                if weight is None:
+                    continue
+                rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
+                yield experts_prefix, weight_name, kind, weight, rank
 
 
 def iter_lora_weights(
@@ -518,7 +589,6 @@ def iter_lora_weights(
 
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
-    lora_rank = _peft_adapter_rank(model)
     # Families whose module tree differs from the served checkpoint rename adapter tensors here.
     rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
     expert_parameter_ids: set[int] = set()
@@ -527,6 +597,7 @@ def iter_lora_weights(
         weight_name,
         kind,
         parameter,
+        lora_rank,
     ) in _iter_param_wrapper_expert_loras(model):
         expert_parameter_ids.add(id(parameter))
         prefix = strip_activation_checkpoint_segments(experts_prefix).replace(".base_layer", "")
@@ -544,6 +615,8 @@ def iter_lora_weights(
                     rename(_expert_lora_vllm_key(prefix, weight_name, kind)),
                     torch.cat(shards, dim=0).contiguous(),
                 )
+            else:
+                wait_for_export_collective(local)
         elif is_master:
             yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
@@ -556,10 +629,13 @@ def iter_lora_weights(
 
             group = _expert_parallel_group(parameter)
             assert not is_master or dist.get_rank(group=group) == 0
-            shards = [torch.empty_like(parameter.data) for _ in range(dist.get_world_size(group=group))]
-            dist.all_gather(shards, parameter.data.contiguous(), group=group)
+            local = parameter.data.contiguous()
+            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
+            dist.all_gather(shards, local, group=group)
             if is_master:
                 yield export_name, torch.cat(shards, dim=0)
+            else:
+                wait_for_export_collective(local)
         elif is_master:
             yield export_name, parameter.data
 
@@ -610,11 +686,17 @@ def iter_model_weights(
     Models without a family contract stream ``named_parameters()``: unchanged for
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
     :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+
+    ``include_skipped=True`` is the weights-only checkpoint export, which writes the unmerged base of a PEFT model
+    beside its separately saved adapter pack. Every other ``"hf"`` or ``"vllm"`` stream feeds a sampler, so a model
+    with trainable LoRA parameters is refused there (see :func:`validate_full_weight_sync_source`).
     """
     if weight_format not in ("hf", "vllm", "lora"):
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
+    if weight_format != "lora" and not include_skipped:
+        validate_full_weight_sync_source(model, weight_format)
     maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
