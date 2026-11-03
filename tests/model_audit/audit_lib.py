@@ -121,6 +121,11 @@ class Profile:
     def dtype(self) -> str:
         return self.launch.get("dtype", "bfloat16")
 
+    @property
+    def reference(self) -> str:
+        """``transformers`` (the model's transformers class) or ``deepseek_inference`` (the checkpoint's own code)."""
+        return self.raw.get("reference", "transformers")
+
     def known_issue(self, check_id: str) -> dict | None:
         return (self.raw.get("known_issues") or {}).get(check_id)
 
@@ -261,11 +266,26 @@ def text_config_of(config: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def _mtp_layers(text: dict) -> int:
+    return int(text.get("num_nextn_predict_layers") or 0)
+
+
 def _per_layer_lists(text: dict, num_layers: int) -> dict[str, list]:
+    """Per-layer lists; some configs append one entry per MTP layer after the backbone's."""
+    lengths = {num_layers, num_layers + _mtp_layers(text)}
     return {
         key: value
         for key, value in text.items()
-        if isinstance(value, list) and len(value) == num_layers and key not in ("eos_token_id",)
+        if isinstance(value, list) and len(value) in lengths and key not in ("eos_token_id",)
+    }
+
+
+def _layer_id_scalars(text: dict, num_layers: int) -> dict[str, int]:
+    """Single layer ids (e.g. ``candidate_source_layer_id``); a negative value means none."""
+    return {
+        key: value
+        for key, value in text.items()
+        if key.endswith("_layer_id") and isinstance(value, int) and not isinstance(value, bool) and value < num_layers
     }
 
 
@@ -289,7 +309,7 @@ def _layer_index_lists(text: dict, num_layers: int) -> list[tuple[tuple[str, ...
     for key, value in text.items():
         if isinstance(value, dict):
             visit(value, (key,))
-        elif isinstance(value, list) and key.endswith("layers") and len(value) != num_layers:
+        elif isinstance(value, list) and key.endswith(("layers", "layer_ids")) and len(value) != num_layers:
             visit(value, (key,))
     return found
 
@@ -299,12 +319,14 @@ def layer_signatures(text: dict) -> list[tuple]:
     num_layers = int(text["num_hidden_layers"])
     lists = _per_layer_lists(text, num_layers)
     index_lists = _layer_index_lists(text, num_layers)
+    scalars = _layer_id_scalars(text, num_layers)
     first_dense = text.get("first_k_dense_replace")
     moe_freq = text.get("moe_layer_freq") if isinstance(text.get("moe_layer_freq"), int) else None
     signatures = []
     for i in range(num_layers):
         sig = [(key, json.dumps(values[i], sort_keys=True)) for key, values in sorted(lists.items())]
         sig += [(".".join(path), i in set(indices)) for path, indices in index_lists]
+        sig += [(key, i == value) for key, value in sorted(scalars.items())]
         if isinstance(first_dense, int):
             sig.append(("first_k_dense_replace", i < first_dense))
         if moe_freq:
@@ -340,8 +362,13 @@ def shrink_config(full: dict, tiny: dict) -> tuple[dict, list[int]]:
     keep = select_layers(text, tiny.get("layers"), tiny.get("min_layers", 2))
     remap = {old: new for new, old in enumerate(keep)}
 
+    overrides = tiny.get("text_overrides") or {}
+    mtp = int(overrides.get("num_nextn_predict_layers", _mtp_layers(text)))
     for key, values in _per_layer_lists(text, num_layers).items():
-        text[key] = [values[i] for i in keep]
+        tail = values[num_layers : num_layers + mtp] if len(values) > num_layers else []
+        text[key] = [values[i] for i in keep] + tail
+    for key, value in _layer_id_scalars(text, num_layers).items():
+        text[key] = remap.get(value, -1)
     for path, indices in _layer_index_lists(text, num_layers):
         node = text
         for part in path[:-1]:
@@ -413,13 +440,12 @@ def row_lengths(profile: Profile, tiny_config: dict) -> list[int]:
 _TINY_FORMAT = 2
 
 
-def _config_hash(config: dict, seed: int, dtype: str) -> str:
+def _config_hash(config: dict, seed: int, dtype: str, reference: str = "transformers") -> str:
     import torch
     import transformers
 
-    payload = json.dumps(
-        [config, seed, dtype, transformers.__version__, torch.__version__, _TINY_FORMAT], sort_keys=True
-    )
+    key = [config, seed, dtype, transformers.__version__, torch.__version__, _TINY_FORMAT]
+    payload = json.dumps(key if reference == "transformers" else [*key, reference], sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -439,7 +465,7 @@ def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
     import transformers
 
     config_dict = tiny_config(profile)
-    key = _config_hash(config_dict, seed, profile.dtype)
+    key = _config_hash(config_dict, seed, profile.dtype, profile.reference)
     out = audit_root() / "checkpoints" / f"{profile.name}-{key}-s{seed}"
     if (out / ".complete").exists():
         _copy_tokenizer_files(profile, out)
@@ -447,18 +473,23 @@ def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
     staging = Path(tempfile.mkdtemp(prefix=f"{out.name}.", dir=out.parent if out.parent.exists() else None))
     try:
         (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
-        config = transformers.AutoConfig.from_pretrained(str(staging))
-        arch = (config_dict.get("architectures") or [None])[0]
-        model_cls = getattr(transformers, arch, None) if arch else None
-        if model_cls is None:
-            model_cls = transformers.AutoModelForCausalLM._model_mapping[type(config)]
-        torch.manual_seed(seed)
-        with torch.device("cpu"):
-            model = model_cls._from_config(config, dtype=torch.float32)
-        _perturb_zero_init(model, seed)
-        model.to(getattr(torch, profile.dtype)).save_pretrained(str(staging), safe_serialization=True)
-        (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
         _copy_tokenizer_files(profile, staging)
+        if profile.reference == "deepseek_inference":
+            import deepseek_inference
+
+            deepseek_inference.build_tiny(profile.checkpoint, config_dict, staging, seed)
+        else:
+            config = transformers.AutoConfig.from_pretrained(str(staging))
+            arch = (config_dict.get("architectures") or [None])[0]
+            model_cls = getattr(transformers, arch, None) if arch else None
+            if model_cls is None:
+                model_cls = transformers.AutoModelForCausalLM._model_mapping[type(config)]
+            torch.manual_seed(seed)
+            with torch.device("cpu"):
+                model = model_cls._from_config(config, dtype=torch.float32)
+            _perturb_zero_init(model, seed)
+            model.to(getattr(torch, profile.dtype)).save_pretrained(str(staging), safe_serialization=True)
+        (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
         (staging / ".complete").write_text("")
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():

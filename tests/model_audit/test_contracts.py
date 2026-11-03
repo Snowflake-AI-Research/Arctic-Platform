@@ -40,6 +40,11 @@ TINY_LAYOUT = audit_lib.register_check(
     "the tiny checkpoint has the real checkpoint's tensor-name layout, so loading it exercises the real conversion",
 )
 
+REFERENCE_CONFIG = audit_lib.register_check(
+    "contract.reference_config_matches_shipped",
+    "the reference's mapping of config.json onto the checkpoint's inference code reproduces its shipped config",
+)
+
 
 def _launch_spec(profile, tiny_ckpt) -> ModelSpec:
     return ModelSpec(**profile.trainer_spec(model_path=str(tiny_ckpt), tiny=False))
@@ -92,7 +97,7 @@ def _layout(names, keep: list[int] | None = None) -> set[str]:
     """Name patterns with layer and expert indices abstracted; restricted to kept layers when given."""
     out = set()
     for name in names:
-        match = re.search(r"\.layers\.(\d+)\.", name)
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
         if match and keep is not None and int(match.group(1)) not in keep:
             continue
         out.add(re.sub(r"\.\d+(?=\.|$)", ".N", name))
@@ -116,3 +121,14 @@ def test_tiny_layout_matches_source(profile, tiny_ckpt, record):
         f"{len(only_source)} name pattern(s) only in the real checkpoint (e.g. {only_source[:5]}), "
         f"{len(only_tiny)} only in the tiny one (e.g. {only_tiny[:5]})"
     )
+
+
+@pytest.mark.audit_check(REFERENCE_CONFIG)
+def test_reference_config_matches_shipped(profile, record):
+    if profile.reference != "deepseek_inference":
+        pytest.skip("the reference is the model's transformers class")
+    import deepseek_inference
+
+    mismatches = deepseek_inference.shipped_args_mismatches(profile.checkpoint)
+    record(mismatches=mismatches)
+    assert not mismatches, mismatches

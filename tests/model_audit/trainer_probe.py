@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import os
 import sys
@@ -229,8 +230,25 @@ def run_reference(profile, ckpt: str) -> dict:
     cls = getattr(transformers, arch, None) or transformers.AutoModelForCausalLM
     result = {"ids": ids, "pos": pos, "labels": labels, "rows": rows}
     for tag, dtype in (("fp32", torch.float32), ("lowp", getattr(torch, profile.dtype))):
-        model = cls.from_pretrained(ckpt, dtype=dtype, attn_implementation="eager").cuda()
-        model.train()
+        if profile.reference == "deepseek_inference":
+            import deepseek_inference
+
+            model = deepseek_inference.Reference(profile.checkpoint, ckpt, dtype, max(len(r) for r in rows))
+
+            def row_logprobs(sl, model=model):
+                return _logprobs_from_output(model.logits(ids[:, sl]), labels[:, sl].cuda())
+
+            def published(grads):
+                return grads
+
+        else:
+            model = cls.from_pretrained(ckpt, dtype=dtype, attn_implementation="eager").cuda()
+            model.train()
+
+            def row_logprobs(sl, model=model):
+                return _forward(model, ids[:, sl], pos[:, sl], labels[:, sl], pass_labels=False)[0]
+
+            published = functools.partial(_checkpoint_named, model)
         # One sequence per call: not every transformers model masks at position resets (GLM-5.3 sparse attention
         # does not), and a packed reference would then attend across rows.
         lp = torch.zeros(ids.shape, dtype=torch.float32)
@@ -239,7 +257,7 @@ def run_reference(profile, ckpt: str) -> dict:
         # Sum over rows of |row gradient|: bf16 noise scales with this, not with the (possibly cancelling) total.
         mass = {n: torch.zeros_like(p, dtype=torch.float32) for n, p in params.items()}
         for sl in audit_lib.row_slices(rows):
-            row_lp, _ = _forward(model, ids[:, sl], pos[:, sl], labels[:, sl], pass_labels=False)
+            row_lp = row_logprobs(sl)
             _loss(row_lp, labels[:, sl], total).backward()
             lp[:, sl] = row_lp.detach().float().cpu()
             for n, p in params.items():
@@ -248,14 +266,13 @@ def run_reference(profile, ckpt: str) -> dict:
                     seen[n] = p.grad.float().clone()
         del seen
         result[f"{tag}_logprobs"] = lp
-        result[f"{tag}_grad_mass"] = _checkpoint_named(model, {n: m.cpu() for n, m in mass.items()})
+        result[f"{tag}_grad_mass"] = published({n: m.cpu() for n, m in mass.items()})
         del mass
-        result[f"{tag}_grads"] = _checkpoint_named(
-            model,
+        result[f"{tag}_grads"] = published(
             {
                 n: (p.grad.detach() if p.grad is not None else torch.zeros_like(p)).float().cpu()
                 for n, p in model.named_parameters()
-            },
+            }
         )
         result[f"{tag}_param_names"] = sorted(result[f"{tag}_grads"])
         del model

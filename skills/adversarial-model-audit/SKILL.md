@@ -69,11 +69,17 @@ reproduced it outside the suite.
 
 | Tier | File | Needs | What it compares |
 | --- | --- | --- | --- |
-| Contracts | `test_contracts.py` | CPU | launch spec resolution and validation, length support, tiny-checkpoint coverage and layout |
-| Trainer | `test_trainer.py` | baseline layout | production model vs transformers fp32 on the same tiny checkpoint: log-probs per position bucket, determinism, packed-row isolation, row order, 1..8-token samples, gradient coverage and values, LM-head gradient vs an unfused head, export round trip, the production config class on a transformers-re-saved config |
+| Contracts | `test_contracts.py` | CPU | launch spec resolution and validation, length support, tiny-checkpoint coverage and layout, the reference's reading of the config |
+| Trainer | `test_trainer.py` | baseline layout | production model vs the fp32 reference on the same tiny checkpoint: log-probs per position bucket, determinism, packed-row isolation, row order, 1..8-token samples, gradient coverage and values, LM-head gradient vs an unfused head, export round trip, the production config class on a transformers-re-saved config |
 | Optimizer | `test_optimizer.py` | baseline layout | one step through `initialize_training_engine` vs reference AdamW on the clipped reduced gradient; the engine's clip norm vs the reduced gradient's, and (with clipping forced on) whether the clip coefficient reaches the gradient unrounded; master-weight update loss at the launch lr; frozen params; implementation policy |
 | Parallel | `test_parallel.py` | 2-8 GPUs | EP/SP/DP layouts vs the baseline layout: log-probs, the optimizer update and the clip norm (real gradient reductions) |
 | Sampler | `test_sampler.py` | 1-8 GPUs, vLLM | sampler vs trainer and vs fp32, repeatability, batch invariance, production weight sync (file and NCCL placement) vs a fresh load, TP degrees below launch vs fp32 |
+
+The reference is the model's transformers class. For a model transformers does not implement, it is the
+checkpoint's own inference code (`reference: deepseek_inference` runs the `inference/model.py` DeepSeek ships, with
+its tilelang kernels replaced by torch and activation quantization off), and the tiny checkpoint is written in the
+real checkpoint's storage formats (FP8 and MXFP4 with their scales). Check any new kernel stand-in against the real
+kernel before trusting the reference.
 
 The baseline layout is the profile's `tiny.trainer.parallelism`: the smallest layout the production loader actually
 builds (one GPU for dense models, EP2 for MoE loaders that require EP > 1). Never test a layout production cannot
@@ -147,8 +153,9 @@ Hypothesis checklist (model-agnostic; tick each in the report with its evidence)
   but not across engines). All run for every model: a broken variant is a finding even when this launch takes another,
   since the client picks the format per job and colocated jobs use the file path. A checkpoint tensor the trainer's HF
   export lacks is never trained, so the fresh-load sampler keeps the pre-sync value there.
-- Optimizer: policy per family, frozen and FP8 parameters, bf16 master-weight update loss at the launch lr, weight
-  decay groups, clipping across EP/SP, expert-data-parallel reduction.
+- Optimizer: policy per family, frozen and FP8 parameters, bf16 master-weight update loss at the launch lr,
+  parameters the model keeps in fp32 under bf16 master weights, weight decay groups, clipping across EP/SP,
+  expert-data-parallel reduction.
 - Parallelism: EP/SP parity, reduction groups, expert DP with SP, uneven sequence splits.
 - Checkpoint save, resume and HF export; LoRA if it will be launched.
 - Platform: config keys silently dropped, client/server default mismatches, retries that change workload identity.
@@ -228,6 +235,7 @@ model:
 ```yaml
 name: <file stem>
 checkpoint: <hub id or local dir>            # config.json and the safetensors index are read; weights are not
+reference: transformers                      # or deepseek_inference: the checkpoint's own inference/model.py
 launch:
   dtype: bfloat16
   max_seq_len: 262144
