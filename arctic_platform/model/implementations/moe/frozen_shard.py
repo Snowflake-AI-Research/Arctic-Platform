@@ -128,6 +128,10 @@ def install_frozen_layer_shards(layers: nn.ModuleList, group: dist.ProcessGroup 
         group = dist.new_group(list(range(dist.get_world_size())))
     shards = []
     for layer in layers:
+        # Only whole-block-checkpointed layers: a layer that is not recomputed keeps its gathered weights saved for
+        # backward anyway, and a selective recompute runs submodule methods after the gathered weights were released.
+        if not hasattr(layer, "_checkpoint_wrapped_module"):
+            continue
         inner = _inner_layer(layer)
         shard = FrozenLayerShard(inner, group)
         inner.register_forward_pre_hook(lambda module, args, shard=shard: shard.gather())
