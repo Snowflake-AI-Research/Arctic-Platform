@@ -252,3 +252,31 @@ def test_w4a8_experts_match_the_decoded_bf16_experts(monkeypatch):
     error = (x.grad.float() - x_ref.grad.float()).norm() / x_ref.grad.float().norm()
     assert error < 5e-2, error
     assert module._scales_interleaved and module.w1_scale_inv.shape == (experts, dim // 128, hidden)
+
+
+def test_stash_frozen_keeps_parameters_on_ctx_and_saves_other_stacks():
+    import gc
+    import weakref
+
+    from arctic_platform.model.implementations.fp8 import Int4InterleavedScales
+    from arctic_platform.model.implementations.fp8 import stash_frozen
+    from arctic_platform.model.implementations.fp8 import unstash_frozen
+
+    class Ctx:
+        pass
+
+    param = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    ctx = Ctx()
+    assert stash_frozen(ctx, param, Int4InterleavedScales(param, 1)) == []
+    assert unstash_frozen(ctx, (torch.ones(1),))[0][0] is param
+
+    stack, scale = torch.zeros(4, 3), torch.ones(4, 2)
+    ctx = Ctx()
+    saved = stash_frozen(ctx, (stack, stack), (Int4InterleavedScales(scale, 1), Int4InterleavedScales(scale, 1)))
+    (weights, scales), rest = unstash_frozen(ctx, (torch.ones(1), *saved))
+    assert weights[0] is stack and scales[1].scale is scale and scales[1].align == 1 and len(rest) == 1
+    # Nothing but the saved tensors keeps the stacks alive: the rebuild closure holds only their structure.
+    ref = weakref.ref(stack)
+    del stack, weights, scales, saved, rest
+    gc.collect()
+    assert ref() is None

@@ -122,10 +122,10 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
     def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit, act_scale):
         gate_up = gate_up.contiguous()
         hidden = gate_up.shape[1] // 2
-        # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
-        ctx.weights = (weight, scale)
+        from arctic_platform.model.implementations.fp8 import stash_frozen
+
         ctx.rows, ctx.block_size, ctx.limit = rows, block_size, limit
-        ctx.save_for_backward(gate_up, scores, offsets)
+        ctx.save_for_backward(gate_up, scores, offsets, *stash_frozen(ctx, weight, scale))
         h = torch.empty(gate_up.shape[0], hidden, dtype=gate_up.dtype, device=gate_up.device)
         if h.numel():
             _packed_swiglu_fwd_kernel[(h.shape[0],)](
@@ -145,8 +145,9 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        gate_up, scores, offsets = ctx.saved_tensors
-        weight, scale = ctx.weights
+        from arctic_platform.model.implementations.fp8 import unstash_frozen
+
+        (weight, scale), (gate_up, scores, offsets) = unstash_frozen(ctx, ctx.saved_tensors)
         rows = ctx.rows
         hidden = gate_up.shape[1] // 2
         grad_h = torch._grouped_mm(
