@@ -739,3 +739,58 @@ def test_packed_ple_survives_custom_lm_head():
     packed = model(input_ids=ids, position_ids=positions, **kwargs)
     separate = model(input_ids=ids[:, 4:], position_ids=positions[:, 4:], **kwargs)
     torch.testing.assert_close(packed[:, 4:], separate, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("include_skipped", [False, True])
+def test_qwen38_full_hf_export_restores_ple_shards(monkeypatch, include_skipped):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=2))
+    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    tensor = torch.arange(20).reshape(5, 4)
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            yield name, tensor
+            if include_skipped:
+                yield "mtp.fc_embedding.weight", torch.ones(2, 2)
+
+        return iterator
+
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights", ordinary_builder)
+    exported = dict(integration._build_iter_full_hf_weights(model)(include_skipped=include_skipped))
+    if not include_skipped:
+        assert set(exported) == {name}
+        assert exported[name] is tensor
+        return
+    assert set(exported) == {
+        name.replace(".weight", ".shard_0.weight"),
+        name.replace(".weight", ".shard_1.weight"),
+        "mtp.fc_embedding.weight",
+    }
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_0.weight")], tensor[:3], rtol=0, atol=0)
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_1.weight")], tensor[3:], rtol=0, atol=0)
+
+
+def test_qwen38_full_hf_export_uses_family_export_builder():
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    assert integration._adapter().hf_weight_export is integration._build_iter_full_hf_weights
+
+
+@pytest.mark.parametrize("parts", [0, -1, True, 1.5, "128"])
+def test_qwen38_full_hf_export_rejects_invalid_ple_part_count(monkeypatch, parts):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=parts))
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights", lambda model: None)
+    with pytest.raises(ValueError, match="split_ngram_parts must be a positive integer"):
+        integration._build_iter_full_hf_weights(model)
