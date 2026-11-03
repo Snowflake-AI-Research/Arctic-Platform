@@ -20,6 +20,7 @@ import json
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import arctic_platform.common.deepspeed_engine as deepspeed_engine
 from arctic_platform.common.deepspeed_engine import OptimizerSettings
@@ -31,6 +32,10 @@ from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.deepspeed_engine import optimizer_choice
 from arctic_platform.common.deepspeed_engine import optimizer_implementation
 from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
+from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 
 _ZERO2 = {"zero_optimization": {"stage": 2}}
 _OFFLOAD = {"zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu"}}}
@@ -461,3 +466,742 @@ def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp
     assert choice["implementation"] == "fused_adam"
     assert calls["split"]
     assert optimizer.param_groups == [{"params": [], "name": "experts"}]
+
+
+_PARTITION_WIDTH = 64
+
+
+def test_offloaded_file_snapshot_reuses_bounded_storage_and_restores_exactly(monkeypatch, tmp_path):
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    storage = deepspeed_engine._OffloadedGradientStorage()
+    source = torch.arange(55, dtype=torch.float32).reshape(5, 11)
+    snapshot = storage.snapshot(source)
+    assert isinstance(snapshot, deepspeed_engine._OffloadedGradientFile)
+    assert snapshot.size == source.numel() * source.element_size()
+    assert storage.staging.numel() * storage.staging.element_size() == 64
+    descriptor = snapshot.file.fileno()
+    initial_buffer = storage.staging.data_ptr()
+    destination = torch.empty_like(source)
+    snapshot.restore(destination)
+    torch_assert_equal(destination, source)
+    source.add_(1.25)
+    snapshot.copy_(source)
+    snapshot.restore(destination)
+    torch_assert_equal(destination, source)
+    assert snapshot.file.fileno() == descriptor
+    assert storage.staging.data_ptr() == initial_buffer
+    snapshot.file.close()
+
+
+@pytest.mark.parametrize("operation", ["pwritev", "preadv"])
+def test_offloaded_file_snapshot_completes_partial_io(monkeypatch, tmp_path, operation):
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    native = getattr(deepspeed_engine.os, operation)
+    calls = []
+
+    def partial(descriptor, views, offset):
+        calls.append(offset)
+        return native(descriptor, [views[0][: min(12, len(views[0]))]], offset)
+
+    monkeypatch.setattr(deepspeed_engine.os, operation, partial)
+    storage = deepspeed_engine._OffloadedGradientStorage()
+    source = torch.arange(55, dtype=torch.float32)
+    snapshot = storage.snapshot(source)
+    destination = torch.empty_like(source)
+    snapshot.restore(destination)
+    torch_assert_equal(destination, source)
+    assert len(calls) > 4
+    snapshot.file.close()
+
+
+def test_offloaded_file_snapshot_closes_failed_write(monkeypatch, tmp_path):
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    native = deepspeed_engine.tempfile.TemporaryFile
+    files = []
+
+    def owned_file(*args, **kwargs):
+        file = native(*args, **kwargs)
+        files.append(file)
+        return file
+
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", owned_file)
+    monkeypatch.setattr(deepspeed_engine.os, "pwritev", lambda *args: 0)
+    with pytest.raises(OSError, match="made no progress"):
+        deepspeed_engine._OffloadedGradientStorage().snapshot(torch.ones(55, dtype=torch.float32))
+    assert len(files) == 1
+    assert files[0].closed
+
+
+def test_offloaded_file_snapshot_refuses_truncated_restore(monkeypatch, tmp_path):
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    source = torch.arange(55, dtype=torch.float32)
+    snapshot = deepspeed_engine._OffloadedGradientStorage().snapshot(source)
+    deepspeed_engine.os.ftruncate(snapshot.file.fileno(), 12)
+    with pytest.raises(OSError, match="made no progress"):
+        snapshot.restore(torch.empty_like(source))
+    snapshot.file.close()
+
+
+class _PartialGradientModel(torch.nn.Module):
+    def __init__(self, *, participation, reentrant):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            torch.nn.Linear(_PARTITION_WIDTH, _PARTITION_WIDTH, bias=False) for _ in range(6)
+        )
+        self.participation = participation
+        self.reentrant = reentrant
+        self.forwards = 0
+
+    def forward(self, inputs):
+        self.forwards += 1
+        for index, layer in enumerate(self.layers):
+            if self.participation == "unused" and index in (2, 5):
+                continue
+            if self.participation == "alternating" and index == (2 if self.forwards % 2 else 5):
+                continue
+            inputs = checkpoint(layer, inputs, use_reentrant=self.reentrant)
+            inputs = torch.nn.functional.gelu(inputs)
+        return inputs
+
+
+def _partition_release_engine(monkeypatch, *, stage, fp32_masters, release, participation=None, reentrant=False):
+    set_seed(0)
+    if participation is None:
+        model = torch.nn.Sequential(
+            torch.nn.Linear(_PARTITION_WIDTH, 2 * _PARTITION_WIDTH),
+            torch.nn.GELU(),
+            torch.nn.Linear(2 * _PARTITION_WIDTH, _PARTITION_WIDTH),
+        )
+    else:
+        model = _PartialGradientModel(participation=participation, reentrant=reentrant)
+    spec = TrainingEngineSpec(
+        dtype="bfloat16",
+        world_size=1,
+        fp32_masters=fp32_masters,
+        gradient_clipping=0,
+        ds_overrides={
+            "zero_optimization": {"stage": stage, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+            "zero_force_ds_cpu_optimizer": False,
+            "data_types": {"grad_accum_dtype": "fp32"},
+        },
+    )
+    ds_config = build_deepspeed_config(spec)
+    assert ds_config["data_types"] == {"grad_accum_dtype": "fp32"}
+    with monkeypatch.context() as patch:
+        if not release:
+            patch.setattr(
+                deepspeed_engine, "release_offloaded_grad_partitions", lambda optimizer: False, raising=False
+            )
+        engine, _, _ = initialize_training_engine(
+            model,
+            ds_config,
+            optimizer=OptimizerSettings(name="AdamW", lr=1e-3, fused=True),
+            ep_size=1,
+            mpu=None,
+            model_path="unused",
+            rank=0,
+        )
+    return engine
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_offloaded_partition_release_evicts_nonboundary_gradients(monkeypatch, single_rank_group, stage, fp32_masters):
+    import inspect
+
+    engine = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"]
+    copy_grads = engine.optimizer.copy_grads_in_partition
+    completed_groups = set()
+
+    def observe_copy(param, group_idx=None):
+        if group_idx is None:
+            group_idx = engine.optimizer._get_param_group_idx(param)
+        result = copy_grads(param, group_idx)
+        if all(
+            engine.optimizer.params_already_reduced[engine.optimizer.get_param_id(partition_param)]
+            for partition_param in engine.optimizer.params_in_partition[group_idx]
+        ):
+            assert engine.optimizer.averaged_gradients[group_idx] is None
+            completed_groups.add(group_idx)
+        return result
+
+    monkeypatch.setattr(engine.optimizer, "copy_grads_in_partition", observe_copy)
+    engine.set_gradient_accumulation_boundary(False)
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    engine.backward(engine(inputs).float().square().mean())
+    remaining = sum(
+        partition.flat_partition.numel() * partition.flat_partition.element_size()
+        for partition in engine.optimizer.averaged_gradients.values()
+        if partition is not None
+    )
+    print(
+        f"NONBOUNDARY_PARTITION_MEMORY stage={stage} fp32_masters={fp32_masters} remaining_bytes={remaining}",
+        flush=True,
+    )
+    assert remaining == 0, "offloaded FP32 sums remain on GPU between accumulation microsteps"
+    # ZeRO-1 can defer reduction to the boundary; ZeRO-2 reduces every microstep.
+    if stage == 2:
+        assert len(retained) == len(engine.optimizer.bit16_groups)
+        assert completed_groups == set(range(len(engine.optimizer.bit16_groups)))
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+@pytest.mark.parametrize("boundaries", [(True,), (False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("file_snapshots", [False, True])
+def test_offloaded_partition_release_preserves_repeated_backwards_and_steps(
+    monkeypatch, single_rank_group, stage, fp32_masters, boundaries, file_snapshots
+):
+    import inspect
+
+    from deepspeed.utils import safe_get_full_grad
+
+    if file_snapshots:
+        monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    evicted = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    baseline = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=False)
+    retained = inspect.getclosurevars(evicted.optimizer.step).nonlocals["retained"]
+    inputs = [
+        torch.arange(8 * _PARTITION_WIDTH, device="cuda").reshape(8, _PARTITION_WIDTH).bfloat16() / 512,
+        torch.full((8, _PARTITION_WIDTH), 0.123456, device="cuda", dtype=torch.bfloat16),
+    ]
+    # A second window detects snapshots that accidentally survive an optimizer step.
+    for window in range(2):
+        for index, boundary in enumerate(boundaries):
+            losses = []
+            for engine in (evicted, baseline):
+                engine.set_gradient_accumulation_boundary(boundary)
+                loss = engine(inputs[(index + window) % len(inputs)]).float().square().mean()
+                losses.append(loss.detach())
+                engine.backward(loss)
+            torch_assert_equal(*losses)
+            groups = list(evicted.optimizer.averaged_gradients.values())
+            assert all(partition is None for partition in groups)
+            if boundary or stage == 2:
+                assert retained
+                assert all(
+                    isinstance(snapshot, deepspeed_engine._OffloadedGradientFile) is file_snapshots
+                    for snapshot in retained.values()
+                )
+        if not boundaries[-1]:
+            for engine in (evicted, baseline):
+                engine.optimizer.finalize_gradient_accumulation_boundary()
+                engine.set_gradient_accumulation_boundary(True)
+        pairs = list(zip(evicted.module.named_parameters(), baseline.module.named_parameters()))
+        for (name, parameter), (_, reference) in pairs:
+            torch_assert_equal(
+                safe_get_full_grad(parameter),
+                safe_get_full_grad(reference),
+                msg=lambda message, name=name: f"{name} gradient: {message}",
+            )
+        evicted.step()
+        baseline.step()
+        assert retained == {}
+        torch_assert_equal(
+            torch.as_tensor(evicted.optimizer._global_grad_norm),
+            torch.as_tensor(baseline.optimizer._global_grad_norm),
+        )
+        for (name, parameter), (_, reference) in pairs:
+            torch_assert_equal(parameter, reference, msg=lambda message, name=name: f"{name}: {message}")
+        actual, expected = evicted.optimizer.optimizer.state_dict(), baseline.optimizer.optimizer.state_dict()
+        for param_id, state in actual["state"].items():
+            for key, value in state.items():
+                reference = expected["state"][param_id][key]
+                if isinstance(value, torch.Tensor):
+                    torch_assert_equal(value, reference)
+                else:
+                    assert value == reference
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+@pytest.mark.parametrize("reentrant", [False, True])
+@pytest.mark.parametrize("participation", ["unused", "alternating"])
+@pytest.mark.parametrize("boundaries", [(True, True), (False, True), (True, False)])
+def test_offloaded_partition_release_evicts_partial_checkpoint_groups(
+    monkeypatch, single_rank_group, stage, fp32_masters, reentrant, participation, boundaries
+):
+    from deepspeed.utils import safe_get_full_grad
+
+    options = dict(stage=stage, fp32_masters=fp32_masters, participation=participation, reentrant=reentrant)
+    evicted = _partition_release_engine(monkeypatch, release=True, **options)
+    baseline = _partition_release_engine(monkeypatch, release=False, **options)
+    for window in range(2):
+        for index, boundary in enumerate(boundaries):
+            losses = []
+            for engine in (evicted, baseline):
+                engine.set_gradient_accumulation_boundary(boundary)
+                inputs = torch.full(
+                    (8, _PARTITION_WIDTH),
+                    0.125 + (index + window) / 32,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    requires_grad=True,
+                )
+                loss = engine(inputs).float().square().mean()
+                losses.append(loss.detach().clone())
+                engine.backward(loss)
+            torch_assert_equal(*losses)
+            assert all(partition is None for partition in evicted.optimizer.averaged_gradients.values())
+        if not boundaries[-1]:
+            for engine in (evicted, baseline):
+                engine.optimizer.finalize_gradient_accumulation_boundary()
+                engine.set_gradient_accumulation_boundary(True)
+        for parameter, reference in zip(evicted.module.parameters(), baseline.module.parameters()):
+            actual, expected = safe_get_full_grad(parameter), safe_get_full_grad(reference)
+            if actual is None:
+                assert expected is None
+            else:
+                torch_assert_equal(actual, expected)
+        evicted.step()
+        baseline.step()
+        assert evicted.optimizer.accumulated_grads_in_cpu == {}
+        torch_assert_equal(
+            torch.as_tensor(evicted.optimizer._global_grad_norm),
+            torch.as_tensor(baseline.optimizer._global_grad_norm),
+        )
+        for parameter, reference in zip(evicted.module.parameters(), baseline.module.parameters()):
+            torch_assert_equal(parameter, reference)
+        actual, expected = evicted.optimizer.optimizer.state_dict(), baseline.optimizer.optimizer.state_dict()
+        assert actual["param_groups"] == expected["param_groups"]
+        assert actual["state"].keys() == expected["state"].keys()
+        for param_id, state in actual["state"].items():
+            for key, value in state.items():
+                reference = expected["state"][param_id][key]
+                if isinstance(value, torch.Tensor):
+                    torch_assert_equal(value, reference)
+                else:
+                    assert value == reference
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+@pytest.mark.parametrize("file_snapshots", [False, True])
+def test_offloaded_partition_reset_preserves_checkpoint_continuation(
+    monkeypatch, single_rank_group, tmp_path, stage, fp32_masters, file_snapshots
+):
+    import inspect
+
+    if file_snapshots:
+        monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    continued = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    inputs = torch.full((8, _PARTITION_WIDTH), 0.125, device="cuda", dtype=torch.bfloat16)
+
+    def update(engine):
+        for boundary in (False, True, True):
+            engine.set_gradient_accumulation_boundary(boundary)
+            loss = engine(inputs).float().square().mean()
+            engine.backward(loss)
+        retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"]
+        assert retained
+        assert all(
+            isinstance(snapshot, deepspeed_engine._OffloadedGradientFile) is file_snapshots
+            for snapshot in retained.values()
+        )
+        engine.step()
+        assert retained == {}
+        assert engine.optimizer.accumulated_grads_in_cpu == {}
+        return loss.detach(), torch.as_tensor(engine.optimizer._global_grad_norm)
+
+    update(continued)
+    checkpoint_root = str(tmp_path / "checkpoint")
+    assert continued.save_checkpoint(checkpoint_root, tag="first-update")
+    expected_loss, expected_norm = update(continued)
+
+    restored = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    loaded, _ = restored.load_checkpoint(checkpoint_root, tag="first-update")
+    assert loaded is not None
+    actual_loss, actual_norm = update(restored)
+    torch_assert_equal(actual_loss, expected_loss)
+    torch_assert_equal(actual_norm, expected_norm)
+    for parameter, reference in zip(restored.module.parameters(), continued.module.parameters()):
+        torch_assert_equal(parameter, reference)
+    for parameter, reference in zip(
+        restored.optimizer.single_partition_of_fp32_groups, continued.optimizer.single_partition_of_fp32_groups
+    ):
+        torch_assert_equal(parameter, reference)
+    actual = restored.optimizer.optimizer.state_dict()
+    expected = continued.optimizer.optimizer.state_dict()
+    assert actual["param_groups"] == expected["param_groups"]
+    assert actual["state"].keys() == expected["state"].keys()
+    for param_id, state in actual["state"].items():
+        assert state.keys() == expected["state"][param_id].keys()
+        for key, value in state.items():
+            reference = expected["state"][param_id][key]
+            if isinstance(value, torch.Tensor):
+                torch_assert_equal(value, reference)
+            else:
+                assert value == reference
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("file_snapshots", [False, True])
+def test_offloaded_partition_release_clears_snapshots_after_overflow(monkeypatch, single_rank_group, file_snapshots):
+    import inspect
+
+    if file_snapshots:
+        monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    evicted = _partition_release_engine(monkeypatch, stage=2, fp32_masters=True, release=True)
+    baseline = _partition_release_engine(monkeypatch, stage=2, fp32_masters=True, release=False)
+    retained = inspect.getclosurevars(evicted.optimizer.step).nonlocals["retained"]
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    for overflow in (True, False):
+        # The control never accumulates the discarded gradients: installed DeepSpeed can retain its compact buffer
+        # after overflow, so repeating that path would compare against a stale-gradient update.
+        engines = (evicted,) if overflow else (evicted, baseline)
+        for engine in engines:
+            engine.set_gradient_accumulation_boundary(True)
+            engine.backward(engine(inputs).float().square().mean())
+            if engine is evicted:
+                assert retained
+                assert all(
+                    isinstance(snapshot, deepspeed_engine._OffloadedGradientFile) is file_snapshots
+                    for snapshot in retained.values()
+                )
+            if overflow:
+                engine.optimizer.check_grad_overflow = True
+
+                def force_overflow(**kwargs):
+                    engine.optimizer.overflow = True
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(engine.optimizer, "check_overflow", force_overflow)
+                    engine.step()
+            else:
+                engine.step()
+            if engine is evicted:
+                assert retained == {}
+        for parameter, reference in zip(evicted.module.parameters(), baseline.module.parameters()):
+            torch_assert_equal(parameter, reference)
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_offloaded_partition_snapshots_allocate_each_group_once_per_update(
+    monkeypatch, single_rank_group, stage, fp32_masters
+):
+    import inspect
+    from collections import Counter
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    engine = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    snapshots = Counter()
+    retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"]
+
+    class CountSnapshots(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            group_idx = None
+            if func == torch.ops.aten._to_copy.default and args[0].device.type == "cuda":
+                for index, partition in engine.optimizer.averaged_gradients.items():
+                    if (
+                        partition is not None
+                        and args[0].numel() == partition.flat_partition.numel()
+                        and args[0].data_ptr() == partition.flat_partition.data_ptr()
+                    ):
+                        group_idx = index
+                        break
+            result = func(*args, **(kwargs or {}))
+            if group_idx is not None and result.device.type == "cpu":
+                snapshots[group_idx] += 1
+            return result
+
+    for _ in range(2):
+        snapshots.clear()
+        storage_ids = None
+        for _ in range(3):
+            engine.set_gradient_accumulation_boundary(True)
+            with CountSnapshots():
+                engine.backward(engine(inputs).float().square().mean())
+            current_ids = {index: snapshot.data_ptr() for index, snapshot in retained.items()}
+            if storage_ids is None:
+                storage_ids = current_ids
+            else:
+                assert current_ids == storage_ids
+        expected = {index: 1 for index in range(len(engine.optimizer.bit16_groups))}
+        print(f"PARTITION_SNAPSHOT_ALLOCATIONS actual={dict(snapshots)} expected={expected}", flush=True)
+        assert snapshots == expected
+        engine.step()
+        assert retained == {}
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_offloaded_partition_snapshots_end_before_moment_allocation(
+    monkeypatch, single_rank_group, stage, fp32_masters
+):
+    import inspect
+    import weakref
+
+    engine = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    engine.set_gradient_accumulation_boundary(True)
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    engine.backward(engine(inputs).float().square().mean())
+    retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"]
+    snapshots = {index: weakref.ref(snapshot) for index, snapshot in retained.items()}
+    assert len(snapshots) == len(engine.optimizer.bit16_groups)
+    native_step = engine.optimizer.optimizer.step
+    consumed = []
+
+    def observe_step(*args, **kwargs):
+        selected = engine.optimizer.optimizer.param_groups[0]["params"][0]
+        group_idx = next(
+            index
+            for index, master in enumerate(engine.optimizer.single_partition_of_fp32_groups)
+            if master is selected
+        )
+        live_bytes = sum(
+            snapshot().numel() * snapshot().element_size() for snapshot in snapshots.values() if snapshot() is not None
+        )
+        print(f"PARTITION_SNAPSHOT_MOMENT_ALLOCATION group={group_idx} retained_bytes={live_bytes}", flush=True)
+        assert snapshots[group_idx]() is None, "FP32 snapshot overlaps lazy optimizer-state allocation"
+        consumed.append(group_idx)
+        return native_step(*args, **kwargs)
+
+    monkeypatch.setattr(engine.optimizer.optimizer, "step", observe_step)
+    engine.step()
+    assert consumed == list(range(len(snapshots)))
+    assert all(snapshot() is None for snapshot in snapshots.values())
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("during_update", [False, True])
+def test_offloaded_partition_failure_retains_only_unconsumed_snapshots(monkeypatch, single_rank_group, during_update):
+    import inspect
+
+    engine = _partition_release_engine(monkeypatch, stage=2, fp32_masters=False, release=True)
+    engine.set_gradient_accumulation_boundary(True)
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    engine.backward(engine(inputs).float().square().mean())
+    retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"]
+    original_ids = {index: id(snapshot) for index, snapshot in retained.items()}
+    assert len(original_ids) > 1
+    failure = RuntimeError("injected native step failure")
+    consumed = []
+
+    def fail_before_update(*args, **kwargs):
+        raise failure
+
+    def fail_during_update(*args, **kwargs):
+        selected = engine.optimizer.optimizer.param_groups[0]["params"][0]
+        group_idx = next(
+            index
+            for index, master in enumerate(engine.optimizer.single_partition_of_fp32_groups)
+            if master is selected
+        )
+        consumed.append(group_idx)
+        raise failure
+
+    if during_update:
+        monkeypatch.setattr(engine.optimizer.optimizer, "step", fail_during_update)
+    else:
+        monkeypatch.setattr(engine.optimizer, "unscale_and_clip_grads", fail_before_update)
+    with pytest.raises(RuntimeError) as caught:
+        engine.step()
+    assert caught.value is failure
+    expected = {index: identity for index, identity in original_ids.items() if index not in consumed}
+    assert {index: id(snapshot) for index, snapshot in retained.items()} == expected
+
+
+def test_partition_release_leaves_non_zero_optimizers_unchanged():
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))])
+    original = set(vars(optimizer))
+    assert not deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    assert set(vars(optimizer)) == original
+
+
+@require_deepspeed
+@pytest.mark.parametrize("compact", [False, True])
+def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, compact):
+    class NativeOptimizer:
+        def __init__(self):
+            self.cpu_offload = True
+            self.bit16_groups = [[0], [1]]
+            self.accumulated_grads_in_cpu = {0: object(), 1: object()}
+            self.averaged_gradients = {0: object(), 1: object()}
+            self.reset_calls = []
+
+        def _use_compact_grad_partition_buffer(self, group_idx):
+            return compact and group_idx == 0
+
+        def get_param_id(self, param):
+            return param
+
+        def copy_grads_in_partition(self, param, group_idx=None):
+            return param, group_idx
+
+        def _get_compact_grad_partition_buffer(self, group_idx):
+            return self.averaged_gradients[group_idx]
+
+        def step(self):
+            return "stepped"
+
+        def reset_cpu_buffers(self, *args, **kwargs):
+            self.reset_calls.append((args, kwargs))
+            return "reset"
+
+        def _optimizer_step(self, group_idx):
+            return group_idx
+
+        def independent_gradient_partition_epilogue(self):
+            return "epilogue"
+
+    monkeypatch.setattr("deepspeed.runtime.zero.stage_1_and_2.DeepSpeedZeroOptimizer", NativeOptimizer)
+    optimizer = NativeOptimizer()
+    original_attributes = dict(vars(optimizer))
+    original_accumulators = dict(optimizer.accumulated_grads_in_cpu)
+    original_partitions = dict(optimizer.averaged_gradients)
+    assert deepspeed_engine.release_offloaded_grad_partitions(optimizer) is compact
+    if not compact:
+        assert vars(optimizer) == original_attributes
+    assert optimizer.reset_cpu_buffers("request", boundary=True) == "reset"
+    assert optimizer.reset_calls == [(("request",), {"boundary": True})]
+    expected_ids = {1} if compact else {0, 1}
+    assert optimizer.accumulated_grads_in_cpu.keys() == expected_ids
+    for param_id in expected_ids:
+        assert optimizer.accumulated_grads_in_cpu[param_id] is original_accumulators[param_id]
+    assert optimizer.averaged_gradients[1] is original_partitions[1]
+    if compact:
+        assert optimizer.averaged_gradients[0] is None
+    else:
+        assert optimizer.averaged_gradients[0] is original_partitions[0]
+
+
+@require_deepspeed
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("file_snapshots", [False, True])
+@pytest.mark.parametrize("failure_phase", [None, "native", "wait"])
+def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
+    monkeypatch, boundary, file_snapshots, failure_phase
+):
+    import inspect
+    from types import SimpleNamespace
+
+    if file_snapshots:
+        monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 4)
+    events = []
+    failure = RuntimeError("injected epilogue failure")
+
+    class NativeOptimizer:
+        def __init__(self):
+            self.cpu_offload = True
+            self.bit16_groups = [[0, 1], [2]]
+            self.accumulated_grads_in_cpu = {}
+            self.averaged_gradients = {
+                0: SimpleNamespace(flat_partition=torch.tensor([1.0, 2.0])),
+                1: object(),
+            }
+            self.pending = False
+
+        def _use_compact_grad_partition_buffer(self, group_idx):
+            return group_idx == 0
+
+        def get_param_id(self, param):
+            return param
+
+        def copy_grads_in_partition(self, param, group_idx=None):
+            return None
+
+        def _get_compact_grad_partition_buffer(self, group_idx):
+            if self.averaged_gradients[group_idx] is None:
+                self.averaged_gradients[group_idx] = SimpleNamespace(flat_partition=torch.zeros(2))
+            return self.averaged_gradients[group_idx]
+
+        def is_gradient_accumulation_boundary(self):
+            return boundary
+
+        def independent_gradient_partition_epilogue(self, *args, **kwargs):
+            events.append(("native", args, kwargs))
+            if failure_phase == "native":
+                raise failure
+            self.pending = True
+            return "reduced"
+
+        def _wait_for_offload_copies(self):
+            events.append(("wait",))
+            assert self.pending
+            if failure_phase == "wait":
+                raise failure
+            self.averaged_gradients[0].flat_partition.add_(2)
+            self.pending = False
+
+        def step(self):
+            return None
+
+        def reset_cpu_buffers(self):
+            return None
+
+        def _optimizer_step(self, group_idx):
+            return group_idx
+
+    monkeypatch.setattr("deepspeed.runtime.zero.stage_1_and_2.DeepSpeedZeroOptimizer", NativeOptimizer)
+    optimizer = NativeOptimizer()
+    native_partition = optimizer.averaged_gradients[0]
+    noncompact_partition = optimizer.averaged_gradients[1]
+    assert deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    retained = inspect.getclosurevars(optimizer.step).nonlocals["retained"]
+    if failure_phase in ("native", "wait"):
+        with pytest.raises(RuntimeError) as caught:
+            optimizer.independent_gradient_partition_epilogue("request", complete=True)
+        assert caught.value is failure
+        assert events == [("native", ("request",), {"complete": True})] + (
+            [("wait",)] if failure_phase == "wait" else []
+        )
+        assert optimizer.averaged_gradients[0] is native_partition
+        assert optimizer.averaged_gradients[1] is noncompact_partition
+        assert retained == {}
+        return
+    assert optimizer.independent_gradient_partition_epilogue("request", complete=True) == "reduced"
+    assert events == [("native", ("request",), {"complete": True}), ("wait",)]
+    assert optimizer.averaged_gradients[1] is noncompact_partition
+    assert optimizer.averaged_gradients[0] is None
+    snapshot = retained[0]
+    assert isinstance(snapshot, deepspeed_engine._OffloadedGradientFile) is file_snapshots
+    rebuilt = optimizer._get_compact_grad_partition_buffer(0)
+    assert rebuilt is not native_partition
+    torch_assert_equal(rebuilt.flat_partition, torch.tensor([3.0, 4.0]))
+    optimizer.independent_gradient_partition_epilogue()
+    assert retained[0] is snapshot
+    torch_assert_equal(optimizer._get_compact_grad_partition_buffer(0).flat_partition, torch.tensor([5.0, 6.0]))
+    optimizer.reset_cpu_buffers()
+    assert retained == {}
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("fp32_masters", [False, True])
+def test_offloaded_partition_release_evicts_boundary_gradients(monkeypatch, single_rank_group, stage, fp32_masters):
+    engine = _partition_release_engine(monkeypatch, stage=stage, fp32_masters=fp32_masters, release=True)
+    engine.set_gradient_accumulation_boundary(True)
+    inputs = torch.ones(8, _PARTITION_WIDTH, device="cuda", dtype=torch.bfloat16)
+    engine.backward(engine(inputs).float().square().mean())
+    remaining = sum(
+        partition.flat_partition.numel() * partition.flat_partition.element_size()
+        for partition in engine.optimizer.averaged_gradients.values()
+        if partition is not None
+    )
+    print(
+        f"BOUNDARY_PARTITION_MEMORY stage={stage} fp32_masters={fp32_masters} remaining_bytes={remaining}", flush=True
+    )
+    assert remaining == 0, "completed offload partitions remain on GPU between backward requests"
