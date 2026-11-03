@@ -76,6 +76,11 @@ def model_parallelism_metadata_from_config(
         text_config = config
 
     linear_attn_config = text_config.get("linear_attn_config")
+    linear_num_heads = text_config.get("linear_num_heads")
+    if linear_num_heads is None and text_config is not config:
+        linear_num_heads = config.get("linear_num_heads")
+    if isinstance(linear_attn_config, Mapping) and linear_attn_config.get("num_heads") is not None:
+        linear_num_heads = linear_attn_config["num_heads"]
 
     def positive_int(
         name: str,
@@ -104,6 +109,7 @@ def model_parallelism_metadata_from_config(
         "linear_attention" in layer_types
         or "linear_num_key_heads" in text_config
         or "linear_num_value_heads" in text_config
+        or linear_num_heads is not None
     )
     num_attention_heads = positive_int("num_attention_heads", required=True)
     assert num_attention_heads is not None
@@ -115,12 +121,12 @@ def model_parallelism_metadata_from_config(
         linear_num_key_heads=positive_int(
             "linear_num_key_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_num_heads,
         ),
         linear_num_value_heads=positive_int(
             "linear_num_value_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_num_heads,
         ),
     )
 
