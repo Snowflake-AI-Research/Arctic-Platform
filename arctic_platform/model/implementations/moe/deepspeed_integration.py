@@ -182,6 +182,10 @@ def build_iter_full_hf_weights(model: nn.Module):
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
         """
+        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
+        if local.dtype != torch.uint8:
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            return None if full is None else full.view(local.dtype)
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:

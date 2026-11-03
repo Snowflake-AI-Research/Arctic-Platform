@@ -122,7 +122,8 @@ def test_hf_export_non_master_waits_after_every_gather(monkeypatch, events):
 
     assert list(deepspeed_integration.build_iter_full_hf_weights(_model((4, 2), (3, 2)))()) == []
 
-    assert events == [("gather", (4, 2)), ("wait", (4, 2)), ("gather", (3, 2)), ("wait", (3, 2))]
+    # HF export gathers fp32 rows as bytes.
+    assert events == [("gather", (4, 8)), ("wait", (4, 8)), ("gather", (3, 8)), ("wait", (3, 8))]
 
 
 def test_hf_export_non_master_waits_after_every_row_slice(monkeypatch, events):
@@ -131,7 +132,7 @@ def test_hf_export_non_master_waits_after_every_row_slice(monkeypatch, events):
 
     assert list(deepspeed_integration.build_iter_full_hf_weights(_model((3, 2)))()) == []
 
-    assert events == [("gather", (1, 2)), ("wait", (1, 2))] * 3
+    assert events == [("gather", (1, 8)), ("wait", (1, 8))] * 3
 
 
 @pytest.mark.parametrize("gather_bytes", (1 << 30, 16))
