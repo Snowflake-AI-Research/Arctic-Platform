@@ -477,8 +477,9 @@ class _SparseGQAAttention(torch.autograd.Function):
         grad_query = torch.empty_like(query)
         # Sum in at least fp32: a key selected by N queries gets N scatter-adds, and bf16 atomics round after each.
         accumulate_dtype = torch.promote_types(key.dtype, torch.float32)
-        grad_key = torch.zeros_like(key, dtype=accumulate_dtype)
-        grad_value = torch.zeros_like(value, dtype=accumulate_dtype)
+        # Contiguous so that flatten(2) below is a view: at sp 1, K arrives as a transpose of RoPE's output.
+        grad_key = torch.zeros_like(key, dtype=accumulate_dtype, memory_format=torch.contiguous_format)
+        grad_value = torch.zeros_like(value, dtype=accumulate_dtype, memory_format=torch.contiguous_format)
         flattened_grad_key = grad_key.flatten(2)
         flattened_grad_value = grad_value.flatten(2)
         kv_width = flattened_grad_key.shape[-1]
