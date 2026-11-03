@@ -163,6 +163,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from arctic_platform.model.implementations.moe.vllm_weights import wait_for_export_collective
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 
     def layer_index(name: str) -> int:
@@ -191,6 +192,8 @@ def build_iter_full_hf_weights(model: nn.Module):
                 full = None
                 gather_list = None
             dist.gather(local, gather_list, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(local)
             return full
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
         if is_master:
@@ -202,7 +205,10 @@ def build_iter_full_hf_weights(model: nn.Module):
         for start in range(0, rows, step):
             n = min(step, rows - start)
             outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
+            chunk = local[start:start + n].contiguous()
+            dist.gather(chunk, outputs, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
                     full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
