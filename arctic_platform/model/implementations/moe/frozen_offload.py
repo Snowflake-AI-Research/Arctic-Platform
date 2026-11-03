@@ -87,15 +87,16 @@ class FrozenExpertOffload:
         self.host: torch.Tensor | None = None
         self.registered = False
         self.stream: torch.cuda.Stream | None = None
-        self.pending: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+        # Which layer's codes each buffer holds (or is being copied), and the copy's event.
+        self.resident: list[int] = [-1, -1]
+        self.events: list[torch.cuda.Event | None] = [None, None]
         # Two persistent GPU buffers: layer i always copies into buffers[i % 2], so its codes keep their addresses
         # from call to call (UltraEP's pointer pools read them in place) and no call allocates. Each buffer
         # remembers the temporaries of the layer that last used it, to refuse an overwrite while they live.
         self.buffers: list[torch.Tensor] = []
         self.holders: list[tuple[int, list]] = [(-1, []), (-1, [])]
         self.installed: set[int] = set()
-        self.last: int | None = None
-        self.direction = 1
+        self.last: tuple[int, bool] | None = None
         self.copies = 0
         self.prefetched = 0
 
@@ -148,52 +149,64 @@ class FrozenExpertOffload:
             )
 
     def _fetch(self, i: int) -> None:
-        if i in self.pending or not self.layer_bytes[i]:
+        """Start copying layer ``i``'s codes into its buffer, unless the buffer holds them already."""
+        b = i % 2
+        if self.resident[b] == i or not self.layer_bytes[i]:
             return
         assert self.host is not None and self.stream is not None
         current = torch.cuda.current_stream()
         self._check_free(i)
         # The side stream starts after everything queued on the compute stream, the last reads of this buffer included;
         # the compute stream waits for the copy's event before reading it.
-        buffer = self.buffers[i % 2][: self.layer_bytes[i]]
+        buffer = self.buffers[b][: self.layer_bytes[i]]
         self.stream.wait_stream(current)
         with torch.cuda.stream(self.stream):
             base = self.host_offsets[i]
             buffer.copy_(self.host[base : base + self.layer_bytes[i]], non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.stream)
-        self.pending[i] = (buffer, event)
+        self.resident[b], self.events[b] = i, event
         self.copies += 1
 
     def before(self, i: int) -> None:
+        """Install layer ``i``'s codes for one call of its experts (one dispatch chunk, or its recompute)."""
         if not self.offloaded:
             self._offload_all()
-        # A recompute that stopped early never reached the post-hook.
         self.after(i)
-        if i in self.pending:
+        if not self.layer_bytes[i]:
+            return
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        _install_recompute_detector()
+        b = i % 2
+        recompute = _in_recompute()
+        # The first call of this layer in this pass (later calls are the same layer's other dispatch chunks).
+        first_call = self.last != (i, recompute)
+        if first_call and self.resident[b] == i:
             self.prefetched += 1
         self._fetch(i)
-        if self.layer_bytes[i]:
-            buffer, event = self.pending.pop(i)
+        event = self.events[b]
+        if event is not None:
             torch.cuda.current_stream().wait_event(event)
-            temporaries: list = []
-            for owner, name, param, shape, dtype, start, nbytes in self.entries[i]:
-                temporary = nn.Parameter(buffer[start : start + nbytes].view(dtype).view(shape), requires_grad=False)
-                for attr in ("allreduce", "_dss_keep_fp32", "ds_shape"):
-                    if hasattr(param, attr):
-                        setattr(temporary, attr, getattr(param, attr))
-                temporary._ap_transient = True
-                owner._parameters[name] = temporary
-                temporaries.append(weakref.ref(temporary))
-            self.holders[i % 2] = (i, temporaries)
-            self.installed.add(i)
-        # Call order: forward 0..n-1, then the recomputes n-1..0; the same layer twice in a row turns around.
-        if self.last is not None:
-            self.direction = -self.direction if i == self.last else (1 if i > self.last else -1)
-        self.last = i
-        following = i + self.direction
-        if 0 <= following < len(self.layers):
-            self._fetch(following)
+        buffer = self.buffers[b]
+        refs = self.holders[b][1] if self.holders[b][0] == i else []
+        for owner, name, param, shape, dtype, start, nbytes in self.entries[i]:
+            temporary = nn.Parameter(buffer[start : start + nbytes].view(dtype).view(shape), requires_grad=False)
+            for attr in ("allreduce", "_dss_keep_fp32", "ds_shape"):
+                if hasattr(param, attr):
+                    setattr(temporary, attr, getattr(param, attr))
+            temporary._ap_transient = True
+            owner._parameters[name] = temporary
+            refs = [*refs, weakref.ref(temporary)]
+        self.holders[b] = (i, refs)
+        self.installed.add(i)
+        if first_call:
+            # The forward runs the layers up, the recompute (in backward) down; prefetch the next in that order.
+            following = i + (-1 if recompute else 1)
+            if 0 <= following < len(self.layers):
+                self._fetch(following)
+        self.last = (i, recompute)
 
     def after(self, i: int) -> None:
         if i not in self.installed:
@@ -206,19 +219,35 @@ class FrozenExpertOffload:
         return 0 if self.host is None else self.host.numel()
 
 
-def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
-    """Offload the frozen routed-expert codes of every decoder layer that has routed experts; copied in per call.
+def experts_recomputed(layer: nn.Module) -> bool:
+    """Whether a decoder layer's routed experts run again in its backward: the whole block checkpointed, or a selective
+    checkpoint around them. Otherwise their saved tensors keep the codes alive until backward."""
+    if hasattr(layer, "_checkpoint_wrapped_module"):
+        return True
+    from arctic_platform.model.implementations.moe.layers.checkpointing import _PATCHED_METHODS_ATTR
 
-    The hooks sit on the layer inside its activation-checkpoint wrapper, so they also run for the recompute, which
-    must run the whole layer (``early_stop=False``, as the MoE builders wrap their blocks).
+    mlp = getattr(layer, "mlp", None)
+    patched = getattr(mlp, _PATCHED_METHODS_ATTR, ()) if mlp is not None else ()
+    return bool({"_run_routed_experts", "_run_local_routed_experts"} & set(patched))
+
+
+def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
+    """Offload the frozen routed-expert codes of every decoder layer whose experts are recomputed; copied in per call.
+
+    The hooks sit on the experts module, so they run for every call of the experts (each dispatch chunk, the forward
+    and the recompute, a selective recompute of the experts alone included). Layers whose experts are not recomputed
+    (``ac_config.layers`` leaves them out) keep their codes on the GPU: their saved tensors hold them until backward.
     """
     from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
-    inners = [_inner_layer(layer) for layer in layers]
-    managed = [inner for inner in inners if any(isinstance(m, GroupedExperts) for m in inner.modules())]
+    managed = []
+    for layer in layers:
+        if not experts_recomputed(layer):
+            continue
+        managed += [m for m in _inner_layer(layer).modules() if isinstance(m, GroupedExperts)]
     offload = FrozenExpertOffload(managed)
-    for i, inner in enumerate(managed):
-        inner.register_forward_pre_hook(lambda module, args, i=i: offload.before(i))
-        inner.register_forward_hook(lambda module, args, output, i=i: offload.after(i))
-        inner._ap_frozen_expert_offload = offload
+    for i, experts in enumerate(managed):
+        experts.register_forward_pre_hook(lambda module, args, i=i: offload.before(i))
+        experts.register_forward_hook(lambda module, args, output, i=i: offload.after(i))
+        experts._ap_frozen_expert_offload = offload
     return offload

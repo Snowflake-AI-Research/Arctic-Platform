@@ -34,9 +34,11 @@ class _Layer(nn.Module):
         self.lora = nn.ParameterDict()
 
     def forward(self, x):
+        # Two calls of the experts per layer call, as DeepEP's dispatch chunks make them.
         counts = torch.tensor(COUNTS, dtype=torch.int32, device=x.device)
         scores = torch.linspace(0.1, 1.0, x.shape[0], device=x.device)
-        return x + self.experts(self.proj(x), counts, scores)
+        h = self.proj(x)
+        return x + self.experts(h, counts, scores) + 0.5 * self.experts(h.flip(0), counts, scores)
 
 
 def _fill(layer: _Layer, seed: int) -> None:
@@ -60,7 +62,8 @@ def _bind_lora(layer: _Layer) -> None:
     }
 
 
-def _model(seed: int) -> nn.ModuleList:
+def _model(seed: int, plain: tuple = ()) -> nn.ModuleList:
+    """``LAYERS`` blocks, each checkpointed except those in ``plain`` (not recomputed)."""
     layers = []
     for i in range(LAYERS):
         layer = _Layer()
@@ -68,7 +71,7 @@ def _model(seed: int) -> nn.ModuleList:
         layer = layer.cuda()
         layer.proj.bfloat16()
         _bind_lora(layer)
-        layers.append(checkpoint_wrapper(layer, early_stop=False))
+        layers.append(layer if i in plain else checkpoint_wrapper(layer, early_stop=False))
     return nn.ModuleList(layers)
 
 
@@ -90,11 +93,11 @@ def test_offloaded_expert_codes_match_resident_ones():
     addresses: dict[int, set[int]] = {}
 
     def record(module, args, i):
-        addresses.setdefault(i, set()).add(module.experts.w1.data_ptr())
+        addresses.setdefault(i, set()).add(module.w1.data_ptr())
 
     for i, layer in enumerate(offloaded):
-        # Runs after the offload's pre-hook, which installed the copied codes.
-        layer._checkpoint_wrapped_module.register_forward_pre_hook(lambda m, a, i=i: record(m, a, i))
+        # Registered after the offload's own pre-hook on the experts, so it sees the installed copy.
+        layer._checkpoint_wrapped_module.experts.register_forward_pre_hook(lambda m, a, i=i: record(m, a, i))
     steps = 3
     for step in range(steps):
         for model in (reference, offloaded):
@@ -124,11 +127,11 @@ def test_offloaded_expert_codes_match_resident_ones():
         ), "codes live on the host between calls"
         assert experts.w1_scale_inv.numel() > 0, "scales stay on the GPU"
     assert offload.host_bytes() == LAYERS * code_bytes
-    # Per step: LAYERS forwards, then LAYERS recomputes in reverse. Every call but the first of each pass was
-    # prefetched by the call before it, and no prefetch went unused.
-    calls = steps * 2 * LAYERS
-    assert offload.copies == calls
-    assert offload.prefetched == calls - 2 * steps, f"{offload.prefetched} of {calls} calls prefetched"
+    # Per step: LAYERS forwards (two experts calls each), then LAYERS recomputes in reverse. Every first call of a pass
+    # but training's very first finds its codes prefetched or still resident; a later step copies 2 * LAYERS - 4 times
+    # (the turnaround layers and the two the next pass starts with are still in their buffers).
+    assert offload.prefetched == steps * 2 * LAYERS - 1
+    assert offload.copies == (2 * LAYERS - 2) + (steps - 1) * (2 * LAYERS - 4), offload.copies
     # Every call of a layer finds its codes at the same address: buffer i % 2 of the two persistent buffers.
     assert all(len(ptrs) == 1 for ptrs in addresses.values()), addresses
     assert addresses[0] != addresses[1] and addresses[0] == addresses[2]
@@ -148,3 +151,26 @@ def test_offload_refuses_to_overwrite_a_buffer_in_use():
     out = inner[0](xs)
     with pytest.raises(RuntimeError, match="still in use"):
         inner[2](out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_layers_not_recomputed_keep_their_codes_on_the_gpu():
+    """``ac_config.layers`` leaves blocks out of checkpointing: their saved tensors hold the codes until backward."""
+    from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+
+    plain = (LAYERS - 1,)
+    reference, offloaded = _model(0, plain), _model(0, plain)
+    offload = install_frozen_expert_offload(offloaded)
+    assert len(offload.layers) == LAYERS - 1
+    x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        for model in (reference, offloaded):
+            model.zero_grad(set_to_none=True)
+        xr, xo = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+        want = _run(reference, xr)
+        want.float().square().sum().backward()
+        got = _run(offloaded, xo)
+        got.float().square().sum().backward()
+        assert torch.equal(got, want) and torch.equal(xo.grad, xr.grad)
+    assert offloaded[LAYERS - 1].experts.w1.numel() > 0
+    assert offloaded[0]._checkpoint_wrapped_module.experts.w1.numel() == 0

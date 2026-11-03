@@ -119,12 +119,16 @@ def install_frozen_layer_shards(layers: nn.ModuleList, group: dist.ProcessGroup 
 
     The hooks sit on the layer inside its activation-checkpoint wrapper, so they also run for the recompute, which
     must run the whole layer (``early_stop=False``, as the MoE builders wrap their blocks) for the post-hook to
-    release the gathered weights.
+    release the gathered weights. Only such whole-block-checkpointed layers are sharded: a layer that is not
+    recomputed keeps its gathered weights saved for backward anyway, and selective checkpointing recomputes submodule
+    methods in backward, outside the layer call, after the gathered weights were released.
     """
     if group is None:
         group = dist.new_group(list(range(dist.get_world_size())))
     shards = []
     for layer in layers:
+        if not hasattr(layer, "_checkpoint_wrapped_module"):
+            continue
         inner = _inner_layer(layer)
         shard = FrozenLayerShard(inner, group)
         inner.register_forward_pre_hook(lambda module, args, shard=shard: shard.gather())
