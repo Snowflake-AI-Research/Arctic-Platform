@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -30,8 +31,38 @@ def is_fp8_lora_dtype(dtype: Any) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
+def _packed_4bit_expert_modules(model: nn.Module) -> list[nn.Module]:
+    return [module for module in model.modules() if getattr(module, "packed4", None) is not None]
+
+
 def model_has_fp8_weights(model: nn.Module) -> bool:
-    return any(is_fp8_lora_dtype(param.dtype) for _, param in model.named_parameters())
+    """FP8 weights, or routed experts stored as packed 4-bit codes: frozen bases LoRA must not autocast or merge."""
+    return any(is_fp8_lora_dtype(param.dtype) for _, param in model.named_parameters()) or bool(
+        _packed_4bit_expert_modules(model)
+    )
+
+
+@contextmanager
+def packed_4bit_logical_shapes(model: nn.Module):
+    """Give packed 4-bit expert stacks their logical ``[E, out, in]`` shape while PEFT sizes its adapters.
+
+    The codes are stored two per byte along the input dimension, so the parameter's shape halves ``in``. PEFT's
+    ``ParamWrapper`` reads ``ds_shape`` before ``shape`` (for ZeRO-3 partitioned parameters); it is set only for the
+    wrapping and removed afterwards, so nothing else sees it.
+    """
+    marked = []
+    for module in _packed_4bit_expert_modules(model):
+        for name in ("w1", "w2", "w3"):
+            param = module._parameters.get(name)
+            if param is None or hasattr(param, "ds_shape"):
+                continue
+            param.ds_shape = torch.Size((*param.shape[:-1], param.shape[-1] * 2))
+            marked.append(param)
+    try:
+        yield
+    finally:
+        for param in marked:
+            del param.ds_shape
 
 
 def is_peft_lora_param(name: str, param: Any) -> bool:
@@ -157,7 +188,8 @@ def apply_peft(
 
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
     if model_has_fp8_weights(model):
-        model = peft.get_peft_model(model, config, autocast_adapter_dtype=False)
+        with packed_4bit_logical_shapes(model):
+            model = peft.get_peft_model(model, config, autocast_adapter_dtype=False)
         cast_trainable_params_off_fp8(model, optimization_dtype)
     else:
         model = peft.get_peft_model(model, config)

@@ -225,6 +225,28 @@ def _fp32_weight(linear: nn.Linear) -> None:
     linear.weight = nn.Parameter(linear.weight.detach().to(dtype=torch.float32))
 
 
+def _fp32_linear(linear: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    """``hidden @ W.T`` in FP32, plus the adapter delta when PEFT wraps ``linear`` with LoRA.
+
+    The ratio-2 compressor pools in FP32 from its FP32 weights. Calling ``F.linear`` on the weight directly would skip
+    a LoRA wrapper, so the delta is added here, from the adapter's own layers, in the adapter's dtype.
+    """
+    x = hidden.float()
+    base = getattr(linear, "base_layer", None)
+    if base is None:
+        return F.linear(x, linear.weight.float())
+    out = F.linear(x, base.weight.float())
+    if getattr(linear, "disable_adapters", False) or getattr(linear, "merged", False):
+        return out
+    for adapter in linear.active_adapters:
+        if adapter not in linear.lora_A:
+            continue
+        lora_a, lora_b = linear.lora_A[adapter], linear.lora_B[adapter]
+        delta = lora_b(lora_a(linear.lora_dropout[adapter](hidden.to(lora_a.weight.dtype))))
+        out = out + delta.float() * linear.scaling[adapter]
+    return out
+
+
 class DeepseekV41Compressor(nn.Module):
     """Pre-RoPE compressed latent. Ratio 2 softmax-pools disjoint pairs; ratio 1 projects each token."""
 
@@ -250,8 +272,8 @@ class DeepseekV41Compressor(nn.Module):
                 return projected.new_empty(projected.shape[0], 0, self.head_dim)
             return self.norm(projected[:, layout.entry_tok_idx[:, 0]])
 
-        kv = gather(F.linear(hidden.float(), self.wkv.weight.float()))
-        gate = gather(F.linear(hidden.float(), self.wgate.weight.float()))
+        kv = gather(_fp32_linear(self.wkv, hidden))
+        gate = gather(_fp32_linear(self.wgate, hidden))
         if entries == 0:
             return hidden.new_empty(hidden.shape[0], 0, self.head_dim)
         pooled = kv[:, layout.entry_tok_idx] * gate[:, layout.entry_tok_idx].softmax(dim=2)
