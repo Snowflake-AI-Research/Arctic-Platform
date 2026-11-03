@@ -102,8 +102,12 @@ pass@1. `kl` was nonzero on every step.
 | Sampler π_old | 0.838 | 131 | 5.10 s | mean `1.2e-3`, never 0 |
 | Trainer π_old | 0.734 | 184 | 6.02 s | mean `8.0e-4`, never 0 |
 
-A 250-step run on this checkout's client is the reproducibility check. Do not
-overwrite those pins; write a new metrics file (`--metrics-out`).
+The same launcher on `main` (`c40f78bca`, trainer π_old, ZoRRo off) finished
+250 steps in 27:34. Step-1 `kl` was `3.0e-4` and the first 20 steps averaged
+`5.9e-4`, matching the trainer pin. Last-20 training reward was 0.767 with
+completion length 126. Last-20 `kl` was `1.8e-2`, about 18× the pre-main pin,
+and `kl` was nonzero on every step. Mean step time was 6.56 s. Write a new
+metrics file (`--metrics-out`); do not overwrite the pins above.
 
 ## Files
 
