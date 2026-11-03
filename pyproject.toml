@@ -52,7 +52,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.1.5rc22"
+version = "0.2.1.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
@@ -97,8 +97,10 @@ all = [
     "arctic_platform[onprem]",
     "arctic_platform[tinker]",
     "arctic_platform[verl]",
+    "arctic_platform[trl]",
     "arctic_platform[prime-rl]",
     "arctic_platform[sonicmoe]",
+    "arctic_platform[harbor]",
 ]
 
 dev = [
@@ -111,8 +113,12 @@ dev = [
 # it reaches [rl] -> [inference] -> vllm, and vLLM's build needs CUDA_HOME,
 # which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
+    "arctic_platform[harbor]",
     "arctic_platform[tinker]",
     "httpx",
+    # The Harbor recipe's agent tests. The recipe itself pins a git revision.
+    "openhands-sdk==1.7.1",
+    "openhands-tools==1.7.1",
     "parameterized",
     "pytest-asyncio",
     "pytest-instafail",
@@ -225,6 +231,12 @@ verl = [
     "omegaconf",
 ]
 
+# TRL adapter (arctic_platform/integrations/trl). TRL itself is user-supplied.
+trl = [
+    "arctic_platform[rl]",
+    "accelerate",
+]
+
 # prime-rl launcher (arctic_platform/integrations/prime_rl). prime-rl itself and its
 # verifiers runtime are user-supplied and version-pinned in launchers (see that package's
 # README); here we only carry the Cortex client stack plus the few libraries the launcher
@@ -234,6 +246,19 @@ prime-rl = [
     "httpx",
     "huggingface-hub",
     "orjson",
+]
+
+# Harbor RL integration (arctic_platform/integrations/harbor) and its bundled
+# Snowflake Cortex Sandboxes environment. harbor 0.25.0 is the newest release
+# with the environment APIs snowflake_sandbox uses. OpenHands is pinned by git
+# revision in recipes/rl/harbor/run_qwen35_4b.sh: package metadata can't carry
+# git URLs.
+harbor = [
+    "certifi",
+    "dockerfile-parse>=2.0.1",
+    "harbor==0.25.0",
+    "pathspec>=1.0.3",
+    "snowflake-sandbox-python==0.2.2a5",
 ]
 
 [tool.pytest.ini_options]

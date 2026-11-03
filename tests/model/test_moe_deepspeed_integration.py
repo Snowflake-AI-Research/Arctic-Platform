@@ -332,7 +332,7 @@ def test_ep_checkpoint_dense_model_keeps_original_paths(ep_checkpoint_engine, tm
 
 
 def _mock_ep_all_gather(monkeypatch, shards):
-    flat_shards = [shard.detach().contiguous().view(-1) for shard in shards]
+    flat_shards = [shard.detach().contiguous().view(torch.uint8).view(-1) for shard in shards]
     state = {"offset": 0, "calls": []}
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: len(flat_shards))
@@ -378,7 +378,7 @@ def test_ep_weight_gather_to_cpu_preserves_order_layout_dtype_and_bound(monkeypa
     assert result.shape == expected.shape
     assert result.dtype == expected.dtype
     assert torch.equal(result, expected)
-    assert state["offset"] == shards[0].numel()
+    assert state["offset"] == shards[0].numel() * shards[0].element_size()
     assert len(state["calls"]) > 1
     assert state["calls"][-1] < state["calls"][0]
     assert max(state["calls"]) <= max_gather_bytes
@@ -401,7 +401,7 @@ def test_ep_weight_gather_to_cpu_preserves_bfloat16_and_nonmaster_schedule(monke
     assert result.dtype == torch.bfloat16
     assert torch.equal(result, expected)
     assert discarded is None
-    assert nonmaster["offset"] == shards[0].numel()
+    assert nonmaster["offset"] == shards[0].numel() * shards[0].element_size()
     assert nonmaster["calls"] == master_calls
 
 
@@ -416,7 +416,7 @@ def test_ep_weight_gather_to_cpu_nccl_uses_bounded_packed_buffer(monkeypatch, is
         for rank in range(3)
     ]
     expected = torch.cat([shard.cpu() for shard in shards], dim=0)
-    flat_shards = [shard.contiguous().view(-1) for shard in shards]
+    flat_shards = [shard.contiguous().view(torch.uint8).view(-1) for shard in shards]
     group = object()
     state = {"offset": 0, "bytes": []}
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 3)
@@ -442,7 +442,7 @@ def test_ep_weight_gather_to_cpu_nccl_uses_bounded_packed_buffer(monkeypatch, is
 
     result = common._gather_ep_weight_to_cpu(shards[0], group, is_master=is_master, max_gather_bytes=24)
 
-    assert state["offset"] == shards[0].numel()
+    assert state["offset"] == shards[0].numel() * shards[0].element_size()
     assert state["bytes"] == [24, 24, 24, 18]
     if is_master:
         assert result is not None and result.device.type == "cpu"
@@ -497,7 +497,8 @@ def test_ep_weight_gather_to_cpu_rejects_budget_smaller_than_one_group_element(m
     assert state["calls"] == []
 
 
-def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
+@pytest.mark.parametrize("rank,group_ranks", [(0, [0, 1]), (2, [2, 3])])
+def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank, group_ranks):
     converted = {}
 
     class ExportableModel(nn.Module):
@@ -524,7 +525,8 @@ def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: group_ranks)
     calls = []
 
     def gather(tensor, ep_group, *, is_master, max_gather_bytes=64 * 1024 * 1024):
@@ -535,6 +537,12 @@ def test_hf_export_delegates_tagged_expert_weights_to_cpu_gather(monkeypatch):
     model = ExportableModel()
 
     exported = dict(common.build_iter_full_hf_weights(model)())
+
+    if rank != 0:
+        assert exported == {}
+        assert converted == {}
+        assert calls == []
+        return
 
     assert list(exported) == ["dense", "expert"]
     assert converted == {"layer_index": -1, "expert_device": "cpu"}

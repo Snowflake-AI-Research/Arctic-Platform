@@ -302,6 +302,9 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
     return count
 
 
+_EXPORT_GATHER_BYTES = 64 * 1024 * 1024
+
+
 def _gather_ep_weight_to_cpu(
     tensor: torch.Tensor,
     ep_group,
@@ -317,6 +320,15 @@ def _gather_ep_weight_to_cpu(
         raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
     if max_gather_bytes < ep_size * local.element_size():
         raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
+    # Collect exact bytes so NCCL/Gloo need no support for packed or float8 export dtypes.
+    if local.dtype != torch.uint8:
+        gathered = _gather_ep_weight_to_cpu(
+            local.view(torch.uint8), ep_group, is_master=is_master, max_gather_bytes=max_gather_bytes
+        )
+        return None if gathered is None else gathered.view(local.dtype)
 
     full = None
     if is_master:
@@ -347,6 +359,8 @@ def _gather_ep_weight_to_cpu(
             dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
         else:
             dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if not is_master:
+            wait_for_export_collective(inputs)
         if full_shards is not None:
             for rank, shard in enumerate(outputs.view(ep_size, count)):
                 full_shards[rank, offset : offset + count].copy_(shard)
@@ -428,6 +442,8 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    if 0 not in dist.get_process_group_ranks(ep_group):
+                        continue
                     if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
                         # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
                         local = tensor.data.contiguous()
@@ -436,7 +452,9 @@ def build_iter_full_hf_weights(model: nn.Module):
                             layer_state[name] = full
                         del full
                         continue
-                    full = _gather_ep_weight_to_cpu(tensor, ep_group, is_master=is_master)
+                    full = _gather_ep_weight_to_cpu(
+                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                    )
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
