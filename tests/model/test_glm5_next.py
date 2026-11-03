@@ -722,3 +722,147 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     assert rel(out, out_ref) < 1e-2
     assert rel(q.grad, q_ref.grad) < 1e-2
     assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
+
+
+@pytest.mark.parametrize("target_format", ["prime", "hf"])
+def test_glm53_streaming_checkpoint_matches_whole_state_conversion(tmp_path, monkeypatch, target_format):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import modeling_glm5_next
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    set_seed(0)
+    model_class = modeling_glm5_next.Glm5NextForConditionalGenerationPrimeRL
+    original = dict(model_class(_tiny_config()).state_dict())
+    # Native expert tensors are allocated empty; conversion needs finite, distinct fixture values.
+    original = {
+        name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape) + index
+        for index, (name, weight) in enumerate(original.items())
+    }
+    if target_format == "prime":
+        original = model_class.convert_to_hf(original)
+    expected = getattr(model_class, f"convert_to_{target_format}")(
+        {name: tensor.clone() for name, tensor in original.items()}
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    names = tuple(original)
+    for shard_index in range(2):
+        save_file(
+            {name: original[name].clone().contiguous() for name in names[shard_index::2]},
+            source / f"model-{shard_index}.safetensors",
+        )
+
+    observed_groups = []
+    convert = getattr(model_class, f"convert_to_{target_format}")
+
+    def observe_group(cls, state):
+        observed_groups.append(tuple(state))
+        return convert(state)
+
+    monkeypatch.setattr(model_class, f"convert_to_{target_format}", classmethod(observe_group))
+    destination = tmp_path / "converted"
+    getattr(model_class, f"convert_to_{target_format}_checkpoint")(source, destination)
+
+    converted = load_state_dict(destination)
+    assert converted.keys() == expected.keys()
+    for name, weight in expected.items():
+        torch_assert_equal(converted[name], weight)
+    assert len(observed_groups) > 4
+    for group in observed_groups:
+        layer_prefixes = {name.split(".", 4)[3] for name in group if name.startswith("model.language_model.layers.")}
+        assert len(layer_prefixes) <= 1
+        if not layer_prefixes:
+            assert len(group) == 1
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["weight_map"].keys() == expected.keys()
+
+
+@pytest.mark.parametrize("groups", [[["a"]], [["a", "b"], ["b"]], [["a", "b"], []], [["a", "b", "c"]]])
+def test_checkpoint_conversion_rejects_invalid_dependency_groups(tmp_path, groups):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+    calls = []
+
+    with pytest.raises(ValueError, match="cover every source tensor exactly once"):
+        convert_safetensor_checkpoint(source, destination, calls.append, lambda names: groups)
+
+    assert not destination.exists()
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["empty", "overlapping"])
+def test_checkpoint_conversion_rejects_invalid_converted_groups(tmp_path, failure):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+
+    def convert(state):
+        tensor = next(iter(state.values()))
+        state.clear()
+        if failure == "overlapping":
+            state["output"] = tensor
+
+    with pytest.raises(ValueError, match="empty or overlapping groups"):
+        convert_safetensor_checkpoint(source, destination, convert, lambda names: [(name,) for name in names])
+
+    assert not (destination / "model.safetensors.index.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["empty-source", "duplicate-source"])
+def test_checkpoint_conversion_rejects_invalid_source(tmp_path, failure):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    if failure == "duplicate-source":
+        for index in range(2):
+            save_file({"a": torch.tensor([1.0])}, source / f"model-{index}.safetensors")
+    destination = tmp_path / "converted"
+    message = "No safetensors weights" if failure == "empty-source" else "Duplicate checkpoint tensor"
+
+    with pytest.raises(ValueError, match=message):
+        convert_safetensor_checkpoint(source, destination, lambda state: None, lambda names: [names])
+
+    assert not destination.exists()
+
+
+def test_checkpoint_conversion_shard_failure_never_publishes_index(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+    calls = []
+
+    def save(state, path, **kwargs):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("storage full")
+        save_file(state, path, **kwargs)
+
+    monkeypatch.setattr(weights, "save_file", save)
+    with pytest.raises(OSError, match="storage full"):
+        weights.convert_safetensor_checkpoint(
+            source, destination, lambda state: None, lambda names: [(name,) for name in names]
+        )
+
+    assert len(calls) == 2
+    assert calls[0].is_file()
+    assert not (destination / "model.safetensors.index.json").exists()
