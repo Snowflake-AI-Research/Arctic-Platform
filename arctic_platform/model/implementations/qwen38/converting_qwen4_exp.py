@@ -22,6 +22,7 @@ from torch import Tensor
 
 _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 _PLE_SHARD_RE = re.compile(r"^(.*\.ple\.ple_embedding\.ngram_embedding)\.shard_(\d+)\.weight$")
+_PLE_TABLE_RE = re.compile(r"^(.*\.ple\.ple_embedding\.ngram_embedding)\.weight$")
 
 
 def _layer_prefix(layer_idx: int) -> str:
@@ -53,6 +54,19 @@ def _concatenate_ple_shards(state_dict: dict[str, Tensor]) -> None:
             [state_dict.pop(name) for _, name in shards],
             dim=0,
         )
+
+
+def ple_shard_names(name: str, num_parts: int) -> list[str] | None:
+    """HF checkpoint names of the ``num_parts`` row shards that hold the PLE n-gram table ``name``.
+
+    Transformers loads ``ngram_embedding.shard_*`` by concatenating them on dim 0 and ``save_pretrained`` writes
+    ``torch.chunk(table, split_ngram_parts)`` back under these names, so this is the published checkpoint layout.
+    ``None`` for any other parameter.
+    """
+    match = _PLE_TABLE_RE.match(name)
+    if match is None:
+        return None
+    return [f"{match.group(1)}.shard_{index}.weight" for index in range(num_parts)]
 
 
 def convert_hf_layer_to_prime(
