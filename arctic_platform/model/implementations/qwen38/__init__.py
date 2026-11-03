@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+QWEN38_NUM_EXPERTS = 512
+QWEN38_ATTN_BACKEND = "qsa_flex"
+
 
 def __getattr__(name: str):
     if name == "Qwen4ExpForConditionalGenerationPrimeRL":

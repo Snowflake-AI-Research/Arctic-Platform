@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_a
 )
 from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
+from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
@@ -53,7 +54,6 @@ _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
 # Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
 _SCORE_BUDGET_BYTES = 1 << 30
-SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
 
 
 def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
