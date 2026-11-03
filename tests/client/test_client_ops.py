@@ -1296,3 +1296,53 @@ class TestCortexShimForwardsLikeOnPrem:
         assert out["batch"]["logprobs"][0].tolist() == [0, 0, 1, 2]
         assert out["batch"]["logprobs"][1].tolist() == [5, 6, 7, 8]
         assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
+
+    def test_forward_returns_predict_next_logprobs_on_the_caller_columns(self):
+        import asyncio
+
+        import torch
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent = payload["kwargs"]["input_ids"]
+                # Column t of a compute_logprobs response scores token t + 1.
+                return {"logprobs": torch.roll(sent, -1, dims=1).to(torch.float32)}
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "batch": {"input_ids": ids, "attention_mask": attn},
+            "meta": {"pad_token_id": 0, "zorro_train_enable": False},
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        logprobs = out["batch"]["logprobs"]
+        # Every real column except the last scores the next caller token.
+        # The last real column is the roll wrap, and padding is 0.
+        assert logprobs[0].tolist() == [0, 0, 2, 0]
+        assert logprobs[1].tolist() == [6, 7, 8, 5]
+
+    def test_flat_zorro_forward_keeps_the_server_columns(self):
+        import asyncio
+
+        import torch
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent = payload["kwargs"]["input_ids"]
+                return {"logprobs": torch.arange(sent.numel(), dtype=torch.float32).reshape_as(sent)}
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "input_ids": ids,
+            "attention_mask": attn,
+            "prompts": ids[:, :2],
+            "context": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 2,
+                "max_response_len": 2,
+                "pad_token_id": 0,
+            },
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        assert out["batch"]["logprobs"].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]

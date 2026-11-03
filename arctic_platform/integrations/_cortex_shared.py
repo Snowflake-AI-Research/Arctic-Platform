@@ -146,8 +146,11 @@ def restore_left_aligned_logprobs(logprobs, attention_mask):
     """Scatter a left-aligned ``[B, T]`` response back onto the caller's columns.
 
     :func:`_left_align_batch` moved each row's real tokens to the front. The
-    server's logprobs follow that order. Padding in the caller's layout is
-    written as ``0``: it is not a scored token.
+    server's logprobs follow that order, in the predict-next frame: column
+    ``t`` is the log probability of token ``t + 1``. Scattering keeps that
+    frame, because each row's real tokens are contiguous. Padding in the
+    caller's layout is written as ``0``: it is not a scored token. The response
+    width must equal ``attention_mask``; a different width is a broken forward.
     """
     import torch
 
