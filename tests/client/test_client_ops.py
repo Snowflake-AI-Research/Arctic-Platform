@@ -1136,9 +1136,7 @@ class TestCortexSharedHelper:
         assert "load_balancer" not in forward_only["context"]
         opted_in = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"balance_batch": True}})
         assert opted_in["context"]["balance_batch"] is True
-        grouped = to_cortex_fwd_bwd_payload(
-            {"batch": batch, "meta": {"balance_batch": True, "load_balancer": True}}
-        )
+        grouped = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"balance_batch": True, "load_balancer": True}})
         assert grouped["context"]["balance_batch"] is True
         assert "load_balancer" not in grouped["context"]
         absent = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}})
@@ -1734,8 +1732,6 @@ class TestCortexZorroVerlGrpo:
     def test_flattened_shard_reaches_verl_grpo(self):
         """Replays the worker: context promoted onto the batch, then ZoRRo's
         response-only flatten, then the registered loss with DSS's dp_size."""
-        import torch
-
         import arctic_platform.rl.processors  # noqa: F401  # registers verl_grpo before the loss module loads
         from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -1748,9 +1744,11 @@ class TestCortexZorroVerlGrpo:
         batch, meta = promote_batch_dim_to_batch(out["kwargs"], out["context"])
         mask = batch["attention_mask"].bool()
         flat = {
-            key: padded_tensor_2d_full_to_unpadded_tensor_1d_response(value, mask, 3)
-            if key not in ("input_ids", "position_ids", "attention_mask") and value.shape == mask.shape
-            else value
+            key: (
+                padded_tensor_2d_full_to_unpadded_tensor_1d_response(value, mask, 3)
+                if key not in ("input_ids", "position_ids", "attention_mask") and value.shape == mask.shape
+                else value
+            )
             for key, value in batch.items()
         }
         assert flat["response_mask"].shape == (1, 3)
@@ -1818,7 +1816,9 @@ class TestCortexUnpackedVerlGrpo:
         assert out["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]
         assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0], [1, 2, 3, 4, 0]]
         assert context["loss_mask"].int().tolist() == [[0, 1, 1, 0, 0], [0, 0, 1, 0, 0]]
-        assert torch.equal(context["advantages"], torch.tensor([[0.0, 1.0, 1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0, 0.0]]))
+        assert torch.equal(
+            context["advantages"], torch.tensor([[0.0, 1.0, 1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0, 0.0]])
+        )
 
     def test_unpacked_job_keeps_the_on_prem_loss_and_names(self):
         import torch
@@ -1949,7 +1949,9 @@ class TestCortexUnpackedVerlGrpo:
         for part in ("kwargs", "context"):
             assert inferred[part].keys() == explicit[part].keys()
             for key, value in inferred[part].items():
-                same = torch.equal(value, explicit[part][key]) if torch.is_tensor(value) else value == explicit[part][key]
+                same = (
+                    torch.equal(value, explicit[part][key]) if torch.is_tensor(value) else value == explicit[part][key]
+                )
                 assert same, key
 
     def test_unpacked_forward_keeps_the_client_layout(self):
