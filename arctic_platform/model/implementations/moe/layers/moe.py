@@ -608,15 +608,15 @@ class GroupedExperts(nn.Module):
         num_tokens_per_expert: torch.Tensor | None,
         scores: torch.Tensor | None = None,
         expert_indices: torch.Tensor | None = None,
-        grad_sums: list[torch.Tensor] | None = None,
+        weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Routed experts for tokens packed by expert; ``scores``, one routing weight per row, scale the outputs (from
         the down projection's FP32 accumulator with ``fp32_routed_weighting``).
 
         With ``expert_indices`` the rows are the EP receive buffer as delivered instead (one row per token, ``[tokens,
         top_k]`` local expert ids, ``-1`` elsewhere, and their scores), run through SonicMoE. Called through the PEFT
-        wrappers, so LoRA-trained experts see their merged weights here. ``grad_sums`` folds trainable base-weight
-        gradients over token chunks without changing adapter gradients.
+        wrappers, so LoRA-trained experts see their merged weights here. BF16 experts compute with ``weights``, when
+        given, in place of ``[w1, w2, w3]``.
         """
         if expert_indices is not None:
             return sonic_routed_experts(self, x, expert_indices, scores)
@@ -624,18 +624,6 @@ class GroupedExperts(nn.Module):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
             )
-        weights = None
-        if grad_sums is not None:
-            weights = []
-            for name, grad_sum in zip(("w1", "w2", "w3"), grad_sums):
-                parametrized = nn.utils.parametrize.is_parametrized(self, name)
-                weight = self.parametrizations[name].original if parametrized else getattr(self, name)
-                # PEFT refreshes leaf accumulators per call: detach the unused edge and fold below its active merge.
-                weight = _WeightUse.apply(grad_sum, _maybe_to_local(weight).detach())
-                if parametrized:
-                    for proxy in self.parametrizations[name]:
-                        weight = proxy(weight)
-                weights.append(weight)
         return self._forward_deepep(x, num_tokens_per_expert, scores, weights)
 
     def init_weights(self, init_std: float):
@@ -876,11 +864,11 @@ class MoE(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         scores: torch.Tensor | None = None,
-        grad_sums: list[torch.Tensor] | None = None,
+        weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if grad_sums is None:  # Only GroupedExperts takes grad_sums.
+        if weights is None:  # Only GroupedExperts takes weights.
             return self.experts(x, num_tokens_per_expert, scores)
-        return self.experts(x, num_tokens_per_expert, scores, grad_sums=grad_sums)
+        return self.experts(x, num_tokens_per_expert, scores, weights=weights)
 
     def _run_routed_experts(
         self,
@@ -959,7 +947,8 @@ class MoE(nn.Module):
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
             scores = dispatch_state.permuted_scores
-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores, grad_sums)
+            chunk_weights = None if folds is None else [_WeightUse.apply(s, w) for s, w in folds]
+            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores, chunk_weights)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
             return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
@@ -978,16 +967,17 @@ class MoE(nn.Module):
             num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
             torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
             num_chunks = int(num_chunks_tensor.item())
-        # Fold chunk gradients in FP32 and round once, as the chunked LM head does with its tiles.
-        grad_sums = None
+        # Fold chunk gradients in FP32 and round once, as the chunked LM head does with its tiles. Not for PEFT-wrapped
+        # experts: the wrapper merges their adapters into the weights inside each call, which these weights would skip.
+        folds = None
         if (
             num_chunks > 1
             and not use_sonic
+            and self.experts is experts
             and torch.is_grad_enabled()
             and any(w.requires_grad for w in (experts.w1, experts.w2, experts.w3))
         ):
-            weights = [_maybe_to_local(experts.w1), _maybe_to_local(experts.w2), _maybe_to_local(experts.w3)]
-            grad_sums = [_Fp32GradSum.apply(w) for w in weights]
+            folds = [(_Fp32GradSum.apply(w), w) for w in map(_maybe_to_local, (experts.w1, experts.w2, experts.w3))]
 
         chunk_bounds = [(start, min(start + chunk_size, x.shape[0])) for start in range(0, x.shape[0], chunk_size)]
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
