@@ -132,6 +132,9 @@ class FrozenExpertOffload:
                 self.host[base + start : base + start + nbytes].copy_(param.data.contiguous().view(torch.uint8).view(-1))
                 param.data = torch.empty(0, dtype=dtype, device=param.device)
         self.stream = torch.cuda.Stream()
+        # The codes' GPU blocks went back to PyTorch's cache; hand them to the driver too, or NCCL and DeepEP, which
+        # allocate outside the cache, still see the memory as taken (out of memory in an NCCL call without sharding).
+        torch.cuda.empty_cache()
         size = max(self.layer_bytes, default=0)
         device = torch.device("cuda", torch.cuda.current_device())
         self.buffers = [torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)]
