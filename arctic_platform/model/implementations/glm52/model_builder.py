@@ -246,6 +246,68 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
+def resolve_weight_source(config: ModelConfig) -> Path:
+    """Return the local checkpoint directory ``config.name`` loads from."""
+    if not Path(config.name).exists():
+        return Path(snapshot_download(repo_id=config.name, repo_type="model"))
+    get_logger().info(
+        f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
+        f"please remove the directory {config.name} and run again"
+    )
+    return Path(config.name)
+
+
+def prepare_weight_conversion(
+    model: nn.Module, config: ModelConfig, source_path: Path, *, rank: int, local_rank: int
+) -> Path | None:
+    """Fill the converted-weight cache ``model`` loads from and return its path, or None when no conversion applies.
+
+    The distributed load and the per-node preparation that may run before it both call this, so they resolve the
+    same cache path. ``rank`` 0 writes a shared (not node-local) cache; ``local_rank`` 0 writes a node-local one.
+    """
+    if not isinstance(model, PreTrainedModelPrimeRL):
+        return None
+    snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
+    model_keys = dict.fromkeys(model.state_dict().keys())
+    if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "prime", model.convert_to_prime, "HF", "PrimeRL"
+    elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "hf", model.convert_to_hf, "PrimeRL", "HF"
+    else:
+        return None
+
+    get_logger().warning(
+        f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
+        "state dict. Trying to auto-convert..."
+    )
+    snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
+    if conversion_cache_is_node_local(snapshot_path):
+        ensure_node_local_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+        )
+    elif not conversion_cache_ready(snapshot_path) and rank == 0:
+        _write_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+        )
+    return snapshot_path
+
+
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -266,68 +328,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         _move_buffers_to_cuda(model, config)
         return
 
-    if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
-    else:
-        logger.info(
-            f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
-            f"please remove the directory {config.name} and run again"
-        )
-        snapshot_path = Path(config.name)
+    snapshot_path = resolve_weight_source(config)
+    world = get_world()
+    converted_path = prepare_weight_conversion(
+        model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
+    )
 
-    conversion = None
-    if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
-
-        source_path = snapshot_path
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
-            conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
-            conversion = ("hf", model.convert_to_hf, "PrimeRL", "HF")
-
-        if conversion is not None:
-            fmt, convert_fn, src_fmt, dst_fmt = conversion
-            logger.warning(
-                f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
-                "state dict. Trying to auto-convert..."
-            )
-            snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
-            node_local_cache = conversion_cache_is_node_local(snapshot_path)
-            world = get_world()
-            if node_local_cache:
-                ensure_node_local_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                )
-            elif not conversion_cache_ready(snapshot_path) and world.is_master:
-                _write_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                )
-
+    # All ranks wait for the selected cache writer before loading.
     torch.distributed.barrier()
-    if conversion is not None and not conversion_cache_ready(snapshot_path):
-        world = get_world()
+    if converted_path is not None and not conversion_cache_ready(converted_path):
         raise FileNotFoundError(
             "Converted weight cache is missing or incomplete after conversion barrier: "
-            f"path={snapshot_path}, rank={world.rank}, local_rank={world.local_rank}, "
+            f"path={converted_path}, rank={world.rank}, local_rank={world.local_rank}, "
             f"scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')}"
         )
+    if converted_path is not None:
+        snapshot_path = converted_path
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
