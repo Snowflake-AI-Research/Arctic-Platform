@@ -163,8 +163,8 @@ def build_iter_full_hf_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
-    from arctic_platform.model.implementations.moe.vllm_weights import wait_for_export_collective
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
         parts = name.split(".")

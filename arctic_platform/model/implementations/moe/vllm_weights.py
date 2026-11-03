@@ -8,17 +8,6 @@ import torch
 import torch.nn as nn
 
 
-def wait_for_export_collective(tensor: torch.Tensor) -> None:
-    """Block until the collective that sends ``tensor`` has completed on this rank.
-
-    An NCCL collective returns once it is queued, and its watchdog timeout starts counting then. A rank that only
-    contributes shards to the master's export would queue every collective of the export at once while the master
-    converts and sends layer by layer, so any export longer than the group timeout aborts the job.
-    """
-    if tensor.is_cuda:
-        torch.cuda.current_stream(tensor.device).synchronize()
-
-
 def named_weight_sync_tensors(
     model: nn.Module, *, include_export_buffers: bool = True
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -198,6 +187,8 @@ def build_iter_full_vllm_weights(model: nn.Module):
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     is_vlm = bool(getattr(model, "_is_vlm", False))
     layer_prefix_pattern = (
