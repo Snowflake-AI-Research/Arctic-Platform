@@ -47,9 +47,11 @@ _STARTUP_FAILURES = frozenset({"EngineCore failed to start.", "WorkerProc failed
 # ``RuntimeError("Worker failed with error '<str>'...")``, so during startup
 # (profile run, KV cache init, warmup) this is the only record of the real type.
 _WORKER_RPC_FAILURE = "WorkerProc hit an exception."
-# Suffix of a worker RPC failure's record. Its stem is not a pid, so
-# ``recorded_pids`` (the startup watchdog's signal) leaves it out.
+# Suffix of a worker RPC failure's record, ``<pid>-<n>.rpc.json``. Its stem is
+# not a pid, so ``recorded_pids`` (the startup watchdog's signal) leaves it out.
 _RPC_SUFFIX = ".rpc"
+# Records kept per worker; the EngineCore's error names which one is the root.
+_MAX_RPC_RECORDS = 8
 # How the EngineCore's error starts when a worker RPC failed
 # (multiproc_executor.py collective_rpc); ``str()`` of the worker's error follows.
 _WORKER_FAILED_PREFIX = "Worker failed with error '"
@@ -85,8 +87,8 @@ def _origin(tb: TracebackType | None) -> str | None:
 class StartupErrorHandler(logging.Handler):
     """Write the startup failure this process logs to ``<directory>/<pid>.json``.
 
-    A worker's first RPC failure while the directory exists goes to
-    ``<directory>/<pid>.rpc.json``.
+    A worker's RPC failures while the directory exists go to
+    ``<directory>/<pid>-<n>.rpc.json``.
     """
 
     def __init__(self, directory: str) -> None:
@@ -103,13 +105,16 @@ class StartupErrorHandler(logging.Handler):
             elif record.msg == _WORKER_RPC_FAILURE:
                 # A worker keeps the directory in its environment after startup;
                 # InferenceWorker removes it once startup ends, which is what
-                # keeps later RPC failures out. The first failure is the root.
+                # keeps later RPC failures out. Each failure gets its own record
+                # (one process logs them in order, so the count is race-free).
                 if not os.path.isdir(self.directory):
                     return
                 rpc = True
-                path = os.path.join(self.directory, f"{os.getpid()}{_RPC_SUFFIX}.json")
-                if os.path.exists(path):
+                pid = os.getpid()
+                count = sum(1 for name in os.listdir(self.directory) if name.startswith(f"{pid}-"))
+                if count >= _MAX_RPC_RECORDS:
                     return
+                path = os.path.join(self.directory, f"{pid}-{count}{_RPC_SUFFIX}.json")
             else:
                 return
             exc = record.exc_info[1]

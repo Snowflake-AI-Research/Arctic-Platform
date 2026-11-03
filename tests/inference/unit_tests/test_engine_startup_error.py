@@ -109,9 +109,10 @@ def _worker_rpc_failure(message):
 def test_worker_rpc_failure_during_startup_is_the_root(tmp_path):
     """A warmup fault: the worker's own type, not the EngineCore's ``Worker failed with error``."""
     handler = startup_error.StartupErrorHandler(str(tmp_path))
+    # Startup survived the first failure; the EngineCore quotes the second.
+    handler.handle(_worker_rpc_failure("an RPC failure startup survived"))
     rpc = _worker_rpc_failure("CUDA error: an illegal memory access was encountered")
     handler.handle(rpc)
-    handler.handle(_worker_rpc_failure("a later RPC failure"))
     _write(
         tmp_path,
         999999,
@@ -121,7 +122,10 @@ def test_worker_rpc_failure_during_startup_is_the_root(tmp_path):
         time=rpc.created + 1.0,
     )
 
-    assert os.path.exists(tmp_path / f"{os.getpid()}.rpc.json")
+    assert sorted(name for name in os.listdir(tmp_path) if name.endswith(".rpc.json")) == [
+        f"{os.getpid()}-0.rpc.json",
+        f"{os.getpid()}-1.rpc.json",
+    ]
     record = startup_error.earliest_startup_record(str(tmp_path))
     assert (record["process"], record["type"], record["message"]) == (
         "Worker_TP1",
@@ -192,6 +196,14 @@ def test_worker_rpc_failure_racing_the_directory_removal_is_dropped(tmp_path, mo
     handler.handle(_worker_rpc_failure("while startup ended"))
 
     assert reported == []
+
+
+def test_worker_rpc_records_are_bounded(tmp_path):
+    handler = startup_error.StartupErrorHandler(str(tmp_path))
+    for n in range(startup_error._MAX_RPC_RECORDS + 3):
+        handler.handle(_worker_rpc_failure(f"failure {n}"))
+
+    assert len(os.listdir(tmp_path)) == startup_error._MAX_RPC_RECORDS
 
 
 def test_worker_rpc_failure_after_startup_is_not_recorded(tmp_path):
