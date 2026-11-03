@@ -739,3 +739,64 @@ def test_packed_ple_survives_custom_lm_head():
     packed = model(input_ids=ids, position_ids=positions, **kwargs)
     separate = model(input_ids=ids[:, 4:], position_ids=positions[:, 4:], **kwargs)
     torch.testing.assert_close(packed[:, 4:], separate, rtol=0, atol=1e-6)
+
+
+def test_qwen38_preserves_original_mtp_payload(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    names = (
+        "fc_embedding.weight",
+        "fc_hidden.weight",
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
+        "hyper_connection_mixer.hc_norm.weight",
+        "hyper_connection_mixer.input_mix_weight_down.weight",
+        "hyper_connection_mixer.input_mix_weight_up.weight",
+    )
+    layer_names = (
+        "attn_hyper_connection.block_inject_weight.weight",
+        "attn_hyper_connection.hc_norm.weight",
+        "attn_hyper_connection.input_mix_weight_down.weight",
+        "attn_hyper_connection.input_mix_weight_up.weight",
+        "mlp_hyper_connection.block_inject_weight.weight",
+        "mlp_hyper_connection.hc_norm.weight",
+        "mlp_hyper_connection.input_mix_weight_down.weight",
+        "mlp_hyper_connection.input_mix_weight_up.weight",
+        "self_attn.indexer.index_qk_proj.weight",
+        "self_attn.indexer.k_layernorm.weight",
+        "self_attn.indexer.q_layernorm.weight",
+        "self_attn.k_norm.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.v_proj.weight",
+        "mlp.gate.weight",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+        "mlp.shared_expert_gate.weight",
+    )
+    payload = {
+        name: torch.full((2, 3), float(index), dtype=torch.bfloat16)
+        for index, name in enumerate(
+            [f"mtp.{name}" for name in names] + [f"mtp.layers.0.{name}" for name in layer_names]
+        )
+    }
+    save_file(payload, tmp_path / "model.safetensors")
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(model_type="qwen4_exp_text", mtp_num_hidden_layers=1))
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    exported = dict(mtp_weights.iter_preserved_mtp_weights(model))
+    assert len(exported) == 31
+    assert set(exported) == set(payload)
+    assert not list(model.parameters()) and not list(model.buffers())
+    for name, value in payload.items():
+        torch.testing.assert_close(exported[name], value, rtol=0, atol=0)
