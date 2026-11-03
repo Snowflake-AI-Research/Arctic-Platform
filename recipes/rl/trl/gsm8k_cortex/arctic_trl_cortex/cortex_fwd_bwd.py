@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .cortex_forward import _context_meta
+
 _FWD_BWD_DUMP_LEFT = int(os.environ.get("CORTEX_DUMP_FWD_BWD_KEYS", "0"))
 _FWD_BWD_COMPARE = os.environ.get("CORTEX_VALIDATE_FWD_BWD_LOGPROBS", "0") not in (
     "0",
@@ -89,7 +91,12 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     return {
         "args": (),
         "kwargs": kwargs_out,
-        "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
+        "context": {
+            **_context_meta(meta),
+            "input_ids": input_ids,
+            "advantages": advantages,
+            "loss_mask": loss_mask,
+        },
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
     }
 

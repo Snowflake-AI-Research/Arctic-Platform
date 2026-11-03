@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 
+from arctic_platform.common.utils.batch import unpack_batch
+
 
 RECIPE_ROOT = Path(__file__).resolve().parents[3] / "recipes" / "rl" / "trl" / "gsm8k_cortex"
 sys.path.insert(0, str(RECIPE_ROOT))
@@ -14,6 +16,7 @@ sys.path.insert(0, str(RECIPE_ROOT))
 from arctic_trl_cortex.upstream import CortexModelBridge
 from arctic_trl_cortex.upstream import _flatten_row
 from arctic_trl_cortex.upstream import _pad_rows
+from arctic_trl_cortex.client import engine_old_log_probs
 
 
 class _Row:
@@ -29,9 +32,11 @@ class _Row:
 
 class _FakeCortexClient:
     def __init__(self) -> None:
+        self.forward_payloads: list[dict] = []
         self.backward_payloads: list[dict] = []
 
     def fwd_no_grad(self, payload: dict) -> dict:
+        self.forward_payloads.append(payload)
         input_ids = payload["kwargs"]["input_ids"]
         return {
             "batch": {
@@ -72,4 +77,27 @@ def test_cortex_backward_runs_once_for_upstream_autograd() -> None:
     assert output.log_probs.shape == (1, 3)
     output.log_probs[:, :2].sum().backward()
 
+    assert len(client.forward_payloads) == 1
     assert len(client.backward_payloads) == 1
+    for payload in (*client.forward_payloads, *client.backward_payloads):
+        _args, server_batch, server_meta, _processing = unpack_batch(payload)
+        assert "attention_mask" in server_batch
+        assert server_meta["pad_token_id"] == 0
+
+
+def test_trainer_old_logprob_forward_carries_unpadding_metadata() -> None:
+    client = _FakeCortexClient()
+
+    engine_old_log_probs(
+        client,
+        [[1, 2, 3], [4, 5]],
+        temperature=0.7,
+        pad_token_id=42,
+        rollout_n=8,
+        max_token_len_per_gpu=16,
+    )
+
+    (payload,) = client.forward_payloads
+    _args, server_batch, server_meta, _processing = unpack_batch(payload)
+    assert server_batch["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+    assert server_meta["pad_token_id"] == 42

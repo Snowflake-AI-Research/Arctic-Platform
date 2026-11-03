@@ -149,6 +149,13 @@ class CortexModelBridge:
             to_cortex_fwd_bwd_payload(
                 {
                     "batch": {**batch, "advantages": advantages, "response_mask": response_mask},
+                    "meta": _meta_dict(
+                        temperature=self.temperature,
+                        rollout_n=self.rollout_n,
+                        pad_token_id=self.pad_token_id,
+                        max_token_len_per_gpu=self.max_token_len_per_gpu,
+                        calculate_entropy=True,
+                    ),
                     "processing": {
                         "config": {
                             "eps_clip": epsilon,
