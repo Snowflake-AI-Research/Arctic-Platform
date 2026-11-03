@@ -96,6 +96,12 @@ constrains what runs correctly here:
 * **Recipe** —
   [`recipes/rl/skyrl/simple_gsm8k_cortex/`](../recipes/rl/skyrl/simple_gsm8k_cortex/README.md),
   SkyRL GRPO on GSM8K, with a measured reference curve.
+* **TRL recipe** —
+  [`recipes/rl/trl/gsm8k_cortex/`](../recipes/rl/trl/gsm8k_cortex/README.md),
+  TRL `AsyncGRPOTrainer` on GSM8K. The driver is CPU-only and ZoRRo is off.
+  Unlike the SkyRL path above, trainer-π_old issues a real `/forward`, and the
+  logged `kl` is a per-step metric (about `1e-4` to `1e-3`), not a loss term
+  and not the SkyRL `approx_kl=0` case.
 
 ## Env vars
 
