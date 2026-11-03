@@ -104,9 +104,22 @@ def _down_weight(weight: torch.Tensor, scale, block_size: int | None) -> torch.T
     return _decode_fp8_to_bf16(weight, scale, block_size)
 
 
+def _down_projection(h, weight, scale, offsets, rows, block_size, act_scale):
+    if act_scale is None:
+        return torch._grouped_mm(h, _down_weight(weight, scale, block_size).transpose(-2, -1), offs=offsets)
+    from arctic_platform.model.implementations.kernels.w4a8 import quantize_fp8_per_tensor
+    from arctic_platform.model.implementations.kernels.w4a8 import w4a8_grouped_mm_into
+
+    y = torch.empty(h.shape[0], weight.shape[-2], dtype=torch.bfloat16, device=h.device)
+    w4a8_grouped_mm_into(
+        y[:rows], quantize_fp8_per_tensor(h[:rows], act_scale), weight, scale.scale, offsets, act_scale
+    )
+    return y
+
+
 class _ScoredSwiGLUDownFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit):
+    def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit, act_scale):
         gate_up = gate_up.contiguous()
         hidden = gate_up.shape[1] // 2
         # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
@@ -124,7 +137,7 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
                 HAS_LIMIT=limit is not None,
                 BLOCK_D=_BLOCK_D,
             )
-        y = torch._grouped_mm(h, _down_weight(weight, scale, block_size).transpose(-2, -1), offs=offsets)
+        y = _down_projection(h, weight, scale, offsets, rows, block_size, act_scale)
         del h
         if rows < y.shape[0]:
             y[rows:].zero_()
@@ -161,7 +174,7 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
         if rows < gate_up.shape[0]:
             d_gate_up[rows:].zero_()
             dscores[rows:].zero_()
-        return d_gate_up, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None
+        return d_gate_up, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None, None
 
 
 def scored_swiglu_down(
@@ -173,16 +186,18 @@ def scored_swiglu_down(
     rows: int,
     block_size: int | None = None,
     limit: float | None = None,
+    act_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``scores[:, None] * (swiglu(gate, up) @ W2_e.T)`` per expert for rows packed by expert, ``W2`` frozen.
 
     ``gate_up`` is ``[rows, 2 * hidden]``: gate in the first half of each row, up in the second. ``weight`` is the
     ``[experts, dim, hidden]`` down-projection stack, BF16 or block FP8 with ``scale`` (decoded per GEMM).
     ``offsets`` is the cumulative row count per expert and ``rows`` its last value; rows past it are padding and
-    come out zero. Gradients flow to ``gate_up`` (same layout) and ``scores``.
+    come out zero. Gradients flow to ``gate_up`` (same layout) and ``scores``. With ``act_scale`` (INT4 ``weight``
+    with ``Int4InterleavedScales``) the forward GEMM runs W4A8 on ``h`` quantized to E4M3 by that per-tensor scale.
     """
     if gate_up.ndim != 2 or gate_up.shape[1] % 2 or scores.numel() != gate_up.shape[0]:
         raise ValueError(
             f"gate_up {tuple(gate_up.shape)} must be [rows, 2 * hidden] with one score per row, got {scores.numel()}"
         )
-    return _ScoredSwiGLUDownFn.apply(gate_up, scores, weight, scale, offsets, rows, block_size, limit)
+    return _ScoredSwiGLUDownFn.apply(gate_up, scores, weight, scale, offsets, rows, block_size, limit, act_scale)

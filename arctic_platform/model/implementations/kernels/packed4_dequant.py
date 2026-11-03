@@ -43,6 +43,7 @@ def _dequant_int4_group_kernel(
     out_rows,
     out_row0,
     GROUP: tl.constexpr,
+    ALIGN: tl.constexpr,
     TILE_ROWS: tl.constexpr,
     TILE_BYTES: tl.constexpr,
 ):
@@ -58,7 +59,13 @@ def _dequant_int4_group_kernel(
     cols = packed_cols * 2
     col = (tl.program_id(1) * (2 * TILE_BYTES) + tl.arange(0, 2 * TILE_BYTES))[None, :]
     out_mask = (row < rows) & (col < cols)
-    scale = tl.load(scale_ptr + (expert * rows + row) * scale_cols + col // GROUP, mask=out_mask, other=0.0)
+    group = col // GROUP
+    if ALIGN > 0:
+        # The W4A8 layout [E, groups // ALIGN, rows * ALIGN]: ALIGN consecutive groups of a row sit together.
+        scale_offset = (expert * (scale_cols // ALIGN) + group // ALIGN) * (rows * ALIGN) + row * ALIGN + group % ALIGN
+    else:
+        scale_offset = (expert * rows + row) * scale_cols + group
+    scale = tl.load(scale_ptr + scale_offset, mask=out_mask, other=0.0)
     out_offset = (expert * out_rows + out_row0 + row) * cols + col
     tl.store(out_ptr + out_offset, (values * scale.to(tl.float32)).to(tl.bfloat16), mask=out_mask)
 
@@ -120,15 +127,30 @@ def _checked_out(weight: torch.Tensor, out: torch.Tensor | None, out_row: int) -
     return out
 
 
+def interleave_int4_scales(scale: torch.Tensor, align: int) -> torch.Tensor:
+    """``[E, rows, groups]`` -> the W4A8 layout ``[E, groups // align, rows * align]`` (SGLang's ``interleave_scales``;
+    ``align`` is the GEMM tile's K step over the group size, 1 for the training tiles)."""
+    experts, rows, groups = scale.shape
+    if groups % align:
+        raise ValueError(f"interleaving INT4 scales by {align} needs a multiple of {align} groups, got {groups}")
+    return (
+        scale.reshape(experts, rows, groups // align, align)
+        .permute(0, 2, 1, 3)
+        .reshape(experts, groups // align, rows * align)
+    )
+
+
 def dequantize_int4_groups(
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor | None = None,
     out_row: int = 0,
+    interleaved: int = 0,
 ) -> torch.Tensor:
     """BF16 copy of a CUDA group-scaled INT4 matrix ``[rows, cols // 2]`` (int8 bytes), or of an expert stack.
 
-    ``scale`` is BF16 ``[.., rows, cols // group]``; the group size follows from the shapes. With ``out`` (BF16, same
+    ``scale`` is BF16 ``[.., rows, cols // group]``; the group size follows from the shapes. ``interleaved=a`` (> 0) reads
+    an expert stack's scales in the W4A8 kernel's ``[E, groups // a, rows * a]`` layout instead. With ``out`` (BF16, same
     leading and column sizes, at least ``out_row + rows`` rows) the rows are written into
     ``out[..., out_row : out_row + rows, :]``, so several stacks can be decoded side by side for one GEMM.
     """
@@ -137,11 +159,22 @@ def dequantize_int4_groups(
             f"expected a CUDA int8 [.., rows, cols // 2] packed INT4 weight, got {weight.dtype} {weight.shape}"
         )
     rows, cols = weight.shape[-2], weight.shape[-1] * 2
-    if scale.dtype != torch.bfloat16 or scale.shape[:-1] != weight.shape[:-1] or cols % scale.shape[-1]:
+    if interleaved:
+        a = interleaved
+        if weight.ndim != 3 or scale.ndim != 3 or scale.shape[0] != weight.shape[0] or scale.shape[2] != rows * a:
+            raise TypeError(
+                f"interleaved INT4 scales must be [E, groups // {a}, {rows * a}], got {tuple(scale.shape)}"
+            )
+        groups = scale.shape[1] * a
+    else:
+        if scale.shape[:-1] != weight.shape[:-1]:
+            raise TypeError(f"INT4 group scale must be [.., {rows}, groups], got {tuple(scale.shape)}")
+        groups = scale.shape[-1]
+    if scale.dtype != torch.bfloat16 or cols % groups:
         raise TypeError(
-            f"INT4 group scale must be bfloat16 [.., {rows}, groups], got {scale.dtype} {tuple(scale.shape)}"
+            f"INT4 group scale must be bfloat16 with groups dividing {cols}, got {scale.dtype} {tuple(scale.shape)}"
         )
-    group = cols // scale.shape[-1]
+    group = cols // groups
     if group % (2 * _TILE_BYTES) and (2 * _TILE_BYTES) % group:
         raise ValueError(f"INT4 group size {group} does not tile the decode's {2 * _TILE_BYTES} columns")
     out = _checked_out(weight, out, out_row)
@@ -155,10 +188,11 @@ def dequantize_int4_groups(
                 out,
                 rows,
                 weight.shape[-1],
-                scale.shape[-1],
+                groups,
                 out.shape[-2],
                 out_row,
                 GROUP=group,
+                ALIGN=interleaved,
                 TILE_ROWS=_TILE_ROWS,
                 TILE_BYTES=_TILE_BYTES,
             )

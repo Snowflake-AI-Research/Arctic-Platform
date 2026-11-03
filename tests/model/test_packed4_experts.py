@@ -226,3 +226,29 @@ def test_nvfp4_expert_scales_stack_per_projection():
     assert state[f"{prefix}.w1_scale_inv"].dtype == torch.float8_e4m3fn
     torch.testing.assert_close(state[f"{prefix}.w2_scale_2"], torch.tensor([1e-3, 2e-3]))
     assert not [k for k in state if "input_scale" in k or ".experts.0." in k]
+
+
+@cuda
+def test_w4a8_experts_match_the_decoded_bf16_experts(monkeypatch):
+    monkeypatch.setenv("ARL_W4A8_EXPERTS", "1")
+    torch.manual_seed(0)
+    experts, dim, hidden = 4, 512, 512
+    module, reference = _int4_experts(experts, dim, hidden, "cuda")
+    for name in ("w1", "w2", "w3"):
+        getattr(module, f"{name}_input_scale").data.fill_(1.0)
+    counts = [5, 0, 17, 9]
+    x = torch.randn(sum(counts), dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    scores = torch.rand(sum(counts), device="cuda", requires_grad=True)
+    out = module(x, torch.tensor(counts, device="cuda"), scores)
+    x_ref = x.detach().clone().requires_grad_(True)
+    scores_ref = scores.detach().clone().requires_grad_(True)
+    want = _dense_experts(reference, x_ref.float(), counts, scores_ref)
+    # The forward quantizes the gate/up and down inputs to E4M3 (scale 1), about 3% error per element.
+    error = (out.float() - want).norm() / want.norm()
+    assert error < 5e-2, error
+    grad = torch.randn_like(want)
+    out.float().backward(grad)
+    want.backward(grad)
+    error = (x.grad.float() - x_ref.grad.float()).norm() / x_ref.grad.float().norm()
+    assert error < 5e-2, error
+    assert module._scales_interleaved and module.w1_scale_inv.shape == (experts, dim // 128, hidden)

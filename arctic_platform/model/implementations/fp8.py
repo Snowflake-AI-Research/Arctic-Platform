@@ -352,6 +352,16 @@ class Nvfp4Scales:
         self.per_matrix = per_matrix
 
 
+class Int4InterleavedScales:
+    """BF16 INT4 group scales of an expert stack in the W4A8 kernel's ``[E, groups // align, out * align]`` layout."""
+
+    __slots__ = ("scale", "align")
+
+    def __init__(self, scale: Tensor, align: int) -> None:
+        self.scale = scale
+        self.align = align
+
+
 PACKED_4BIT_DTYPES = (torch.int8, torch.uint8)
 
 
@@ -373,7 +383,10 @@ def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tenso
     elif weight.dtype == torch.int8:
         from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups
 
-        dequantize_int4_groups(weight, scale, out=out, out_row=out_row)
+        if isinstance(scale, Int4InterleavedScales):
+            dequantize_int4_groups(weight, scale.scale, out=out, out_row=out_row, interleaved=scale.align)
+        else:
+            dequantize_int4_groups(weight, scale, out=out, out_row=out_row)
     elif weight.dtype == torch.uint8:
         from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_nvfp4
 
@@ -673,6 +686,56 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
         if ctx.rows < dx.shape[0]:
             dx[ctx.rows :].zero_()
         return dx.type_as(grad_output), None, None, None, None, None
+
+
+class _GroupedW4A8MmFn(torch.autograd.Function):
+    """Grouped ``x_e @ W_e.T`` for INT4 experts: W4A8 (FP8 activations) forward, decoded BF16 input gradient.
+
+    Like ``_GroupedDecodedFp8MmFn``, tuples of stacks sharing ``x`` give their outputs side by side; the backward is
+    the straight-through gradient of the activation quantization, ``dY_e @ dequant(W_e)``.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, act_scale: Tensor) -> Tensor:
+        from arctic_platform.model.implementations.kernels.w4a8 import quantize_fp8_per_tensor
+        from arctic_platform.model.implementations.kernels.w4a8 import w4a8_grouped_mm_into
+
+        ctx.weights = (weight, scale)
+        ctx.rows = rows
+        ctx.save_for_backward(offsets)
+        stacks = weight if isinstance(weight, tuple) else (weight,)
+        scales = scale if isinstance(scale, tuple) else (scale,)
+        out = torch.empty(x.shape[0], sum(w.shape[-2] for w in stacks), dtype=torch.bfloat16, device=x.device)
+        x_fp8 = quantize_fp8_per_tensor(x[:rows], act_scale)
+        col = 0
+        for w, sc in zip(stacks, scales):
+            w4a8_grouped_mm_into(out[:rows, col : col + w.shape[-2]], x_fp8, w, sc.scale, offsets, act_scale)
+            col += w.shape[-2]
+        if rows < out.shape[0]:
+            out[rows:].zero_()
+        return out.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (offsets,) = ctx.saved_tensors
+        weight, scale = ctx.weights
+        decoded = _decode_fp8_to_bf16(weight, scale, None)
+        dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
+        if ctx.rows < dx.shape[0]:
+            dx[ctx.rows :].zero_()
+        return dx.type_as(grad_output), None, None, None, None, None
+
+
+def grouped_w4a8_mm(
+    x: Tensor,
+    weight: Tensor | tuple[Tensor, ...],
+    scale: Int4InterleavedScales | tuple[Int4InterleavedScales, ...],
+    offsets: Tensor,
+    rows: int,
+    act_scale: Tensor,
+) -> Tensor:
+    """``grouped_fp8_decoded_mm`` for INT4 experts through the W4A8 kernel (``kernels/w4a8``)."""
+    return _GroupedW4A8MmFn.apply(x, weight, scale, offsets, rows, act_scale)
 
 
 def grouped_fp8_decoded_mm(
