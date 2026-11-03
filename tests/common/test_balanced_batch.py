@@ -293,14 +293,13 @@ def test_stamp_and_apply_keep_explicit_true():
     assert "prompt_group_ids" not in applied
 
 
-def test_legacy_load_balancer_false_keeps_arrival_order():
+def test_legacy_balancer_keys_are_ignored():
     from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
 
     mask = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 0, 0]])
-    assert (
-        assign_balanced_batch(2, {"load_balancer": False}, attention_mask=mask) is None
-    )
-    assert assign_balanced_batch(2, {"balance_batch": True, "load_balancer": False}, attention_mask=mask) is not None
+    for key in ("load_balancer", "zorro_load_balancer", "zorro_train_load_balancer"):
+        assert assign_balanced_batch(2, {key: False}, attention_mask=mask) is not None
+    assert assign_balanced_batch(2, {"balance_batch": False, "load_balancer": True}, attention_mask=mask) is None
 
 
 def test_reordered_prompt_blocks_omit_group_ids():

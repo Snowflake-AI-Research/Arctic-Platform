@@ -162,11 +162,9 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.logits_compute_in_fp32 = _logits_cfg.get("compute_in_fp32", False)
         self.logits_compute_from_fp32_inputs = _logits_cfg.get("compute_from_fp32_inputs", False)
         # False keeps arrival order. True balances sample lengths, or whole ZoRRo prompt groups.
-        # ``load_balancer`` is the previous key. An explicit false still opts out.
+        # The legacy ``load_balancer`` config key is ignored.
         if _train_cfg.get("balance_batch", None) is not None:
             self.balance_batch = bool(_train_cfg.get("balance_batch"))
-        elif _train_cfg.get("load_balancer", None) is not None:
-            self.balance_batch = bool(_train_cfg.get("load_balancer"))
         else:
             self.balance_batch = True
         # CUDA-IPC bypasses NCCL for weight sync; only valid when colocate=True.
