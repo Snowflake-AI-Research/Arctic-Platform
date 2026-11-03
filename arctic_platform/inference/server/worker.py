@@ -21,6 +21,7 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.inference.engine_startup_error import EngineStartupError
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -37,6 +38,8 @@ from arctic_platform.inference.vllm.spec_decode_grammar import (
 from arctic_platform.inference.vllm.startup_error import (
     ENV_VAR as _STARTUP_ERROR_DIR_ENV,
     earliest_startup_error,
+    earliest_startup_record,
+    format_root_cause,
     recorded_pids,
 )
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
@@ -324,27 +327,44 @@ def _end_engine_startup_capture(directory: str | None) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeError | None:
-    """vLLM's generic startup error with the earliest engine process's own failure appended.
+# How vLLM's generic startup error starts (vllm/v1/engine/utils.py wait_for_engine_startup).
+# Only that error is converted: another RuntimeError raised during the attempt,
+# such as semi_p's restore mismatch, is not the engine failure a record explains.
+_VLLM_STARTUP_FAILED = "Engine core initialization failed."
 
-    The root has to be in the message: Ray drops ``__cause__``, and dss-platform's
-    classifier matches on the error's type and ``str()``, which leaves out
-    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
-    replaced, so every other type keeps the type a classifier matches on. Returns
-    None, so the original is raised as it is, for any other type, when there is no
-    record, or when reading one fails; the last two are logged.
+
+def _engine_startup_error(exc: BaseException, directory: str | None) -> EngineStartupError | None:
+    """vLLM's generic startup error as an ``EngineStartupError`` built from the earliest record.
+
+    The root has to be on the raised error itself: Ray drops ``__cause__``. Its
+    fields carry the engine process's own type, message and origin for a
+    classifier across the actor boundary; its message is vLLM's with the root
+    appended, as before, for one that matches on ``str()``, which leaves out
+    ``__notes__``. Only vLLM's generic error, a plain ``RuntimeError`` with
+    vLLM's message, is replaced, so every other error keeps the type a
+    classifier matches on and no record is attached to an error it does not
+    explain. Returns None, so the original is raised as it is, for any other
+    error, when there is no record, or when reading one fails; the last two are
+    logged.
     """
-    if directory is None or type(exc) is not RuntimeError:
+    if directory is None or type(exc) is not RuntimeError or not str(exc).startswith(_VLLM_STARTUP_FAILED):
         return None
     try:
-        root_cause = earliest_startup_error(directory)
+        record = earliest_startup_record(directory)
     except Exception:
         logger.info("Engine startup root cause not appended: reading %s failed", directory, exc_info=True)
         return None
-    if root_cause is None:
+    if record is None:
         logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
         return None
-    return RuntimeError(f"{exc}\n{root_cause}")
+    return EngineStartupError(
+        f"{exc}\n{format_root_cause(record)}",
+        root_type=record["type"],
+        root_message=record["message"],
+        process=record["process"],
+        origin=record["origin"],
+        cuda_error_code=record["cuda_error_code"],
+    )
 
 
 # vLLM's title for its engine processes (setproctitle), e.g. "VLLM::EngineCore".
