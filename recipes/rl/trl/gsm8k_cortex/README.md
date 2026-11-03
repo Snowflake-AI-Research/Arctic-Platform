@@ -87,13 +87,38 @@ local optimizer only records the server step.
 
 ## 4. What a healthy run looks like
 
-On current `main`, a 2-step trainer-π_old run (Qwen3-1.7B, 4+4, ZoRRo off,
-seed 42) finished with `kl` `3.4e-4` then `6.8e-4`. That sits in the band of
-the earlier 250-step trainer-π_old run below, whose step-1 `kl` was `2.9e-4`.
+This recipe (upstream TRL `3b24f2fcd`, trainer π_old, ZoRRo off, `sdpa`, seed
+42) finished 250 steps in 29:35. `train_runtime` was 1775 s, about 7.1 s/step.
+Step-1 training reward was 0.359 and step-1 `kl` was `2.8e-4`. The first 20
+steps averaged reward 0.426 and `kl` `5.5e-4`. Last-20 training reward was
+0.809, completion length 135, and `kl` `2.9e-3`. Mean `kl` over all 250 steps
+was `1.3e-3`, and `kl` was nonzero on every step. `grad_norm` stayed 0.
+
+The reward below is the mean training-batch `accuracy_reward` over the 20
+steps ending at that step, not a held-out pass@1.
+
+| Step | Reward |
+| --- | ---: |
+| 20 | 0.43 |
+| 40 | 0.62 |
+| 60 | 0.63 |
+| 80 | 0.75 |
+| 100 | 0.79 |
+| 120 | 0.77 |
+| 140 | 0.73 |
+| 160 | 0.80 |
+| 180 | 0.76 |
+| 200 | 0.80 |
+| 220 | 0.85 |
+| 240 | 0.76 |
+| 250 | 0.81 |
+
+Write that run to a new `--metrics-out`. The older pins below stay where they
+are.
 
 The 250-step quality pins were measured with the pre-main Cortex client, same
-knobs. They are training-batch reward over the last 20 steps, not held-out
-pass@1. `kl` was nonzero on every step.
+knobs. They are training-batch reward over the last 20 steps. `kl` was
+nonzero on every step.
 
 | Arm | Last-20 reward | Last-20 completion length | Mean step | `kl` over 250 |
 | --- | ---: | ---: | ---: | --- |
@@ -101,12 +126,11 @@ pass@1. `kl` was nonzero on every step.
 | Trainer π_old | 0.734 | 184 | 6.02 s | mean `8.0e-4`, never 0 |
 
 The previous adapter on `main` (`c40f78bca`, trainer π_old, ZoRRo off) finished
-250 steps in 27:34. Step-1 `kl` was `3.0e-4` and the first 20 steps averaged
-`5.9e-4`, matching the trainer pin. Last-20 training reward was 0.767 with
-completion length 126. Last-20 `kl` was `1.8e-2`, about 18× the pre-main pin,
-and `kl` was nonzero on every step. Mean step time was 6.56 s. The upstream-TRL
-bridge above must be checked with a new metrics file (`--metrics-out`); do not
-overwrite the pins above.
+250 steps in 27:34. A 2-step run of that adapter logged `kl` `3.4e-4` then
+`6.8e-4`. Over 250 steps, step-1 `kl` was `3.0e-4` and the first 20 steps
+averaged `5.9e-4`. Last-20 training reward was 0.767 with completion length
+126. Last-20 `kl` was `1.8e-2`, and `kl` was nonzero on every step. Mean step
+time was 6.56 s.
 
 ## Files
 
