@@ -1,0 +1,518 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""GLM-5.3-Flash norms, Qwen3.8-Flash-Next QSA attention and both models' routed experts round to bf16 once, from
+fp32, as vLLM's kernels do.
+
+Each test runs the trainer's own modules with bf16 parameters (DeepSpeed's cast) and checks one site against the
+fp64 value of the same formula from the same bf16 inputs, rounded once. With ``fp32_parity`` off, the sites keep
+the transformers order. The routed experts round once only with ``fp32_routed_weighting``, which is off by default.
+"""
+
+import dataclasses
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from arctic_platform.model import loader as loader_mod
+from tests.model.test_glm5_next import _tiny_config as _glm_tiny_config
+
+
+def _assert_rounded_once(actual: torch.Tensor, reference: torch.Tensor) -> None:
+    """``actual`` is ``reference`` (fp64) rounded once, except where fp32 noise could flip that rounding."""
+    expected = reference.to(actual.dtype)
+    ambiguous = (reference * (1 - 1e-5)).to(actual.dtype) != (reference * (1 + 1e-5)).to(actual.dtype)
+    assert ambiguous.double().mean() < 0.01
+    mismatched = int((actual != expected)[~ambiguous].sum())
+    assert mismatched == 0, f"{mismatched} of {int((~ambiguous).sum())} values were rounded more than once"
+
+
+@pytest.mark.parametrize("name", ["glm5_next", "qwen4_exp"])
+def test_flash_loaders_take_fp32_parity(name):
+    options = loader_mod._LOADERS[name].options
+    assert options().fp32_parity is True
+    assert options.model_validate({"fp32_parity": False}).fp32_parity is False
+
+
+@pytest.mark.parametrize("name", ["glm5_next", "qwen4_exp"])
+def test_flash_loaders_pass_fp32_routed_weighting_to_the_model_config(name):
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
+    from arctic_platform.model.loaders import flash_moe
+
+    options = loader_mod._LOADERS[name].options
+    assert options().fp32_routed_weighting is False
+    for enabled in (True, False):
+        spec_options = options.model_validate({"fp32_routed_weighting": enabled}).model_dump(exclude_unset=True)
+        load_options = flash_moe._FlashLoadOptions.model_validate(spec_options)
+        config = _build_model_config(name, 1, 1, "bfloat16", "sdpa", options=load_options)
+        assert config.fp32_routed_weighting is enabled
+
+
+def test_qwen3_5_moe_loader_rejects_fp32_routed_weighting():
+    with pytest.raises(ValueError, match="fp32_routed_weighting"):
+        loader_mod._LOADERS["qwen3_5_moe"].options.model_validate({"fp32_routed_weighting": True})
+
+
+def _glm_norms(fp32_parity: bool) -> list:
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    torch.manual_seed(0)
+    config = _glm_tiny_config()
+    config.use_grouped_mm = False
+    config.fp32_parity = fp32_parity
+    model = Glm5NextForConditionalGenerationPrimeRL(config).to(torch.bfloat16)
+    norms = {name: module for name, module in model.named_modules() if type(module) is Glm5NextTextRMSNorm}
+    kinds = {name.rsplit(".", 1)[-1] for name in norms}
+    assert kinds >= {"input_layernorm", "post_attention_layernorm", "q_a_layernorm", "kv_a_layernorm", "norm"}
+    with torch.no_grad():
+        for norm in norms.values():
+            norm.weight.normal_(1.0, 0.5)
+    return list(norms.values())
+
+
+def test_glm53_rms_norms_multiply_the_weight_before_rounding():
+    for norm in _glm_norms(fp32_parity=True):
+        with torch.no_grad():
+            hidden_states = (3 * torch.randn(256, norm.weight.numel())).to(torch.bfloat16)
+            x = hidden_states.double()
+            reference = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.double()
+            _assert_rounded_once(norm(hidden_states), reference)
+
+
+def test_glm53_rms_norms_keep_the_reference_order_without_fp32_parity():
+    for norm in _glm_norms(fp32_parity=False):
+        with torch.no_grad():
+            hidden_states = (3 * torch.randn(256, norm.weight.numel())).to(torch.bfloat16)
+            expected = type(norm).forward(norm, hidden_states)
+            torch.testing.assert_close(norm(hidden_states), expected, rtol=0, atol=0)
+
+
+def _qsa_sites(monkeypatch, fp32_parity: bool = True) -> dict[str, torch.Tensor]:
+    """One QSA layer's forward through ``apply_qsa_flex``, with the tensors at each rounding site recorded."""
+    pytest.importorskip("transformers.models.qwen4_exp")
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
+    from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
+
+    torch.manual_seed(7)
+    config = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=0.5,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+        hc_count=2,
+        hc_lowrank=4,
+        layer_types=["qwen_sparse_attention"],
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=4,
+        indexer_compress_ratio=2,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000, "mrope_section": [2, 1, 1]},
+    )
+    qsa.register_qsa_flex_backend()
+    config._attn_implementation = "qsa_flex"
+    model = Qwen4ExpForCausalLM(config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.5)
+    model = model.to(torch.bfloat16).eval()
+    qsa.apply_qsa_flex(model, fp32_parity=fp32_parity)
+    attention = model.model.layers[0].self_attn
+
+    sites: dict[str, torch.Tensor] = {}
+
+    def attend(query, key, value, ids, softmax_scale, fp32_parity):
+        output = qsa._SparseGQAAttention.apply(query, key, value, ids, softmax_scale, 128, fp32_parity)
+        sites.update(query=query, key=key, value=value, ids=ids, scale=torch.tensor(softmax_scale), attention=output)
+        return output
+
+    # The real attention runs on CPU; only its CUDA/bf16 entry guard is replaced.
+    monkeypatch.setattr(qsa, "flex_sparse_gqa_attention", attend)
+    attention.register_forward_pre_hook(lambda _module, args: sites.update(zip(("cos", "sin"), args[1])))
+    attention.q_norm.register_forward_hook(lambda _m, _a, output: sites.update(normed_query=output))
+    attention.k_norm.register_forward_hook(lambda _m, _a, output: sites.update(normed_key=output))
+    attention.q_proj.register_forward_hook(lambda _m, _a, output: sites.update(query_and_gate=output))
+    attention.o_proj.register_forward_pre_hook(lambda _m, args: sites.update(gated=args[0]))
+
+    ids = torch.randint(1, config.vocab_size, (2, 32))
+    with torch.no_grad():
+        model(input_ids=ids, position_ids=torch.arange(32)[None] + 5, use_cache=False)
+    return sites
+
+
+def _rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    rotary_dim = cos.shape[-1]
+    x = x.double()
+    cos, sin = cos.double()[:, :, None], sin.double()[:, :, None]
+    rotary, rest = x[..., :rotary_dim], x[..., rotary_dim:]
+    half = torch.cat((-rotary[..., rotary_dim // 2 :], rotary[..., : rotary_dim // 2]), dim=-1)
+    return torch.cat((rotary * cos + half * sin, rest), dim=-1)
+
+
+def test_qwen38_qsa_rotary_rounds_once(monkeypatch):
+    sites = _qsa_sites(monkeypatch)
+    _assert_rounded_once(sites["query"], _rotated(sites["normed_query"], sites["cos"], sites["sin"]))
+    _assert_rounded_once(sites["key"], _rotated(sites["normed_key"], sites["cos"], sites["sin"]))
+
+
+def _attention_reference(sites: dict[str, torch.Tensor]) -> torch.Tensor:
+    query, key, value, ids = sites["query"].double(), sites["key"].double(), sites["value"].double(), sites["ids"]
+    groups = query.shape[2] // key.shape[2]
+    key, value = key.repeat_interleave(groups, dim=2), value.repeat_interleave(groups, dim=2)
+    valid = (ids >= 0) & (ids < key.shape[1])
+    hits = torch.zeros(ids.shape[0], ids.shape[1], key.shape[1], dtype=torch.int32)
+    selected = hits.scatter_add_(-1, ids.clamp(min=0, max=key.shape[1] - 1).long(), valid.int()) > 0
+    scores = torch.einsum("bqhd,bkhd->bhqk", query, key) * sites["scale"].double()
+    probabilities = torch.softmax(scores.masked_fill(~selected[:, None], -torch.inf), dim=-1)
+    return torch.einsum("bhqk,bkhd->bqhd", probabilities, value)
+
+
+def _gate(sites: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, length, heads, head_dim = sites["attention"].shape
+    gate = sites["query_and_gate"].view(batch, length, heads, 2 * head_dim)[..., head_dim:].reshape(batch, length, -1)
+    return sites["attention"].reshape(batch, length, -1), gate
+
+
+def test_qwen38_qsa_attention_rounds_once(monkeypatch):
+    sites = _qsa_sites(monkeypatch)
+    _assert_rounded_once(sites["attention"], _attention_reference(sites))
+
+
+def test_qwen38_qsa_output_gate_rounds_once(monkeypatch):
+    sites = _qsa_sites(monkeypatch)
+    attention, gate = _gate(sites)
+    _assert_rounded_once(sites["gated"], attention.double() * torch.sigmoid(gate.double()))
+
+
+def test_qwen38_qsa_without_fp32_parity_rounds_like_transformers(monkeypatch):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+    sites = _qsa_sites(monkeypatch, fp32_parity=False)
+    query, key = apply_rotary_pos_emb(
+        sites["normed_query"].transpose(1, 2), sites["normed_key"].transpose(1, 2), sites["cos"], sites["sin"]
+    )
+    torch.testing.assert_close(sites["query"], query.transpose(1, 2), rtol=0, atol=0)
+    torch.testing.assert_close(sites["key"], key.transpose(1, 2), rtol=0, atol=0)
+    with pytest.raises(AssertionError, match="rounded more than once"):
+        _assert_rounded_once(sites["attention"], _attention_reference(sites))
+    attention, gate = _gate(sites)
+    torch.testing.assert_close(sites["gated"], attention * torch.sigmoid(gate), rtol=0, atol=0)
+
+
+class _Branch(torch.nn.Linear):
+    """Stands in for the attention and the MoE: the hyper-connection sites only see its bf16 output."""
+
+    def forward(self, hidden_states, **_kwargs):
+        return super().forward(hidden_states)
+
+
+def _hyper_connection_sites(fp32_parity: bool, dtype=torch.bfloat16, hc_count=4):
+    """Layer 0 and the final mixer of a tiny Qwen3.8-Flash-Next built by the trainer class, with each site recorded."""
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
+    from tests.model.test_qwen4_exp import _tiny_config as _qwen38_tiny_config
+
+    torch.manual_seed(11)
+    config = _qwen38_tiny_config()
+    config.text_config.hc_count = hc_count
+    config.fp32_parity = fp32_parity
+    language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(config))
+    layer = language_model.layers[0]
+    layer.ple = None
+    layer.linear_attn = _Branch(16, 16, bias=False)
+    layer.mlp = _Branch(16, 16, bias=False)
+    with torch.no_grad():
+        for parameter in language_model.parameters():
+            parameter.normal_(std=0.5)
+    language_model.to(dtype)
+
+    sites: dict[str, dict[str, torch.Tensor]] = {"attn": {}, "mlp": {}, "final": {}}
+    for name, hc, branch in (
+        ("attn", layer.attn_hyper_connection, layer.linear_attn),
+        ("mlp", layer.mlp_hyper_connection, layer.mlp),
+        ("final", language_model.hyper_connection_mixer, None),
+    ):
+        site = sites[name]
+        hc.register_forward_pre_hook(lambda _m, args, site=site: site.update(hyper_input=args[0]))
+        hc.hc_norm.register_forward_hook(lambda _m, _a, out, site=site: site.update(normed=out))
+        hc.input_mix_weight_down.register_forward_hook(lambda _m, _a, out, site=site: site.update(down=out))
+        hc.input_mix_weight_up.register_forward_pre_hook(lambda _m, args, site=site: site.update(silu=args[0]))
+        hc.input_mix_weight_up.register_forward_hook(lambda _m, _a, out, site=site: site.update(gate=out))
+        if branch is not None:
+            hc.block_inject_weight.register_forward_hook(lambda _m, _a, out, site=site: site.update(logits=out))
+            branch.register_forward_pre_hook(lambda _m, args, site=site: site.update(mixed=args[0]))
+            branch.register_forward_hook(lambda _m, _a, out, site=site: site.update(branch=out))
+    layer.mlp_hyper_connection.register_forward_pre_hook(lambda _m, args: sites["attn"].update(combined=args[0]))
+    layer.register_forward_hook(lambda _m, _a, out: sites["mlp"].update(combined=out))
+    language_model.hyper_connection_mixer.register_forward_hook(lambda _m, _a, out: sites["final"].update(mixed=out))
+    return layer, language_model.hyper_connection_mixer, sites
+
+
+def _mixed(site: dict[str, torch.Tensor], hc_count=4) -> torch.Tensor:
+    streams = (hc_count, -1)
+    return (
+        torch.sigmoid(site["gate"].double()).unflatten(-1, streams) * site["normed"].double().unflatten(-1, streams)
+    ).mean(-2)
+
+
+def _combined(site: dict[str, torch.Tensor], hc_count=4) -> torch.Tensor:
+    # Cancellation in the residual add can amplify fp32 noise, so use the kernel's fp32 arithmetic here.
+    weights = 2 * torch.sigmoid(site["logits"].float() / hc_count)
+    streams = site["hyper_input"].float().unflatten(-1, (hc_count, -1))
+    return (streams + site["branch"].float().unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
+
+
+def _run_hyper_connections(fp32_parity: bool, autocast: bool = False, dtype=torch.bfloat16, hc_count=4):
+    layer, mixer, sites = _hyper_connection_sites(fp32_parity, dtype, hc_count)
+    hidden = (2 * torch.randn(2, 64, 16 * hc_count)).to(dtype).requires_grad_()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        output = mixer(layer(hidden, position_embeddings=(torch.ones(1), torch.zeros(1))))
+    return layer, hidden, output, sites
+
+
+@pytest.mark.parametrize("hc_count", [3, 4])
+def test_qwen38_hyper_connection_mix_and_injection_round_once(hc_count):
+    """vLLM's hc_gate_mix and hc_combine keep sigmoid, products and sums in fp32 and store bf16 once."""
+    _, _, _, sites = _run_hyper_connections(fp32_parity=True, hc_count=hc_count)
+    for name in ("attn", "mlp", "final"):
+        down = sites[name]["down"].double() / hc_count
+        _assert_rounded_once(sites[name]["silu"], down * torch.sigmoid(down))
+        _assert_rounded_once(sites[name]["mixed"], _mixed(sites[name], hc_count))
+    for name in ("attn", "mlp"):
+        torch.testing.assert_close(
+            sites[name]["combined"], _combined(sites[name], hc_count).to(sites[name]["combined"].dtype), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("dtype,autocast", [(torch.bfloat16, False), (torch.float32, True), (torch.float32, False)])
+@pytest.mark.parametrize("fp32_parity", [False, True])
+def test_qwen38_hyper_connections_preserve_dtypes_and_stock_order(dtype, autocast, fp32_parity):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+
+    layer, hidden, output, sites = _run_hyper_connections(fp32_parity, autocast, dtype)
+    output.float().square().sum().backward()
+    for tensor in (hidden, *layer.parameters()):
+        assert tensor.grad.dtype == tensor.dtype and bool(torch.isfinite(tensor.grad).all())
+    assert output.dtype == sites["mlp"]["combined"].dtype == dtype
+    if not fp32_parity:
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            expected = Qwen4ExpTextDecoderLayer.forward(
+                layer, hidden, position_embeddings=(torch.ones(1), torch.zeros(1))
+            )
+        torch.testing.assert_close(sites["mlp"]["combined"], expected, rtol=0, atol=0)
+        if dtype == torch.bfloat16:
+            with pytest.raises(AssertionError, match="rounded more than once"):
+                _assert_rounded_once(sites["attn"]["mixed"], _mixed(sites["attn"]))
+
+
+def test_qwen38_qsa_fp32_math_survives_autocast():
+    from transformers import set_seed
+
+    from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
+
+    set_seed(13)
+    inputs = [torch.randn(1, 8, heads, 16).bfloat16() for heads in (4, 2, 2)]
+    ids = torch.arange(8, dtype=torch.int32)[None, None].expand(1, 8, 8)
+    grad = torch.randn_like(inputs[0])
+    results = []
+    for enabled in (False, True):
+        leaves = [x.detach().requires_grad_(True) for x in inputs]
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=enabled):
+            output = _SparseGQAAttention.apply(*leaves, ids, 0.25, 4, True)
+        results.append((output, *torch.autograd.grad(output, leaves, grad)))
+    for actual, expected in zip(results[1], results[0]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@dataclasses.dataclass
+class _OneRankDispatchState:
+    permuted_scores: torch.Tensor | None
+    permuted_indices: torch.Tensor
+    num_recv_tokens: int
+    dispatched_scores: torch.Tensor
+    counts: torch.Tensor
+
+
+class _OneRankDispatch:
+    """DeepEP/UCCL dispatch and combine with every expert on this rank; records what each combine receives."""
+
+    def __init__(self):
+        self.received: list[SimpleNamespace] = []
+
+    @staticmethod
+    def dispatch_tokens_async(hidden, indices, scores, num_experts, group, *, score_before_experts):
+        assert not score_before_experts
+        return hidden, indices.masked_fill(scores == 0, -1), scores.float(), num_experts
+
+    @staticmethod
+    def finalize_dispatch_tokens(pending):
+        from arctic_platform.model.implementations.moe.distributed.token_permute import permute_tokens
+
+        hidden, indices, scores, num_experts = pending
+        rows, row_scores, row_tokens, counts = permute_tokens(hidden, indices, scores, num_experts)
+        return rows, counts, _OneRankDispatchState(row_scores, row_tokens, len(hidden), row_scores, counts)
+
+    def combine_tokens(self, rows, state):
+        from arctic_platform.model.implementations.moe.distributed.token_permute import unpermute_tokens
+        from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
+
+        if state.permuted_scores is not None:  # as deepep.combine_tokens and ucclep.combine_tokens
+            rows = apply_routing_weights(rows, state.permuted_scores)
+        self.received.append(SimpleNamespace(rows=rows, scores=state.dispatched_scores, counts=state.counts))
+        return unpermute_tokens(rows, state.permuted_indices, state.num_recv_tokens)
+
+    @staticmethod
+    def sync_combine():
+        pass
+
+    @staticmethod
+    def finalize_dispatch_rows(pending):
+        raise AssertionError("took the SonicMoE path")
+
+
+def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool):
+    from arctic_platform.model.implementations.moe.layers.moe import MoE
+
+    if model == "glm5_next":
+        from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
+            Glm5NextForConditionalGenerationPrimeRL as model_cls,
+        )
+
+        config = _glm_tiny_config()
+    else:
+        from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
+            Qwen4ExpForConditionalGenerationPrimeRL as model_cls,
+        )
+        from tests.model.test_qwen4_exp import _tiny_config as _qwen_tiny_config
+
+        config = _qwen_tiny_config()
+    config.use_grouped_mm = use_grouped_mm
+    config.fp32_routed_weighting = fp32_routed_weighting
+    torch.manual_seed(0)
+    layer = next(module for module in model_cls(config).modules() if isinstance(module, MoE)).to(torch.bfloat16)
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.normal_(std=0.5)
+    return layer
+
+
+@pytest.mark.parametrize("fp32_routed_weighting", [True, False])
+@pytest.mark.parametrize("use_grouped_mm", [True, False])
+@pytest.mark.parametrize("model", ["glm5_next", "qwen4_exp"])
+def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
+    monkeypatch, model, use_grouped_mm, fp32_routed_weighting
+):
+    """The routed rows reaching the expert-parallel combine are ``score * (h @ w2.T)`` rounded once, as vLLM's
+    fused MoE kernel stores them, through the production dispatch path with only the cross-rank exchange replaced."""
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+    from arctic_platform.model.implementations.moe.layers import moe
+
+    layer = _flash_moe(model, fp32_routed_weighting, use_grouped_mm)
+    dispatch = _OneRankDispatch()
+    hidden = []
+    swiglu = moe._apply_swiglu
+
+    def routed_hidden(gate, up, limit):  # the down projection's input; shared experts run after the combine
+        output = swiglu(gate, up, limit)
+        if not dispatch.received:
+            hidden.append(output)
+        return output
+
+    histc = torch.histc
+    monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
+    monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
+    monkeypatch.setattr(moe, "_apply_swiglu", routed_hidden)
+    if fp32_routed_weighting:  # SonicMoE rounds each row before weighting it, so the option must bypass it
+        layer.set_use_sonicmoe(True)
+        monkeypatch.setattr(moe, "sonic_routed_experts_applicable", lambda experts: True)
+
+    output = layer(torch.randn(1, 512, layer.experts.w2.shape[1]).to(torch.bfloat16))
+    (received,) = dispatch.received
+    h, w2 = torch.cat(hidden).double(), layer.experts.w2.detach().double()
+    expert = torch.repeat_interleave(torch.arange(len(received.counts)), received.counts)
+    reference = torch.einsum("ri,rhi->rh", h, w2[expert]) * received.scores.detach().double()[:, None]
+    if fp32_routed_weighting:
+        _assert_rounded_once(received.rows, reference)
+    else:
+        with pytest.raises(AssertionError, match="rounded more than once"):
+            _assert_rounded_once(received.rows, reference)
+    output.float().square().sum().backward()
+    assert layer.router.gate.weight.grad.abs().sum() > 0
+    assert layer.experts.w2.grad.abs().sum() > 0
+
+
+def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
+    from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    torch.manual_seed(0)
+    offsets = torch.tensor([37, 37, 96], dtype=torch.int32)  # the second expert has no rows
+    inputs = [torch.randn(96, 32).bfloat16(), torch.randn(3, 48, 32).bfloat16(), 2.5 * torch.rand(96)]
+    grad = torch.randn(96, 48).bfloat16()
+    gradients = []
+    for weighted_first in (True, False):
+        hidden, weight, scores = (tensor.clone().requires_grad_(True) for tensor in inputs)
+        if weighted_first:
+            output = weighted_down_projection(hidden, weight, offsets, scores)
+        else:
+            output = apply_routing_weights(torch._grouped_mm(hidden, weight.transpose(-2, -1), offs=offsets), scores)
+        gradients.append(torch.autograd.grad(output, (hidden, weight, scores), grad))
+    for actual, expected in zip(*gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_weighted_down_projection_keeps_the_fp32_accumulator_under_autocast():
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    torch.manual_seed(0)
+    offsets = torch.tensor([40, 100], dtype=torch.int32)
+    inputs = (torch.randn(100, 64).bfloat16(), torch.randn(2, 96, 64).bfloat16(), offsets, 2.5 * torch.rand(100))
+    expected = weighted_down_projection(*inputs)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = weighted_down_projection(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_weighted_experts_with_fp32_parameters_under_bf16_autocast():
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    torch.manual_seed(0)
+    experts = GroupedExperts(16, 32, 2, use_grouped_mm=False)
+    experts.fp32_routed_weighting = True
+    experts.init_weights(0.2)
+    hidden, scores = torch.randn(8, 16, requires_grad=True), torch.rand(8, requires_grad=True)
+    counts = torch.tensor([4, 4])
+    results = []
+    for dtype in (torch.float32, torch.bfloat16):
+        experts.to(dtype)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = experts(hidden, counts, scores)
+        grads = torch.autograd.grad(output.float().square().sum(), (hidden, scores, *experts.parameters()))
+        results.append((output, *(grad.float() for grad in grads)))
+    for actual, expected in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

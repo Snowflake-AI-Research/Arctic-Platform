@@ -161,6 +161,7 @@ def test_iter_lora_weights_reshapes_expert_adapters(monkeypatch):
                 group_name=None,
                 allreduce=True,
             ),
+            rank,
         )
         yield (
             "model.layers.0.mlp.experts",
@@ -171,6 +172,7 @@ def test_iter_lora_weights_reshapes_expert_adapters(monkeypatch):
                 group_name=None,
                 allreduce=True,
             ),
+            rank,
         )
 
     monkeypatch.setattr(
@@ -196,6 +198,7 @@ def test_iter_lora_weights_reshapes_expert_adapters(monkeypatch):
 
 
 def test_gather_peft_adapter_state_dict_uses_expert_layout(monkeypatch):
+    # Rank 2, one expert per EP rank: A rows are (expert, r), B columns are (r, expert) with the expert fastest.
     a_shards = [torch.ones(2, 3), torch.full((2, 3), 2)]
     b_shards = [torch.ones(4, 2), torch.full((4, 2), 2)]
     model = _Model(
@@ -208,7 +211,8 @@ def test_gather_peft_adapter_state_dict_uses_expert_layout(monkeypatch):
                 "model.layers.0.mlp.experts.lora_B.default.weight",
                 SimpleNamespace(data=b_shards[0], group_name="ep_size_2", allreduce=False),
             ),
-        ]
+        ],
+        peft_config={"default": SimpleNamespace(r=2)},
     )
 
     group = object()
@@ -235,8 +239,74 @@ def test_gather_peft_adapter_state_dict_uses_expert_layout(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
     state = gather_peft_adapter_state_dict(model, rank=0, is_zero3=False)
 
-    assert state["model.layers.0.mlp.experts.lora_A.default.weight"].shape == (4, 3)
-    assert state["model.layers.0.mlp.experts.lora_B.default.weight"].shape == (4, 4)
+    torch.testing.assert_close(
+        state["model.layers.0.mlp.experts.lora_A.default.weight"], torch.tensor([[1.0] * 3] * 2 + [[2.0] * 3] * 2)
+    )
+    torch.testing.assert_close(
+        state["model.layers.0.mlp.experts.lora_B.default.weight"], torch.tensor([[1.0, 2.0, 1.0, 2.0]] * 4)
+    )
+
+
+def test_gather_peft_adapter_state_dict_uses_each_adapters_rank(monkeypatch):
+    # Two adapters, one expert per EP rank. Each lora_B view uses that adapter's r, so the ranks interleave
+    # separately: r=2 stays [1, 2, 1, 2], r=4 interleaves four columns per expert.
+    a_default = [torch.ones(2, 3), torch.full((2, 3), 2.0)]
+    b_default = [torch.ones(4, 2), torch.full((4, 2), 2.0)]
+    a_other = [torch.ones(4, 3), torch.full((4, 3), 3.0)]
+    b_other = [torch.ones(4, 4), torch.full((4, 4), 3.0)]
+    model = _Model(
+        [
+            (
+                "model.layers.0.mlp.experts.lora_A.default.weight",
+                SimpleNamespace(data=a_default[0], group_name="ep_size_2", allreduce=False),
+            ),
+            (
+                "model.layers.0.mlp.experts.lora_B.default.weight",
+                SimpleNamespace(data=b_default[0], group_name="ep_size_2", allreduce=False),
+            ),
+            (
+                "model.layers.0.mlp.experts.lora_A.other.weight",
+                SimpleNamespace(data=a_other[0], group_name="ep_size_2", allreduce=False),
+            ),
+            (
+                "model.layers.0.mlp.experts.lora_B.other.weight",
+                SimpleNamespace(data=b_other[0], group_name="ep_size_2", allreduce=False),
+            ),
+        ],
+        peft_config={"default": SimpleNamespace(r=2), "other": SimpleNamespace(r=4)},
+    )
+
+    group = object()
+    groups_module = ModuleType("deepspeed.utils.groups")
+    groups_module._get_expert_parallel_group = lambda _name: group
+    utils_module = ModuleType("deepspeed.utils")
+    utils_module.__path__ = []
+    utils_module.groups = groups_module
+    deepspeed_module = ModuleType("deepspeed")
+    deepspeed_module.__path__ = []
+    deepspeed_module.utils = utils_module
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
+    monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
+    monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    shard_sets = iter((a_default, b_default, a_other, b_other))
+
+    def all_gather(outputs, local, group=None):
+        expected = next(shard_sets)
+        for output, shard in zip(outputs, expected, strict=True):
+            output.copy_(shard)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    state = gather_peft_adapter_state_dict(model, rank=0, is_zero3=False)
+
+    torch.testing.assert_close(
+        state["model.layers.0.mlp.experts.lora_B.default.weight"], torch.tensor([[1.0, 2.0, 1.0, 2.0]] * 4)
+    )
+    torch.testing.assert_close(
+        state["model.layers.0.mlp.experts.lora_B.other.weight"],
+        torch.tensor([[1.0, 3.0, 1.0, 3.0, 1.0, 3.0, 1.0, 3.0]] * 4),
+    )
 
 
 class _Base:
@@ -263,24 +333,112 @@ class _PeftModel(_Model):
     def get_base_model(self):
         return self.base
 
-    def save_pretrained(self, path, state_dict=None, **_kwargs):
-        Path(path).mkdir(parents=True, exist_ok=True)
-        (Path(path) / "adapter_config.json").write_text("{}")
-        if state_dict:
-            (Path(path) / "adapter_model.safetensors").write_bytes(b"adapter")
 
-
-def test_hf_and_adapter_checkpoint_contract(tmp_path):
+def test_hf_checkpoint_contract(tmp_path):
     base = _Base()
     model = _PeftModel(base)
 
     save_hf_pretrained(model, str(tmp_path))
-    save_peft_adapters(model, str(tmp_path))
 
     assert set(base.saved_state) == {"proj.weight"}
-    adapter = tmp_path / PEFT_ADAPTER_DIRNAME
-    assert (adapter / "adapter_config.json").is_file()
-    assert (adapter / "adapter_model.safetensors").is_file()
+
+
+class _AttentionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(8, 8, bias=False)
+
+    def forward(self, hidden):
+        return hidden + self.q_proj(hidden)
+
+
+class _Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(_AttentionBlock() for _ in range(2))
+
+    def forward(self, hidden):
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return hidden
+
+
+def test_peft_adapter_checkpoint_strips_activation_checkpoint_wrappers(tmp_path):
+    from peft import LoraConfig
+    from peft import PeftModel
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    torch.manual_seed(0)
+    base = _Decoder()
+    reference = _Decoder()
+    reference.load_state_dict(base.state_dict())
+    model = get_peft_model(base, LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj"]))
+    for name, parameter in model.named_parameters():
+        if "lora_B" in name:
+            nn.init.normal_(parameter)
+    # Activation checkpointing wraps the blocks after PEFT, as the gradient-checkpointing patch does.
+    layers = model.base_model.model.layers
+    for index in range(len(layers)):
+        layers[index] = checkpoint_wrapper(layers[index])
+    assert any("_checkpoint_wrapped_module" in name for name, _ in model.named_parameters())
+
+    save_peft_adapters(model, str(tmp_path))
+
+    adapter_dir = tmp_path / PEFT_ADAPTER_DIRNAME
+    saved = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert set(saved) == {
+        f"base_model.model.layers.{index}.q_proj.lora_{kind}.weight" for index in range(2) for kind in "AB"
+    }
+    trained = {name.replace("._checkpoint_wrapped_module", ""): p for name, p in model.named_parameters()}
+    for key, tensor in saved.items():
+        torch.testing.assert_close(tensor, trained[key.replace(".weight", ".default.weight")], rtol=0, atol=0)
+
+    hidden = torch.randn(3, 8)
+    reloaded = PeftModel.from_pretrained(reference, str(adapter_dir))
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(hidden), model(hidden))
+
+
+def test_save_peft_adapters_writes_peft_names_under_activation_checkpointing(tmp_path):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from transformers import LlamaConfig
+    from transformers import LlamaForCausalLM
+
+    def pack(wrap):
+        torch.manual_seed(0)
+        config = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=128,
+        )
+        targets = ["q_proj", "o_proj", "embed_tokens"]
+        lora = LoraConfig(r=8, lora_alpha=8, target_modules=targets, init_lora_weights=False)
+        model = get_peft_model(LlamaForCausalLM(config), lora)
+        if wrap:
+            layers = model.base_model.model.model.layers
+            for index, layer in enumerate(layers):
+                layers[index] = checkpoint_wrapper(layer)
+        save_peft_adapters(model, str(tmp_path / f"wrap_{wrap}"))
+        return model, load_file(tmp_path / f"wrap_{wrap}" / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors")
+
+    plain_model, plain = pack(wrap=False)
+    _, wrapped = pack(wrap=True)
+
+    expected = get_peft_model_state_dict(plain_model, save_embedding_layers=False)
+    assert len(plain) == 10
+    assert plain.keys() == expected.keys()
+    assert all(torch.equal(plain[name], expected[name]) for name in expected)
+    assert wrapped.keys() == plain.keys()
+    assert all(torch.equal(wrapped[name], plain[name]) for name in plain)
 
 
 def test_iter_lora_weights_rejects_non_lora_trainables():

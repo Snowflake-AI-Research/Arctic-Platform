@@ -8,12 +8,21 @@ import torch
 import torch.nn as nn
 
 
-def named_weight_sync_tensors(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield parameters, expert biases and module-declared persistent buffers."""
+def named_weight_sync_tensors(
+    model: nn.Module, *, include_export_buffers: bool = True
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield parameters, expert biases and module-declared persistent buffers.
+
+    Weight sync passes ``include_export_buffers=False``: declared buffers are constant
+    checkpoint state the sampler loads with the model, and the receiver only accepts
+    parameter destinations.
+    """
     yield from model.named_parameters()
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
+            continue
+        if not include_export_buffers:
             continue
         module_name, _, buffer_name = name.rpartition(".")
         owning_module = model.get_submodule(module_name)
@@ -179,6 +188,8 @@ def build_iter_full_vllm_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
     is_vlm = bool(getattr(model, "_is_vlm", False))
     layer_prefix_pattern = (
         "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
@@ -209,7 +220,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
     def _iter():
         is_master = dist.get_rank() == 0
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
             by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
         ordered_layers: list[int] = []
@@ -233,6 +244,8 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
+                    else:
+                        wait_for_export_collective(local)
                 elif is_master:
                     layer_sd[name] = tensor.data
 

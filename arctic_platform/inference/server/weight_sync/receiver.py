@@ -322,6 +322,31 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
     return added, activated
 
 
+def _refresh_cached_weight_copies(model) -> int:
+    """Rebuild the weight copies vLLM GLM-5.3 caches on its first forward from the synced parameters.
+
+    ``Glm5NextLinearAttention._forward`` (vLLM 0.31/0.32 ``glm5next/common/kda.py``) concatenates
+    the three conv weights once and reuses that copy, so a sync never reaches the convolution; the
+    sparse indexer (``glm5next/common/attention.py``) keeps an fp32 transpose of its head-gate rows.
+    Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
+    Returns how many caches were refreshed; a GLM-5.3 sampler reporting 0 after its first forward means
+    vLLM renamed them and the refresh no longer applies.
+    """
+    refreshed = 0
+    with torch.inference_mode():
+        for module in model.modules():
+            merged = getattr(module, "_merged_conv_weight", None)
+            if merged is not None:
+                convs = (module.q_conv1d, module.k_conv1d, module.v_conv1d)
+                merged.copy_(torch.cat([c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs]))
+                refreshed += 1
+            head_gate = getattr(module, "_wp_fp32", None)
+            if head_gate is not None:
+                head_gate.copy_(module.wk_weights_proj.weight[module.head_dim :].t())
+                refreshed += 1
+    return refreshed
+
+
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
 
@@ -499,8 +524,10 @@ class WeightSyncExtension:
                 _,
                 skipped_source_names,
             ) = self._load_batched(model, engine)
+        refreshed = _refresh_cached_weight_copies(model)
 
         result = self._build_result(start, mem_before, path, loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
         if recv_l2_sq is not None:
             result["recv_l2_sq"] = recv_l2_sq
         if applied_source_l2_sq is not None:
@@ -530,6 +557,7 @@ class WeightSyncExtension:
                     f"{tuple(tensor.shape)} and dtype {tensor.dtype}"
                 ) from exc
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if updater.pending:
             logger.warning(
                 "FP8 updater has %d incomplete modules", updater.pending,
@@ -591,6 +619,7 @@ class WeightSyncExtension:
             else:
                 orphans.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
 
         if orphans:
             sample = "\n".join(f"  - {n}" for n in orphans[:10])
@@ -668,6 +697,7 @@ class WeightSyncExtension:
             else:
                 skipped_source_names.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
@@ -803,6 +833,7 @@ class WeightSyncExtension:
                 source_to_destinations,
                 skipped_source_names,
             ) = self._load_batched(model, engine)
+        refreshed = _refresh_cached_weight_copies(model)
 
         if (
             loaded_destination_validation_applicable
@@ -843,6 +874,7 @@ class WeightSyncExtension:
         )
 
         result = self._build_result(start, mem_before, path, loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
         result["weight_format"] = weight_format
         result["model_l2_sq_before"] = model_l2_sq_before
         result["model_l2_sq_after"] = model_l2_sq_after
@@ -1048,8 +1080,11 @@ class WeightSyncExtension:
         all_weights = [(n, t.cpu()) for n, t in engine.receive_weights()]
         loaded = len(all_weights)
         spec_model.load_weights(all_weights)
+        refreshed = _refresh_cached_weight_copies(spec_model)
 
-        return self._build_result(start, mem_before, "batched", loaded)
+        result = self._build_result(start, mem_before, "batched", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
+        return result
 
     # ------------------------------------------------------------------
     # Colocated CUDA IPC / shared-file load, and the sampler weight norm
@@ -1149,8 +1184,10 @@ class WeightSyncExtension:
                 "This usually indicates a GPU UUID / placement mismatch between sender and receiver."
             )
 
+        refreshed = _refresh_cached_weight_copies(model)
         torch.cuda.synchronize()
         result = self._build_result(start, mem_before, "cuda_ipc", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
         result["recv_l2_sq"] = recv_l2_sq.item()
         return result
 
@@ -1192,8 +1229,11 @@ class WeightSyncExtension:
                 f"CUDA IPC streaming sync: {len(missing)} param(s) had no IPC handle for GPU "
                 f"{physical_gpu_id} (e.g. {missing[:5]})."
             )
+        result = {}
         if validate_names is not None:
             self._validate_weight_sync_names(model, validate_names, context="cuda_ipc_stream")
+            # The caller passes validate_names with the last chunk only.
+            result["cached_weight_copies_refreshed"] = _refresh_cached_weight_copies(model)
 
         torch.cuda.synchronize()
         return {
@@ -1201,6 +1241,7 @@ class WeightSyncExtension:
             "names": names,
             "elapsed_s": time.time() - start,
             "recv_l2_sq": recv_l2_sq.item(),
+            **result,
         }
 
     def load_weights_from_shm_path(self, path: str) -> dict:
@@ -1225,8 +1266,10 @@ class WeightSyncExtension:
             model.load_weights([(name, tensor)])
             loaded += 1
 
+        refreshed = _refresh_cached_weight_copies(model)
         torch.cuda.synchronize()
         result = self._build_result(start, mem_before, "cpu_to_gpu", loaded)
+        result["cached_weight_copies_refreshed"] = refreshed
         result["recv_l2_sq"] = recv_l2_sq.item()
         return result
 

@@ -88,7 +88,7 @@ def manager_methods(monkeypatch):
         ("xgrammar_stop_mask", "ensure_xgrammar_stop_mask_fix"),
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
-        ("dflash2_nan_fix", "apply_dflash2_nan_fixes"),
+        ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
         ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
