@@ -55,24 +55,28 @@ def _inner_layer(layer: nn.Module) -> nn.Module:
     return getattr(layer, "_checkpoint_wrapped_module", layer)
 
 
+def _slot(module: nn.Module, name: str) -> tuple[nn.Module, str]:
+    """Where an expert stack ``name`` lives right now: the experts' own parameter, or the ``original`` of its PEFT
+    parametrization (PEFT's ParamWrapper registers one around each call on a BF16 base, so look it up per call)."""
+    parametrizations = getattr(module, "parametrizations", None)
+    if parametrizations is not None and name in parametrizations:
+        return parametrizations[name], "original"
+    return module, name
+
+
 def _expert_code_params(layer: nn.Module):
-    """``(owner, name, param)`` of every frozen routed-expert code stack in ``layer``: the experts' own parameter, or
-    the ``original`` of its PEFT parametrization."""
+    """``(experts module, name, param)`` of every frozen routed-expert code stack in ``layer``."""
     from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
     for module in layer.modules():
         if not isinstance(module, GroupedExperts):
             continue
-        parametrizations = getattr(module, "parametrizations", None)
         for name in _NAMES:
-            if parametrizations is not None and name in parametrizations:
-                owner, key = parametrizations[name], "original"
-            else:
-                owner, key = module, name
+            owner, key = _slot(module, name)
             param = owner._parameters.get(key)
             if param is None or param.requires_grad or param.numel() == 0:
                 continue
-            yield owner, key, param
+            yield module, name, param
 
 
 class FrozenExpertOffload:
@@ -80,7 +84,7 @@ class FrozenExpertOffload:
 
     def __init__(self, layers: list[nn.Module]) -> None:
         self.layers = layers
-        # Per layer: [(owner, name, param, shape, dtype, offset in the layer's bytes, nbytes)], its host offset, size.
+        # Per layer: [(experts module, name, param, shape, dtype, offset in the layer's bytes, nbytes)], host offset, size.
         self.entries: list[list[tuple]] = []
         self.host_offsets: list[int] = []
         self.layer_bytes: list[int] = []
@@ -108,9 +112,9 @@ class FrozenExpertOffload:
         total = 0
         for layer in self.layers:
             entries, offset = [], 0
-            for owner, name, param in _expert_code_params(layer):
+            for module, name, param in _expert_code_params(layer):
                 nbytes = param.numel() * param.element_size()
-                entries.append((owner, name, param, param.shape, param.dtype, offset, nbytes))
+                entries.append((module, name, param, param.shape, param.dtype, offset, nbytes))
                 offset = _align(offset + nbytes)
             self.entries.append(entries)
             self.host_offsets.append(total)
@@ -126,6 +130,9 @@ class FrozenExpertOffload:
             if int(err) != 0:
                 raise RuntimeError(f"cudaHostRegister of {total / 2**30:.1f} GiB of expert codes failed: {err}")
             self.registered = True
+            # Unregister before the buffer's memory goes back to the host allocator, or a later registration (or
+            # pinning) of reused memory fails with cudaErrorAlreadyMapped.
+            weakref.finalize(raw, torch.cuda.cudart().cudaHostUnregister, host.data_ptr())
         self.host = host
         for i, entries in enumerate(self.entries):
             base = self.host_offsets[i]
@@ -191,13 +198,14 @@ class FrozenExpertOffload:
             torch.cuda.current_stream().wait_event(event)
         buffer = self.buffers[b]
         refs = self.holders[b][1] if self.holders[b][0] == i else []
-        for owner, name, param, shape, dtype, start, nbytes in self.entries[i]:
+        for module, name, param, shape, dtype, start, nbytes in self.entries[i]:
             temporary = nn.Parameter(buffer[start : start + nbytes].view(dtype).view(shape), requires_grad=False)
             for attr in ("allreduce", "_dss_keep_fp32", "ds_shape"):
                 if hasattr(param, attr):
                     setattr(temporary, attr, getattr(param, attr))
             temporary._ap_transient = True
-            owner._parameters[name] = temporary
+            owner, key = _slot(module, name)
+            owner._parameters[key] = temporary
             refs = [*refs, weakref.ref(temporary)]
         self.holders[b] = (i, refs)
         self.installed.add(i)
@@ -211,8 +219,9 @@ class FrozenExpertOffload:
     def after(self, i: int) -> None:
         if i not in self.installed:
             return
-        for owner, name, param, *_ in self.entries[i]:
-            owner._parameters[name] = param
+        for module, name, param, *_ in self.entries[i]:
+            owner, key = _slot(module, name)
+            owner._parameters[key] = param
         self.installed.discard(i)
 
     def host_bytes(self) -> int:
@@ -231,23 +240,46 @@ def experts_recomputed(layer: nn.Module) -> bool:
     return bool({"_run_routed_experts", "_run_local_routed_experts"} & set(patched))
 
 
+def _expert_call_sites(layer: nn.Module):
+    """The modules the MoE calls for its routed experts: ``<moe>.experts`` as installed, which is PEFT's outermost
+    ParamWrapper when expert LoRA wraps the experts, else the experts themselves."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    seen = set()
+    for module in layer.modules():
+        site = getattr(module, "experts", None)
+        if not isinstance(site, nn.Module) or id(site) in seen:
+            continue
+        base = site
+        while hasattr(base, "base_layer"):
+            base = base.base_layer
+        if isinstance(base, GroupedExperts):
+            seen.add(id(site))
+            yield site
+
+
 def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
     """Offload the frozen routed-expert codes of every decoder layer whose experts are recomputed; copied in per call.
 
-    The hooks sit on the experts module, so they run for every call of the experts (each dispatch chunk, the forward
-    and the recompute, a selective recompute of the experts alone included). Layers whose experts are not recomputed
-    (``ac_config.layers`` leaves them out) keep their codes on the GPU: their saved tensors hold them until backward.
+    The hooks sit on the module the MoE calls for its experts (PEFT's outermost wrapper with expert LoRA: the copy is
+    installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
+    each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. Layers
+    whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their saved
+    tensors hold them until backward.
     """
-    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
-
-    managed = []
+    managed, sites = [], []
     for layer in layers:
         if not experts_recomputed(layer):
             continue
-        managed += [m for m in _inner_layer(layer).modules() if isinstance(m, GroupedExperts)]
+        inner = _inner_layer(layer)
+        layer_sites = list(_expert_call_sites(inner))
+        if layer_sites:
+            managed.append(inner)
+            sites.append(layer_sites)
     offload = FrozenExpertOffload(managed)
-    for i, experts in enumerate(managed):
-        experts.register_forward_pre_hook(lambda module, args, i=i: offload.before(i))
-        experts.register_forward_hook(lambda module, args, output, i=i: offload.after(i))
-        experts._ap_frozen_expert_offload = offload
+    for i, layer_sites in enumerate(sites):
+        for site in layer_sites:
+            site.register_forward_pre_hook(lambda module, args, i=i: offload.before(i))
+            site.register_forward_hook(lambda module, args, output, i=i: offload.after(i))
+            site._ap_frozen_expert_offload = offload
     return offload

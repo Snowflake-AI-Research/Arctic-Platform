@@ -174,3 +174,66 @@ def test_layers_not_recomputed_keep_their_codes_on_the_gpu():
         assert torch.equal(got, want) and torch.equal(xo.grad, xr.grad)
     assert offloaded[LAYERS - 1].experts.w1.numel() > 0
     assert offloaded[0]._checkpoint_wrapped_module.experts.w1.numel() == 0
+
+
+class _Bf16Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = GroupedExperts(DIM, HIDDEN, EXPERTS, use_grouped_mm=True)
+
+    def forward(self, x):
+        counts = torch.tensor(COUNTS, dtype=torch.int32, device=x.device)
+        return x + self.experts(x, counts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_offload_under_peft_fused_expert_lora():
+    """A BF16 base with expert LoRA: PEFT's ParamWrapper registers W + BA over the weights around each call, so the
+    copy must be in place before the wrapper runs."""
+    from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+    from arctic_platform.model.patches.peft import apply_peft
+
+    def build():
+        torch.manual_seed(1)
+        blocks = nn.ModuleList([_Bf16Block() for _ in range(LAYERS)])
+        with torch.no_grad():
+            for p in blocks.parameters():
+                p.normal_(0, 0.05)
+        blocks = blocks.cuda().bfloat16()
+        peft = {
+            "peft_type": "LORA",
+            "r": 4,
+            "lora_alpha": 4,
+            "target_parameters": ["experts.w1", "experts.w2", "experts.w3"],
+        }
+        wrapped = apply_peft(nn.Sequential(*blocks), peft)
+        with torch.no_grad():
+            for name, p in wrapped.named_parameters():
+                if ".lora_B" in name:
+                    p.normal_(0, 0.05)
+        layers = wrapped.base_model.model
+        for i in range(LAYERS):
+            layers[i] = checkpoint_wrapper(layers[i], early_stop=False)
+        return wrapped, layers
+
+    reference, ref_layers = build()
+    offloaded, off_layers = build()
+    offload = install_frozen_expert_offload(nn.ModuleList(list(off_layers)))
+    assert len(offload.layers) == LAYERS
+    x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        outs = []
+        for model in (reference, offloaded):
+            model.zero_grad(set_to_none=True)
+            xi = x.clone().requires_grad_(True)
+            out = model(xi)
+            out.float().square().sum().backward()
+            outs.append((out, xi.grad, {n: p.grad for n, p in model.named_parameters() if ".lora_" in n}))
+        assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+        assert outs[0][2].keys() == outs[1][2].keys() and all(
+            torch.equal(outs[0][2][k], outs[1][2][k]) for k in outs[0][2]
+        )
+    base = off_layers[0]._checkpoint_wrapped_module.experts
+    while hasattr(base, "base_layer"):
+        base = base.base_layer
+    assert base.w1.numel() == 0, "codes live on the host between calls"
