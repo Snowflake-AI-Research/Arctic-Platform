@@ -180,7 +180,8 @@ class _CortexClientShim:
                 "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
                 "See docs/cortex-integration.md#supported-recipes."
             )
-        result = await self._client.fwd_no_grad(to_cortex_fwd_payload(batch))
+        payload = to_cortex_fwd_payload(batch)
+        result = await self._client.fwd_no_grad(payload)
         logprobs = result.get("logprobs") if isinstance(result, dict) else None
         if logprobs is None and isinstance(result, dict):
             body = result.get("batch")
@@ -191,12 +192,16 @@ class _CortexClientShim:
                 "cortex forward returned no logprobs; "
                 f"got keys={list(result) if isinstance(result, dict) else type(result).__name__}"
             )
-        # Non-ZoRRo requests were left-aligned on the way out. SkyRL's rows are
-        # left-padded, so the response has to come back on those columns.
+        # Restore only when the sent mask differs from the caller's. ZoRRo and an
+        # already left-aligned row keep the caller layout, including a flat batch
+        # whose meta lives under context.
         body = batch.get("batch") if isinstance(batch, dict) and isinstance(batch.get("batch"), dict) else batch
-        meta = batch.get("meta") if isinstance(batch, dict) and isinstance(batch.get("meta"), dict) else {}
-        if isinstance(body, dict) and not meta.get("zorro_train_enable"):
-            logprobs = restore_left_aligned_logprobs(logprobs, body.get("attention_mask"))
+        sent_mask = payload["kwargs"].get("attention_mask") if isinstance(payload, dict) else None
+        caller_mask = body.get("attention_mask") if isinstance(body, dict) else None
+        import torch
+
+        if torch.is_tensor(sent_mask) and torch.is_tensor(caller_mask) and not torch.equal(sent_mask, caller_mask):
+            logprobs = restore_left_aligned_logprobs(logprobs, caller_mask)
         # SkyRL reads logprobs and log_probs at different call sites.
         return {"batch": {"logprobs": logprobs, "log_probs": logprobs}}
 

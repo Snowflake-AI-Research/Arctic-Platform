@@ -21,12 +21,17 @@ use the training `forward` operation. There is no reference forward, no
 disk-shared weight reload, and no colocation lifecycle. That constrains what
 runs correctly here:
 
-* **`fwd_no_grad` returns the server logprobs in the caller's layout.**
-  Non-ZoRRo rows are left-aligned on the way out, because the packer rejects
-  leading padding, and the response is scattered back onto the caller's
-  left-padded columns. Padding comes back as `0`. ZoRRo rows stay in the
-  client layout. The logprobs come back under `batch["logprobs"]` and
-  `batch["log_probs"]`.
+* **`fwd_no_grad` returns the server logprobs in the caller's columns.**
+  A non-ZoRRo response is full width `[B, S]`, and column `t` is the log
+  probability of token `t + 1`, the same predict-next frame as the on-prem
+  forward. SkyRL shifts that onto the token itself. Rows are left-aligned on
+  the way out, because the packer rejects leading padding, and the response
+  is scattered back onto the caller's columns. Padding comes back as `0`.
+  The last real column is the roll-wrap value, and the loss mask there is 0.
+  A ZoRRo response stays in the client layout and scores each response token
+  itself, with `0` on the prompt columns. The logprobs come back under
+  `batch["logprobs"]` and `batch["log_probs"]`. A width other than the
+  caller's `attention_mask` raises.
 * **Log-prob calls keep arrival order.** `to_cortex_fwd_payload` stamps
   `balance_batch` false and does not send `prompt_group_ids`.
 * **Non-ZoRRo clipping stays inert.** That training request drops
