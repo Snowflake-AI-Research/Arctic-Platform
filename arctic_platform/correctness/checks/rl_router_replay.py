@@ -29,10 +29,18 @@ zone then runs one RL fwd-bwd over those same rows, replaying the sampler's rout
 Three equalities are checked, all exact: the routing generate returned equals the routing the trainer
 received for that sample; the ``routed_experts`` a model call carries equals the sample's routing at every
 captured position of the tokens it packs; and every router invocation replayed and used exactly its layer's
-slice of that tensor. Under ``ac_config`` mode ``full`` with ``freq`` 1 every layer is recomputed, so each
-call must show a recompute invocation for every layer as well as a forward one. A router that computed its
-own routing, a sample whose routing reached no model call, and a router invocation outside any traced call
-are failures.
+slice of that tensor. Under sequence parallelism a rank receives only the ``[start, end)`` window of the capture
+spanned by the positions its own calls carry for that sample, clipped to ``capture_len``, so that window is what
+its received routing is compared with. The capture is as wide as the decoder; a dense layer has no router, so the
+layers that must show invocations are those whose router ran in some traced call. Under ``ac_config`` mode
+``full`` with ``freq`` 1 every layer is recomputed, so each call must show a recompute invocation for every such
+layer as well as a forward one. A router that computed its own routing, a sample whose routing reached no model
+call, no router invocation in any call, and a router invocation outside any traced call are failures.
+
+Under sequence parallelism dispatch right-pads a packed call so it divides across the ranks, and a rank whose window
+holds only that padding holds no token of any sample. Its call carries no ``routed_experts`` and its routers route by
+the gate, so the call is not compared and its tokens count as unattributed; a call holding a sample's tokens without
+``routed_experts`` is a failure.
 
 The last token of a sequence produces no routing in the sampler: ``capture_len`` is one less than the row
 length, and the trainer's value at that position is not compared.
@@ -238,6 +246,11 @@ def _attribute(
     return matches[0] if len(matches) == 1 else None
 
 
+def _holds_sample(tokens: Sequence[int], positions: Sequence[int], samples: Sequence[dict]) -> bool:
+    """Whether a span of a packed call belongs to a sample; a window of sequence-parallel padding alone holds none."""
+    return any(_attribute(tokens, positions, start, end, samples) is not None for start, end in _segments(positions))
+
+
 def judge(
     samples: Sequence[dict], traces: Sequence[Optional[dict]], *, full_recompute: bool
 ) -> Tuple[List[Mismatch], Dict[str, float]]:
@@ -246,6 +259,19 @@ def judge(
     layers = len(samples[0]["routing"][0]) if samples and samples[0]["routing"] else 0
     received_by: Dict[int, int] = {}
     covered_positions = [0] * len(samples)
+    router_layers = sorted(
+        {
+            invocation["layer"]
+            for trace in traces
+            if trace is not None
+            for call in trace.get("calls") or []
+            if not call.get("padding")
+            for invocation in call.get("router") or []
+            if invocation.get("layer") is not None
+        }
+    )
+    if samples and not router_layers:
+        failed.append(Mismatch("no MoE router invocation in any traced call", 1.0, 0.0))
     counts = {
         "calls": 0,
         "padding_calls": 0,
@@ -259,26 +285,7 @@ def judge(
         if trace is None:
             continue
         rank = trace.get("rank")
-        for replay_id, routing in (trace.get("received") or {}).items():
-            index = by_replay_id.get(replay_id)
-            if index is None:
-                failed.append(
-                    Mismatch(
-                        f"rank {rank}: received routing for unknown id {replay_id}",
-                        1.0,
-                        0.0,
-                    )
-                )
-                continue
-            received_by[index] = received_by.get(index, 0) + 1
-            if routing != samples[index]["routing"]:
-                failed.append(
-                    Mismatch(
-                        f"rank {rank}: sample {index} routing received differs from generate",
-                        1.0,
-                        0.0,
-                    )
-                )
+        windows: Dict[int, Tuple[int, int]] = {}
         for entry in trace.get("unattributed_router_calls") or []:
             failed.append(
                 Mismatch(
@@ -294,15 +301,20 @@ def judge(
                 continue
             label = f"rank {rank} call {call_index}"
             routed = call.get("routed_experts")
-            if routed is None:
-                failed.append(Mismatch(f"{label}: no routed_experts handed to the model", 1.0, 0.0))
-                continue
             tokens, positions = call["input_ids"], call["position_ids"]
+            if routed is None:
+                if _holds_sample(tokens, positions, samples):
+                    failed.append(Mismatch(f"{label}: no routed_experts handed to the model", 1.0, 0.0))
+                else:
+                    counts["unattributed_tokens"] += len(positions)
+                continue
             for start, end in _segments(positions):
                 index = _attribute(tokens, positions, start, end, samples)
                 if index is None:
                     counts["unattributed_tokens"] += end - start
                     continue
+                low, high = windows.get(index, (positions[start], positions[end - 1] + 1))
+                windows[index] = (min(low, positions[start]), max(high, positions[end - 1] + 1))
                 capture = samples[index]["routing"]
                 differing = 0
                 for t in range(start, end):
@@ -352,7 +364,7 @@ def judge(
                     )
             for phase, required in (("forward", True), ("recompute", full_recompute)):
                 if required:
-                    for layer in sorted(set(range(layers)) - seen[phase]):
+                    for layer in sorted(set(router_layers) - seen[phase]):
                         failed.append(
                             Mismatch(
                                 f"{label}: layer {layer} has no {phase} router invocation",
@@ -360,6 +372,28 @@ def judge(
                                 0.0,
                             )
                         )
+        for replay_id, routing in (trace.get("received") or {}).items():
+            index = by_replay_id.get(replay_id)
+            if index is None:
+                failed.append(
+                    Mismatch(
+                        f"rank {rank}: received routing for unknown id {replay_id}",
+                        1.0,
+                        0.0,
+                    )
+                )
+                continue
+            received_by[index] = received_by.get(index, 0) + 1
+            capture = samples[index]["routing"]
+            low, high = windows.get(index, (0, 0))
+            if routing != capture[low : min(high, len(capture))]:
+                failed.append(
+                    Mismatch(
+                        f"rank {rank}: sample {index} routing received differs from generate",
+                        1.0,
+                        0.0,
+                    )
+                )
 
     for index, sample in enumerate(samples):
         if index not in received_by:

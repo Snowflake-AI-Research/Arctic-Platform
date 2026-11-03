@@ -565,9 +565,14 @@ CAPTURE_ENV = "ARCTIC_CORRECTNESS_PARTICIPATION_CAPTURE"
 GATEWAY_MODULE = "arctic_platform.debug.training"
 
 
+def participation_capture_enabled() -> bool:
+    """Whether this process is the correctness gateway, which captures participation for every training job."""
+    return os.environ.get(CAPTURE_ENV) == "1"
+
+
 @contextmanager
 def maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
-    if os.environ.get(CAPTURE_ENV) != "1":
+    if not participation_capture_enabled():
         yield
         return
     selected = participation_coordinator_class(training)
@@ -616,29 +621,14 @@ def participation_worker_class(worker_base):
     return ParticipationWorker
 
 
-def participation_coordinator_class(training):
-    import ray
+def participation_step_class(coordinator_base):
+    """Attach the merged step-1 participation inventory to the step response of ``coordinator_base``.
 
-    # The correctness gateway is optional; ordinary model imports must not load its service stack.
-    native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
-    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
-    ParticipationWorker = participation_worker_class(training._DeepSpeedWorker)
-    coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
+    Worker creation stays with ``coordinator_base``, so a coordinator that binds its own worker subclass (the LoRA
+    adapter coordinators) captures participation by binding ``participation_worker_class`` over that subclass.
+    """
 
-    class ParticipationCoordinator(coordinator_base):
-        async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
-            from dss.ray_dss.jobs.gpu import training as native_training
-
-            native_spawn = super()._spawn_workers
-            namespace, original_worker = native_lora._spawn_worker_binding(native_spawn, native_training, sources)
-            namespace["_DeepSpeedWorker"] = ParticipationWorker
-            try:
-                await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
-                if namespace.get("_DeepSpeedWorker") is not ParticipationWorker:
-                    raise ValueError("participation worker binding changed during creation")
-            finally:
-                namespace["_DeepSpeedWorker"] = original_worker
-
+    class ParticipationStepCoordinator(coordinator_base):
         async def step(self, learning_rate=None):
             response = await super().step(learning_rate)
             global_steps = response.get("global_steps")
@@ -654,6 +644,32 @@ def participation_coordinator_class(training):
                 receipts, job_id=self._info.job_id, world_size=len(self._workers)
             )
             return response
+
+    return ParticipationStepCoordinator
+
+
+def participation_coordinator_class(training):
+    import ray
+
+    # The correctness gateway is optional; ordinary model imports must not load its service stack.
+    native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
+    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
+    ParticipationWorker = participation_worker_class(training._DeepSpeedWorker)
+    coordinator_base = participation_step_class(training.GPUTrainingJob.__ray_metadata__.modified_class)
+
+    class ParticipationCoordinator(coordinator_base):
+        async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
+            from dss.ray_dss.jobs.gpu import training as native_training
+
+            native_spawn = super()._spawn_workers
+            namespace, original_worker = native_lora._spawn_worker_binding(native_spawn, native_training, sources)
+            namespace["_DeepSpeedWorker"] = ParticipationWorker
+            try:
+                await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
+                if namespace.get("_DeepSpeedWorker") is not ParticipationWorker:
+                    raise ValueError("participation worker binding changed during creation")
+            finally:
+                namespace["_DeepSpeedWorker"] = original_worker
 
     return ray.remote(num_cpus=1, num_gpus=0)(ParticipationCoordinator)
 

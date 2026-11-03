@@ -293,6 +293,9 @@ from arctic_platform.model.patches.peft import is_peft_lora_param
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import register_weight_export
 from arctic_platform.model.weight_export import weight_export_contract
+from arctic_platform.testing_utils import get_unique_port_number
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import reserve_free_port
 from arctic_platform.testing_utils import torch_assert_equal
 
 # Helpers
@@ -1001,7 +1004,7 @@ def _flash_source_recipe(recipe: str) -> tuple[str, dict, dict | None]:
             "lora_alpha": 32,
             "lora_dropout": 0.0,
             "bias": "none",
-            "target_modules": ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"],
+            "target_modules": ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"],
         }
         training["peft_config"] = peft
     if qwen:
@@ -9370,22 +9373,23 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     assert "Reusing the verified completed phase" in capsys.readouterr().out
 
 
-def test_getting_started_preserves_pr_demo_commands_and_is_first_read():
+def test_getting_started_preserves_pr_demo_config_and_is_first_read():
     root = Path(__file__).resolve().parents[3]
     guide = root / "arctic_platform/correctness/docs/getting-started.md"
 
-    def demo_commands(path):
+    def demo_config(path):
         text = path.read_text()
-        report_dir = re.search(r"--out (\./work/reports/[a-zA-Z0-9_-]+)", text).group(1)
-        return sorted(
-            block.replace(report_dir, "./work/reports/demo")
-            for language, block in re.findall(
-                r"^```([a-zA-Z0-9_-]*)\n(.*?)^```[ \t]*$", text, re.MULTILINE | re.DOTALL
-            )
-            if language in {"", "bash"}
+        script = re.search(r"(?ms)^python - <<'PY'\n(.*?)^PY$", text).group(1)
+        config = next(
+            node.value
+            for node in ast.parse(script).body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "config" for target in node.targets)
         )
+        return ast.dump(config)
 
-    assert demo_commands(guide) == demo_commands(root / "PR_DESCRIPTION.md")
+    # Main and P1 have different setup and test selections; the demo's supplied recipe must still agree.
+    assert demo_config(guide) == demo_config(root / "PR_DESCRIPTION.md")
     index = (root / "docs/correctness.md").read_text()
     first_paragraph = index.split("\n\n", 2)[1]
     assert first_paragraph.startswith(
@@ -9436,9 +9440,7 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}\n")
-    (tmp_path / ".gitignore").write_text(
-        "/arctic_platform/correctness/configs/\n/arctic_platform/correctness/specs/\n/arctic_platform/correctness/reference_data/\n/work/\n"
-    )
+    (tmp_path / ".gitignore").write_text((root / ".gitignore").read_text())
 
     def run(*args, env=None):
         return subprocess.run(args, cwd=tmp_path, env=env, check=True, text=True, capture_output=True).stdout
@@ -15713,18 +15715,24 @@ def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path
 # Optimizer capture.
 
 
-@pytest.fixture
-def _native_participation_worker(tmp_path, monkeypatch):
+@pytest.fixture(params=[False, True], ids=["shared-storage", "node-local-storage"])
+def _native_participation_worker(tmp_path, monkeypatch, request):
     model = torch.nn.Module()
     model.decoder = torch.nn.Linear(2, 2, bias=False)
     model.head = torch.nn.Linear(2, 2, bias=False)
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.get_decoder = lambda: model.decoder
     model.get_output_embeddings = lambda: model.head
-    engine = SimpleNamespace(module=model, global_steps=0)
+    engine = SimpleNamespace(
+        module=model,
+        global_steps=0,
+        use_node_local_storage=lambda: request.param,
+        save_non_zero_checkpoint=False,
+    )
     pair = _native_ep_bf16_pair(tmp_path)
 
     def save(engine, root, tag):
+        assert engine.save_non_zero_checkpoint is request.param
         target = Path(root) / tag
         target.mkdir(parents=True, exist_ok=True)
         source = pair.before if engine.global_steps == 0 else pair.after
@@ -15733,7 +15741,7 @@ def _native_participation_worker(tmp_path, monkeypatch):
         return "saved"
 
     checkpointer = SimpleNamespace(save_resumable=save)
-    worker = SimpleNamespace(job_id="child", _engine=engine, _checkpointer=checkpointer)
+    worker = SimpleNamespace(job_id="child", local_rank=0, _engine=engine, _checkpointer=checkpointer)
     monkeypatch.setattr(decoder, "_native_runtime_sources", lambda *args: None)
     monkeypatch.setattr(
         decoder,
@@ -15752,6 +15760,7 @@ def test_native_participation_collector_observes_backward_and_restores_all_hooks
     (case.model.head(case.model.decoder(torch.ones(1, 2))) * 0).sum().backward()
     case.worker._engine.global_steps = 1
     case.worker._checkpointer.save_resumable(case.worker._engine, case.root, "global_step1")
+    assert case.worker._engine.save_non_zero_checkpoint is False
     after = json.loads((case.root / "global_step1/native_optimizer_layout/rank00000.json").read_text())
     assert after["participation"]["parameters"]["decoder.weight"]["state"] == "active"
     assert after["participation"]["parameters"]["visual.weight"]["state"] == "inactive"
@@ -17685,6 +17694,38 @@ def test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_ac
     assert all(not root.exists() for root in case.saved)
 
 
+def test_maintained_native_optimizer_keeps_ordinary_participation_receipts_out_of_native_decode(
+    _maintained_native_capture, monkeypatch
+):
+    case = _maintained_native_capture
+    receipts = [{"rank": rank} for rank in range(8)]
+    native_step = case.client.step
+
+    def step(learning_rate):
+        response = native_step(learning_rate)
+        response["participation"] = {"training_child_id": "actual-child", "rank_receipts": receipts}
+        return response
+
+    # The fixture transport is not a CorrectnessCortexTransport; this stands in for its bound training child.
+    def training_child(transport, selector):
+        assert transport is case.client.transport and selector == "actual-parent:train:0"
+        return "actual-child"
+
+    original, decoded = decoder.decode_optimizer_capture, []
+
+    def decode(before, after, output, **kwargs):
+        decoded.append(kwargs)
+        return original(before, after, output, **kwargs)
+
+    case.client.step = step
+    monkeypatch.setattr(capture, "_dense_training_child", training_child)
+    monkeypatch.setattr(decoder, "decode_optimizer_capture", decode)
+    result = _maintained_native_run(case)
+    assert len(decoded) == 1 and "expected_native_layout" in decoded[0]
+    assert "participation_receipts" not in decoded[0] and "expected_participation_job_id" not in decoded[0]
+    assert Path(result.optimizer_state_manifest).is_file()
+
+
 def _native_ap_ep_shards(pair, source, root, step, ep_ranks):
     from arctic_platform.model.implementations.moe.deepspeed_integration import _ep_checkpoint_path
 
@@ -19410,6 +19451,7 @@ def test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_an
     hostfile.write_text(content)
     monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", hostfile)
     monkeypatch.setattr(transfer, "_validate_local_node", lambda node, deadline: None)
+    monkeypatch.setattr(transfer.socket, "gethostname", lambda: "head")
     nodes = [
         {
             "host": name,
@@ -19596,7 +19638,8 @@ def test_dense_collection_new_boundary_source_pin_survives_optimized_python_befo
     source.write_text("changed")
     result = capture.subprocess.run([argv[0], "-O", *argv[1:]], capture_output=True, timeout=10)
     assert result.returncode != 0 and b"source drift before import" in result.stderr
-    assert b"ModuleNotFoundError" not in result.stderr
+    traceback_output = result.stderr.split(b"Traceback (most recent call last):", 1)[1]
+    assert b"ModuleNotFoundError" not in traceback_output
 
 
 @pytest.mark.parametrize("outcome", ["success", "exit", "json", "timeout"])
@@ -21698,6 +21741,39 @@ def test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values(t
         deterministic_lora.bind_payload({"training_config": cfg.training}, output)
 
 
+def test_onboarding_generated_shared_adapter_matches_runner_adapter(tmp_path, monkeypatch):
+    from transformers import Qwen3Config
+
+    from arctic_platform.correctness.harness import runner
+
+    root = tmp_path / "data-fast"
+    root.mkdir()
+    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", root)
+    monkeypatch.setenv(workdir.CORRECTNESS_TMPDIR_ENV, str(root / "tmp"))
+    source = root / "model"
+    Qwen3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        architectures=["Qwen3ForCausalLM"],
+    ).save_pretrained(source)
+    peft_config = {"peft_type": "Lora", "r": 4, "lora_alpha": 8, "target_modules": ["q_proj", "v_proj"]}
+    config = SimpleNamespace(training={"peft_config": peft_config})
+    onboarded = onboard._shared_adapter(argparse.Namespace(peft_adapter=None), config, source)
+    regression = deterministic_lora.generate_adapter(
+        source, peft_config, root / "runner" / "initial-adapter", seed=runner.SEED
+    )
+    expected = deterministic_lora.shared_adapter_identity(regression, peft_config)
+    actual = deterministic_lora.shared_adapter_identity(onboarded, peft_config)
+    assert actual["generation"]["seed"] == expected["generation"]["seed"]
+    assert actual["adapter_model_sha256"] == expected["adapter_model_sha256"]
+    assert actual == expected
+
+
 # Qwen4 reference.
 
 
@@ -21834,8 +21910,11 @@ def test_qwen4_reference_missing_layer_period_rejected(missing):
 
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "qwen3"])
 def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_type):
+    from arctic_platform.correctness.reference import hf_single_gpu
+
     model = _qwen4_reference_TinyQwen4()
     calls = []
+    numerics_calls = []
     cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
 
     def from_pretrained(path, **kwargs):
@@ -21852,8 +21931,14 @@ def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_
             Tiny=SimpleNamespace(from_pretrained=from_pretrained),
         ),
     )
+    monkeypatch.setattr(
+        hf_single_gpu,
+        "apply_target_loader_numerics",
+        lambda loaded, path: numerics_calls.append((loaded, path)),
+    )
     engine = build_engine("fixture", attn_implementation="qsa_flex", device="cpu")
     assert engine.model is model
+    assert numerics_calls == [(model, "fixture")]
     assert model.checkpointing and model.training
     if model_type.startswith("qwen4"):
         assert calls[0]["attn_implementation"] == "sdpa"
@@ -26673,9 +26758,9 @@ def test_shared_adapter_generated_onboard_cache_reuses_exact_pack_and_refuses_mu
     original_generate = shared.generate_adapter
     generated = []
 
-    def generate(model_path, peft_config, destination):
+    def generate(model_path, peft_config, destination, *, seed):
         assert model_path == source.path and peft_config == source.config
-        path = original_generate(model_path, peft_config, destination)
+        path = original_generate(model_path, peft_config, destination, seed=seed)
         generated.append(path)
         return path
 
@@ -39225,6 +39310,190 @@ def test_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_not_
     assert not (library / ".git").exists()
 
 
+@pytest.mark.parametrize("external_config", [False, True])
+def test_onboarding_checkout_root_preserves_nested_source_tree(
+    _onboarding_checkout_roots, monkeypatch, external_config
+):
+    library, external = _onboarding_checkout_roots
+    onboard.subprocess.run(["git", "init", "--quiet", str(library)], check=True)
+    frozen = library / "snapshots" / "frozen" / "tree"
+    module = frozen / "arctic_platform" / "correctness" / "onboarding" / "onboard.py"
+    module.parent.mkdir(parents=True)
+    config_dir = module.parent.parent / "configs"
+    config = external / "train.config" if external_config else config_dir / "model" / "h200" / "train.config"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    raw = b'{"synthetic":"frozen config identity, no model execution"}\n'
+    config.write_bytes(raw)
+    monkeypatch.setattr(onboard, "__file__", str(module))
+
+    assert onboard._checkout_root(config) == frozen
+    assert config.read_bytes() == raw
+    assert not (frozen / ".git").exists()
+    assert not (library / "arctic_platform" / "correctness" / "configs").exists()
+
+
+def test_onboarding_checkout_root_final_regression_binds_source_config_directory(tmp_path, monkeypatch):
+    args, _, spec = _fixed_tolerance_onboarding_prepared(tmp_path, "inference-checkpoint-loss")
+    args.checkout_root = tmp_path / "snapshots" / "frozen" / "tree"
+    config_dir = args.checkout_root / "arctic_platform" / "correctness" / "configs"
+    nested = config_dir / "model" / "h200" / "train.config"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(args.config.read_bytes())
+    args.config = nested
+    original_config, original_spec = nested.read_bytes(), spec.read_bytes()
+    captured = []
+
+    def child(command, **kwargs):
+        captured.append((command, kwargs))
+        out = Path(command[command.index("--out") + 1])
+        (out / "report.json").write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO("synthetic target completed\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    command, kwargs = captured[0]
+    assert command.count("--config-dir") == 1
+    assert command[command.index("--config-dir") + 1] == str(config_dir)
+    assert command[command.index("--config") + 1] == str(nested)
+    assert kwargs["cwd"] == args.checkout_root
+    assert nested.read_bytes() == original_config
+    assert spec.read_bytes() == original_spec
+    assert not (tmp_path / "arctic_platform").exists()
+
+
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer", "inference-checkpoint-loss"])
+@pytest.mark.parametrize("tokens", [None, 256])
+def test_onboarding_final_regression_scopes_inference_options_to_inference(tmp_path, monkeypatch, test_id, tokens):
+    args, _, _ = _fixed_tolerance_onboarding_prepared(tmp_path, test_id)
+    args.tokens = tokens
+    args.inference_sampling_topology = (8, 8, 1)
+    args.inference_export_allocation = tmp_path / "allocation.json"
+    args.inference_export_allocation_sha256 = "a" * 64
+    args.inference_initial_model_dir = tmp_path / "full-model"
+    captured = []
+
+    def child(command, **kwargs):
+        captured.append(command)
+        out = Path(command[command.index("--out") + 1])
+        (out / "report.json").write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO("synthetic target completed\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    command = captured[0]
+    assert ("--tokens" in command) == (
+        tokens is not None and test_id in {"single-step-grads", "single-step-optimizer"}
+    )
+    if "--tokens" in command:
+        assert command[command.index("--tokens") + 1] == str(args.tokens)
+    for option in (
+        "--inference-sampling-topology",
+        "--inference-export-allocation",
+        "--inference-export-allocation-sha256",
+        "--inference-initial-model-dir",
+    ):
+        assert (option in command) == (test_id == "inference-checkpoint-loss")
+    if test_id == "inference-checkpoint-loss":
+        topology = command.index("--inference-sampling-topology")
+        assert command[topology + 1 : topology + 4] == ["8", "8", "1"]
+        assert command[command.index("--inference-initial-model-dir") + 1] == str(args.inference_initial_model_dir)
+
+
+def test_short_sequence_regression_cli_and_api_preserve_explicit_tokens():
+    request, options = api.parse_run_args(
+        ["--config", "synthetic.config", "--test", "single-step-optimizer", "--tokens", "256"]
+    )
+    assert options.tokens == 256
+    assert execution._validate_regression_tokens(api._namespace(request, options)) == 256
+    _, defaults = api.parse_run_args(["--config", "synthetic.config"])
+    assert defaults.tokens is None
+
+
+@pytest.mark.parametrize(
+    "tokens,config,all_configs,tests",
+    [
+        (0, "synthetic.config", False, ("single-step-grads",)),
+        (-1, "synthetic.config", False, ("single-step-grads",)),
+        (True, "synthetic.config", False, ("single-step-grads",)),
+        (256, None, False, ("single-step-grads",)),
+        (256, "synthetic.config", True, ("single-step-grads",)),
+        (256, "synthetic.config", False, ()),
+        (256, "synthetic.config", False, ("checkpoint-resume-loss",)),
+        (256, "synthetic.config", False, ("single-step-grads", "inference-checkpoint-loss")),
+    ],
+)
+def test_short_sequence_regression_rejects_invalid_selection_before_work(
+    monkeypatch, tokens, config, all_configs, tests
+):
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid tokens reached catalog or target"))
+    with pytest.raises(ValueError, match="--tokens"):
+        api.run(api.RunRequest(config=config, all_configs=all_configs, tests=tests), api.RunOptions(tokens=tokens))
+
+
+@pytest.mark.parametrize("requested_tokens", [None, 128, 256])
+@pytest.mark.parametrize("damage", [None, "identity", "checksum", "rows", "attention"])
+def test_short_sequence_regression_requires_exact_frozen_cases(
+    selected_spec_case_state, monkeypatch, requested_tokens, damage
+):
+    state = selected_spec_case_state
+    for arm in state.spec.arms:
+        arm.max_seq_len = 256
+        arm.total_tokens = arm.global_batch_size * 256
+        arm.active_tokens = arm.total_tokens
+    if damage == "identity":
+        state.spec.config_id = "foreign-config"
+    elif damage == "checksum":
+        state.spec.config_checksum = "0" * 64
+    elif damage == "rows":
+        state.spec.arms[0].global_batch_size += 1
+    elif damage == "attention":
+        state.spec.attn_implementations = ["unreviewed"]
+    state.spec.write(state.candidate)
+    before_spec = state.candidate.read_bytes()
+    original_config = copy.deepcopy(state.cfg.sub_job)
+    monkeypatch.setattr(execution, "_configure_regression_target", lambda args: args)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: [state.path])
+    monkeypatch.setattr(execution, "load_config", lambda *a: state.cfg)
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    captured = []
+    reported = []
+
+    def finish(results, *args, **kwargs):
+        reported.extend(results)
+        return 0 if len(captured) == 1 else 1
+
+    def target(config, spec, arms, **kwargs):
+        captured.append(arms)
+        return []
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(state.path),
+            "--test",
+            "single-step-optimizer",
+            "--test-spec",
+            str(state.candidate),
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--out",
+            str(state.tmp / "report"),
+            *(["--tokens", str(requested_tokens)] if requested_tokens is not None else []),
+        ]
+    )
+    status = execution._run_configs(args, executor=target)
+    if requested_tokens == 256 and damage is None:
+        assert status == 0 and not reported
+        assert [(arm.global_batch_size, arm.max_seq_len) for arm in captured[0]] == [(8, 256), (32, 256)]
+    else:
+        assert status != 0 and captured == []
+        assert len(reported) == 1 and reported[0].outcome is Outcome.FAIL
+    assert state.candidate.read_bytes() == before_spec
+    assert state.cfg.sub_job == original_config
+
+
 # Data fast storage.
 
 
@@ -39745,6 +40014,57 @@ def test_inference_forwarding_onboarding_local_route_never_admits_gpu_pool_from_
     monkeypatch.setattr(onboard, "_onboard_fixed_tolerance_test", lambda args, cfg: calls.append(cfg) or 0)
     assert onboard._parent(args) == 0
     assert calls == [cfg]
+
+
+@pytest.mark.parametrize(
+    ("test_id", "initial_model", "admission_error", "expected_error"),
+    [
+        ("inference-checkpoint-loss", True, None, None),
+        ("inference-checkpoint-loss", False, None, "Cortex onboarding requires"),
+        ("inference-checkpoint-loss", True, "pinned local inference export allocation", "pinned local"),
+        ("inference-checkpoint-loss", True, "inference export allocation SHA256 mismatch", "SHA256 mismatch"),
+        ("inference-checkpoint-loss", True, "initial model directory is invalid", "directory is invalid"),
+        ("rl-weight-sync", True, None, "Cortex onboarding requires"),
+    ],
+)
+def test_inference_forwarding_onboarding_initial_model_requires_existing_admission(
+    monkeypatch, tmp_path, _synthetic_onboarding_environment, test_id, initial_model, admission_error, expected_error
+):
+    from arctic_platform.correctness.harness import execution
+
+    args, cfg, _ = _fixed_tolerance_onboarding_prepared(tmp_path, test_id)
+    args.backend = "cortex"
+    args.base_url = "http://127.0.0.1:8003"
+    args.database = args.schema = "dev"
+    args.local_gateway_full_model = False
+    args.inference_initial_model_dir = tmp_path / "original" if initial_model else None
+    args.source_checkpoint = None
+    args.tokens = None
+    args.reference_token_budget = None
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
+    admissions = []
+    calls = []
+
+    def admit(selected):
+        assert selected.test == ["inference-checkpoint-loss"]
+        assert selected.all_configs is False
+        assert selected.inference_initial_model_dir == args.inference_initial_model_dir
+        admissions.append(selected)
+        if admission_error is not None:
+            raise ValueError(admission_error)
+        return selected.inference_initial_model_dir
+
+    monkeypatch.setattr(execution, "_load_inference_initial_model_dir", admit)
+    monkeypatch.setattr(onboard, "_onboard_fixed_tolerance_test", lambda args, cfg: calls.append(cfg) or 0)
+    if expected_error is None:
+        assert onboard._parent(args) == 0
+        assert calls == [cfg]
+    else:
+        with pytest.raises(ValueError, match=expected_error):
+            onboard._parent(args)
+        assert calls == []
+    assert len(admissions) == int(test_id == "inference-checkpoint-loss" and initial_model)
 
 
 @pytest.mark.parametrize(
@@ -41380,6 +41700,7 @@ def test_onboarding_storage_materializers_forward_canonical_fast_destination(
             assert path == target / "reduced"
             calls.append(path)
             (path / "config.json").write_text("{}")
+            save_file({"weight": torch.ones(1)}, path / "model.safetensors")
 
     monkeypatch.setattr(transformers, "StorageTestModel", FakeModel, raising=False)
     monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 8, 1))
@@ -41432,8 +41753,52 @@ def test_onboarding_pretrained_generation_defaults_round_trip(
         assert getattr(reopened.generation_config, name) == value
     saved = load_file(destination / "model.safetensors")
     assert saved.keys() == expected.keys()
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["weight_map"] == dict.fromkeys(saved, "model.safetensors")
+    assert index["metadata"]["total_size"] == sum(tensor.numel() * tensor.element_size() for tensor in saved.values())
     for name, tensor in saved.items():
         torch.testing.assert_close(tensor, expected[name], atol=0, rtol=0, msg=name)
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_onboarding_pretrained_save_indexes_weights_without_rewriting_them(tmp_path, sharded) -> None:
+    tensors = dict(weight=torch.ones(2, 2, dtype=torch.bfloat16), counter=torch.tensor(3, dtype=torch.int64))
+    saved_bytes = {}
+
+    class FakeModel:
+        def save_pretrained(self, path, **kwargs):
+            assert kwargs == dict(safe_serialization=True, max_shard_size="5GB")
+            (path / "config.json").write_text("{}")
+            if sharded:
+                synth_model._write_checkpoint(tensors, path, max_shard_bytes=8)
+                saved_bytes["model.safetensors.index.json"] = (path / "model.safetensors.index.json").read_bytes()
+            else:
+                save_file(tensors, path / "model.safetensors", metadata=dict(format="pt"))
+            saved_bytes.update({file.name: file.read_bytes() for file in path.glob("*.safetensors")})
+
+    synth_model._save_reduced_pretrained(FakeModel(), tmp_path)
+
+    index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(tensors)
+    assert index["metadata"]["total_size"] == 16
+    assert set(index["weight_map"].values()) == {file.name for file in tmp_path.glob("*.safetensors")}
+    for name, raw in saved_bytes.items():
+        assert (tmp_path / name).read_bytes() == raw
+    for filename in set(index["weight_map"].values()):
+        saved = load_file(tmp_path / filename)
+        assert set(saved) == {name for name, shard in index["weight_map"].items() if shard == filename}
+        for name, tensor in saved.items():
+            torch.testing.assert_close(tensor, tensors[name], atol=0, rtol=0, msg=name)
+
+
+def test_onboarding_pretrained_save_rejects_missing_weights_before_index_publication(tmp_path) -> None:
+    class FakeModel:
+        def save_pretrained(self, path, **kwargs):
+            (path / "config.json").write_text("{}")
+
+    with pytest.raises(FileNotFoundError, match="model.safetensors"):
+        synth_model._save_reduced_pretrained(FakeModel(), tmp_path)
+    assert not (tmp_path / "model.safetensors.index.json").exists()
 
 
 def test_onboarding_pretrained_generation_defaults_restore_after_save_failure(tmp_path) -> None:
@@ -43807,7 +44172,17 @@ def _native_checkpoint_bridge(monkeypatch):
     snowapi = SimpleNamespace(_parents=parents)
     monkeypatch.setitem(sys.modules, "dss.ray_dss", SimpleNamespace(gateway_snowapi=snowapi))
     state = SimpleNamespace(
-        calls=[], verified=[], roots=[], counter=0, response={}, create_error=None, closed=False, created=[]
+        calls=[],
+        verified=[],
+        roots=[],
+        counter=0,
+        response={},
+        create_error=None,
+        closed=False,
+        created=[],
+        replicated=[],
+        replication_error=None,
+        events=[],
     )
     zone = SimpleNamespace(num_gpus=4, nodes=[SimpleNamespace(model_dump=lambda **kw: {"host": "node-a", "gpus": 4})])
 
@@ -43837,6 +44212,7 @@ def _native_checkpoint_bridge(monkeypatch):
     async def request(zone_arg, method, path, **kwargs):
         assert zone_arg is zone
         state.calls.append((method, path, copy.deepcopy(kwargs)))
+        state.events.append(path.rsplit("/", 1)[-1])
         child = path.split("/")[-2]
         body = kwargs["json_body"]
         return {
@@ -43860,7 +44236,18 @@ def _native_checkpoint_bridge(monkeypatch):
     gw._create_child_job = create
     gw._zone_for_job = lambda child: gw._jobs[child]
     gw._zone_request_and_wait = request
-    store = SimpleNamespace(create=retain, verify=lambda binding: state.verified.append(copy.deepcopy(binding)))
+
+    def verify(binding):
+        state.verified.append(copy.deepcopy(binding))
+        state.events.append("verify")
+
+    def replicate(binding, tag, hosts, ep_size):
+        state.replicated.append((copy.deepcopy(binding), tag, list(hosts), ep_size))
+        state.events.append("replicate")
+        if state.replication_error is not None:
+            raise state.replication_error
+
+    store = SimpleNamespace(create=retain, verify=verify, materialize_expert_replicas=replicate)
     gateway.install_checkpoint_routes(gw, store)
     state.gw, state.parents, state.zone, state.store = gw, parents, zone, store
     state.config = {
@@ -44008,6 +44395,69 @@ def test_native_checkpoint_bridge_exact_store_survives_fresh_child_resume(_nativ
         async with state.gw.app.router.lifespan_context(state.gw.app):
             pass
         assert state.closed and state.roots == ["/data-fast/control-resume"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ep_size", [None, 1, 2, 4])
+def test_native_checkpoint_bridge_expert_replicas_precede_catalog_publication(_native_checkpoint_bridge, ep_size):
+    state = _native_checkpoint_bridge
+    state.config["training_config"]["ep_size"] = ep_size
+
+    async def scenario():
+        source = await state.child()
+        saved = await state.invoke(
+            "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+        )
+        if ep_size == 2:
+            assert state.replicated == [
+                (
+                    {
+                        "path": "/data-fast/control-resume",
+                        "source_job_id": "owned-store",
+                        "native_path": "/tmp/dss.ray_dss/ds/job-owned-store",
+                    },
+                    "global_step10",
+                    ["node-a"],
+                    2,
+                )
+            ]
+            assert state.events == ["verify", "save", "replicate", "verify"]
+        else:
+            assert state.replicated == []
+            assert state.events == ["verify", "save", "verify"]
+        del state.gw._jobs[source]
+        state.parents.clear()
+        target = await state.child({**state.config, "job_id": "resume"})
+        await state.invoke("/correctness/load-checkpoint", target, checkpoint_id=saved["checkpoint_id"])
+        assert state.events[-1] == "verify"
+        assert "load" in state.events
+
+    asyncio.run(scenario())
+
+
+def test_native_checkpoint_bridge_replica_failure_does_not_publish_checkpoint(_native_checkpoint_bridge):
+    from fastapi import HTTPException
+
+    state = _native_checkpoint_bridge
+    state.config["training_config"]["ep_size"] = 2
+    state.replication_error = RuntimeError("expert replica transfer failed")
+
+    async def scenario():
+        source = await state.child()
+        with pytest.raises(RuntimeError, match="expert replica transfer failed"):
+            await state.invoke(
+                "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+            )
+        assert state.events == ["verify", "save", "replicate"]
+        del state.gw._jobs[source]
+        state.parents.clear()
+        target = await state.child({**state.config, "job_id": "resume"})
+        with pytest.raises(HTTPException) as failure:
+            await state.invoke("/correctness/load-checkpoint", target, checkpoint_id="cp_" + "0" * 32)
+        assert failure.value.status_code == 404
+        assert "load" not in state.events
+        assert state.roots == ["/data-fast/control-resume"]
 
     asyncio.run(scenario())
 
@@ -45595,7 +46045,12 @@ def test_native_checkpoint_fanout_fresh_child_uses_private_overlay(_native_check
     closed = env.store._fanout("close", binding, receipts)
     assert closed["node-0"]["identity"]["closed"] is True
     assert len(env.children) == 3
-    assert all(child.returncode == 0 and child.stderr == "" for child in env.children)
+    startup_notice = (
+        "[arctic prime-rl] grading-policy patch skipped: ModuleNotFoundError(\"No module named 'verifiers'\")\n"
+    )
+    assert all(child.returncode == 0 and child.stderr in ("", startup_notice) for child in env.children), [
+        {"returncode": child.returncode, "stderr": child.stderr} for child in env.children
+    ]
 
 
 @pytest.mark.parametrize("import_root", ["absolute", "relative", "cwd", "non-string"])
@@ -45665,6 +46120,73 @@ def test_native_checkpoint_fanout_missing_gateway_source_is_structured(_native_c
     assert error.value.transport_stdout == error.value.transport_stderr == ""
 
 
+@pytest.mark.parametrize("operation", ["expert-inventory", "expert-replicate"])
+def test_native_checkpoint_expert_payload_outlives_control_deadline(_native_checkpoint_fresh_child, operation):
+    env = _native_checkpoint_fresh_child
+    env.source.write_text(
+        "import time\n"
+        + env.source.read_text().replace(
+            "    binding =",
+            "    if request['operation'].startswith('expert-'):\n        time.sleep(0.5)\n    binding =",
+        )
+    )
+    binding = {"source_job_id": "synthetic-source", "path": "/synthetic/retained"}
+    receipts = env.store._fanout("create", binding, {})
+    env.store.timeout = 0.25
+    env.store.expert_timeout = 5
+    result = env.store._fanout(operation, binding, receipts, payload={})
+    assert result["node-0"]["ok"] is True
+    assert len(env.children) == 2
+    assert all(child.returncode == 0 for child in env.children)
+
+
+def test_native_checkpoint_expert_replica_payload_uses_expert_deadline(_native_checkpoint_store_env, monkeypatch):
+    env = _native_checkpoint_store_env
+    binding = dict(source_job_id="synthetic-source", path=str(env.root))
+    env.store.hosts = {"node-0", "node-1"}
+    env.store.expert_timeout = 900
+    identities = {host: dict(host=host, identity={}) for host in env.store.hosts}
+    env.store._records[binding["source_job_id"]] = (binding, identities)
+    identity = dict(size=8, sha256="a" * 64)
+    shards = {f"experts_ep_rank_{rank:03d}.pt": identity for rank in range(2)}
+    operations = []
+
+    def fanout(operation, supplied_binding, supplied_identities, *, payload):
+        assert supplied_binding == binding and supplied_identities == identities
+        assert payload["timeout"] == 900
+        operations.append(operation)
+        if operation == "expert-inventory":
+            return {
+                f"node-{rank}": dict(host=f"node-{rank}", expert_shards={f"experts_ep_rank_{rank:03d}.pt": identity})
+                for rank in range(2)
+            }
+        assert operation == "expert-replicate"
+        return {host: dict(expert_shards=shards) for host in env.store.hosts}
+
+    monkeypatch.setattr(env.store, "_fanout", fanout)
+    env.store.materialize_expert_replicas(binding, "global_step10", ["node-0", "node-1"], 2)
+    assert operations == ["expert-inventory", "expert-replicate"]
+    assert env.store.timeout == 120
+
+
+@pytest.mark.parametrize("operation", ["create", "verify", "close", "expert-inventory", "expert-replicate"])
+def test_native_checkpoint_operation_deadlines_remain_bounded(_native_checkpoint_fresh_child, operation):
+    env = _native_checkpoint_fresh_child
+    env.source.write_text(
+        "import time\n" + env.source.read_text().replace("    binding =", "    time.sleep(1)\n    binding =")
+    )
+    env.store.timeout = 0.25
+    env.store.expert_timeout = 0.4
+    timeout = env.store.expert_timeout if operation.startswith("expert-") else env.store.timeout
+    with pytest.raises(env.module.CheckpointStoreError, match=rf"{operation} \(timeout={timeout}s\)") as error:
+        env.store._fanout(
+            operation, {"source_job_id": "synthetic-source", "path": "/synthetic/retained"}, {}, payload={}
+        )
+    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+    assert error.value.__cause__.timeout == timeout
+    assert error.value.receipts == {}
+
+
 @pytest.fixture
 def _native_checkpoint_store_env(tmp_path, monkeypatch):
     import base64
@@ -45689,7 +46211,6 @@ def _native_checkpoint_store_env(tmp_path, monkeypatch):
     def run(command, **kwargs):
         calls.append(command)
         assert command[1:3] == ["-f", str(hostfile)]
-        assert kwargs["timeout"] == 120
         tokens = shlex.split(command[-1])
         if tokens[0] == "echo":
             assert tokens[2:7] == ["|", "base64", "-d", "|", sys.executable]
@@ -45697,6 +46218,13 @@ def _native_checkpoint_store_env(tmp_path, monkeypatch):
             script = base64.b64decode(tokens[1], validate=True).decode()
         else:
             script = tokens[-1]
+        request = next(
+            json.loads(node.args[0].value)
+            for node in ast.walk(ast.parse(script))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "loads"
+        )
+        expected_timeout = 14400 if request["operation"].startswith("expert-") else 120
+        assert kwargs["timeout"] == expected_timeout
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             exec(script, {})
@@ -45804,6 +46332,454 @@ def test_native_checkpoint_store_root_is_retained_without_close(_native_checkpoi
     binding = env.store.create(env.root)
     assert env.root.exists() and Path(binding["native_path"]).is_symlink()
     assert len(env.calls) == 1
+
+
+@pytest.mark.parametrize("ap_shards", [False, True])
+def test_native_checkpoint_expert_replicas_complete_inventory_is_not_copied(_native_checkpoint_store_env, ap_shards):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    directory = env.root / "global_step10"
+    directory.mkdir()
+    shards = {f"experts_ep_rank_{rank:03d}.pt": f"expert-{rank}".encode() for rank in range(2)}
+    if ap_shards:
+        shards.update(
+            {f"ap_ep_ep_size_2_rank_{rank:02d}_model_states.pt": f"ap-expert-{rank}".encode() for rank in range(2)}
+        )
+    for name, data in shards.items():
+        (directory / name).write_bytes(data)
+    optimizer = directory / "zero_pp_rank_0_mp_rank_00_optim_states.pt"
+    optimizer.write_bytes(b"optimizer must stay local")
+    env.store.materialize_expert_replicas(binding, "global_step10", ["node-0"], 2)
+    assert len(env.calls) == 2
+    assert {name: (directory / name).read_bytes() for name in shards} == shards
+    receipts = env.store._fanout(
+        "expert-inventory",
+        *env.store._records[binding["source_job_id"]],
+        payload=dict(tag="global_step10", training_hosts={"node-0": "node-0"}),
+    )
+    assert set(receipts["node-0"]["expert_shards"]) == set(shards)
+    assert optimizer.read_bytes() == b"optimizer must stay local"
+    env.store.close()
+
+
+def test_native_checkpoint_expert_manifest_includes_ap_rank_local_shards():
+    from arctic_platform.correctness.harness import storage as module
+
+    identity = dict(size=8, sha256="a" * 64)
+    inventories = {
+        f"node-{rank}": {
+            f"experts_ep_rank_{rank:03d}.pt": identity,
+            f"ap_ep_ep_size_2_rank_{rank:02d}_model_states.pt": identity,
+        }
+        for rank in range(2)
+    }
+    manifest = module._expert_manifest(inventories, 2)
+    assert set(manifest) == {name for inventory in inventories.values() for name in inventory}
+    assert manifest["ap_ep_ep_size_2_rank_00_model_states.pt"] == dict(host="node-0", identity=identity)
+
+
+@pytest.mark.parametrize(
+    "condition", ["missing", "degree", "rank", "group", "conflict", "noncanonical", "optimizer", "nonstring"]
+)
+def test_native_checkpoint_ap_expert_manifest_rejects_invalid_shards(condition):
+    from arctic_platform.correctness.harness import storage as module
+
+    identity = dict(size=8, sha256="a" * 64)
+    inventory = {f"experts_ep_rank_{rank:03d}.pt": identity for rank in range(2)}
+    inventory.update({f"ap_ep_ep_size_2_rank_{rank:02d}_model_states.pt": identity for rank in range(2)})
+    inventories = {"node-0": inventory, "node-1": {}}
+    if condition == "missing":
+        del inventory["ap_ep_ep_size_2_rank_01_model_states.pt"]
+    elif condition == "conflict":
+        inventories["node-1"]["ap_ep_ep_size_2_rank_00_model_states.pt"] = dict(size=8, sha256="b" * 64)
+    elif condition == "nonstring":
+        inventory[0] = identity
+    else:
+        unexpected = {
+            "degree": "ap_ep_ep_size_4_rank_00_model_states.pt",
+            "rank": "ap_ep_ep_size_2_rank_02_model_states.pt",
+            "group": "ap_ep_other_rank_00_model_states.pt",
+            "noncanonical": "ap_ep_ep_size_2_rank_000_model_states.pt",
+            "optimizer": "zero_pp_rank_0_mp_rank_00_optim_states.pt",
+        }[condition]
+        inventory[unexpected] = identity
+    with pytest.raises(ValueError):
+        module._expert_manifest(inventories, 2)
+
+
+@pytest.mark.parametrize("condition", ["missing", "unexpected", "conflict", "identity", "degree"])
+def test_native_checkpoint_expert_manifest_rejects_incomplete_or_conflicting_shards(condition):
+    from arctic_platform.correctness.harness import storage as module
+
+    first = {"size": 8, "sha256": "a" * 64}
+    second = {"size": 8, "sha256": "b" * 64}
+    shards = {"node-0": {"experts_ep_rank_000.pt": first}, "node-1": {"experts_ep_rank_001.pt": second}}
+    degree = 2
+    if condition == "missing":
+        shards["node-1"] = {}
+    elif condition == "unexpected":
+        shards["node-0"]["optimizer.pt"] = first
+    elif condition == "conflict":
+        shards["node-1"]["experts_ep_rank_000.pt"] = second
+    elif condition == "identity":
+        first["size"] = True
+    else:
+        degree = True
+    with pytest.raises(ValueError):
+        module._expert_manifest(shards, degree)
+
+
+@pytest.mark.parametrize("condition", ["symlink", "hardlink", "empty"])
+def test_native_checkpoint_expert_file_identity_rejects_unsafe_files(tmp_path, condition):
+    from arctic_platform.correctness.harness import storage as module
+
+    source = tmp_path / "source"
+    source.write_bytes(b"expert contents")
+    shard = tmp_path / "experts_ep_rank_000.pt"
+    if condition == "symlink":
+        shard.symlink_to(source)
+    elif condition == "hardlink":
+        os.link(source, shard)
+    else:
+        shard.touch()
+    with pytest.raises((OSError, ValueError)):
+        module._expert_file_identity(shard)
+    assert source.read_bytes() == b"expert contents"
+
+
+@pytest.mark.parametrize("tag", ["../global_step10", "global_step10/other", "not-a-tag"])
+def test_native_checkpoint_expert_directory_rejects_non_native_tags(tmp_path, tag):
+    from arctic_platform.correctness.harness import storage as module
+
+    with pytest.raises(ValueError, match="exact native checkpoint tag"):
+        module._expert_directory(tmp_path, tag)
+
+
+@pytest.mark.parametrize("operation", ["expert-inventory", "expert-replicate"])
+def test_native_checkpoint_expert_operations_allow_concurrent_source_readers(
+    _native_checkpoint_store_env, monkeypatch, operation
+):
+    import fcntl
+
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    native = Path(binding["native_path"])
+    directory = env.root / "global_step10"
+    directory.mkdir()
+    shard = directory / "experts_ep_rank_000.pt"
+    shard.write_bytes(b"expert contents")
+    identity = env.module._expert_file_identity(shard)
+    locks = []
+    original = env.module._native_lock
+
+    @contextlib.contextmanager
+    def inspect_lock(path, *, exclusive):
+        locks.append(exclusive)
+        with original(path, exclusive=exclusive) as held:
+            yield held
+
+    monkeypatch.setattr(env.module, "_native_lock", inspect_lock)
+    payload = {
+        "tag": "global_step10",
+        "training_hosts": {"node-0": "node-0"},
+        "manifest": {shard.name: {"host": "node-0", "identity": identity}},
+        "timeout": 120,
+    }
+    with Path(f"{native}.lock").open("r+") as reader:
+        fcntl.flock(reader, fcntl.LOCK_SH)
+        receipts = env.store._fanout(operation, *env.store._records[binding["source_job_id"]], payload=payload)
+        fcntl.flock(reader, fcntl.LOCK_UN)
+    assert locks == [False]
+    assert receipts["node-0"]["expert_shards"] == {shard.name: identity}
+
+
+def test_native_checkpoint_expert_inventory_excludes_sampler_nodes(_native_checkpoint_store_env):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    receipts = env.store._fanout(
+        "expert-inventory",
+        *env.store._records[binding["source_job_id"]],
+        payload={"tag": "global_step10", "training_hosts": {"training-node": "node-1"}},
+    )
+    assert receipts["node-0"]["expert_shards"] == {}
+    assert not (env.root / "global_step10").exists()
+
+
+@pytest.mark.parametrize("hosts", [[], ["node-0", "node-0"], ["outside"]])
+def test_native_checkpoint_expert_replicas_reject_unacknowledged_training_nodes(_native_checkpoint_store_env, hosts):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    with pytest.raises(env.module.CheckpointStoreError, match="exact training nodes"):
+        env.store.materialize_expert_replicas(binding, "global_step10", hosts, 2)
+    assert len(env.calls) == 1
+
+
+@pytest.mark.parametrize("name", ["experts_ep_rank_000.pt", "ap_ep_ep_size_2_rank_00_model_states.pt"])
+@pytest.mark.parametrize("failure", [None, "digest", "transport", "race", "foreign"])
+def test_native_checkpoint_expert_replica_transfer_is_verified_and_never_overwrites(
+    tmp_path, monkeypatch, failure, name
+):
+    from arctic_platform.correctness.harness import storage as module
+
+    directory = tmp_path / "global_step10"
+    directory.mkdir()
+    data = b"expert contents"
+    target = directory / name
+    identity = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    request = {
+        "expected": {"source-node": {}},
+        "payload": {
+            "tag": directory.name,
+            "timeout": 120,
+            "training_hosts": {"source-node": "node-1"},
+            "manifest": {name: {"host": "source-node", "identity": identity}},
+        },
+    }
+    if failure == "foreign":
+        request["payload"]["training_hosts"] = {}
+    calls = []
+
+    def transfer(command, **kwargs):
+        calls.append(command)
+        assert command[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "node-1"]
+        assert kwargs["timeout"] == 120
+        kwargs["stdout"].write(b"wrong contents" if failure == "digest" else data)
+        if failure == "race":
+            target.write_bytes(b"preserve racing writer")
+        return SimpleNamespace(returncode=int(failure == "transport"), stderr=b"transfer error")
+
+    monkeypatch.setattr(module.subprocess, "run", transfer)
+    if failure:
+        with pytest.raises((ValueError, RuntimeError, FileExistsError)):
+            module._replicate_checkpoint_experts(directory, request)
+        if failure == "race":
+            assert target.read_bytes() == b"preserve racing writer"
+        else:
+            assert not target.exists()
+    else:
+        assert module._replicate_checkpoint_experts(directory, request) == {name: identity}
+        assert target.read_bytes() == data
+        assert module._replicate_checkpoint_experts(directory, request) == {name: identity}
+        assert len(calls) == 1
+    assert not list(directory.glob(".expert-replica-*"))
+
+
+def test_native_checkpoint_expert_replication_bounds_parallel_transfers(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import storage as module
+
+    names = [f"experts_ep_rank_{rank:03d}.pt" for rank in range(12)]
+    data = b"parallel authenticated expert contents"
+    identity = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+    request = dict(
+        expected={"source-node": {}},
+        payload=dict(
+            tag="global_step10",
+            timeout=120,
+            training_hosts={"source-node": "node-1"},
+            manifest={name: dict(host="source-node", identity=identity) for name in names},
+        ),
+    )
+    lock = threading.Lock()
+    first_wave = threading.Event()
+    active = 0
+    peak = 0
+    completed = 0
+
+    def transfer(command, **kwargs):
+        nonlocal active, peak, completed
+        assert kwargs["timeout"] == 120
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 4:
+                first_wave.set()
+        try:
+            assert first_wave.wait(2), "expert transfers still run serially"
+            kwargs["stdout"].write(data)
+            return SimpleNamespace(returncode=0, stderr=b"")
+        finally:
+            with lock:
+                active -= 1
+                completed += 1
+
+    monkeypatch.setattr(module.subprocess, "run", transfer)
+    assert module._replicate_checkpoint_experts(tmp_path, request) == {name: identity for name in names}
+    assert peak == 4
+    assert active == 0
+    assert completed == len(names)
+    assert all((tmp_path / name).read_bytes() == data for name in names)
+    assert not list(tmp_path.glob(".expert-replica-*"))
+
+
+def test_native_checkpoint_parallel_replication_validates_all_sources_before_transfer(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import storage as module
+
+    identity = dict(size=8, sha256="a" * 64)
+    request = dict(
+        expected={"source-node": {}},
+        payload=dict(
+            tag="global_step10",
+            timeout=120,
+            training_hosts={"source-node": "node-1"},
+            manifest={
+                "experts_ep_rank_000.pt": dict(host="source-node", identity=identity),
+                "experts_ep_rank_001.pt": dict(host="outside", identity=identity),
+            },
+        ),
+    )
+
+    def unexpected_transfer(*args, **kwargs):
+        pytest.fail("every source must be admitted before parallel transfers begin")
+
+    monkeypatch.setattr(module.subprocess, "run", unexpected_transfer)
+    with pytest.raises(ValueError, match="outside the acknowledged training allocation"):
+        module._replicate_checkpoint_experts(tmp_path, request)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["transport", "timeout", "digest"])
+def test_native_checkpoint_parallel_replication_settles_running_transfers_on_failure(tmp_path, monkeypatch, failure):
+    from arctic_platform.correctness.harness import storage as module
+
+    names = [f"experts_ep_rank_{rank:03d}.pt" for rank in range(12)]
+    data = b"authenticated parallel expert contents"
+    identity = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+    request = dict(
+        expected={"source-node": {}},
+        payload=dict(
+            tag="global_step10",
+            timeout=120,
+            training_hosts={"source-node": "node-1"},
+            manifest={name: dict(host="source-node", identity=identity) for name in names},
+        ),
+    )
+    lock = threading.Lock()
+    first_wave = threading.Event()
+    settling = threading.Event()
+    release = threading.Event()
+    started = 0
+    active = 0
+    errors = []
+
+    class ObservedExecutor(module.ThreadPoolExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            settling.set()
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def transfer(command, **kwargs):
+        nonlocal started, active
+        assert kwargs["timeout"] == 120
+        with lock:
+            ordinal = started
+            started += 1
+            active += 1
+            if started == 4:
+                first_wave.set()
+        try:
+            assert first_wave.wait(5), "parallel transfer wave never started"
+            if ordinal == 0:
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                kwargs["stdout"].write(b"wrong contents" if failure == "digest" else data)
+                return SimpleNamespace(returncode=int(failure == "transport"), stderr=b"transfer error")
+            assert release.wait(5), "test did not release in-flight transfers"
+            kwargs["stdout"].write(data)
+            return SimpleNamespace(returncode=0, stderr=b"")
+        finally:
+            with lock:
+                active -= 1
+
+    def replicate():
+        try:
+            module._replicate_checkpoint_experts(tmp_path, request)
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(module, "ThreadPoolExecutor", ObservedExecutor)
+    monkeypatch.setattr(module.subprocess, "run", transfer)
+    caller = threading.Thread(target=replicate)
+    caller.start()
+    try:
+        assert settling.wait(5), "failed replication never began settling its workers"
+        assert caller.is_alive(), "replication returned while transfers still held temporary files"
+        with lock:
+            assert active >= 3
+        assert len(list(tmp_path.glob(".expert-replica-*"))) >= 3
+    finally:
+        release.set()
+        caller.join(5)
+    assert not caller.is_alive()
+    assert active == 0
+    assert started < len(names), "queued transfers were not cancelled"
+    expected_error = dict(transport=RuntimeError, timeout=subprocess.TimeoutExpired, digest=ValueError)[failure]
+    assert len(errors) == 1 and isinstance(errors[0], expected_error)
+    assert not list(tmp_path.glob(".expert-replica-*"))
+    assert all(path.read_bytes() == data for path in tmp_path.glob("*.pt"))
+
+
+@pytest.mark.parametrize("name", ["experts_ep_rank_000.pt", "ap_ep_ep_size_2_rank_00_model_states.pt"])
+@pytest.mark.parametrize("failure", [None, "digest", "ownership"])
+def test_native_checkpoint_expert_stream_checks_owned_source_and_digest(
+    _native_checkpoint_store_env, monkeypatch, name, failure
+):
+    env = _native_checkpoint_store_env
+    binding = env.store.create(env.root)
+    directory = env.root / "global_step10"
+    directory.mkdir()
+    data = b"authenticated expert contents"
+    shard = directory / name
+    shard.write_bytes(data)
+    identity = env.module._expert_file_identity(shard)
+    receipts = env.store._records[binding["source_job_id"]][1]
+    request = {
+        "binding": binding,
+        "store_id": env.store.store_id,
+        "allocation_sha256": env.store._host_identity["sha256"],
+        "expected": {"node-0": receipts["node-0"]["identity"]},
+        "payload": {"tag": directory.name},
+    }
+    if failure == "digest":
+        identity["sha256"] = "b" * 64
+    elif failure == "ownership":
+        request["store_id"] = "another-owner"
+    output = io.BytesIO()
+    with monkeypatch.context() as patch:
+        patch.setattr(env.module.sys, "stdout", SimpleNamespace(buffer=output))
+        if failure:
+            with pytest.raises(ValueError):
+                env.module._stream_checkpoint_expert(request, name, identity)
+            assert output.getvalue() == b""
+        else:
+            env.module._stream_checkpoint_expert(request, name, identity)
+            assert output.getvalue() == data
+    assert shard.read_bytes() == data
+    env.store.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../ap_ep_ep_size_2_rank_00_model_states.pt",
+        "ap_ep_ep_size_2_rank_00_optim_states.pt",
+        "zero_pp_rank_0_mp_rank_00_optim_states.pt",
+        "ap_ep_other_rank_00_model_states.pt",
+        None,
+        0,
+    ],
+)
+def test_native_checkpoint_expert_transfer_rejects_non_weight_shards(tmp_path, monkeypatch, name):
+    from arctic_platform.correctness.harness import storage as module
+
+    def unexpected_transfer(*args, **kwargs):
+        pytest.fail("invalid shard must be rejected before opening a connection")
+
+    monkeypatch.setattr(module.subprocess, "run", unexpected_transfer)
+    identity = dict(size=8, sha256="a" * 64)
+    request = dict(payload=dict(manifest={name: dict(host="node-0", identity=identity)}))
+    with pytest.raises(ValueError, match="only expert weight shards"):
+        module._replicate_checkpoint_experts(tmp_path, request)
+    with pytest.raises(ValueError, match="only expert weight shards"):
+        module._stream_checkpoint_expert(request, name, identity)
 
 
 @pytest.mark.parametrize("condition", ["nonempty", "symlink", "outside"])
@@ -46066,11 +47042,12 @@ def test_native_checkpoint_store_close_attempts_all_owned_bindings(_native_check
     assert env.store.bindings == (first,)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True, float("nan"), float("inf")])
-def test_native_checkpoint_store_requires_bounded_timeout(_native_checkpoint_store_env, timeout):
+@pytest.mark.parametrize("setting", ["timeout", "expert_timeout"])
+@pytest.mark.parametrize("timeout", [0, -1, True, float("nan"), float("inf"), "120", None])
+def test_native_checkpoint_store_requires_bounded_timeout(_native_checkpoint_store_env, setting, timeout):
     env = _native_checkpoint_store_env
     with pytest.raises(ValueError, match="finite and positive"):
-        env.module.NativeCheckpointStore(env.hostfile, timeout=timeout)
+        env.module.NativeCheckpointStore(env.hostfile, **{setting: timeout})
 
 
 # Local Transport
@@ -46123,6 +47100,9 @@ def _local_cortex_checkpoint_load_response(payload):
 
 @pytest.fixture
 def _local_cortex_checkpoint_load_gateway(monkeypatch):
+    from arctic_platform.correctness.harness import weight_cache
+
+    monkeypatch.setattr(weight_cache, "maybe_prepare_allocation_weights", lambda config: [])
     monkeypatch.delenv(LOCAL_NATIVE_FORWARD_ENV, raising=False)
     monkeypatch.delenv(local_transport_cortex_transport.LOCAL_CHECKPOINT_BRIDGE_ENV, raising=False)
     state = SimpleNamespace(
@@ -47392,6 +48372,50 @@ def test_local_cortex_checkpoint_resume_restore_after_owned_shutdown_cannot_reop
 
 
 # Local cortex forward.
+
+
+@pytest.mark.parametrize("request_timeout", [0.05, 2.0])
+def test_local_cortex_checkpoint_real_http_preserves_explicit_request_deadline(request_timeout):
+    from aiohttp import web
+
+    port = reserve_free_port(get_unique_port_number() + 1, span=7)
+    transport = CorrectnessCortexTransport(
+        CortexConfig(base_url=f"http://127.0.0.1:{port}", request_timeout=request_timeout, poll_timeout=2.0)
+    )
+    entered = []
+    completed = []
+
+    async def exercise():
+        async def save(request):
+            entered.append(request.path)
+            await asyncio.sleep(0.2)
+            completed.append(request.path)
+            return web.json_response(dict(checkpoint_id="cp_control"))
+
+        app = web.Application()
+        app.router.add_post("/correctness/save-checkpoint", save)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, "127.0.0.1", port).start()
+            url = f"{transport.config.base_url}/correctness/save-checkpoint"
+            if request_timeout < 0.2:
+                with pytest.raises(TimeoutError):
+                    await transport._native_http("POST", url, json=dict(path="/data-fast/tmp/control"))
+            else:
+                result = await transport._native_http("POST", url, json=dict(path="/data-fast/tmp/control"))
+                assert json.loads(result) == dict(checkpoint_id="cp_control")
+        finally:
+            await transport._close_session()
+            await runner.cleanup()
+
+    try:
+        transport._on_loop(exercise()).result(timeout=10)
+        assert entered == ["/correctness/save-checkpoint"]
+        assert completed == ["/correctness/save-checkpoint"]
+        assert transport.config.request_timeout == request_timeout
+    finally:
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
 
 
 def _local_cortex_forward_response(payload=None, *, status=200, data=None):
@@ -52393,6 +53417,47 @@ def test_sampler_evidence_manifest_preserves_bf16_bytes_and_geometry():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.uint8, torch.bool])
+@pytest.mark.parametrize("layout", ["dense", "transpose", "slice", "scalar", "empty", "expanded"])
+@pytest.mark.parametrize("chunk_bytes", [16, 128, 8192])
+def test_sampler_evidence_manifest_bounded_hash_preserves_exact_bytes(monkeypatch, dtype, layout, chunk_bytes):
+    base = torch.arange(240).reshape(4, 6, 10).to(dtype)
+    value = {
+        "dense": base,
+        "transpose": base.transpose(0, 2),
+        "slice": base[:, ::2, 1::3],
+        "scalar": base[0, 0, 0],
+        "empty": base[:0],
+        "expanded": base[:1].expand(3, -1, -1),
+    }[layout]
+    expected = hashlib.sha256(value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()
+    before = value.clone()
+    digest = hashlib.sha256()
+    sizes = []
+
+    def update(raw):
+        assert isinstance(raw, memoryview)
+        sizes.append(raw.nbytes)
+        digest.update(raw)
+
+    monkeypatch.setattr(sampler_evidence_evidence, "_MANIFEST_CHUNK_BYTES", chunk_bytes)
+    monkeypatch.setattr(
+        sampler_evidence_evidence.hashlib,
+        "sha256",
+        lambda: SimpleNamespace(update=update, hexdigest=digest.hexdigest),
+    )
+    record = sampler_evidence_evidence.tensor_manifest(value)
+    assert record == dict(
+        shape=list(value.shape),
+        dtype=str(dtype).removeprefix("torch."),
+        numel=value.numel(),
+        sha256=expected,
+    )
+    assert len(sizes) > 0 and max(sizes) <= chunk_bytes
+    assert sum(sizes) == value.numel() * value.element_size()
+    assert torch.equal(value, before)
+
+
 def test_sampler_evidence_sender_passes_exact_existing_list_once(monkeypatch):
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
     worker = _Worker()
@@ -52488,6 +53553,262 @@ def test_sampler_evidence_shadow_byte_mismatch_is_reported():
     assert result["destinations"]["packed"]["mismatched"] == 1
 
 
+@require_torch_gpu
+@pytest.mark.parametrize("complete", [False, True])
+def test_sampler_evidence_shadow_cuda_partial_backings_offload_without_changing_replay(complete):
+    class DeviceModel(_PackedModel):
+        def load_weights(self, weights):
+            assert self.packed.device.type == "cuda"
+            for name, value in weights:
+                assert value.device.type == "cuda"
+                start = 0 if name == "left" else 2
+                self.packed.data[start : start + 2].copy_(value)
+
+    model = DeviceModel().cuda()
+    identities = {name: id(value) for name, value in model.named_parameters()}
+    verifier = _verifier(model)
+    verifier.load("left", torch.tensor([1.0, 2.0], device="cuda"))
+    key = verifier.storage_keys["packed"]
+    assert verifier.backings[key].device.type == "cpu"
+    assert verifier.shadow_keys[sampler_evidence_evidence._storage(verifier.backings[key])] == key
+    if complete:
+        verifier.load("right", torch.tensor([3.0, 4.0], device="cuda"))
+        assert key not in verifier.backings
+    result = verifier.finish()
+    assert result["destinations"]["packed"] == dict(uncovered=0 if complete else 2, mismatched=0)
+    assert result["changed_after_verification"] == []
+    assert result["untouched_parameters"] == dict(other=1)
+    assert {name: id(value) for name, value in model.named_parameters()} == identities
+
+
+@require_torch_gpu
+def test_sampler_evidence_shadow_cuda_offloaded_corruption_remains_mismatched():
+    model = _PackedModel().cuda()
+    verifier = _verifier(model)
+    verifier.load("left", torch.tensor([1.0, 2.0], device="cuda"))
+    with torch.no_grad():
+        model.packed[0] = 7.0
+    result = verifier.finish()
+    assert result["destinations"]["packed"] == dict(uncovered=2, mismatched=1)
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("damage", ["none", "partial", "live", "shadow"])
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+def test_sampler_evidence_shadow_cuda_allocation_failure_preserves_copy_evidence(monkeypatch, damage, source_dtype):
+    model = _PackedModel().bfloat16().cuda()
+    identities = {name: id(value) for name, value in model.named_parameters()}
+    native_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("dtype") == torch.uint8 and torch.device(kwargs.get("device", "cpu")).type == "cuda":
+            raise torch.OutOfMemoryError("bounded allocation failure")
+        return native_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    verifier = _verifier(model)
+    verifier.load("left", torch.tensor([1.001, 2.003], device="cuda", dtype=source_dtype))
+    key = verifier.storage_keys["packed"]
+    assert key in verifier.host_backings and verifier.backings[key].device.type == "cpu"
+    if damage == "live":
+        with torch.no_grad():
+            model.packed[0] = 7.0
+    elif damage == "shadow":
+        verifier.backings[key][0] = 7.0
+    if damage != "partial":
+        verifier.load("right", torch.tensor([3.005, 4.007], device="cuda", dtype=source_dtype))
+    result = verifier.finish()
+    assert result["destinations"]["packed"] == dict(
+        uncovered=2 if damage == "partial" else 0, mismatched=int(damage in ("live", "shadow"))
+    )
+    assert result["untouched_parameters"] == dict(other=1)
+    assert result["changed_after_verification"] == []
+    assert {name: id(value) for name, value in model.named_parameters()} == identities
+
+
+@require_torch_gpu
+def test_sampler_evidence_shadow_cuda_rematerialization_failure_preserves_copy_evidence(monkeypatch):
+    model = _PackedModel().cuda()
+    verifier = _verifier(model)
+    verifier.load("left", torch.tensor([1.0, 2.0], device="cuda"))
+    key = verifier.storage_keys["packed"]
+    backing = verifier.backings[key]
+    native_to = torch.Tensor.to
+
+    def to(value, *args, **kwargs):
+        if value is backing and args and torch.device(args[0]).type == "cuda":
+            raise torch.OutOfMemoryError("bounded rematerialization failure")
+        return native_to(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    verifier.load("right", torch.tensor([3.0, 4.0], device="cuda"))
+    assert key in verifier.host_backings
+    result = verifier.finish()
+    assert result["destinations"]["packed"] == dict(uncovered=0, mismatched=0)
+    assert result["changed_after_verification"] == []
+
+
+@require_torch_gpu
+def test_sampler_evidence_shadow_cuda_allocation_failure_never_replays_arithmetic_on_cpu(monkeypatch):
+    class ArithmeticModel(_PackedModel):
+        def load_weights(self, weights):
+            self.packed.data.mul_(2)
+
+    model = ArithmeticModel().cuda()
+    native_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("dtype") == torch.uint8 and torch.device(kwargs.get("device", "cpu")).type == "cuda":
+            raise torch.OutOfMemoryError("bounded allocation failure")
+        return native_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    verifier = _verifier(model)
+    with pytest.raises(ValueError, match="CUDA shadow arithmetic requires GPU storage"):
+        verifier.load("weight", torch.tensor([1.0], device="cuda"))
+    assert model.packed.device.type == "cuda" and not torch.isnan(model.packed).any()
+
+
+def test_sampler_evidence_shadow_comparison_uses_bounded_chunks(monkeypatch):
+    monkeypatch.setattr(sampler_evidence_evidence, "_MANIFEST_CHUNK_BYTES", 4)
+    verifier = _verifier(_PackedModel())
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    chunks = list(verifier._comparison_chunks("packed"))
+    assert len(chunks) == 4
+    assert all(uncovered.numel() == 1 and mismatch.numel() == 1 for uncovered, mismatch in chunks)
+    assert verifier.finish()["destinations"]["packed"] == dict(uncovered=2, mismatched=0)
+
+
+@pytest.mark.parametrize("width", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("elements", [0, 1, 257])
+def test_sampler_evidence_element_byte_equality_preserves_every_byte(width, elements):
+    shadow = torch.arange((elements + 1) * width, dtype=torch.int64).to(torch.uint8).reshape(-1, width)[1:]
+    fill = torch.arange(width, dtype=torch.uint8)
+    expected_coverage = (shadow == fill).all(dim=1)
+    torch_assert_equal(sampler_evidence_evidence._equal_element_bytes(shadow, fill), expected_coverage)
+    for byte in range(width):
+        actual = shadow.clone()
+        actual[::3, byte] ^= 1
+        torch_assert_equal(
+            sampler_evidence_evidence._equal_element_bytes(actual, shadow), (actual == shadow).all(dim=1)
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("chunk_bytes", [9, 16, 31])
+def test_sampler_evidence_shadow_bit_comparison_preserves_nan_zero_and_partial_coverage(
+    monkeypatch, dtype, transpose, chunk_bytes
+):
+    monkeypatch.setattr(sampler_evidence_evidence, "_MANIFEST_CHUNK_BYTES", chunk_bytes)
+    model = _PackedModel()
+    value = torch.zeros(3, 4, dtype=dtype)
+    model.packed = torch.nn.Parameter(value.T if transpose else value)
+    verifier = _verifier(model)
+    verifier._open(verifier.storage_keys["packed"], from_live=False)
+    shadow = verifier._view("packed")
+    with torch.no_grad():
+        shadow[0].copy_(model.packed[0])
+        shadow[1].fill_(-0.0)
+        model.packed[2].fill_(float("nan"))
+        model.packed.detach().as_strided((model.packed.numel(),), (1,), 0).view(torch.uint8)[-1] ^= 1
+    expected_bytes = shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, value.element_size())
+    actual_bytes = model.packed.detach().contiguous().reshape(-1).view(torch.uint8).reshape(-1, value.element_size())
+    expected_coverage = (expected_bytes == verifier._fill("packed")).all(dim=1)
+    expected_mismatch = (actual_bytes != expected_bytes).any(dim=1)
+    chunks = list(verifier._comparison_chunks("packed"))
+    torch_assert_equal(torch.cat([uncovered for uncovered, _ in chunks]), expected_coverage)
+    torch_assert_equal(torch.cat([mismatch for _, mismatch in chunks]), expected_mismatch)
+    assert all(uncovered.numel() <= max(1, chunk_bytes // value.element_size()) for uncovered, _ in chunks)
+
+
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_sampler_evidence_element_byte_equality_avoids_threaded_cpu_comparison(width):
+    operations = []
+
+    class Observe(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operations.append((func, args))
+            return func(*args, **(kwargs or {}))
+
+    left = torch.zeros(4, width, dtype=torch.uint8)
+    with Observe():
+        actual = sampler_evidence_evidence._equal_element_bytes(left, left.clone())
+    torch_assert_equal(actual, torch.ones(4, dtype=torch.bool))
+    assert all(func not in {torch.ops.aten.eq.Tensor, torch.ops.aten.all.dim} for func, _ in operations)
+
+
+def test_sampler_evidence_shadow_cpu_comparison_keeps_thread_settings_and_avoids_threaded_masks(monkeypatch):
+    operations = []
+
+    class Observe(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operations.append(func)
+            return func(*args, **(kwargs or {}))
+
+    def change_threads(*args, **kwargs):
+        raise AssertionError("verification must not change process-global thread settings")
+
+    monkeypatch.setattr(torch, "set_num_threads", change_threads)
+    verifier = _verifier(_PackedModel())
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    with Observe():
+        assert verifier._uncovered_count("packed") == 2
+        result = verifier.finish()
+    assert result["destinations"]["packed"] == dict(uncovered=2, mismatched=0)
+    assert all(
+        func
+        not in {
+            torch.ops.aten.eq.Tensor,
+            torch.ops.aten.bitwise_not.default,
+            torch.ops.aten.bitwise_and.Tensor,
+            torch.ops.aten.sum.default,
+        }
+        for func in operations
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("chunk_bytes", [4, 16, 64])
+def test_sampler_evidence_shadow_coverage_does_not_read_or_compare_live_bytes(
+    monkeypatch, dtype, transpose, chunk_bytes
+):
+    class CoverageModel(_PackedModel):
+        def load_weights(self, weights):
+            for _, incoming in weights:
+                self.packed.data[0].copy_(incoming)
+
+    monkeypatch.setattr(sampler_evidence_evidence, "_MANIFEST_CHUNK_BYTES", chunk_bytes)
+    model = CoverageModel()
+    value = torch.zeros(3, 4, dtype=dtype)
+    model.packed = torch.nn.Parameter(value.T if transpose else value)
+    verifier = _verifier(model)
+    verifier.load("first-row", torch.ones_like(model.packed[0]))
+    shadow = verifier._view("packed")
+    expected_uncovered = shadow.numel() - shadow[0].numel()
+    native_cpu = torch.Tensor.cpu
+    live_pointer = model.packed.untyped_storage().data_ptr()
+
+    def cpu(value, *args, **kwargs):
+        assert value.untyped_storage().data_ptr() != live_pointer
+        return native_cpu(value, *args, **kwargs)
+
+    def comparison(name):
+        raise AssertionError("coverage must not perform live-byte comparisons")
+
+    with monkeypatch.context() as coverage:
+        coverage.setattr(torch.Tensor, "cpu", cpu)
+        coverage.setattr(verifier, "_comparison_chunks", comparison)
+        assert verifier._uncovered_count("packed") == expected_uncovered
+        with torch.no_grad():
+            model.packed.fill_(7)
+        assert verifier._uncovered_count("packed") == expected_uncovered
+    assert verifier.finish()["destinations"]["packed"] == dict(
+        uncovered=expected_uncovered, mismatched=shadow[0].numel()
+    )
+
+
 class _SamplerHcPadding(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -52572,8 +53893,53 @@ def test_sampler_evidence_shadow_duplicate_wire_names_fail():
 
 
 def test_sampler_evidence_shadow_budget_checked_before_allocation():
+    model = _PackedModel()
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=1)
     with pytest.raises(ValueError, match="explicit"):
-        sampler_evidence_evidence.ShadowVerifier(_PackedModel(), max_shadow_bytes=1)
+        verifier.load("left", torch.ones(2))
+    assert model.packed.tolist() == [0.0] * 4
+    assert verifier.backings == {} and verifier.peak_bytes == 0
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, None])
+def test_sampler_evidence_shadow_invalid_budget_is_rejected(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        sampler_evidence_evidence.ShadowVerifier(_PackedModel(), max_shadow_bytes=limit)
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_sampler_evidence_shadow_untouched_large_parameter_does_not_allocate(frozen):
+    model = _PackedModel()
+    model.unsent = torch.nn.Parameter(torch.zeros(128), requires_grad=not frozen)
+    size = model.packed.untyped_storage().nbytes()
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size)
+    verifier.load("left", torch.tensor([1.0, 2.0]))
+    verifier.load("right", torch.tensor([3.0, 4.0]))
+    verifier.load("other", torch.tensor([5.0]))
+    result = verifier.finish()
+    assert result["untouched_parameters"] == {"unsent": 128}
+    assert result["shadow_bytes"] == {"limit": size, "peak": size}
+    assert all(row == {"uncovered": 0, "mismatched": 0} for row in result["destinations"].values())
+    assert model.unsent.tolist() == [0.0] * 128
+    assert verifier.backings == {}
+
+
+@pytest.mark.parametrize("operation", ["write", "read"])
+def test_sampler_evidence_shadow_oversized_storage_rejected_before_use(operation):
+    model = _PackedModel()
+    size = model.packed.untyped_storage().nbytes()
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size - 1)
+
+    def loader(name, value):
+        if operation == "write":
+            model.packed.data.copy_(value)
+        else:
+            model.packed.data.clone()
+
+    with pytest.raises(ValueError, match="explicit"):
+        verifier.load("packed", torch.ones_like(model.packed), loader=loader)
+    assert model.packed.tolist() == [0.0] * 4
+    assert verifier.backings == {} and verifier.peak_bytes == 0
 
 
 def test_sampler_evidence_shadow_shared_storage_not_inferred():
@@ -52661,10 +54027,13 @@ def test_sampler_evidence_shadow_completed_storage_reopens_from_verified_live_by
 
 def test_sampler_evidence_shadow_mla_budget_counts_unique_backing_once():
     model = _MlaViewModel()
+    original = model.kv_b_proj.weight.detach().clone()
     size = model.kv_b_proj.weight.untyped_storage().nbytes()
     sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size)
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size - 1)
     with pytest.raises(ValueError, match="explicit"):
-        sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size - 1)
+        verifier.load("W_UV", torch.ones_like(model.W_UV))
+    assert torch.equal(model.kv_b_proj.weight, original)
 
 
 @pytest.mark.parametrize("layout", ["partial", "overlap", "expanded", "reinterpreted"])
@@ -52848,9 +54217,11 @@ def test_sampler_evidence_shadow_integer_buffer_budget_includes_private_storage(
         for allocator in ("full", "empty"):
             patch.setattr(torch, allocator, lambda *args, **kwargs: pytest.fail("verifier allocated at construction"))
         verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=largest)
-        with pytest.raises(ValueError, match="explicit"):
-            sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=largest - 1)
+        too_small = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=largest - 1)
     assert verifier.backings == {}
+    with pytest.raises(ValueError, match="explicit"):
+        too_small.load("ngram", torch.arange(4, dtype=torch.int64))
+    assert model.ngram.tolist() == [0] * 4
 
 
 def test_sampler_evidence_shadow_lazy_backings_stay_under_the_limit():
@@ -53192,7 +54563,55 @@ def test_native_broadcast_sender_observes_once_and_always_resets_context(monkeyp
     assert broadcast._SEND.get() is None
 
 
-def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypatch):
+@pytest.fixture
+def native_broadcast_evidence_groups(monkeypatch):
+    import torch.distributed as dist
+
+    created, released = [], []
+
+    def create(*, backend):
+        assert backend == "gloo"
+        group = object()
+        created.append(group)
+        return group
+
+    def release(group):
+        released.append(group)
+
+    monkeypatch.setattr(dist, "new_group", create)
+    monkeypatch.setattr(dist, "destroy_process_group", release)
+    yield created, released
+    assert released == created
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_native_broadcast_evidence_group_released_after_collective(
+    monkeypatch, failure, native_broadcast_evidence_groups
+):
+    import torch.distributed as dist
+
+    created, released = native_broadcast_evidence_groups
+    records = [None, None]
+    local = dict(rank=0)
+
+    def gather(actual, value, *, group):
+        assert group is created[-1] and released == []
+        assert actual is records and value is local
+        if failure:
+            raise RuntimeError("evidence collective failed")
+        actual[:] = [value, dict(rank=1)]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    if failure:
+        with pytest.raises(RuntimeError, match="evidence collective failed"):
+            broadcast._gather_broadcast_evidence(records, local)
+    else:
+        broadcast._gather_broadcast_evidence(records, local)
+        assert records == [dict(rank=0), dict(rank=1)]
+    assert len(created) == 1 and released == created
+
+
+def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypatch, native_broadcast_evidence_groups):
     import torch.distributed as dist
 
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
@@ -53202,7 +54621,8 @@ def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypa
     model = torch.nn.Linear(2, 1, bias=False)
     calls = []
 
-    def gather(records, local):
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
         calls.append(local)
         records[:] = [local, {**copy.deepcopy(local), "rank": 1}]
 
@@ -53233,7 +54653,9 @@ def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypa
         "missing-rank",
     ],
 )
-def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(monkeypatch, case):
+def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
     import torch.distributed as dist
 
     monkeypatch.setenv(broadcast.VERIFY_ENV, "1")
@@ -53245,7 +54667,8 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(monkey
     model.frozen._dss_skip_weight_sync = True
     calls = []
 
-    def gather(records, local):
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
         calls.append(local)
         replica = copy.deepcopy(local)
         replica["rank"] = 1
@@ -53303,7 +54726,9 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(monkey
     "case",
     ["complete", "unexported-drift", "exported-drift", "duplicate", "copied", "partial", "mutation"],
 )
-def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica(monkeypatch, case):
+def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
     import torch.distributed as dist
 
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
@@ -53314,7 +54739,8 @@ def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica
     model.register_buffer("exported", torch.arange(4, dtype=torch.float32))
     model.register_buffer("counter", torch.ones(3))
 
-    def gather(records, local):
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
         replica = copy.deepcopy(local)
         replica["rank"] = 1
         if case in ("exported-drift", "unexported-drift"):
@@ -53356,7 +54782,9 @@ def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica
 
 
 @pytest.mark.parametrize("case", ["buffer-alias", "parameter-alias", "enumeration"])
-def test_native_broadcast_invalid_buffer_inventory_fails_collectively(monkeypatch, case):
+def test_native_broadcast_invalid_buffer_inventory_fails_collectively(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
     import torch.distributed as dist
 
     monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
@@ -53377,7 +54805,8 @@ def test_native_broadcast_invalid_buffer_inventory_fails_collectively(monkeypatc
         monkeypatch.setattr(model, "named_buffers", fail_enumeration)
     calls = []
 
-    def gather(records, local):
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
         calls.append(local)
         records[:] = [local, {**copy.deepcopy(local), "rank": 1}]
 
@@ -54752,12 +56181,13 @@ def test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_eac
     "config_id",
     [inference_rl_check._FLASHNEXT_CONFIG_ID, "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k"],
 )
+@pytest.mark.parametrize("layers", [4, 48])
 def test_inference_ple_padding_floor_uses_effective_offline_config(
-    monkeypatch, composite, ngram, kernel, expected, config_id
+    monkeypatch, composite, ngram, kernel, expected, config_id, layers
 ):
     text = SimpleNamespace(
         model_type="qwen4_exp_text",
-        num_hidden_layers=48,
+        num_hidden_layers=layers,
         ngram_size=ngram,
         ple_conv_kernel_size=kernel,
     )
@@ -54789,11 +56219,15 @@ def test_inference_ple_padding_floor_uses_effective_offline_config(
         ("ngram_size", None),
         ("ple_conv_kernel_size", -1),
         ("ple_conv_kernel_size", 4.0),
-        ("num_hidden_layers", 4),
+        ("num_hidden_layers", 0),
+        ("num_hidden_layers", -1),
+        ("num_hidden_layers", True),
+        ("num_hidden_layers", 4.0),
+        ("num_hidden_layers", None),
         ("model_type", "qwen3"),
     ],
 )
-def test_inference_ple_padding_refuses_missing_invalid_or_reduced_config(monkeypatch, field, value):
+def test_inference_ple_padding_refuses_missing_or_invalid_config(monkeypatch, field, value):
     text = SimpleNamespace(
         model_type="qwen4_exp_text",
         num_hidden_layers=48,
@@ -55885,6 +57319,31 @@ def test_inference_export_hostfile_symlink_prescribed_target_binds_bytes_and_ord
     assert before["original"] != before["target"]
 
 
+def test_inference_export_unordered_hostfile_returns_actual_head_first(
+    _inference_export_prescribed_hostfile,
+):
+    admission = _inference_export_prescribed_hostfile
+    head = admission["nodes"][0]
+    worker = dict(head, host="127.0.0.2", hostname="fixture-worker")
+    target = export._LOCAL_HOSTFILE_TARGET
+    target.write_text("127.0.0.2 slots=8\n127.0.0.1 slots=8\n")
+    admission["hostfile_content"] = target.read_text()
+    admission["hostfile_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    admission["nodes"] = [worker, head]
+    before = copy.deepcopy(admission)
+    assert export.validate_local_inference_allocation(admission) == [head, worker]
+    assert admission == before
+
+
+def test_inference_export_admission_without_live_head_is_rejected(
+    _inference_export_locality_admission,
+):
+    admission = _inference_export_locality_admission
+    admission["nodes"][0]["hostname"] = "different-allocation-head"
+    with pytest.raises(ValueError, match="match the live head"):
+        export.validate_local_inference_allocation(admission)
+
+
 @pytest.mark.parametrize("change", ["link_target", "same_bytes_target_replacement"])
 def test_inference_export_hostfile_symlink_changed_during_validation_rejected(
     _inference_export_prescribed_hostfile, monkeypatch, tmp_path, change
@@ -56695,6 +58154,30 @@ _inference_sampling_topology_TOPOLOGIES = [(8, 8, 1), (16, 8, 2)]
 
 _inference_sampling_topology_TOKEN_BUDGET = 10240
 
+_inference_sampling_topology_DENSE_B200_CONFIG = (
+    _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-27b/b200/train-sft-8gpus-2k.config"
+)
+
+# Routed-expert fields of the full models these configs name, as their HF ``text_config`` declares them.
+_inference_sampling_topology_MODEL_EXPERTS = {
+    "Qwen/Qwen3-8B": {},
+    "Qwen/Qwen3.8-Flash-Next": {"num_experts": 512},
+    "zai-org/GLM-5.3-Flash": {"n_routed_experts": 288},
+    "zai-org/GLM-5.3-Flash-BF16": {"n_routed_experts": 288},
+}
+
+
+@pytest.fixture(autouse=False)
+def _inference_sampling_model_configs(monkeypatch):
+    read = inference_rl_check._model_config
+
+    def model_config(source):
+        if source in _inference_sampling_topology_MODEL_EXPERTS:
+            return {"text_config": dict(_inference_sampling_topology_MODEL_EXPERTS[source])}
+        return read(source)
+
+    monkeypatch.setattr(inference_rl_check, "_model_config", model_config)
+
 
 def _inference_sampling_topology_context(config=_inference_sampling_topology_FLASH_CONFIG, topology=None):
     cfg = load_config(config)
@@ -56758,6 +58241,49 @@ def test_inference_sampling_topology_glm_reviewed_sampler_survives_cortex_wire()
     assert engine["extra_engine_kwargs"]["distributed_executor_backend"] == "ray"
     assert ctx.cfg.n_gpus == ctx.cfg.sp_size == ctx.cfg.training["ep_size"] == 16
     assert ctx.cfg == before
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_inference_sampling_topology_flashnext_replicas_survive_cortex_wire(monkeypatch, tmp_path, local):
+    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    ctx = _inference_sampling_topology_context(path, topology=(16, 8, 1))
+    before = deepcopy(ctx.cfg)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    if local:
+        weights = tmp_path / "saved-flashnext"
+        monkeypatch.setattr(inference_rl_check, "validate_local_inference_export", lambda ctx, path: path)
+        monkeypatch.setattr(export, "require_local_inference_export_locality", lambda ctx, path: None)
+        config = inference_rl_check.local_cortex_sampling_config(ctx, backend, weights, 10240)
+    else:
+        config = inference_rl_check.cortex_sampling_config(ctx, backend, "cp_flashnext", "owned-training", 10240)
+    sub = config.to_cortex()[0]
+    inference = sub["inference_config"]
+    engine = inference["vllm_config"]
+    assert inference_rl_check.sampling_gpu_count(ctx) == 16
+    assert inference["n_gpus"] == 16
+    assert inference["num_replicas"] == 2
+    assert engine["tensor_parallel_size"] == 8
+    assert engine["pipeline_parallel_size"] == 1
+    assert engine["extra_engine_kwargs"]["data_parallel_size"] == 1
+    assert ctx.cfg == before
+
+
+@pytest.mark.parametrize("replicas", [True, 2.0, 0, -1, None, 1, 3])
+def test_inference_sampling_topology_flashnext_rejects_invalid_or_inconsistent_replicas(replicas):
+    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    ctx = _inference_sampling_topology_context(path, topology=(16, 8, 1))
+    inference = next(sub["inference_config"] for sub in ctx.cfg.sub_jobs if sub["job_type"] == "sampling")
+    inference["num_replicas"] = replicas
+    with pytest.raises(ValueError):
+        inference_rl_check.sampling_gpu_count(ctx)
+
+
+def test_inference_sampling_topology_flashnext_default_does_not_enable_replicas():
+    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    ctx = _inference_sampling_topology_context(path)
+    payload = inference_rl_check._sampling_payload(ctx, "/saved-flashnext", 10240)
+    assert inference_rl_check.sampling_gpu_count(ctx) == 1
+    assert "num_replicas" not in payload["inference_config"]
 
 
 def test_inference_sampling_topology_lora_recipe_survives_payload_and_cortex_wire():
@@ -56955,6 +58481,35 @@ def test_inference_sampling_topology_explicit_training_only_placement_accepts_va
     assert engine["tensor_parallel_size"] == topology[1]
     assert engine["pipeline_parallel_size"] == topology[2]
     assert "engram_config" not in engine["extra_engine_kwargs"]
+
+
+@pytest.mark.parametrize(
+    "experts,expert_parallel",
+    [
+        ({}, False),
+        ({"num_experts": 0}, False),
+        ({"num_experts": 512}, True),
+        ({"n_routed_experts": 288}, True),
+        ({"num_local_experts": 8}, True),
+    ],
+)
+def test_inference_sampling_topology_expert_parallelism_follows_the_model_routed_experts(
+    tmp_path, experts, expert_parallel
+):
+    model = tmp_path / "full-model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text", **experts}})
+    )
+    ctx = _inference_sampling_topology_context(_inference_sampling_topology_DENSE_B200_CONFIG, topology=(8, 8, 1))
+    ctx.cfg.sub_job["model_name"] = str(model)
+    ctx.cfg.native.model_name = str(model)
+    engine = inference_rl_check._sampling_payload(ctx, "/saved/full-checkpoint", 10240)["inference_config"][
+        "vllm_config"
+    ]
+    assert engine["enable_expert_parallel"] is expert_parallel
+    assert engine["tensor_parallel_size"] == 8
+    assert engine["pipeline_parallel_size"] == 1
 
 
 @pytest.mark.parametrize("topology", _inference_sampling_topology_TOPOLOGIES)
@@ -59667,6 +61222,309 @@ def test_rl_checks_weight_sync_without_sampler_verification_raises():
         rl_weight_sync.judge(sync)
 
 
+_RL_CHECKS_LORA_SHAPES = {
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": (2, 4),
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": (3, 2),
+    "base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight": (2, 4),
+    "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight": (4, 2),
+}
+
+
+def _rl_checks_lora_adapters():
+    return {
+        name: torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols) + index
+        for index, (name, (rows, cols)) in enumerate(_RL_CHECKS_LORA_SHAPES.items())
+    }
+
+
+def _rl_checks_lora_records(sent, ranks=2):
+    return [
+        {
+            "status": "ok",
+            "weight_format": "lora",
+            "rank": rank,
+            "world_size": ranks + 1,
+            "received": {name: {**entry, "destinations": [f"{name}.installed"]} for name, entry in sent.items()},
+        }
+        for rank in range(1, ranks + 1)
+    ]
+
+
+def _rl_checks_lora_sync(records=None):
+    """A LoRA sync from two DP trainer ranks holding frozen base weights beside their trainable adapters."""
+    sent = {name: tensor_manifest(value) for name, value in _rl_checks_lora_adapters().items()}
+    parameters = {
+        name.removesuffix(".weight") + ".default.weight": dict(**entry, requires_grad=True, ep_ranks=None)
+        for name, entry in sent.items()
+    }
+    for name, shape in (
+        ("base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight", (3, 4)),
+        ("base_model.model.model.layers.0.self_attn.o_proj.base_layer.weight", (4, 4)),
+    ):
+        parameters[name] = dict(**tensor_manifest(torch.ones(shape)), requires_grad=False, ep_ranks=None)
+    inventory = global_inventory(
+        [dict(rank=rank, world_size=2, parameters=copy.deepcopy(parameters), buffers={}) for rank in range(2)]
+    )
+    return {
+        "weight_format": "lora",
+        "targets": [
+            {
+                "send": {
+                    "results": [
+                        {
+                            "weight_format": "lora",
+                            "sent_manifest": sent,
+                            "trainer_parameters": {
+                                "count": len(parameters),
+                                "numel": sum(entry["global_numel"] for entry in inventory["parameters"].values()),
+                            },
+                            "trainer_inventory": inventory,
+                            "trainer_buffers": {"numel": 0, "count": 0, "wire_numel": 0, "wire_sources": {}},
+                        },
+                        {"sent_manifest": None},
+                    ]
+                },
+                "recv": {
+                    "recv": {
+                        "weight_format": "lora",
+                        "workers": [
+                            {
+                                "all_rank_weight_sync_verification": (
+                                    _rl_checks_lora_records(sent) if records is None else records
+                                )
+                            }
+                        ],
+                    }
+                },
+            }
+        ],
+    }
+
+
+def _rl_checks_lora_ranks(sync):
+    return sync["targets"][0]["recv"]["recv"]["workers"][0]["all_rank_weight_sync_verification"]
+
+
+def test_rl_checks_lora_weight_sync_agreement_passes():
+    failed, metrics = rl_weight_sync.judge(_rl_checks_lora_sync())
+    assert failed == []
+    assert metrics["sent_elements"] == metrics["trainer_elements"] == 30
+    assert metrics["trainer_parameter_elements"] == 58
+    assert metrics["sampler_ranks"] == 2
+    assert metrics["sampler_ranks_missing"] == 0
+
+
+def test_rl_checks_lora_weight_sync_holdings_are_the_trainable_parameters():
+    sync = _rl_checks_lora_sync()
+    sync["weight_format"] = "vllm"
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert [failure.name for failure in failed] == ["trainer elements sent"]
+    assert metrics["trainer_elements"] == 58
+
+
+_Q_B = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+_O_B = "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight"
+
+
+@pytest.mark.parametrize(
+    "case,expected,metric",
+    [
+        ("trainer-unsent", "trainer elements sent", None),
+        ("uninstalled", f"sampler rank 2: {_Q_B} received but installed into no LoRA-manager module", "dropped"),
+        ("not-received", f"sampler rank 1: {_O_B} not received", "missing"),
+        ("bytes", f"sampler rank 1: {_Q_B} received with different bytes", "differing"),
+        ("extra", "sampler rank 2: extra.lora_A.weight received but not sent", "extra"),
+        ("missing-rank", "sampler rank 2: no verification record", "ranks_missing"),
+    ],
+)
+def test_rl_checks_lora_weight_sync_disagreement_fails(case, expected, metric):
+    sync = _rl_checks_lora_sync()
+    ranks = _rl_checks_lora_ranks(sync)
+    if case == "trainer-unsent":
+        sync["targets"][0]["send"]["results"][0]["sent_manifest"].pop(_O_B)
+        for record in ranks:
+            record["received"].pop(_O_B)
+    elif case == "uninstalled":
+        ranks[1]["received"][_Q_B]["destinations"] = []
+    elif case == "not-received":
+        ranks[0]["received"].pop(_O_B)
+    elif case == "bytes":
+        ranks[0]["received"][_Q_B]["sha256"] = "0" * 64
+    elif case == "extra":
+        ranks[1]["received"]["extra.lora_A.weight"] = {**ranks[1]["received"][_Q_B], "destinations": ["extra"]}
+    elif case == "missing-rank":
+        ranks.pop()
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert [failure.name for failure in failed if expected in failure.name], [failure.name for failure in failed]
+    if metric is not None:
+        assert metrics[f"sampler_{metric}"] == 1
+
+
+@pytest.mark.parametrize("case", ["world-sizes-differ", "duplicate-rank", "trainer-rank", "no-inventory"])
+def test_rl_checks_lora_weight_sync_malformed_evidence_raises(case):
+    sync = _rl_checks_lora_sync()
+    ranks = _rl_checks_lora_ranks(sync)
+    if case == "world-sizes-differ":
+        ranks[1]["world_size"] = 4
+    elif case == "duplicate-rank":
+        ranks[1]["rank"] = 1
+    elif case == "trainer-rank":
+        ranks[0]["rank"] = 0
+    elif case == "no-inventory":
+        sync["targets"][0]["send"]["results"][0].pop("trainer_inventory")
+    with pytest.raises(RuntimeError):
+        rl_weight_sync.judge(sync)
+
+
+class _LoRAWeightSyncEngine:
+    def __init__(self, rows):
+        self.rows = rows
+        self.released = False
+
+    def receive_weights(self):
+        yield from self.rows
+
+    def release_staging_buffers(self):
+        self.released = True
+
+
+class _LoRAWeightSyncManager:
+    """The vLLM LoRA-manager surface the receiver uses: packed modules merge on add, only wrapped modules apply."""
+
+    def __init__(self, modules, packed_modules):
+        self.modules = {name: object() for name in modules}
+        self.packed_modules = packed_modules
+        self.adapters = {}
+
+    def remove_adapter(self, adapter_id):
+        return self.adapters.pop(adapter_id, None) is not None
+
+    def add_adapter(self, adapter):
+        from vllm.lora.lora_weights import PackedLoRALayerWeights
+
+        for packed, members in self.packed_modules.items():
+            parts = [adapter.loras.get(member) for member in members]
+            if any(part is not None for part in parts):
+                adapter.loras[packed] = PackedLoRALayerWeights.pack(parts)
+                for member in members:
+                    adapter.loras.pop(member, None)
+        self.adapters[adapter.id] = adapter
+        return True
+
+    def activate_adapter(self, adapter_id):
+        return adapter_id in self.adapters
+
+    def get_adapter(self, adapter_id):
+        return self.adapters.get(adapter_id)
+
+    def _get_lora_layer_weights(self, adapter, name):
+        return adapter.loras.get(name)
+
+
+def _lora_weight_sync_receive(monkeypatch, receiver_module, tp_rank, rows):
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.lora.lora_model as lora_model_module
+    import vllm.utils.platform_utils as platform_utils
+
+    attention = "model.layers.0.self_attn"
+    manager = _LoRAWeightSyncManager(
+        [f"{attention}.qkv_proj", f"{attention}.o_proj"],
+        {f"{attention}.qkv_proj": [f"{attention}.{name}" for name in ("q_proj", "k_proj", "v_proj")]},
+    )
+    engine = _LoRAWeightSyncEngine(rows)
+    extension = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(dtype=torch.float32),
+        model_runner=SimpleNamespace(model=None),
+        _get_or_create_broadcast_engine=lambda *args: engine,
+        _lora_adapter_manager=lambda: manager,
+        _build_result=lambda start, mem_before, path, loaded: {
+            "status": "done",
+            "update_path": path,
+            "loaded": loaded,
+        },
+    )
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: SimpleNamespace(rank=tp_rank))
+    monkeypatch.setattr(platform_utils, "is_pin_memory_available", lambda: False)
+    monkeypatch.setattr(lora_model_module, "PIN_MEMORY", False)
+    monkeypatch.setattr(receiver_module.torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
+    monkeypatch.setattr(receiver_module.torch.cuda, "memory_allocated", lambda device=None: 0)
+    result = receiver_module.WeightSyncExtension.sync_lora_weights_broadcast(
+        extension,
+        "same-allocation-host",
+        30000,
+        rank_offset=1,
+        world_size=3,
+        lora_int_id=1,
+        lora_name="policy",
+        lora_config={
+            "peft_type": "Lora",
+            "task_type": "CAUSAL_LM",
+            "r": 2,
+            "lora_alpha": 4,
+            "target_modules": ["q_proj", "o_proj", "unwrapped_proj"],
+        },
+    )
+    assert engine.released
+    return result, manager
+
+
+def test_lora_weight_sync_receiver_records_installed_factors_only_when_verifying(monkeypatch):
+    pytest.importorskip("vllm")
+    from arctic_platform.inference.server.weight_sync import receiver as receiver_module
+
+    adapters = _rl_checks_lora_adapters()
+    unwrapped = "base_model.model.model.layers.0.mlp.unwrapped_proj.lora_A.weight"
+    rows = [*adapters.items(), (unwrapped, torch.ones(2, 4))]
+
+    monkeypatch.delenv(VERIFY_ENV, raising=False)
+    plain, _ = _lora_weight_sync_receive(monkeypatch, receiver_module, 0, [(n, v.clone()) for n, v in rows])
+    assert "weight_sync_verification" not in plain and "rank" not in plain
+
+    monkeypatch.setenv(VERIFY_ENV, "1")
+    verified = []
+    for tp_rank in (0, 1):
+        result, manager = _lora_weight_sync_receive(
+            monkeypatch, receiver_module, tp_rank, [(n, v.clone()) for n, v in rows]
+        )
+        verified.append(result)
+    assert {key: value for key, value in result.items() if key not in ("rank", "weight_sync_verification")} == plain
+    record = result["weight_sync_verification"]
+    assert (result["rank"], record["rank"], record["world_size"], record["weight_format"]) == (2, 2, 3, "lora")
+    attention = "model.layers.0.self_attn"
+    assert {name: entry["destinations"] for name, entry in record["received"].items()} == {
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": [f"{attention}.qkv_proj.lora_a[0]"],
+        _Q_B: [f"{attention}.qkv_proj.lora_b[0]"],
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight": [f"{attention}.o_proj.lora_a"],
+        _O_B: [f"{attention}.o_proj.lora_b"],
+        unwrapped: [],
+    }
+    # The installed q_proj B factor carries the folded alpha / r = 2 scaling; the record is of the received bytes.
+    installed = manager.get_adapter(1).loras[f"{attention}.qkv_proj"].lora_b[0]
+    assert torch.equal(installed, adapters[_Q_B] * 2)
+    assert {
+        name: {key: entry[key] for key in tensor_manifest(adapters[_Q_B])}
+        for name, entry in record["received"].items()
+    } == {name: tensor_manifest(value) for name, value in rows}
+
+    gathered = _collect_broadcast(verified, world=2, offset=1)
+    records = gathered[0]["all_rank_weight_sync_verification"]
+    for entry in records:
+        entry["received"].pop(unwrapped)
+    failed, metrics = rl_weight_sync.judge(_rl_checks_lora_sync(records))
+    assert failed == []
+    assert metrics["sampler_ranks"] == 2
+
+    for entry in records:
+        entry["received"][unwrapped] = {**tensor_manifest(torch.ones(2, 4)), "destinations": []}
+    failed, _ = rl_weight_sync.judge(_rl_checks_lora_sync(records))
+    assert [failure.name for failure in failed] == [
+        f"sampler rank {rank}: {unwrapped} {kind}"
+        for rank in (1, 2)
+        for kind in ("received but not sent", "received but installed into no LoRA-manager module")
+    ]
+
+
 def _rl_checks_samples():
     rows = [
         ([5, 6, 7], 2, [[[1], [2]], [[3], [4]]]),
@@ -59808,14 +61666,15 @@ def test_router_replay_evidence_rejects_publication_without_active_trace(
     _router_replay_evidence_case, monkeypatch, operation
 ):
     engine, kwargs, _ = _router_replay_evidence_case
-    monkeypatch.setattr(replay_evidence, "_active", None)
-    with pytest.raises(RuntimeError, match="publication has no active trace"):
-        if operation == "receive":
-            replay_evidence.maybe_record_router_replay_received("sample", None)
-        elif operation == "begin":
-            replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward=True)
-        else:
-            replay_evidence.maybe_complete_router_replay_call(engine)
+    with monkeypatch.context() as patch:
+        patch.setattr(replay_evidence, "_active", None)
+        with pytest.raises(RuntimeError, match="publication has no active trace"):
+            if operation == "receive":
+                replay_evidence.maybe_record_router_replay_received("sample", None)
+            elif operation == "begin":
+                replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward=True)
+            else:
+                replay_evidence.maybe_complete_router_replay_call(engine)
 
 
 @pytest.mark.parametrize(
@@ -61516,6 +63375,14 @@ def test_optimizer_compute_dtype_follows_the_resolved_product_implementation(tmp
     glm_bf16_cpu_adam = load_config(_optimizer_compute_dtype_GLM_BF16)
     assert glm_bf16_cpu_adam.optimizer_dtype == "bfloat16"
     assert glm_bf16_cpu_adam.optimizer_compute_dtype(glm) == "float32"
+    # ``optimizer.fused: false`` selects the non-fused CPUAdam arithmetic, which computes in the storage precision.
+    raw = json.loads(_optimizer_compute_dtype_GLM_BF16.read_text())
+    raw["training"]["ds_config"]["optimizer"]["params"]["fused"] = False
+    nonfused_path = tmp_path / _optimizer_compute_dtype_GLM_BF16.name
+    nonfused_path.write_text(json.dumps(raw))
+    glm_bf16_nonfused = load_config(nonfused_path)
+    assert glm_bf16_nonfused.optimizer_dtype == "bfloat16"
+    assert glm_bf16_nonfused.optimizer_compute_dtype(glm) == "bfloat16"
 
 
 def _optimizer_compute_dtype_bf16_problem():
@@ -61661,6 +63528,7 @@ _SELFTEST_FIXTURES = (
     "native_original_capability",
     "lora_config_serialization_control",
     "native_spawn_globals_control",
+    "native_broadcast_evidence_groups",
     "native_first_two_control",
     "native_shared_pack_control",
     "native_shared_pack_capability",
@@ -61715,6 +63583,7 @@ _SELFTEST_FIXTURES = (
     "_inference_export_locality_saved",
     "_inference_export_locality_adapter",
     "_inference_export_locality_admission",
+    "_inference_sampling_model_configs",
     "_inference_export_prescribed_hostfile",
     "_inference_export_integration_runner",
     "_inference_text_projection_projection_case",
@@ -62075,7 +63944,7 @@ _SELFTEST_GROUPS = {
         "test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_failure",
         "test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_command",
         "test_onboarding_resume_config_only_command_retries_failed_optimizer",
-        "test_getting_started_preserves_pr_demo_commands_and_is_first_read",
+        "test_getting_started_preserves_pr_demo_config_and_is_first_read",
         "test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scratch",
         "test_total_runtime_rounds_up_with_full_hours_minutes_seconds",
         "test_onboarding_heading_marker_is_distinct_from_inner_stages",
@@ -62360,6 +64229,7 @@ _SELFTEST_GROUPS = {
         "test_local_cortex_optimizer_runner_rejects_different_frozen_optimizer_reference_before_batch_or_job",
         "test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gpu_width",
         "test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_actual_child",
+        "test_maintained_native_optimizer_keeps_ordinary_participation_receipts_out_of_native_decode",
         "test_maintained_native_optimizer_supplier_timeout_keeps_inputs_for_pending_owner",
         "test_maintained_native_optimizer_failed_stage_never_publishes_or_uses_unadmitted_baseline",
         "test_maintained_native_optimizer_requires_selected_supplier_source_before_save",
@@ -63055,6 +64925,9 @@ _SELFTEST_GROUPS = {
     "onboarding_storage": [
         "test_onboarding_checkout_root_uses_library_for_external_configs",
         "test_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_not_git",
+        "test_onboarding_checkout_root_preserves_nested_source_tree",
+        "test_onboarding_checkout_root_final_regression_binds_source_config_directory",
+        "test_onboarding_final_regression_scopes_inference_options_to_inference",
         "test_data_fast_storage_require_data_fast_path_returns_canonical_path_without_writes",
         "test_data_fast_storage_require_data_fast_path_expands_home_and_relative_paths",
         "test_data_fast_storage_require_data_fast_path_rejects_other_storage",
@@ -63218,6 +65091,8 @@ _SELFTEST_GROUPS = {
         "test_native_checkpoint_bridge_training_config_round_trips_optional_optimizer_defaults",
         "test_native_checkpoint_bridge_leaves_weights_only_and_sampling_configs_unchanged",
         "test_native_checkpoint_bridge_exact_store_survives_fresh_child_resume",
+        "test_native_checkpoint_bridge_expert_replicas_precede_catalog_publication",
+        "test_native_checkpoint_bridge_replica_failure_does_not_publish_checkpoint",
         "test_native_checkpoint_bridge_rejects_incompatible_resume_before_load",
         "test_native_checkpoint_bridge_rejects_invalid_native_save_metadata",
         "test_native_checkpoint_bridge_rejects_wrong_restored_state",
@@ -63295,6 +65170,14 @@ _SELFTEST_GROUPS = {
         "test_native_checkpoint_store_preserves_timeout_output",
         "test_native_checkpoint_store_create_verify_and_explicit_close",
         "test_native_checkpoint_store_root_is_retained_without_close",
+        "test_native_checkpoint_expert_replicas_complete_inventory_is_not_copied",
+        "test_native_checkpoint_expert_manifest_rejects_incomplete_or_conflicting_shards",
+        "test_native_checkpoint_expert_file_identity_rejects_unsafe_files",
+        "test_native_checkpoint_expert_directory_rejects_non_native_tags",
+        "test_native_checkpoint_expert_operations_allow_concurrent_source_readers",
+        "test_native_checkpoint_expert_inventory_excludes_sampler_nodes",
+        "test_native_checkpoint_expert_replicas_reject_unacknowledged_training_nodes",
+        "test_native_checkpoint_expert_replica_transfer_is_verified_and_never_overwrites",
         "test_native_checkpoint_store_rejects_unsafe_roots",
         "test_native_checkpoint_store_never_overwrites_existing_native_namespace",
         "test_native_checkpoint_store_preserves_replaced_owned_objects",
@@ -63522,6 +65405,7 @@ _SELFTEST_GROUPS = {
         "test_native_broadcast_training_engine_consumes_opt_in_before_deepspeed",
         "test_native_broadcast_parent_environment_is_restored",
         "test_sampler_evidence_manifest_preserves_bf16_bytes_and_geometry",
+        "test_sampler_evidence_manifest_bounded_hash_preserves_exact_bytes",
         "test_sampler_evidence_sender_passes_exact_existing_list_once",
         "test_sampler_evidence_disabled_sender_and_pool_are_unchanged",
         "test_sampler_evidence_incomplete_sender_rejected_before_send",
@@ -63529,8 +65413,17 @@ _SELFTEST_GROUPS = {
         "test_sampler_evidence_shadow_view_narrow_writes_have_actual_destinations",
         "test_sampler_evidence_shadow_partial_dropped_and_untouched_are_not_erased",
         "test_sampler_evidence_shadow_byte_mismatch_is_reported",
+        "test_sampler_evidence_shadow_cuda_partial_backings_offload_without_changing_replay",
+        "test_sampler_evidence_shadow_cuda_offloaded_corruption_remains_mismatched",
+        "test_sampler_evidence_shadow_cuda_allocation_failure_preserves_copy_evidence",
+        "test_sampler_evidence_shadow_cuda_rematerialization_failure_preserves_copy_evidence",
+        "test_sampler_evidence_shadow_cuda_allocation_failure_never_replays_arithmetic_on_cpu",
+        "test_sampler_evidence_shadow_comparison_uses_bounded_chunks",
         "test_sampler_evidence_shadow_duplicate_wire_names_fail",
         "test_sampler_evidence_shadow_budget_checked_before_allocation",
+        "test_sampler_evidence_shadow_invalid_budget_is_rejected",
+        "test_sampler_evidence_shadow_untouched_large_parameter_does_not_allocate",
+        "test_sampler_evidence_shadow_oversized_storage_rejected_before_use",
         "test_sampler_evidence_shadow_shared_storage_not_inferred",
         "test_sampler_evidence_shadow_exception_never_exposes_nan_to_live_model",
         "test_sampler_evidence_shadow_buffer_mutation_rejected_before_write",
@@ -63620,7 +65513,7 @@ _SELFTEST_GROUPS = {
         "test_inference_checkpoint_loss_unshifted_labels_would_score_the_wrong_span",
         "test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_each",
         "test_inference_ple_padding_floor_uses_effective_offline_config",
-        "test_inference_ple_padding_refuses_missing_invalid_or_reduced_config",
+        "test_inference_ple_padding_refuses_missing_or_invalid_config",
         "test_inference_ple_padding_leaves_unaffected_routes_without_config_reads",
         "test_inference_ple_padding_survives_real_pack_and_all_sequence_shards",
         "test_inference_ple_padding_already_long_rows_are_identity_noop",
@@ -63656,6 +65549,8 @@ _SELFTEST_GROUPS = {
         "test_reviewed_weight_format_callers_explicit_onprem_format_reaches_prestart_route_rejection",
         "test_reviewed_weight_format_callers_onprem_rejects_before_gateway_runtime_or_client_start",
         "test_inference_export_hostfile_symlink_prescribed_target_binds_bytes_and_order",
+        "test_inference_export_unordered_hostfile_returns_actual_head_first",
+        "test_inference_export_admission_without_live_head_is_rejected",
         "test_inference_export_hostfile_symlink_changed_during_validation_rejected",
         "test_inference_export_hostfile_symlink_identity_change_blocks_published_sampling",
         "test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty",
@@ -63694,6 +65589,7 @@ _SELFTEST_GROUPS = {
         "test_inference_sampling_topology_malformed_topology_is_rejected",
         "test_inference_sampling_topology_explicit_placement_is_not_restricted_by_training_identity",
         "test_inference_sampling_topology_explicit_training_only_placement_accepts_valid_sizes",
+        "test_inference_sampling_topology_expert_parallelism_follows_the_model_routed_experts",
         "test_inference_sampling_topology_managed_sampling_uses_helper_and_preserves_topology_on_cortex_wire",
         "test_inference_sampling_topology_local_sampling_validates_export_then_uses_same_helper",
         "test_inference_sampling_topology_local_topology_never_bypasses_full_export_rejection",
@@ -63844,5 +65740,5 @@ _SELFTEST_AUTO_FIXTURES = {
     "runtime_clients": ["_external_operator_catalog"],
     "sampler_evidence": [],
     "ep_weight_sync_evidence": [],
-    "inference_rl": [],
+    "inference_rl": ["_inference_sampling_model_configs"],
 }

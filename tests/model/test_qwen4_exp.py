@@ -23,6 +23,7 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_to_prime
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_prime_to_hf
+from arctic_platform.testing_utils import tiny_qwen4_exp_config
 
 
 def _require():
@@ -44,70 +45,7 @@ def _require():
 
 def _tiny_config():
     _require()
-    text_config = {
-        "vocab_size": 32,
-        "hidden_size": 16,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "head_dim": 8,
-        "linear_key_head_dim": 4,
-        "linear_value_head_dim": 4,
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 2,
-        "linear_conv_kernel_dim": 2,
-        "moe_intermediate_size": 8,
-        "shared_expert_intermediate_size": 8,
-        "num_experts": 4,
-        "num_experts_per_tok": 2,
-        "layer_types": ["linear_attention", "full_attention"],
-        "hc_count": 2,
-        "hc_lowrank": 4,
-        "ple_layer_ids": [1],
-        "ple_embed_dim": 8,
-        "ple_conv_kernel_size": 2,
-        "ngram_size": 3,
-        "heads_per_ngram": 1,
-        "ngram_vocab_size_base": 11,
-        "make_ngram_vocab_size_divisible_by": 4,
-        "split_ngram_parts": 2,
-        "indexer_n_heads": 1,
-        "indexer_kv_heads": 1,
-        "indexer_head_dim": 4,
-        "indexer_budget": 4,
-        "indexer_compress_ratio": 2,
-        "output_gate_type": "sigmoid",
-        "eos_token_id": 1,
-        "pad_token_id": 0,
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10_000.0,
-            "partial_rotary_factor": 0.5,
-            "mrope_section": [1, 1, 0],
-            "mrope_interleaved": True,
-        },
-    }
-    vision_config = {
-        "depth": 1,
-        "hidden_size": 16,
-        "intermediate_size": 32,
-        "num_heads": 2,
-        "out_hidden_size": 16,
-        "patch_size": 2,
-        "spatial_merge_size": 1,
-        "temporal_patch_size": 1,
-        "num_position_embeddings": 16,
-    }
-    config = Qwen4ExpConfig(
-        text_config=text_config,
-        vision_config=vision_config,
-        image_token_id=29,
-        video_token_id=30,
-        vision_start_token_id=27,
-        vision_end_token_id=28,
-    )
-    config.use_grouped_mm = False
-    return config
+    return tiny_qwen4_exp_config()
 
 
 def _checkpoint(tmp_path, model_type: str) -> str:

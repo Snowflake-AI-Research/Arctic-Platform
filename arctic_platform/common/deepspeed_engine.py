@@ -27,6 +27,9 @@ one engine-construction path.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -38,6 +41,7 @@ from arctic_platform.debug.training import maybe_configure_router_replay_trace
 from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +201,204 @@ def split_expert_param_groups(param_groups: list) -> list:
     return configure_moe_param_groups(named)
 
 
+_OFFLOADED_SNAPSHOT_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+class _OffloadedGradientStorage:
+    """Reuse bounded staging when FP32 offload snapshots outgrow a small CPU tensor."""
+
+    def __init__(self):
+        self.staging = None
+
+    def snapshot(self, source):
+        size = source.numel() * source.element_size()
+        if size <= _OFFLOADED_SNAPSHOT_CHUNK_BYTES:
+            return source.detach().to(device="cpu", non_blocking=False)
+        snapshot = _OffloadedGradientFile(source, self)
+        try:
+            snapshot.copy_(source)
+        except BaseException:
+            snapshot.file.close()
+            raise
+        return snapshot
+
+    def buffer(self, source):
+        import torch
+
+        if source.dtype != torch.float32 or not source.is_contiguous():
+            raise ValueError("offloaded snapshots require contiguous FP32 partitions")
+        if self.staging is None:
+            self.staging = torch.empty(
+                _OFFLOADED_SNAPSHOT_CHUNK_BYTES // source.element_size(),
+                dtype=source.dtype,
+                pin_memory=source.device.type == "cuda",
+            )
+        return self.staging
+
+
+class _OffloadedGradientFile:
+    """An owned, unlinked scratch file; native CPU master gradients remain untouched."""
+
+    def __init__(self, source, storage):
+        self.storage = storage
+        self.shape = source.shape
+        self.size = source.numel() * source.element_size()
+        fast = Path("/data-fast/tmp")
+        if fast.parent.is_dir():
+            fast.mkdir(exist_ok=True)
+            directory = str(fast)
+        else:
+            directory = tempfile.gettempdir()
+        self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+        os.ftruncate(self.file.fileno(), self.size)
+        os.posix_fadvise(self.file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+
+    def copy_(self, source):
+        self._transfer(source, writing=True)
+
+    def restore(self, destination):
+        self._transfer(destination, writing=False)
+
+    def _transfer(self, tensor, *, writing):
+        staging = self.storage.buffer(tensor)
+        if tensor.shape != self.shape:
+            raise ValueError("offloaded snapshot shape differs from its partition")
+        flat = tensor.view(-1)
+        descriptor = self.file.fileno()
+        operation = os.pwritev if writing else os.preadv
+        for offset in range(0, flat.numel(), staging.numel()):
+            length = min(staging.numel(), flat.numel() - offset)
+            chunk = staging.narrow(0, 0, length)
+            view = memoryview(chunk.numpy()).cast("B")
+            byte_offset = offset * tensor.element_size()
+            if writing:
+                chunk.copy_(flat.narrow(0, offset, length), non_blocking=False)
+            transferred = 0
+            while transferred < len(view):
+                count = operation(descriptor, [view[transferred:]], byte_offset + transferred)
+                if count <= 0:
+                    raise OSError("offloaded snapshot I/O made no progress")
+                transferred += count
+            if writing:
+                # Flush each chunk before advisory eviction so dirty pages cannot grow with model size.
+                os.fdatasync(descriptor)
+            else:
+                flat.narrow(0, offset, length).copy_(chunk, non_blocking=False)
+            os.posix_fadvise(descriptor, byte_offset, len(view), os.POSIX_FADV_DONTNEED)
+
+
+def release_offloaded_grad_partitions(optimizer) -> bool:
+    """Evict completed ZeRO-1/2 offload partitions without losing FP32 request-boundary accumulation.
+
+    DeepSpeed copies each reduced parameter to the CPU master gradient at an accumulation boundary but keeps the
+    compact FP32 GPU partition until ``step()``. Once every local parameter has been copied, retain a separate
+    FP32 snapshot and release the GPU partition. Small snapshots use CPU tensors; larger ones use unlinked local
+    scratch files with a shared 16 MiB staging buffer and chunkwise page-cache eviction. Reuse that storage across
+    backwards in the same update. A later
+    backward restores the snapshot only when recreating its GPU partition, preserving the cumulative sum even when
+    master gradients are BF16. Release completed groups during every reduction, including non-boundary microsteps.
+    Partial groups are released after the native reduction epilogue, waiting for CPU copies before snapshotting.
+
+    The wrappers are instance-local. Each group drops its snapshot before the native update allocates optimizer
+    state: its CPU master gradient has already been unscaled and clipped, so the snapshot is no longer needed.
+    Successful steps, including skipped overflow steps, clear all snapshots. Failed steps retain only groups not
+    submitted for update; native updates are not transactional. Optimizers without CPU offload keep their methods.
+    After native reset has waited for offload copies, discard compact groups' CPU accumulators as well: their sums and
+    master-gradient views belong to the completed update, not to the next update or a restored checkpoint. Noncompact
+    groups retain native accumulator ownership and cleanup.
+    """
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    if type(optimizer) is not DeepSpeedZeroOptimizer or not optimizer.cpu_offload:
+        return False
+    compact_groups = [
+        group_idx
+        for group_idx in range(len(optimizer.bit16_groups))
+        if optimizer._use_compact_grad_partition_buffer(group_idx)
+    ]
+    if not compact_groups:
+        return False
+    compact_param_ids = {
+        optimizer.get_param_id(param) for group_idx in compact_groups for param in optimizer.bit16_groups[group_idx]
+    }
+    retained: dict[int, Any] = {}
+    storage = _OffloadedGradientStorage()
+    copy_grads_in_partition = optimizer.copy_grads_in_partition
+    compact_grad_partition_buffer = optimizer._get_compact_grad_partition_buffer
+    step = optimizer.step
+    reset_cpu_buffers = optimizer.reset_cpu_buffers
+    optimizer_step = optimizer._optimizer_step
+    gradient_partition_epilogue = optimizer.independent_gradient_partition_epilogue
+
+    def release_partition(group_idx):
+        partition = optimizer.averaged_gradients.get(group_idx)
+        if partition is None:
+            return
+        snapshot = retained.get(group_idx)
+        if snapshot is None:
+            retained[group_idx] = storage.snapshot(partition.flat_partition.detach())
+        else:
+            snapshot.copy_(partition.flat_partition.detach())
+        optimizer.averaged_gradients[group_idx] = None
+
+    def copy_then_release(param, group_idx=None):
+        if group_idx is None:
+            group_idx = optimizer._get_param_group_idx(param)
+        copy_grads_in_partition(param, group_idx)
+        if optimizer._use_compact_grad_partition_buffer(group_idx) and all(
+            optimizer.params_already_reduced[optimizer.get_param_id(partition_param)]
+            for partition_param in optimizer.params_in_partition[group_idx]
+        ):
+            release_partition(group_idx)
+
+    def epilogue_then_release(*args, **kwargs):
+        result = gradient_partition_epilogue(*args, **kwargs)
+        if any(optimizer.averaged_gradients.get(group_idx) is not None for group_idx in compact_groups):
+            optimizer._wait_for_offload_copies()
+            for group_idx in compact_groups:
+                release_partition(group_idx)
+        return result
+
+    def partition_buffer(group_idx):
+        previous_partition = optimizer.averaged_gradients.get(group_idx)
+        partition = compact_grad_partition_buffer(group_idx)
+        snapshot = retained.get(group_idx)
+        if snapshot is not None and partition is not previous_partition:
+            if isinstance(snapshot, _OffloadedGradientFile):
+                snapshot.restore(partition.flat_partition)
+            else:
+                partition.flat_partition.copy_(snapshot, non_blocking=False)
+        return partition
+
+    def reset_then_release(*args, **kwargs):
+        result = reset_cpu_buffers(*args, **kwargs)
+        for param_id in compact_param_ids:
+            optimizer.accumulated_grads_in_cpu.pop(param_id, None)
+        retained.clear()
+        # The overflow path resets CPU buffers without detaching the compact GPU partition.
+        for group_idx in optimizer.averaged_gradients:
+            if optimizer._use_compact_grad_partition_buffer(group_idx):
+                optimizer.averaged_gradients[group_idx] = None
+        return result
+
+    def step_then_release(*args, **kwargs):
+        result = step(*args, **kwargs)
+        retained.clear()
+        return result
+
+    def release_then_update(group_idx):
+        retained.pop(group_idx, None)
+        return optimizer_step(group_idx)
+
+    optimizer.copy_grads_in_partition = copy_then_release
+    optimizer.independent_gradient_partition_epilogue = epilogue_then_release
+    optimizer._get_compact_grad_partition_buffer = partition_buffer
+    optimizer.reset_cpu_buffers = reset_then_release
+    optimizer.step = step_then_release
+    optimizer._optimizer_step = release_then_update
+    return True
+
+
 def initialize_training_engine(
     model,
     ds_config: dict[str, Any],
@@ -221,7 +423,9 @@ def initialize_training_engine(
     # Marks first: the optimizer groups split on them.
     preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused is not False
+        fused = optimizer.fused
+        if fused is None:
+            fused = _optimizer_cpu_offload_enabled(ds_config) or not is_glm_moe_model(model_path)
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
@@ -246,6 +450,8 @@ def initialize_training_engine(
         else:
             engine, *_ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
             built = None
+    if built is not None:
+        release_offloaded_grad_partitions(built)
     return engine, built, choice
 
 
@@ -300,8 +506,10 @@ def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bo
         reason = "AdamW ran as the faster fused GPU implementation (FusedAdam)"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    else:
+    elif optimizer.fused is False:
         reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
+    else:
+        reason = "FusedAdam isn't supported for this model, so standard AdamW ran"
     return {"implementation": implementation, "reason": reason}
 
 

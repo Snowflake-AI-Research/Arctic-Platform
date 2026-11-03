@@ -214,12 +214,13 @@ def _cortex_config(peft=None, config_type=ArcticSFTClientConfig) -> ArcticClient
         training_gpus=1,
         sampling_gpus=1,
         backend=CortexConfig(base_url="http://localhost"),
-        training=TrainingConfig(peft=peft),
+        training=TrainingConfig(peft=peft, checkpoint_path="/tmp/c"),
     )
 
 
 def _sync_payload(client) -> dict:
-    (sync,) = [call for call in client.transport.calls if call.op == "operation"]
+    operations = [call for call in client.transport.calls if call.op == "operation"]
+    (sync,) = [call for call in operations if call.body["operation_type"] == "weight-sync"]
     return sync.body["payload"]
 
 

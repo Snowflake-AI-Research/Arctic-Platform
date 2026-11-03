@@ -954,12 +954,16 @@ def _validate_local_allocation(admission, deadline, hostfile_identity=None):
             or not re.fullmatch(r"[0-9a-f]{64}", node.get("python_sha256", ""))
         ):
             raise ValueError("actual node hostname, boot, slots and executable pins required")
-    _validate_local_node(nodes[0], deadline)
+    local = [node for node in nodes if node["hostname"] == socket.gethostname()]
+    if len(local) != 1:
+        raise ValueError("exactly one admitted identity must match the live head")
+    _validate_local_node(local[0], deadline)
     if _local_hostfile_identity() != before:
         raise ValueError("allocation hostfile link or target changed during validation")
     if hostfile_identity is not None:
         hostfile_identity.update(before)
-    return nodes
+    # Hostfile order binds the admission; transfers need the actual head first.
+    return [local[0], *[node for node in nodes if node is not local[0]]]
 
 
 def validate_local_inference_allocation(admission):
@@ -1332,8 +1336,13 @@ def _local_ssh_argv(admission, node, request, deadline):
         yield argv
 
 
-def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
-    """Publish exact step-save bytes on every admitted same-job sampling node."""
+def distribute_local_inference_export(root, admission, *, timeout_s=14400.0):
+    """Publish exact step-save bytes on every admitted same-job sampling node.
+
+    Every sampling node receives its copy concurrently, each over its own sender and SSH receiver. The default deadline
+    only bounds a hung transport: one stream moved 423 MB/s, so a 642.7 GB GLM-5.3-Flash export takes about 2,000 s per
+    node including the receiver's re-hash, and about 5,000 s if three concurrent streams share one stream's bandwidth.
+    """
     if type(timeout_s) not in (float, int) or not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("finite positive inference export deadline required")
     deadline = time.monotonic() + timeout_s
@@ -1346,22 +1355,22 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
     manifest = saved["manifest"]
     manifest_sha = schema_sha(manifest)
     receipts = []
-    for node in nodes[1:]:
-        request = {
-            "root": str(root),
-            "node": node,
-            "allocation_id": admission["allocation_id"],
-            "manifest_sha256": manifest_sha,
-            "timeout_s": _local_remaining(deadline),
-            "deadline_epoch": time.time() + _local_remaining(deadline),
-        }
-        children = []
-        with (
-            _local_ssh_argv(admission, node, request, deadline) as argv,
-            tempfile.TemporaryFile() as sender_errors,
-            tempfile.TemporaryFile() as receiver_errors,
-        ):
-            try:
+    children = []
+    with contextlib.ExitStack() as transports:
+        try:
+            transfers = []
+            for node in nodes[1:]:
+                request = {
+                    "root": str(root),
+                    "node": node,
+                    "allocation_id": admission["allocation_id"],
+                    "manifest_sha256": manifest_sha,
+                    "timeout_s": _local_remaining(deadline),
+                    "deadline_epoch": time.time() + _local_remaining(deadline),
+                }
+                argv = transports.enter_context(_local_ssh_argv(admission, node, request, deadline))
+                sender_errors = transports.enter_context(tempfile.TemporaryFile())
+                receiver_errors = transports.enter_context(tempfile.TemporaryFile())
                 sender = subprocess.Popen(
                     _local_worker_argv(
                         sys.executable,
@@ -1382,6 +1391,10 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
                 )
                 children.append(receiver)
                 sender.stdout.close()
+                transfers.append((node, sender, receiver, sender_errors, receiver_errors))
+            # A receiver writes only its bounded JSON receipt to stdout, so collecting the receipts in node order
+            # cannot stall a transfer that is still streaming.
+            for node, sender, receiver, sender_errors, receiver_errors in transfers:
                 output, _ = receiver.communicate(timeout=_local_remaining(deadline))
                 sender.wait(timeout=_local_remaining(deadline))
                 _local_remaining(deadline)
@@ -1404,8 +1417,8 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
                 }:
                     raise ValueError("sampling node did not publish the exact inference export")
                 receipts.append(receipt)
-            finally:
-                _stop_local_children(children)
+        finally:
+            _stop_local_children(children)
     _validate_local_allocation(admission, deadline, hostfile_identity)
     if saved["head_files"] != {
         name: list(_fingerprint(path)) for name, path in _local_export_paths(Path(root)).items()

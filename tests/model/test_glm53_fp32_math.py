@@ -30,9 +30,9 @@ import torch
 import torch.nn.functional as F
 
 from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import tiny_glm5_next_config as _tiny_config
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
-from tests.model.test_glm5_next import _tiny_config
 
 
 def _bf16_model(hc_mult=2, fp32_parity=True):
@@ -165,7 +165,7 @@ def _record_kda_beta(captured):
 @pytest.mark.parametrize("fp32_parity", [True, False])
 def test_glm53_kda_beta_gate_is_an_fp32_sigmoid(tiny_glm_sparse_model, single_rank_group, fp32_parity):
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
-    from tests.model.test_glm53_packed_rows import _unfused_causal_conv1d_module
+    from arctic_platform.testing_utils import unfused_causal_conv1d_module as _unfused_causal_conv1d_module
 
     set_seed(0)
     attention = tiny_glm_sparse_model(with_linear_attention=True).model.layers[1].self_attn

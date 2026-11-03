@@ -1203,7 +1203,7 @@ def owned_receiver_binding(receiver, *, adapter_id, admitted_sources, teardown):
 
 # Lora Weight Sync Evidence
 
-_EXPORT_SHA = "677781f51ac8fe1c28cb39787a78689a0c04ccefb77971ad13f626eb32ca8940"
+_EXPORT_SHA = "88b7f1b4693157f4c929168a25d9895d9b613dd9aef36ea18e4a72d81ced9d03"
 
 
 def _admit(admitted, *objects):

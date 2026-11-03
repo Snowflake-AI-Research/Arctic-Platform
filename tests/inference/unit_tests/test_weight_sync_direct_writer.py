@@ -669,6 +669,32 @@ def test_load_batched_returns_rank_skips_when_the_rank_holds_part_of_the_model(
     assert skipped == ["other_rank.weight"]
 
 
+def test_load_batched_returns_dropped_sources_to_an_attached_verifier(monkeypatch):
+    import contextlib
+
+    from arctic_platform.inference.server.weight_sync import receiver as receiver_module
+
+    observed = []
+
+    @contextlib.contextmanager
+    def observe(verifier, loader, name, value):
+        observed.append(name)
+        yield
+
+    monkeypatch.setattr(receiver_module, "maybe_bind_broadcast_loader", lambda verifier, writer: None)
+    monkeypatch.setattr(receiver_module, "maybe_observe_broadcast_tensor", observe)
+    receiver = SimpleNamespace(
+        device=torch.device("cpu"),
+        parallel_config=SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1),
+    )
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("model.layers.0.extra.weight", torch.tensor([3.0]))])
+
+    *_, skipped = WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine, verifier=object())
+
+    assert skipped == ["model.layers.0.extra.weight"]
+    assert observed == ["weight", "model.layers.0.extra.weight"]
+
+
 def test_hf_sync_of_declared_export_buffers_passes_loaded_destination_check(monkeypatch):
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
 

@@ -44,12 +44,22 @@ def _load_deepep(monkeypatch):
 
     # Load the real tensor helpers without importing the optional distributed package.
     modules = {}
-    for relative in ("token_combine", "routing_weights", "distributed.token_permute", "distributed.deepep"):
+    for relative in (
+        "token_combine",
+        "routing_weights",
+        "distributed.token_permute",
+        "distributed.combine_replay",
+        "distributed.deepep",
+    ):
         name = f"{package_name}.{relative}"
         spec = importlib.util.spec_from_file_location(name, root / f"{relative.replace('.', '/')}.py")
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
         modules[relative] = (spec, module)
+
+    for relative, (spec, module) in modules.items():
+        if relative != "distributed.deepep":
+            spec.loader.exec_module(module)
 
     extension = ModuleType("deep_ep")
     extension.Buffer = object
@@ -71,8 +81,8 @@ def _load_deepep(monkeypatch):
         imports.setattr(torch.library, "Library", CudaLibrary)
         imports.setattr(torch.library, "impl", lambda *args: lambda function: function)
         imports.setattr(torch.library, "register_autograd", lambda *args, **kwargs: None)
-        for spec, module in modules.values():
-            spec.loader.exec_module(module)
+        spec, module = modules["distributed.deepep"]
+        spec.loader.exec_module(module)
     return modules["distributed.deepep"][1]
 
 

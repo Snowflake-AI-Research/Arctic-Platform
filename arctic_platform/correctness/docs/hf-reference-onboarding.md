@@ -103,6 +103,8 @@ python -m arctic_platform.correctness onboard \
 
 ## Run Regression
 
+**Short-sequence onboarding and regression must request the same inputs.** For the first two supervised checks, an explicit `onboard --tokens 256` freezes 256-token cases and forwards that length to target validation. Subsequent `run` commands must also use `--tokens 256`; omission keeps the config-derived length and rejects a shortened specification. The override requires one explicit config and only `single-step-grads` or `single-step-optimizer`, cannot exceed the supplied config's sequence limit, and does not bypass frozen-case or prepared-reference identity checks. A short-sequence result is not full-sequence validation.
+
 ### Native Multi-Rank Optimizer Capture
 
 **A local optimizer checkpoint must include every actual training rank, not just the rank-zero response from the save API.** Expert parallelism (EP) partitions experts across workers; sequence parallelism (SP) partitions a sequence across workers. The optimizer checkpoint can therefore span all configured GPUs even when the config's data-parallel width is one. The optional [runner integration](../harness/runner.py) uses `cfg.n_gpus` for native collection; ordinary capture continues to use `cfg.dp_size`.

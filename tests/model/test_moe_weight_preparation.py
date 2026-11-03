@@ -169,6 +169,38 @@ def test_prepare_model_weights_dispatches_to_the_resolved_loader_hook(monkeypatc
     assert received == [{"world_size": 32, "rank": 8, "local_rank": 0}]
 
 
+@pytest.mark.parametrize(
+    "name, tiny_config, implementation, preparer",
+    [
+        ("glm5_next", "tiny_glm5_next_config", "glm53", "prepare_glm5_next_weights"),
+        ("qwen4_exp", "tiny_qwen4_exp_config", "qwen38", "prepare_qwen4_exp_weights"),
+    ],
+)
+def test_flash_moe_weight_hook_takes_the_spec_its_loader_defaulted(
+    monkeypatch, tmp_path, name, tiny_config, implementation, preparer
+):
+    # The spec stores every FlashMoeOptions default, fp32_routed_weighting among them, and the hook revalidates it.
+    import importlib
+
+    from arctic_platform import testing_utils
+    from arctic_platform.model import loader
+    from arctic_platform.model.moe_spec import moe_model_spec
+
+    getattr(testing_utils, tiny_config)().save_pretrained(tmp_path)
+    received = {}
+    module = importlib.import_module(f"arctic_platform.model.implementations.{implementation}.deepspeed_integration")
+    monkeypatch.setattr(module, preparer, lambda **kwargs: received.update(kwargs) or tmp_path / "cache")
+    spec = moe_model_spec(model_name=str(tmp_path), ep_size=8, sp_size=8)
+
+    path = loader.prepare_model_weights(spec, world_size=16, rank=8, local_rank=0)
+
+    assert spec.loader == name
+    assert spec.loader_options["fp32_routed_weighting"] is False
+    assert path == tmp_path / "cache"
+    assert received["options"].fp32_routed_weighting is False
+    assert (received["ep_size"], received["world_size"], received["rank"]) == (8, 16, 8)
+
+
 @pytest.mark.parametrize("name", ["glm5_next", "qwen4_exp", "qwen3_5_moe", "generic_moe", "glm_moe_dsa"])
 def test_every_converting_moe_loader_registers_a_weight_hook(name):
     import arctic_platform.model.loaders  # noqa: F401

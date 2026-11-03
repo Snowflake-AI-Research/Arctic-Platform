@@ -38,23 +38,92 @@ from uuid import uuid4
 # Weight Sync Evidence
 
 VERIFY_ENV = "ARCTIC_INFERENCE_WEIGHT_SYNC_VERIFY"
+_MANIFEST_CHUNK_BYTES = 8 << 20
 
 
 def enabled() -> bool:
     return os.environ.get(VERIFY_ENV) == "1"
 
 
+def _manifest_chunks(value, max_elements):
+    """Yield bounded views in the tensor's logical row-major order."""
+    if value.numel() <= max_elements:
+        yield value
+        return
+    row_elements = math.prod(value.shape[1:])
+    if row_elements <= max_elements:
+        rows = max(1, max_elements // row_elements)
+        for start in range(0, value.shape[0], rows):
+            yield value[start : start + rows]
+    else:
+        for index in range(value.shape[0]):
+            yield from _manifest_chunks(value[index], max_elements)
+
+
+def _equal_element_bytes(left, right):
+    """Compare whole element bit patterns, including NaN payloads and signed zero."""
+    import torch
+
+    if left.device.type == right.device.type == "cpu":
+        import numpy as np
+
+        dtype = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}.get(left.shape[-1])
+        if dtype is None:
+            equal = (left.numpy() == right.numpy()).all(axis=-1)
+        else:
+            equal = left.numpy().view(dtype).reshape(-1) == right.numpy().view(dtype).reshape(-1)
+        return torch.from_numpy(equal)
+    dtype = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}.get(left.shape[-1])
+    if dtype is None:
+        return (left == right).all(dim=-1)
+    return left.view(dtype).reshape(-1) == right.view(dtype).reshape(-1)
+
+
 def tensor_manifest(value) -> dict:
+    """Hash exact logical tensor bytes without a tensor-sized staging allocation."""
     import torch
 
     if value.layout != torch.strided or value.device.type == "meta":
         raise ValueError("weight-sync manifest requires materialized strided tensors")
-    raw = value.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+    digest = hashlib.sha256()
+    elements = max(1, _MANIFEST_CHUNK_BYTES // value.element_size())
+    for part in _manifest_chunks(value.detach(), elements):
+        flat = part.contiguous().reshape(-1)
+        # A singleton can be contiguous with a nonunit stride, which a dtype view rejects.
+        if flat.stride(0) != 1:
+            flat = flat.clone(memory_format=torch.contiguous_format)
+        raw = flat.view(torch.uint8).cpu().numpy()
+        digest.update(memoryview(raw).cast("B"))
     return {
         "shape": list(value.shape),
         "dtype": str(value.dtype).removeprefix("torch."),
         "numel": value.numel(),
-        "sha256": hashlib.sha256(raw).hexdigest(),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def checkpoint_shard_rows(rows: int, parts: int) -> list[tuple[int, int]]:
+    """Row ranges of the ``parts`` shards a checkpoint stores a ``rows``-row table in.
+
+    vLLM's Qwen3.8 n-gram loader places checkpoint shard ``i`` at row ``i * ceil(rows / parts)`` and refuses every
+    other shard shape (vllm 0.32.0, ``models/qwen4_exp/nvidia/ngram_embedding.py:450-464``), so a checkpoint a sampler
+    loaded stores the table in exactly these ranges.
+    """
+    size = -(-rows // parts)
+    return [(start, min(start + size, rows)) for start in range(0, rows, size)]
+
+
+def checkpoint_shard_manifests(value, start: int, rows: int, parts: int) -> dict[str, dict | None]:
+    """Manifest of each checkpoint shard overlapping ``value``, rows ``start`` onward of a ``rows``-row table.
+
+    Keyed by shard index. A shard ``value`` holds only part of cannot be hashed without rows held elsewhere, so it
+    maps to ``None``.
+    """
+    stop = start + value.shape[0]
+    return {
+        str(index): tensor_manifest(value[low - start : high - start]) if start <= low and high <= stop else None
+        for index, (low, high) in enumerate(checkpoint_shard_rows(rows, parts))
+        if low < stop and start < high
     }
 
 
@@ -137,7 +206,8 @@ class ShadowVerifier:
     freed as soon as every element has been written, so only the storages being written at once are resident and
     ``max_shadow_bytes`` bounds that resident sum. A completed storage written again is reopened from the live bytes
     it was verified equal to, after rehashing them; completed live bytes that change by any other route are reported
-    in ``changed_after_verification``.
+    in ``changed_after_verification``. Inactive partial CUDA shadows are held on CPU between received tensors;
+    replay always restores them to the original device. Byte comparisons use bounded CPU chunks.
     """
 
     def __init__(self, model, *, max_shadow_bytes: int):
@@ -226,9 +296,8 @@ class ShadowVerifier:
             storage_owners[key] = name
         self.registered = {**self.parameters, **self.buffers}
         self.owners = storage_owners
-        largest = max(key[2] for key in self.storage_names)
-        if type(max_shadow_bytes) is not int or not 0 < largest <= max_shadow_bytes:
-            raise ValueError(f"shadow allocation {largest} exceeds the explicit {max_shadow_bytes} byte limit")
+        if type(max_shadow_bytes) is not int or max_shadow_bytes <= 0:
+            raise ValueError("max_shadow_bytes must be a positive integer")
         self.max_shadow_bytes = max_shadow_bytes
         self.sources = source_files(
             model.load_weights,
@@ -243,6 +312,7 @@ class ShadowVerifier:
         self.native_operations: set = set()
         self.native_schemas: dict[str, str] = {}
         self.backings: dict[tuple[str, int, int], Any] = {}
+        self.host_backings: set[tuple[str, int, int]] = set()
         self.shadow_keys: dict[tuple[str, int, int], tuple[str, int, int]] = {}
         self.written_numel: dict[tuple[str, int, int], int] = {}
         self.completed: dict[tuple[str, int, int], dict[str, dict]] = {}
@@ -276,12 +346,19 @@ class ShadowVerifier:
 
         owner = self.registered[self.owners[key]]
         self._reserve(key[2])
-        raw = torch.empty(key[2], dtype=torch.uint8, device=owner.device)
+        device = "cpu" if key in self.host_backings else owner.device
+        try:
+            raw = torch.empty(key[2], dtype=torch.uint8, device=device)
+        except torch.OutOfMemoryError:
+            if owner.device.type != "cuda":
+                raise
+            self.host_backings.add(key)
+            raw = torch.empty(key[2], dtype=torch.uint8, device="cpu")
         with torch.no_grad():
             if from_live:
                 raw.copy_(owner.detach().as_strided((owner.numel(),), (1,), 0).view(torch.uint8))
             else:
-                fill = self._fill(self.owners[key]).to(owner.device)
+                fill = self._fill(self.owners[key]).to(raw.device)
                 raw.view(-1, fill.numel()).copy_(fill.expand(key[2] // fill.numel(), -1))
         backing = raw.view(owner.dtype)
         self.backings[key] = backing
@@ -305,38 +382,88 @@ class ShadowVerifier:
         )
         return self._open(key, from_live=True)
 
-    def _uncovered(self, name):
+    def _move_backing(self, key, device):
+        import torch
+
+        backing = self.backings[key]
+        if backing.device == device or (key in self.host_backings and torch.device(device).type == "cuda"):
+            return backing
+        try:
+            moved = backing.to(device)
+        except torch.OutOfMemoryError:
+            if torch.device(device).type != "cuda":
+                raise
+            self.host_backings.add(key)
+            return backing
+        del self.shadow_keys[_storage(backing)]
+        self.backings[key] = moved
+        self.shadow_keys[_storage(moved)] = key
+        return moved
+
+    def _offload_pending(self, held):
+        for key, backing in list(self.backings.items()):
+            if backing.device.type == "cuda" and _storage(backing) not in held:
+                self._move_backing(key, "cpu")
+
+    def _shadow_chunks(self, name):
+        """Yield bounded shadow bytes and coverage without reading live tensor bytes."""
         import torch
 
         shadow = self._view(name)
-        if name not in self.parameters:
-            return torch.zeros_like(shadow, dtype=torch.bool)
-        fill = self._fill(name).to(shadow.device)
-        flat = shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, fill.numel())
-        uncovered = (flat == fill).all(dim=1).reshape(shadow.shape)
-        if name in self.padding:
-            uncovered[self.padding[name]["start"] :] = False
-        return uncovered
+        elements = max(1, _MANIFEST_CHUNK_BYTES // shadow.element_size())
+        fill = self._fill(name)
+        offset = 0
+        padding_start = self.padding[name]["start"] * math.prod(shadow.shape[1:]) if name in self.padding else None
+        for expected in _manifest_chunks(shadow, elements):
+            expected = expected.cpu().contiguous().reshape(-1)
+            if expected.stride(0) != 1:
+                expected = expected.clone(memory_format=torch.contiguous_format)
+            expected_bytes = expected.view(torch.uint8).reshape(-1, shadow.element_size())
+            uncovered = (
+                _equal_element_bytes(expected_bytes, fill)
+                if name in self.parameters
+                else torch.zeros(expected.numel(), dtype=torch.bool)
+            )
+            if padding_start is not None:
+                uncovered[max(0, padding_start - offset) :] = False
+            yield expected_bytes, uncovered
+            offset += expected.numel()
+
+    def _comparison_chunks(self, name):
+        """Compare exact live bytes with the covered shadow bytes in bounded CPU chunks."""
+        import numpy as np
+        import torch
+
+        live = self.registered[name].detach()
+        elements = max(1, _MANIFEST_CHUNK_BYTES // live.element_size())
+        for actual, (expected_bytes, uncovered) in zip(_manifest_chunks(live, elements), self._shadow_chunks(name)):
+            actual = actual.cpu().contiguous().reshape(-1)
+            if actual.stride(0) != 1:
+                actual = actual.clone(memory_format=torch.contiguous_format)
+            actual_bytes = actual.view(torch.uint8).reshape(-1, live.element_size())
+            equal = _equal_element_bytes(actual_bytes, expected_bytes).numpy()
+            yield uncovered, torch.from_numpy(np.logical_not(equal))
+
+    def _uncovered_count(self, name):
+        import numpy as np
+
+        return sum(int(np.count_nonzero(uncovered.numpy())) for _, uncovered in self._shadow_chunks(name))
 
     def _complete(self, key, *, digest=True):
         """Compare, record and free one storage that the loader can no longer leave partially written."""
-        import torch
+        import numpy as np
 
         for name in sorted(self.storage_names[key]):
-            live = self.registered[name].detach()
             shadow = self._view(name)
             if name in self.padding and tensor_manifest(shadow[self.padding[name]["start"] :]) != (
                 self.padding[name]["before"]
             ):
                 raise RuntimeError(f"shadow loader changed unused HC projection padding: {name}")
-            uncovered = self._uncovered(name)
-            byte_diff = (
-                live.contiguous().reshape(-1).view(torch.uint8).reshape(-1, live.element_size())
-                != shadow.contiguous().reshape(-1).view(torch.uint8).reshape(-1, shadow.element_size())
-            ).any(dim=1)
             entry = self.destinations.setdefault(name, {"uncovered": 0, "mismatched": 0})
-            entry["uncovered"] += int(uncovered.sum().item())
-            entry["mismatched"] += int((byte_diff & ~uncovered.reshape(-1)).sum().item())
+            for uncovered, byte_diff in self._comparison_chunks(name):
+                coverage = uncovered.numpy()
+                entry["uncovered"] += int(np.count_nonzero(coverage))
+                entry["mismatched"] += int(np.count_nonzero(byte_diff.numpy() & ~coverage))
         if digest:
             self.completed[key] = {name: tensor_manifest(self.registered[name]) for name in self.storage_names[key]}
         self._free(key)
@@ -352,7 +479,7 @@ class ShadowVerifier:
         if (
             key in self.backings
             and self.written_numel.get(key, 0) >= self.registered[owner].numel()
-            and not bool(self._uncovered(owner).any().item())
+            and self._uncovered_count(owner) == 0
         ):
             self._complete(key)
 
@@ -509,6 +636,9 @@ class ShadowVerifier:
                         else:
                             backing = verifier._open(key, from_live=False)
                         self.owned.add(_storage(backing))
+                    elif backing.device != tensor.device:
+                        backing = verifier._move_backing(key, tensor.device)
+                        self.owned.add(_storage(backing))
                     if tensor.dtype != backing.dtype:
                         raise ValueError("reinterpretation of parameter storage is unsupported")
                     return backing.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
@@ -557,6 +687,43 @@ class ShadowVerifier:
                             raise ValueError("weight loader writes an input, buffer or unowned storage")
                 call_args = tree_map(substitute, args)
                 call_kwargs = tree_map(substitute, kwargs)
+                if self.shadow:
+                    operands, _ = tree_flatten((call_args, call_kwargs))
+                    host_views = [
+                        tensor
+                        for tensor in operands
+                        if isinstance(tensor, torch.Tensor)
+                        and verifier.shadow_keys.get(_storage(tensor)) in verifier.host_backings
+                    ]
+                    if host_views:
+                        # Host shadows can replay metadata views and exact copies, never CUDA arithmetic on CPU.
+                        views = {
+                            torch.ops.aten.alias.default,
+                            torch.ops.aten.as_strided.default,
+                            torch.ops.aten.detach.default,
+                            torch.ops.aten.expand.default,
+                            torch.ops.aten.permute.default,
+                            torch.ops.aten.select.int,
+                            torch.ops.aten.slice.Tensor,
+                            torch.ops.aten.split.Tensor,
+                            torch.ops.aten.split_with_sizes.default,
+                            torch.ops.aten.squeeze.default,
+                            torch.ops.aten.squeeze.dim,
+                            torch.ops.aten.t.default,
+                            torch.ops.aten.transpose.int,
+                            torch.ops.aten.unbind.int,
+                            torch.ops.aten.unsqueeze.default,
+                            torch.ops.aten.view.default,
+                        }
+                        if func is torch.ops.aten.copy_.default and call_args[0] is host_views[0]:
+                            destination, source, *remaining = call_args
+                            if source.dtype != destination.dtype:
+                                key = verifier.shadow_keys[_storage(destination)]
+                                device = verifier.registered[verifier.owners[key]].device
+                                source = source.to(device=device, dtype=destination.dtype)
+                            call_args = (destination, source, *remaining)
+                        elif func not in views:
+                            raise ValueError(f"CUDA shadow arithmetic requires GPU storage: {func}")
                 result = func(*call_args, **call_kwargs)
                 outputs, _ = tree_flatten(result)
                 for tensor in outputs:
@@ -589,6 +756,7 @@ class ShadowVerifier:
         entry["destinations"] = sorted(live.written | live_pending)
         self.received[name] = entry
         self.touched.update(live.written | live_pending)
+        self._offload_pending(replay_staging())
 
     def load(self, name, value, *, loader=None):
         """Debug-only convenience for a live load and its private shadow replay."""
@@ -599,6 +767,43 @@ class ShadowVerifier:
 
         with self.observe_load(name, value, loader=loader):
             return loader(name, value)
+
+    def _checkpoint_shards(self, names):
+        """Checkpoint-shard manifests of the ``names`` that are vocabulary-parallel tables a checkpoint stores split.
+
+        Such a table's owner declares ``split_ngram_parts``. The first rows of its parameter are its rows
+        ``org_vocab_start_index`` to ``org_vocab_end_index``, the ones vLLM loads checkpoint shards into
+        (vllm 0.32.0, ``models/qwen4_exp/common/ple.py:80-98``). Its checkpoint name inverts the one
+        ``hf_to_vllm_mapper`` prefix rule that produces its name; a table no single rule produces is not reported.
+        """
+        prefixes = getattr(getattr(self.model, "hf_to_vllm_mapper", None), "orig_to_new_prefix", None) or {}
+        result = {}
+        for name in names:
+            path, _, leaf = name.rpartition(".")
+            owner = path.rpartition(".")[0]
+            if leaf != "weight" or not owner:
+                continue
+            table = self.model.get_submodule(path)
+            parts = getattr(self.model.get_submodule(owner), "split_ngram_parts", None)
+            indices = getattr(table, "shard_indices", None)
+            rules = [(old, new) for old, new in prefixes.items() if new is not None and name.startswith(new)]
+            if (
+                type(parts) is not int
+                or parts < 1
+                or indices is None
+                or getattr(table, "weight", None) is not self.parameters[name]
+                or len(rules) != 1
+            ):
+                continue
+            ((old, new),) = rules
+            start, stop = indices.org_vocab_start_index, indices.org_vocab_end_index
+            result[name] = {
+                "checkpoint_name": old + name.removeprefix(new),
+                "shards": checkpoint_shard_manifests(
+                    self.parameters[name][: stop - start], start, table.org_vocab_size, parts
+                ),
+            }
+        return result
 
     def finish(self):
         self._check_inventory()
@@ -617,6 +822,8 @@ class ShadowVerifier:
             name: dict(self.destinations.get(name) or {"uncovered": self.registered[name].numel(), "mismatched": 0})
             for name in sorted(self.touched)
         }
+        untouched = {name: value.numel() for name, value in self.parameters.items() if name not in self.touched}
+        frozen = self._checkpoint_shards(untouched)
         return {
             "status": "ok",
             "received": self.received,
@@ -624,15 +831,14 @@ class ShadowVerifier:
             "unverifiable_destinations": [],
             "non_parameter_destinations": [],
             "changed_after_verification": sorted(self.changed),
-            "untouched_parameters": {
-                name: value.numel() for name, value in self.parameters.items() if name not in self.touched
-            },
+            "untouched_parameters": untouched,
             "evidence_sources": self.sources,
             "admitted_native_operations": dict(self.native_schemas),
             "shadow_bytes": {"limit": self.max_shadow_bytes, "peak": self.peak_bytes},
             "preserved_padding": {
                 name: dict(start_row=entry["start"], **entry["before"]) for name, entry in self.padding.items()
             },
+            **({"checkpoint_shards": frozen} if frozen else {}),
         }
 
 
@@ -1540,6 +1746,17 @@ def _explicitly_skipped_parameters(model):
     }
 
 
+def _gather_broadcast_evidence(records, local):
+    """CPU evidence must not queue NCCL work while another replica still exports GPU tensors."""
+    import torch.distributed as dist
+
+    group = dist.new_group(backend="gloo")
+    try:
+        dist.all_gather_object(records, local, group=group)
+    finally:
+        dist.destroy_process_group(group)
+
+
 def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
     """All exporter ranks bind actual EP holdings; count DP replicas only once."""
     if not enabled():
@@ -1559,6 +1776,9 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
         type(model).named_parameters,
         type(model).named_buffers,
         dist.all_gather_object,
+        dist.new_group,
+        dist.destroy_process_group,
+        _gather_broadcast_evidence,
         global_inventory,
         _verify_trainer_replicas,
         _explicitly_skipped_parameters,
@@ -1614,7 +1834,7 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
     verify_sources(sources)
     local = {"rank": rank, "world_size": world, **local_inventory, "error": error}
     records = [None] * world
-    dist.all_gather_object(records, local)
+    _gather_broadcast_evidence(records, local)
     errors = [record.get("error") for record in records if isinstance(record, dict) and record.get("error")]
     if errors:
         raise ValueError("collective trainer inventory failed: " + "; ".join(errors))
@@ -1653,8 +1873,48 @@ def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
         )
 
 
+def _skipped_checkpoint_shards(model, export, rank: int) -> dict:
+    """This rank's checkpoint-shard manifests of the skipped tables its checkpoint stores split.
+
+    A Qwen3.8 checkpoint stores each ``*.ple.ple_embedding.ngram_embedding.weight`` table in ``split_ngram_parts``
+    shards, the tables its HF export splits (``model/implementations/qwen38/deepspeed_integration.py``). The export
+    concatenates the rows of the EP replica holding rank 0 in process-group order, so only that replica's ranks
+    report, each the shards overlapping its own rows, which follow the rows the bound inventory records for the members
+    before it.
+    """
+    from arctic_platform.model.weight_export import hf_export_parameter_name
+    from arctic_platform.model.weight_export import pretrained_config_of
+
+    config = pretrained_config_of(model)
+    parts = getattr(getattr(config, "text_config", config), "split_ngram_parts", None)
+    if type(parts) is not int or parts < 1:
+        return {}
+    held = {record["rank"]: record["parameters"] for record in export["records"]}
+    result = {}
+    for name, value in export["objects"].items():
+        checkpoint_name = hf_export_parameter_name(name)
+        members = export["local"]["parameters"][name]["ep_ranks"] or [0]
+        if (
+            checkpoint_name is None
+            or not checkpoint_name.endswith(".ple.ple_embedding.ngram_embedding.weight")
+            or 0 not in members
+            or rank not in members
+        ):
+            continue
+        rows = [held[member][name]["shape"][0] for member in members]
+        result[name] = dict(
+            checkpoint_name=checkpoint_name,
+            shards=checkpoint_shard_manifests(value, sum(rows[: members.index(rank)]), sum(rows), parts),
+        )
+    return result
+
+
 def maybe_complete_broadcast_trainer_inventory(model, *, is_master):
-    """Every export rank proves intentionally omitted frozen storage stayed unchanged."""
+    """Every export rank proves intentionally omitted frozen storage stayed unchanged.
+
+    A rank of the exported EP replica also reports the checkpoint-shard manifests of its rows of a skipped table its
+    checkpoint stores split (:func:`_skipped_checkpoint_shards`), so the sampler's unwritten copy can be compared.
+    """
     if not enabled():
         return
     import torch.distributed as dist
@@ -1667,6 +1927,7 @@ def maybe_complete_broadcast_trainer_inventory(model, *, is_master):
         return
     error = None
     actual = {}
+    shards = {}
     try:
         if is_master != (dist.get_rank() == 0):
             raise RuntimeError("skipped frozen export completion changed the master rank")
@@ -1681,11 +1942,14 @@ def maybe_complete_broadcast_trainer_inventory(model, *, is_master):
             before = export["local"]["parameters"][name]
             if value.requires_grad or any(actual[name][key] != before[key] for key in actual[name]):
                 raise RuntimeError(f"skipped frozen parameter bytes or layout changed: {name}")
+        shards = _skipped_checkpoint_shards(model, export, dist.get_rank())
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     local = dict(rank=dist.get_rank(), world_size=dist.get_world_size(), parameters=actual, error=error)
+    if shards:
+        local["checkpoint_shards"] = shards
     completed = [None] * dist.get_world_size()
-    dist.all_gather_object(completed, local)
+    _gather_broadcast_evidence(completed, local)
     if any(
         not isinstance(entry, dict)
         or type(entry.get("rank")) is not int
@@ -1860,6 +2124,62 @@ def maybe_collect_broadcast_verification(results, *, engine_only, llm, rank_offs
         },
         *results[1:],
     ]
+
+
+def maybe_lora_received_manifest(tensors):
+    """Hash the received adapter tensors before the LoRA builder casts them or folds scaling into them in place."""
+    if not enabled():
+        return None
+    return {name: tensor_manifest(value) for name, value in tensors.items()}
+
+
+def _lora_manager_destinations(manager, adapter, module, factor, slot) -> list[str]:
+    if module in manager.modules:
+        candidates = [(module, slot)]
+    elif slot is None:
+        candidates = [
+            (packed, index)
+            for packed, members in getattr(manager, "packed_modules", {}).items()
+            if packed in manager.modules
+            for index, member in enumerate(members)
+            if member == module
+        ]
+    else:
+        candidates = []
+    destinations = []
+    for name, index in candidates:
+        weights = manager._get_lora_layer_weights(adapter, name)
+        value = getattr(weights, factor, None) if weights is not None else None
+        if index is not None:
+            value = value[index] if isinstance(value, list) and index < len(value) else None
+        if value is not None:
+            destinations.append(f"{name}.{factor}" if index is None else f"{name}.{factor}[{index}]")
+    return destinations
+
+
+def maybe_lora_receiver_result(result, received, built_factors, *, manager, lora_int_id, rank, world_size):
+    """Record, per received adapter tensor, the LoRA-manager module factor this rank installed it into.
+
+    A destination is a module of ``manager.modules`` (the modules ``activate_adapter`` hands to ``set_lora``) whose
+    installed adapter holds the tensor's factor, either directly or in its slot of a packed module. A tensor the
+    builder skipped or overwrote, or whose module the manager does not wrap, has no destination.
+    """
+    if received is None:
+        return result
+    adapter = manager.get_adapter(lora_int_id)
+    entries = {}
+    for name, manifest in received.items():
+        built = built_factors.get(name)
+        destinations = [] if built is None or adapter is None else _lora_manager_destinations(manager, adapter, *built)
+        entries[name] = {**manifest, "destinations": destinations}
+    verification = {
+        "status": "ok",
+        "weight_format": "lora",
+        "rank": rank,
+        "world_size": world_size,
+        "received": entries,
+    }
+    return {**result, "rank": rank, "weight_sync_verification": verification}
 
 
 # Rl Sampler Evidence

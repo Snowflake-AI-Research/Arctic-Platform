@@ -1828,6 +1828,9 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
+        results = maybe_collect_broadcast_verification(
+            results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset
+        )
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

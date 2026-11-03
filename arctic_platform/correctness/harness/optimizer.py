@@ -4275,7 +4275,13 @@ def capture_optimizer_step(
             }
         decoded = scratch / "decoded"
         participation_options = {}
-        if result.participation is not None and "rank_receipts" in result.participation:
+        # A native capture's participation comes from its collector's save receipts; the decoder refuses both.
+        if (
+            native is None
+            and native_layout_supplier is None
+            and result.participation is not None
+            and "rank_receipts" in result.participation
+        ):
             actual_child = _dense_training_child(transport, job.client.jobs.training)
             if (
                 job.client.transport is not transport

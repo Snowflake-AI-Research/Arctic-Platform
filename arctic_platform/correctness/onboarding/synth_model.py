@@ -28,11 +28,14 @@ tensors on the same side, and the checkpoint's weights bring that to -2.01e-04 w
 
 from __future__ import annotations
 
+import copy
 import glob
 import hashlib
 import json
 import math
+import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -314,7 +317,7 @@ def size_for_single_gpu(
 SIDECAR_PATTERNS = ("*token*", "*.txt", "*processor*", "chat_template*")
 
 
-def sidecar_files(source: str) -> List[Path]:
+def sidecar_files(source: str, patterns: Tuple[str, ...] = SIDECAR_PATTERNS) -> List[Path]:
     """The source checkpoint's tokenizer sidecars, as paths on this filesystem.
 
     ``source`` is a Hugging Face hub id as often as it is a directory, and a glob over a hub id matches
@@ -328,14 +331,14 @@ def sidecar_files(source: str) -> List[Path]:
     if not Path(source).is_dir():
         from huggingface_hub import snapshot_download
 
-        root = snapshot_download(source, allow_patterns=list(SIDECAR_PATTERNS))
+        root = snapshot_download(source, allow_patterns=list(patterns))
     found: List[Path] = []
-    for pattern in SIDECAR_PATTERNS:
+    for pattern in patterns:
         found.extend(Path(path) for path in glob.glob(f"{root}/{pattern}"))
     return sorted(set(found))
 
 
-def copy_sidecars(source: str, dest_path: Path) -> List[Path]:
+def copy_sidecars(source: str, dest_path: Path, patterns: Tuple[str, ...] = SIDECAR_PATTERNS) -> List[Path]:
     """Place the source's tokenizer sidecars beside a reduced model's weights.
 
     Run whether or not the weights were just written, so a cache produced before this copy existed gains
@@ -345,7 +348,7 @@ def copy_sidecars(source: str, dest_path: Path) -> List[Path]:
     """
     dest_path = require_data_fast_path(dest_path, label="reduced model sidecar destination")
     copied: List[Path] = []
-    for sidecar in sidecar_files(source):
+    for sidecar in sidecar_files(source, patterns):
         target = dest_path / sidecar.name
         target.unlink(missing_ok=True)
         shutil.copyfile(sidecar, target)
@@ -374,6 +377,19 @@ def _save_reduced_pretrained(model, dest_path: Path) -> None:
     finally:
         if preserve_legacy_defaults:
             model.generation_config = generation
+    index_path = dest_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        # HF omits the index for a single shard; fixture authorization still needs its exact tensor inventory.
+        with (dest_path / "model.safetensors").open("rb") as stream:
+            header = json.loads(stream.read(int.from_bytes(stream.read(8), "little")))
+        tensors = {name: entry for name, entry in header.items() if name != "__metadata__"}
+        index = dict(
+            metadata=dict(
+                total_size=sum(entry["data_offsets"][1] - entry["data_offsets"][0] for entry in tensors.values())
+            ),
+            weight_map=dict.fromkeys(tensors, "model.safetensors"),
+        )
+        index_path.write_text(json.dumps(index, indent=2) + "\n")
     if preserve_legacy_defaults:
         generation.to_json_file(dest_path / "generation_config.json", use_diff=True, keys_to_pop=["compile_config"])
 
@@ -535,3 +551,458 @@ def materialize(
         content_hash=hash_directory(dest_path),
         sized_against_gib=SINGLE_GPU_BUDGET_GIB,
     )
+
+
+# The tiny model's sidecars: the reduced model's set, the slow tokenizer's vocabulary, and the original's generation
+# defaults, which a freshly built model's save would replace with values derived from its configuration.
+TINY_SIDECAR_PATTERNS = (*SIDECAR_PATTERNS, "vocab*", "generation_config.json")
+
+# Decoder layers, vision blocks and routed experts, under the prefixes both checkpoint tensors and quantization module
+# lists use (``model.language_model.layers.3``, ``model.layers.3``, ``model.visual.blocks.0``, ``visual.blocks.0``).
+_MAIN_LAYER = re.compile(r"^((?:model\.)?(?:language_model\.)?layers\.)(\d+)(\..+)?$")
+_VISION_BLOCK = re.compile(r"^((?:.+\.)?visual\.blocks\.)(\d+)(\..+)?$")
+_EXPERT = re.compile(r"\.experts\.(\d+)\.")
+_MTP_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
+
+# The RMSNorm weight that leaves its normalized input unscaled: GLM-5.3 multiplies by the weight, Qwen4-Exp by one
+# plus the weight.
+_NORM_IDENTITY = {"glm5_next_text": 1.0, "qwen4_exp_text": 0.0}
+
+# Shapes of the prediction-layer tensors Hugging Face does not build, by name suffix: GLM-5.3's projection of the
+# concatenated embedding and hidden state with its three RMSNorms, and Qwen3.8's MTP embedding and hidden projections
+# with their RMSNorms, the hidden one spanning every hyper-connection stream. Qwen3.8's MTP hyper-connection mixer
+# takes the shapes of the decoder's.
+_PREDICTION_SHAPES = {
+    "eh_proj.weight": lambda text: (text["hidden_size"], 2 * text["hidden_size"]),
+    "enorm.weight": lambda text: (text["hidden_size"],),
+    "hnorm.weight": lambda text: (text["hidden_size"],),
+    "shared_head.norm.weight": lambda text: (text["hidden_size"],),
+    "fc_embedding.weight": lambda text: (text["hidden_size"], text["hidden_size"]),
+    "fc_hidden.weight": lambda text: (text["hidden_size"], text["hidden_size"]),
+    "pre_fc_norm_embedding.weight": lambda text: (text["hidden_size"],),
+    "pre_fc_norm_hidden.weight": lambda text: (text["hc_count"] * text["hidden_size"],),
+}
+
+
+def _tiny_name(
+    name: str,
+    layers: int,
+    original_layers: int,
+    prediction_layers: int,
+    vision_depth: int | None,
+    experts: int | None = None,
+) -> str | None:
+    """``name`` in the tiny model's numbering, or ``None`` when the tiny model drops it.
+
+    Decoder layers below ``layers`` keep their index and the ``prediction_layers`` stored after the original's last
+    decoder layer move to follow the tiny model's last. Vision blocks at or past ``vision_depth`` and routed experts
+    at or past ``experts`` are dropped.
+    """
+    if match := _MAIN_LAYER.match(name):
+        index = int(match[2])
+        if original_layers <= index < original_layers + prediction_layers:
+            index += layers - original_layers
+        elif index >= layers:
+            return None
+        name = f"{match[1]}{index}{match[3] or ''}"
+    elif vision_depth is not None and (match := _VISION_BLOCK.match(name)) and int(match[2]) >= vision_depth:
+        return None
+    if experts is not None and (match := _EXPERT.search(name)) and int(match[1]) >= experts:
+        return None
+    return name
+
+
+def tiny_config_dict(
+    original: dict,
+    num_layers: int,
+    text_overrides: dict,
+    vision_overrides: dict | None = None,
+    vision_depth: int | None = None,
+) -> dict:
+    """The original ``config.json`` with the named fields replaced and every per-layer entry cut to ``num_layers``.
+
+    Every other field keeps the original's value, and an override of a field the original does not carry is refused,
+    so the tiny model has exactly the original's fields. A list as long as the original layer count is truncated, and
+    the kept prefix must still contain every distinct string the list holds, so no layer or MLP kind disappears. A
+    layer-index list in a nested section, such as ``linear_attn_config.kda_layers``, keeps the indices below
+    ``num_layers``. A block-FP8 ``modules_to_not_convert`` list is renumbered the way the checkpoint is.
+    """
+    config = copy.deepcopy(original)
+    text = config.get("text_config", config)
+    original_layers = text["num_hidden_layers"]
+    if type(num_layers) is not int or not 0 < num_layers <= original_layers:
+        raise ValueError(f"num_layers must be in [1, {original_layers}], got {num_layers!r}")
+    for key, value in list(text.items()):
+        if isinstance(value, list) and len(value) == original_layers:
+            kept = value[:num_layers]
+            if all(isinstance(entry, str) for entry in value) and set(kept) != set(value):
+                raise ValueError(f"{num_layers} layers drop {sorted(set(value) - set(kept))} from {key}")
+            text[key] = kept
+        elif isinstance(value, dict):
+            for sub, entries in value.items():
+                if (
+                    sub.endswith("_layers")
+                    and isinstance(entries, list)
+                    and all(type(index) is int and 0 <= index < original_layers for index in entries)
+                ):
+                    value[sub] = [index for index in entries if index < num_layers]
+    text["num_hidden_layers"] = num_layers
+    vision = config.get("vision_config")
+    for section, overrides in ((text, text_overrides), (vision, vision_overrides or {})):
+        for key, value in overrides.items():
+            if section is None or key not in section:
+                raise ValueError(f"the original configuration has no {key!r} to override")
+            section[key] = value
+    if vision_depth is not None:
+        if vision is None:
+            raise ValueError("vision_depth was given for a configuration without a vision tower")
+        vision["depth" if "depth" in vision else "num_hidden_layers"] = vision_depth
+    prediction_layers = text.get("num_nextn_predict_layers", 0)
+    for holder in [config] if text is config else [config, text]:
+        quantization = holder.get("quantization_config")
+        if isinstance(quantization, dict) and isinstance(quantization.get("modules_to_not_convert"), list):
+            quantization["modules_to_not_convert"] = [
+                renamed
+                for module in quantization["modules_to_not_convert"]
+                if (renamed := _tiny_name(module, num_layers, original_layers, prediction_layers, vision_depth))
+                is not None
+            ]
+    return config
+
+
+def config_diff(original: dict, tiny: dict, prefix: str = "") -> List[dict]:
+    """Every field whose value differs between two ``config.json`` dictionaries, by dotted key.
+
+    A list longer than 16 entries is summarized by its length and its distinct entries rather than printed whole.
+    """
+
+    def summary(value):
+        if isinstance(value, list) and len(value) > 16:
+            distinct = sorted({json.dumps(entry, sort_keys=True) for entry in value})
+            return {"length": len(value), "distinct": distinct if len(distinct) <= 16 else len(distinct)}
+        return value
+
+    diff: List[dict] = []
+    for key in sorted(original.keys() | tiny.keys()):
+        old, new = original.get(key), tiny.get(key)
+        if isinstance(old, dict) and isinstance(new, dict):
+            diff.extend(config_diff(old, new, f"{prefix}{key}."))
+        elif old != new:
+            diff.append({"key": f"{prefix}{key}", "original": summary(old), "tiny": summary(new)})
+    return diff
+
+
+def checkpoint_schema(root: Path) -> dict:
+    """Every tensor's safetensors dtype and shape, read from the shard headers without reading any payload."""
+    schema = {}
+    for shard in sorted(Path(root).glob("*.safetensors")):
+        with shard.open("rb") as stream:
+            header = json.loads(stream.read(int.from_bytes(stream.read(8), "little")))
+        for name, entry in header.items():
+            if name != "__metadata__":
+                schema[name] = (entry["dtype"], tuple(entry["shape"]))
+    return schema
+
+
+def _is_prediction(name: str, num_layers: int) -> bool:
+    return name.startswith("mtp.") or bool((match := _MAIN_LAYER.match(name)) and int(match[2]) >= num_layers)
+
+
+def _prediction_layer_count(names, num_layers: int) -> int:
+    main = {int(match[2]) for name in names if (match := _MAIN_LAYER.match(name)) and int(match[2]) >= num_layers}
+    mtp = {num_layers + int(match[1]) for name in names if (match := _MTP_LAYER.match(name))}
+    if main and mtp:
+        raise ValueError("the original stores prediction layers both after its decoder layers and under mtp.layers")
+    found = main or mtp
+    if found != set(range(num_layers, num_layers + len(found))):
+        raise ValueError(f"the original's prediction layers are not contiguous: {sorted(found)}")
+    return len(found)
+
+
+def _with_prediction_layers(config: dict, count: int) -> Tuple[dict, dict]:
+    """``config`` with ``count`` prediction layers appended as decoder layers, and their built-to-stored prefixes.
+
+    Hugging Face builds neither family's prediction layers, so they are built as the decoder layers they are:
+    GLM-5.3 stores a sparse-MLA MoE layer after its last decoder layer, and Qwen3.8 stores its MTP layers' decoder
+    blocks under ``mtp.layers``.
+    """
+    config = copy.deepcopy(config)
+    text = config.get("text_config", config)
+    layers = text["num_hidden_layers"]
+    renames = {}
+    if text.get("model_type") == "glm5_next_text":
+        sparse = text["layer_types"].index("deepseek_sparse_attention")
+        text["layer_types"] += ["deepseek_sparse_attention"] * count
+        text["mlp_layer_types"] += ["sparse"] * count
+        text["indexer_types"] += [text["indexer_types"][sparse]] * count
+        text["linear_attn_config"]["full_attn_layers"] += list(range(layers, layers + count))
+    elif text.get("model_type") == "qwen4_exp_text":
+        mtp_types = list(text["mtp"]["layer_types"])
+        if len(mtp_types) != count:
+            raise ValueError(f"the original stores {count} MTP layers and declares {len(mtp_types)} MTP layer types")
+        text["layer_types"] += mtp_types
+        renames = {f"model.language_model.layers.{layers + j}.": f"mtp.layers.{j}." for j in range(count)}
+    else:
+        raise ValueError(f"no prediction-layer layout is known for {text.get('model_type')!r}")
+    text["num_hidden_layers"] = layers + count
+    return config, renames
+
+
+def _built_layouts(config: dict, seed: int, scratch: Path) -> List[dict]:
+    """The tensors a model built from ``config`` with ``seed`` saves, in both layouts Hugging Face writes.
+
+    The first has the architecture's load-time conversions reverted, which stores one tensor per expert as GLM-5.3
+    checkpoints do; the second keeps the layout the model holds in memory, with fused experts as Qwen3.8 checkpoints
+    store them.
+    """
+    import torch
+    import transformers
+    from safetensors.torch import load_file
+    from transformers import AutoConfig
+    from transformers.conversion_mapping import get_model_conversion_mapping
+
+    (scratch / "config").mkdir(parents=True)
+    (scratch / "config" / "config.json").write_text(json.dumps(config))
+    cfg = AutoConfig.from_pretrained(scratch / "config")
+    torch.manual_seed(seed)
+    model = getattr(transformers, cfg.architectures[0])(cfg)
+    layouts = []
+    for index, conversions in enumerate((get_model_conversion_mapping(model, add_legacy=False), [])):
+        # ``save_pretrained`` reverts exactly the conversions attached to the model; none keeps the in-memory names.
+        model._weight_conversions = conversions
+        _save_reduced_pretrained(model, scratch / f"saved-{index}")
+        tensors = {}
+        for shard in sorted((scratch / f"saved-{index}").glob("*.safetensors")):
+            tensors.update(load_file(shard))
+        layouts.append(tensors)
+    del model
+    return layouts
+
+
+def _split_ngram_tables(produced: dict, target: dict) -> None:
+    """Store each Qwen3.8 n-gram embedding table as the ``shard_<i>`` row blocks the original checkpoint holds."""
+    for name in [name for name in produced if name.endswith(".ngram_embedding.weight") and name not in target]:
+        prefix = name.removesuffix(".weight")
+        shard = re.compile(rf"{re.escape(prefix)}\.shard_\d+\.weight")
+        parts = sum(1 for other in target if shard.fullmatch(other))
+        if parts:
+            for index, block in enumerate(produced.pop(name).tensor_split(parts, dim=0)):
+                produced[f"{prefix}.shard_{index}.weight"] = block.contiguous()
+
+
+def _prediction_tensor(name: str, text: dict, produced: dict, generator):
+    import torch
+
+    shape = None
+    for suffix, rule in _PREDICTION_SHAPES.items():
+        if name == suffix or name.endswith(f".{suffix}"):
+            shape = rule(text)
+    if shape is None and name.startswith("mtp.") and (main := f"model.language_model.{name[4:]}") in produced:
+        shape = tuple(produced[main].shape)
+    if shape is None:
+        raise ValueError(f"no shape is known for the prediction-layer tensor {name}")
+    if len(shape) == 1:
+        return torch.full(shape, _NORM_IDENTITY[text["model_type"]])
+    return torch.empty(shape).normal_(0.0, text["initializer_range"], generator=generator)
+
+
+def _checkpoint_tensors(produced: dict, target: dict, block: int | None) -> dict:
+    """``produced`` in the original's dtypes, with block-FP8 weights and their inverse scales where it is quantized."""
+    import torch
+
+    from arctic_platform.model.implementations.fp8 import quantize_to_fp8_blockwise
+
+    dtypes = {
+        "BF16": torch.bfloat16,
+        "F16": torch.float16,
+        "F32": torch.float32,
+        "F64": torch.float64,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "BOOL": torch.bool,
+        "F8_E4M3": torch.float8_e4m3fn,
+    }
+    scales = {f"{name}_scale_inv" for name, (dtype, _) in target.items() if dtype == "F8_E4M3"}
+    missing = sorted(target.keys() - produced.keys() - scales)
+    unexpected = sorted(produced.keys() - target.keys())
+    unscaled = sorted(scales - target.keys())
+    if missing or unexpected or unscaled:
+        raise ValueError(
+            f"the tiny tensors do not match the original's layout: {len(missing)} missing {missing[:8]}, "
+            f"{len(unexpected)} unexpected {unexpected[:8]}, {len(unscaled)} FP8 weights without a stored scale "
+            f"{unscaled[:8]}"
+        )
+    tensors = {}
+    for name, tensor in produced.items():
+        dtype, shape = target[name]
+        if tensor.dim() != len(shape):
+            raise ValueError(f"{name} has rank {tensor.dim()} and the original's tensor rank {len(shape)}")
+        if dtype == "F8_E4M3":
+            tensors[name], tensors[f"{name}_scale_inv"] = quantize_to_fp8_blockwise(tensor.to(torch.bfloat16), block)
+        else:
+            tensors[name] = tensor.to(dtypes[dtype]).contiguous()
+    wrong = sorted(name for name, tensor in tensors.items() if tensor.dtype != dtypes[target[name][0]])
+    if wrong:
+        raise ValueError(f"{len(wrong)} tiny tensors are not in the original's dtype: {wrong[:8]}")
+    return tensors
+
+
+def _write_checkpoint(tensors: dict, dest: Path, max_shard_bytes: int = 2 * 1024**3) -> None:
+    """Write ``tensors`` as sorted safetensors shards and a ``model.safetensors.index.json``, the hub layout."""
+    from safetensors.torch import save_file
+
+    shards: List[dict] = [{}]
+    size = 0
+    for name in sorted(tensors):
+        nbytes = tensors[name].numel() * tensors[name].element_size()
+        if shards[-1] and size + nbytes > max_shard_bytes:
+            shards.append({})
+            size = 0
+        shards[-1][name] = tensors[name]
+        size += nbytes
+    weight_map = {}
+    for number, shard in enumerate(shards, start=1):
+        filename = f"model-{number:05d}-of-{len(shards):05d}.safetensors"
+        save_file(shard, dest / filename, metadata={"format": "pt"})
+        weight_map.update(dict.fromkeys(shard, filename))
+    total = sum(tensor.numel() * tensor.element_size() for tensor in tensors.values())
+    index = {"metadata": {"total_size": total}, "weight_map": weight_map}
+    (dest / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 24), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def materialize_tiny(
+    source: str,
+    dest: str,
+    *,
+    num_layers: int,
+    text_overrides: dict,
+    vision_overrides: dict | None = None,
+    vision_depth: int | None = 1,
+    seed: int = SEED,
+    force: bool = False,
+) -> dict:
+    """Write a random-weight model with the original's architecture and checkpoint layout at reduced size to ``dest``.
+
+    ``materialize`` keeps every dimension and writes an unquantized BF16 model without prediction layers. This keeps
+    the original's configuration fields with the named dimensions replaced (``tiny_config_dict``) and writes the
+    checkpoint the original's loaders read: the same tensor names, with prediction layers renumbered after the last
+    kept decoder layer and experts and vision blocks past the reduced counts dropped; every tensor in the original's
+    dtype; block-FP8 weights with their ``weight_scale_inv`` wherever the original is quantized; and the original's
+    tokenizer, processor and generation sidecars. Weights are random from ``seed``. An FP8 original and its BF16
+    sibling reduced with the same fields and seed get the same weights, the FP8 copy block-quantized from the BF16
+    values.
+
+    Returns the manifest, also written beside ``dest`` as ``<name>.manifest.json``: the configuration diff against the
+    original, the model's parameter count, the stored tensor elements, each file's SHA-256, and the content hash a
+    ``ModelSpec`` binds.
+    """
+    import torch
+    from transformers import AutoConfig
+
+    dest_path = require_data_fast_path(dest, label="tiny model destination")
+    if dest_path.exists() and not force:
+        raise FileExistsError(f"{dest_path} exists; rebuild it with force=True")
+    root = Path(source)
+    if not root.is_dir():
+        from huggingface_hub import snapshot_download
+
+        root = Path(snapshot_download(source, local_files_only=True))
+    original = json.loads((root / "config.json").read_text())
+    tiny = tiny_config_dict(original, num_layers, text_overrides, vision_overrides, vision_depth)
+    original_text = original.get("text_config", original)
+    text = tiny.get("text_config", tiny)
+    experts = text.get("n_routed_experts", text.get("num_experts"))
+    target = {}
+    for name, entry in checkpoint_schema(root).items():
+        renamed = _tiny_name(
+            name,
+            num_layers,
+            original_text["num_hidden_layers"],
+            original_text.get("num_nextn_predict_layers", 0),
+            vision_depth,
+            experts,
+        )
+        if renamed is not None:
+            target[renamed] = entry
+    block = None
+    if any(dtype == "F8_E4M3" for dtype, _ in target.values()):
+        quantization = tiny.get("quantization_config", text.get("quantization_config")) or {}
+        block_size = quantization.get("weight_block_size")
+        if quantization.get("quant_method") != "fp8" or not block_size or len(set(block_size)) != 1:
+            raise ValueError("an FP8 original needs a square block-FP8 quantization_config")
+        block = block_size[0]
+
+    build = copy.deepcopy(tiny)
+    for holder in [build] if "text_config" not in build else [build, build["text_config"]]:
+        holder.pop("quantization_config", None)
+    count = _prediction_layer_count(target, num_layers)
+    renames = {}
+    if count:
+        build, renames = _with_prediction_layers(build, count)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=dest_path.parent, prefix=f".{dest_path.name}.") as scratch:
+        scratch = Path(scratch)
+        layouts = []
+        for layout in _built_layouts(build, seed, scratch / "build"):
+            produced = {}
+            for name, tensor in layout.items():
+                for built, stored in renames.items():
+                    if name.startswith(built):
+                        name = stored + name[len(built) :]
+                        break
+                produced[name] = tensor
+            _split_ngram_tables(produced, target)
+            layouts.append(produced)
+        # Compared only after the renames and the n-gram split, which both layouts need, so that hundreds of n-gram
+        # shard names cannot outweigh the expert names that tell the layouts apart.
+        produced = max(layouts, key=lambda layout: len(target.keys() & layout.keys()))
+        del layouts
+        for name in [name for name in produced if _is_prediction(name, num_layers) and name not in target]:
+            # A prediction layer is a decoder layer without the parts that only the decoder stack carries, such as
+            # GLM-5.3's per-layer hyper-connection mixers.
+            del produced[name]
+        generator = torch.Generator().manual_seed(seed)
+        for name in sorted(target):
+            if _is_prediction(name, num_layers) and name not in produced and not name.endswith("_scale_inv"):
+                produced[name] = _prediction_tensor(name, text, produced, generator)
+        tensors = _checkpoint_tensors(produced, target, block)
+        del produced
+        staged = scratch / "model"
+        staged.mkdir()
+        _write_checkpoint(tensors, staged)
+        (staged / "config.json").write_text(json.dumps(tiny, indent=2) + "\n")
+        copy_sidecars(str(root), staged, TINY_SIDECAR_PATTERNS)
+        if dest_path.exists():
+            shutil.rmtree(dest_path)
+        staged.rename(dest_path)
+
+    manifest = {
+        "path": str(dest_path),
+        "source": source,
+        "source_path": str(root),
+        "seed": seed,
+        "num_hidden_layers": num_layers,
+        "prediction_layers": count,
+        "vision_depth": vision_depth,
+        "config_diff": config_diff(original, tiny),
+        "parameter_count": count_parameters(AutoConfig.from_pretrained(dest_path)),
+        "stored_tensor_count": len(tensors),
+        "stored_tensor_elements": sum(tensor.numel() for tensor in tensors.values()),
+        "stored_tensor_bytes": sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()),
+        "content_hash": hash_directory(dest_path),
+        "files": {
+            path.name: {"bytes": path.stat().st_size, "sha256": _file_sha256(path)}
+            for path in sorted(dest_path.iterdir())
+            if path.is_file()
+        },
+    }
+    (dest_path.parent / f"{dest_path.name}.manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest

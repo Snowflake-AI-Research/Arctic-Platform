@@ -38,6 +38,8 @@ import sys
 import tempfile
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
@@ -523,6 +525,195 @@ def _verified_identity(root: Path, native: Path, binding: dict, request: dict, e
     return actual
 
 
+def _checkpoint_script(body: str) -> str:
+    source = Path(__file__).resolve(strict=True)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    import_roots = list(
+        dict.fromkeys(
+            [str(source.parents[3]), *(str(Path(root).resolve()) for root in sys.path if isinstance(root, str))]
+        )
+    )
+    script = (
+        f"import hashlib, json, sys\nfrom pathlib import Path\nsys.path[:] = {import_roots!r}\n"
+        f"source = Path({str(source)!r})\nexpected_sha = {source_sha!r}\n"
+        "if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n"
+        "    raise RuntimeError('checkpoint store source SHA256 differs')\n"
+        "from arctic_platform.correctness.harness import storage as module\n"
+        "if Path(module.__file__).resolve() != source:\n"
+        "    raise RuntimeError('checkpoint store imported source path differs')\n"
+        "if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n"
+        "    raise RuntimeError('checkpoint store source SHA256 differs after import')\n"
+        + body
+    )
+    encoded = base64.b64encode(script.encode()).decode()
+    return f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -"
+
+
+def _expert_directory(root: Path, tag: str) -> Path:
+    if not isinstance(tag, str) or not re.fullmatch(r"global_step[0-9]+", tag):
+        raise ValueError("expert replicas require an exact native checkpoint tag")
+    directory = root / tag
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("expert checkpoint directory is not an owned real directory")
+    return directory
+
+
+def _expert_file_identity(path: Path) -> dict:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_size <= 0
+            or _identity(path.lstat()) != _identity(info)
+        ):
+            raise ValueError(f"expert shard is not a nonempty owned regular file: {path.name}")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        current = os.fstat(descriptor)
+        fields = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
+        if any(getattr(info, field) != getattr(current, field) for field in fields):
+            raise ValueError("expert shard changed while hashing")
+        if _identity(path.lstat()) != _identity(current):
+            raise ValueError("expert shard was replaced while hashing")
+        return {"size": info.st_size, "sha256": digest.hexdigest()}
+    finally:
+        os.close(descriptor)
+
+
+def _is_checkpoint_expert_shard(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    if re.fullmatch(r"experts_ep_rank_[0-9]{3}\.pt", name):
+        return True
+    match = re.fullmatch(r"ap_ep_ep_size_([0-9]+)_rank_([0-9]+)_model_states\.pt", name)
+    if match is None:
+        return False
+    degree, rank = map(int, match.groups())
+    return (
+        1 <= degree <= 1000
+        and 0 <= rank < degree
+        and name == f"ap_ep_ep_size_{degree}_rank_{rank:02d}_model_states.pt"
+    )
+
+
+def _expert_manifest(inventories: dict, ep_size: int) -> dict:
+    if type(ep_size) is not int or not 1 <= ep_size <= 1000:
+        raise ValueError("expert replica inventory requires a supported positive EP degree")
+    required = {f"experts_ep_rank_{rank:03d}.pt" for rank in range(ep_size)}
+    for host, inventory in inventories.items():
+        if not isinstance(inventory, dict) or any(not isinstance(name, str) for name in inventory):
+            raise ValueError(f"unexpected expert shards on {host}")
+        if any(name.startswith("ap_ep_") for name in inventory):
+            required.update(f"ap_ep_ep_size_{ep_size}_rank_{rank:02d}_model_states.pt" for rank in range(ep_size))
+    manifest = {}
+    for host, inventory in inventories.items():
+        if not isinstance(inventory, dict) or not inventory.keys() <= required:
+            raise ValueError(f"unexpected expert shards on {host}")
+        for name, identity in inventory.items():
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"size", "sha256"}
+                or type(identity["size"]) is not int
+                or identity["size"] <= 0
+                or not isinstance(identity["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", identity["sha256"])
+            ):
+                raise ValueError(f"invalid expert shard identity on {host}: {name}")
+            if name in manifest:
+                if manifest[name]["identity"] != identity:
+                    raise ValueError(f"conflicting expert shard replicas: {name}")
+            else:
+                manifest[name] = {"host": host, "identity": identity}
+    if manifest.keys() != required:
+        raise ValueError(f"missing expert shards: {sorted(required - manifest.keys())}")
+    return manifest
+
+
+def _stream_checkpoint_expert(request: dict, name: str, identity: dict) -> None:
+    if not _is_checkpoint_expert_shard(name):
+        raise ValueError("only expert weight shards may be transferred")
+    binding = request["binding"]
+    root = _canonical_root(binding["path"])
+    native = _native_path(binding["source_job_id"])
+    with _native_lock(native, exclusive=False) as lock:
+        _verified_identity(root, native, binding, request, request["expected"][socket.gethostname()], lock)
+        path = _expert_directory(root, request["payload"]["tag"]) / name
+        if _expert_file_identity(path) != identity:
+            raise ValueError("source expert shard differs from its acknowledged inventory")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            shutil.copyfileobj(stream, sys.stdout.buffer, length=8 * 1024 * 1024)
+        sys.stdout.buffer.flush()
+
+
+def _replicate_checkpoint_experts(directory: Path, request: dict) -> dict:
+    payload = request["payload"]
+    result = {}
+    transfers = []
+    for name, source in payload["manifest"].items():
+        if not _is_checkpoint_expert_shard(name):
+            raise ValueError("only expert weight shards may be transferred")
+        target = directory / name
+        identity = source["identity"]
+        peer = payload["training_hosts"].get(source["host"])
+        if peer is None or source["host"] not in request["expected"]:
+            raise ValueError("expert source is outside the acknowledged training allocation")
+        if os.path.lexists(target):
+            if _expert_file_identity(target) != identity:
+                raise ValueError(f"conflicting destination expert shard: {name}")
+        else:
+            transfers.append((target, peer, identity))
+        result[name] = identity
+
+    def transfer(target: Path, peer: str, identity: dict) -> None:
+        name = target.name
+        body = (
+            f"module._stream_checkpoint_expert(json.loads({json.dumps(request)!r}),"
+            f" {name!r}, json.loads({json.dumps(identity)!r}))\n"
+        )
+        descriptor, temporary = tempfile.mkstemp(prefix=".expert-replica-", dir=directory)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                done = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", peer, _checkpoint_script(body)],
+                    stdout=stream,
+                    stderr=subprocess.PIPE,
+                    timeout=payload["timeout"],
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            if done.returncode:
+                raise RuntimeError(f"expert shard transfer failed: {done.stderr.decode(errors='replace')}")
+            if _expert_file_identity(temporary) != identity:
+                raise ValueError(f"transferred expert shard digest differs: {name}")
+            # A racing writer must never be overwritten, even with matching contents.
+            os.link(temporary, target)
+        finally:
+            temporary.unlink()
+        if _expert_file_identity(target) != identity:
+            raise ValueError(f"published expert shard digest differs: {name}")
+
+    if len(transfers) > 0:
+        # Admit the complete manifest first; settle running transfers before releasing the native read lock.
+        with ThreadPoolExecutor(max_workers=min(4, len(transfers))) as executor:
+            futures = [executor.submit(transfer, *arguments) for arguments in transfers]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+    return result
+
+
 def _node_receipt(request: dict) -> dict:
     receipt = {
         "host": socket.gethostname(),
@@ -547,9 +738,9 @@ def _node_receipt(request: dict) -> dict:
             raise ValueError("native checkpoint path differs from the native resolver")
         binding["native_path"] = str(native)
         operation = request["operation"]
-        if operation not in {"create", "verify", "close"}:
+        if operation not in {"create", "verify", "close", "expert-inventory", "expert-replicate"}:
             raise ValueError("unknown checkpoint store operation")
-        with _native_lock(native, exclusive=operation != "verify") as lock:
+        with _native_lock(native, exclusive=operation in {"create", "close"}) as lock:
             if operation == "create":
                 if os.path.lexists(native):
                     raise FileExistsError(f"native checkpoint namespace already exists: {native}")
@@ -578,6 +769,25 @@ def _node_receipt(request: dict) -> dict:
                     receipt["identity"] = _verified_identity(root, native, binding, request, expected, lock)
                     if operation == "verify" and receipt["identity"]["link"] is None:
                         raise ValueError("checkpoint native link is absent")
+                    if operation in {"expert-inventory", "expert-replicate"}:
+                        payload = request["payload"]
+                        receipt["expert_shards"] = {}
+                        if receipt["host"] in payload["training_hosts"]:
+                            if receipt["identity"]["link"] is None:
+                                raise ValueError("checkpoint native link is absent")
+                            directory = _expert_directory(root, payload["tag"])
+                            if operation == "expert-inventory":
+                                receipt["expert_shards"] = {
+                                    path.name: _expert_file_identity(path)
+                                    for path in sorted(
+                                        [
+                                            *directory.glob("experts_ep_rank_*.pt"),
+                                            *directory.glob("ap_ep_*_model_states.pt"),
+                                        ]
+                                    )
+                                }
+                            else:
+                                receipt["expert_shards"] = _replicate_checkpoint_experts(directory, request)
                     if operation == "close":
                         if not shutil.rmtree.avoids_symlink_attacks:
                             raise RuntimeError("checkpoint cleanup requires symlink-safe tree removal")
@@ -593,13 +803,19 @@ def _node_receipt(request: dict) -> dict:
 
 
 class NativeCheckpointStore:
-    """Keep source namespaces until all native consumers have quiesced."""
+    """Keep source namespaces until all native consumers have quiesced.
 
-    def __init__(self, hostfile: Path, *, timeout: float = 120) -> None:
+    Ownership operations have a short control deadline. Expert inventory and copying
+    use a separate finite deadline because they read complete model-weight payloads.
+    """
+
+    def __init__(self, hostfile: Path, *, timeout: float = 120, expert_timeout: float = 14400) -> None:
         self.hostfile = Path(hostfile).absolute()
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < float("inf"):
-            raise ValueError("checkpoint fanout timeout must be finite and positive")
+        for name, value in (("control", timeout), ("expert payload", expert_timeout)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+                raise ValueError(f"checkpoint {name} timeout must be finite and positive")
         self.timeout = timeout
+        self.expert_timeout = expert_timeout
         self.store_id = uuid.uuid4().hex
         self._host_identity = self._hostfile_identity()
         entries = parse_hostfile(self.hostfile)
@@ -643,8 +859,9 @@ class NativeCheckpointStore:
                 f"allocation hostfile changed: path={self.hostfile}; differences={json.dumps(changes, sort_keys=True)}"
             )
 
-    def _fanout(self, operation: str, binding: dict, identities: dict) -> dict:
+    def _fanout(self, operation: str, binding: dict, identities: dict, *, payload: dict | None = None) -> dict:
         self._check_hostfile()
+        timeout = self.expert_timeout if operation in {"expert-inventory", "expert-replicate"} else self.timeout
         request = {
             "operation": operation,
             "binding": binding,
@@ -653,39 +870,20 @@ class NativeCheckpointStore:
             "token": uuid.uuid4().hex,
             "expected": {receipt["host"]: receipt["identity"] for receipt in identities.values()},
         }
+        if payload is not None:
+            request["payload"] = payload
         results = {}
         done = None
         try:
-            source = Path(__file__).resolve(strict=True)
-            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
-            # SSH login cwd/environment need not retain the gateway's private overlay.
-            import_roots = list(
-                dict.fromkeys(
-                    [
-                        str(source.parents[3]),
-                        *(str(Path(root).resolve()) for root in sys.path if isinstance(root, str)),
-                    ]
-                )
+            command = _checkpoint_script(
+                f"receipt = module._node_receipt(json.loads({json.dumps(request)!r}))\n"
+                f"print({_RECEIPT!r} + json.dumps(receipt), flush=True)\n"
             )
-            script = (
-                f"import hashlib, json, sys\nfrom pathlib import Path\nsys.path[:] = {import_roots!r}\nsource ="
-                f" Path({str(source)!r})\nexpected_sha = {source_sha!r}\nif"
-                " hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n    raise"
-                " RuntimeError('checkpoint store source SHA256 differs')\nfrom arctic_platform.correctness.harness"
-                " import storage as module\nif Path(module.__file__).resolve() != source:\n    raise"
-                " RuntimeError('checkpoint store imported source path differs')\nif"
-                " hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n    raise"
-                " RuntimeError('checkpoint store source SHA256 differs after import')\nreceipt ="
-                f" module._node_receipt(json.loads({json.dumps(request)!r}))\nprint({_RECEIPT!r} +"
-                " json.dumps(receipt), flush=True)\n"
-            )
-            # ds_ssh forwards unquoted arguments to pdsh, flattening multiline source.
-            encoded = base64.b64encode(script.encode()).decode()
             done = subprocess.run(
-                [_ds_ssh(), "-f", str(self.hostfile), f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -"],
+                [_ds_ssh(), "-f", str(self.hostfile), command],
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=timeout,
             )
             for line in done.stdout.splitlines():
                 prefix, separator, raw = line.partition(_RECEIPT)
@@ -736,7 +934,7 @@ class NativeCheckpointStore:
         except Exception as exc:
             output = exc if isinstance(exc, subprocess.TimeoutExpired) else done
             raise CheckpointStoreError(
-                f"allocation checkpoint {operation}: {exc}",
+                f"allocation checkpoint {operation} (timeout={timeout}s): {exc}",
                 results,
                 transport_stdout=getattr(output, "stdout", None),
                 transport_stderr=getattr(output, "stderr", None),
@@ -767,6 +965,37 @@ class NativeCheckpointStore:
         if record is None or record[0] != binding:
             raise CheckpointStoreError("checkpoint binding is not owned by this store")
         self._fanout("verify", record[0], record[1])
+
+    def materialize_expert_replicas(self, binding: dict, tag: str, training_hosts: list[str], ep_size: int) -> None:
+        record = self._records.get(binding.get("source_job_id"))
+        if record is None or record[0] != binding:
+            raise CheckpointStoreError("checkpoint binding is not owned by this store")
+        if (
+            not training_hosts
+            or len(set(training_hosts)) != len(training_hosts)
+            or not set(training_hosts) <= self.hosts
+        ):
+            raise CheckpointStoreError("expert replicas require exact training nodes within this allocation")
+        payload = {
+            "tag": tag,
+            "timeout": self.expert_timeout,
+            "training_hosts": {record[1][host]["host"]: host for host in training_hosts},
+        }
+        inventories = self._fanout("expert-inventory", *record, payload=payload)
+        selected = {
+            receipt["host"]: receipt["expert_shards"]
+            for host, receipt in inventories.items()
+            if host in training_hosts
+        }
+        manifest = _expert_manifest(selected, ep_size)
+        payload["manifest"] = manifest
+        # Fully populated nodes are sources, not transfer destinations.
+        if all(set(shards) == set(manifest) for shards in selected.values()):
+            return
+        receipts = self._fanout("expert-replicate", *record, payload=payload)
+        expected = {name: source["identity"] for name, source in manifest.items()}
+        if any(receipts[host].get("expert_shards") != expected for host in training_hosts):
+            raise CheckpointStoreError("expert replica receipts differ from the complete inventory", receipts)
 
     @property
     def bindings(self) -> tuple[dict, ...]:

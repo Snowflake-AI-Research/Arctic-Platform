@@ -509,8 +509,26 @@ def _regression_gateway(args):
             yield url
 
 
+def _validate_regression_tokens(args) -> int | None:
+    """An explicit first-two input length must still match the frozen cases and reference identity."""
+    tokens = getattr(args, "tokens", None)
+    if tokens is None:
+        return None
+    if type(tokens) is not int or tokens <= 0:
+        raise ValueError("--tokens must be a positive integer")
+    if (
+        not args.config
+        or args.all_configs
+        or not args.test
+        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+    ):
+        raise ValueError("--tokens requires one explicit config and only single-step-grads/single-step-optimizer")
+    return tokens
+
+
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
+    tokens = _validate_regression_tokens(args)
     args = _configure_regression_target(args)
     dense_checkpoint_allocation = _load_dense_checkpoint_allocation(args)
     inference_export_allocation = _load_inference_export_allocation(args)
@@ -622,9 +640,10 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if checkpoint_gpus > pool:
                     raise ValueError(f"requested checkpoint training width {checkpoint_gpus} exceeds GPU pool {pool}")
                 cfg.at_gpu_width(checkpoint_gpus)
-            # Both are read from the config as written. The cases belong to the reviewed spec and do not
-            # move with the placement, so every width measures the same work on a different topology.
-            arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
+            # Placement never changes sequence length; explicit first-two lengths require matching frozen cases.
+            if tokens is not None and (cfg.is_rl or tokens > cfg.max_seq_len):
+                raise ValueError("--tokens requires a supervised config and cannot exceed its max_seq_len")
+            arm_defs = arms_for(cfg.max_seq_len if tokens is None else tokens, cfg.n_gpus)
             selected_gpus = training_gpus if training_gpus is not None else checkpoint_gpus
             widths = (
                 [selected_gpus]
@@ -1253,6 +1272,11 @@ def parse_args(argv=None):
     add_connection_arguments(r)
     r.add_argument(
         "--test-spec", type=Path, help="reviewed private spec for one explicit config; integrity checks apply"
+    )
+    r.add_argument(
+        "--tokens",
+        type=int,
+        help="first-two input sequence limit; must match onboarding's frozen cases and prepared HF records",
     )
     r.add_argument(
         "--peft-adapter",

@@ -34,6 +34,22 @@ The check fails when the trainer sends fewer elements than it holds, when a rank
 the sent set by name, shape, dtype, element count or bytes, when a received tensor reaches no parameter, when a
 destination is not covered or not equal, when a destination cannot be shadow-verified or changed after it was
 verified, or when a sampler parameter is written by no tensor.
+
+A frozen table the trainer marks skip-sync is not sent, so the sampler's copy is the one its checkpoint loaded. When
+the checkpoint stores the table split, the trainer's exported EP replica and every sampler rank holding the table
+unwritten hash it one checkpoint shard at a time, and that sampler parameter fails when a shard it holds has no digest
+on either side or differs from the trainer's shard in shape, dtype, element count or sha256, instead of failing as
+written by no tensor.
+
+A trainer with PEFT adapters syncs ``weight_format='lora'``: it sends only its trainable adapter factors, and the
+sampler installs them into vLLM's LoRA manager instead of writing parameters. The trainer's holdings are then the
+elements of its trainable parameters in its collective inventory. Each sampler rank records every adapter tensor it
+received, hashed before the LoRA builder casts it or folds the adapter scaling into it, with the LoRA-manager module
+factor (``lora_a`` or ``lora_b``, and its slot in a packed module) it was installed into, and the broadcast group it
+belongs to. A LoRA sync fails when the trainer sends fewer elements than its trainable parameters hold, when a
+sampler rank of the broadcast group returns no record, when a rank's received set differs from the sent set by
+name, shape, dtype, element count or bytes, or when a received tensor reaches no LoRA-manager module. TP ranks
+receive whole tensors and slice them when installing, so the bytes compared are the whole received tensor.
 """
 
 from __future__ import annotations
@@ -79,7 +95,8 @@ _MANIFEST_FIELDS = ("shape", "dtype", "numel", "sha256")
     criterion=(
         "after one RL step, every tensor the training zone sends reaches every sampling rank with identical "
         "bytes and element count, the trainer sends every element it holds, and every sampler parameter is "
-        "written, element for element, with what it received"
+        "written, element for element, with what it received, or, for a frozen table the trainer does not send, "
+        "matches the trainer's copy in every checkpoint shard"
     ),
     compares_to_reference=False,
     workload_modes=("rl",),
@@ -172,14 +189,23 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
             "gateway started by this check inherits and an external gateway must be started with"
         )
 
+    lora = sync.get("weight_format") == "lora"
+
     failed: List[Mismatch] = []
     sent_numel = sum(int(entry["numel"]) for entry in sent.values())
     parameter_numel = int(holdings[0]["numel"])
     skipped_numel = skipped_parameter_numel(target.get("send"), parameter_numel)
+    skipped_shards = skipped_checkpoint_shards(target.get("send"))
     wire_buffer_numel = exported_buffer_numel(target.get("send"), sent)
-    held_numel = parameter_numel - skipped_numel + wire_buffer_numel
+    if lora:
+        held_numel = trainable_parameter_numel(target.get("send"), parameter_numel) + wire_buffer_numel
+    else:
+        held_numel = parameter_numel - skipped_numel + wire_buffer_numel
     if sent_numel != held_numel:
         failed.append(Mismatch("trainer elements sent", float(sent_numel), float(held_numel)))
+    absent_ranks = missing_lora_ranks(ranks) if lora else []
+    for rank in absent_ranks:
+        failed.append(Mismatch(f"sampler rank {rank}: no verification record", 1.0, 0.0))
 
     totals = {
         "missing": 0,
@@ -195,7 +221,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         "destinations": 0,
     }
     for index, record in enumerate(ranks):
-        label = f"sampler rank {index}"
+        label = f"sampler rank {record['rank'] if lora else index}"
         if not isinstance(record, dict) or record.get("status") != "ok":
             status = record.get("status") if isinstance(record, dict) else record
             failed.append(Mismatch(f"{label}: verification status {status!r}", 1.0, 0.0))
@@ -216,12 +242,16 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
             set(record.get("unverifiable_destinations") or []) | set(record.get("non_parameter_destinations") or [])
         )
         untouched: Dict[str, int] = record.get("untouched_parameters") or {}
+        frozen: Dict[str, dict] = record.get("checkpoint_shards") or {}
         changed = sorted(record.get("changed_after_verification") or [])
+        unwritten = (
+            "received but installed into no LoRA-manager module" if lora else "received but written to no parameter"
+        )
         for kind, names in (
             ("not received", missing),
             ("received but not sent", extra),
             ("received with different bytes, shape, dtype or count", differing),
-            ("received but written to no parameter", dropped),
+            (unwritten, dropped),
             ("written but not shadow-verifiable", unverifiable),
             ("changed after its shadow verification", changed),
         ):
@@ -232,7 +262,12 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         for name, count in mismatched.items():
             failed.append(Mismatch(f"{label}: {name} elements differing from what was written", float(count), 0.0))
         for name, count in untouched.items():
-            failed.append(Mismatch(f"{label}: parameter {name} written by no tensor", float(count), 0.0))
+            held = frozen.get(name) or {}
+            trainer = skipped_shards.get(held.get("checkpoint_name")) or {}
+            if trainer and held.get("shards"):
+                failed.extend(skipped_table_mismatches(label, name, held["shards"], trainer))
+            else:
+                failed.append(Mismatch(f"{label}: parameter {name} written by no tensor", float(count), 0.0))
         totals["missing"] += len(missing)
         totals["extra"] += len(extra)
         totals["differing"] += len(differing)
@@ -256,7 +291,40 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         "sampler_ranks": float(len(ranks)),
     }
     metrics.update({f"sampler_{key}": float(value) for key, value in totals.items()})
+    if lora:
+        metrics["sampler_ranks_missing"] = float(len(absent_ranks))
     return failed, metrics
+
+
+def trainable_parameter_numel(send: dict, parameter_numel: int) -> int:
+    """Elements of the trainer's trainable parameters, the only parameters a LoRA sync exports.
+
+    Counted from the collective inventory, whose EP shards are counted once and DP replicas once, after binding it to
+    the trainer's reported parameter element count.
+    """
+    inventories = [entry for entry in find_key(send, "trainer_inventory") if entry]
+    if len(inventories) != 1:
+        raise RuntimeError("a lora sync needs exactly one sender's collective trainer inventory")
+    parameters = inventories[0].get("parameters") or {}
+    if sum(int(entry["global_numel"]) for entry in parameters.values()) != parameter_numel:
+        raise RuntimeError("the trainer inventory does not bind the trainer's parameter element count")
+    return sum(int(entry["global_numel"]) for entry in parameters.values() if entry["requires_grad"] is True)
+
+
+def missing_lora_ranks(ranks: list) -> List[int]:
+    """Sampler ranks of the LoRA broadcast group that returned no verification record; rank 0 is the trainer."""
+    if any(not isinstance(record, dict) for record in ranks):
+        raise RuntimeError("a lora verification record is not an object")
+    sizes = {record.get("world_size") for record in ranks}
+    if len(sizes) != 1 or type(next(iter(sizes))) is not int:
+        raise RuntimeError("lora verification records disagree on the broadcast world size")
+    world_size = sizes.pop()
+    reported = [record.get("rank") for record in ranks]
+    if any(type(rank) is not int or not 0 < rank < world_size for rank in reported):
+        raise RuntimeError("a lora verification record carries a rank outside the broadcast group's sampler ranks")
+    if len(set(reported)) != len(reported):
+        raise RuntimeError("two lora verification records carry the same sampler rank")
+    return sorted(set(range(1, world_size)) - set(reported))
 
 
 def skipped_parameter_numel(send: dict, parameter_numel: int) -> int:
@@ -316,6 +384,56 @@ def skipped_parameter_numel(send: dict, parameter_numel: int) -> int:
         return sum(entry["global_numel"] for entry in skipped.values())
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(f"invalid skipped frozen parameter proof: {exc}") from exc
+
+
+def skipped_checkpoint_shards(send: dict) -> Dict[str, Dict[str, dict]]:
+    """The trainer's checkpoint-shard manifests of its skipped tables, by checkpoint table name and shard index.
+
+    Read from the completion proof :func:`skipped_parameter_numel` validates: each rank of the exported EP replica
+    reports the shards overlapping its rows of a skipped table its checkpoint stores split, ``None`` for a shard it
+    holds only part of. A report under a parameter the inventory does not mark skip-sync, a shard reported twice and a
+    manifest with other fields invalidate the proof.
+    """
+    proofs = [entry for entry in find_key(send, "trainer_skipped_parameters") if entry]
+    if not proofs:
+        return {}
+    inventories = [entry for entry in find_key(send, "trainer_inventory") if entry]
+    tables: Dict[str, Dict[str, dict]] = {}
+    try:
+        skipped = {
+            name for name, entry in inventories[0]["parameters"].items() if entry.get("skip_weight_sync") is True
+        }
+        for record in proofs[0]["after"]:
+            for name, table in (record.get("checkpoint_shards") or {}).items():
+                if name not in skipped:
+                    raise ValueError(f"{name} is not marked skip-sync")
+                shards = tables.setdefault(table["checkpoint_name"], {})
+                for index, manifest in table["shards"].items():
+                    if manifest is None:
+                        continue
+                    if index in shards or set(manifest) != set(_MANIFEST_FIELDS):
+                        raise ValueError(f"checkpoint shard {index} of {name} is reported twice or malformed")
+                    shards[index] = manifest
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid skipped frozen checkpoint shards: {exc}") from exc
+    return tables
+
+
+def skipped_table_mismatches(label: str, name: str, held: Dict[str, dict], trainer: Dict[str, dict]) -> List[Mismatch]:
+    """Each checkpoint shard a sampler rank holds of an unwritten skipped table, against the trainer's shard."""
+    failed = []
+    for index in sorted(held, key=int):
+        sampler_shard, trainer_shard = held[index], trainer.get(index)
+        if sampler_shard is None:
+            problem = "has no sampler digest"
+        elif trainer_shard is None:
+            problem = "has no trainer digest"
+        elif any(sampler_shard.get(field) != trainer_shard[field] for field in _MANIFEST_FIELDS):
+            problem = "differs from the trainer's"
+        else:
+            continue
+        failed.append(Mismatch(f"{label}: parameter {name} checkpoint shard {index} {problem}", 1.0, 0.0))
+    return failed
 
 
 def exported_buffer_numel(send: dict, sent: Dict[str, dict]) -> int:

@@ -658,16 +658,16 @@ def _validate_storage(args: argparse.Namespace) -> None:
 
 
 def _checkout_root(config_path: Path) -> Path:
-    """Resolve the executing library's Git checkout, not the operator config's directory."""
+    """Resolve the executing source tree, requiring Git backing rather than adopting a parent tree."""
     source_root = Path(__file__).resolve().parents[3]
-    result = subprocess.run(
+    subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=source_root,
         check=True,
         capture_output=True,
         text=True,
     )
-    return Path(result.stdout.strip())
+    return source_root
 
 
 def _resolve_source(value: str) -> str:
@@ -1265,14 +1265,16 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         return None
     if path is None:
         from arctic_platform.correctness.harness.lora import generate_adapter
+        from arctic_platform.correctness.harness.sft import SEED
 
         if model_path is None:
             return None
         generated = getattr(args, "_generated_shared_adapters", {})
         key = str(model_path.resolve())
         if key not in generated:
+            # The runner generates the regression adapter with SEED; its identity binds the recorded references.
             generated[key] = generate_adapter(
-                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
+                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter", seed=SEED
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
@@ -1431,6 +1433,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         getattr(args, "backend", "onprem"),
         "--config",
         str(args.config),
+        "--config-dir",
+        str(args.checkout_root / "arctic_platform" / "correctness" / "configs"),
         "--test",
         str(args.test_id),
         "--out",
@@ -1438,6 +1442,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     ]
     if getattr(args, "test_spec", None) is not None:
         command += ["--test-spec", str(args.test_spec)]
+    if args.test_id in {"single-step-grads", "single-step-optimizer"} and getattr(args, "tokens", None) is not None:
+        command += ["--tokens", str(args.tokens)]
     for name in (
         "host",
         "database",
@@ -1457,11 +1463,12 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         command += ["--reference-records-dir", str(args.reference_records_dir)]
     if getattr(args, "local_cortex_fixture", False):
         command.append("--local-cortex-fixture")
-    if getattr(args, "inference_sampling_topology", None) is not None:
+    inference_validation = args.test_id == "inference-checkpoint-loss"
+    if inference_validation and getattr(args, "inference_sampling_topology", None) is not None:
         command += ["--inference-sampling-topology", *map(str, args.inference_sampling_topology)]
     if getattr(args, "peft_adapter", None) is not None:
         command += ["--peft-adapter", str(args.peft_adapter)]
-    if getattr(args, "inference_export_allocation", None) is not None:
+    if inference_validation and getattr(args, "inference_export_allocation", None) is not None:
         command += [
             "--inference-export-allocation",
             str(args.inference_export_allocation),
@@ -1475,7 +1482,7 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--dense-checkpoint-allocation-sha256",
             str(args.dense_checkpoint_allocation_sha256),
         ]
-    if getattr(args, "inference_initial_model_dir", None) is not None:
+    if inference_validation and getattr(args, "inference_initial_model_dir", None) is not None:
         command += ["--inference-initial-model-dir", str(args.inference_initial_model_dir)]
     if bootstrap is not None:
         command = [
@@ -2198,10 +2205,23 @@ def _parent(args: argparse.Namespace) -> int:
         supervised_full_model = (
             not config.is_rl and full_model and args.test_id in {"inference-checkpoint-loss", "e2e-sft-train-validate"}
         )
-        if not (rl_fixed_check or supervised_full_model or local_fixture):
+        supervised_initial_model = (
+            not config.is_rl
+            and not full_model
+            and args.test_id == "inference-checkpoint-loss"
+            and getattr(args, "inference_initial_model_dir", None) is not None
+        )
+        if supervised_initial_model:
+            from arctic_platform.correctness.harness.execution import _load_inference_initial_model_dir
+
+            _load_inference_initial_model_dir(
+                SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False})
+            )
+        if not (rl_fixed_check or supervised_full_model or supervised_initial_model or local_fixture):
             raise ValueError(
                 "Cortex onboarding requires a local reference-free RL fixed-gate check or "
-                "a local full-model supervised inference/e2e check or an explicit local Cortex fixture"
+                "a local full-model supervised inference/e2e check, pinned initial-model inference, "
+                "or an explicit local Cortex fixture"
             )
         require_local_cortex_gateway(_client_backend(args))
         required_gpus = rl_gpu_count(config) if config.is_rl else placed.n_gpus

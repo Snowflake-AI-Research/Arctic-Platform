@@ -126,7 +126,22 @@ LOG_PROB_TOP_K = 0
 SAMPLING_GPUS = 1
 _FLASHNEXT_CONFIG_ID = "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
 
+# HF config fields that count a model's routed experts, across the MoE families the harness serves.
+_ROUTED_EXPERT_FIELDS = ("n_routed_experts", "num_experts", "num_local_experts")
+
 QUANTITY = "validation cross entropy over answer tokens"
+
+
+def _sampling_replicas(ctx) -> int:
+    if getattr(ctx, "inference_sampling_topology", None) is None:
+        return 1
+    for sub in ctx.cfg.sub_jobs:
+        if sub.get("job_type") == "sampling":
+            replicas = sub["inference_config"].get("num_replicas", 1)
+            if type(replicas) is not int or replicas <= 0:
+                raise ValueError("configured sampling replicas must be a positive integer")
+            return replicas
+    return 1
 
 
 def _sampling_topology(ctx) -> tuple[int, int, int]:
@@ -137,9 +152,11 @@ def _sampling_topology(ctx) -> tuple[int, int, int]:
         not isinstance(topology, tuple)
         or len(topology) != 3
         or any(type(size) is not int or size <= 0 for size in topology)
-        or topology[0] != topology[1] * topology[2]
     ):
-        raise ValueError("inference sampling topology requires positive integer allocation, TP and PP with GPUs=TP*PP")
+        raise ValueError("inference sampling topology requires positive integer allocation, TP and PP")
+    replicas = _sampling_replicas(ctx)
+    if topology[0] != replicas * topology[1] * topology[2]:
+        raise ValueError("inference sampling topology requires GPUs=replicas*TP*PP")
     for sub in ctx.cfg.sub_jobs:
         if sub.get("job_type") != "sampling":
             continue
@@ -162,6 +179,26 @@ def sampling_gpu_count(ctx) -> int:
     return _sampling_topology(ctx)[0]
 
 
+def _model_config(source: str) -> dict:
+    from transformers import PretrainedConfig
+
+    config, _ = PretrainedConfig.get_config_dict(source)
+    return config
+
+
+def _has_routed_experts(ctx) -> bool:
+    """Whether the configured model's own HF config declares routed experts.
+
+    vLLM refuses ``enable_expert_parallel`` for a model with no experts, so an explicit placement of a dense model
+    keeps expert parallelism off. The raw config dict is read so a model type not registered with ``AutoConfig``
+    still resolves.
+    """
+    source = getattr(ctx, "inference_initial_model_dir", None) or _full_model_name(ctx)
+    config = _model_config(str(source))
+    text = config.get("text_config") or config
+    return any(type(text.get(name)) is int and text[name] > 0 for name in _ROUTED_EXPERT_FIELDS)
+
+
 def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
     allocation, tensor, pipeline = _sampling_topology(ctx)
     payload = sampling_payload(
@@ -174,10 +211,13 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
     if ctx.cfg.training.get("peft_config"):
         payload["inference_config"]["peft_config"] = deepcopy(ctx.cfg.training["peft_config"])
     if getattr(ctx, "inference_sampling_topology", None) is not None:
+        replicas = _sampling_replicas(ctx)
+        if replicas > 1:
+            payload["inference_config"]["num_replicas"] = replicas
         payload["inference_config"]["vllm_config"].update(
             tensor_parallel_size=tensor,
             pipeline_parallel_size=pipeline,
-            enable_expert_parallel=True,
+            enable_expert_parallel=_has_routed_experts(ctx),
             extra_engine_kwargs={
                 "distributed_executor_backend": "ray",
                 "data_parallel_size": 1,

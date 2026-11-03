@@ -141,7 +141,7 @@ def _prepare(spec: ModelSpec, prepare_weights, *, world_size: int, rank: int, lo
         attn_implementation=spec.attn_implementation,
         ep_size=spec.parallelism.expert_parallel,
         world_size=world_size,
-        options=Qwen3_5MoeOptions.model_validate(spec.loader_options),
+        options=_FlashLoadOptions.model_validate(spec.loader_options),
         rank=rank,
         local_rank=local_rank,
     )

@@ -1763,7 +1763,7 @@ def step(client: RLClient, learning_rate: float) -> dict:
 
 
 def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
-    """Read PLE's required shard context from the configured full Flash-Next model."""
+    """Read PLE's required shard context from the effective Flash-Next model, including reduced fixtures."""
     if (
         getattr(cfg, "config_id", None)
         not in (
@@ -1782,9 +1782,9 @@ def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
         source.model_type not in ("qwen4_exp", "qwen4_exp_text")
         or text.model_type != "qwen4_exp_text"
         or type(text.num_hidden_layers) is not int
-        or text.num_hidden_layers != 48
+        or text.num_hidden_layers <= 0
     ):
-        raise ValueError("context-parallel Flash-Next requires the original full48 text configuration")
+        raise ValueError("context-parallel Flash-Next requires a qwen4_exp_text configuration with positive layers")
     ngram = getattr(text, "ngram_size", None)
     kernel = getattr(text, "ple_conv_kernel_size", None)
     if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
@@ -2363,6 +2363,15 @@ def install_checkpoint_routes(gw, store) -> None:
                 no_keepalive=True,
             )
             tag, version = _metadata(result, child=job_id, path=str(root))
+            ep_size = binding["config"]["training_config"].get("ep_size")
+            if ep_size is not None and 1 < ep_size < binding["num_gpus"]:
+                await asyncio.to_thread(
+                    store.materialize_expert_replicas,
+                    retained,
+                    tag,
+                    [node["host"] for node in binding["nodes"]],
+                    ep_size,
+                )
             await asyncio.to_thread(store.verify, retained)
             checkpoint_id = f"cp_{uuid4().hex}"
             checkpoints[checkpoint_id] = _SavedCheckpoint(
