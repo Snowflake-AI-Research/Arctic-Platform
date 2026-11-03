@@ -182,4 +182,16 @@ def load_glm_moe_dsa_model(
         layers = get_language_model(model).layers
         install_frozen_layer_shards(layers)
         get_logger().info(f"Frozen replicated weights of {len(layers)} decoder layers sharded over all ranks")
+    from arctic_platform.model.implementations.moe.frozen_offload import frozen_expert_offload_requested
+
+    if frozen_expert_offload_requested():
+        from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.ultraep_packed4 import ultraep_spares
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        if ultraep_spares():
+            raise ValueError("ARL_OFFLOAD_FROZEN_EXPERTS: UltraEP's spare slots read the experts in place; unset ARL_ULTRAEP_SPARES")
+        offload = install_frozen_expert_offload(get_language_model(model).layers)
+        get_logger().info(f"Frozen routed-expert codes of {len(offload.layers)} layers offloaded to host memory at the first call")
     return model
