@@ -428,7 +428,8 @@ class GroupedExperts(nn.Module):
 
         INT4 (W4AFP8 checkpoints): int8 bytes, BF16 scales ``[E, out, in // group]``. NVFP4: uint8 bytes, E4M3 scales
         ``[E, out, in // 16]`` (``w*_scale_inv``) and one FP32 scale per expert matrix (``w*_scale_2``, ``[E]``).
-        MXFP4 (DeepSeek-V4): int8 bytes, FP32 power-of-two scales ``[E, out, in // 32]``.
+        MXFP4 (DeepSeek-V4): int8 bytes, FP32 power-of-two scales ``[E, out, in // 32]``, which
+        ``compact_mxfp4_scales`` turns into their E8M0 exponent bytes after the checkpoint loads.
         """
         from arctic_platform.model.implementations.fp8 import mark_keep_fp32
 
@@ -462,6 +463,29 @@ class GroupedExperts(nn.Module):
 
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
+
+    def compact_mxfp4_scales(self) -> int:
+        """Store MXFP4 scales as their E8M0 exponent bytes (uint8) instead of FP32: exact for the checkpoint's
+        power-of-two scales, a quarter of the memory. Returns the bytes freed."""
+        if self.packed4 != "mxfp4":
+            return 0
+        freed = 0
+        for name in ("w1", "w2", "w3"):
+            param = getattr(self, f"{name}_scale_inv")
+            scale = _maybe_to_local(param).data
+            if scale.dtype == torch.uint8:
+                continue
+            bits = scale.float().contiguous().view(torch.int32)
+            # Powers of two 2^-126 .. 2^127 have an empty mantissa; E8M0's 0 byte is the subnormal 2^-127.
+            if not bool(((bits & 0x807FFFFF) == 0).logical_or(bits == 0x00400000).all()):
+                raise ValueError(f"{name}_scale_inv holds values that are not E8M0 powers of two")
+            exponent = torch.where(bits == 0x00400000, 0, (bits >> 23) & 0xFF).to(torch.uint8)
+            freed += scale.numel() * (scale.element_size() - 1)
+            param.data = exponent
+            for attr in ("_dss_keep_fp32",):
+                if hasattr(param, attr):
+                    delattr(param, attr)
+        return freed
 
     def _forward_packed4_reference(
         self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None
@@ -1509,3 +1533,8 @@ class LatentMoE(nn.Module):
             self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
             if self.load_balance_coeff is not None:
                 self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+
+
+def compact_mxfp4_expert_scales(model: nn.Module) -> int:
+    """``GroupedExperts.compact_mxfp4_scales`` on every MXFP4 expert stack of ``model``; returns the bytes freed."""
+    return sum(m.compact_mxfp4_scales() for m in model.modules() if isinstance(m, GroupedExperts))

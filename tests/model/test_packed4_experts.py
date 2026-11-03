@@ -294,3 +294,28 @@ def test_peft_sizes_mxfp4_expert_lora_from_the_logical_shape():
         if isinstance(module, ParamWrapper)
     }
     assert shapes == {"w1": ((32, 512), (256, 32)), "w2": ((32, 256), (512, 32)), "w3": ((32, 512), (256, 32))}
+
+
+def test_mxfp4_scales_compact_to_e8m0_bytes_exactly():
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import compact_mxfp4_expert_scales
+
+    module = GroupedExperts(64, 32, 2, use_grouped_mm=True, packed4="mxfp4")
+    decoded = {}
+    for name in ("w1", "w2", "w3"):
+        packed = getattr(module, name)
+        packed.data.copy_(torch.randint(-128, 128, packed.shape, dtype=torch.int8))
+        exponent = torch.randint(0, 255, getattr(module, f"{name}_scale_inv").shape, dtype=torch.uint8)
+        exponent.view(-1)[0] = 0  # the subnormal 2^-127
+        getattr(module, f"{name}_scale_inv").data.copy_(exponent.view(torch.float8_e8m0fnu).float())
+        decoded[name] = dequantize_mxfp4_reference(packed.data, getattr(module, f"{name}_scale_inv").data)
+    before = sum(getattr(module, f"{n}_scale_inv").numel() * 4 for n in ("w1", "w2", "w3"))
+    assert compact_mxfp4_expert_scales(nn.ModuleList([module])) == before * 3 // 4
+    for name in ("w1", "w2", "w3"):
+        scale = getattr(module, f"{name}_scale_inv")
+        assert scale.dtype == torch.uint8 and not scale.requires_grad
+        assert torch.equal(dequantize_mxfp4_reference(getattr(module, name).data, scale.data), decoded[name])
+    assert compact_mxfp4_expert_scales(nn.ModuleList([module])) == 0, "idempotent"
+    module.w1_scale_inv.data = torch.full(module.w1_scale_inv.shape, 0.3)
+    with pytest.raises(ValueError, match="powers of two"):
+        module.compact_mxfp4_scales()

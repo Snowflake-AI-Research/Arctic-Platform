@@ -168,6 +168,13 @@ def load_deepseek_v41_model(
         device_mesh_type=DeviceMesh,
     )
     qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
+    from arctic_platform.model.implementations.moe.layers.moe import compact_mxfp4_expert_scales
+
+    freed = compact_mxfp4_expert_scales(model)
+    if freed:
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+
+        get_logger().info(f"MXFP4 expert scales kept as E8M0 bytes: {freed / 2**30:.2f} GiB freed")
     if sp_size > 1:
         _install_context_parallel(model, sp_group, sp_size)
     install_tokenizer_compressed_map(model, model_name)
