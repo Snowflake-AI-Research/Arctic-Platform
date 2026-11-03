@@ -56,6 +56,8 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -636,6 +638,21 @@ class ArcticRLRayServerState(ArcticRLServerState):
             self.n_bundles = 0
             self.placement_group = None
 
+    def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
+        worker_sp_info = None
+        if sp_size > 1:
+            _, _, meta, processing = unpack_batch(batch)
+            validate_sequence_parallel_grpo(meta, processing, backward=backward)
+            worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
+        shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+        return shards, reorder, worker_sp_info
+
+    @staticmethod
+    def _logical_model_results(results, worker_sp_info, *, sp_size: int):
+        if worker_sp_info is None:
+            return results
+        return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
+
     async def shutdown(self) -> dict[str, Any]:
         """Release all workers and colocated placement groups owned by this state."""
         async with self._shutdown_lock:
@@ -890,6 +907,21 @@ class ArcticRLRayServer:
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
 
+    def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
+        worker_sp_info = None
+        if sp_size > 1:
+            _, _, meta, processing = unpack_batch(batch)
+            validate_sequence_parallel_grpo(meta, processing, backward=backward)
+            worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
+        shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+        return shards, reorder, worker_sp_info
+
+    @staticmethod
+    def _logical_model_results(results, worker_sp_info, *, sp_size: int):
+        if worker_sp_info is None:
+            return results
+        return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
+
     async def shutdown(self) -> None:
         """Release state-owned resources, then terminate the state actor."""
         if self._shutdown_complete:
@@ -929,7 +961,10 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
+        sp_size = self.jobs[job_id]["sp_size"]
+        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=True
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
@@ -958,6 +993,7 @@ class ArcticRLRayServer:
         pr0(f"[DeepSpeedWorker] fwd_bwd: {len(results)=}")
 
         tname = timers.start("xyz fwd_bwd: epilogue")
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
         if loss_object is not None:
             worker_metrics = [result.get("metrics") or {} for result in results]
@@ -1003,7 +1039,10 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        sp_size = info["sp_size"]
+        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=False
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
 
@@ -1017,6 +1056,7 @@ class ArcticRLRayServer:
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         batch = merge_dict_shards([r["batch"] for r in results])
         if reorder_indices is not None:
             batch = restore_batch_order(batch, reorder_indices)

@@ -47,6 +47,9 @@ from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import verify_sequence_parallel_reduction
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +433,14 @@ class DeepSpeedWorker:
         num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
+        sp_info = None
+        if self.sp_size > 1:
+            if args:
+                raise ValueError("SP model route requires named token inputs, not positional arguments")
+            validate_sequence_parallel_grpo(meta_data, processing, backward=backward)
+            sp_info = self.get_sequence_parallel_info()
+            if backward:
+                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
 
         # Resolve before selecting a specialized pipeline so class registry
         # precedence applies equally to SFT and RL names. Do not fill a missing
@@ -512,6 +523,21 @@ class DeepSpeedWorker:
                     device=self._device,
                     backward=backward,
                 )
+            elif sp_info is not None:
+                if backward:
+                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+                micro_batch_output = run_sequence_parallel_grpo(
+                    self.engine,
+                    micro_batch,
+                    meta_data,
+                    processing,
+                    self._device,
+                    sp_info=sp_info,
+                    sp_group=self.sp_group,
+                    backward=backward,
+                    loss_object=loss_object,
+                    loss_scale=1.0 if loss_reduction is None else loss_reduction.loss_scales[i],
+                )
             else:
                 from arctic_platform.rl.processors import apply_packed_loss_reduction
                 from arctic_platform.rl.processors import run_pipeline
@@ -592,6 +618,12 @@ class DeepSpeedWorker:
             metrics = sft_profile.merge_into_metrics(metrics)
             pipeline_outputs["metrics"] = metrics
             sft_profile.maybe_print(f"worker rank{self.rank} {tag}", metrics.get("_profile_ms"))
+        if sp_info is not None:
+            if self.get_sequence_parallel_info() != sp_info:
+                raise RuntimeError("SP worker membership changed during model execution")
+            if backward:
+                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
+            pipeline_outputs["_sequence_parallel_info"] = sp_info
         return pipeline_outputs
 
     def forward_backward(self, batch: dict) -> dict:
