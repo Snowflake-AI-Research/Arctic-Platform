@@ -96,7 +96,7 @@ def test_offloaded_expert_codes_match_resident_ones():
         addresses.setdefault(i, set()).add(module.w1.data_ptr())
 
     for i, layer in enumerate(offloaded):
-        # Registered after the offload's own pre-hook on the experts, so it sees the installed copy.
+        # The offload's own pre-hook on the experts runs first (bound at the layer's first call), so this sees the copy.
         layer._checkpoint_wrapped_module.experts.register_forward_pre_hook(lambda m, a, i=i: record(m, a, i))
     steps = 3
     for step in range(steps):
@@ -187,19 +187,26 @@ class _Bf16Block(nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_offload_under_peft_fused_expert_lora():
+@pytest.mark.parametrize("peft_after_install", [False, True])
+def test_offload_under_peft_fused_expert_lora(peft_after_install):
     """A BF16 base with expert LoRA: PEFT's ParamWrapper registers W + BA over the weights around each call, so the
-    copy must be in place before the wrapper runs."""
+    copy must be in place before the wrapper runs. The trainer applies LoRA after the model (and the offload) is
+    loaded, so the hooks must find PEFT's wrapper then too."""
     from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
     from arctic_platform.model.patches.peft import apply_peft
 
-    def build():
+    def build(install=False):
         torch.manual_seed(1)
         blocks = nn.ModuleList([_Bf16Block() for _ in range(LAYERS)])
         with torch.no_grad():
             for p in blocks.parameters():
                 p.normal_(0, 0.05)
         blocks = blocks.cuda().bfloat16()
+        offload = None
+        if install:
+            for i in range(LAYERS):
+                blocks[i] = checkpoint_wrapper(blocks[i], early_stop=False)
+            offload = install_frozen_expert_offload(blocks)
         peft = {
             "peft_type": "LORA",
             "r": 4,
@@ -212,13 +219,15 @@ def test_offload_under_peft_fused_expert_lora():
                 if ".lora_B" in name:
                     p.normal_(0, 0.05)
         layers = wrapped.base_model.model
-        for i in range(LAYERS):
-            layers[i] = checkpoint_wrapper(layers[i], early_stop=False)
-        return wrapped, layers
+        if not install:
+            for i in range(LAYERS):
+                layers[i] = checkpoint_wrapper(layers[i], early_stop=False)
+        return wrapped, layers, offload
 
-    reference, ref_layers = build()
-    offloaded, off_layers = build()
-    offload = install_frozen_expert_offload(nn.ModuleList(list(off_layers)))
+    reference, ref_layers, _ = build()
+    offloaded, off_layers, offload = build(install=peft_after_install)
+    if not peft_after_install:
+        offload = install_frozen_expert_offload(nn.ModuleList(list(off_layers)))
     assert len(offload.layers) == LAYERS
     x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
     for _ in range(2):

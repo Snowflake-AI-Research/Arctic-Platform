@@ -263,23 +263,34 @@ def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
 
     The hooks sit on the module the MoE calls for its experts (PEFT's outermost wrapper with expert LoRA: the copy is
     installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
-    each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. Layers
-    whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their saved
-    tensors hold them until backward.
+    each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. PEFT may
+    wrap the experts after this returns (the trainer applies LoRA to the loaded model), so each layer binds its hooks
+    to the call sites at its first call. Layers whose experts are not recomputed (``ac_config.layers`` leaves them out)
+    keep their codes on the GPU: their saved tensors hold them until backward.
     """
-    managed, sites = [], []
+    managed = []
     for layer in layers:
         if not experts_recomputed(layer):
             continue
         inner = _inner_layer(layer)
-        layer_sites = list(_expert_call_sites(inner))
-        if layer_sites:
+        if any(True for _ in _expert_call_sites(inner)):
             managed.append(inner)
-            sites.append(layer_sites)
     offload = FrozenExpertOffload(managed)
-    for i, layer_sites in enumerate(sites):
-        for site in layer_sites:
-            site.register_forward_pre_hook(lambda module, args, i=i: offload.before(i))
-            site.register_forward_hook(lambda module, args, output, i=i: offload.after(i))
-            site._ap_frozen_expert_offload = offload
+    for i, inner in enumerate(managed):
+        _bind_at_first_call(offload, i, inner)
     return offload
+
+
+def _bind_at_first_call(offload: FrozenExpertOffload, i: int, layer: nn.Module) -> None:
+    """Hook layer ``i``'s experts call sites as they are when the layer first runs, then drop this hook."""
+    handle = None
+
+    def bind(module, args):
+        for site in _expert_call_sites(layer):
+            # First, so any other pre-hook on the experts already sees the installed copy.
+            site.register_forward_pre_hook(lambda module, args: offload.before(i), prepend=True)
+            site.register_forward_hook(lambda module, args, output: offload.after(i))
+            site._ap_frozen_expert_offload = offload
+        handle.remove()
+
+    handle = layer.register_forward_pre_hook(bind)
