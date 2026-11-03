@@ -19,6 +19,9 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+# Bounds the fp32 packed gradient each gather backward reduce-scatters at once.
+_GATHER_BACKWARD_CHUNK_BYTES = 256 * 1024 * 1024
+
 
 class _SeqAllToAll(torch.autograd.Function):
     """Swap a sharded tensor dimension for another dimension across an SP group."""
@@ -79,10 +82,16 @@ class _GatherSequence(torch.autograd.Function):
         # torch's own all_gather backward reduce-scatters in the gradient's dtype, and a bf16 ring rounds each partial sum.
         accumulate_dtype = torch.promote_types(grad.dtype, torch.float32)
         parts = grad.unflatten(1, (dist.get_world_size(ctx.group), -1)).movedim(1, 0)
-        parts = parts.to(accumulate_dtype, memory_format=torch.contiguous_format)
-        summed = torch.empty_like(parts[0])
-        dist.reduce_scatter_tensor(summed, parts.flatten(0, 1), group=ctx.group)
-        return None, summed.to(grad.dtype)
+        grad_input = grad.new_empty(parts.shape[1:])
+        row_bytes = parts[:, :, :1].numel() * accumulate_dtype.itemsize
+        rows = max(1, _GATHER_BACKWARD_CHUNK_BYTES // max(row_bytes, 1))
+        for start in range(0, parts.shape[2], rows):
+            packed = parts[:, :, start : start + rows].to(accumulate_dtype, memory_format=torch.contiguous_format)
+            summed = packed.new_empty(packed.shape[1:])
+            dist.reduce_scatter_tensor(summed, packed.flatten(0, 1), group=ctx.group)
+            grad_input[:, start : start + rows] = summed
+            del packed, summed
+        return None, grad_input
 
 
 def gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:

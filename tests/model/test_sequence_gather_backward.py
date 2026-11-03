@@ -22,12 +22,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from arctic_platform.model.implementations.gpu.sp import collectives
 from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
 
 
 def _nccl_like_group(monkeypatch, world_size, rank):
     """Simulate identical rank gradients with a reduction that rounds each addition."""
+    chunk_rows = []
 
     def all_gather(parts, tensor, group=None):
         for part in parts:
@@ -35,6 +37,7 @@ def _nccl_like_group(monkeypatch, world_size, rank):
             part.copy_(tensor)
 
     def reduce_scatter(output, inputs, op=None, group=None):
+        chunk_rows.append(output.shape[1])
         inputs = inputs.reshape(world_size, *output.shape)
         total = inputs[rank].clone()
         for _ in range(world_size - 1):
@@ -44,8 +47,10 @@ def _nccl_like_group(monkeypatch, world_size, rank):
     for name, value in (("get_world_size", lambda group=None: world_size), ("all_gather", all_gather),
                         ("reduce_scatter_tensor", reduce_scatter)):  # fmt: skip
         monkeypatch.setattr(dist, name, value)
+    return chunk_rows
 
 
+@pytest.mark.parametrize("rows_per_chunk, expected_chunks", [(4, [4]), (3, [3, 1])])
 @pytest.mark.parametrize(
     "module",
     [
@@ -53,16 +58,19 @@ def _nccl_like_group(monkeypatch, world_size, rank):
         "arctic_platform.model.implementations.qwen38.qsa_flex",
     ],
 )
-def test_sequence_gather_backward_sums_ranks_in_fp32(monkeypatch, module):
+def test_sequence_gather_backward_sums_ranks_in_fp32(monkeypatch, module, rows_per_chunk, expected_chunks):
     gather_sequence = importlib.import_module(module).gather_sequence
     world_size, rank, local_length = 8, 3, 4
-    _nccl_like_group(monkeypatch, world_size, rank)
+    chunk_rows = _nccl_like_group(monkeypatch, world_size, rank)
     set_seed(0)
     local = torch.randn(2, 2, local_length, 16).to(torch.bfloat16).transpose(1, 2).requires_grad_(True)
+    row_bytes = world_size * local[:, :1].numel() * torch.float32.itemsize
+    monkeypatch.setattr(collectives, "_GATHER_BACKWARD_CHUNK_BYTES", rows_per_chunk * row_bytes)
     gathered = gather_sequence(local, "sp-group")
     grad = torch.randn(gathered.shape).to(torch.bfloat16)
     gathered.backward(grad)
 
+    assert chunk_rows == expected_chunks
     torch_assert_equal(gathered, local.detach().repeat(1, world_size, 1, 1))
     # Every rank holds the same gradient, so the exact sum is world_size x this rank's chunk (exact in bf16).
     expected = world_size * grad[:, rank * local_length : (rank + 1) * local_length]
@@ -74,13 +82,15 @@ def test_sequence_gather_backward_sums_ranks_in_fp32(monkeypatch, module):
     torch_assert_equal(local.grad, expected)
 
 
-def _gloo_worker(rank, rendezvous):
+def _gloo_worker(rank, rendezvous, chunk_bytes):
     from datetime import timedelta
 
     import torch.distributed.nn as dist_nn
 
     from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 
+    if chunk_bytes is not None:
+        collectives._GATHER_BACKWARD_CHUNK_BYTES = chunk_bytes
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         local = (torch.arange(48).reshape(2, 2, 3, 4) + rank * 48).to(torch.bfloat16)
@@ -96,5 +106,8 @@ def _gloo_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_sequence_gather_gloo(tmp_path):
-    torch.multiprocessing.spawn(_gloo_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+# 128 bytes is one fp32 sequence row of the 2-rank packed gradient, so the backward runs three chunks.
+@pytest.mark.parametrize("chunk_bytes", [None, 128])
+def test_sequence_gather_gloo(tmp_path, chunk_bytes):
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+    torch.multiprocessing.spawn(_gloo_worker, args=(rendezvous, chunk_bytes), nprocs=2, join=True)
