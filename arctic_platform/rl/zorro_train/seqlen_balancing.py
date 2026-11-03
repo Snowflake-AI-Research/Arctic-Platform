@@ -29,12 +29,10 @@
 
 import copy
 import heapq
-import itertools
 import logging
 from typing import List
 from typing import Tuple
 
-import numpy as np
 import torch
 from tensordict import TensorDict
 from torch import distributed as dist

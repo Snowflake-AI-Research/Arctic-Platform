@@ -1,5 +1,17 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Client metadata for rank assignment.
 
 Stamps ``balance_batch`` and ZoRRo prompt-group ids onto a request. The
@@ -62,9 +74,7 @@ def assert_contiguous_rollout_blocks(prompts, rollout_n) -> None:
     for start in range(0, rows, width):
         block = prompts[start : start + width]
         if not torch.equal(block, block[:1].expand_as(block)):
-            raise ValueError(
-                "balance_batch prompt_group_ids require each rollout block to share prompt columns"
-            )
+            raise ValueError("balance_batch prompt_group_ids require each rollout block to share prompt columns")
 
 
 def apply_balance_metadata(context: dict, meta: dict, input_ids, prompts) -> dict:

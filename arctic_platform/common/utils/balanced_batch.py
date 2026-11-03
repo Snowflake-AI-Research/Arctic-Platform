@@ -1,4 +1,4 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,8 @@ the RL package.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
+from typing import Sequence
 
 
 def assign_balanced_batch(
@@ -139,9 +140,7 @@ def assign_row_lpt(costs: Sequence[int], num_shards: int) -> list[list[int]]:
     for idx in order:
         candidates = [rank for rank, indices in enumerate(assignment) if len(indices) < caps[rank]]
         if not candidates:
-            raise RuntimeError(
-                f"Unable to assign row {idx}: batch_size={n}, num_shards={num_shards}, caps={caps}"
-            )
+            raise RuntimeError(f"Unable to assign row {idx}: batch_size={n}, num_shards={num_shards}, caps={caps}")
         rank = min(candidates, key=lambda candidate: (shard_costs[candidate], candidate))
         assignment[rank].append(idx)
         shard_costs[rank] += costs[idx]
@@ -249,14 +248,12 @@ def assign_zorro_groups(
         return None
     if num_rows % num_shards != 0:
         raise ValueError(
-            f"ZoRRo group assignment needs batch_size divisible by num_shards; "
+            "ZoRRo group assignment needs batch_size divisible by num_shards; "
             f"got batch_size={num_rows} num_shards={num_shards}"
         )
     covered = [index for group in groups for index in group]
     if sorted(covered) != list(range(num_rows)):
-        raise ValueError(
-            f"prompt groups must be a permutation of {num_rows} rows, got {len(covered)} indices"
-        )
+        raise ValueError(f"prompt groups must be a permutation of {num_rows} rows, got {len(covered)} indices")
 
     cap = num_rows // num_shards
     order = sorted(range(len(groups)), key=lambda i: (len(groups[i]), costs[i]), reverse=True)
@@ -299,9 +296,7 @@ def prompt_groups(
         raise ValueError("prompt_groups requires 2D input_ids")
     batch_size, seq_len = input_ids.shape
     if response_length < 0 or response_length > seq_len:
-        raise ValueError(
-            f"response_length={response_length} is outside sequence width {seq_len}"
-        )
+        raise ValueError(f"response_length={response_length} is outside sequence width {seq_len}")
     prompt_len = seq_len - response_length
     ids_ok = (
         torch.is_tensor(prompt_group_ids)

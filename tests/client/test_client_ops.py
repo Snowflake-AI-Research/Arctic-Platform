@@ -1117,7 +1117,6 @@ class TestCortexSharedHelper:
                 },
             )
 
-
     def test_zorro_fwd_bwd_keeps_the_client_layout(self):
         import torch
 
