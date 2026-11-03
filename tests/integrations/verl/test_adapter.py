@@ -254,3 +254,14 @@ def test_update_actor_balance_off_skips_the_prompt_block_check(verl_stub) -> Non
     asyncio.run(_run())
     assert client.payloads[0]["meta"]["balance_batch"] is False
     assert "prompt_group_ids" not in client.payloads[0]["meta"]
+
+
+def test_legacy_load_balancer_false_warns_and_balances(verl_stub, caplog) -> None:
+    adapter = _adapter(verl_stub)
+    with caplog.at_level("WARNING", logger=adapter.logger.name):
+        assert adapter._balance_batch_setting({"load_balancer": False}) is True
+    assert "load_balancer is ignored" in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=adapter.logger.name):
+        assert adapter._balance_batch_setting({"balance_batch": False}) is False
+    assert caplog.text == ""

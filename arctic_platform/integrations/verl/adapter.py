@@ -28,6 +28,7 @@ this module for that side effect, and pairs it with the matching per-
 backend worker and rollout replica.
 """
 
+import logging
 import os
 from copy import deepcopy
 from typing import Any
@@ -47,6 +48,8 @@ from arctic_platform.client import TrainingConfig
 from arctic_platform.common.balance_metadata import prompt_rows_for_balance
 from arctic_platform.common.balance_metadata import stamp_client_balance
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
+
+logger = logging.getLogger(__name__)
 
 _ARCTIC_METRIC_REDUCTION_FN = {
     "actor/pg_clipfrac_lower": np.mean,
@@ -130,6 +133,24 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
     return batch_dict, max_prompt_len, max_response_len
 
 
+def _balance_batch_setting(train_cfg) -> bool:
+    """Return whether this train config balances.
+
+    ``balance_batch`` false keeps arrival order. A missing key balances.
+    ``load_balancer`` is ignored. A config that still sets it is warned,
+    because that key used to opt out and a silent ignore would reorder the run.
+    """
+    if "load_balancer" in train_cfg:
+        logger.warning(
+            "remote_backend.train.load_balancer is ignored. "
+            "Set remote_backend.train.balance_batch false to keep arrival order."
+        )
+    setting = train_cfg.get("balance_batch", None)
+    if setting is None:
+        return True
+    return bool(setting)
+
+
 @RemoteBackendRegistry.register("arctic")
 class ArcticRLClientWrapper(RemoteBackend):
     """Arctic backend: a thin wrapper around ArcticRL's ``AsyncArcticRLClient``.
@@ -162,11 +183,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.logits_compute_in_fp32 = _logits_cfg.get("compute_in_fp32", False)
         self.logits_compute_from_fp32_inputs = _logits_cfg.get("compute_from_fp32_inputs", False)
         # False keeps arrival order. True balances sample lengths, or whole ZoRRo prompt groups.
-        # The legacy ``load_balancer`` config key is ignored.
-        if _train_cfg.get("balance_batch", None) is not None:
-            self.balance_batch = bool(_train_cfg.get("balance_batch"))
-        else:
-            self.balance_batch = True
+        self.balance_batch = _balance_batch_setting(_train_cfg)
         # CUDA-IPC bypasses NCCL for weight sync; only valid when colocate=True.
         self.cuda_ipc_weight_sync = self._backend_config.weight_sync.cuda_ipc
         self.low_memory_weight_sync = self._backend_config.weight_sync.low_memory

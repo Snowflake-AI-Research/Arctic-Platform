@@ -150,40 +150,81 @@ def assign_row_lpt(costs: Sequence[int], num_shards: int) -> list[list[int]]:
     return assignment
 
 
+# Backtracking stops here and the caller reports the assignment as infeasible.
+# A few thousand nodes covers the greedy pass for the 1024-group recipe and a
+# short search after a dead end, and cuts off the exponential case.
+_PACK_NODE_BUDGET = 100_000
+
+
 def _pack_groups(sizes, costs, order, num_shards, cap):
     """Place groups in ``order``, cheapest rank first, backtracking on a dead end.
 
-    The first pass is the greedy min-cost placement, so the result matches the
-    greedy pass whenever that pass fits every group. Backtracking only runs after a
-    dead end. Ranks with the same row count and cost are interchangeable, so a
-    dead end skips ranks that match one already tried. Returns ``{group: rank}``
-    or ``None``.
+    The greedy pass is a loop, so the call stack does not grow with the number
+    of groups. Backtracking runs only after a dead end. It keeps an explicit
+    stack and stops after ``_PACK_NODE_BUDGET`` nodes, which the caller reports
+    as an infeasible assignment. Ranks with the same row count and cost are
+    interchangeable, so a position skips a rank that matches one already tried.
+    Returns ``{group: rank}`` or ``None``.
     """
     rows = [0] * num_shards
     rank_costs = [0.0] * num_shards
     placed: dict[int, int] = {}
+    # Each frame is the position, the ranks still worth trying, the choice in
+    # that list, and the rank's row count and cost before that choice.
+    stack: list[tuple[int, list[int], int, int, float]] = []
+    pos = 0
+    nodes = 0
+    group_count = len(order)
 
-    def place(pos: int) -> bool:
-        if pos == len(order):
-            return True
-        index = order[pos]
+    def candidates(index: int) -> list[int]:
         tried = set()
+        found = []
         for rank in sorted(range(num_shards), key=lambda candidate: (rank_costs[candidate], candidate)):
             state = (rows[rank], rank_costs[rank])
             if rows[rank] + sizes[index] > cap or state in tried:
                 continue
             tried.add(state)
-            saved_rows, saved_cost = rows[rank], rank_costs[rank]
-            rows[rank] += sizes[index]
-            rank_costs[rank] += float(costs[index])
-            placed[index] = rank
-            if place(pos + 1):
-                return True
-            rows[rank], rank_costs[rank] = saved_rows, saved_cost
-            del placed[index]
-        return False
+            found.append(rank)
+        return found
 
-    return placed if place(0) else None
+    while True:
+        if pos == group_count:
+            return placed
+        if nodes >= _PACK_NODE_BUDGET:
+            return None
+        ranks = candidates(order[pos])
+        nodes += 1
+        if ranks:
+            rank = ranks[0]
+            saved_rows, saved_cost = rows[rank], rank_costs[rank]
+            rows[rank] = saved_rows + sizes[order[pos]]
+            rank_costs[rank] = saved_cost + float(costs[order[pos]])
+            placed[order[pos]] = rank
+            stack.append((pos, ranks, 0, saved_rows, saved_cost))
+            pos += 1
+            continue
+        while stack:
+            prev_pos, prev_ranks, choice, saved_rows, saved_cost = stack.pop()
+            prev_index = order[prev_pos]
+            rows[prev_ranks[choice]] = saved_rows
+            rank_costs[prev_ranks[choice]] = saved_cost
+            del placed[prev_index]
+            if choice + 1 >= len(prev_ranks):
+                continue
+            if nodes >= _PACK_NODE_BUDGET:
+                return None
+            choice += 1
+            rank = prev_ranks[choice]
+            saved_rows, saved_cost = rows[rank], rank_costs[rank]
+            rows[rank] = saved_rows + sizes[prev_index]
+            rank_costs[rank] = saved_cost + float(costs[prev_index])
+            placed[prev_index] = rank
+            stack.append((prev_pos, prev_ranks, choice, saved_rows, saved_cost))
+            nodes += 1
+            pos = prev_pos + 1
+            break
+        else:
+            return None
 
 
 def assign_zorro_groups(

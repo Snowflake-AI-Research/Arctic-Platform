@@ -48,6 +48,22 @@ def test_zorro_groups_backtrack_when_greedy_dead_ends():
     assert {frozenset(rows) for rows in assignment} == {frozenset(range(6)), frozenset(range(6, 12))}
 
 
+def test_zorro_thousands_of_single_row_groups_assign():
+    groups = [[row] for row in range(2048)]
+    costs = [float(row % 7) for row in range(2048)]
+    for num_shards in (2, 8):
+        assignment = assign_zorro_groups(groups, costs, num_shards=num_shards, num_rows=2048)
+        assert sorted(_flat(assignment)) == list(range(2048))
+        assert {len(rank) for rank in assignment} == {2048 // num_shards}
+
+
+def test_zorro_infeasible_hundreds_of_groups_raise():
+    # Each rank holds 100 groups of 3 and has one spare row, so the 301st group cannot land.
+    groups = [[3 * index, 3 * index + 1, 3 * index + 2] for index in range(301)]
+    with pytest.raises(ValueError, match="do not fit"):
+        assign_zorro_groups(groups, [1.0] * 301, num_shards=3, num_rows=903)
+
+
 def test_zorro_groups_raise_when_the_batch_does_not_divide():
     try:
         assign_zorro_groups([[0, 1], [2]], [1.0, 1.0], num_shards=2, num_rows=3)
