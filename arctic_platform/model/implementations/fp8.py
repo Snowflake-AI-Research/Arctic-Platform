@@ -648,6 +648,67 @@ class _GroupedBlockFp8MmFn(torch.autograd.Function):
         return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None, None
 
 
+def _frozen_leaves(weight, scale) -> tuple[list[Tensor], Any]:
+    """The tensors of a frozen ``(weight, scale)`` pair (tuples of stacks, ``Nvfp4Scales``), with a function that
+    rebuilds the pair from them."""
+    weights = weight if isinstance(weight, tuple) else (weight,)
+    scales = scale if isinstance(scale, tuple) else (scale,)
+    leaves: list[Tensor] = list(weights)
+    specs: list[str] = []
+    for sc in scales:
+        if isinstance(sc, Nvfp4Scales):
+            leaves += [sc.block, sc.per_matrix]
+            specs.append("nvfp4")
+        elif sc is None:
+            specs.append("none")
+        else:
+            leaves.append(sc)
+            specs.append("tensor")
+
+    # The closure keeps only the structure: holding the tensors would keep them alive with the autograd graph.
+    n_weights, weight_tuple, scale_tuple = len(weights), isinstance(weight, tuple), isinstance(scale, tuple)
+
+    def rebuild(tensors):
+        it = iter(tensors)
+        ws = tuple(next(it) for _ in range(n_weights))
+        ss: list[Any] = []
+        for kind in specs:
+            if kind == "nvfp4":
+                ss.append(Nvfp4Scales(next(it), next(it)))
+            elif kind == "none":
+                ss.append(None)
+            else:
+                ss.append(next(it))
+        return (ws if weight_tuple else ws[0]), (tuple(ss) if scale_tuple else ss[0])
+
+    return leaves, rebuild
+
+
+def stash_frozen(ctx, weight, scale) -> list[Tensor]:
+    """Keep a GEMM's frozen ``(weight, scale)`` for its backward; returns the tensors to add to ``save_for_backward``.
+
+    Parameters ride on ``ctx``: they live anyway, and activation offload must not copy them. Anything else (UltraEP's
+    per-call native + spare stacks) goes through ``save_for_backward``, so activation checkpointing frees it after the
+    forward instead of every layer's graph holding its stacks until backward.
+    """
+    leaves, rebuild = _frozen_leaves(weight, scale)
+    if all(isinstance(t, nn.Parameter) for t in leaves):
+        ctx.weights = (weight, scale)
+        ctx.frozen_rebuild = None
+        return []
+    ctx.frozen_rebuild = rebuild
+    ctx.frozen_count = len(leaves)
+    return leaves
+
+
+def unstash_frozen(ctx, saved: tuple) -> tuple[tuple, tuple]:
+    """``((weight, scale), the other saved tensors)`` for a ``stash_frozen`` backward."""
+    if ctx.frozen_rebuild is None:
+        return ctx.weights, tuple(saved)
+    n = ctx.frozen_count
+    return ctx.frozen_rebuild(saved[len(saved) - n :]), tuple(saved[: len(saved) - n])
+
+
 class _GroupedDecodedFp8MmFn(torch.autograd.Function):
     """Grouped ``x_e @ W_e.T`` against block-FP8 experts decoded to BF16; gradients flow to ``x``.
 
@@ -658,11 +719,9 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, block_size: int) -> Tensor:
-        # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
-        ctx.weights = (weight, scale)
         ctx.rows = rows
         ctx.block_size = block_size
-        ctx.save_for_backward(offsets)
+        ctx.save_for_backward(offsets, *stash_frozen(ctx, weight, scale))
         decoded = _decode_fp8_to_bf16(weight, scale, block_size)
         out = torch._grouped_mm(x.bfloat16(), decoded.transpose(-2, -1), offs=offsets)
         if rows < out.shape[0]:
@@ -671,8 +730,7 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        (offsets,) = ctx.saved_tensors
-        weight, scale = ctx.weights
+        (weight, scale), (offsets,) = unstash_frozen(ctx, ctx.saved_tensors)
         decoded = _decode_fp8_to_bf16(weight, scale, ctx.block_size)
         dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
         if ctx.rows < dx.shape[0]:

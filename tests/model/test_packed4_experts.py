@@ -319,3 +319,31 @@ def test_mxfp4_scales_compact_to_e8m0_bytes_exactly():
     module.w1_scale_inv.data = torch.full(module.w1_scale_inv.shape, 0.3)
     with pytest.raises(ValueError, match="powers of two"):
         module.compact_mxfp4_scales()
+
+
+def test_stash_frozen_keeps_parameters_on_ctx_and_saves_other_stacks():
+    import gc
+    import weakref
+
+    from arctic_platform.model.implementations.fp8 import Nvfp4Scales
+    from arctic_platform.model.implementations.fp8 import stash_frozen
+    from arctic_platform.model.implementations.fp8 import unstash_frozen
+
+    class Ctx:
+        pass
+
+    param = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    ctx = Ctx()
+    assert stash_frozen(ctx, param, param) == []
+    assert unstash_frozen(ctx, (torch.ones(1),))[0][0] is param
+
+    stack, scale, per_matrix = torch.zeros(4, 3), torch.ones(4, 2), torch.ones(4)
+    ctx = Ctx()
+    saved = stash_frozen(ctx, (stack, stack), (scale, Nvfp4Scales(scale, per_matrix)))
+    (weights, scales), rest = unstash_frozen(ctx, (torch.ones(1), *saved))
+    assert weights[0] is stack and scales[0] is scale and scales[1].per_matrix is per_matrix and len(rest) == 1
+    # Nothing but the saved tensors keeps the stacks alive: the rebuild closure holds only their structure.
+    ref = weakref.ref(stack)
+    del stack, weights, scales, saved, rest
+    gc.collect()
+    assert ref() is None
