@@ -636,7 +636,12 @@ class GroupedExperts(nn.Module):
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
-                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab, scores)
+                weights, scales = (w1, w2, w3), (s1, s2, s3)
+                call = getattr(self, "_arl_ultraep_call", None)
+                if call is not None:
+                    # UltraEP's spare slots, as for packed experts: native experts then this rank's copies.
+                    weights, scales, ab, _ = call.extend(self, weights, scales, ab, {})
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, weights, scales, ab, scores)
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
@@ -1081,12 +1086,13 @@ class MoE(nn.Module):
         return routed_output if shared_output is None else shared_output + routed_output
 
     def _ultraep_plan(self, experts: nn.Module, group, selected_experts_indices: torch.Tensor):
-        """UltraEP's plan for this call (``moe/ultraep_packed4.py``) with ``ARL_ULTRAEP_SPARES`` on packed-4-bit
-        experts, else None. A recompute reuses its forward's placement and physical routes."""
+        """UltraEP's plan for this call (``moe/ultraep_packed4.py``) with ``ARL_ULTRAEP_SPARES`` on frozen quantized
+        experts (packed 4-bit or block FP8), else None. A recompute reuses its forward's placement and physical routes."""
         from ..ultraep_packed4 import packed4_ultraep_plan
         from ..ultraep_packed4 import ultraep_spares
 
-        if not ultraep_spares() or getattr(experts, "packed4", None) is None or group is None:
+        frozen_quantized = getattr(experts, "packed4", None) is not None or getattr(experts, "fp8_block_size", None) is not None
+        if not ultraep_spares() or not frozen_quantized or group is None:
             return None
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector

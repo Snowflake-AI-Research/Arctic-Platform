@@ -15,7 +15,7 @@
 """UltraEP spares for packed-4-bit experts with LoRA (moe/ultraep_packed4.py): copies compute with their owners'
 codes, scales and LoRA factors, and the copies' LoRA gradients return to the owners.
 
-Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_packed4.py [w4a8]
+Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_packed4.py [w4a8 | fp8]
 """
 
 import os
@@ -35,6 +35,7 @@ def _gather(t):
 
 def main():
     w4a8 = "w4a8" in sys.argv[1:]
+    fp8 = "fp8" in sys.argv[1:]  # block-FP8 experts (the FP8 release), 128 x 128 FP32 scales
     if w4a8:
         os.environ["ARL_W4A8_EXPERTS"] = "1"
     os.environ["ARL_ULTRAEP_SPARES"] = str(S)
@@ -47,9 +48,23 @@ def main():
 
     group = dist.new_group(list(range(world)))
     torch.manual_seed(100 + rank)
-    experts = GroupedExperts(DIM, HIDDEN, L, use_grouped_mm=True, fp8_block_size=128, packed4="int4").cuda()
+    experts = GroupedExperts(
+        DIM, HIDDEN, L, use_grouped_mm=True, fp8_block_size=128, packed4=None if fp8 else "int4"
+    ).cuda()
     shapes = {"w1": (HIDDEN, DIM), "w2": (DIM, HIDDEN), "w3": (HIDDEN, DIM)}
     for name, (rows, cols) in shapes.items():
+        if fp8:
+            from arctic_platform.model.implementations.fp8 import quantize_to_fp8_blockwise
+
+            q, sc = zip(
+                *(
+                    quantize_to_fp8_blockwise((torch.randn(rows, cols, device="cuda") * 0.05).bfloat16())
+                    for _ in range(L)
+                )
+            )
+            getattr(experts, name).data.copy_(torch.stack(q))
+            getattr(experts, f"{name}_scale_inv").data.copy_(torch.stack(sc))
+            continue
         codes = torch.randint(-7, 8, (L, rows, cols), dtype=torch.int16, device="cuda")
         getattr(experts, name).data.copy_(
             ((codes[..., 0::2] & 15) | ((codes[..., 1::2] & 15) << 4)).to(torch.uint8).view(torch.int8)
@@ -67,10 +82,14 @@ def main():
     experts._ap_lora_ab = ab
     # Logical reference weights of every expert: [world * L, out, in] FP32, and every rank's factors.
     raw_scales = {n: getattr(experts, f"{n}_scale_inv").detach().clone() for n in shapes}
-    ref_w = {
-        n: _gather(dequantize_int4_groups_reference(getattr(experts, n).detach(), raw_scales[n])).flatten(0, 1)
-        for n in shapes
-    }
+    from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
+
+    def decode(weight, scale):
+        if fp8:
+            return torch.stack([dequantize_from_fp8_blockwise(weight[e], scale[e], 128).float() for e in range(L)])
+        return dequantize_int4_groups_reference(weight, scale)
+
+    ref_w = {n: _gather(decode(getattr(experts, n).detach(), raw_scales[n])).flatten(0, 1) for n in shapes}
     ref_ab = {n: (_gather(ab[n][0].detach()), _gather(ab[n][1].detach())) for n in shapes}
 
     # Skewed routing: experts 0 and 1 hot on every rank.
@@ -141,8 +160,8 @@ def main():
             assert err < (6e-2 if w4a8 else 2e-2), f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
     if rank == 0:
         print(
-            f"ok ({'w4a8' if w4a8 else 'w4a16'}): EP{world}, {S} spares: copies compute with their owners' weights and"
-            " LoRA, LoRA gradients return; rank load max/mean"
+            f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'w4a16'}): EP{world}, {S} spares: copies compute with their"
+            " owners' weights and LoRA, LoRA gradients return; rank load max/mean"
             f" {(logical.max() / logical.float().mean()).item():.3f} ->"
             f" {(loads.max() / loads.float().mean()).item():.3f}"
         )

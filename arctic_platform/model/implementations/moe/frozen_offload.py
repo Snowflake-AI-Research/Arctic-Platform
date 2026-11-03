@@ -18,7 +18,8 @@ GLM-5.3's block-FP8 routed experts are 91 GiB per GPU at EP8, which leaves too l
 sequence. With LoRA they are frozen and every layer reads them twice per step: in its forward and in its
 activation-checkpoint recompute (the backward reuses the recompute's copy). So each rank keeps its experts' codes in
 one host buffer, registered with CUDA, and a layer's codes (1.2 GiB per GPU for GLM-5.3) are copied in on a side
-stream for each call. The next layer in call order (forward: the next one; backward: the previous one) is prefetched
+stream for each call, into one of two persistent GPU buffers by the layer's parity (so a layer's codes always sit at
+the same addresses, which UltraEP's spare-slot copies read in place). The next layer in call order (forward: the next one; backward: the previous one) is prefetched
 while the current one runs, so the copy overlaps compute.
 
 As in ``frozen_shard``, the offload happens at the first call, after PEFT and DeepSpeed have wrapped the model; the
@@ -32,6 +33,7 @@ stay on the GPU (W4A8 rewrites INT4 scales in place on first use). A model with 
 from __future__ import annotations
 
 import os
+import weakref
 
 import torch
 from torch import nn
@@ -86,6 +88,11 @@ class FrozenExpertOffload:
         self.registered = False
         self.stream: torch.cuda.Stream | None = None
         self.pending: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+        # Two persistent GPU buffers: layer i always copies into buffers[i % 2], so its codes keep their addresses
+        # from call to call (UltraEP's pointer pools read them in place) and no call allocates. Each buffer
+        # remembers the temporaries of the layer that last used it, to refuse an overwrite while they live.
+        self.buffers: list[torch.Tensor] = []
+        self.holders: list[tuple[int, list]] = [(-1, []), (-1, [])]
         self.installed: set[int] = set()
         self.last: int | None = None
         self.direction = 1
@@ -125,14 +132,27 @@ class FrozenExpertOffload:
                 self.host[base + start : base + start + nbytes].copy_(param.data.contiguous().view(torch.uint8).view(-1))
                 param.data = torch.empty(0, dtype=dtype, device=param.device)
         self.stream = torch.cuda.Stream()
+        size = max(self.layer_bytes, default=0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.buffers = [torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)]
+
+    def _check_free(self, i: int) -> None:
+        owner, refs = self.holders[i % 2]
+        if owner != i and any(ref() is not None for ref in refs):
+            raise RuntimeError(
+                f"frozen expert offload: layer {i} would overwrite buffer {i % 2} while layer {owner}'s copy is still "
+                "in use (the layers were called out of the forward / reverse-recompute order)"
+            )
 
     def _fetch(self, i: int) -> None:
         if i in self.pending or not self.layer_bytes[i]:
             return
         assert self.host is not None and self.stream is not None
         current = torch.cuda.current_stream()
-        # Allocated on the compute stream, which waits for the copy's event before any use or free of the buffer.
-        buffer = torch.empty(self.layer_bytes[i], dtype=torch.uint8, device=current.device)
+        self._check_free(i)
+        # The side stream starts after everything queued on the compute stream, the last reads of this buffer included;
+        # the compute stream waits for the copy's event before reading it.
+        buffer = self.buffers[i % 2][: self.layer_bytes[i]]
         self.stream.wait_stream(current)
         with torch.cuda.stream(self.stream):
             base = self.host_offsets[i]
@@ -153,6 +173,7 @@ class FrozenExpertOffload:
         if self.layer_bytes[i]:
             buffer, event = self.pending.pop(i)
             torch.cuda.current_stream().wait_event(event)
+            temporaries: list = []
             for owner, name, param, shape, dtype, start, nbytes in self.entries[i]:
                 temporary = nn.Parameter(buffer[start : start + nbytes].view(dtype).view(shape), requires_grad=False)
                 for attr in ("allreduce", "_dss_keep_fp32", "ds_shape"):
@@ -160,6 +181,8 @@ class FrozenExpertOffload:
                         setattr(temporary, attr, getattr(param, attr))
                 temporary._ap_transient = True
                 owner._parameters[name] = temporary
+                temporaries.append(weakref.ref(temporary))
+            self.holders[i % 2] = (i, temporaries)
             self.installed.add(i)
         # Call order: forward 0..n-1, then the recomputes n-1..0; the same layer twice in a row turns around.
         if self.last is not None:

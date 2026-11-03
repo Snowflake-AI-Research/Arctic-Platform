@@ -87,7 +87,16 @@ def test_offloaded_expert_codes_match_resident_ones():
     offload = install_frozen_expert_offload(offloaded)
     code_bytes = EXPERTS * HIDDEN * DIM * 3  # E4M3 codes of w1, w2, w3 per layer
     x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
-    for step in range(2):
+    addresses: dict[int, set[int]] = {}
+
+    def record(module, args, i):
+        addresses.setdefault(i, set()).add(module.experts.w1.data_ptr())
+
+    for i, layer in enumerate(offloaded):
+        # Runs after the offload's pre-hook, which installed the copied codes.
+        layer._checkpoint_wrapped_module.register_forward_pre_hook(lambda m, a, i=i: record(m, a, i))
+    steps = 3
+    for step in range(steps):
         for model in (reference, offloaded):
             model.zero_grad(set_to_none=True)
         xr, xo = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
@@ -96,9 +105,10 @@ def test_offloaded_expert_codes_match_resident_ones():
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         got = _run(offloaded, xo)
-        # The checkpointed forward keeps no layer's copied codes alive (at most the prefetched next one is pending).
+        # The checkpointed forward keeps no copied codes alive: they sit in two persistent buffers (allocated in step 0).
         held = torch.cuda.memory_allocated() - before
-        assert held < 1.5 * code_bytes, f"step {step}: forward holds {held / code_bytes:.2f} layers of expert codes"
+        if step:
+            assert held < 0.5 * code_bytes, f"step {step}: forward allocates {held / code_bytes:.2f} layers of codes"
         got.float().square().sum().backward()
         assert torch.equal(got, want), step
         assert torch.equal(xo.grad, xr.grad), step
@@ -116,6 +126,25 @@ def test_offloaded_expert_codes_match_resident_ones():
     assert offload.host_bytes() == LAYERS * code_bytes
     # Per step: LAYERS forwards, then LAYERS recomputes in reverse. Every call but the first of each pass was
     # prefetched by the call before it, and no prefetch went unused.
-    steps, calls = 2, 2 * 2 * LAYERS
+    calls = steps * 2 * LAYERS
     assert offload.copies == calls
     assert offload.prefetched == calls - 2 * steps, f"{offload.prefetched} of {calls} calls prefetched"
+    # Every call of a layer finds its codes at the same address: buffer i % 2 of the two persistent buffers.
+    assert all(len(ptrs) == 1 for ptrs in addresses.values()), addresses
+    assert addresses[0] != addresses[1] and addresses[0] == addresses[2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_offload_refuses_to_overwrite_a_buffer_in_use():
+    from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+
+    model = _model(0)
+    install_frozen_expert_offload(model)
+    x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
+    _run(model, x.clone().requires_grad_(True)).float().sum().backward()
+    # Layer 0's copy held by a live graph (no checkpoint: its forward saves the codes) while layer 2 wants its buffer.
+    inner = [layer._checkpoint_wrapped_module for layer in model]
+    xs = x.clone().requires_grad_(True)
+    out = inner[0](xs)
+    with pytest.raises(RuntimeError, match="still in use"):
+        inner[2](out)
