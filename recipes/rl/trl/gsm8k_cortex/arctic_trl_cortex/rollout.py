@@ -106,6 +106,7 @@ class ArcticRolloutWorker:
             self._sampling_params["min_p"] = min_p
 
         self.rollout_buffer: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        self.metrics_queue: queue.Queue = queue.Queue()
 
         self._model_version = 0
         self._version_lock = threading.Lock()
@@ -279,13 +280,17 @@ class ArcticRolloutWorker:
             sample = RolloutSample(
                 prompt=prompt,
                 completion=completions[i],
-                input_ids=rows[i]["input_ids"],
-                completion_mask=rows[i]["completion_mask"],
-                old_log_probs=rows[i]["old_log_probs"],
+                input_ids=np.asarray(rows[i]["input_ids"], dtype=np.int64),
+                completion_mask=np.asarray(rows[i]["completion_mask"], dtype=np.int64),
+                old_log_probs=np.asarray(rows[i]["old_log_probs"], dtype=np.float32),
+                sampling_mask=[[] for _ in rows[i]["input_ids"]],
+                sampler_ids=np.empty((len(rows[i]["input_ids"]), 0), dtype=np.int64),
+                sampler_log_probs=np.empty((len(rows[i]["input_ids"]), 0), dtype=np.float32),
                 advantage=float(adv),
                 model_version=model_version,
                 group_id=group_id,
                 metrics=metrics,
+                enqueued_at=time.time(),
             )
             self._put(sample)
 

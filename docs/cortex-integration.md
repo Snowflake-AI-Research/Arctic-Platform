@@ -99,9 +99,10 @@ constrains what runs correctly here:
 * **TRL recipe** —
   [`recipes/rl/trl/gsm8k_cortex/`](../recipes/rl/trl/gsm8k_cortex/README.md),
   TRL `AsyncGRPOTrainer` on GSM8K. The driver is CPU-only and ZoRRo is off.
-  Unlike the SkyRL path above, trainer-π_old issues a real `/forward`, and the
-  logged `kl` is a per-step metric (about `1e-4` to `1e-3`), not a loss term
-  and not the SkyRL `approx_kl=0` case.
+  Trainer-π_old issues a real `/forward`. Logged `kl` is the per-step Schulman
+  approximation. The pre-upstream-TRL 250-step reference run averaged `5.9e-4`
+  for its first 20 steps and `1.8e-2` for its last 20; revalidate those values
+  after changing the pinned TRL version.
 
 ## Env vars
 

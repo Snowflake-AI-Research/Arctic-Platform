@@ -60,11 +60,12 @@ client = create_arctic_rl_client(config)
 ### Integrated
 
 1. [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/1837). [Documentation](https://github.com/NovaSky-AI/SkyRL/tree/main/integrations/arctic_rl)
+2. TRL on Cortex. GSM8K GRPO from a CPU driver: [recipes/rl/trl/gsm8k_cortex](recipes/rl/trl/gsm8k_cortex).
 
 ### Integration is done but not yet merged
 
 1. Verl. The reference integration is [verl](https://github.com/verl-project/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [recipes/rl/verl](recipes/rl/verl/), including a [simple single-GPU GSM8K](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/simple) starter, [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/long_context_qa).
-2. TRL. The adapter lives under [`arctic_platform/integrations/trl/`](arctic_platform/integrations/trl/) and drives Arctic RL from TRL's `AsyncGRPOTrainer`. End-to-end recipes live under [recipes/rl/trl](recipes/rl/trl/), including a [GSM8K](recipes/rl/trl/gsm8k) starter, [GSM8K on Cortex](recipes/rl/trl/gsm8k_cortex) (CPU driver, ZoRRo off), and [Txt2SQL (BIRD)](recipes/rl/trl/txt2sql).
+2. TRL. The adapter lives under [`arctic_platform/integrations/trl/`](arctic_platform/integrations/trl/) and drives Arctic RL from TRL's `AsyncGRPOTrainer`. End-to-end recipes live under [recipes/rl/trl](recipes/rl/trl/), including a [GSM8K](recipes/rl/trl/gsm8k) starter and [Txt2SQL (BIRD)](recipes/rl/trl/txt2sql).
 
 ### Upcoming integrations
 

@@ -12,6 +12,7 @@ to the Cortex ``/operation`` forward and ``/forward-backward`` routes.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -36,30 +37,25 @@ def patch_cortex_transport_pr55() -> None:
     patch_cortex_transport()
 
 
-def install_stub_model_loader() -> None:
-    import trl.experimental.async_grpo.async_grpo_trainer as agt
-    from transformers import AutoConfig
-    from transformers import AutoModelForCausalLM as _RealAuto
-
-    class _StubLoader:
-        @staticmethod
-        def from_pretrained(model_id: str, **kwargs):
-            cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=kwargs.get("trust_remote_code", False))
-            text = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-            if hasattr(text, "num_hidden_layers"):
-                text.num_hidden_layers = 1
-            model = _RealAuto.from_config(cfg, attn_implementation="eager")
-            return model.to(torch.float32)
-
-    agt.AutoModelForCausalLM = _StubLoader
-    print("[e2e] installed inert stub-model loader", flush=True)
-
-
 def format_sample(sample: dict) -> dict:
     return {
         "prompt": [{"role": "user", "content": sample["question"]}],
         "solution": sample["answer"].split("####")[-1].strip(),
     }
+
+
+def build_stub_model(config):
+    """Create the minimal local module upstream TRL needs to initialize."""
+    from transformers import AutoModelForCausalLM
+
+    full = copy.deepcopy(config)
+    stub_config = copy.deepcopy(config)
+    text = stub_config.get_text_config() if hasattr(stub_config, "get_text_config") else stub_config
+    if hasattr(text, "num_hidden_layers"):
+        text.num_hidden_layers = 1
+    model = AutoModelForCausalLM.from_config(stub_config, dtype=torch.float32)
+    model._arctic_full_config = full
+    return model
 
 
 def cortex_backend():
@@ -140,56 +136,19 @@ def build_client(model: str, *, max_seq_len: int, response_len: int, rollout_n: 
     return ArcticRLClient(cfg)
 
 
-def make_trainer(*, model, args, train_dataset, processing_class, training_client, rollout_worker,
-                 weight_transfer, arctic_client):
-    from trl.experimental.async_grpo import AsyncGRPOTrainer
-    from arctic_trl_cortex.client import ArcticOptimizer
+def make_trainer(*, model, args, train_dataset, processing_class, rollout_worker, weight_transfer,
+                 arctic_client, cortex_bridge):
+    from arctic_trl_cortex.upstream import make_trainer_class
 
-    class ArcticAsyncGRPOTrainer(AsyncGRPOTrainer):
-        def __init__(self, *a, **kw):
-            self._arctic_client = arctic_client
-            super().__init__(*a, **kw)
-
-        def create_optimizer(self):
-            if self.optimizer is None:
-                self.optimizer = ArcticOptimizer(
-                    self._arctic_client, self.model.parameters(), lr=self.args.learning_rate
-                )
-            return self.optimizer
-
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-            # TRL's protocol has no advantages; Cortex GRPO needs them unpacked [B, S].
-            mask_bool = inputs["attention_mask"].bool()
-            advantages = inputs["advantages"][mask_bool].unsqueeze(0)
-            orig = self.training_client.forward_backward
-            eps = float(self.epsilon_low)
-
-            def forward_backward(model, input_ids, position_ids, completion_mask, loss_fn, aux_loss_coef=0.0):
-                return orig(
-                    model,
-                    input_ids,
-                    position_ids,
-                    completion_mask,
-                    loss_fn,
-                    aux_loss_coef=aux_loss_coef,
-                    advantages=advantages,
-                    eps_clip=eps,
-                )
-
-            self.training_client.forward_backward = forward_backward
-            try:
-                return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
-            finally:
-                self.training_client.forward_backward = orig
-
-    return ArcticAsyncGRPOTrainer(
+    return make_trainer_class()(
         model=model,
         args=args,
         train_dataset=train_dataset,
         processing_class=processing_class,
-        training_client=training_client,
         rollout_worker=rollout_worker,
         weight_transfer=weight_transfer,
+        arctic_client=arctic_client,
+        cortex_bridge=cortex_bridge,
     )
 
 
@@ -218,9 +177,10 @@ def main() -> None:
     args = ap.parse_args()
 
     from datasets import load_dataset
+    from transformers import AutoConfig
     from transformers import AutoTokenizer
-    from arctic_trl_cortex.client import ArcticTrainingClient
     from arctic_trl_cortex.rollout import ArcticRolloutWorker
+    from arctic_trl_cortex.upstream import CortexModelBridge
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
     from trl.experimental.async_grpo import AsyncGRPOConfig
     from trl.rewards import accuracy_reward
@@ -263,7 +223,9 @@ def main() -> None:
         dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
         print(f"[e2e] dataset ready: {len(dataset)} prompts (split={split})", flush=True)
 
-        install_stub_model_loader()
+        model_config = AutoConfig.from_pretrained(args.model)
+        stub_model = build_stub_model(model_config)
+        print("[e2e] built one-layer CPU stub model", flush=True)
 
         world = int(os.environ.get("WORLD_SIZE", "1"))
         max_inflight = args.max_inflight_tasks
@@ -296,13 +258,15 @@ def main() -> None:
             max_staleness=args.max_staleness,
             max_inflight_tasks=max_inflight,
             token_budget=0,
+            score_centering=False,
+            router_aux_loss_coef=0.0,
             logging_steps=1,
             report_to="none",
             log_completions=True,
             vllm_server_base_url="http://cortex-managed",
         )
 
-        training_client = ArcticTrainingClient(
+        cortex_bridge = CortexModelBridge(
             client=client,
             temperature=1.0,
             pad_token_id=tokenizer.pad_token_id or 0,
@@ -322,9 +286,9 @@ def main() -> None:
         weight_transfer = ArcticWeightTransfer(client)
 
         trainer = make_trainer(
-            model=args.model, args=config, train_dataset=dataset, processing_class=tokenizer,
-            training_client=training_client, rollout_worker=rollout_worker,
-            weight_transfer=weight_transfer, arctic_client=client,
+            model=stub_model, args=config, train_dataset=dataset, processing_class=tokenizer,
+            rollout_worker=rollout_worker, weight_transfer=weight_transfer, arctic_client=client,
+            cortex_bridge=cortex_bridge,
         )
 
         run_desc = f"max_steps={args.max_steps}" if args.max_steps > 0 else f"{args.num_train_epochs} epoch(s)"

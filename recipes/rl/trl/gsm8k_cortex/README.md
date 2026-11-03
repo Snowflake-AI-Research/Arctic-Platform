@@ -4,11 +4,9 @@ Same task as [`../gsm8k/`](../gsm8k/), with training and sampling dispatched to
 Cortex. The TRL driver is CPU-only: it builds a one-layer stub so
 `AsyncGRPOTrainer` can run its loop, and Cortex owns the GPUs. ZoRRo is off.
 
-The logged `kl` is not a loss term. The update is clipped GRPO (importance
-ratio times advantage) with `entropy_coeff=0`. After each forward, TRL records
-the Schulman approximation between the new log-probs and that step's π_old.
-A real trainer-π_old step is about `1e-4` to `1e-3`. `kl` of 0 means the old
-log-probs were missing or identical to the new ones.
+The update is clipped GRPO (importance ratio times advantage) with
+`entropy_coeff=0`. Logged `kl` is the Schulman approximation between the new
+log-probs and that step's π_old. A missing or identical π_old logs `kl` of 0.
 
 | Knob | Value |
 | --- | --- |
@@ -32,7 +30,7 @@ Cortex client from this checkout and TRL from the same pin as
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 git clone https://github.com/huggingface/trl
-git -C trl checkout 914196293543f609d0a8cb68b16154934e6b0c51
+git -C trl checkout 3b24f2fcd85102893a9175483da2636eb49c1a22
 
 conda create -y -n trl_cortex python=3.12
 conda activate trl_cortex
@@ -102,12 +100,13 @@ pass@1. `kl` was nonzero on every step.
 | Sampler π_old | 0.838 | 131 | 5.10 s | mean `1.2e-3`, never 0 |
 | Trainer π_old | 0.734 | 184 | 6.02 s | mean `8.0e-4`, never 0 |
 
-The same launcher on `main` (`c40f78bca`, trainer π_old, ZoRRo off) finished
+The previous adapter on `main` (`c40f78bca`, trainer π_old, ZoRRo off) finished
 250 steps in 27:34. Step-1 `kl` was `3.0e-4` and the first 20 steps averaged
 `5.9e-4`, matching the trainer pin. Last-20 training reward was 0.767 with
 completion length 126. Last-20 `kl` was `1.8e-2`, about 18× the pre-main pin,
-and `kl` was nonzero on every step. Mean step time was 6.56 s. Write a new
-metrics file (`--metrics-out`); do not overwrite the pins above.
+and `kl` was nonzero on every step. Mean step time was 6.56 s. The upstream-TRL
+bridge above must be checked with a new metrics file (`--metrics-out`); do not
+overwrite the pins above.
 
 ## Files
 
@@ -115,7 +114,7 @@ metrics file (`--metrics-out`); do not overwrite the pins above.
 | --- | --- |
 | `run_qwen3_1.7b_gsm8k_grpo_cortex.sh` | 250-step launcher. Reads `ARCTIC_CORTEX_*` |
 | `run_qwen3_1.7b_gsm8k_grpo_cortex.py` | CPU driver: stub model, `ArcticRLClient`, TRL loop |
-| `arctic_trl_cortex/` | Forward and `/fwd_bwd` adapters, rollout worker, training client |
+| `arctic_trl_cortex/` | Upstream-TRL forward/backward bridge, rollout worker, and Cortex payload adapters |
 
 `arctic_platform.integrations.trl` remains the on-prem adapter. This recipe
 does not import it for the training step. It does use

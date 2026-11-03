@@ -13,21 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic backend for TRL's ``TrainingClientProtocol``.
-
-TRL's fused ``forward_backward(..., loss_fn)`` stays in-process: Arctic runs the
-model, this adapter unpacks packed rows and evaluates ``loss_fn`` on returned logprobs.
-"""
+"""Shared Cortex calls for the upstream-TRL GSM8K recipe."""
 
 from typing import Any
 
 import torch
-from trl.experimental.api import ForwardBackwardOutput
 
 from .cortex_forward import normalize_forward_result
 from .cortex_forward import to_cortex_fwd_payload
-from .cortex_fwd_bwd import compare_fwd_bwd_to_forward
-from .cortex_fwd_bwd import to_cortex_fwd_bwd_payload
 
 
 def _meta_dict(
@@ -57,135 +50,6 @@ def _meta_dict(
         logits_optimization_peak_mem_size_in_gib=logits_optimization_peak_mem_size_in_gib,
         logits_compute_in_fp32=logits_compute_in_fp32,
     )
-
-
-class ArcticTrainingClient:
-    """Arctic-hosted model, TRL-hosted loss.
-
-    Args:
-        client: :class:`~arctic_platform.client.client.SyncArcticRLClient`.
-        temperature: Applied by the ``apply_temperature`` post-processor.
-        loss_fn: Server surrogate name (or dotted import). Not TRL's local ``loss_fn`` callable.
-    """
-
-    def __init__(
-        self,
-        client: Any,
-        temperature: float = 1.0,
-        loss_fn: str = "arctic_platform.integrations.trl.loss.weighted_logprob_sum",
-        *,
-        pad_token_id: int = 0,
-        rollout_n: int = 1,
-        max_token_len_per_gpu: int = 4096,
-        logits_optimization: str = "none",
-        logits_optimization_peak_mem_size_in_gib: int = 4,
-        logits_compute_in_fp32: bool = False,
-    ) -> None:
-        self.client = client
-        self.temperature = temperature
-        self.loss_fn = loss_fn
-        self.pad_token_id = pad_token_id
-        self.rollout_n = rollout_n
-        self.max_token_len_per_gpu = max_token_len_per_gpu
-        self.logits_optimization = logits_optimization
-        self.logits_optimization_peak_mem_size_in_gib = logits_optimization_peak_mem_size_in_gib
-        self.logits_compute_in_fp32 = logits_compute_in_fp32
-
-    def _meta(self, *, calculate_entropy: bool) -> dict:
-        """``meta`` for this client's forwards; see :func:`_meta_dict`."""
-        return _meta_dict(
-            temperature=self.temperature,
-            rollout_n=self.rollout_n,
-            pad_token_id=self.pad_token_id,
-            max_token_len_per_gpu=self.max_token_len_per_gpu,
-            calculate_entropy=calculate_entropy,
-            logits_optimization=self.logits_optimization,
-            logits_optimization_peak_mem_size_in_gib=self.logits_optimization_peak_mem_size_in_gib,
-            logits_compute_in_fp32=self.logits_compute_in_fp32,
-        )
-
-    def forward_backward(
-        self,
-        model: torch.nn.Module,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-        loss_fn: Any,
-        aux_loss_coef: float = 0.0,
-        advantages: torch.Tensor | None = None,
-        eps_clip: float = 0.2,
-    ) -> ForwardBackwardOutput:
-        del model  # trainer-local; Arctic owns the weights
-        seq_lens = _segment_lengths(position_ids)
-        batch = _unpack_to_padded_rows(input_ids, position_ids, completion_mask, seq_lens)
-        device = input_ids.device
-        response_mask = _unpack_to_padded(completion_mask, seq_lens).to(torch.bool)
-        adv_b_s = _unpack_to_padded(advantages, seq_lens) if advantages is not None else None
-
-        response = normalize_forward_result(
-            self.client.fwd_no_grad(
-                to_cortex_fwd_payload(
-                    {
-                        "batch": batch,
-                        "meta": self._meta(calculate_entropy=True),
-                    }
-                )
-            )
-        )
-        if "batch" not in response:
-            print(f"[e2e] forward result keys={list(response)[:40]}", flush=True)
-        out = response["batch"]
-        # Server [B, S] roll(-1) -> packed TRL [1, T-1].
-        log_probs = _shift_for_trl(_repack_to_row(out["logprobs"], seq_lens)).to(device)
-        entropy = _shift_for_trl(_repack_to_row(out["entropy"], seq_lens)).to(device)
-        forward_logprobs_bs = out["logprobs"]
-
-        leaf = log_probs.detach().requires_grad_(True)
-        loss = loss_fn(leaf)
-        (grad_log_probs,) = torch.autograd.grad(loss, leaf)
-
-        def send_backward(grad_loss: torch.Tensor) -> None:
-            if adv_b_s is not None:
-                # Cortex GRPO (SkyRL remap): advantages + response_mask, not TRL logprob weights.
-                del grad_loss
-                fb = self.client.fwd_bwd(
-                    to_cortex_fwd_bwd_payload(
-                        {
-                            "batch": {**batch, "advantages": adv_b_s, "response_mask": response_mask},
-                            "processing": {
-                                "config": {
-                                    "eps_clip": eps_clip,
-                                    "loss_agg_mode": "token-mean",
-                                    "entropy_coeff": 0.0,
-                                }
-                            },
-                        }
-                    )
-                )
-                compare_fwd_bwd_to_forward(fb, forward_logprobs_bs, response_mask)
-                return
-            # On-prem / non-Cortex: scale, unshift to [1, T], unpack to [B, S].
-            weights = _unpack_to_padded(_unshift_from_trl(grad_log_probs * grad_loss), seq_lens)
-            self.client.fwd_bwd(
-                {
-                    "batch": {**batch, "logprob_weights_shifted": weights},
-                    "meta": self._meta(calculate_entropy=False),
-                    "processing": {
-                        "post": ["apply_temperature", "compute_entropy_and_logprobs"],
-                        "loss_fn": self.loss_fn,
-                    },
-                }
-            )
-
-        reported_loss = loss.detach().requires_grad_(True)
-        reported_loss.register_hook(send_backward)
-
-        return ForwardBackwardOutput(
-            loss=reported_loss,
-            log_probs=log_probs.detach(),
-            entropy=entropy,
-            aux_loss=None,  # MoE aux is a server metric, not a tensor
-        )
 
 
 class ArcticOptimizer(torch.optim.Optimizer):
