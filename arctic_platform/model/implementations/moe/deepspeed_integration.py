@@ -46,10 +46,6 @@ class MoEDeepSpeedAdapter:
 
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
 _EXPORT_GATHER_BYTES = 1 << 30
-# NCCL has no type for these (DeepSeek V4.1's e8m0 block scales), so export gathers their bytes as uint8.
-_NCCL_BYTE_VIEW_DTYPES = tuple(
-    getattr(torch, name) for name in ("float8_e8m0fnu", "float4_e2m1fn_x2") if hasattr(torch, name)
-)
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -186,7 +182,8 @@ def build_iter_full_hf_weights(model: nn.Module):
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
         """
-        if local.dtype in _NCCL_BYTE_VIEW_DTYPES:
+        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
+        if local.dtype != torch.uint8:
             full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
             return None if full is None else full.view(local.dtype)
         rows = local.shape[0]

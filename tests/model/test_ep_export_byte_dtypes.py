@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EP export gathers dtypes the collective backend has no type for (e8m0 scales, packed fp4) as exact bytes (gloo)."""
+"""EP export gathers every dtype as exact bytes, including ones the backend has no type for (e8m0, packed fp4)."""
 
 import os
 import tempfile
@@ -29,7 +29,7 @@ pytest.importorskip("deepspeed")
 
 _WORLD = 2
 _ROWS, _COLS = 6, 8
-_DTYPES = [name for name in ("float8_e8m0fnu", "float4_e2m1fn_x2", "bfloat16") if hasattr(torch, name)]
+_DTYPES = [name for name in ("float8_e8m0fnu", "float4_e2m1fn_x2", "bfloat16", "float32") if hasattr(torch, name)]
 
 
 class _Experts(nn.Module):
