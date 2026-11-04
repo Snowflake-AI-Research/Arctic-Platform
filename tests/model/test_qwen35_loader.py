@@ -233,7 +233,7 @@ def test_prediction_weight_export_builders_are_family_scoped():
     from arctic_platform.model.implementations.qwen38 import deepspeed_integration as flash
 
     assert qwen._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
-    assert flash._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
+    assert flash._adapter().hf_weight_export is flash._build_iter_full_hf_weights
     assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
     assert qwen._generic_adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
 
