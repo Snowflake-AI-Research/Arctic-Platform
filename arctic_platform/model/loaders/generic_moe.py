@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
@@ -27,6 +26,7 @@ from typing_extensions import Self
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -36,7 +36,7 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 GENERIC_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "glm4_moe", "minimax", "minimax_m2", "afmoe", "nemotron_h"})
 
 
-class GenericMoeOptions(BaseModel):
+class GenericMoeOptions(MoeRuntimeOptions):
     """Validated ``loader_options`` for the generic MoE families."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)

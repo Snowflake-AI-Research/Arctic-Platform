@@ -43,6 +43,20 @@ def test_set_sparse_mla_backend_ref():
     assert sparse_mla_backend() == "ref"
 
 
+@pytest.mark.parametrize(
+    ("usable", "flashmla", "expected"),
+    [(True, True, "flashmla_tilelang"), (True, False, "tilelang"), (False, True, "ref"), (False, False, "ref")],
+)
+def test_auto_sparse_mla_backend_prefers_fused_tilelang_backward(monkeypatch, usable, flashmla, expected):
+    import arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla as kernel
+
+    monkeypatch.setattr(kernel, "_tilelang_usable", lambda: usable)
+    monkeypatch.setattr(kernel, "flash_mla_available", lambda: flashmla)
+    monkeypatch.setattr(kernel, "_ensure_flash_mla_sparse_fwd", lambda: None)
+    assert set_sparse_mla_backend("auto") == expected
+    assert sparse_mla_backend() == expected
+
+
 def test_set_sparse_mla_backend_rejects_unknown():
     with pytest.raises(ValueError, match="Unknown sparse_mla_backend"):
         set_sparse_mla_backend("bogus")
@@ -273,3 +287,30 @@ def test_fused_sparse_mla_backward_matches_fp32_reference(width):
     assert rel(dq, q_ref.grad) < 1e-2
     assert rel(dkv[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
     assert torch.all(dkv[:, keys] == 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashMLA / TileLang parity needs a GPU")
+def test_flashmla_forward_with_tilelang_backward_matches_tilelang():
+    """GLM-5.3 head shapes: the FlashMLA forward feeds the fused TileLang backward the same out and LSE."""
+    import arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla as kernel
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import sparse_mla_apply
+
+    if not flash_mla_available() or not kernel._tilelang_usable():
+        pytest.skip("needs flash_mla and TileLang")
+    torch.manual_seed(0)
+    seq, kv_len, heads, topk = 512, 2048, 64, 512
+    q = (torch.randn(1, seq, heads, 576, device="cuda") * 0.5).bfloat16()
+    kv = (torch.randn(1, kv_len, 1, 576, device="cuda") * 0.5).bfloat16()
+    pos = torch.arange(kv_len - seq, kv_len, device="cuda")
+    indices = (torch.rand(seq, topk, device="cuda") * (pos[:, None] + 1)).long()
+    indices = indices.sort(-1).values.int().view(1, seq, 1, topk)
+    dout = torch.randn(1, seq, heads, 512, device="cuda").bfloat16()
+    results = {}
+    for backend in ("tilelang", "flashmla_tilelang"):
+        set_sparse_mla_backend(backend)
+        q_b, kv_b = q.clone().requires_grad_(True), kv.clone().requires_grad_(True)
+        out = sparse_mla_apply(q_b, kv_b, indices, 576**-0.5)
+        out.backward(dout)
+        results[backend] = (out, q_b.grad, kv_b.grad)
+    for got, want in zip(results["flashmla_tilelang"], results["tilelang"]):
+        torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)

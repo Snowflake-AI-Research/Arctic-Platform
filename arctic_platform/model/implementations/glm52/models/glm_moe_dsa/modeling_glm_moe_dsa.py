@@ -29,6 +29,8 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_g
     convert_tt_to_hf_moe,
 )
 from arctic_platform.model.implementations.glm52.models.fp8 import fp8_weight_block_size
+from arctic_platform.model.implementations.glm52.models.fp8 import dense_mlp_fp8_block_size
+from arctic_platform.model.implementations.glm52.models.fp8 import routed_expert_packed4
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import GlmMoeDsaAttention, SparseMlaAttentionArgs
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.glm52.models.layers.mlp import MLP, MLPConfig
@@ -38,7 +40,6 @@ from arctic_platform.model.implementations.glm52.models.layers.rotary_emb import
     RotaryEmbedding,
     RotaryEmbeddingConfig,
 )
-from arctic_platform.model.implementations.glm52.utils.cp import gather_for_cp, shard_for_cp
 
 
 def _sparse_mla_attention_args(config: GlmMoeDsaConfig, layer_idx: int) -> SparseMlaAttentionArgs:
@@ -72,6 +73,7 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
         self.skip_mlp = config.skip_mlp
         self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config, layer_idx))
 
+        packed4 = routed_expert_packed4(config)
         moe_args = MoEArgs(
             num_experts=config.n_routed_experts,
             num_shared_experts=config.n_shared_experts,
@@ -83,13 +85,15 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
             load_balance_coeff=1e-3,
             use_grouped_mm=config.use_grouped_mm,
             fp8_block_size=fp8_weight_block_size(config),
+            routed_packed4=None if packed4 is None else packed4[0],
+            routed_int4_group_size=128 if packed4 is None else packed4[1],
         )
         mlp_config = MLPConfig(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             gate_act=config.hidden_act,
             bias=False,
-            fp8_block_size=fp8_weight_block_size(config),
+            fp8_block_size=dense_mlp_fp8_block_size(config),
         )
 
         if layer_idx >= config.first_k_dense_replace:
@@ -109,18 +113,6 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
     def cp_enabled(self) -> bool:
         return hasattr(self, "_cp_group") and hasattr(self, "_cp_rank") and hasattr(self, "_cp_world_size")
 
-    def shard_to_cp(self, t: torch.Tensor) -> torch.Tensor:
-        if not self.cp_enabled:
-            return t
-
-        return shard_for_cp(t, self._cp_rank, self._cp_world_size)
-
-    def gather_for_cp(self, t: torch.Tensor) -> torch.Tensor:
-        if not self.cp_enabled:
-            return t
-
-        return gather_for_cp(t, self._cp_group)
-
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -134,15 +126,15 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
         if not self.skip_attention:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-            hidden_states = self.gather_for_cp(hidden_states)
+            # Context parallelism keeps queries local: attention gathers only the compressed keys.
             hidden_states, cached_indices = self.self_attn(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 ks=ks,
                 ke=ke,
                 cached_indices=cached_indices,
+                cp=(self._cp_group, self._cp_rank, self._cp_world_size) if self.cp_enabled else None,
             )
-            hidden_states = self.shard_to_cp(hidden_states)
             hidden_states = residual + hidden_states
 
         if not self.skip_mlp:

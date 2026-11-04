@@ -106,6 +106,10 @@ class MoEArgs:
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
+    routed_packed4: Literal["int4", "nvfp4"] | None = None
+    """Routed experts stored as frozen packed 4-bit codes (group-scaled INT4 or NVFP4), decoded to BF16 per grouped
+    GEMM; ``fp8_block_size`` then applies to the shared expert only. None keeps ``fp8_block_size`` for both."""
+    routed_int4_group_size: int = 128
     swiglu_limit: float | None = None
 
 
@@ -370,12 +374,22 @@ class GroupedExperts(nn.Module):
         use_grouped_mm: bool,
         fp8_block_size: int | None = None,
         swiglu_limit: float | None = None,
+        packed4: Literal["int4", "nvfp4"] | None = None,
+        int4_group_size: int = 128,
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.fp8_block_size = fp8_block_size
+        self.fp8_block_size = None if packed4 is not None else fp8_block_size
         # Set by MoE: BF16 experts weight each row from the down projection's FP32 accumulator.
         self.fp32_routed_weighting = False
+        self.packed4 = packed4
+        self.w4a8 = False
+        self.use_grouped_mm = use_grouped_mm
+        self.swiglu_limit = swiglu_limit
+        self.ep_comm_backend: EPCommBackend = "deepep"
+        if packed4 is not None:
+            self._init_packed4(dim, hidden_dim, num_experts, packed4, int4_group_size)
+            return
         if fp8_block_size is not None:
             self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim, dtype=torch.float8_e4m3fn))
             self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim, dtype=torch.float8_e4m3fn))
@@ -407,9 +421,73 @@ class GroupedExperts(nn.Module):
             self.register_parameter("w1_scale_inv", None)
             self.register_parameter("w2_scale_inv", None)
             self.register_parameter("w3_scale_inv", None)
-        self.use_grouped_mm = use_grouped_mm
-        self.swiglu_limit = swiglu_limit
-        self.ep_comm_backend: EPCommBackend = "deepep"
+
+    def _init_packed4(
+        self, dim: int, hidden_dim: int, num_experts: int, packed4: Literal["int4", "nvfp4"], group: int
+    ) -> None:
+        """Frozen ``[E, out, in // 2]`` byte stacks with their scales, as the converted checkpoint stores them.
+
+        INT4 (W4AFP8 checkpoints): int8 bytes, BF16 scales ``[E, out, in // group]``. NVFP4: uint8 bytes, E4M3 scales
+        ``[E, out, in // 16]`` (``w*_scale_inv``) and one FP32 scale per expert matrix (``w*_scale_2``, ``[E]``).
+        """
+        from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+
+        if packed4 == "nvfp4":
+            group = 16
+        if dim % group or hidden_dim % group:
+            raise ValueError(f"{packed4} experts need dim={dim} and hidden_dim={hidden_dim} divisible by {group}")
+        from arctic_platform.model.implementations.kernels.w4a8 import w4a8_experts_requested
+
+        # W4A8 forward (ARL_W4A8_EXPERTS): the checkpoint's static FP8 activation scales, one per expert matrix.
+        self.w4a8 = packed4 == "int4" and w4a8_experts_requested()
+        self._scales_interleaved = False
+        code_dtype = torch.int8 if packed4 == "int4" else torch.uint8
+        scale_dtype = torch.bfloat16 if packed4 == "int4" else torch.float8_e4m3fn
+        for name, (rows, cols) in (("w1", (hidden_dim, dim)), ("w2", (dim, hidden_dim)), ("w3", (hidden_dim, dim))):
+            self.register_parameter(
+                name, nn.Parameter(torch.empty(num_experts, rows, cols // 2, dtype=code_dtype), requires_grad=False)
+            )
+            self.register_parameter(
+                f"{name}_scale_inv",
+                nn.Parameter(torch.empty(num_experts, rows, cols // group, dtype=scale_dtype), requires_grad=False),
+            )
+            if packed4 == "nvfp4":
+                self.register_parameter(
+                    f"{name}_scale_2",
+                    mark_keep_fp32(nn.Parameter(torch.empty(num_experts, dtype=torch.float32), requires_grad=False)),
+                )
+            if self.w4a8:
+                self.register_parameter(
+                    f"{name}_input_scale",
+                    nn.Parameter(torch.empty(num_experts, dtype=torch.bfloat16), requires_grad=False),
+                )
+
+    def _w4a8_scales(self):
+        """Group scales in the W4A8 layout (rewritten in place on first use) and the per-tensor activation scales."""
+        from arctic_platform.model.implementations.fp8 import Int4InterleavedScales
+        from arctic_platform.model.implementations.kernels.packed4_dequant import interleave_int4_scales
+
+        from arctic_platform.model.implementations.kernels.w4a8 import SCALE_ALIGN
+
+        if not self._scales_interleaved:
+            for name in ("w1", "w2", "w3"):
+                param = getattr(self, f"{name}_scale_inv")
+                param.data = interleave_int4_scales(_maybe_to_local(param).data, SCALE_ALIGN).contiguous()
+            self._scales_interleaved = True
+        scales = tuple(
+            Int4InterleavedScales(_maybe_to_local(getattr(self, f"{n}_scale_inv")), SCALE_ALIGN) for n in ("w1", "w2", "w3")
+        )
+        inputs = {n: _maybe_to_local(getattr(self, f"{n}_input_scale")).float() for n in ("w1", "w2", "w3")}
+        # SGLang quantizes the gate/up input with the largest of the w1/w3 scales and the down input with w2's.
+        return scales, (torch.maximum(inputs["w1"].max(), inputs["w3"].max()).reshape(1), inputs["w2"].max().reshape(1))
+
+    def _packed4_scale(self, name: str):
+        from arctic_platform.model.implementations.fp8 import Nvfp4Scales
+
+        scale = _maybe_to_local(getattr(self, f"{name}_scale_inv"))
+        if self.packed4 == "nvfp4":
+            return Nvfp4Scales(scale, _maybe_to_local(getattr(self, f"{name}_scale_2")))
+        return scale
 
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
@@ -449,8 +527,12 @@ class GroupedExperts(nn.Module):
         scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ab: dict,
         scores: torch.Tensor | None = None,
+        act_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Block-FP8 experts decoded to BF16 for each grouped GEMM (W8A16), plus grouped expert LoRA.
+
+        With ``act_scales`` (gate/up and down per-tensor E4M3 scales; INT4 experts with interleaved scales) the
+        forward GEMMs run W4A8 instead, and the backward decodes as before.
 
         One routed-token count serves every projection; tokens need no per-expert padding and
         activations are not quantized. Routing ``scores`` without down-projection LoRA are folded into
@@ -468,9 +550,16 @@ class GroupedExperts(nn.Module):
         block_size = cast(int, self.fp8_block_size)
         projections = dict(zip(("w1", "w2", "w3"), zip(weights, scales)))
 
+        from arctic_platform.model.implementations.fp8 import grouped_w4a8_mm
+
+        def mm(inputs, weight, scale, act_scale):
+            if act_scales is None:
+                return grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
+            return grouped_w4a8_mm(inputs, weight, scale, offsets, rows, act_scale)
+
         def project(inputs: torch.Tensor, name: str) -> torch.Tensor:
             weight, scale = projections[name]
-            out = grouped_fp8_decoded_mm(inputs, weight, scale, offsets, rows, block_size)
+            out = mm(inputs, weight, scale, None if act_scales is None else act_scales[name == "w2"])
             if name in ab:
                 # In place on the routed rows: the decoded GEMM saves nothing it returns.
                 out = _add_into_rows(out, grouped_expert_lora_rows(inputs, ab[name], offsets, rows), rows)
@@ -478,12 +567,22 @@ class GroupedExperts(nn.Module):
 
         if scores is not None and "w2" not in ab:
             (w1, s1), (w2, s2), (w3, s3) = projections["w1"], projections["w2"], projections["w3"]
-            gate_up = grouped_fp8_decoded_mm(x, (w1, w3), (s1, s3), offsets, rows, block_size)
+            gate_up = mm(x, (w1, w3), (s1, s3), None if act_scales is None else act_scales[0])
             hidden = w1.shape[-2]
             for name, cols in (("w1", slice(0, hidden)), ("w3", slice(hidden, 2 * hidden))):
                 if name in ab:
                     gate_up = _add_into_rows(gate_up, grouped_expert_lora_rows(x, ab[name], offsets, rows), rows, cols)
-            return scored_swiglu_down(gate_up, scores, w2, s2, offsets, rows, block_size, self.swiglu_limit)
+            return scored_swiglu_down(
+                gate_up,
+                scores,
+                w2,
+                s2,
+                offsets,
+                rows,
+                block_size,
+                self.swiglu_limit,
+                act_scale=None if act_scales is None else act_scales[1],
+            )
         gate, up = project(x, "w1"), project(x, "w3")
         out = project(fused_swiglu(gate, up, self.swiglu_limit), "w2")
         return out if scores is None else apply_routing_weights(out, scores)
@@ -494,10 +593,32 @@ class GroupedExperts(nn.Module):
         # The grouped block-FP8 paths take the routing weights, to fold them into the down projection where they can,
         # and so do BF16 experts with fp32_routed_weighting; the other paths scale their outputs here.
         folds_scores = self.fp32_routed_weighting or (
-            self.fp8_block_size is not None and self.use_grouped_mm and x.is_cuda
+            (self.fp8_block_size is not None or self.packed4 is not None) and self.use_grouped_mm and x.is_cuda
         )
         if scores is not None and not folds_scores:
             return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
+        if self.packed4 is not None:
+            if not (self.use_grouped_mm and x.is_cuda):
+                raise NotImplementedError(f"{self.packed4} routed experts run as CUDA grouped GEMMs (moe.grouped_mm)")
+            for name in ("w1", "w2", "w3"):
+                parametrizations = getattr(self, "parametrizations", None)
+                if parametrizations is not None and name in parametrizations:
+                    raise NotImplementedError(f"{self.packed4} experts take unfused expert LoRA, not a fused {name} delta")
+            weights = tuple(_maybe_to_local(getattr(self, name)) for name in ("w1", "w2", "w3"))
+            ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
+            act_scales = None
+            if self.w4a8:
+                scales, act_scales = self._w4a8_scales()
+            else:
+                scales = tuple(self._packed4_scale(name) for name in ("w1", "w2", "w3"))
+            call = getattr(self, "_arl_ultraep_call", None)
+            if call is not None:
+                # UltraEP's spare slots: the call's experts are the native ones and this rank's copies (L + S slots).
+                scalars = {}
+                if self.packed4 == "nvfp4":
+                    scalars = {f"{n}_scale_2": _maybe_to_local(getattr(self, f"{n}_scale_2")) for n in ("w1", "w2", "w3")}
+                weights, scales, ab, _ = call.extend(self, weights, scales, ab, scalars)
+            return self._forward_fp8_decoded(x, num_tokens_per_expert, weights, scales, ab, scores, act_scales)
         if self.fp8_block_size is not None:
             from arctic_platform.model.implementations.fp8 import fp8_linear_with_expert_lora
             from arctic_platform.model.implementations.fp8 import grouped_fp8_mm
@@ -515,7 +636,12 @@ class GroupedExperts(nn.Module):
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
-                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab, scores)
+                weights, scales = (w1, w2, w3), (s1, s2, s3)
+                call = getattr(self, "_arl_ultraep_call", None)
+                if call is not None:
+                    # UltraEP's spare slots, as for packed experts: native experts then this rank's copies.
+                    weights, scales, ab, _ = call.extend(self, weights, scales, ab, {})
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, weights, scales, ab, scores)
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
@@ -592,7 +718,7 @@ class GroupedExperts(nn.Module):
         return self._forward_deepep(x, num_tokens_per_expert, scores)
 
     def init_weights(self, init_std: float):
-        if self.fp8_block_size is not None:
+        if self.fp8_block_size is not None or self.packed4 is not None:
             return
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=init_std)
@@ -759,6 +885,8 @@ class MoE(nn.Module):
             use_grouped_mm=moe_args.use_grouped_mm,
             fp8_block_size=moe_args.fp8_block_size,
             swiglu_limit=moe_args.swiglu_limit,
+            packed4=moe_args.routed_packed4,
+            int4_group_size=moe_args.routed_int4_group_size,
         )
         self.ep_comm_backend: EPCommBackend = "deepep"
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
@@ -875,6 +1003,13 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        num_experts = experts.num_experts
+        plan = self._ultraep_plan(experts, group, selected_experts_indices)
+        if plan is not None:
+            # Tokens go to physical slots (native experts and this call's spares); the experts fetch the spares.
+            selected_experts_indices = plan.remap(selected_experts_indices)
+            num_experts = plan.num_slots
+            experts._arl_ultraep_call = plan
         # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
         # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
         use_sonic = (
@@ -895,7 +1030,7 @@ class MoE(nn.Module):
                 x[start:end],
                 selected_experts_indices[start:end],
                 top_scores[start:end],
-                num_experts=experts.num_experts,
+                num_experts=num_experts,
                 group=group,
                 score_before_experts=self.score_before_experts,
             )
@@ -941,6 +1076,7 @@ class MoE(nn.Module):
             pending_state = next_pending_state
 
         routed_outputs.append(run_pending_chunk(pending_state))
+        experts._arl_ultraep_call = None
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -948,6 +1084,22 @@ class MoE(nn.Module):
         # Dummy padding chunks append their rows after the real tokens; drop them.
         routed_output = routed_output[: x.shape[0]]
         return routed_output if shared_output is None else shared_output + routed_output
+
+    def _ultraep_plan(self, experts: nn.Module, group, selected_experts_indices: torch.Tensor):
+        """UltraEP's plan for this call (``moe/ultraep_packed4.py``) with ``ARL_ULTRAEP_SPARES`` on frozen quantized
+        experts (packed 4-bit or block FP8), else None. A recompute reuses its forward's placement and physical routes."""
+        from ..ultraep_packed4 import packed4_ultraep_plan
+        from ..ultraep_packed4 import ultraep_spares
+
+        frozen_quantized = getattr(experts, "packed4", None) is not None or getattr(experts, "fp8_block_size", None) is not None
+        if not ultraep_spares() or not frozen_quantized or group is None:
+            return None
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        _install_recompute_detector()
+        ab = getattr(experts, "_ap_lora_ab", getattr(experts, "_dss_lora_ab", {}))
+        return packed4_ultraep_plan(self, experts, group, selected_experts_indices, ab, building=not _in_recompute())
 
     def forward(
         self,

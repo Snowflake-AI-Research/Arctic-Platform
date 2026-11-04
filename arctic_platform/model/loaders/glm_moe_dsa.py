@@ -27,6 +27,7 @@ from typing_extensions import Self
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -49,7 +50,7 @@ class GlmMoeDsaDebugOptions(BaseModel):
     full_determinism: bool = False
 
 
-class GlmMoeDsaOptions(BaseModel):
+class GlmMoeDsaOptions(MoeRuntimeOptions):
     """Validated ``loader_options`` for GLM-5.2/5.3 MoE models."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -57,7 +58,7 @@ class GlmMoeDsaOptions(BaseModel):
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = True
     ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
-    sparse_mla_backend: Literal["flashmla", "ref", "tilelang", "dense"] = "ref"
+    sparse_mla_backend: Literal["auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense"] = "auto"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
@@ -90,8 +91,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_2"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("glm_moe_dsa dtype must be 'bfloat16' or 'float32'")
-    if spec.parallelism.sequence_parallel > 1:
-        raise ValueError("glm_moe_dsa does not support sequence parallelism")
     if spec.patches.liger:
         raise ValueError(
             "the glm_moe_dsa loader does not support the liger patch; "

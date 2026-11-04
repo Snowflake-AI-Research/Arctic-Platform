@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from typing import Any
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -76,7 +77,7 @@ def _remark_keep_fp32(model) -> int:
     for name, param in model.named_parameters():
         if param.dtype != torch.float32:
             continue
-        if name.endswith("_scale_inv") or (family_keeps is not None and family_keeps(name)):
+        if name.endswith(("_scale_inv", "_scale_2")) or (family_keeps is not None and family_keeps(name)):
             mark_keep_fp32(param)
             marked += 1
     return marked
@@ -341,24 +342,76 @@ def _decode_workspace(shape: tuple[int, ...], device: torch.device) -> Tensor:
     return buffer[:numel].view(shape)
 
 
-def _decode_fp8_to_bf16(
-    weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
-) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM on the current stream.
+class Nvfp4Scales:
+    """The two NVFP4 scales of one matrix or expert stack: E4M3 per 16 inputs and FP32 per matrix (``[E]``)."""
 
-    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack. CUDA
-    decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
+    __slots__ = ("block", "per_matrix")
+
+    def __init__(self, block: Tensor, per_matrix: Tensor) -> None:
+        self.block = block
+        self.per_matrix = per_matrix
+
+
+class Int4InterleavedScales:
+    """BF16 INT4 group scales of an expert stack in the W4A8 kernel's ``[E, groups // align, out * align]`` layout."""
+
+    __slots__ = ("scale", "align")
+
+    def __init__(self, scale: Tensor, align: int) -> None:
+        self.scale = scale
+        self.align = align
+
+
+PACKED_4BIT_DTYPES = (torch.int8, torch.uint8)
+
+
+def is_packed_4bit(weight: Tensor) -> bool:
+    """Frozen 4-bit codes, two per byte along the input dimension: INT4 (int8 bytes) or NVFP4 (uint8 bytes)."""
+    return weight.dtype in PACKED_4BIT_DTYPES
+
+
+def logical_cols(weight: Tensor) -> int:
+    """Input features of a frozen weight: twice the stored columns for packed 4-bit codes."""
+    return weight.shape[-1] * 2 if is_packed_4bit(weight) else weight.shape[-1]
+
+
+def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tensor, out_row: int) -> None:
+    if weight.dtype == torch.float8_e4m3fn:
+        from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
+
+        dequantize_fp8_blocks(weight, scale, cast(int, block_size), out=out, out_row=out_row)
+    elif weight.dtype == torch.int8:
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups
+
+        if isinstance(scale, Int4InterleavedScales):
+            dequantize_int4_groups(weight, scale.scale, out=out, out_row=out_row, interleaved=scale.align)
+        else:
+            dequantize_int4_groups(weight, scale, out=out, out_row=out_row)
+    elif weight.dtype == torch.uint8:
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_nvfp4
+
+        if not isinstance(scale, Nvfp4Scales):
+            raise TypeError(f"NVFP4 weights decode with Nvfp4Scales, got {type(scale).__name__}")
+        dequantize_nvfp4(weight, scale.block, scale.per_matrix, out=out, out_row=out_row)
+    else:
+        raise TypeError(f"no BF16 decode for frozen {weight.dtype} weights")
+
+
+def _decode_fp8_to_bf16(weight: Tensor | tuple[Tensor, ...], scale, block_size: int | None) -> Tensor:
+    """BF16 copy of a CUDA quantized matrix or expert stack, for one GEMM on the current stream.
+
+    Block FP8 (``block_size`` x ``block_size`` FP32 scales), group-scaled INT4 or NVFP4 (``Nvfp4Scales``), chosen by
+    the weight's dtype. Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one
+    stack. CUDA decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
     """
-    from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
-
     stacks = weight if isinstance(weight, tuple) else (weight,)
     scales = scale if isinstance(scale, tuple) else (scale,)
     first = stacks[0]
     rows = sum(w.shape[-2] for w in stacks)
-    out = _decode_workspace((*first.shape[:-2], rows, first.shape[-1]), first.device)
+    out = _decode_workspace((*first.shape[:-2], rows, logical_cols(first)), first.device)
     row = 0
     for w, sc in zip(stacks, scales):
-        dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
+        _decode_stack_into(w, sc, block_size, out, row)
         row += w.shape[-2]
     return out
 
@@ -603,6 +656,74 @@ class _GroupedBlockFp8MmFn(torch.autograd.Function):
         return dx.to(dtype=grad_output.dtype).view(*ctx.x_shape), None, None, None, None
 
 
+def _frozen_leaves(weight, scale) -> tuple[list[Tensor], Any]:
+    """The tensors of a frozen ``(weight, scale)`` pair (tuples of stacks, ``Int4InterleavedScales``, ``Nvfp4Scales``),
+    with a function that rebuilds the pair from them."""
+    weights = weight if isinstance(weight, tuple) else (weight,)
+    scales = scale if isinstance(scale, tuple) else (scale,)
+    leaves: list[Tensor] = list(weights)
+    specs: list[tuple[str, int | None]] = []
+    for sc in scales:
+        if isinstance(sc, Nvfp4Scales):
+            leaves += [sc.block, sc.per_matrix]
+            specs.append(("nvfp4", None))
+        elif isinstance(sc, Int4InterleavedScales):
+            leaves.append(sc.scale)
+            specs.append(("int4", sc.align))
+        elif sc is None:
+            specs.append(("none", None))
+        else:
+            leaves.append(sc)
+            specs.append(("tensor", None))
+
+    # The closure keeps only the structure: holding the tensors would keep them alive with the autograd graph.
+    n_weights, weight_tuple, scale_tuple = len(weights), isinstance(weight, tuple), isinstance(scale, tuple)
+
+    def rebuild(tensors):
+        it = iter(tensors)
+        ws = tuple(next(it) for _ in range(n_weights))
+        ss = []
+        for kind, arg in specs:
+            if kind == "nvfp4":
+                ss.append(Nvfp4Scales(next(it), next(it)))
+            elif kind == "int4":
+                ss.append(Int4InterleavedScales(next(it), arg))
+            elif kind == "none":
+                ss.append(None)
+            else:
+                ss.append(next(it))
+        return (ws if weight_tuple else ws[0]), (tuple(ss) if scale_tuple else ss[0])
+
+    return leaves, rebuild
+
+
+def stash_frozen(ctx, weight, scale) -> list[Tensor]:
+    """Keep a GEMM's frozen ``(weight, scale)`` for its backward; returns the tensors to add to ``save_for_backward``.
+
+    Parameters ride on ``ctx``: they live anyway, and activation offload must not copy them. Anything else (UltraEP's
+    per-call native + spare stacks, ``frozen_offload``'s per-call copies) goes through ``save_for_backward``, so
+    activation checkpointing frees it after the forward instead of every layer's graph holding its stacks until
+    backward.
+    """
+    leaves, rebuild = _frozen_leaves(weight, scale)
+    # A transient parameter (frozen_offload's per-call copy) is per-call data like the UltraEP stacks.
+    if all(isinstance(t, nn.Parameter) and not getattr(t, "_ap_transient", False) for t in leaves):
+        ctx.weights = (weight, scale)
+        ctx.frozen_rebuild = None
+        return []
+    ctx.frozen_rebuild = rebuild
+    ctx.frozen_count = len(leaves)
+    return leaves
+
+
+def unstash_frozen(ctx, saved: tuple) -> tuple[tuple, tuple]:
+    """``((weight, scale), the other saved tensors)`` for a ``stash_frozen`` backward."""
+    if ctx.frozen_rebuild is None:
+        return ctx.weights, tuple(saved)
+    n = ctx.frozen_count
+    return ctx.frozen_rebuild(saved[len(saved) - n :]), tuple(saved[: len(saved) - n])
+
+
 class _GroupedDecodedFp8MmFn(torch.autograd.Function):
     """Grouped ``x_e @ W_e.T`` against block-FP8 experts decoded to BF16; gradients flow to ``x``.
 
@@ -613,11 +734,9 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, block_size: int) -> Tensor:
-        # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
-        ctx.weights = (weight, scale)
         ctx.rows = rows
         ctx.block_size = block_size
-        ctx.save_for_backward(offsets)
+        ctx.save_for_backward(offsets, *stash_frozen(ctx, weight, scale))
         decoded = _decode_fp8_to_bf16(weight, scale, block_size)
         out = torch._grouped_mm(x.bfloat16(), decoded.transpose(-2, -1), offs=offsets)
         if rows < out.shape[0]:
@@ -626,13 +745,60 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        (offsets,) = ctx.saved_tensors
-        weight, scale = ctx.weights
+        (weight, scale), (offsets,) = unstash_frozen(ctx, ctx.saved_tensors)
         decoded = _decode_fp8_to_bf16(weight, scale, ctx.block_size)
         dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
         if ctx.rows < dx.shape[0]:
             dx[ctx.rows :].zero_()
         return dx.type_as(grad_output), None, None, None, None, None
+
+
+class _GroupedW4A8MmFn(torch.autograd.Function):
+    """Grouped ``x_e @ W_e.T`` for INT4 experts: W4A8 (FP8 activations) forward, decoded BF16 input gradient.
+
+    Like ``_GroupedDecodedFp8MmFn``, tuples of stacks sharing ``x`` give their outputs side by side; the backward is
+    the straight-through gradient of the activation quantization, ``dY_e @ dequant(W_e)``.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, act_scale: Tensor) -> Tensor:
+        from arctic_platform.model.implementations.kernels.w4a8 import quantize_fp8_per_tensor
+        from arctic_platform.model.implementations.kernels.w4a8 import w4a8_grouped_mm_into
+
+        ctx.rows = rows
+        ctx.save_for_backward(offsets, *stash_frozen(ctx, weight, scale))
+        stacks = weight if isinstance(weight, tuple) else (weight,)
+        scales = scale if isinstance(scale, tuple) else (scale,)
+        out = torch.empty(x.shape[0], sum(w.shape[-2] for w in stacks), dtype=torch.bfloat16, device=x.device)
+        x_fp8 = quantize_fp8_per_tensor(x[:rows], act_scale)
+        col = 0
+        for w, sc in zip(stacks, scales):
+            w4a8_grouped_mm_into(out[:rows, col : col + w.shape[-2]], x_fp8, w, sc.scale, offsets, act_scale)
+            col += w.shape[-2]
+        if rows < out.shape[0]:
+            out[rows:].zero_()
+        return out.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (weight, scale), (offsets,) = unstash_frozen(ctx, ctx.saved_tensors)
+        decoded = _decode_fp8_to_bf16(weight, scale, None)
+        dx = torch._grouped_mm(grad_output.contiguous().bfloat16(), decoded, offs=offsets)
+        if ctx.rows < dx.shape[0]:
+            dx[ctx.rows :].zero_()
+        return dx.type_as(grad_output), None, None, None, None, None
+
+
+def grouped_w4a8_mm(
+    x: Tensor,
+    weight: Tensor | tuple[Tensor, ...],
+    scale: Int4InterleavedScales | tuple[Int4InterleavedScales, ...],
+    offsets: Tensor,
+    rows: int,
+    act_scale: Tensor,
+) -> Tensor:
+    """``grouped_fp8_decoded_mm`` for INT4 experts through the W4A8 kernel (``kernels/w4a8``)."""
+    return _GroupedW4A8MmFn.apply(x, weight, scale, offsets, rows, act_scale)
 
 
 def grouped_fp8_decoded_mm(
@@ -673,17 +839,61 @@ def grouped_fp8_mm(
     return _GroupedBlockFp8MmFn.apply(x, weight, scale, num_tokens_per_expert, block_size)
 
 
-def fp8_weight_block_size(config: Any) -> int | None:
-    """Return the HF block size when ``config`` is a finegrained FP8 checkpoint."""
+def _quantization_config(config: Any) -> dict:
     qc = getattr(config, "quantization_config", None)
     if qc is None:
-        return None
+        return {}
     if not isinstance(qc, dict):
         qc = getattr(qc, "to_dict", lambda: {})()
+    return qc
+
+
+def fp8_weight_block_size(config: Any) -> int | None:
+    """Return the HF block size when ``config`` is a finegrained FP8 checkpoint.
+
+    W4AFP8 checkpoints (SGLang's ``w4afp8``: INT4 routed experts) keep every other quantized layer in the FP8
+    release's 128 x 128 blocks, so they report that block size for those layers.
+    """
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "w4afp8":
+        return 128
     if qc.get("quant_method") != "fp8":
         return None
     weight_block_size = qc.get("weight_block_size") or [128, 128]
     return int(weight_block_size[0])
+
+
+def dense_mlp_fp8_block_size(config: Any) -> int | None:
+    """Block size of the dense MLP layers: ``fp8_weight_block_size``, or 128 when a ModelOpt checkpoint stores them in
+    per-tensor FP8 (the conversion repeats that scale per 128 x 128 block)."""
+    block = fp8_weight_block_size(config)
+    if block is not None:
+        return block
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "modelopt":
+        layers = qc.get("quantized_layers") or {}
+        if any(
+            name.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")) and spec.get("quant_algo") == "FP8"
+            for name, spec in layers.items()
+        ):
+            return 128
+    return None
+
+
+def routed_expert_packed4(config: Any) -> tuple[str, int] | None:
+    """``("int4", group)`` or ``("nvfp4", 16)`` when the checkpoint stores routed experts as packed 4-bit codes.
+
+    INT4: SGLang's ``w4afp8`` (int8 bytes, BF16 scales per ``group_size`` inputs). NVFP4: a ModelOpt
+    ``MIXED_PRECISION`` checkpoint whose ``mlp.experts`` layers are ``NVFP4``.
+    """
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "w4afp8":
+        return "int4", int(qc.get("group_size", 128))
+    if qc.get("quant_method") == "modelopt":
+        layers = qc.get("quantized_layers") or {}
+        if any(name.endswith("mlp.experts") and spec.get("quant_algo") == "NVFP4" for name, spec in layers.items()):
+            return "nvfp4", 16
+    return None
 
 
 def quantize_to_fp8_blockwise(weight: Tensor, block_size: int = 128) -> tuple[Tensor, Tensor]:

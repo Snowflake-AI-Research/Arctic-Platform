@@ -1,0 +1,13 @@
+The CUDA sources under csrc/ are ported from SGLang's sgl-kernel
+(https://github.com/sgl-project/sglang, python/sglang/kernels/aot/csrc at commit
+efdcb420c75e7014bc9148b085a8fcdd3154e7e1), licensed under the Apache License, Version 2.0:
+
+- csrc/w4a8_grouped_mm_c3x.cuh, csrc/w4a8_get_group_starts.cuh (moe/cutlass_moe/w4a8/): the grouped
+  INT4 x FP8 GEMM caller and its per-expert pointer setup. Arctic Platform changes: the output pointers
+  use the output's row stride, so two GEMMs can write side by side into one buffer.
+- csrc/cutlass_extensions/ (cutlass_extensions/): the SM90 mixed-input ptr-array collective, itself
+  derived from NVIDIA TensorRT-LLM and CUTLASS (Copyright NVIDIA CORPORATION, Apache-2.0).
+- csrc/w4a8_moe_mm.cu replaces SGLang's scaled_mm_entry.cu and w4a8_grouped_mm_c3x.cu dispatch with a
+  caller-chosen tile configuration and a pybind11 entry point.
+
+They compile against CUTLASS 4.2 (SGLang pins NVIDIA/cutlass 57e3cfb47a2d9e0d46eb6335c3dc411498efa198).

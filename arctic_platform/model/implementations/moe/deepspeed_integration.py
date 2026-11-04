@@ -372,6 +372,10 @@ def load_moe_model(
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from .runtime_options import apply_moe_runtime_options
+
+    # Before the model is built: offload, sharding, W4A8 and UltraEP read these settings while it is built and run.
+    apply_moe_runtime_options(options)
     world_size = dist.get_world_size()
     if world_size % ep_size:
         raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")

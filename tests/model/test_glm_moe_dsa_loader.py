@@ -133,16 +133,18 @@ def test_quack_fused_cross_entropy_is_supported():
         GlmMoeDsaOptions(fused_cross_entropy="quack", fp32_lm_head=True)
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"dtype": "float16"},
-        {"parallelism": ParallelismConfig(expert_parallel=2, sequence_parallel=2)},
-    ],
-)
-def test_spec_cannot_silently_ignore_settings(kwargs):
+def test_spec_cannot_silently_ignore_settings():
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
+        ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", dtype="float16")
+
+
+def test_spec_accepts_sequence_parallelism():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="glm_moe_dsa",
+        parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
+    )
+    assert spec.parallelism.sequence_parallel == 2
 
 
 def test_spec_accepts_peft():
