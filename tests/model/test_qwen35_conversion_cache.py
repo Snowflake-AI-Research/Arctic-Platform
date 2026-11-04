@@ -804,3 +804,112 @@ def test_cleanup_preserves_live_workspace_and_removes_only_abandoned_workspaces(
     assert not old.exists()
     assert live.exists()
     assert recent.exists()
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+@pytest.mark.parametrize("scope", ["shared", "node-local"])
+def test_production_loading_propagates_fresh_attempt_and_early_failure(monkeypatch, tmp_path, family, scope):
+    import importlib
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+
+    class Model:
+        def to_empty(self, *, device):
+            return self
+
+        def state_dict(self):
+            return {"prime": None}
+
+        def is_hf_state_dict(self, state):
+            return "hf" in state
+
+        def is_prime_state_dict(self, state):
+            return "prime" in state
+
+        def convert_to_prime(self, state):
+            return state
+
+    rank, tokens, events = [0], [], []
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        events.append(("broadcast", rank[0]))
+        if rank[0] == 0:
+            tokens.append(message[0])
+        else:
+            message[0] = tokens[0]
+
+    def keys(path):
+        events.append(("keys", rank[0]))
+        if rank[0] == 0:
+            raise ValueError("checkpoint discovery failed")
+        return ["hf"]
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", Model)
+    monkeypatch.setattr(builder, "load_state_dict_keys", keys)
+    monkeypatch.setattr(
+        builder,
+        "get_world",
+        lambda: SimpleNamespace(rank=rank[0], local_rank=rank[0], is_master=rank[0] == 0),
+    )
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: tmp_path / "prime")
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: scope == "node-local")
+    config = SimpleNamespace(
+        name=str(tmp_path),
+        fsdp_cpu_offload=True,
+        debug=SimpleNamespace(random_init=False),
+        dequantize_checkpoint=False,
+        weight_conversion_cache_dir=str(tmp_path),
+    )
+    with pytest.raises(ValueError, match="checkpoint discovery failed"):
+        builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+    assert events[:2] == [("broadcast", 0), ("keys", 0)]
+    assert cache._ACTIVE_ATTEMPT.get() is None
+    rank[0] = 1
+    if scope == "shared":
+        with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
+            builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+    else:
+        cache._write_cache_marker(tmp_path / "prime.failed", dict(attempt_id=tokens[0], error="conversion failed"))
+        with pytest.raises(RuntimeError, match="conversion failed"):
+            builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+    assert tokens and len([event for event in events if event[0] == "broadcast"]) == 2
+    assert cache._ACTIVE_ATTEMPT.get() is None
+
+
+def test_abandoned_conversion_sweep_removes_stale_owner_and_destination_artifacts(tmp_path):
+    import os
+    import time
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    old = tmp_path / "prime.tmp-rank0-pid123-old"
+    old.mkdir()
+    owner = old.with_name(f"{old.name}.owner")
+    owner.touch()
+    orphan = tmp_path / "prime.tmp-rank0-pid123-orphan.owner"
+    orphan.touch()
+    stale = tmp_path / "prime.stale-old"
+    stale.mkdir()
+    recent = tmp_path / "prime.stale-recent"
+    recent.mkdir()
+    timestamp = time.time() - 61
+    for artifact in (owner, orphan, stale):
+        os.utime(artifact, (timestamp, timestamp))
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert not old.exists()
+    assert not owner.exists()
+    assert not orphan.exists()
+    assert not stale.exists()
+    assert recent.exists()

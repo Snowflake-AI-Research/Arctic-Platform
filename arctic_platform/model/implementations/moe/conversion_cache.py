@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
 from pathlib import Path
@@ -21,7 +22,8 @@ WEIGHT_CONVERSION_CACHE_SCOPE_ENV = "DSS_WEIGHT_CONVERSION_CACHE_SCOPE"
 WEIGHT_CONVERSION_ATTEMPT_ID_ENV = "DSS_WEIGHT_CONVERSION_ATTEMPT_ID"
 DEFAULT_WEIGHT_CONVERSION_CACHE_DIR = "/data-fast/prime-rl-weight-cache"
 _CACHE_HEARTBEAT_INTERVAL = 1
-_ABANDONED_CACHE_AGE = 24 * 3600
+_ABANDONED_CACHE_AGE = 60
+_ACTIVE_ATTEMPT = ContextVar("weight_conversion_attempt", default=None)
 
 
 def _preparation_marker_path(attempt_id: str, cache_root=None) -> Path:
@@ -35,28 +37,38 @@ def record_conversion_preparation_failure(function):
 
     @wraps(function)
     def wrapped(*args, **kwargs):
-        attempt = os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV)
-        arguments = parameters.bind_partial(*args, **kwargs).arguments
-        rank = arguments.get("rank")
-        if rank is None:
-            import torch.distributed as dist
-
-            rank = dist.get_rank() if dist.is_initialized() else 0
-        if not attempt or rank != 0:
+        if _ACTIVE_ATTEMPT.get() is not None:
             return function(*args, **kwargs)
-        config = arguments.get("config", arguments.get("options"))
-        marker = _preparation_marker_path(attempt, getattr(config, "weight_conversion_cache_dir", None))
+        # All ranks agree before checkpoint inspection, model setup or source download can fail.
+        attempt, fresh_attempt = conversion_cache_attempt_id()
+        context = _ACTIVE_ATTEMPT.set((attempt, fresh_attempt))
+        marker = None
         try:
-            marker.with_suffix(".failed").unlink(missing_ok=True)
-            return function(*args, **kwargs)
+            arguments = parameters.bind_partial(*args, **kwargs).arguments
+            rank = arguments.get("rank")
+            if rank is None:
+                import torch.distributed as dist
+
+                rank = dist.get_rank() if dist.is_initialized() else 0
+            config = arguments.get("config", arguments.get("options"))
+            if attempt and rank == 0:
+                marker = _preparation_marker_path(attempt, getattr(config, "weight_conversion_cache_dir", None))
+            if marker is not None:
+                marker.with_suffix(".failed").unlink(missing_ok=True)
+            result = function(*args, **kwargs)
+            if marker is not None:
+                marker.with_suffix(".failed").unlink(missing_ok=True)
+            return result
         except BaseException as error:
-            try:
-                path = marker
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _write_cache_marker(path.with_suffix(".failed"), dict(attempt_id=attempt, error=str(error)))
-            except Exception:
-                logger.warning("Could not record weight preparation failure", exc_info=True)
+            if marker is not None:
+                try:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    _write_cache_marker(marker.with_suffix(".failed"), dict(attempt_id=attempt, error=str(error)))
+                except Exception:
+                    logger.warning("Could not record weight preparation failure", exc_info=True)
             raise
+        finally:
+            _ACTIVE_ATTEMPT.reset(context)
 
     return wrapped
 
@@ -88,6 +100,18 @@ def _cleanup_abandoned_conversion_workspaces(path: Path) -> None:
                 owner.unlink(missing_ok=True)
         except OSError:
             logger.info("Could not clean abandoned conversion workspace %s", workspace, exc_info=True)
+    for artifact in (
+        *path.parent.glob(f"{path.name}.tmp-rank*-pid*-*.owner"),
+        *path.parent.glob(f"{path.name}.stale-*"),
+    ):
+        try:
+            if now - artifact.stat().st_mtime > _ABANDONED_CACHE_AGE:
+                if artifact.is_dir():
+                    shutil.rmtree(artifact)
+                elif not artifact.with_suffix("").exists():
+                    artifact.unlink(missing_ok=True)
+        except OSError:
+            logger.info("Could not clean abandoned conversion artifact %s", artifact, exc_info=True)
 
 
 def get_checkpoint_converter(model, fmt: str) -> Callable[[Path, Path], None] | None:
@@ -178,11 +202,14 @@ def _write_cache_marker(path: Path, marker: dict) -> None:
             logger.info("Could not remove temporary conversion marker %s", temporary, exc_info=True)
 
 
-def conversion_cache_attempt_id(*, shared: bool = False) -> str | None:
+def conversion_cache_attempt_id(*, shared: bool = False) -> tuple[str | None, bool]:
     """Use the launcher's retry identity, or agree on one for a distributed load."""
+    active = _ACTIVE_ATTEMPT.get()
+    if active is not None and active[0] is not None:
+        return active
     token = os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV)
     if token:
-        return token
+        return token, False
     import torch.distributed as dist
 
     if not dist.is_initialized():
@@ -191,17 +218,17 @@ def conversion_cache_attempt_id(*, shared: bool = False) -> str | None:
                 f"Standalone shared-cache preparation requires a common {WEIGHT_CONVERSION_ATTEMPT_ID_ENV} "
                 "on every process; choose a new value for each retry"
             )
-        return None
+        return None, False
     tokens = [uuid.uuid4().hex if dist.get_rank() == 0 else None]
     dist.broadcast_object_list(tokens, src=0)
-    return tokens[0]
+    return tokens[0], True
 
 
 def wait_for_conversion_cache(
     path: Path,
     *,
     timeout: float | None = None,
-    poll_interval: float = 0.25,
+    poll_interval: float = 1,
     writer_idle_timeout: float = 120,
     attempt_id: str | None = None,
     writer_start_timeout: float | None = None,
@@ -315,6 +342,9 @@ def _write_conversion_cache(
                 return
             if not snapshot_path.exists():
                 raise
+            if conversion_cache_ready(snapshot_path):
+                shutil.rmtree(tmp_path)
+                return
             stale = snapshot_path.with_name(f"{snapshot_path.name}.stale-{uuid.uuid4().hex}")
             try:
                 os.rename(snapshot_path, stale)
@@ -467,10 +497,6 @@ def ensure_node_local_conversion_cache(
                 failure_recorded = True
                 raise RuntimeError(f"Converted weight cache writer failed for {snapshot_path}: {failure.get('error')}")
             failure_path.unlink(missing_ok=True)
-            if attempt_id is not None:
-                _preparation_marker_path(attempt_id, snapshot_path.parent.parent).with_suffix(".failed").unlink(
-                    missing_ok=True
-                )
             _cleanup_abandoned_conversion_workspaces(snapshot_path)
             stop = threading.Event()
             thread = None

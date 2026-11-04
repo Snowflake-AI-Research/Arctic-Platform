@@ -299,7 +299,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
-            attempt_id = conversion_cache_attempt_id(shared=not node_local_cache)
+            attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local_cache)
             stream_convert_fn = get_checkpoint_converter(model, fmt)
             if node_local_cache:
                 ensure_node_local_conversion_cache(
@@ -315,6 +315,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     stream_convert_fn=stream_convert_fn,
                     attempt_id=attempt_id,
                     node_local=True,
+                    fresh_attempt=fresh_attempt,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 ensure_node_local_conversion_cache(
@@ -330,9 +331,15 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     stream_convert_fn=stream_convert_fn,
                     attempt_id=attempt_id,
                     node_local=False,
+                    fresh_attempt=fresh_attempt,
                 )
             elif not conversion_cache_ready(snapshot_path):
-                wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)
+                wait_for_conversion_cache(
+                    snapshot_path,
+                    attempt_id=attempt_id,
+                    fresh_attempt=fresh_attempt,
+                    preparation_root=getattr(config, "weight_conversion_cache_dir", None),
+                )
 
     torch.distributed.barrier()
     if conversion is not None and not conversion_cache_ready(snapshot_path):
