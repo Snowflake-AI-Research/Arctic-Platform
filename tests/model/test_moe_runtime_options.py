@@ -393,4 +393,3 @@ def test_every_moe_loader_refuses_deepep_v2_recompute_without_the_replay(options
     assert options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full", "combine_replay": True}).ac_config
     assert options_cls(ep_comm_backend="deepep_v2").ep_comm_backend == "deepep_v2"
     assert options_cls(ep_comm_backend="uccl", ac_config={"mode": "full"}).ac_config.combine_replay is False
-
