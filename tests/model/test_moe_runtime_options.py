@@ -221,3 +221,26 @@ def test_the_placement_option_wins_and_the_environment_is_the_fallback(monkeypat
     assert placement.placement_value() == "/nodes/placement.json"
     monkeypatch.delenv(PLACEMENT_ENV)
     assert placement.placement_value() is None
+
+
+def test_deepep_v2_settings_take_the_option_then_the_environment_then_the_default(monkeypatch):
+    runtime_options = _module("moe.runtime_options")
+    monkeypatch.delenv("ARL_DEEPEP_V2_NUM_SMS", raising=False)
+    monkeypatch.delenv("ARL_DEEPEP_V2_MAX_TOKENS", raising=False)
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (32, 8192)
+    monkeypatch.setenv("ARL_DEEPEP_V2_NUM_SMS", "0")
+    monkeypatch.setenv("ARL_DEEPEP_V2_MAX_TOKENS", "16384")
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (0, 16384)
+    apply_moe_runtime_options(GlmMoeDsaOptions(deepep_v2_num_sms=24, deepep_v2_max_tokens=20000))
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (24, 20000)
+    apply_moe_runtime_options(GlmMoeDsaOptions(deepep_v2_num_sms=0))
+    assert runtime_options.deepep_v2_num_sms(32) == 0
+    apply_moe_runtime_options(GenericMoeOptions())  # a loader without the fields leaves the environment in charge
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (0, 16384)
+
+
+@pytest.mark.parametrize("fields", [{"deepep_v2_num_sms": -1}, {"deepep_v2_max_tokens": 0}])
+def test_bad_deepep_v2_settings_are_refused(fields):
+    with pytest.raises(ValidationError):
+        GlmMoeDsaOptions(**fields)

@@ -48,8 +48,8 @@ _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Memory and expert-balance settings of the MoE runtime. None: the environment variable decides. UltraEP's spares
-    and the online replicas both fill the spare expert slots, so at most one of them is on."""
+    """Memory, expert-balance and deepep_v2 settings of the MoE runtime. None: the environment variable decides.
+    UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -77,6 +77,22 @@ class MoeRuntimeOptions(BaseModel):
             "Map UltraEP's peer buffers through CUDA IPC handles instead of torch symmetric memory, whose rendezvous "
             "refuses ranks that each see only their own GPU (as DSS runs them). Written to ULTRA_EP_IPC_SYMM, which "
             "UltraEP reads, before its buffers are allocated. Unset: ULTRA_EP_IPC_SYMM."
+        ),
+    )
+    deepep_v2_num_sms: int | None = Field(
+        None,
+        ge=0,
+        description=(
+            "SMs of the deepep_v2 backend's dispatch and combine kernels, in place of deepep_num_sms; 0 lets DeepEP "
+            "V2 choose. Unset: ARL_DEEPEP_V2_NUM_SMS, else deepep_num_sms."
+        ),
+    )
+    deepep_v2_max_tokens: int | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Tokens per rank the deepep_v2 buffer is sized for, at least the largest per-rank token count of any MoE "
+            "call. Unset: ARL_DEEPEP_V2_MAX_TOKENS, else the first call's count, agreed over the EP group."
         ),
     )
     expert_replicas: int | None = Field(
@@ -139,13 +155,38 @@ class MoeRuntimeOptions(BaseModel):
         return self
 
 
+# The deepep_v2 settings, read by distributed/deepep_v2.py, which cannot be imported without DeepEP V2.
+DEEPEP_V2_NUM_SMS_ENV = "ARL_DEEPEP_V2_NUM_SMS"
+DEEPEP_V2_MAX_TOKENS_ENV = "ARL_DEEPEP_V2_MAX_TOKENS"
+_deepep_v2_num_sms: int | None = None
+_deepep_v2_max_tokens: int | None = None
+
+
+def deepep_v2_num_sms(default: int) -> int:
+    """The deepep_v2 SM count: the job's ``deepep_v2_num_sms``, else ``ARL_DEEPEP_V2_NUM_SMS``, else ``default``."""
+    if _deepep_v2_num_sms is not None:
+        return _deepep_v2_num_sms
+    return int(os.environ.get(DEEPEP_V2_NUM_SMS_ENV, default))
+
+
+def deepep_v2_max_tokens(default: int) -> int:
+    """The deepep_v2 buffer's tokens per rank: the job's ``deepep_v2_max_tokens``, else
+    ``ARL_DEEPEP_V2_MAX_TOKENS``, else ``default``."""
+    if _deepep_v2_max_tokens is not None:
+        return _deepep_v2_max_tokens
+    return int(os.environ.get(DEEPEP_V2_MAX_TOKENS_ENV, default))
+
+
 def apply_moe_runtime_options(options: Any) -> None:
     """Hand ``options``' runtime fields to the modules that read them; a field the options model lacks counts as
     unset. Every load sets every field, so a value from an earlier load in the same process never leaks into this
     one."""
+    global _deepep_v2_num_sms, _deepep_v2_max_tokens
     for field, (module_name, setter) in _SETTERS.items():
         module = importlib.import_module(f"arctic_platform.model.implementations.{module_name}")
         getattr(module, setter)(getattr(options, field, None))
+    _deepep_v2_num_sms = getattr(options, "deepep_v2_num_sms", None)
+    _deepep_v2_max_tokens = getattr(options, "deepep_v2_max_tokens", None)
     ipc_symm = getattr(options, "ultraep_ipc_symm", None)
     if ipc_symm is not None:
         os.environ[_ULTRA_EP_IPC_SYMM_ENV] = "1" if ipc_symm else "0"
