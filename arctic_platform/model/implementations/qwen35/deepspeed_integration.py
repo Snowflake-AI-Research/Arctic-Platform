@@ -227,6 +227,7 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
             prepare_preserved_weights_for_export(
                 model, iter_preserved_mtp_weights, description="Qwen MTP weights",
                 validate=validate_preserved_mtp_weights, names=preserved_mtp_names,
+                live_names=lambda: ordinary.weight_names(include_skipped=True),
             )
             if include_skipped else None
         )

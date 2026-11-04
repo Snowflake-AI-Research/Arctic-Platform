@@ -883,11 +883,12 @@ def test_qwen38_checkpoint_export_preserves_mtp_while_splitting_ple(monkeypatch,
         torch.distributed, "get_rank", lambda: pytest.fail("non-distributed export must not query rank")
     )
     ple = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-    monkeypatch.setattr(
-        integration.qwen_ds,
-        "_build_iter_full_hf_weights",
-        lambda built_model: lambda **kwargs: iter([(ple_name, ple)]),
-    )
+
+    def ordinary(**kwargs):
+        yield ple_name, ple
+
+    ordinary.weight_names = lambda **kwargs: frozenset({ple_name})
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights", lambda built_model: ordinary)
     exporter = integration._adapter().hf_weight_export(model)
     checkpoint = dict(exporter(include_skipped=True))
     assert set(checkpoint) == set(payload) | {

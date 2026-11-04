@@ -210,17 +210,16 @@ def build_iter_full_hf_weights(model: nn.Module):
         for start in range(0, rows, step):
             n = min(step, rows - start)
             outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            chunk = local[start:start + n].contiguous()
+            chunk = local[start : start + n].contiguous()
             dist.gather(chunk, outputs, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
-                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                    full[r * rows + start : r * rows + start + n].copy_(buffer[r, :n])
         return full
 
-    def iterator(*, include_skipped: bool = False):
-        is_master = not dist.is_initialized() or dist.get_rank() == 0
+    def selected_layers(include_skipped: bool):
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
         skipped_parameter_ids = {
@@ -232,14 +231,32 @@ def build_iter_full_hf_weights(model: nn.Module):
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
-                getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
+                getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids
             ):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
                 by_layer.setdefault(layer_index(hf_name), []).append((hf_name, tensor))
+        return by_layer
 
+    def weight_names(*, include_skipped: bool = False):
+        """Run the real layer mapping on metadata only, before export collectives or payload reads."""
+        names: set[str] = set()
+        for index, tensors in selected_layers(include_skipped).items():
+            layer_state = {}
+            for name, tensor in tensors:
+                shape = list(tensor.shape)
+                if getattr(tensor, "allreduce", True) is False and hasattr(tensor, "group_name"):
+                    shape[0] *= ds_groups._get_expert_parallel_world_size(tensor.group_name)
+                name = name.replace("._checkpoint_wrapped_module", "")
+                layer_state[name] = torch.empty(shape, dtype=tensor.dtype, device="meta")
+            convert_layer_to_hf(layer_state, index)
+            names.update(layer_state)
+        return frozenset(names)
+
+    def iterator(*, include_skipped: bool = False):
+        is_master = not dist.is_initialized() or dist.get_rank() == 0
+        by_layer = selected_layers(include_skipped)
         ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
         for index in ordered_layers:
             layer_state: dict[str, torch.Tensor] = {}
@@ -266,6 +283,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             convert_layer_to_hf(layer_state, index)
             yield from layer_state.items()
 
+    setattr(iterator, "weight_names", weight_names)
     return iterator
 
 

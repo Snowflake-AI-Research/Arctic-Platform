@@ -746,7 +746,8 @@ def test_qwen_mtp_capture_uses_metadata_only(monkeypatch, tmp_path):
     assert len(getattr(model, mtp_weights._STATE_ATTRIBUTE)) == len(_mtp_names())
 
 
-def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeypatch, tmp_path):
+@pytest.mark.parametrize("collision_index", [0, 1])
+def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeypatch, tmp_path, collision_index):
     import torch
 
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
@@ -760,11 +761,16 @@ def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeyp
     mtp_weights.capture_mtp_weights(model, source)
     collision = sorted(payload)[-1]
     rank = [0]
-    monkeypatch.setattr(
-        qwen,
-        "_build_iter_full_hf_weights",
-        lambda model: lambda **kwargs: iter([(collision, torch.ones(1))] if rank[0] == 0 else []),
-    )
+    ordinary_calls = []
+    live = [("trained.weight", torch.ones(1))]
+    live.insert(collision_index, (collision, torch.ones(1)))
+
+    def ordinary(**kwargs):
+        ordinary_calls.append(True)
+        yield from live if rank[0] == 0 else []
+
+    ordinary.weight_names = lambda **kwargs: frozenset(name for name, _ in live)
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
     messages = []
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
@@ -783,6 +789,7 @@ def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeyp
             for name, tensor in qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True):
                 yielded.append(name)
         assert yielded == []
+    assert ordinary_calls == []
 
 
 def test_preserved_sidecar_close_broadcasts_failure_to_peers(monkeypatch):
@@ -811,6 +818,58 @@ def test_preserved_sidecar_close_broadcasts_failure_to_peers(monkeypatch):
     with pytest.raises(RuntimeError, match="GeneratorExit"):
         list(mtp_weights.finish_preserved_weight_export(preserved, set(), description="Qwen MTP"))
     assert messages == []
+
+
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_live_export_metadata_inventory_matches_real_layer_mapping(monkeypatch, family, ep_size):
+    import deepspeed.utils.groups as groups
+    import torch
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.converting_qwen3_5_moe import (
+        convert_tt_layer_to_hf,
+    )
+
+    converter = convert_tt_layer_to_hf if family == "qwen" else convert_prime_layer_to_hf
+    prefix = "model.layers.0" if family == "qwen" else "model.language_model.layers.0"
+    seen_meta = []
+
+    class Model(torch.nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            for name in ("w1", "w2", "w3"):
+                parameter = torch.nn.Parameter(torch.ones(2, 3, 4))
+                parameter.allreduce = False
+                parameter.group_name = "ep"
+                yield f"{prefix}.mlp.experts.{name}", parameter
+            yield f"{prefix}.mlp.router.gate.weight", torch.nn.Parameter(torch.ones(2, 4))
+
+        def convert_layer_to_hf(self, state, index):
+            seen_meta.append(all(tensor.is_meta for tensor in state.values()))
+            converter(state, index)
+
+    monkeypatch.setattr(groups, "_get_expert_parallel_world_size", lambda name: ep_size)
+    group = object()
+    monkeypatch.setattr(groups, "_get_expert_parallel_group", lambda name: group)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: list(range(ep_size)))
+    monkeypatch.setattr(dist, "get_world_size", lambda **kwargs: ep_size)
+
+    def gather(tensor, outputs, **kwargs):
+        for output in outputs:
+            output.copy_(tensor)
+
+    monkeypatch.setattr(dist, "gather", gather)
+    exporter = build_iter_full_hf_weights(Model())
+    names = exporter.weight_names(include_skipped=True)
+    assert seen_meta == [True]
+    assert names == set(dict(exporter(include_skipped=True)))
+    assert seen_meta == [True, False]
+    if family == "glm":
+        assert f"{prefix}.mlp.experts.{2 * ep_size - 1}.gate_proj.weight" in names
 
 
 def _rewrite_mtp_index(source, mutate):

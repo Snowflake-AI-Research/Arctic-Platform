@@ -90,6 +90,7 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
                 description="GLM prediction layers",
                 validate=validate_preserved_auxiliary_weights,
                 names=preserved_auxiliary_names,
+                live_names=lambda: ordinary.weight_names(include_skipped=True),
             )
             if include_skipped
             else None

@@ -883,11 +883,13 @@ def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
     from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
 
     value = torch.ones(4)
-    monkeypatch.setattr(
-        glm.qwen_ds,
-        "_build_iter_full_hf_weights",
-        lambda model: lambda **kwargs: iter([("inactive.weight", value)]),
-    )
+
+    def ordinary(**kwargs):
+        yield "trained.weight", value
+        yield "inactive.weight", value
+
+    ordinary.weight_names = lambda **kwargs: frozenset({"trained.weight", "inactive.weight"})
+    monkeypatch.setattr(glm.qwen_ds, "_build_iter_full_hf_weights", lambda model: ordinary)
     monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
     sidecar_reads = []
 
@@ -898,6 +900,9 @@ def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
     monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", sidecar)
     monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
     monkeypatch.setattr(glm, "preserved_auxiliary_names", lambda model: ("inactive.weight",))
+    yielded = []
     with pytest.raises(RuntimeError, match="collides"):
-        list(glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True))
+        for name, tensor in glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True):
+            yielded.append(name)
+    assert yielded == []
     assert sidecar_reads == []

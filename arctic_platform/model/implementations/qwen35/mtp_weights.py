@@ -135,7 +135,7 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
         setattr(model, _STATE_ATTRIBUTE, tuple(sorted(preserved, key=lambda weight: weight.name)))
 
 
-def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str, validate, names):
+def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str, validate, names, live_names):
     """Validate rank zero's sidecar before any ordinary export collective."""
     distributed = dist.is_initialized()
     is_master = not distributed or dist.get_rank() == 0
@@ -146,6 +146,9 @@ def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, descript
         try:
             validate(model)
             weights = _PreservedExport(iterator(model), frozenset(names(model)))
+            collisions = weights.names & live_names() if weights.names else frozenset()
+            if collisions:
+                raise RuntimeError(f"{description} tensor collides with live HF export: {sorted(collisions)}")
         except Exception as exc:
             cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
@@ -157,7 +160,12 @@ def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, descript
 
 
 def finish_preserved_weight_export(preserved, emitted: set[str], *, description: str):
-    """Reach completion on sidecar errors or close; every rank must drain or close the export iterator."""
+    """Finish sidecar status collectively, including a started rank-zero iterator's early close.
+
+    Every rank must fully drain the entire export iterator, or all ranks must abort before the sidecar stage.
+    Closing an unstarted generator does not run its finally block; rank-local cancellation during the live
+    collective stream cannot be recovered here and requires whole-process-group abort by the caller.
+    """
     distributed = dist.is_initialized()
     is_master = not distributed or dist.get_rank() == 0
     failure: list[str | None] = [None]
