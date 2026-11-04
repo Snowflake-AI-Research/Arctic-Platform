@@ -21,9 +21,14 @@ shared ops as an SFT caller sees them.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import AsyncArcticClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -38,13 +43,12 @@ SAMPLING = 2
 
 class FakeTransport(Transport):
     def __init__(self, config, server_state=None) -> None:
-        self.config = config
         self.jobs = JobHandles()
         self.calls: list[Request] = []
         self.shutdown_calls = 0
 
-    def initialize(self) -> JobHandles:
-        sampling = SAMPLING if self.config.sampling_gpus else None
+    def initialize(self, client_config) -> JobHandles:
+        sampling = SAMPLING if client_config.sampling_gpus else None
         self.jobs = JobHandles(training=TRAINING, sampling=sampling)
         return self.jobs
 
@@ -162,7 +166,7 @@ class TestSFTOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/ckpt", "step": 3}
+        assert req.body == {"path": "/tmp/ckpt", "step": 3, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling(self, sampling_client):
         out = sampling_client.generate(["hi"], sampling_params={"max_tokens": 8})
@@ -201,6 +205,52 @@ class TestSFTOpMapping:
         assert payload == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}
 
 
+LORA = {"peft_type": "LORA", "r": 8}
+
+
+def _cortex_config(peft=None, config_type=ArcticSFTClientConfig) -> ArcticClientConfig:
+    return config_type(
+        model_name="m",
+        training_gpus=1,
+        sampling_gpus=1,
+        backend=CortexConfig(base_url="http://localhost"),
+        training=TrainingConfig(peft=peft, checkpoint_path="/tmp/c"),
+    )
+
+
+def _sync_payload(client) -> dict:
+    operations = [call for call in client.transport.calls if call.op == "operation"]
+    (sync,) = [call for call in operations if call.body["operation_type"] == "weight-sync"]
+    return sync.body["payload"]
+
+
+class TestSyncWeightFormat:
+    def test_peft_job_syncs_the_adapter_by_default(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config(peft=LORA))
+        client.sync_weights()
+        assert _sync_payload(client)["weight_format"] == "lora"
+
+    @pytest.mark.parametrize("weight_format", ["vllm", "hf", "lora"])
+    def test_peft_job_sends_an_explicit_weight_format_as_given(self, monkeypatch, weight_format):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config(peft=LORA))
+        client.sync_weights(weight_format=weight_format)
+        assert _sync_payload(client)["weight_format"] == weight_format
+
+    def test_dense_job_leaves_weight_format_to_the_server(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = ArcticSFTClient(_cortex_config())
+        client.sync_weights()
+        assert "weight_format" not in _sync_payload(client)
+
+    def test_async_client_syncs_the_adapter_by_default(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        client = AsyncArcticClient(_cortex_config(peft=LORA, config_type=ArcticClientConfig))
+        asyncio.run(client.sync_weights())
+        assert _sync_payload(client)["weight_format"] == "lora"
+
+
 class TestSFTLifecycle:
     def test_reconnect_config_copies_training_job_id(self, client):
         cfg = client.reconnect_config()
@@ -223,7 +273,7 @@ class TestSFTLifecycle:
         """A launched local server must not be orphaned if initialize() fails."""
 
         class BoomTransport(FakeTransport):
-            def initialize(self):
+            def initialize(self, client_config):
                 raise RuntimeError("init failed")
 
         monkeypatch.setattr(base_module, "make_transport", BoomTransport)

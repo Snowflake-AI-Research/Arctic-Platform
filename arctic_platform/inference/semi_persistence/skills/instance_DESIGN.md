@@ -83,8 +83,8 @@ inst = Instance({"model": "...", "tensor_parallel_size": 2}, model_dir)
 inst.init(gpus=[2, 3])
 ```
 
-Four additional primitives (`destroy_nccl`, `reinit_nccl`, `cleargraph`,
-`recapture_graphs`) bracket the checkpoint and restore; all are no-ops at
+Three additional primitives (`destroy_nccl`, `reinit_nccl`,
+`rebind_graphs`) bracket the checkpoint and restore; all are no-ops at
 TP=1.  See [tp_DESIGN.md](tp_DESIGN.md).
 
 ## Process Hierarchy
@@ -175,8 +175,8 @@ primitives must be:
 | `repin()`               | `cudaHostRegister` each worker's buffer for DMA transfers.  Idempotent. | Worker                           |
 | `unpin()`               | `cudaHostUnregister` each worker's buffer (data stays, CUDA registration removed).  Idempotent. | Worker          |
 | `stage()`               | Snapshot main and drafter params (GPU -> that worker's CPU buffer) in vLLM's internal format. | Worker           |
-| `plan_restore_weights(max_buffer_bytes=None)` | Self-compute the budget from `max_pinned_bytes_per_worker` (the per-GPU shard, not the TP-aggregate) and walk each worker's `index` once to build a chunk plan (each chunk packs whole params under the budget).  Cache the plan on the worker for the next `restore_weights()`.  An explicit `max_buffer_bytes` overrides the computation. | Instance + Worker |
-| `restore_weights()`      | Pure execution against the cached chunk plan: per chunk, copy a slice of that worker's buffer to a single reused GPU staging buffer, then scatter into `main.named_parameters()` and (if present) `drafter.model.named_parameters()` in place using the namespaced index.  Falls back to a single chunk if no plan was cached.  Frees the staging buffer and calls `empty_cache()` before returning. | Worker |
+| `plan_restore_weights()` | Self-compute the budget from `max_pinned_bytes_per_worker` (the per-GPU shard, not the TP-aggregate) and walk each worker's `index` once to build a chunk plan (each chunk packs whole params under the budget).  Cache the plan on the worker for the next `restore_weights()`.  If the worker's buffer is pageable, also form a small pinned double buffer there (`SEMIP_PINNED_BUFFER_BYTES` split into two halves; `SEMIP_PINNED_BUFFER_BYTES=0` forms none). | Instance + Worker |
+| `restore_weights()`      | Pure execution against the cached chunk plan: per chunk, copy a slice of that worker's buffer to a single reused GPU staging buffer (half by half through the double buffer if the plan formed one), then scatter into `main.named_parameters()` and (if present) `drafter.model.named_parameters()` in place using the namespaced index.  Falls back to a single chunk if no plan was cached.  Frees the staging buffer and calls `empty_cache()` before returning. | Worker |
 | `save_weights()` / `load_weights()` | Write / read each worker's buffer as shards plus a `weights_meta.json` manifest.  Flat `weights/` at TP=1, per-rank `weights/rank{R}/` at TP>1. | Worker |
 | `wake_up_weights()`     | Re-allocate weight tensors on GPU (main + drafter).  The arctic patch's disk reload of the main model is suppressed via `_skip_main_reload_on_wake`; both main and drafter parameters are populated by the subsequent `restore_weights()` from the worker's buffer.  Drafter `named_buffers()` are restored here from the per-sleep CPU snapshot. | Child |
 | `wake_up_kv_cache()`    | Re-allocate KV cache on GPU.                                 | Child                                      |
@@ -844,10 +844,6 @@ PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" make 
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-criu PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-lib PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-crit PREFIX=/usr
-
-# Empty plugin directory (used by --libdir during dump; the dump creates
-# it if missing, so this is optional)
-sudo mkdir -p /usr/lib/criu/empty
 ```
 
 ### Verify
@@ -855,7 +851,6 @@ sudo mkdir -p /usr/lib/criu/empty
 ```
 criu --version          # Version: 4.2
 which crit              # /usr/local/bin/crit
-ls -d /usr/lib/criu/empty
 ```
 
 ## File Structure

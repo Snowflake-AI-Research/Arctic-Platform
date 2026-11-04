@@ -115,17 +115,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     _orig_sample_tokens = GPUModelRunner.sample_tokens
     _orig_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
     _orig_reload_weights = GPUModelRunner.reload_weights
+    _orig_determine_batch_execution_and_padding = (
+        GPUModelRunner._determine_batch_execution_and_padding
+    )
 
     def init_routed_experts_capturer(self):
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
             RoutedExpertsCapturer,
         )
 
-        if not self.model_config.enable_return_routed_experts:
+        enable_return_routed_experts = getattr(
+            self.model_config, "enable_return_routed_experts", False)
+        if not enable_return_routed_experts:
             return
         logger.info(
             "Initializing routed experts capturer, enable_return_routed_experts=%s",
-            self.model_config.enable_return_routed_experts,
+            enable_return_routed_experts,
         )
         capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
@@ -166,8 +171,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         )
         if ulysses_sequence_parallel_size > 1:
             self.use_ulysses = True
+            # vLLM 0.32 removed the torch.compile sequence-parallel pass, and
+            # with it PassConfig.enable_sp. Keep the guard for a config that
+            # still carries the flag.
             pass_config = vllm_config.compilation_config.pass_config
-            if pass_config.enable_sp:
+            if getattr(pass_config, "enable_sp", False):
                 raise ValueError(
                     "Ulysses sequence parallelism is incompatible with native "
                     "sequence parallelism. Set enable_sequence_parallelism "
@@ -389,14 +397,23 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return attn_metadata, spec_decode_common_attn_metadata
 
-    # set padding for SP here
+    # vLLM 0.32 removed GPUModelRunner._pad_for_sequence_parallelism when it
+    # dropped the torch.compile sequence-parallel pass. Ulysses still needs
+    # the token count rounded up to the SP size before cudagraph dispatch,
+    # including eager batches that are not padded to a capture size.
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         sp_size = getattr(self.parallel_config, "ulysses_sequence_parallel_size", 1)
         num_input_tokens = round_up(num_scheduled_tokens, sp_size)
         return num_input_tokens
 
-    def profile_run(self) -> None:
-        self._orig_profile_run()
+    def _determine_batch_execution_and_padding(self, num_tokens: int, *args, **kwargs):
+        num_tokens = self._pad_for_sequence_parallelism(num_tokens)
+        return self._orig_determine_batch_execution_and_padding(
+            num_tokens, *args, **kwargs
+        )
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        self._orig_profile_run(randomize_inputs=randomize_inputs)
         if getattr(self, "shift_model", None) is not None:
             torch.distributed.barrier()
             orig_model, self.model = self.model, self.shift_model
@@ -1688,7 +1705,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
+            if getattr(self.model_config, "enable_return_routed_experts", False):
                 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
                     RoutedExpertsCapturer,
                 )
@@ -1746,7 +1763,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return async_output
 
-    def load_model(self, load_dummy_weights: bool = False) -> None:
+    def load_model(
+        self,
+        load_dummy_weights: bool = False,
+        *,
+        model=None,
+    ) -> None:
         load_shift_model = bool(
             getattr(self.vllm_config.parallel_config, "enable_shift_parallel", False)
         )
@@ -1754,7 +1776,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if load_shift_model:
             shift_config = copy.deepcopy(self.vllm_config)
 
-        self._orig_load_model(load_dummy_weights)
+        self._orig_load_model(load_dummy_weights, model=model)
 
         if getattr(self.parallel_config, "ulysses_sequence_parallel_size", 1) > 1:
             self.monkeypatch_forward()

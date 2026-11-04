@@ -108,6 +108,11 @@ class ArcticRLClientConfig(BaseModel):
             )
         return self
 
+    @property
+    def comm_protocol(self) -> str:
+        """Read by SkyRL's Arctic entrypoint. On Cortex ``get_server_state`` returns ``None`` either way."""
+        return "ray"
+
 
 class WeightSyncConfig(BaseModel):
     """NCCL weight-transfer topology between training GPUs and inference replicas.

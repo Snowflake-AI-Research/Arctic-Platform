@@ -12,6 +12,10 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig as HFQwen3_5MoeConfig
 
 from arctic_platform.model.implementations.afmoe.configuration_afmoe import AfmoeConfig
+from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4Config
+from arctic_platform.model.implementations.deepseek_v4 import DeepseekV4ForCausalLM
+from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41ForCausalLM
 from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeForCausalLM
 from arctic_platform.model.implementations.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from arctic_platform.model.implementations.glm4_moe.modeling_glm4_moe import Glm4MoeForCausalLM
@@ -66,6 +70,8 @@ for _config_cls, _model_cls, _model_type in (
     (MiniMaxM2Config, MiniMaxM2ForCausalLM, "minimax_m2"),
     (AfmoeConfig, AfmoeForCausalLM, "afmoe"),
     (NemotronHConfig, NemotronHForCausalLM, "nemotron_h"),
+    (DeepseekV4Config, DeepseekV4ForCausalLM, "deepseek_v4"),
+    (DeepseekV41Config, DeepseekV41ForCausalLM, "deepseek_v41"),
 ):
     _register_causal_lm(_config_cls, _model_cls, _model_type)
 

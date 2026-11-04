@@ -105,16 +105,18 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
     assert options.fp32_lm_head is True
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"dtype": "float16"},
-        {"patches": Patches(peft={"peft_type": "Lora"})},
-    ],
-)
-def test_spec_cannot_silently_ignore_settings(kwargs):
+def test_spec_cannot_silently_ignore_dtype():
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", dtype="float16")
+
+
+def test_spec_accepts_peft():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="qwen3_5_moe",
+        patches=Patches(peft={"peft_type": "Lora"}),
+    )
+    assert spec.patches.peft == {"peft_type": "Lora"}
 
 
 def test_runtime_groups_are_required():
@@ -160,6 +162,10 @@ def test_runtime_config_is_derived_from_validated_options():
                 "pin_memory_max_size_gib": 0,
             },
         },
+        debug={
+            "num_layers": 4,
+            "random_init": True,
+        },
     )
     config = _build_model_config(
         "local",
@@ -179,6 +185,8 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac is options.ac_config
     assert config.ac.offload_config.enabled is True
     assert config.ac.offload_config.keep_last_n == 3
+    assert config.debug.num_layers == 4
+    assert config.debug.random_init is True
 
 
 def test_legacy_qwen_types_are_shared():

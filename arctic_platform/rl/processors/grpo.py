@@ -36,6 +36,7 @@ from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import RATIO_MASK_CONFIG_KEYS
 from .functional import EchoBatchDenominator
 from .functional import RatioMasks
+from .functional import _config_nonnegative
 from .functional import _full_observation_denominator
 from .functional import _get_sequence_parallel_group
 from .functional import _packed_per_sequence_sums
@@ -147,6 +148,8 @@ def _source_statistics(stat: dict, mask: torch.Tensor) -> dict[str, float]:
 
 
 def _grpo_metrics_callback(_worker_metrics: Sequence[dict], metrics: dict) -> None:
+    if {"sampler_kl_sum", "sampler_kl_token_count"}.issubset(metrics):
+        metrics["sampler_kl"] = float(metrics["sampler_kl_sum"]) / max(float(metrics["sampler_kl_token_count"]), 1.0)
     totals = {
         "grpo_stats_token_count",
         "grpo_importance_weight_sum",
@@ -205,6 +208,65 @@ def _resolve_teacher_tau(config: dict, context: dict) -> float:
     if config.get("loss_agg_mode", "token-mean") == "token-mean" and context.get("sequence_loss_weights") is not None:
         raise ValueError("teacher_tau > 0 with token-mean cannot carry sequence_loss_weights to the teacher term")
     return tau
+
+
+_SAMPLER_KL_TYPES = ("k1", "k2", "k3")
+
+
+def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]:
+    """Validated ``(sampler_kl_coef, sampler_kl_type, sampler_kl_ratio_cap)``."""
+    coef = _config_nonnegative(config, "sampler_kl_coef") or 0.0
+    kind = config.get("sampler_kl_type", "k1")
+    if kind not in _SAMPLER_KL_TYPES:
+        raise ValueError(f"sampler_kl_type must be one of {_SAMPLER_KL_TYPES}, got {kind!r}")
+    cap = config.get("sampler_kl_ratio_cap", 5.0)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or math.isnan(cap) or cap <= 1.0:
+        raise ValueError(f"sampler_kl_ratio_cap must be a number > 1 (inf disables the cap), got {cap!r}")
+    # Without them the loss falls back to the policy's own detached log-probs, where k1 has value 0 but gradient
+    # -β ∇ log p on every token.
+    if coef > 0.0 and context.get("old_log_probs_shifted") is None:
+        raise ValueError("sampler_kl_coef > 0 requires context 'old_log_probs_shifted' (the sampler's log-probs)")
+    weights = context.get("sampler_kl_weights")
+    if weights is not None and not (
+        torch.is_tensor(weights) and weights.is_floating_point() and (torch.isfinite(weights) & (weights >= 0)).all()
+    ):
+        raise ValueError("sampler_kl_weights must be a finite, non-negative floating-point tensor")
+    if (
+        coef > 0.0
+        and weights is None
+        and config.get("loss_agg_mode", "token-mean") == "token-mean"
+        and context.get("sequence_loss_weights") is not None
+    ):
+        raise ValueError(
+            "sampler_kl_coef > 0 with token-mean cannot carry sequence_loss_weights to the sampler KL term; "
+            "fold them into sampler_kl_weights"
+        )
+    return coef, kind, float(cap)
+
+
+def _per_token_sampler_kl_weights(weights: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
+    """``sampler_kl_weights`` per token of padded ``[B, S]`` ``like``: a ``[B]`` tensor gives each row's tokens its
+    value. Packed calls hold it per token already (``ROW_BROADCAST_KEYS`` in ``arctic_platform.common.packing``)."""
+    if weights is not None and weights.ndim == 1 and like.ndim == 2 and weights.shape[0] == like.shape[0]:
+        return weights[:, None].expand_as(like)
+    return weights
+
+
+def _sampler_kl(log_ratio: torch.Tensor, kind: str, ratio_cap: float) -> torch.Tensor:
+    """Per-token KL(sampler || policy) estimate from ``log_ratio = log p - log q`` on tokens drawn from the sampler.
+
+    k1 is ``-log r``, k2 ``(log r)^2 / 2``, k3 ``r - 1 - log r``; k1 and k3 are unbiased for the KL and its gradient.
+    Past ``|log r| = log(ratio_cap)`` k2 and k3 continue linearly, so a token's gradient stays at its value at the cap.
+    """
+    if kind == "k1":
+        return -log_ratio
+    bound = math.log(ratio_cap)
+    clamped = log_ratio.clamp(-bound, bound)
+    if kind == "k2":
+        value, slope = 0.5 * clamped.square(), clamped
+    else:
+        value, slope = clamped.exp() - 1.0 - clamped, clamped.exp() - 1.0
+    return value + slope.detach() * (log_ratio - clamped)
 
 
 def compute_prox_logp_approximations(
@@ -335,6 +397,9 @@ def _internal_grpo_loss_fn(
     use_kl_loss: bool = False,
     kl_loss_coef: float = 0.001,
     kl_loss_type: str = "low_var_kl",
+    sampler_kl_coef: float = 0.0,
+    sampler_kl_type: str = "k1",
+    sampler_kl_ratio_cap: float = 5.0,
     prompt_group_ids: torch.Tensor | None = None,
     prompt_token_counts: torch.Tensor | None = None,
     sequence_loss_weights: torch.Tensor | None = None,
@@ -429,6 +494,8 @@ def _internal_grpo_loss_fn(
                 teacher_log_ratio_sum=0.0,
                 teacher_clipped_log_ratio_sum=0.0,
             )
+        if sampler_kl_coef > 0.0:
+            metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
         return zero_loss, metrics
 
     # Degenerate-shard logprob sanitization. Under Ulysses SP a short/padded batch
@@ -498,6 +565,8 @@ def _internal_grpo_loss_fn(
         metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
             metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
+        if sampler_kl_coef > 0.0:
+            metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
     else:
         if use_sapo_loss and use_cispo_loss:
             raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
@@ -620,7 +689,39 @@ def _internal_grpo_loss_fn(
             )
             loss = loss + kl_loss_coef * kl_loss
 
+        if sampler_kl_coef > 0.0:
+            sampler_kl = _sampler_kl(logprobs - old_logp, sampler_kl_type, sampler_kl_ratio_cap)
+            if input_data["sampler_kl_weights"] is not None:
+                sampler_kl = sampler_kl * input_data["sampler_kl_weights"]
+            # NLL targets were not sampled, so they carry no term.
+            if nll_mask is not None:
+                sampler_kl = torch.where(nll_mask, 0.0, sampler_kl)
+            # The client's mask, not the M2PO-shrunk one: tokens dropped from the policy term keep their anchor,
+            # as they do under the ratio masks, which leave loss_mask unchanged.
+            sampler_kl_loss = agg_loss(
+                sampler_kl,
+                policy_loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+            loss = loss + sampler_kl_coef * sampler_kl_loss
+
         stats_mask = loss_mask if nll_mask is None else loss_mask & ~nll_mask
+        sampler_kl_metrics = {}
+        if sampler_kl_coef > 0.0:
+            sampler_kl_mask = policy_loss_mask if nll_mask is None else policy_loss_mask & ~nll_mask
+            sampler_kl_metrics = {
+                "sampler_kl_coef": sampler_kl_coef,
+                "sampler_kl_token_count": float(sampler_kl_mask.sum()),
+                "sampler_kl_sum": float(torch.where(sampler_kl_mask, sampler_kl.detach().double(), 0.0).sum()),
+            }
         metrics = {
             "approx_kl": _masked_mean_float(stat["approx_kl"].detach(), stats_mask),
             "importance_weight": _masked_mean_float(stat["importance_weight"].detach(), stats_mask),
@@ -630,6 +731,7 @@ def _internal_grpo_loss_fn(
         metrics.update(_source_statistics(stat, stats_mask))
         metrics["grpo_entropy_sum"] = float(torch.where(stats_mask, entropy.double(), 0.0).sum())
         metrics.update(stat.get("ratio_mask_metrics", {}))
+        metrics.update(sampler_kl_metrics)
         if nll_mask is not None:
             metrics.update(
                 nll_trainable_token_count=float(nll_mask.sum()),
@@ -764,6 +866,9 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "use_kl_loss": False,
     "kl_loss_coef": 0.001,
     "kl_loss_type": "low_var_kl",
+    "sampler_kl_coef": 0.0,
+    "sampler_kl_type": "k1",
+    "sampler_kl_ratio_cap": 5.0,
 }
 _ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
     "aux_ce_weight": None,
@@ -849,11 +954,22 @@ def _grpo_loss(
         the ratio-control keys in :data:`functional.RATIO_MASK_CONFIG_KEYS`
         (ratio, probability-difference and sequence masks, the
         ``ratio_m2_threshold`` M2PO filter, the
-        ``log_ratio_sq_coef`` penalty and ``ratio_stats`` telemetry; all
-        require ``use_cispo_loss``),
+        ``log_ratio_sq_coef`` penalty, ``ratio_stats`` telemetry and the
+        ``ratio_mask_rebalance`` restoration of each sign's masked advantage
+        mass; all require ``use_cispo_loss``, except that an explicit false of
+        ``ratio_stats`` or ``ratio_mask_rebalance`` with no other ratio control
+        is inert),
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs_shifted`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
+        ``sampler_kl_coef`` (default 0.0; finite non-negative β of ``β · agg(w · k(log p - old_log_probs_shifted))``
+        over non-NLL policy tokens with the policy term's aggregation: a per-token estimate of KL(sampler || policy)),
+        ``sampler_kl_type`` (default "k1": ``k = -log r``, whose gradient ``-β ∇ log p`` raises every sampled token
+        regardless of advantage; "k2": ``(log r)^2 / 2``; "k3": ``r - 1 - log r``, zero gradient where r = 1),
+        ``sampler_kl_ratio_cap`` (default 5.0, > 1, inf allowed; k2 and k3 continue linearly past
+        ``|log r| = log(cap)``); optional context ``sampler_kl_weights`` gives ``w`` per token, or on a padded request
+        as one value per sequence that each of its tokens takes (finite, non-negative, default 1; required to carry
+        ``sequence_loss_weights`` under token-mean),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -886,6 +1002,9 @@ def _grpo_loss(
     values = _grpo_config_values(config)
     _validate_loss_denominators(values["batch_num_tokens"], values["global_batch_size"])
     values["teacher_tau"] = _resolve_teacher_tau(config, context)
+    values["sampler_kl_coef"], values["sampler_kl_type"], values["sampler_kl_ratio_cap"] = _resolve_sampler_kl(
+        config, context
+    )
     values["ratio_masks"] = RatioMasks.from_config(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
 
@@ -948,6 +1067,7 @@ def _grpo_loss(
         "nll_mask": nll_mask,
         "teacher_log_probs": context.get("teacher_log_probs_shifted"),
         "teacher_policy_finite": teacher_policy_finite,
+        "sampler_kl_weights": context.get("sampler_kl_weights"),
         "sft_mask": context.get("sft_mask"),
         "echo_observation_mask": context.get("echo_observation_mask"),
         "echo_observation_token_counts": context.get("echo_observation_token_counts"),
@@ -965,6 +1085,8 @@ def _grpo_loss(
         input_data["versions"] = input_data["versions"].to(logprobs.device)
     if input_data["ref_log_probs"] is not None:
         input_data["ref_log_probs"] = input_data["ref_log_probs"].to(logprobs.device)
+    if input_data["sampler_kl_weights"] is not None:
+        input_data["sampler_kl_weights"] = input_data["sampler_kl_weights"].to(logprobs.device)
     if input_data["teacher_log_probs"] is not None:
         if not torch.is_tensor(input_data["teacher_log_probs"]):
             raise ValueError("teacher_log_probs_shifted must be a floating-point tensor")
@@ -987,6 +1109,7 @@ def _grpo_loss(
             "nll_mask",
             "teacher_log_probs",
             "teacher_policy_finite",
+            "sampler_kl_weights",
             "sft_mask",
             "echo_observation_mask",
             "labels",
@@ -1003,6 +1126,13 @@ def _grpo_loss(
                 "teacher_log_probs_shifted must exactly match prediction-aligned logprobs shape, "
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
             )
+    sampler_kl_weights = _per_token_sampler_kl_weights(input_data["sampler_kl_weights"], logprobs)
+    input_data["sampler_kl_weights"] = sampler_kl_weights
+    if sampler_kl_weights is not None and sampler_kl_weights.shape != logprobs.shape:
+        raise ValueError(
+            "sampler_kl_weights must match logprobs shape or hold one value per sequence, got "
+            f"{tuple(sampler_kl_weights.shape)} and {tuple(logprobs.shape)}"
+        )
 
     prompt_group_ids = context.get("prompt_group_ids")
     if prompt_group_ids is not None:
@@ -1056,11 +1186,16 @@ def _reject_sequence_parallel_m2po(ratio_masks: RatioMasks | None) -> None:
 
 
 def _grpo_model_call_count_callback(model_call_counts: Sequence[int | None], config: dict) -> None:
-    if config.get("ratio_m2_threshold") is None:
-        return
+    required = []
+    if config.get("ratio_m2_threshold") is not None:
+        required.append("ratio_m2_threshold")
+    if config.get("ratio_mask_rebalance") is True:
+        required.append("ratio_mask_rebalance")
     counts = tuple(model_call_counts)
-    if set(counts) != {1}:
-        raise ValueError(f"ratio_m2_threshold requires exactly one synchronized model call per worker, got {counts!r}")
+    if required and set(counts) != {1}:
+        raise ValueError(
+            f"{', '.join(required)} requires exactly one synchronized model call per worker, got {counts!r}"
+        )
 
 
 def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
@@ -1338,6 +1473,7 @@ def _packed_grpo_validation_context(context: dict) -> dict:
         "loss_mask",
         "nll_mask",
         "teacher_log_probs_shifted",
+        "sampler_kl_weights",
         "sft_mask",
         "echo_observation_mask",
     ):
@@ -1353,6 +1489,13 @@ def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
+    _resolve_sampler_kl(config, context)
+    weights = _per_token_sampler_kl_weights(context.get("sampler_kl_weights"), mask)
+    if weights is not None and weights.shape != mask.shape:
+        raise ValueError(
+            "sampler_kl_weights must match loss_mask shape or hold one value per sequence, got "
+            f"{tuple(weights.shape)} and {tuple(mask.shape)}"
+        )
     if teacher_tau > 0:
         teacher_log_probs = context["teacher_log_probs_shifted"]
         if not torch.is_tensor(teacher_log_probs) or not teacher_log_probs.is_floating_point():

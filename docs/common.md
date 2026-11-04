@@ -12,6 +12,7 @@ arctic_platform/common/
 ├── ray_cluster.py        # Ray bootstrap (attach or spawn)
 ├── server.py             # Minimal ArcticRLServerState base
 ├── registry.py           # LOSS_FNS / POST_PROCESSORS
+├── packing/              # token-budget packer (see packing.md)
 └── utils/
     ├── batch.py          # shard, merge, metric aggregation
     ├── server_models.py  # JobConfig, request models
@@ -23,6 +24,14 @@ arctic_platform/common/
 
 Prefer `arctic_platform.common.*` imports. Back-compat shims still exist under
 `arctic_platform.rl.{ray_server,deepspeed_worker}`.
+
+`packing/` is the token-budget layout library (`pack_microbatch`, `token_shard`,
+`window_row_pieces`). The contract is [packing.md](packing.md). It is not wired
+into `run_pipeline`. DSS imports `arctic_platform.common.packing` and keeps no
+copy. `rl/processors/packing.py` (`pack_sequences`) is a separate on-prem layout
+and is unchanged.
+`model/implementations/gpu/packing.py` re-exports `IGNORE_INDEX` and
+`cu_seqlens_from_position_ids` from this package.
 
 ## Ray server
 
@@ -119,6 +128,34 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 `build_model_config()` merges `vllm_config` with ArcticInference signals from
 `arctic_inference_config` (e.g. `zorro_inference.enable` → `use_fca=True`).
+
+### Gradient Accumulation Precision
+
+**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `DeepSpeedWorker.ds_training_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
+
+**Set `data_types.grad_accum_dtype` explicitly to select a different accumulation precision.** An explicit value always wins; the FP32 default written out in full is:
+
+```json
+{
+  "data_types": {
+    "grad_accum_dtype": "fp32"
+  }
+}
+```
+
+**BF16 model precision and gradient-accumulation precision are separate choices.** The setting above accumulates gradients in FP32 without changing BF16 model weights. An explicit `"bf16"` accumulation setting is preserved. A caller that initializes DeepSpeed without going through the AP worker gets DeepSpeed's own default, which accumulates in the model dtype.
+
+**Regression coverage.** Worker tests cover an absent block, supplied blocks without `grad_accum_dtype` (`null`, `{}`, `{"grad_accum_dtype": null}`, other fields only), and explicit `"bf16"` and `"fp32"` values. A BF16 linear-layer control with ZeRO stage 2, eight microsteps and gradient accumulation of four requires identical losses and gradient norms for the worker default, an empty supplied block, and explicit FP32. These tests do not claim that BF16 and FP32 accumulation are equivalent or validate large-model convergence.
+
+### GLM-5.3 Sparse Attention
+
+**The GLM-5.3 loader's `attn_implementation` selects automatic or forced sparse attention.** The selection reaches every sparse layer, including with sequence parallelism disabled (SP1):
+
+- `sparse_mla` (default): prefer installed FlashInfer on compatible Hopper inputs, then installed FlashMLA on a supported layout, then reference attention.
+- `flashinfer`: require the installed FlashInfer FA3 kernel, Hopper and its supported 512-channel BF16/FP16 layout; raise if unavailable or incompatible.
+- `flashmla`: require the installed FlashMLA sparse kernel, Hopper or datacenter Blackwell and its supported layout; raise if unavailable or incompatible.
+
+**Backend execution errors propagate rather than switching kernels.** Device eligibility is checked before layout and package eligibility; CUDA classification and compute capability are cached once per concrete device per process. Compute-capability major 9 means Hopper and major 10 means datacenter Blackwell. Backend execution is logged once per sparse layer. See [the dispatch implementation](../arctic_platform/model/implementations/glm53/context_parallel.py).
 
 ## Metric aggregation
 

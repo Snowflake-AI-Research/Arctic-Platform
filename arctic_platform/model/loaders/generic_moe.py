@@ -47,6 +47,7 @@ class GenericMoeOptions(BaseModel):
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
+    moe_use_sonicmoe: bool = False
     fused_cross_entropy: bool | Literal["liger"] = False
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
@@ -73,8 +74,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("generic MoE dtype must be 'bfloat16' or 'float32'")
-    if spec.patches.peft is not None:
-        raise ValueError("generic MoE PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             "the generic MoE loader does not support the liger patch; "

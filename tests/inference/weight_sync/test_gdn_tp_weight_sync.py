@@ -82,7 +82,7 @@ def _build_model(device):
     from torch import nn
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-    from vllm.models.glm5next.nvidia.kda import (
+    from vllm.models.glm5next.common.kda import (
         _Glm5NextMergedColumnParallelLinear,
     )
 

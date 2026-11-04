@@ -105,8 +105,8 @@ python -m recipes.rl.standalone.rl_loop config=recipes/config.json \
 
 ### MoE / expert parallelism (`ep_size`)
 
-MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need Prime-RL plus expert
-parallelism for full fine-tuning. Set `model_provider=prime_rl` and `ep_size` so
+MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need the Arctic provider plus expert
+parallelism for full fine-tuning. Set `model_provider=arctic` and `ep_size` so
 that the training GPU count is a multiple of `ep_size`.
 
 ### Sequence / generation length

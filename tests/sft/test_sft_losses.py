@@ -33,6 +33,9 @@ from arctic_platform.sft.processor import run_sft_pipeline
 from arctic_platform.sft.processor import sft_ce_loss
 from arctic_platform.sft.processor import sft_loss
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
 
 
 class TestSFTRegistry(TestCasePlus):
@@ -397,3 +400,93 @@ class TestSftCeSumFromHiddenErrors(TestCasePlus):
         )
         with self.assertRaises(ValueError):
             sft_ce_sum_from_hidden(model, torch.randn(1, 3, 4), torch.zeros(1, 3, dtype=torch.long), mode="none")
+
+
+class TestSftCeMemoryGradientReduction(TestCasePlus):
+    """CPU bookkeeping regression, not CUDA CE-kernel parity."""
+
+    device = "cpu"
+
+    class _TinyLm(torch.nn.Module):
+        def __init__(self, *, tied):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+            if tied:
+                self.lm_head.weight = self.embed_tokens.weight
+            self.config = SimpleNamespace(vocab_size=8)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+    def _check_gas4_reduction(self, *, tied, peak_mem_gib, tiles):
+        from arctic_platform.sft.processor import sft_ce_sum_from_hidden
+
+        set_seed(0)
+        model = self._TinyLm(tied=tied).to(self.device)
+        reference = self._TinyLm(tied=tied).to(self.device)
+        reference.load_state_dict(model.state_dict())
+        weight = model.lm_head.weight
+        weight.ds_grad_is_ready = True
+        readiness = []
+        reductions = []
+
+        def record_reduction(param):
+            ready = param.ds_grad_is_ready
+            readiness.append(ready)
+            if ready:
+                reductions.append(param.grad.detach().clone())
+
+        inputs = torch.tensor([[0, 1, 2, 3]], device=self.device)
+        labels = torch.tensor([[-100, 1, 2, 3]], device=self.device)
+        losses = []
+        reference_losses = []
+        hook = weight.register_post_accumulate_grad_hook(record_reduction)
+        try:
+            for _ in range(4):
+                ce_sum, n_valid = sft_ce_sum_from_hidden(
+                    model, model.embed_tokens(inputs), labels, mode="memory", peak_mem_gib=peak_mem_gib
+                )
+                reference_sum, reference_valid = sft_ce_sum_from_hidden(
+                    reference, reference.embed_tokens(inputs), labels, mode="compute"
+                )
+                self.assertEqual(n_valid, 3)
+                self.assertEqual(reference_valid, n_valid)
+                loss = ce_sum / (4 * n_valid)
+                reference_loss = reference_sum / (4 * reference_valid)
+                losses.append(loss.detach())
+                reference_losses.append(reference_loss.detach())
+                loss.backward()
+                reference_loss.backward()
+        finally:
+            hook.remove()
+
+        # Untied heads reduce only on the final tile. Tied heads additionally
+        # accumulate an input-embedding gradient in the outer backward.
+        per_microbatch = [False] * tiles + [True] if tied else [False] * (tiles - 1) + [True]
+        self.assertEqual(readiness, per_microbatch * 4)
+        self.assertEqual(len(reductions), 4)
+        self.assertTrue(weight.ds_grad_is_ready)
+        # fp32 summation order can differ between chunked and tiled replay.
+        torch_assert_close(torch.stack(losses), torch.stack(reference_losses), rtol=0, atol=1e-6)
+        for name, param in model.named_parameters():
+            reference_param = dict(reference.named_parameters())[name]
+            torch_assert_close(param.grad, reference_param.grad, rtol=0, atol=1e-6, msg=name)
+        torch_assert_close(reductions[-1], reference.lm_head.weight.grad, rtol=0, atol=1e-6)
+
+    def test_untied_lm_head_reduces_once_per_microbatch(self):
+        for peak_mem_gib, tiles in ((1.0, 1), (1e-12, 3)):
+            with self.subTest(tiles=tiles):
+                self._check_gas4_reduction(tied=False, peak_mem_gib=peak_mem_gib, tiles=tiles)
+
+    def test_tied_lm_head_reduces_after_outer_embedding_backward(self):
+        for peak_mem_gib, tiles in ((1.0, 1), (1e-12, 3)):
+            with self.subTest(tiles=tiles):
+                self._check_gas4_reduction(tied=True, peak_mem_gib=peak_mem_gib, tiles=tiles)
+
+
+@require_torch_gpu
+class TestSftCeMemoryGradientReductionGPU(TestSftCeMemoryGradientReduction):
+    """Repeat loss/gradient/reduction checks with the installed CUDA CE kernel."""
+
+    device = "cuda"

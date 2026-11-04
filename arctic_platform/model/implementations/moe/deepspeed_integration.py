@@ -41,7 +41,11 @@ class MoEDeepSpeedAdapter:
     shared_expert_type: type[nn.Module]
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
-    extra_weight_iterators: tuple[tuple[str, Callable[[nn.Module], Callable]], ...] = ()
+    vllm_weight_export: Callable[[nn.Module], Callable] | None = None
+
+
+# Largest EP-group gather assembled on the master GPU in one piece during weight export.
+_EXPORT_GATHER_BYTES = 1 << 30
 
 
 def patch_deepspeed_moe_detection() -> None:
@@ -151,14 +155,16 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
 
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
-    convert_layer_to_hf = getattr(model_type, "convert_layer_to_hf", None)
-    if convert_layer_to_hf is None:
+    if getattr(model_type, "convert_layer_to_hf", None) is None:
         raise RuntimeError(f"build_iter_full_hf_weights requires {model_type.__name__}.convert_layer_to_hf")
+    # Bound from the instance so a family whose layer mapping depends on its config can read it.
+    convert_layer_to_hf = model.convert_layer_to_hf
 
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
         parts = name.split(".")
@@ -170,7 +176,49 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def iterator():
+    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
+        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
+
+        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
+        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
+        """
+        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
+        if local.dtype != torch.uint8:
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            return None if full is None else full.view(local.dtype)
+        rows = local.shape[0]
+        row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
+        if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
+            if is_master:
+                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
+                gather_list = list(full.chunk(world, dim=0))
+            else:
+                full = None
+                gather_list = None
+            dist.gather(local, gather_list, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(local)
+            return full
+        step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
+        if is_master:
+            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
+            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+        else:
+            full = None
+            buffer = None
+        for start in range(0, rows, step):
+            n = min(step, rows - start)
+            outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
+            chunk = local[start:start + n].contiguous()
+            dist.gather(chunk, outputs, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(chunk)
+            if full is not None and buffer is not None:
+                for r in range(world):
+                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+        return full
+
+    def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
@@ -181,8 +229,11 @@ def build_iter_full_hf_weights(model: nn.Module):
             for parameter in module.parameters(recurse=False)
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
-        for name, tensor in named_weight_sync_tensors(model):
-            if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+        for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
+            if not include_skipped and (
+                getattr(tensor, "_dss_skip_weight_sync", False)
+                or id(tensor) in skipped_parameter_ids
+            ):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
@@ -194,11 +245,15 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    # Only the master consumes the export: gather its EP group's shards straight into one output
+                    # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
+                    if 0 not in dist.get_process_group_ranks(ep_group):
+                        continue
                     local = tensor.data.contiguous()
-                    shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
-                    dist.all_gather(shards, local, group=ep_group)
+                    world = dist.get_world_size(group=ep_group)
+                    full = _gather_to_master(local, world, ep_group, is_master)
                     if is_master:
-                        layer_state[name] = torch.cat(shards, dim=0)
+                        layer_state[name] = full
                 elif is_master:
                     layer_state[name] = tensor.data
 
@@ -286,9 +341,16 @@ def load_moe_model_for_deepspeed(
     )
     count = tag_expert_params_for_deepspeed(model, ep_group_name)
     get_logger().info(f"Tagged {count} expert parameters with group_name='{ep_group_name}', allreduce=False")
-    model._iter_full_hf_weights = build_iter_full_hf_weights(model)
-    for attribute, builder in adapter.extra_weight_iterators:
-        setattr(model, attribute, builder(model))
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+
+    register_weight_export(
+        model,
+        WeightExportContract(
+            hf=build_iter_full_hf_weights,
+            vllm=adapter.vllm_weight_export,
+        ),
+    )
     return model
 
 

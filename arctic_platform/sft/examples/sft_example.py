@@ -83,7 +83,6 @@ def _config(stack: contextlib.ExitStack, training_gpus: int) -> ArcticSFTClientC
         model_name=MODEL,
         seed=SEED,
         training_gpus=training_gpus,
-        job_ready_timeout=600.0,
         training=TrainingConfig(
             checkpoint_path=ckpt,  # server requires this for training jobs
             ds_config={
