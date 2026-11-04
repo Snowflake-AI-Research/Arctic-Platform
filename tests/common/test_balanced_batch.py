@@ -67,10 +67,19 @@ def test_zorro_thousands_of_single_row_groups_assign():
 
 
 def test_zorro_infeasible_hundreds_of_groups_raise():
-    # Each rank holds 100 groups of 3 and has one spare row, so the 301st group cannot land.
+    # Each rank holds 100 groups of 3 and has one spare row. The search hits the
+    # node budget before it finishes proving that the 301st group cannot land.
     groups = [[3 * index, 3 * index + 1, 3 * index + 2] for index in range(301)]
-    with pytest.raises(ValueError, match="do not fit"):
+    with pytest.raises(ValueError, match="search budget exhausted after 100000 nodes"):
         assign_zorro_groups(groups, [1.0] * 301, num_shards=3, num_rows=903)
+
+
+def test_zorro_proven_infeasible_groups_do_not_fit():
+    # Three pairs cannot pack into two ranks of three rows, and the search is small enough to finish.
+    groups = [[0, 1], [2, 3], [4, 5]]
+    with pytest.raises(ValueError, match="do not fit") as raised:
+        assign_zorro_groups(groups, [1.0, 1.0, 1.0], num_shards=2, num_rows=6)
+    assert "budget" not in str(raised.value)
 
 
 def test_zorro_groups_raise_when_the_batch_does_not_divide():

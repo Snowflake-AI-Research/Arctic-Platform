@@ -149,10 +149,14 @@ def assign_row_lpt(costs: Sequence[int], num_shards: int) -> list[list[int]]:
     return assignment
 
 
-# Backtracking stops here and the caller reports the assignment as infeasible.
-# A few thousand nodes covers the greedy pass for the 1024-group recipe and a
-# short search after a dead end, and cuts off the exponential case.
+# Backtracking stops after this many nodes. ``assign_zorro_groups`` reports
+# that cutoff separately from a search that proved the groups do not fit.
 _PACK_NODE_BUDGET = 100_000
+
+
+class _SearchBudgetExceeded(Exception):
+    def __init__(self, nodes: int) -> None:
+        self.nodes = nodes
 
 
 def _pack_groups(sizes, costs, order, num_shards, cap):
@@ -160,10 +164,10 @@ def _pack_groups(sizes, costs, order, num_shards, cap):
 
     The greedy pass is a loop, so the call stack does not grow with the number
     of groups. Backtracking runs only after a dead end. It keeps an explicit
-    stack and stops after ``_PACK_NODE_BUDGET`` nodes, which the caller reports
-    as an infeasible assignment. Ranks with the same row count and cost are
-    interchangeable, so a position skips a rank that matches one already tried.
-    Returns ``{group: rank}`` or ``None``.
+    stack and raises ``_SearchBudgetExceeded`` after ``_PACK_NODE_BUDGET``
+    nodes. A finished search that cannot place every group returns ``None``.
+    Ranks with the same row count and cost are interchangeable, so a position
+    skips a rank that matches one already tried. Returns ``{group: rank}``.
     """
     rows = [0] * num_shards
     rank_costs = [0.0] * num_shards
@@ -190,7 +194,7 @@ def _pack_groups(sizes, costs, order, num_shards, cap):
         if pos == group_count:
             return placed
         if nodes >= _PACK_NODE_BUDGET:
-            return None
+            raise _SearchBudgetExceeded(nodes)
         ranks = candidates(order[pos])
         nodes += 1
         if ranks:
@@ -211,7 +215,7 @@ def _pack_groups(sizes, costs, order, num_shards, cap):
             if choice + 1 >= len(prev_ranks):
                 continue
             if nodes >= _PACK_NODE_BUDGET:
-                return None
+                raise _SearchBudgetExceeded(nodes)
             choice += 1
             rank = prev_ranks[choice]
             saved_rows, saved_cost = rows[rank], rank_costs[rank]
@@ -264,7 +268,13 @@ def assign_zorro_groups(
                 f"prompt group of {size} rows does not fit in a rank cap of {cap} "
                 f"(batch_size={num_rows}, num_shards={num_shards})"
             )
-    placed = _pack_groups([len(group) for group in groups], costs, order, num_shards, cap)
+    try:
+        placed = _pack_groups([len(group) for group in groups], costs, order, num_shards, cap)
+    except _SearchBudgetExceeded as exc:
+        raise ValueError(
+            f"prompt group search budget exhausted after {exc.nodes} nodes "
+            f"(batch_size={num_rows}, num_shards={num_shards}, groups={len(groups)})"
+        ) from exc
     if placed is None:
         raise ValueError(
             f"prompt groups do not fit into {num_shards} ranks of {cap} rows "
