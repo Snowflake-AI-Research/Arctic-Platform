@@ -1641,7 +1641,8 @@ class ArcticRLRayServer:
             if sp_size > 1:
                 raise ValueError(
                     "log_probs does not support sequence-parallel DeepSpeed jobs; use forward with "
-                    "the supported compute_logprobs/token-mean GRPO payload"
+                    "loss_fn='grpo', post=['compute_logprobs'], and the supported token-mean GRPO payload; "
+                    "pure log-probability forward requests are not supported"
                 )
             tokenizer = self.log_prob_tokenizer
             encoded = tokenizer(full_texts, return_tensors="pt", padding=True)

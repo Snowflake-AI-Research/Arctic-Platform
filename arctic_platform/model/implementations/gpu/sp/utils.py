@@ -114,8 +114,11 @@ def prepare_token_partition(
     or token dropping is invented: nondivisible packed lengths fail pre-model.
     """
     rank, world, ranks, local = _membership(sp_info)
-    if not isinstance(batch, dict) or set(batch) - TOKEN_FIELDS - {"attention_mask"}:
-        raise ValueError("undeclared SP token fields")
+    if not isinstance(batch, dict):
+        raise ValueError("SP batch must be a dictionary")
+    unsupported = set(batch) - TOKEN_FIELDS - {"attention_mask"}
+    if unsupported:
+        raise ValueError(f"undeclared SP token fields: {sorted(unsupported)}")
     ids, attention = batch.get("input_ids"), batch.get("attention_mask")
     if (
         not isinstance(ids, torch.Tensor)

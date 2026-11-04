@@ -184,6 +184,25 @@ def test_token_generated_labels_validate_reset_positions_before_target_generatio
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "sampler_kl_weights",
+        "sft_mask",
+        "nll_mask",
+        "echo_observation_mask",
+        "echo_observation_token_counts",
+        "prompt_group_ids",
+        "prompt_token_counts",
+    ],
+)
+def test_token_partition_names_unsupported_optional_grpo_fields(field):
+    source = _batch()
+    source[field] = torch.ones(2, 5)
+    with pytest.raises(ValueError, match=f"undeclared SP token fields:.*{field}"):
+        sp.prepare_token_partition(source, sp_info=_info())
+
+
+@pytest.mark.parametrize(
     "fault",
     ["unknown", "left_padding", "empty_row", "nonbinary", "remainder", "shape", "dtype", "active_end", "active_pad"],
 )

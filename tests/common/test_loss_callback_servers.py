@@ -113,7 +113,7 @@ def _sp_execution_server(monkeypatch):
 
         def remote(self):
             events.append(("membership", self.rank))
-            return dict(records[self.rank])
+            return _awaitable(dict(records[self.rank]))
 
     class Model:
         def __init__(self, rank):
@@ -144,7 +144,6 @@ def _sp_execution_server(monkeypatch):
         )()
         for rank in (1, 2, 3, 0)
     ]
-    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
     request = {
         "batch": {
             "input_ids": torch.arange(20).reshape(5, 4),
