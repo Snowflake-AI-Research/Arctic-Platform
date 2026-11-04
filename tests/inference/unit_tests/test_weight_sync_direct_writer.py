@@ -379,6 +379,63 @@ def test_load_batched_tracks_many_sources_to_one_destination():
     assert loaded_param_l2 == {"fused_weight": 42.0}
 
 
+def test_load_batched_counts_a_source_once_per_stacked_shard():
+    class LanguageModel(nn.Module):
+        hf_to_vllm_mapper = SimpleNamespace(
+            orig_to_new_stacked={
+                "layers.0.self_attn.q_proj.": ("layers.0.self_attn.qkv_proj.", "q"),
+                "layers.0.self_attn.k_proj.": (
+                    "layers.0.self_attn.qkv_proj.",
+                    ["k", "v"],
+                ),
+            }
+        )
+
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Parameter(torch.zeros(6))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_tower = nn.Module()
+            self.vision_tower.k_proj = nn.Parameter(torch.zeros(2))
+            self.language_model = nn.Module()
+            self.language_model.model = LanguageModel()
+
+        def load_weights(self, weights):
+            ((name, tensor),) = weights
+            qkv = self.language_model.model.qkv_proj.data
+            if name == "model.language_model.layers.0.self_attn.q_proj.weight":
+                qkv[:2].copy_(tensor)
+            elif name == "model.language_model.layers.0.self_attn.k_proj.weight":
+                qkv[2:4].copy_(tensor)
+                qkv[4:].copy_(tensor)
+            elif name == "model.vision_tower.layers.0.self_attn.k_proj.weight":
+                self.vision_tower.k_proj.data.copy_(tensor)
+                return {"vision_tower.k_proj"}
+            return {"language_model.model.qkv_proj"}
+
+    model = Model()
+    _, recv_l2_sq, applied_source_l2_sq, mappings, _ = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        model,
+        _FakeEngine(
+            [
+                ("model.language_model.layers.0.self_attn.q_proj.weight", torch.tensor([1.0, 2.0])),
+                ("model.language_model.layers.0.self_attn.k_proj.weight", torch.tensor([3.0, 4.0])),
+                ("model.vision_tower.layers.0.self_attn.k_proj.weight", torch.tensor([5.0, 6.0])),
+            ]
+        ),
+    )
+
+    _, loaded_l2_sq, _, _ = _model_parameter_l2(
+        model, torch.device("cpu"), _loaded_destination_names(mappings)
+    )
+    assert recv_l2_sq == 5.0 + 25.0 + 61.0
+    assert applied_source_l2_sq == loaded_l2_sq == 5.0 + 2 * 25.0 + 61.0
+
+
 def test_model_parameter_l2_excludes_receiver_only_composite_parameters():
     class CompositeModel(nn.Module):
         def __init__(self):

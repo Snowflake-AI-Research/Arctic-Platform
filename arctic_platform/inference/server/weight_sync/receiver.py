@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -129,6 +130,37 @@ def _canonicalize_destinations(
             for name in destinations
         }
     )
+
+
+def _stacked_source_fanout(model) -> Callable[[str, list[str]], int]:
+    """Count the shards ``model.load_weights`` fills from one HF source.
+
+    A list shard ID in a vLLM ``orig_to_new_stacked`` mapping loads the same
+    tensor into each listed shard; Gemma 4 ``attention_k_eq_v`` layers load one
+    ``k_proj`` into both K and V of ``qkv_proj``. Only destinations under the
+    module owning that mapping count, since another submodule's loader (the
+    Gemma 4 vision tower's ``k_proj``) can share the same name substring.
+    """
+    fanouts: list[tuple[str, str, int]] = []
+    for module_name, module in model.named_modules():
+        mapper = getattr(module, "hf_to_vllm_mapper", None)
+        for substr, (_, shard_id) in getattr(mapper, "orig_to_new_stacked", {}).items():
+            if isinstance(shard_id, list) and len(shard_id) > 1:
+                prefix = f"{module_name}." if module_name else ""
+                fanouts.append((prefix, substr, len(shard_id)))
+
+    def fanout(name: str, destinations: list[str]) -> int:
+        return max(
+            (
+                count
+                for prefix, substr, count in fanouts
+                if substr in name
+                and any(destination.startswith(prefix) for destination in destinations)
+            ),
+            default=1,
+        )
+
+    return fanout
 
 
 def _loaded_destination_names(
@@ -673,6 +705,7 @@ class WeightSyncExtension:
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
         param_names = {pname for pname, _ in model.named_parameters()}
+        fanout = _stacked_source_fanout(model)
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         applied_source_l2_sq = torch.zeros(
             (), dtype=torch.float64, device=self.device
@@ -693,7 +726,7 @@ class WeightSyncExtension:
             destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
-                applied_source_l2_sq.add_(source_l2_sq)
+                applied_source_l2_sq.add_(source_l2_sq * fanout(name, destinations))
             else:
                 skipped_source_names.append(name)
             loaded += 1
