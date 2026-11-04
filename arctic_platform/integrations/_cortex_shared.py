@@ -77,11 +77,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         input_ids = tensors["input_ids"]
 
     kwargs = {key: value for key, value in tensors.items() if torch.is_tensor(value)}
-    context = {
-        key: value
-        for key, value in meta.items()
-        if key != "dp_size" and not torch.is_tensor(value)
-    }
+    context = {key: value for key, value in meta.items() if key != "dp_size" and not torch.is_tensor(value)}
     context["input_ids"] = input_ids
     # A log-prob call is a snapshot of the caller's rows. Balancing would
     # reorder them, and the returned logprobs have to land on those same columns.
