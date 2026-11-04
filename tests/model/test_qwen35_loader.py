@@ -416,10 +416,140 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     iterator = qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)
-    assert next(iterator) == ("mtp.fc.weight", live)
     with pytest.raises(RuntimeError, match="collides with live HF export"):
         next(iterator)
     assert sidecar_reads == []
+
+
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, monkeypatch, family, replacement):
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights as glm
+    from arctic_platform.model.implementations.qwen35 import mtp_weights as qwen
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    model = nn.Identity()
+    if family == "glm":
+        from types import SimpleNamespace
+
+        model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
+        tensors = {
+            f"model.language_model.layers.1.{suffix}.weight": torch.ones(2) for suffix in ("eh_proj", "enorm", "hnorm")
+        }
+        capture, iterator = glm.capture_auxiliary_weights, glm.iter_preserved_auxiliary_weights
+    else:
+        model = _mtp_export_model()
+        tensors = {name: torch.ones(2) for name in qwen._configured_names(model)}
+        capture, iterator = qwen.capture_mtp_weights, qwen.iter_preserved_mtp_weights
+    shard = tmp_path / "model.safetensors"
+    save_file(tensors, shard)
+    capture(model, tmp_path)
+    export = iterator(model)
+    next(export)
+    if replacement:
+        substitute = tmp_path / "replacement.safetensors"
+        save_file({name: tensor + 1 for name, tensor in tensors.items()}, substitute)
+        substitute.replace(shard)
+    else:
+        save_file({name: tensor + 1 for name, tensor in tensors.items()}, shard)
+    with pytest.raises(RuntimeError, match="shard changed"):
+        next(export)
+
+
+def test_glm_prediction_capture_rejects_nonregular_shard_without_blocking(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights as glm
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    model = nn.Identity()
+    model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
+    names = [f"model.language_model.layers.1.{suffix}.weight" for suffix in ("eh_proj", "enorm", "hnorm")]
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(dict(weight_map=dict.fromkeys(names, "fifo.safetensors")))
+    )
+    os.mkfifo(tmp_path / "fifo.safetensors")
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        glm.capture_auxiliary_weights(model, tmp_path)
+
+
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+def test_prediction_export_rechecks_source_after_tensor_read(tmp_path, monkeypatch, family):
+    from types import SimpleNamespace
+
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights as glm
+    from arctic_platform.model.implementations.moe import preserved_weights
+    from arctic_platform.model.implementations.qwen35 import mtp_weights as qwen
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    model = _mtp_export_model() if family == "qwen" else nn.Identity()
+    if family == "glm":
+        model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
+        names = {f"model.language_model.layers.1.{suffix}.weight" for suffix in ("eh_proj", "enorm", "hnorm")}
+        capture, iterator = glm.capture_auxiliary_weights, glm.iter_preserved_auxiliary_weights
+    else:
+        names = qwen._configured_names(model)
+        capture, iterator = qwen.capture_mtp_weights, qwen.iter_preserved_mtp_weights
+    shard = tmp_path / "model.safetensors"
+    tensors = {name: torch.ones(2) for name in names}
+    save_file(tensors, shard)
+    capture(model, tmp_path)
+    replacement = tmp_path / "replacement.safetensors"
+    save_file({name: torch.zeros(2) for name in names}, replacement)
+    native = preserved_weights.safe_open
+
+    class Reader:
+        def __init__(self, *args, **kwargs):
+            self.context = native(*args, **kwargs)
+
+        def __enter__(self):
+            self.reader = self.context.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.context.__exit__(*args)
+
+        def get_slice(self, name):
+            return self.reader.get_slice(name)
+
+        def get_tensor(self, name):
+            tensor = self.reader.get_tensor(name)
+            replacement.replace(shard)
+            return tensor
+
+    monkeypatch.setattr(preserved_weights, "safe_open", Reader)
+    with pytest.raises(RuntimeError, match="shard changed"):
+        next(iterator(model))
+
+
+def test_glm_prediction_capture_checks_indexed_inventory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    model = nn.Identity()
+    model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
+    prefix = "model.language_model.layers.1."
+    names = {prefix + suffix + ".weight" for suffix in ("eh_proj", "enorm", "hnorm")}
+    save_file({name: torch.ones(2) for name in names | {prefix + "unindexed.weight"}}, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(dict(weight_map=dict.fromkeys(names, "model.safetensors")))
+    )
+    with pytest.raises(RuntimeError, match="does not match checkpoint index"):
+        auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
 
 
 @pytest.mark.parametrize("family,fault", [("qwen", "collision"), ("glm", "collision"), ("glm", "read")])

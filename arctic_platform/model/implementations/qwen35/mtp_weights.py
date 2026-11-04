@@ -17,18 +17,18 @@
 
 from __future__ import annotations
 
-import json
-import os
-import stat
 from collections.abc import Iterable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from safetensors import safe_open
 from torch import nn
+
+from arctic_platform.model.implementations.moe.preserved_weights import PreservedWeight as _PreservedWeight
+from arctic_platform.model.implementations.moe.preserved_weights import capture_original_weights as _capture_original_weights
+from arctic_platform.model.implementations.moe.preserved_weights import open_preserved_weight
+from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
 _STATE_ATTRIBUTE = "_ap_preserved_mtp_weights"
 _BASE_NAMES = (
@@ -80,16 +80,6 @@ _QWEN4_LAYER_NAMES = (
 
 
 @dataclass(frozen=True)
-class _PreservedWeight:
-    name: str
-    path: Path
-    identity: tuple[int, ...]
-    shape: tuple[int, ...]
-    dtype: str
-    index_identity: tuple[Path, tuple[int, ...]] | None
-
-
-@dataclass(frozen=True)
 class _PreservedExport:
     weights: Iterable[tuple[str, torch.Tensor]]
     names: frozenset[str]
@@ -113,109 +103,6 @@ def _configured_names(model: nn.Module) -> set[str]:
     return {f"mtp.{name}" for name in base_names} | {
         f"mtp.layers.{index}.{name}" for index in range(count) for name in layer_names
     }
-
-
-def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
-def _unique_json_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate checkpoint index key: {key}")
-        result[key] = value
-    return result
-
-
-def _capture_original_weights(
-    source_path: Path, expected: set[str], *, prefixes: tuple[str, ...] = ("mtp.",)
-) -> list[_PreservedWeight]:
-    """The resolved original checkpoint must stay immutable through ordinary DCP loading."""
-    preserved: list[_PreservedWeight] = []
-    held: list[tuple[Path, int, os.stat_result]] = []
-    with ExitStack() as stack:
-
-        def hold(path: Path) -> int:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-            stack.callback(os.close, fd)
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(f"original checkpoint source is not a regular file: {path}")
-            if _file_identity(os.stat(path)) != _file_identity(metadata):
-                raise ValueError(f"original checkpoint source changed while opening: {path}")
-            held.append((path, fd, metadata))
-            return fd
-
-        index_path = source_path / "model.safetensors.index.json"
-        index_identity = None
-        indexed: dict[Path, set[str]] | None = None
-        if os.path.lexists(index_path):
-            index_fd = hold(index_path)
-            index_identity = (index_path, _file_identity(os.fstat(index_fd)))
-            with os.fdopen(os.dup(index_fd), encoding="utf-8") as handle:
-                index = json.load(handle, object_pairs_hook=_unique_json_object)
-            weight_map = index.get("weight_map") if isinstance(index, dict) else None
-            if not isinstance(weight_map, dict) or not all(isinstance(name, str) for name in weight_map):
-                raise ValueError("original checkpoint index requires a weight_map object")
-            mtp_names = {name for name in weight_map if name.startswith(prefixes)}
-            if mtp_names != expected:
-                raise ValueError(
-                    "original Qwen MTP index mismatch: "
-                    f"missing={sorted(expected - mtp_names)}, unexpected={sorted(mtp_names - expected)}"
-                )
-            indexed = {}
-            for name in sorted(mtp_names):
-                shard_name = weight_map[name]
-                if (
-                    not isinstance(shard_name, str)
-                    or not shard_name
-                    or "\\" in shard_name
-                    or Path(shard_name).is_absolute()
-                    or ".." in Path(shard_name).parts
-                    or Path(shard_name).suffix != ".safetensors"
-                ):
-                    raise ValueError(f"unsafe original MTP shard path for {name}: {shard_name!r}")
-                indexed.setdefault(source_path / shard_name, set()).add(name)
-
-        shards = sorted(indexed if indexed is not None else source_path.glob("*.safetensors"))
-        names: set[str] = set()
-        for shard in shards:
-            shard_fd = hold(shard)
-            # Read the held file generation, not a separately reopened mutable pathname.
-            with safe_open(f"/proc/self/fd/{shard_fd}", framework="pt", device="cpu") as reader:
-                shard_names = {name for name in reader.keys() if name.startswith(prefixes)}
-                if indexed is not None and shard_names != indexed[shard]:
-                    raise ValueError(f"original MTP shard does not match checkpoint index: {shard}")
-                for name in sorted(shard_names):
-                    if name in names:
-                        raise ValueError(f"duplicate original MTP tensor: {name}")
-                    names.add(name)
-                    source = reader.get_slice(name)
-                    preserved.append(
-                        _PreservedWeight(
-                            name, shard, _file_identity(os.fstat(shard_fd)),
-                            tuple(source.get_shape()), source.get_dtype(), index_identity,
-                        )
-                    )
-        if names != expected:
-            raise ValueError(
-                "original Qwen MTP inventory mismatch: "
-                f"missing={sorted(expected - names)}, unexpected={sorted(names - expected)}"
-            )
-        for path, fd, metadata in held:
-            if _file_identity(os.fstat(fd)) != _file_identity(metadata) or _file_identity(
-                os.stat(path)
-            ) != _file_identity(metadata):
-                raise ValueError(f"original checkpoint source changed during MTP capture: {path}")
-    return preserved
 
 
 def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
@@ -316,16 +203,8 @@ def validate_preserved_mtp_weights(model: nn.Module) -> None:
     if len(names) != len(set(names)) or set(names) != expected:
         raise RuntimeError("Full Qwen HF export requires captured original MTP weights")
     for weight in preserved:
-        if _file_identity(weight.path.stat()) != weight.identity:
-            raise RuntimeError(f"Preserved original MTP shard changed: {weight.path}")
-        if weight.index_identity is not None:
-            path, identity = weight.index_identity
-            if _file_identity(path.stat()) != identity:
-                raise RuntimeError("Preserved original Qwen MTP index changed")
-        with safe_open(weight.path, framework="pt", device="cpu") as reader:
-            source = reader.get_slice(weight.name)
-            if tuple(source.get_shape()) != weight.shape or source.get_dtype() != weight.dtype:
-                raise RuntimeError(f"Preserved original MTP tensor changed layout or dtype: {weight.name}")
+        with open_preserved_weight(weight):
+            pass
 
 
 def iter_preserved_mtp_weights(model: nn.Module):
@@ -334,5 +213,4 @@ def iter_preserved_mtp_weights(model: nn.Module):
     if model.__dict__.get("_ap_weights_random_initialized", False) or not _configured_names(model):
         return
     for weight in getattr(model, _STATE_ATTRIBUTE, ()):
-        with safe_open(weight.path, framework="pt", device="cpu") as reader:
-            yield weight.name, reader.get_tensor(weight.name)
+        yield weight.name, read_preserved_weight(weight)

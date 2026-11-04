@@ -228,13 +228,17 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
                 model, iter_preserved_mtp_weights, description="Qwen MTP weights",
                 validate=validate_preserved_mtp_weights, names=preserved_mtp_names,
             )
-            if include_skipped else ()
+            if include_skipped else None
         )
         names: set[str] = set()
+        collision = False
         for name, tensor in ordinary(include_skipped=include_skipped):
             names.add(name)
-            yield name, tensor
-        if include_skipped:
+            collision = collision or (preserved is not None and name in preserved.names)
+            # Drain ordinary collectives on every rank, but never publish a colliding live tensor.
+            if not collision:
+                yield name, tensor
+        if preserved is not None:
             yield from finish_preserved_weight_export(preserved, names, description="Original MTP")
 
     return iterator

@@ -17,28 +17,18 @@
 
 from __future__ import annotations
 
-import json
-import stat
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch.distributed as dist
-from safetensors import safe_open
 from torch import nn
 
-from arctic_platform.model.implementations.qwen35.mtp_weights import _file_identity
-from arctic_platform.model.implementations.qwen35.mtp_weights import _unique_json_object
+from arctic_platform.model.implementations.moe.preserved_weights import PreservedWeight as _PreservedShardWeight
+from arctic_platform.model.implementations.moe.preserved_weights import capture_original_weights
+from arctic_platform.model.implementations.moe.preserved_weights import file_identity
+from arctic_platform.model.implementations.moe.preserved_weights import open_preserved_weight
+from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
 STATE_ATTRIBUTE = "_ap_preserved_glm_auxiliary_weights"
-
-
-@dataclass(frozen=True)
-class _PreservedShardWeight:
-    name: str
-    path: Path
-    identity: tuple[int, ...]
-    shape: tuple[int, ...]
-    dtype: str
 
 
 def _layer_prefixes(config) -> tuple[str, ...]:
@@ -53,61 +43,13 @@ def _layer_prefixes(config) -> tuple[str, ...]:
 
 
 def _capture(source_path: Path, prefixes: tuple[str, ...]):
-    index_path = source_path / "model.safetensors.index.json"
-    index_identity = None
-    mapping: dict[str, str] = {}
-    if index_path.exists():
-        metadata = index_path.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("GLM auxiliary checkpoint index must be a regular file")
-        index_identity = (index_path, _file_identity(metadata))
-        with index_path.open(encoding="utf-8") as stream:
-            index = json.load(stream, object_pairs_hook=_unique_json_object)
-        indexed_mapping = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(indexed_mapping, dict) or not all(isinstance(name, str) for name in indexed_mapping):
-            raise ValueError("GLM auxiliary checkpoint requires an indexed tensor inventory")
-        mapping = indexed_mapping
-    else:
-        for shard in sorted(source_path.glob("*.safetensors")):
-            with safe_open(shard, framework="pt", device="cpu") as reader:
-                for name in reader.keys():
-                    if name in mapping:
-                        raise ValueError(f"Duplicate original GLM tensor: {name}")
-                    mapping[name] = shard.name
-    expected = {name for name in mapping if name.startswith(prefixes)}
+    preserved: list[_PreservedShardWeight] = capture_original_weights(source_path, None, prefixes=prefixes)
+    expected = {weight.name for weight in preserved}
     for prefix in prefixes:
         required = {prefix + suffix for suffix in ("eh_proj.weight", "enorm.weight", "hnorm.weight")}
         if not required <= expected:
             raise ValueError(f"GLM original prediction layer is incomplete: {prefix}")
-    shards: dict[Path, list[str]] = {}
-    for name in sorted(expected):
-        filename = mapping[name]
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or "\\" in filename
-            or Path(filename).is_absolute()
-            or ".." in Path(filename).parts
-            or Path(filename).suffix != ".safetensors"
-        ):
-            raise ValueError(f"Unsafe original GLM shard path: {filename!r}")
-        shards.setdefault(source_path / filename, []).append(name)
-    preserved = []
-    for shard, names in shards.items():
-        metadata = shard.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"Original GLM shard is not a regular file: {shard}")
-        identity = _file_identity(metadata)
-        with safe_open(shard, framework="pt", device="cpu") as reader:
-            for name in names:
-                source = reader.get_slice(name)
-                preserved.append(
-                    _PreservedShardWeight(name, shard, identity, tuple(source.get_shape()), source.get_dtype())
-                )
-        if _file_identity(shard.stat()) != identity:
-            raise ValueError(f"Original GLM shard changed during capture: {shard}")
-    if index_identity is not None and _file_identity(index_path.stat()) != index_identity[1]:
-        raise ValueError("GLM auxiliary checkpoint index changed during capture")
+    index_identity = preserved[0].index_identity if preserved else None
     return tuple(sorted(expected)), tuple(sorted(preserved, key=lambda weight: weight.name)), index_identity
 
 
@@ -151,11 +93,11 @@ def validate_preserved_auxiliary_weights(model: nn.Module) -> None:
     actual = tuple(weight.name for weight in weights)
     if actual != names or len(set(actual)) != len(actual) or not all(name.startswith(prefixes) for name in actual):
         raise RuntimeError("Preserved GLM prediction-layer inventory changed")
-    if index_identity is not None and _file_identity(index_identity[0].stat()) != index_identity[1]:
+    if index_identity is not None and file_identity(index_identity[0].stat()) != index_identity[1]:
         raise RuntimeError("Preserved GLM prediction-layer index changed")
     for weight in weights:
-        if _file_identity(weight.path.stat()) != weight.identity:
-            raise RuntimeError(f"Preserved GLM prediction shard changed: {weight.path}")
+        with open_preserved_weight(weight):
+            pass
 
 
 def iter_preserved_auxiliary_weights(model: nn.Module):
@@ -169,11 +111,7 @@ def iter_preserved_auxiliary_weights(model: nn.Module):
     if state is None:
         raise RuntimeError("Full GLM HF export requires captured original prediction layers")
     for weight in state[2]:
-        with safe_open(weight.path, framework="pt", device="cpu") as reader:
-            source = reader.get_slice(weight.name)
-            if tuple(source.get_shape()) != weight.shape or source.get_dtype() != weight.dtype:
-                raise RuntimeError(f"Preserved GLM prediction tensor changed layout or dtype: {weight.name}")
-            yield weight.name, reader.get_tensor(weight.name)
+        yield weight.name, read_preserved_weight(weight)
 
 
 def preserved_auxiliary_names(model: nn.Module):
