@@ -231,6 +231,11 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     contract = weight_export_contract(model)
     if contract is not None and contract.vllm is not None:
         return False
+    # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
+    for name, _ in model.named_parameters():
+        export_name = hf_export_parameter_name(name)
+        if export_name is not None and export_name.startswith("model.language_model."):
+            return True
     return bool(hf_sync_name_map(model, checkpoint_dir))
 
 
