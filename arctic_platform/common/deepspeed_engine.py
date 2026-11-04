@@ -195,10 +195,16 @@ class _OffloadedGradientFile:
         self.size = source.numel() * source.element_size()
         directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(exist_ok=True)
             self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
-        except OSError:
-            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=tempfile.gettempdir())
+        except OSError as error:
+            fallback = Path(tempfile.gettempdir())
+            logger.info(
+                "Offloaded gradient scratch %s is unavailable (%s); falling back to %s", directory, error, fallback
+            )
+            directory = fallback
+            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+        logger.info("Offloaded gradient snapshot scratch directory: %s", directory)
         os.ftruncate(self.file.fileno(), self.size)
         os.posix_fadvise(self.file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
 
@@ -258,7 +264,10 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     """
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
-    if type(optimizer) is not DeepSpeedZeroOptimizer or not optimizer.cpu_offload:
+    if type(optimizer) is not DeepSpeedZeroOptimizer:
+        logger.debug("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
+        return False
+    if not optimizer.cpu_offload:
         return False
     compact_groups = [
         group_idx
@@ -278,6 +287,8 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     reset_cpu_buffers = optimizer.reset_cpu_buffers
     optimizer_step = optimizer._optimizer_step
     gradient_partition_epilogue = optimizer.independent_gradient_partition_epilogue
+    finalize_gradient_accumulation = optimizer.finalize_gradient_accumulation_boundary
+    finalize_remaining = None
 
     def release_partition(group_idx):
         partition = optimizer.averaged_gradients.get(group_idx)
@@ -294,6 +305,12 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
         if group_idx is None:
             group_idx = optimizer._get_param_group_idx(param)
         copy_grads_in_partition(param, group_idx)
+        if finalize_remaining is not None and group_idx in finalize_remaining:
+            finalize_remaining[group_idx].discard(optimizer.get_param_id(param))
+            if len(finalize_remaining[group_idx]) == 0:
+                optimizer._wait_for_offload_copies()
+                optimizer.averaged_gradients[group_idx] = None
+            return
         if optimizer._use_compact_grad_partition_buffer(group_idx) and all(
             optimizer.params_already_reduced[optimizer.get_param_id(partition_param)]
             for partition_param in optimizer.params_in_partition[group_idx]
@@ -308,6 +325,26 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
             for group_idx in compact_groups:
                 release_partition(group_idx)
         return result
+
+    def finalize_then_release(*args, **kwargs):
+        nonlocal finalize_remaining
+        finalize_remaining = {
+            group_idx: {
+                optimizer.get_param_id(param)
+                for param in optimizer.params_in_partition[group_idx]
+                if param.requires_grad and optimizer.get_param_id(param) in optimizer._offload_accumulated_param_ids
+            }
+            for group_idx in compact_groups
+        }
+        try:
+            result = finalize_gradient_accumulation(*args, **kwargs)
+            if any(optimizer.averaged_gradients.get(group_idx) is not None for group_idx in compact_groups):
+                optimizer._wait_for_offload_copies()
+                for group_idx in compact_groups:
+                    optimizer.averaged_gradients[group_idx] = None
+            return result
+        finally:
+            finalize_remaining = None
 
     def partition_buffer(group_idx):
         previous_partition = optimizer.averaged_gradients.get(group_idx)
@@ -342,6 +379,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
 
     optimizer.copy_grads_in_partition = copy_then_release
     optimizer.independent_gradient_partition_epilogue = epilogue_then_release
+    optimizer.finalize_gradient_accumulation_boundary = finalize_then_release
     optimizer._get_compact_grad_partition_buffer = partition_buffer
     optimizer.reset_cpu_buffers = reset_then_release
     optimizer.step = step_then_release

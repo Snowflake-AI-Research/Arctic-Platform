@@ -597,6 +597,30 @@ def test_offloaded_file_snapshot_refuses_truncated_restore(monkeypatch, tmp_path
     snapshot.file.close()
 
 
+def test_offloaded_file_snapshot_closes_enospc_without_retry(monkeypatch, tmp_path):
+    import errno
+
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path))
+    native = deepspeed_engine.tempfile.TemporaryFile
+    files = []
+
+    def owned_file(*args, **kwargs):
+        file = native(*args, **kwargs)
+        files.append(file)
+        return file
+
+    def disk_full(*args):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", owned_file)
+    monkeypatch.setattr(deepspeed_engine.os, "pwritev", disk_full)
+    with pytest.raises(OSError, match="No space left on device"):
+        deepspeed_engine._OffloadedGradientStorage().snapshot(torch.ones(55, dtype=torch.float32))
+    assert len(files) == 1
+    assert files[0].closed
+
+
 class _PartialGradientModel(torch.nn.Module):
     def __init__(self, *, participation, reentrant):
         super().__init__()
@@ -619,7 +643,9 @@ class _PartialGradientModel(torch.nn.Module):
         return inputs
 
 
-def _partition_release_engine(monkeypatch, *, stage, fp32_masters, release, participation=None, reentrant=False):
+def _partition_release_engine(
+    monkeypatch, *, stage, fp32_masters, release, participation=None, reentrant=False, managed=True, overlap_comm=False
+):
     set_seed(0)
     if participation is None:
         model = torch.nn.Sequential(
@@ -635,7 +661,12 @@ def _partition_release_engine(monkeypatch, *, stage, fp32_masters, release, part
         fp32_masters=fp32_masters,
         gradient_clipping=0,
         ds_overrides={
-            "zero_optimization": {"stage": stage, "offload_optimizer": {"device": "cpu", "pin_memory": False}},
+            "zero_optimization": {
+                "stage": stage,
+                "offload_optimizer": {"device": "cpu", "pin_memory": False},
+                "overlap_comm": overlap_comm,
+            },
+            "managed_gradient_accumulation": managed,
             "zero_force_ds_cpu_optimizer": False,
             "data_types": {"grad_accum_dtype": "fp32"},
         },
@@ -657,6 +688,73 @@ def _partition_release_engine(monkeypatch, *, stage, fp32_masters, release, part
             rank=0,
         )
     return engine
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("fp32_masters", [False, True])
+@pytest.mark.parametrize("overlap_comm", [False, True])
+@pytest.mark.parametrize("file_snapshots", [False, True])
+def test_offloaded_unmanaged_finalize_releases_each_group_without_resnapshot(
+    monkeypatch, single_rank_group, fp32_masters, overlap_comm, file_snapshots
+):
+    import inspect
+
+    if file_snapshots:
+        monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    options = dict(stage=2, fp32_masters=fp32_masters, managed=False, overlap_comm=overlap_comm)
+    evicted = _partition_release_engine(monkeypatch, release=True, **options)
+    baseline = _partition_release_engine(monkeypatch, release=False, **options)
+    retained = inspect.getclosurevars(evicted.optimizer.step).nonlocals["retained"]
+    original_buffer = evicted.optimizer._get_compact_grad_partition_buffer
+    original_finalize = evicted.optimizer.finalize_gradient_accumulation_boundary
+    restores = []
+    finalizing = False
+
+    def buffer(group_idx):
+        restoring = evicted.optimizer.averaged_gradients.get(group_idx) is None and group_idx in retained
+        result = original_buffer(group_idx)
+        if finalizing and restoring:
+            restores.append(group_idx)
+        return result
+
+    def finalize():
+        nonlocal finalizing
+        finalizing = True
+        try:
+            result = original_finalize()
+            assert all(partition is None for partition in evicted.optimizer.averaged_gradients.values())
+            # Gradient inspection still needs the sum until the native update consumes it.
+            assert set(retained) == set(range(len(evicted.optimizer.bit16_groups)))
+            return result
+        finally:
+            finalizing = False
+
+    monkeypatch.setattr(evicted.optimizer, "_get_compact_grad_partition_buffer", buffer)
+    monkeypatch.setattr(evicted.optimizer, "finalize_gradient_accumulation_boundary", finalize)
+    for window in range(2):
+        for microstep in range(2):
+            inputs = torch.full(
+                (4, _PARTITION_WIDTH), 0.1 * (window + microstep + 1), device="cuda", dtype=torch.bfloat16
+            )
+            losses = []
+            for engine in (evicted, baseline):
+                loss = engine(inputs).float().square().mean()
+                losses.append(loss.detach())
+                engine.backward(loss)
+            torch_assert_equal(*losses)
+            assert all(partition is None for partition in evicted.optimizer.averaged_gradients.values())
+        restores.clear()
+        evicted.step()
+        baseline.step()
+        assert restores == list(range(len(evicted.optimizer.bit16_groups)))
+        assert retained == {}
+        assert all(partition is None for partition in evicted.optimizer.averaged_gradients.values())
+        torch_assert_equal(
+            torch.as_tensor(evicted.optimizer._global_grad_norm), torch.as_tensor(baseline.optimizer._global_grad_norm)
+        )
+        for parameter, reference in zip(evicted.module.parameters(), baseline.module.parameters()):
+            torch_assert_equal(parameter, reference)
 
 
 @require_torch_gpu
@@ -1117,6 +1215,9 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
         def independent_gradient_partition_epilogue(self):
             return "epilogue"
 
+        def finalize_gradient_accumulation_boundary(self):
+            return "finalized"
+
     monkeypatch.setattr("deepspeed.runtime.zero.stage_1_and_2.DeepSpeedZeroOptimizer", NativeOptimizer)
     optimizer = NativeOptimizer()
     original_attributes = dict(vars(optimizer))
@@ -1207,6 +1308,9 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
 
         def _optimizer_step(self, group_idx):
             return group_idx
+
+        def finalize_gradient_accumulation_boundary(self):
+            return None
 
     monkeypatch.setattr("deepspeed.runtime.zero.stage_1_and_2.DeepSpeedZeroOptimizer", NativeOptimizer)
     optimizer = NativeOptimizer()
