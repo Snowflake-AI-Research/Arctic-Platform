@@ -334,9 +334,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     state: its CPU master gradient has already been unscaled and clipped, so the snapshot is no longer needed.
     Successful steps, including skipped overflow steps, clear all snapshots. Failed steps retain only groups not
     submitted for update; native updates are not transactional. Optimizers without CPU offload keep their methods.
-    After native reset has waited for offload copies, discard compact groups' CPU accumulators as well: their sums and
-    master-gradient views belong to the completed update, not to the next update or a restored checkpoint. Noncompact
-    groups retain native accumulator ownership and cleanup.
+    Native CPU accumulator ownership and cleanup are unchanged.
     """
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
@@ -345,6 +343,29 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     if type(optimizer) is not DeepSpeedZeroOptimizer:
         logger.warning("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
         return False
+    required = (
+        "bit16_groups",
+        "partition_size",
+        "averaged_gradients",
+        "params_in_partition",
+        "params_already_reduced",
+        "_offload_accumulated_param_ids",
+        "_use_compact_grad_partition_buffer",
+        "_get_compact_grad_partition_buffer",
+        "_get_param_group_idx",
+        "_wait_for_offload_copies",
+        "get_param_id",
+        "copy_grads_in_partition",
+        "step",
+        "reset_cpu_buffers",
+        "_optimizer_step",
+        "independent_gradient_partition_epilogue",
+        "finalize_gradient_accumulation_boundary",
+    )
+    missing = [name for name in required if not hasattr(optimizer, name)]
+    if missing:
+        logger.warning("Offloaded partition release requires supported DeepSpeed capabilities; missing: %s", missing)
+        return False
     compact_groups = [
         group_idx
         for group_idx in range(len(optimizer.bit16_groups))
@@ -352,11 +373,13 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     ]
     if not compact_groups:
         return False
-    compact_param_ids = {
-        optimizer.get_param_id(param) for group_idx in compact_groups for param in optimizer.bit16_groups[group_idx]
-    }
     retained: dict[int, Any] = {}
-    storage = _OffloadedGradientStorage()
+    # Small partitions never touch scratch storage, including its filesystem requirements.
+    storage = (
+        _OffloadedGradientStorage()
+        if max(optimizer.partition_size[index] * 4 for index in compact_groups) > _OFFLOADED_SNAPSHOT_CHUNK_BYTES
+        else None
+    )
     copy_grads_in_partition = optimizer.copy_grads_in_partition
     compact_grad_partition_buffer = optimizer._get_compact_grad_partition_buffer
     step = optimizer.step
@@ -372,7 +395,10 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
             return
         snapshot = retained.get(group_idx)
         if snapshot is None:
-            retained[group_idx] = storage.snapshot(partition.flat_partition.detach())
+            source = partition.flat_partition.detach()
+            retained[group_idx] = (
+                storage.snapshot(source) if storage is not None else source.to(device="cpu", non_blocking=False)
+            )
         else:
             snapshot.copy_(partition.flat_partition.detach())
         optimizer.averaged_gradients[group_idx] = None
@@ -436,8 +462,6 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
 
     def reset_then_release(*args, **kwargs):
         result = reset_cpu_buffers(*args, **kwargs)
-        for param_id in compact_param_ids:
-            optimizer.accumulated_grads_in_cpu.pop(param_id, None)
         retained.clear()
         # The overflow path resets CPU buffers without detaching the compact GPU partition.
         for group_idx in optimizer.averaged_gradients:

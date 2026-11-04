@@ -673,10 +673,53 @@ def test_offloaded_release_validates_settings_before_installing_hooks(monkeypatc
     optimizer = object.__new__(DeepSpeedZeroOptimizer)
     optimizer.cpu_offload = True
     optimizer.bit16_groups = [[]]
+    optimizer.partition_size = [deepspeed_engine._OFFLOADED_SNAPSHOT_CHUNK_BYTES]
+    optimizer.averaged_gradients = {}
+    optimizer.params_in_partition = {}
+    optimizer.params_already_reduced = {}
+    optimizer._offload_accumulated_param_ids = set()
+    optimizer._wait_for_offload_copies = lambda: None
+    optimizer.finalize_gradient_accumulation_boundary = lambda: None
     optimizer._use_compact_grad_partition_buffer = lambda group: True
     monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", value)
     with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES"):
         deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+
+
+@pytest.mark.parametrize("large", [False, True])
+def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp_path, large):
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    optimizer = object.__new__(DeepSpeedZeroOptimizer)
+    optimizer.cpu_offload = True
+    optimizer.bit16_groups = [[]]
+    optimizer.partition_size = [deepspeed_engine._OFFLOADED_SNAPSHOT_CHUNK_BYTES if large else 1]
+    optimizer.averaged_gradients = {}
+    optimizer.params_in_partition = {}
+    optimizer.params_already_reduced = {}
+    optimizer._offload_accumulated_param_ids = set()
+    optimizer._use_compact_grad_partition_buffer = lambda group: True
+    optimizer._wait_for_offload_copies = lambda: None
+    optimizer.finalize_gradient_accumulation_boundary = lambda: None
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path / "missing" / "scratch"))
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(deepspeed_engine, "_scratch_filesystem_type", lambda path: "tmpfs")
+    if large:
+        with pytest.raises(ValueError, match="tmpfs"):
+            deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    else:
+        assert deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+
+
+def test_offloaded_missing_private_capability_preserves_native_optimizer(monkeypatch, caplog):
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    optimizer = object.__new__(DeepSpeedZeroOptimizer)
+    optimizer.cpu_offload = True
+    original = dict(vars(optimizer))
+    assert not deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    assert vars(optimizer) == original
+    assert "missing:" in caplog.text
 
 
 def test_offloaded_scratch_setup_is_cached_across_snapshots(monkeypatch, tmp_path, caplog):
@@ -1075,7 +1118,6 @@ def test_offloaded_partition_release_evicts_partial_checkpoint_groups(
                 torch_assert_equal(actual, expected)
         evicted.step()
         baseline.step()
-        assert evicted.optimizer.accumulated_grads_in_cpu == {}
         torch_assert_equal(
             torch.as_tensor(evicted.optimizer._global_grad_norm),
             torch.as_tensor(baseline.optimizer._global_grad_norm),
@@ -1122,7 +1164,6 @@ def test_offloaded_partition_reset_preserves_checkpoint_continuation(
         )
         engine.step()
         assert retained == {}
-        assert engine.optimizer.accumulated_grads_in_cpu == {}
         return loss.detach(), torch.as_tensor(engine.optimizer._global_grad_norm)
 
     update(continued)
@@ -1346,6 +1387,10 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
         def __init__(self):
             self.cpu_offload = True
             self.bit16_groups = [[0], [1]]
+            self.partition_size = [1, 1]
+            self.params_in_partition = {}
+            self.params_already_reduced = {}
+            self._offload_accumulated_param_ids = set()
             self.accumulated_grads_in_cpu = {0: object(), 1: object()}
             self.averaged_gradients = {0: object(), 1: object()}
             self.reset_calls = []
@@ -1355,6 +1400,12 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
 
         def get_param_id(self, param):
             return param
+
+        def _get_param_group_idx(self, param):
+            return param
+
+        def _wait_for_offload_copies(self):
+            return None
 
         def copy_grads_in_partition(self, param, group_idx=None):
             return param, group_idx
@@ -1388,7 +1439,7 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
         assert vars(optimizer) == original_attributes
     assert optimizer.reset_cpu_buffers("request", boundary=True) == "reset"
     assert optimizer.reset_calls == [(("request",), {"boundary": True})]
-    expected_ids = {1} if compact else {0, 1}
+    expected_ids = {0, 1}
     assert optimizer.accumulated_grads_in_cpu.keys() == expected_ids
     for param_id in expected_ids:
         assert optimizer.accumulated_grads_in_cpu[param_id] is original_accumulators[param_id]
@@ -1425,6 +1476,8 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
                 torch.nn.Parameter(torch.empty(0)),
             ]
             self.bit16_groups = [self.parameters, [torch.nn.Parameter(torch.ones(1))]]
+            self.partition_size = [2, 1]
+            self._offload_accumulated_param_ids = set()
             self.accumulated_grads_in_cpu = {}
             self.averaged_gradients = {
                 0: SimpleNamespace(flat_partition=torch.tensor([1.0, 2.0])),
@@ -1439,6 +1492,9 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
 
         def get_param_id(self, param):
             return next(index for index, candidate in enumerate(self.parameters) if candidate is param)
+
+        def _get_param_group_idx(self, param):
+            return 0
 
         def copy_grads_in_partition(self, param, group_idx=None):
             return NativeOptimizer.independent_gradient_partition_epilogue(self, "request", complete=True)
