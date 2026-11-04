@@ -22,7 +22,6 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
 import torch.distributed as dist
 from safetensors import safe_open
 from torch import nn
@@ -39,7 +38,7 @@ class _PreservedShardWeight:
     path: Path
     identity: tuple[int, ...]
     shape: tuple[int, ...]
-    dtype: torch.dtype
+    dtype: str
 
 
 def _layer_prefixes(config) -> tuple[str, ...]:
@@ -101,9 +100,10 @@ def _capture(source_path: Path, prefixes: tuple[str, ...]):
         identity = _file_identity(metadata)
         with safe_open(shard, framework="pt", device="cpu") as reader:
             for name in names:
-                # get_tensor creates a mapped view; retain only metadata, never the inactive layer's payload.
-                tensor = reader.get_tensor(name)
-                preserved.append(_PreservedShardWeight(name, shard, identity, tuple(tensor.shape), tensor.dtype))
+                source = reader.get_slice(name)
+                preserved.append(
+                    _PreservedShardWeight(name, shard, identity, tuple(source.get_shape()), source.get_dtype())
+                )
         if _file_identity(shard.stat()) != identity:
             raise ValueError(f"Original GLM shard changed during capture: {shard}")
     if index_identity is not None and _file_identity(index_path.stat()) != index_identity[1]:
@@ -170,7 +170,14 @@ def iter_preserved_auxiliary_weights(model: nn.Module):
         raise RuntimeError("Full GLM HF export requires captured original prediction layers")
     for weight in state[2]:
         with safe_open(weight.path, framework="pt", device="cpu") as reader:
-            tensor = reader.get_tensor(weight.name)
-            if tuple(tensor.shape) != weight.shape or tensor.dtype != weight.dtype:
+            source = reader.get_slice(weight.name)
+            if tuple(source.get_shape()) != weight.shape or source.get_dtype() != weight.dtype:
                 raise RuntimeError(f"Preserved GLM prediction tensor changed layout or dtype: {weight.name}")
-            yield weight.name, tensor
+            yield weight.name, reader.get_tensor(weight.name)
+
+
+def preserved_auxiliary_names(model: nn.Module):
+    state = getattr(model, STATE_ATTRIBUTE, None)
+    if model.__dict__.get("_ap_weights_random_initialized", False) or state is None:
+        return ()
+    return state[1]

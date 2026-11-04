@@ -861,7 +861,15 @@ def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
         lambda model: lambda **kwargs: iter([("inactive.weight", value)]),
     )
     monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", value)]))
+    sidecar_reads = []
+
+    def sidecar(model):
+        sidecar_reads.append(model)
+        yield "inactive.weight", value
+
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", sidecar)
     monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
+    monkeypatch.setattr(glm, "preserved_auxiliary_names", lambda model: ("inactive.weight",))
     with pytest.raises(RuntimeError, match="collides"):
         list(glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True))
+    assert sidecar_reads == []

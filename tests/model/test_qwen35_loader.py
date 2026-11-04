@@ -310,6 +310,7 @@ def test_qwen_full_hf_export_validates_mtp_first_and_appends_after_ordinary_stre
     import torch
 
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_export_model()
     ordinary_tensor = torch.tensor([1.0])
@@ -331,14 +332,25 @@ def test_qwen_full_hf_export_validates_mtp_first_and_appends_after_ordinary_stre
         events.append(("sidecar-start",))
         yield "mtp.fc.weight", mtp_tensor
 
+    def validate_sidecar(built_model):
+        assert built_model is model
+        events.append(("sidecar-validated",))
+
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
     monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", iter_sidecar)
+    monkeypatch.setattr(mtp_weights, "validate_preserved_mtp_weights", validate_sidecar)
+    monkeypatch.setattr(mtp_weights, "preserved_mtp_names", lambda built_model: ("mtp.fc.weight",))
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     exported = list(qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True))
 
     assert exported == [("model.weight", ordinary_tensor), ("mtp.fc.weight", mtp_tensor)]
-    assert events == [("sidecar-start",), ("ordinary-start", True), ("ordinary-exhausted",)]
+    assert events == [
+        ("sidecar-validated",),
+        ("ordinary-start", True),
+        ("ordinary-exhausted",),
+        ("sidecar-start",),
+    ]
 
 
 def test_qwen_full_hf_export_nonmaster_finishes_ordinary_stream_without_sidecar(monkeypatch):
@@ -376,6 +388,7 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
     import torch
 
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_export_model()
     live = torch.tensor([1.0])
@@ -391,13 +404,22 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
-    monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", lambda built_model: iter([("mtp.fc.weight", preserved)]))
+    sidecar_reads = []
+
+    def sidecar(built_model):
+        sidecar_reads.append(built_model)
+        yield "mtp.fc.weight", preserved
+
+    monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", sidecar)
+    monkeypatch.setattr(mtp_weights, "validate_preserved_mtp_weights", lambda built_model: None)
+    monkeypatch.setattr(mtp_weights, "preserved_mtp_names", lambda built_model: ("mtp.fc.weight",))
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     iterator = qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)
     assert next(iterator) == ("mtp.fc.weight", live)
     with pytest.raises(RuntimeError, match="collides with live HF export"):
         next(iterator)
+    assert sidecar_reads == []
 
 
 @pytest.mark.parametrize("family,fault", [("qwen", "collision"), ("glm", "collision"), ("glm", "read")])
@@ -406,10 +428,13 @@ def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, fam
 
     from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     rank = [0]
     broadcasts = []
+    sidecar_reads = []
     name = "inactive.weight"
+    live_name = name if fault == "collision" else "active.weight"
     value = torch.ones(1)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank[0])
@@ -421,6 +446,7 @@ def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, fam
             message[0] = broadcasts.pop(0)
 
     def sidecar(model):
+        sidecar_reads.append(rank[0])
         if fault == "read":
             raise OSError("source disappeared during export")
         yield name, value
@@ -429,15 +455,17 @@ def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, fam
     monkeypatch.setattr(
         qwen,
         "_build_iter_full_hf_weights",
-        lambda model: lambda **kwargs: iter([(name, value)] if rank[0] == 0 else []),
+        lambda model: lambda **kwargs: iter([(live_name, value)] if rank[0] == 0 else []),
     )
     if family == "qwen":
-        # Qwen validates its resident tensors eagerly; this test exercises a late collision.
         monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", sidecar)
+        monkeypatch.setattr(mtp_weights, "validate_preserved_mtp_weights", lambda model: None)
+        monkeypatch.setattr(mtp_weights, "preserved_mtp_names", lambda model: (name,))
         exporter = qwen._build_iter_full_hf_weights_with_mtp
     else:
         monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", sidecar)
         monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
+        monkeypatch.setattr(glm, "preserved_auxiliary_names", lambda model: (name,))
         exporter = glm._build_iter_full_hf_weights_with_auxiliary
     model = _mtp_export_model()
     for current in (0, 1):
@@ -445,6 +473,7 @@ def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, fam
         with pytest.raises(RuntimeError, match="collides|source disappeared"):
             list(exporter(model)(include_skipped=True))
     assert broadcasts == []
+    assert sidecar_reads == ([] if fault == "collision" else [0])
 
 
 def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):

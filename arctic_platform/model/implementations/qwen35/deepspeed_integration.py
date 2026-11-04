@@ -220,9 +220,14 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
     def iterator(*, include_skipped: bool = False):
         from .mtp_weights import finish_preserved_weight_export
         from .mtp_weights import prepare_preserved_weights_for_export
+        from .mtp_weights import preserved_mtp_names
+        from .mtp_weights import validate_preserved_mtp_weights
 
         preserved = (
-            prepare_preserved_weights_for_export(model, iter_preserved_mtp_weights, description="Qwen MTP weights")
+            prepare_preserved_weights_for_export(
+                model, iter_preserved_mtp_weights, description="Qwen MTP weights",
+                validate=validate_preserved_mtp_weights, names=preserved_mtp_names,
+            )
             if include_skipped else ()
         )
         names: set[str] = set()

@@ -394,6 +394,8 @@ def test_capture_mtp_weights_preserves_exact_cpu_payload_without_registering_sta
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
 
     mtp_weights.capture_mtp_weights(model, source)
+    records = getattr(model, mtp_weights._STATE_ATTRIBUTE)
+    assert all(not isinstance(record, torch.Tensor) and not hasattr(record, "tensor") for record in records)
     preserved = dict(mtp_weights.iter_preserved_mtp_weights(model))
 
     assert tuple(preserved) == tuple(sorted(payload))
@@ -635,7 +637,7 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
 
 @pytest.mark.parametrize("family", ["qwen", "glm"])
 @pytest.mark.parametrize("fault", ["missing", "changed"])
-def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives(monkeypatch, family, fault):
+def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives(monkeypatch, tmp_path, family, fault):
     from types import SimpleNamespace
 
     import torch
@@ -647,21 +649,28 @@ def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives
 
     model = _mtp_model()
     if family == "qwen":
-        names = sorted(mtp_weights._configured_names(model))
-        attribute = mtp_weights._STATE_ATTRIBUTE
         builder = qwen._build_iter_full_hf_weights_with_mtp
     else:
         model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=2, num_nextn_predict_layers=1)
-        names = ["model.language_model.layers.2.eh_proj.weight"]
-        attribute = auxiliary_weights.STATE_ATTRIBUTE
         builder = glm._build_iter_full_hf_weights_with_auxiliary
     if fault == "changed":
-        weights = tuple(mtp_weights._PreservedWeight(name, torch.ones(2), (2,), torch.float32) for name in names)
-        state = (
-            weights if family == "qwen" else (auxiliary_weights._layer_prefixes(model.config), tuple(names), weights)
-        )
-        setattr(model, attribute, state)
-        weights[0].tensor.resize_(1)
+        from safetensors.torch import save_file
+
+        monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+        if family == "qwen":
+            source = tmp_path / "mtp"
+            _write_mtp_checkpoint(source, _mtp_payload())
+            mtp_weights.capture_mtp_weights(model, source)
+            shard = getattr(model, mtp_weights._STATE_ATTRIBUTE)[0].path
+        else:
+            tensors = {
+                f"model.language_model.layers.2.{suffix}": torch.ones(2)
+                for suffix in ("eh_proj.weight", "enorm.weight", "hnorm.weight", "mlp.experts.gate_up_proj")
+            }
+            save_file(tensors, tmp_path / "original.safetensors")
+            auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+            shard = getattr(model, auxiliary_weights.STATE_ATTRIBUTE)[2][0].path
+        save_file(dict(replaced=torch.ones(1)), shard)
     ordinary_calls = []
 
     def ordinary(**kwargs):
@@ -689,7 +698,80 @@ def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives
             list(builder(model)(include_skipped=True))
         errors.append(str(error.value))
     assert errors[0] == errors[1]
+    if fault == "changed":
+        assert "shard changed" in errors[0]
     assert ordinary_calls == []
+
+
+def test_qwen_mtp_capture_uses_metadata_only(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    source = tmp_path / "mtp"
+    _write_mtp_checkpoint(source, _mtp_payload())
+    model = _mtp_model()
+    native_open = mtp_weights.safe_open
+
+    class MetadataReader:
+        def __init__(self, *args, **kwargs):
+            self.reader = native_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.reader.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.reader.__exit__(*args)
+
+        def keys(self):
+            return self.reader.keys()
+
+        def get_slice(self, name):
+            return self.reader.get_slice(name)
+
+        def get_tensor(self, name):
+            pytest.fail("capture materialized an inactive MTP tensor")
+
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(mtp_weights, "safe_open", MetadataReader)
+    mtp_weights.capture_mtp_weights(model, source)
+    assert len(getattr(model, mtp_weights._STATE_ATTRIBUTE)) == len(_mtp_names())
+
+
+def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeypatch, tmp_path):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    source = tmp_path / "mtp"
+    payload = _mtp_payload()
+    _write_mtp_checkpoint(source, payload)
+    model = _mtp_model()
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, source)
+    collision = sorted(payload)[-1]
+    monkeypatch.setattr(
+        qwen, "_build_iter_full_hf_weights", lambda model: lambda **kwargs: iter([(collision, torch.ones(1))])
+    )
+    rank = [0]
+    messages = []
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        if rank[0] == 0:
+            messages.append(message[0])
+        else:
+            message[0] = messages.pop(0)
+
+    monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast)
+    for current_rank in (0, 1):
+        rank[0] = current_rank
+        yielded = []
+        with pytest.raises(RuntimeError, match="collides with live HF export"):
+            for name, tensor in qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True):
+                yielded.append(name)
+        assert yielded == [collision]
 
 
 def _rewrite_mtp_index(source, mutate):

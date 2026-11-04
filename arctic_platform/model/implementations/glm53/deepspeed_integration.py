@@ -33,6 +33,7 @@ from arctic_platform.model.implementations.qwen35.mtp_weights import prepare_pre
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 from .auxiliary_weights import iter_preserved_auxiliary_weights
+from .auxiliary_weights import preserved_auxiliary_names
 from .auxiliary_weights import validate_preserved_auxiliary_weights
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
@@ -88,6 +89,7 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
                 iter_preserved_auxiliary_weights,
                 description="GLM prediction layers",
                 validate=validate_preserved_auxiliary_weights,
+                names=preserved_auxiliary_names,
             )
             if include_skipped
             else ()
