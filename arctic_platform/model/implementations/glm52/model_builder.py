@@ -249,7 +249,6 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
-@record_conversion_preparation_failure
 def resolve_weight_source(config: ModelConfig) -> Path:
     """Return the local checkpoint directory ``config.name`` loads from."""
     if not Path(config.name).exists():
@@ -312,7 +311,9 @@ def prepare_weight_conversion(
             node_local=node_local,
         )
     else:
-        wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)
+        wait_for_conversion_cache(
+            snapshot_path, attempt_id=attempt_id, preparation_root=getattr(config, "weight_conversion_cache_dir", None)
+        )
     return snapshot_path
 
 

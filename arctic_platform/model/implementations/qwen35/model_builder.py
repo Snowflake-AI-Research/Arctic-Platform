@@ -508,7 +508,6 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
-@record_conversion_preparation_failure
 def resolve_weight_source(config: ModelConfig) -> Path:
     """Return the local checkpoint directory ``config.name`` loads from."""
     if not Path(config.name).exists():
@@ -576,7 +575,9 @@ def prepare_weight_conversion(
             node_local=node_local,
         )
     else:
-        wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)
+        wait_for_conversion_cache(
+            snapshot_path, attempt_id=attempt_id, preparation_root=getattr(config, "weight_conversion_cache_dir", None)
+        )
     return snapshot_path
 
 
