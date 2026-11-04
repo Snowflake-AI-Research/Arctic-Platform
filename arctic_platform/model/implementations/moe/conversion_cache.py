@@ -77,15 +77,41 @@ def conversion_cache_is_node_local(path: Path) -> bool:
     return any(resolved == root or root in resolved.parents for root in node_local_roots)
 
 
-def wait_for_conversion_cache(path: Path, *, timeout: float = 3600, poll_interval: float = 0.25) -> None:
-    """Wait for publication, failing immediately when the writer records a conversion error."""
-    if timeout < 0 or poll_interval <= 0:
-        raise ValueError("cache timeout must be nonnegative and poll_interval must be positive")
+def wait_for_conversion_cache(
+    path: Path, *, timeout: float = 3600, poll_interval: float = 0.25, writer_start_timeout: float = 30
+) -> None:
+    """Wait for a live writer; ignore old failures and detect a writer killed without a failure marker."""
+    if timeout < 0 or poll_interval <= 0 or writer_start_timeout <= 0:
+        raise ValueError("cache timeout must be nonnegative and polling/start intervals must be positive")
+    started_at = time.time()
     deadline = time.monotonic() + timeout
+    writer_deadline = time.monotonic() + writer_start_timeout
     failure_path = path.with_name(f"{path.name}.failed")
+    lock_path = path.parent / f".{path.name}.lock"
+    writer_seen = False
     while not conversion_cache_ready(path):
-        if failure_path.is_file():
-            raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure_path.read_text()}")
+        try:
+            if failure_path.stat().st_mtime >= started_at:
+                raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure_path.read_text()}")
+        except FileNotFoundError:
+            pass
+        try:
+            with open(lock_path, "r", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    writer_seen = True
+                else:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    # The writer publishes under this lock; recheck after observing its release.
+                    if conversion_cache_ready(path):
+                        return
+                    if writer_seen:
+                        raise RuntimeError(f"Converted weight cache writer exited without publishing: {path}")
+        except FileNotFoundError:
+            pass
+        if not writer_seen and time.monotonic() >= writer_deadline:
+            raise TimeoutError(f"Converted weight cache writer did not start within {writer_start_timeout}s: {path}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"Converted weight cache did not become ready within {timeout}s: {path}")
@@ -145,9 +171,8 @@ def _write_conversion_cache(
     try:
         snapshot_state_dict = load_state_dict_fn(source_path)
         t_load = time.perf_counter()
-        converted = convert_fn(snapshot_state_dict)
-        if converted is not None:
-            snapshot_state_dict = converted
+        # Bulk converters mutate the supplied state in place; preserve that existing contract.
+        convert_fn(snapshot_state_dict)
         t_convert = time.perf_counter()
         save_state_dict_fn(snapshot_state_dict, tmp_path)
         t_save = time.perf_counter()
@@ -225,8 +250,12 @@ def ensure_node_local_conversion_cache(
                         local_rank=local_rank,
                         stream_convert_fn=stream_convert_fn,
                     )
-                except Exception as error:
-                    failure_path.write_text(f"rank={rank}: {type(error).__name__}: {error}", encoding="utf-8")
+                except BaseException as error:
+                    if not conversion_cache_is_node_local(snapshot_path):
+                        try:
+                            failure_path.write_text(f"rank={rank}: {type(error).__name__}: {error}", encoding="utf-8")
+                        except OSError:
+                            logger.info("Could not record conversion failure for %s", snapshot_path, exc_info=True)
                     raise
             elif local_rank == 0:
                 logger.info(

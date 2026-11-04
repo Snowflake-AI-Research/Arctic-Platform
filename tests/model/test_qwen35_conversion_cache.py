@@ -131,9 +131,11 @@ def test_node_local_conversion_cache_uses_lock_and_skips_ready_cache(tmp_path):
     assert conversion_cache.conversion_cache_ready(cache_path) is True
 
 
-def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_failed_node_local_conversion_removes_tmp_cache(tmp_path, monkeypatch, scope):
     from arctic_platform.model.implementations.qwen35 import conversion_cache
 
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
     source_path = tmp_path / "source"
     source_path.mkdir()
     cache_path = tmp_path / "cache" / "prime"
@@ -160,8 +162,9 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
-    assert leftovers == ["prime.failed"]
-    assert "disk full" in (cache_path.parent / "prime.failed").read_text()
+    assert leftovers == (["prime.failed"] if scope == "shared" else [])
+    if scope == "shared":
+        assert "disk full" in (cache_path.parent / "prime.failed").read_text()
     assert not conversion_cache.conversion_cache_ready(cache_path)
 
 
@@ -348,6 +351,36 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
     assert len(converted) == 1
     assert not converted[0].exists()
     assert conversion_cache.conversion_cache_ready(destination)
+
+
+def test_bulk_conversion_preserves_in_place_contract_when_converter_returns_other_data(tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    saved = []
+    original = {"original": object()}
+
+    def convert(state):
+        assert state is original
+        state["converted"] = state.pop("original")
+        return {"not_a_full_state_dict": "converter metadata"}
+
+    def save(state, path):
+        saved.append(state.copy())
+        _write_ready_cache(path)
+
+    conversion_cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        tmp_path / "prime",
+        convert,
+        "HF",
+        "PrimeRL",
+        lambda path: original,
+        save,
+        rank=0,
+        local_rank=0,
+    )
+    assert saved == [original]
+    assert set(saved[0]) == {"converted"}
 
 
 @pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
