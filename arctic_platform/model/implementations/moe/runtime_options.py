@@ -49,8 +49,8 @@ class MoeRuntimeOptions(BaseModel):
         None,
         description=(
             "Keep the frozen routed experts' weights (codes) in pinned host memory, copied into two GPU buffers per "
-            "experts call with the next layer prefetched (moe/frozen_offload.py). Every layer with routed experts "
-            "must be recomputed. Unset: ARL_OFFLOAD_FROZEN_EXPERTS."
+            "experts call with the next layer prefetched (moe/frozen_offload.py); layers that are not recomputed keep "
+            "theirs on the GPU. Unset: ARL_OFFLOAD_FROZEN_EXPERTS."
         ),
     )
     ultraep_spares: int | None = Field(

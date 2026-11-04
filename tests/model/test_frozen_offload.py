@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Frozen block-FP8 routed-expert codes kept on the host and copied in per experts call, under activation
-checkpointing (moe/frozen_offload.py). The install checks and ``fp8.stash_frozen`` run on CPU; the rest needs a GPU."""
+checkpointing (moe/frozen_offload.py); layers that are not recomputed keep theirs. The install checks and
+``fp8.stash_frozen`` run on CPU; the rest needs a GPU."""
 
 import gc
 import weakref
@@ -166,12 +167,38 @@ def test_offload_refuses_to_overwrite_a_buffer_in_use():
         inner[2](out)
 
 
-def test_offload_refuses_layers_whose_experts_are_not_recomputed():
-    """A layer left out of checkpointing would hold its copy until backward, while the next layers need its buffer."""
+def test_offload_leaves_layers_that_are_not_recomputed_on_the_gpu():
+    """``ac_config.layers`` leaves blocks out of checkpointing (here the last two): they are not managed."""
+    from arctic_platform.model.implementations.moe.frozen_offload import experts_recomputed
     from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
 
-    with pytest.raises(ValueError, match="decoder layer 3's routed experts are not recomputed"):
-        install_frozen_expert_offload(_model(0, plain=(LAYERS - 1,), device="cpu"))
+    model = _model(0, plain=(LAYERS - 2, LAYERS - 1), device="cpu")
+    assert [experts_recomputed(layer) for layer in model] == [True] * (LAYERS - 2) + [False] * 2
+    offload = install_frozen_expert_offload(model)
+    assert offload.layers == [layer._checkpoint_wrapped_module for layer in model[: LAYERS - 2]]
+
+
+@requires_cuda
+def test_layers_not_recomputed_keep_their_codes_on_the_gpu():
+    """Their saved tensors hold the codes until backward; the recomputed layers still match resident experts."""
+    from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+
+    plain = (LAYERS - 1,)
+    reference, offloaded = _model(0, plain=plain), _model(0, plain=plain)
+    offload = install_frozen_expert_offload(offloaded)
+    assert len(offload.layers) == LAYERS - 1
+    x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        for model in (reference, offloaded):
+            model.zero_grad(set_to_none=True)
+        xr, xo = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+        want = _run(reference, xr)
+        want.float().square().sum().backward()
+        got = _run(offloaded, xo)
+        got.float().square().sum().backward()
+        assert torch.equal(got, want) and torch.equal(xo.grad, xr.grad)
+    assert offloaded[LAYERS - 1].experts.w1.numel() > 0
+    assert offloaded[0]._checkpoint_wrapped_module.experts.w1.numel() == 0
 
 
 def test_offload_manages_only_layers_with_routed_experts():

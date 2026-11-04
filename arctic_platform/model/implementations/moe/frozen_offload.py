@@ -29,6 +29,10 @@ The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them wi
 (``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the recompute's copy lives
 until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their FP32 scales (one per 128 x
 128 block: a 4,096th of the codes' bytes) stay on the GPU. A model with offloaded experts cannot export them.
+
+A layer whose experts are not recomputed (``ac_config.layers`` leaves its block out of checkpointing) saves its
+expert weights for backward, so a copy of its codes would live until then and hold a buffer the next layers need: such
+layers keep their codes on the GPU and are not managed.
 """
 
 from __future__ import annotations
@@ -273,7 +277,7 @@ def _expert_call_sites(layer: nn.Module):
 
 
 def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
-    """Offload the frozen routed-expert codes of every decoder layer with routed experts; copied in per call.
+    """Offload the frozen routed-expert codes of every decoder layer whose experts are recomputed; copied in per call.
 
     The hooks sit on the module the MoE calls for its experts (PEFT's outermost wrapper with expert LoRA: the copy is
     installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
@@ -281,21 +285,16 @@ def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
     wrap the experts after this returns (the trainer applies LoRA to the loaded model), so each layer binds its hooks
     to the call sites at its first call.
 
-    Every such layer must recompute its experts in backward (whole-block checkpointing, or a selective checkpoint
-    around them): a layer that does not keeps its copy alive through its saved tensors until backward, while the
-    layers after it need the same two buffers.
+    Layers whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their
+    saved tensors hold them until backward.
     """
     managed = []
-    for layer_id, layer in enumerate(layers):
-        inner = _inner_layer(layer)
-        if not any(True for _ in _expert_call_sites(inner)):
-            continue
+    for layer in layers:
         if not experts_recomputed(layer):
-            raise ValueError(
-                f"frozen expert offload: decoder layer {layer_id}'s routed experts are not recomputed in backward "
-                "(the layer is left out of activation checkpointing); checkpoint every layer with routed experts"
-            )
-        managed.append(inner)
+            continue
+        inner = _inner_layer(layer)
+        if any(True for _ in _expert_call_sites(inner)):
+            managed.append(inner)
     offload = FrozenExpertOffload(managed)
     for i, inner in enumerate(managed):
         _bind_at_first_call(offload, i, inner)
