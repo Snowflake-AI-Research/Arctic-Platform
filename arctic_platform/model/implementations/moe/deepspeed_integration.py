@@ -194,10 +194,9 @@ def build_iter_full_hf_weights(model: nn.Module):
         if local.dtype != torch.uint8:
             full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master, dest)
             return None if full is None else full.view(local.dtype)
-        # NCCL gathers device tensors: a shard in host memory goes through this rank's GPU (other backends, such as
-        # the gloo of the CPU tests, gather it where it is).
-        nccl = dist.get_backend(ep_group) == "nccl"
-        device = torch.device("cuda", torch.cuda.current_device()) if nccl else local.device
+        # A shard in pinned host memory (Qwen3.8's n-gram table under ARL_NGRAM_TABLE_ON_HOST) is gathered through
+        # this rank's GPU, a slice at a time; any other shard is gathered where it lives (the CPU tests' gloo groups).
+        device = torch.device("cuda", torch.cuda.current_device()) if local.is_pinned() else local.device
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:

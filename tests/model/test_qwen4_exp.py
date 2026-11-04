@@ -415,6 +415,7 @@ def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in sync_names
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the n-gram table moves from a CUDA model")
 def test_qwen38_hf_checkpoint_exports_the_host_ple_table(monkeypatch):
     """With ARL_NGRAM_TABLE_ON_HOST the EP-sharded n-gram parameter is emptied on the GPU and its rows live in pinned
     host memory; the export has to gather the host rows, not the empty parameter."""
@@ -429,7 +430,7 @@ def test_qwen38_hf_checkpoint_exports_the_host_ple_table(monkeypatch):
     rows = embedding.weight.detach().clone()
     embedding.weight.group_name = "ep_size_1"
     embedding.weight.allreduce = False
-    embedding._host_weight = rows.cpu()
+    embedding._host_weight = rows.cpu().pin_memory()
     embedding.weight.data = embedding.weight.data.new_empty((0, embedding.embedding_dim))
 
     def gather(tensor, gather_list=None, dst=0, group=None):
