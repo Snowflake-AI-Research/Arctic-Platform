@@ -138,7 +138,11 @@ def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> N
     if found is None:
         raise FileNotFoundError(f"Legacy EP checkpoint is missing this rank's ZeRO optimizer file: {path}")
     path = found
-    saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
+    # Native ZIP archives expose metadata without materializing masters and Adam moments a second time.
+    if zipfile.is_zipfile(path):
+        saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    else:
+        saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
     optimizer = saved.get("optimizer_state_dict", {}) if isinstance(saved, dict) else None
     base = optimizer.get("base_optimizer_state") if isinstance(optimizer, dict) else None
     if not isinstance(optimizer, dict) or not isinstance(base, dict):
@@ -343,13 +347,39 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
             os.close(directory_descriptor)
 
 
+def _probe_ep_checkpoint_serialization() -> None:
+    """Fail during model setup if Torch cannot reserve and locate compact expert storage."""
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with tempfile.TemporaryDirectory(prefix="ap-ep-checkpoint-probe-") as directory:
+            path = Path(directory) / "probe.pt"
+            with FakeTensorMode():
+                tensor = torch.empty(3, dtype=torch.uint8)
+            with torch.serialization.skip_data(materialize_fake_tensors=True):
+                torch.save(dict(module=dict(probe=tensor)), path)
+            with FakeTensorMode():
+                tensor = torch.load(path, weights_only=True)["module"]["probe"]
+            offset = getattr(tensor.untyped_storage(), "_checkpoint_offset", None)
+            if type(offset) is not int:
+                raise RuntimeError("Torch did not expose its checkpoint storage offset")
+            _validate_ep_checkpoint_storage_offsets(path, dict(probe=tensor), dict(probe=offset))
+    except (ImportError, AttributeError, TypeError, RuntimeError, ValueError) as error:
+        raise RuntimeError(
+            "AP expert-parallel checkpoints require Torch compact-storage serialization support "
+            "(torch>=2.7); the startup capability probe failed"
+        ) from error
+
+
 def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     if getattr(engine_type, "_ap_ep_ckpt_patched", False):
         return
+    _probe_ep_checkpoint_serialization()
     import deepspeed.utils.groups as ds_groups
     from deepspeed.checkpoint.constants import FROZEN_PARAM_FRAGMENTS
 
     original_load = engine_type._load_checkpoint
+    original_public_load = engine_type.load_checkpoint
     original_module_load = engine_type.load_module_state_dict
     original_module_state_dict = engine_type.module_state_dict
     original_non_moe_state_dict = engine_type._get_non_moe_state_dict
@@ -516,10 +546,20 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         self._ap_ep_restore_legacy_masters = restore_legacy_masters
         try:
             return original_load(*bound.args, **bound.kwargs)
-        finally:
+        except BaseException:
             self.__dict__.pop("_ap_ep_restore_legacy_masters", None)
+            raise
+        finally:
             del self._ap_ep_checkpoint_state
             del self._ap_ep_legacy_parameters
+
+    @wraps(original_public_load)
+    def load_checkpoint(self, *args, **kwargs):
+        try:
+            # DeepSpeed loads ZeRO masters after the private module-load call has returned.
+            return original_public_load(self, *args, **kwargs)
+        finally:
+            self.__dict__.pop("_ap_ep_restore_legacy_masters", None)
 
     if original_zero_load is not None:
 
@@ -580,6 +620,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     # Frozen expert-only models follow DeepSpeed's ordinary checkpoint path.
     engine_type._save_checkpoint = wrap_save(engine_type._save_checkpoint)
     engine_type._load_checkpoint = load
+    engine_type.load_checkpoint = load_checkpoint
     engine_type.load_module_state_dict = load_module
     engine_type._ap_ep_ckpt_patched = True
 

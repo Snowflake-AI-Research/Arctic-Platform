@@ -29,6 +29,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from arctic_platform.model.implementations.moe import deepspeed_integration as common
 from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import require_torch_multi_gpu
 from arctic_platform.testing_utils import torch_assert_equal
 
 
@@ -304,11 +305,33 @@ def ep_checkpoint_engine(monkeypatch):
                 ("load", load_module_strict, load_optimizer_states, load_lr_scheduler_states, load_module_only)
             )
             self.load_module_state_dict(self.saved_checkpoint, load_module_strict, custom_load_fn)
+            return "loaded", dict(tag=tag)
+
+        def load_checkpoint(
+            self,
+            load_dir,
+            tag,
+            load_module_strict=True,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=True,
+            load_module_only=False,
+            custom_load_fn=None,
+        ):
+            result = self._load_checkpoint(
+                load_dir,
+                tag,
+                load_module_strict,
+                load_optimizer_states,
+                load_lr_scheduler_states,
+                load_module_only,
+                custom_load_fn,
+            )
+            # Native DeepSpeed loads ZeRO only after its private module-loading call returns.
             if load_optimizer_states and not load_module_only:
                 self._load_zero_checkpoint(load_dir, tag, load_optimizer_states)
                 if getattr(self, "fail_after_zero_load", False):
                     raise RuntimeError("native checkpoint completion failed")
-            return "loaded", dict(tag=tag)
+            return result
 
         def load_module_state_dict(self, checkpoint, strict=True, custom_load_fn=None):
             self.calls.append(("module", strict, custom_load_fn))
@@ -880,13 +903,13 @@ def test_ep_checkpoint_legacy_ep_resume_requires_and_restores_zero_masters(
 
     engine.optimizer.update_lp_params = update
     if optimizer_states and zero_files:
-        engine._load_checkpoint(tmp_path, "legacy", load_optimizer_states=True)
+        engine.load_checkpoint(tmp_path, "legacy", load_optimizer_states=True)
         assert restored == [True]
         for name, value in engine.module.state_dict().items():
             torch_assert_equal(value, expected[name])
     else:
         with pytest.raises(FileNotFoundError, match="rank-local shard|this rank's ZeRO optimizer file"):
-            engine._load_checkpoint(tmp_path, "legacy", load_optimizer_states=optimizer_states)
+            engine.load_checkpoint(tmp_path, "legacy", load_optimizer_states=optimizer_states)
     assert restored == ([True] if optimizer_states and zero_files else [])
     assert not hasattr(engine, "_ap_ep_restore_legacy_masters")
 
@@ -910,7 +933,7 @@ def test_legacy_nested_restore_preserves_native_failure(ep_checkpoint_engine, tm
     engine.fail_after_zero_load = failure == "after-zero-load"
     message = "successfully loaded ZeRO master weights" if failure == "zero-load" else "native checkpoint completion"
     with pytest.raises(RuntimeError, match=message):
-        engine._load_checkpoint(tmp_path, "legacy")
+        engine.load_checkpoint(tmp_path, "legacy")
     for attribute in ("_ap_ep_restore_legacy_masters", "_ap_ep_checkpoint_state", "_ap_ep_legacy_parameters"):
         assert not hasattr(engine, attribute)
 
@@ -1093,6 +1116,44 @@ def test_legacy_ep_optimizer_old_filename_and_elastic_metadata(ep_checkpoint_eng
         common._validate_legacy_ep_zero_layout(engine, tmp_path, "legacy", dict(group_name="ep_size_2", ep_size=2))
 
 
+def test_legacy_ep_layout_validation_uses_mapped_optimizer_metadata(ep_checkpoint_engine, tmp_path, monkeypatch):
+    engine = ep_checkpoint_engine
+    path = Path(engine._get_zero_ckpt_name(tmp_path, "legacy"))
+    path.parent.mkdir()
+    torch.save(
+        dict(
+            optimizer_state_dict=dict(
+                partition_count=[1],
+                base_optimizer_state=dict(param_groups=[dict(moe=True, name="ep_size_2")]),
+                fp32_flat_groups=[torch.ones(1024)],
+            )
+        ),
+        path,
+    )
+    native_load = torch.load
+    calls = []
+
+    def load(*args, **kwargs):
+        calls.append(kwargs)
+        return native_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", load)
+    monkeypatch.setattr(engine.checkpoint_engine, "load", lambda *args, **kwargs: pytest.fail("eager optimizer read"))
+    common._validate_legacy_ep_zero_layout(engine, tmp_path, "legacy", dict(group_name="ep_size_2", ep_size=2))
+    assert len(calls) == 1
+    assert calls[0]["mmap"] is True
+
+
+def test_ep_checkpoint_capability_failure_is_reported_before_patching(monkeypatch):
+    class UnsupportedEngine:
+        pass
+
+    monkeypatch.setattr(torch.serialization, "skip_data", lambda: None)
+    with pytest.raises(RuntimeError, match="startup capability probe failed"):
+        common._patch_deepspeed_ep_checkpoints(UnsupportedEngine)
+    assert not hasattr(UnsupportedEngine, "_ap_ep_ckpt_patched")
+
+
 def test_ep_checkpoint_cleans_only_stale_workspace_for_current_shard(tmp_path):
     import os
     import time
@@ -1199,6 +1260,8 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
         "_save_moe_checkpoint",
         "_save_checkpoint",
         "_load_checkpoint",
+        "load_checkpoint",
+        "_load_zero_checkpoint",
         "load_module_state_dict",
     )
     for name in patched_methods:
@@ -1222,6 +1285,91 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
     for name, parameter in model.named_parameters():
         target = expected[name] + 100 if exclude_frozen and not parameter.requires_grad else expected[name]
         torch_assert_equal(parameter, target)
+
+
+def _native_legacy_ep_resume_worker(rank, rendezvous, directory):
+    import deepspeed
+    import deepspeed.utils.groups as groups
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2")
+    deepspeed.init_distributed(
+        dist_backend="nccl",
+        auto_mpi_discovery=False,
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        group_name = "ep_size_2"
+        groups._EXPERT_PARALLEL_GROUP[group_name] = dist.group.WORLD
+        for peer in range(2):
+            group = dist.new_group([peer])
+            if peer == rank:
+                groups._EXPERT_DATA_PARALLEL_GROUP[group_name] = group
+        model = nn.Module()
+        model.dense = nn.Linear(2, 2, bias=False)
+        model.experts = common.MoE.__new__(common.MoE)
+        nn.Module.__init__(model.experts)
+        model.experts.num_experts = 2
+        model.experts.weight = nn.Parameter(torch.full((2, 2), 11.0 + rank))
+        model.experts.weight.allreduce = False
+        model.experts.weight.group_name = group_name
+        model.cuda()
+        common.patch_deepspeed_moe_detection()
+        optimizer = torch.optim.AdamW(
+            [
+                dict(params=list(model.dense.parameters())),
+                dict(params=[model.experts.weight], moe=True, name=group_name),
+            ]
+        )
+        engine, *_ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            config=dict(
+                train_micro_batch_size_per_gpu=1,
+                zero_allow_untested_optimizer=True,
+                zero_optimization=dict(stage=2),
+            ),
+        )
+        expected = model.experts.weight.detach().clone()
+        # Reconstruct the historical ordinary save: rank-zero dense experts plus native rank-local ZeRO archives.
+        engine.has_moe_layers = False
+        assert engine.save_checkpoint(directory, tag="legacy")
+        sidefile = common._ep_checkpoint_path(directory, "legacy", common._ep_checkpoint_identity(group_name))
+        sidefile.unlink()
+        if rank == 0:
+            dense_path = engine._get_ckpt_name(directory, "legacy")
+            dense = torch.load(dense_path, weights_only=False)
+            dense["module"]["experts.weight"] = expected.cpu()
+            torch.save(dense, dense_path)
+        dist.barrier()
+        with torch.no_grad():
+            model.experts.weight.add_(100)
+            for master in engine.optimizer.single_partition_of_fp32_groups:
+                master.add_(200)
+        steps = engine.global_steps
+        loaded, _ = engine.load_checkpoint(directory, tag="legacy", load_optimizer_states=True)
+        assert loaded is not None
+        assert engine.global_steps == steps
+        torch_assert_equal(model.experts.weight, expected)
+        assert not hasattr(engine, "_ap_ep_restore_legacy_masters")
+        print(f"LEGACY_EP_NATIVE_PRE_STEP_RESTORE_PASS rank={rank}", flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
+@require_torch_multi_gpu
+@require_deepspeed
+def test_legacy_ep_native_deepspeed_public_resume_restores_experts_before_step(tmp_path):
+    mp.spawn(
+        _native_legacy_ep_resume_worker,
+        args=((tmp_path / "legacy-rendezvous").as_uri(), str(tmp_path / "checkpoints")),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_ep_checkpoint_failure_clears_local_state(ep_checkpoint_engine, tmp_path):
