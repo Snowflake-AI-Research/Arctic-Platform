@@ -71,6 +71,25 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
     tiled_mlp_token_chunk_size: int | None = Field(None, gt=0)
     weight_conversion_cache_dir: str | None = None
     ac_config: ActivationCheckpointConfig | None = None
+    # Only this loader installs the dense shards, so these two are its fields, not MoeRuntimeOptions' (whose other
+    # loaders would accept and ignore them); apply_moe_runtime_options still hands them to moe/dense_shard.py.
+    shard_dense: bool | None = Field(
+        None,
+        description=(
+            "Full fine-tuning: shard the trainable weights every GPU holds whole (each decoder layer's attention, DSA "
+            "indexer, shared experts, dense MLP, router and norms; the embedding; the LM head) over the GPUs of each "
+            "node, all-gathered around each call of the layer and reduce-scattered in its backward "
+            "(moe/dense_shard.py). Not with LoRA. Unset: ARL_SHARD_DENSE."
+        ),
+    )
+    shard_dense_group_size: int | None = Field(
+        None,
+        ge=2,
+        description=(
+            "GPUs per shard_dense group: consecutive ranks on one host. Unset: ARL_SHARD_DENSE_GROUP_SIZE, else the "
+            "ranks of one host."
+        ),
+    )
     debug: GlmMoeDsaDebugOptions | None = None
 
     @model_validator(mode="after")

@@ -47,6 +47,7 @@ _SETTERS = {
     "expert_replicas": ("moe.expert_replicas", "configure_spares"),
     "expert_replicas_ema": ("moe.expert_replicas", "configure_ema"),
     "expert_placement": ("moe.expert_placement", "configure_from_options"),
+    # glm_moe_dsa's own fields (GlmMoeDsaOptions): the other loaders lack them, so they count as unset there.
     "shard_dense": ("moe.dense_shard", "configure_from_options"),
     "shard_dense_group_size": ("moe.dense_shard", "configure_group_size"),
 }
@@ -54,9 +55,9 @@ _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Memory, expert-balance, expert-GEMM, dense-sharding and deepep_v2 settings of the MoE runtime. None: the
-    environment variable decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most
-    one of them is on."""
+    """Memory, expert-balance, expert-GEMM and deepep_v2 settings of the MoE runtime. None: the environment variable
+    decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is
+    on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -151,24 +152,6 @@ class MoeRuntimeOptions(BaseModel):
             "(moe/expert_placement.py): a JSON file path on the workers, the JSON text, or the object itself, "
             '{"ep_size": ep, "gpus_per_node": g, "layers": {"<layer>": [expert per slot, ...]}}. Unset: '
             "ARL_EXPERT_PLACEMENT."
-        ),
-    )
-
-    shard_dense: bool | None = Field(
-        None,
-        description=(
-            "Full fine-tuning: shard the trainable weights every GPU holds whole (each decoder layer's attention, DSA "
-            "indexer, shared experts, dense MLP, router and norms; the embedding; the LM head) over the GPUs of each "
-            "node, all-gathered around each call of the layer and reduce-scattered in its backward "
-            "(moe/dense_shard.py). Not with LoRA. Unset: ARL_SHARD_DENSE."
-        ),
-    )
-    shard_dense_group_size: int | None = Field(
-        None,
-        ge=2,
-        description=(
-            "GPUs per shard_dense group: consecutive ranks on one host. Unset: ARL_SHARD_DENSE_GROUP_SIZE, else the "
-            "ranks of one host."
         ),
     )
 
