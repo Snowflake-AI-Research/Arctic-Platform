@@ -39,6 +39,7 @@ SWITCHES = {
         False,
     ),
     "ultraep_spares": ("moe.ultraep_frozen", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
+    "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
 }
 
 
@@ -126,3 +127,22 @@ def test_unknown_runtime_fields_are_refused():
     for field in ("shard_frozen_dense", "w4a8_experts"):
         with pytest.raises(ValidationError):
             GlmMoeDsaOptions.model_validate({field: True})
+
+
+def test_w8a8_experts_reach_the_experts_built_after_the_load():
+    """GroupedExperts read the switch when they are built, which the loader does after applying the options."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    apply_moe_runtime_options(GlmMoeDsaOptions(w8a8_experts=True))
+    assert GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128).w8a8
+    # A checkpoint without block-FP8 experts is refused rather than run W8A16.
+    with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
+        GroupedExperts(256, 128, 2, use_grouped_mm=True)
+    apply_moe_runtime_options(GlmMoeDsaOptions(w8a8_experts=False))
+    assert not GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128).w8a8
+
+
+def test_w8a8_experts_with_w4a8_experts_is_refused():
+    """W4A8 (the W4AFP8 ladder's INT4 experts) is not on this branch: a job asking for both fails at validation."""
+    with pytest.raises(ValidationError, match="w4a8_experts"):
+        GlmMoeDsaOptions.model_validate({"w8a8_experts": True, "w4a8_experts": True})

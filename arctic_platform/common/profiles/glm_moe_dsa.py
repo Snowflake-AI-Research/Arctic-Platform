@@ -46,6 +46,7 @@ def register(registry: Registry) -> None:
             "moe.frozen_expert_offload",
             "moe.ultraep_spares",
             "moe.ultraep_ipc_symm",
+            "moe.w8a8_experts",
             "attention.sparse_mla",
             "attention.backend",
             "numerics.reduce_dtype",

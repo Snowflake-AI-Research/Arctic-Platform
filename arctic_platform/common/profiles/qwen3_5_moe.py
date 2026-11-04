@@ -59,6 +59,7 @@ def register(registry: Registry) -> None:
             "moe.frozen_expert_offload": "only the glm_moe_dsa loader offloads frozen routed experts",
             "moe.ultraep_spares": "only the glm_moe_dsa loader gives frozen block-FP8 experts UltraEP's spare slots",
             "moe.ultraep_ipc_symm": "only the glm_moe_dsa loader gives frozen block-FP8 experts UltraEP's spare slots",
+            "moe.w8a8_experts": "only the glm_moe_dsa loader runs frozen block-FP8 experts' forward GEMMs as W8A8",
         },
         not_applicable={
             "attention.sparse_mla": "Qwen3.5-MoE has no sparse MLA attention",

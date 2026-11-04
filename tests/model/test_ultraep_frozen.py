@@ -15,11 +15,13 @@
 """UltraEP spares for frozen block-FP8 experts with LoRA (moe/ultraep_frozen.py): copies compute with their owners'
 codes, block scales and LoRA factors, and the copies' LoRA gradients return to the owners.
 
-Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_frozen.py [offload]
+Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_frozen.py [offload] [w8a8]
 
 With ``offload``, three activation-checkpointed layers run under the frozen expert offload (moe/frozen_offload.py):
 their codes exist only in its two persistent buffers by layer parity, which UltraEP's pointer pools read in place,
-through the forward and the reverse recompute. Under pytest (CPU) only the LoRA staging round trip runs.
+through the forward and the reverse recompute. With ``w8a8`` the experts' forward GEMMs run W8A8
+(moe.w8a8_experts) on the native + spare stacks, and the reference emulates its activation quantization (and the
+BF16 roundings ahead of each one), straight through. Under pytest (CPU) only the LoRA staging round trip runs.
 """
 
 import os
@@ -31,6 +33,19 @@ from torch import nn
 
 L, S, DIM, HIDDEN, RANK, TOKENS, TOPK, MAX_ROWS = 4, 2, 512, 256, 8, 2048, 4, 8
 SHAPES = {"w1": (HIDDEN, DIM), "w2": (DIM, HIDDEN), "w3": (HIDDEN, DIM)}
+_W8A8 = False  # set by main from argv
+
+
+def _w8a8_quant(t):
+    """The W8A8 forward's 1 x 128 E4M3 activation quantization (FP32 emulation), straight through."""
+    groups = t.reshape(t.shape[0], t.shape[1] // 128, 128)
+    scale = groups.detach().abs().amax(-1, keepdim=True).clamp(min=1e-10) / 448.0
+    q = ((groups.detach() / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale).reshape(t.shape)
+    return t + (q - t).detach()
+
+
+def _bf16(t):
+    return t + (t.bfloat16().float() - t).detach()
 
 
 def test_lora_staging_round_trip():
@@ -64,6 +79,7 @@ def _experts(seed: int, rank: int):
 
     torch.manual_seed(seed + rank)
     experts = GroupedExperts(DIM, HIDDEN, L, use_grouped_mm=True, fp8_block_size=128).cuda()
+    assert experts.w8a8 == _W8A8
     for name, (rows, cols) in SHAPES.items():
         q, sc = zip(
             *(quantize_to_fp8_blockwise((torch.randn(rows, cols, device="cuda") * 0.05).bfloat16()) for _ in range(L))
@@ -111,22 +127,25 @@ def _slot_rows(plan, rank: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _reference(x, scores, counts, slot_logical, ref_w, full_ab):
-    """FP32 experts with LoRA for rows packed by slot, each slot computing its logical expert."""
+    """FP32 experts with LoRA for rows packed by slot, each slot computing its logical expert. In W8A8 the forward
+    GEMMs read quantized activations, and the tensors are rounded to BF16 where the kernels round them (the SwiGLU
+    quantization turns those roundings into whole FP8 steps)."""
+    q, r = (_w8a8_quant, _bf16) if _W8A8 else ((lambda t: t), (lambda t: t))
 
     def lora(n, inputs, lid):
         owner, local = divmod(lid, L)
         a = full_ab[n][0][owner].float().view(L, RANK, -1)[local]
         b = full_ab[n][1][owner].float().view(-1, RANK, L)[:, :, local]
-        return (inputs @ a.T) @ b.T * 0.5
+        return r(r(inputs @ a.T) * 0.5 @ b.T)
 
     pieces, start = [], 0
     for j, c in enumerate(counts.tolist()):
         if c:
             xs, lid = x[start : start + c], int(slot_logical[j])
-            gate = xs @ ref_w["w1"][lid].T + lora("w1", xs, lid)
-            up = xs @ ref_w["w3"][lid].T + lora("w3", xs, lid)
-            h = torch.nn.functional.silu(gate) * up
-            pieces.append((h @ ref_w["w2"][lid].T + lora("w2", h, lid)) * scores[start : start + c, None])
+            gate = r(r(q(xs) @ ref_w["w1"][lid].T) + lora("w1", xs, lid))
+            up = r(r(q(xs) @ ref_w["w3"][lid].T) + lora("w3", xs, lid))
+            h = r(torch.nn.functional.silu(gate) * up)
+            pieces.append((r(q(h) @ ref_w["w2"][lid].T) + lora("w2", h, lid)) * scores[start : start + c, None])
         start += c
     return torch.cat(pieces) if pieces else x.new_zeros(0, DIM)
 
@@ -245,8 +264,14 @@ def _offloaded_layers(rank, world, group, layers=3):
 
 
 def main():
+    global _W8A8
     offload = "offload" in sys.argv[1:]
+    _W8A8 = "w8a8" in sys.argv[1:]
     os.environ["ARL_ULTRAEP_SPARES"] = str(S)
+    if _W8A8:
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import configure_from_options
+
+        configure_from_options(True)
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -258,7 +283,8 @@ def main():
         assert state.offloaded and state.copies >= len(state.layers), state.copies
     if rank == 0:
         print(
-            f"ok (fp8{' + offload' if offload else ''}): EP{world}, {S} spares: copies compute with their owners'"
+            f"ok (fp8{' + w8a8' if _W8A8 else ''}{' + offload' if offload else ''}): EP{world}, {S} spares: copies"
+            " compute with their owners'"
             f" weights and LoRA, LoRA gradients return; rank load max/mean {before:.3f} -> {after:.3f}"
         )
     dist.destroy_process_group()

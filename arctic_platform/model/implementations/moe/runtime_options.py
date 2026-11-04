@@ -36,12 +36,13 @@ from pydantic import Field
 _MODULES = {
     "frozen_expert_offload": "moe.frozen_offload",
     "ultraep_spares": "moe.ultraep_frozen",
+    "w8a8_experts": "kernels.fp8_grouped_w8a8",
 }
 _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Memory and expert-balance settings of the MoE runtime. None: the environment variable decides."""
+    """Memory, expert-balance and expert-GEMM settings of the MoE runtime. None: the environment variable decides."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -60,6 +61,15 @@ class MoeRuntimeOptions(BaseModel):
             "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest "
             "frozen block-FP8 experts and their LoRA inside the NVLink domain (moe/ultraep_frozen.py). 0 turns "
             "UltraEP off. Unset: ARL_ULTRAEP_SPARES."
+        ),
+    )
+    w8a8_experts: bool | None = Field(
+        None,
+        description=(
+            "Run the frozen block-FP8 routed experts' forward GEMMs as W8A8 (activations quantized to E4M3 per token "
+            "per 128 inputs) through DeepGEMM on Hopper, instead of decoding the weights to BF16; input gradients "
+            "stay BF16 GEMMs on the decoded weights (kernels/fp8_grouped_w8a8.py). Refused for experts that are not "
+            "block FP8. Unset: ARL_W8A8_EXPERTS."
         ),
     )
     ultraep_ipc_symm: bool | None = Field(

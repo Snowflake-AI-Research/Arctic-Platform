@@ -29,23 +29,10 @@ import torch
 import triton
 import triton.language as tl
 
+from arctic_platform.model.implementations.kernels.fused_swiglu import _packed_swiglu_fwd_kernel
 from arctic_platform.model.implementations.moe.routing_weights import scale_rows
 
 _BLOCK_D = 1024
-
-
-@triton.jit
-def _packed_swiglu_fwd_kernel(gu_ptr, out_ptr, D, stride_gu, limit, HAS_LIMIT: tl.constexpr, BLOCK_D: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    for start in range(0, D, BLOCK_D):
-        cols = start + tl.arange(0, BLOCK_D)
-        mask = cols < D
-        g = tl.load(gu_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
-        u = tl.load(gu_ptr + row * stride_gu + D + cols, mask=mask, other=0.0).to(tl.float32)
-        if HAS_LIMIT:
-            g = tl.minimum(g, limit)
-            u = tl.minimum(tl.maximum(u, -limit), limit)
-        tl.store(out_ptr + row * D + cols, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -104,15 +91,33 @@ def _down_weight(weight: torch.Tensor, scale: torch.Tensor | None, block_size: i
     return _decode_fp8_to_bf16(weight, scale, block_size)
 
 
+def _w8a8_forward(gate_up, scores, weight, scale, rows, limit, layout):
+    """SwiGLU quantized straight into the padded layout, DeepGEMM, then one gather back that applies the scores."""
+    from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import grouped_gemm_padded
+    from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import swiglu_quantize_into_padded
+    from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import unpad_rows_into
+
+    q, q_scale = swiglu_quantize_into_padded(gate_up[:rows], layout, limit)
+    y = grouped_gemm_padded(q, q_scale, weight, scale, layout)
+    del q, q_scale
+    out = torch.empty(gate_up.shape[0], weight.shape[-2], dtype=gate_up.dtype, device=gate_up.device)
+    unpad_rows_into(out, y, layout, scores=scores.reshape(-1)[:rows])
+    if rows < out.shape[0]:
+        out[rows:].zero_()
+    return out
+
+
 class _ScoredSwiGLUDownFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit):
+    def forward(ctx, gate_up, scores, weight, scale, offsets, rows, block_size, limit, layout):
         gate_up = gate_up.contiguous()
         hidden = gate_up.shape[1] // 2
         from arctic_platform.model.implementations.fp8 import stash_frozen
 
         ctx.rows, ctx.block_size, ctx.limit = rows, block_size, limit
         ctx.save_for_backward(gate_up, scores, offsets, *stash_frozen(ctx, weight, scale))
+        if layout is not None:
+            return _w8a8_forward(gate_up, scores, weight, scale, rows, limit, layout)
         h = torch.empty(gate_up.shape[0], hidden, dtype=gate_up.dtype, device=gate_up.device)
         if h.numel():
             _packed_swiglu_fwd_kernel[(h.shape[0],)](
@@ -162,7 +167,7 @@ class _ScoredSwiGLUDownFn(torch.autograd.Function):
         if rows < gate_up.shape[0]:
             d_gate_up[rows:].zero_()
             dscores[rows:].zero_()
-        return d_gate_up, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None
+        return d_gate_up, dscores.reshape(scores.shape).to(scores.dtype), None, None, None, None, None, None, None
 
 
 def scored_swiglu_down(
@@ -174,16 +179,21 @@ def scored_swiglu_down(
     rows: int,
     block_size: int | None = None,
     limit: float | None = None,
+    layout=None,
 ) -> torch.Tensor:
     """``scores[:, None] * (swiglu(gate, up) @ W2_e.T)`` per expert for rows packed by expert, ``W2`` frozen.
 
     ``gate_up`` is ``[rows, 2 * hidden]``: gate in the first half of each row, up in the second. ``weight`` is the
     ``[experts, dim, hidden]`` down-projection stack, BF16 or block FP8 with ``scale`` (decoded per GEMM).
     ``offsets`` is the cumulative row count per expert and ``rows`` its last value; rows past it are padding and
-    come out zero. Gradients flow to ``gate_up`` (same layout) and ``scores``.
+    come out zero. Gradients flow to ``gate_up`` (same layout) and ``scores``. With ``layout``
+    (``kernels.fp8_grouped_w8a8.padded_layout``) the forward GEMM runs block-FP8 W8A8 on SwiGLU quantized per token
+    per 128 inputs; the backward is unchanged (straight through the quantization).
     """
     if gate_up.ndim != 2 or gate_up.shape[1] % 2 or scores.numel() != gate_up.shape[0]:
         raise ValueError(
             f"gate_up {tuple(gate_up.shape)} must be [rows, 2 * hidden] with one score per row, got {scores.numel()}"
         )
-    return _ScoredSwiGLUDownFn.apply(gate_up, scores, weight, scale, offsets, rows, block_size, limit)
+    if layout is not None and scale is None:
+        raise ValueError("a W8A8 down projection needs block-FP8 weights")
+    return _ScoredSwiGLUDownFn.apply(gate_up, scores, weight, scale, offsets, rows, block_size, limit, layout)
