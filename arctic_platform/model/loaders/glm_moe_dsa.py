@@ -57,7 +57,7 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = True
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = "deepep"
     sparse_mla_backend: Literal["auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense"] = "auto"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
@@ -77,6 +77,18 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
         validate_lm_head_fused_ce_config(self.model_dump())
         if self.fused_cross_entropy == "quack" and self.fp32_lm_head:
             raise ValueError("fp32_lm_head is not supported with fused_cross_entropy='quack'")
+        return self
+
+    @model_validator(mode="after")
+    def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
+        """DeepEP V2's unordered kernels deliver each expert's rows in arrival order, so a whole-block recompute must
+        dispatch with its forward's handle, which the combine replay carries (distributed/deepep_v2.py)."""
+        ac = self.ac_config
+        if self.ep_comm_backend == "deepep_v2" and ac is not None and ac.mode == "full" and not ac.combine_replay:
+            raise ValueError(
+                "ep_comm_backend='deepep_v2' recomputes a checkpointed block's dispatch with its forward's handle, "
+                "which ac_config.combine_replay carries: set ac_config.combine_replay=true"
+            )
         return self
 
 

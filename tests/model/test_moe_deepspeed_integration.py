@@ -34,6 +34,7 @@ def test_shared_setup_runs_family_hooks_in_order(monkeypatch):
 
     monkeypatch.setattr(common, "apply_ep_with_mesh", record("ep"))
     monkeypatch.setattr(common, "convert_dtensors_to_local", record("convert", 0))
+    monkeypatch.setattr(common, "apply_expert_placement", record("placement", 0))
     monkeypatch.setattr(common, "enable_tiled_mlp", record("tiled"))
     adapter = common.MoEDeepSpeedAdapter(
         dtype_map={"bfloat16": torch.bfloat16},
@@ -76,6 +77,7 @@ def test_shared_setup_runs_family_hooks_in_order(monkeypatch):
         "weights",
         "reset",
         "convert",
+        "placement",
         "tiled",
     ]
 

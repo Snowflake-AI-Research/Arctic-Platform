@@ -12,16 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""UltraEP spare expert slots for frozen packed-4-bit routed experts trained with expert LoRA (``ARL_ULTRAEP_SPARES``).
+"""UltraEP spare expert slots for frozen quantized routed experts trained with expert LoRA (``ARL_ULTRAEP_SPARES``):
+block FP8 and packed 4-bit (INT4 / W4A8, NVFP4, MXFP4), the frozen path of ``moe/ultraep_replicas.py``'s
+``ultraep_plan`` (which also owns the spare count).
 
 UltraEP (https://github.com/Dots-Infra/UltraEP) plans, every MoE call, which of the call's hottest experts get a copy
 in each EP rank's ``S`` spare slots, reroutes tokens to the copies, and moves the copies' weights and gradients over
 NVLink. EP rank ``r`` owns physical slots ``r * (L + S) ..``: its ``L`` native experts, then ``S`` spares.
 
-Here the experts' base weights are frozen 4-bit codes with their scales (``GroupedExperts(packed4=...)``) and the
-trained parameters are the experts' LoRA factors, so a copy carries both:
-- the codes and per-group scales of w1 | w3 (one UltraEP manager, weights and weight scales as its two blocks) and of
-  w2 (a second manager, in halves) are copied with ``weight_sync`` only;
+Here the experts' base weights are frozen codes with their scales: E4M3 codes with 128 x 128 FP32 block scales
+(``GroupedExperts(fp8_block_size=128)``, GLM-5.3's FP8 release), or packed 4-bit codes with their group scales
+(``GroupedExperts(packed4=...)``: GLM-5.3's W4AFP8 INT4, NVFP4, DeepSeek-V4.1's MXFP4 with E8M0 scales). The trained
+parameters are the experts' LoRA factors, so a copy carries both:
+- the codes and scales of w1 | w3 (one UltraEP manager, weights and weight scales as its two blocks) and of w2 (a
+  second manager, in halves) are copied with ``weight_sync`` only;
 - the LoRA factors (``A`` ``[r, in]``, ``B`` ``[out, r]`` per expert and projection) are staged expert-major (PEFT
   keeps ``B`` as ``[out, r * E]`` with the expert index fastest) and copied by a trainable manager, whose
   ``grad_reduce`` returns the copies' FP32 gradients to their owners: the fetch is an autograd node, so DeepSpeed's
@@ -29,11 +33,14 @@ trained parameters are the experts' LoRA factors, so a copy carries both:
 - the per-expert scalars (W4A8's static input scales, NVFP4's per-matrix scales) are gathered over the EP group and
   read through the plan's physical-to-logical map.
 A recompute reuses its forward's plan and physical routes, so forward, recompute and backward route identically.
+
+UltraEP's pointer pools read each layer's native stacks in place. With ``moe/frozen_offload.py`` the codes exist only
+during a call of the experts, as that call's copy in the layer's persistent buffer (by layer parity), at the same
+addresses in every call; so a layer's pools are built at its first fetch, inside that call.
 """
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from typing import Any
 
@@ -41,23 +48,11 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-ULTRAEP_SPARES_ENV = "ARL_ULTRAEP_SPARES"
-# Placement maps and pointer pools are sized per layer; GLM-5.3 has 75 MoE layers.
+from .ultraep_replicas import ultraep_spares
+
+# Placement maps and pointer pools are sized per layer; GLM-5.3 has 75 MoE layers, DeepSeek-V4.1 43.
 _MAX_LAYERS = 128
-
-
-_configured: int | None = None  # loader option moe.ultraep_spares (moe/runtime_options.py); None: the env
-
-
-def configure_from_options(value: int | None) -> None:
-    global _configured
-    _configured = value
-
-
-def ultraep_spares() -> int:
-    if _configured is not None:
-        return _configured
-    return int(os.environ.get(ULTRAEP_SPARES_ENV, "0") or 0)
+_NAMES = ("w1", "w2", "w3")
 
 
 def _lora_layout(ab: dict, experts: int) -> dict:
@@ -66,7 +61,9 @@ def _lora_layout(ab: dict, experts: int) -> dict:
     for name, (weight_a, weight_b, rank, _scaling) in ab.items():
         shapes[name] = (rank, weight_a.shape[1], weight_b.shape[0])
         if weight_a.shape[0] != experts * rank or weight_b.shape[1] != experts * rank:
-            raise ValueError(f"{name}: LoRA factors {tuple(weight_a.shape)} / {tuple(weight_b.shape)} for {experts} experts")
+            raise ValueError(
+                f"{name}: LoRA factors {tuple(weight_a.shape)} / {tuple(weight_b.shape)} for {experts} experts"
+            )
     return shapes
 
 
@@ -81,12 +78,29 @@ def _unstage(staged: Tensor, rank: int, width_in: int, width_out: int) -> tuple[
     """Inverse of ``_stage`` for ``staged`` ``[E, ...]``: ``(A [E * r, in], B [out, r * E])``."""
     experts = staged.shape[0]
     a = staged[:, : rank * width_in].reshape(experts * rank, width_in)
-    b = staged[:, rank * width_in :].reshape(experts, width_out, rank).permute(1, 2, 0).reshape(width_out, rank * experts)
+    b = (
+        staged[:, rank * width_in :]
+        .reshape(experts, width_out, rank)
+        .permute(1, 2, 0)
+        .reshape(width_out, rank * experts)
+    )
     return a, b
 
 
-class Packed4UltraEPState:
-    """The UltraEP managers of one EP group's packed-4-bit experts, their LoRA staging, and each layer's index."""
+def _local(t: Tensor) -> Tensor:
+    return t.to_local() if hasattr(t, "to_local") else t
+
+
+def _stacks(experts) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+    """The experts' code stacks ``(w1, w2, w3)`` and block scales as they are now."""
+    return (
+        tuple(_local(getattr(experts, name)) for name in _NAMES),
+        tuple(_local(getattr(experts, f"{name}_scale_inv")) for name in _NAMES),
+    )
+
+
+class FrozenUltraEPState:
+    """The UltraEP managers of one EP group's frozen quantized experts, their LoRA staging, and each layer's index."""
 
     def __init__(self, group, experts, ab: dict, spares: int) -> None:
         import ultra_ep
@@ -95,8 +109,12 @@ class Packed4UltraEPState:
         self.spares = spares
         self.ranks = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
-        w1, w2, w3 = (_local(getattr(experts, name)) for name in ("w1", "w2", "w3"))
-        s1, s2, s3 = (_local(getattr(experts, f"{name}_scale_inv")) for name in ("w1", "w2", "w3"))
+        (w1, w2, w3), (s1, s2, s3) = _stacks(experts)
+        if w1.numel() == 0:
+            raise RuntimeError(
+                "UltraEP: the experts' codes are not on the GPU (frozen expert offload); its state is built at the "
+                "first MoE call, before the offload moves them"
+            )
         L = w1.shape[0]
         self.experts_per_rank = L
         self.n2_half = w2[0].numel() // 2
@@ -128,7 +146,9 @@ class Packed4UltraEPState:
         self.lora_names = [name for name in ("w1", "w3", "w2") if name in ab]
         self.lora: Any = None
         if self.lora_names:
-            widths = {name: rank * (width_in + width_out) for name, (rank, width_in, width_out) in self.lora_shapes.items()}
+            widths = {
+                name: rank * (width_in + width_out) for name, (rank, width_in, width_out) in self.lora_shapes.items()
+            }
             self.lora_width = widths
             # fc1 carries w1's factors and w2's; fc2 w3's (zero-width projections are padded to keep two blocks).
             self.fc1_names = [n for n in ("w1", "w2") if n in ab]
@@ -148,8 +168,9 @@ class Packed4UltraEPState:
                 grad_dtype=torch.float32,
             )
             # One staging pair serves every layer: a layer's sync and reduce finish before the next layer's start.
-            self.lora_stage = torch.zeros(L, 2, max(self.fc1_numel, self.fc2_numel), dtype=dtype, device=w1.device)
-            self.lora_grads = torch.zeros(L, 2, max(self.fc1_numel, self.fc2_numel), dtype=torch.float32, device=w1.device)
+            width = max(self.fc1_numel, self.fc2_numel)
+            self.lora_stage = torch.zeros(L, 2, width, dtype=dtype, device=w1.device)
+            self.lora_grads = torch.zeros(L, 2, width, dtype=torch.float32, device=w1.device)
         self.layer_of: dict[int, int] = {}
         self.pooled: set[int] = set()
         self.kept_routes: dict[int, deque] = {}
@@ -164,14 +185,15 @@ class Packed4UltraEPState:
         return self.layer_of[key]
 
     def ensure_pools(self, lid: int, experts) -> None:
-        """Point UltraEP at the layer's expert tensors, at their first fetch: W4A8 rewrites the scales into its layout
-        in place on first use, so pools built earlier would hold the old storage."""
+        """Point UltraEP at the layer's expert stacks at their first fetch, inside a call of the experts: with the
+        frozen expert offload the codes are that call's copy, which every later call of the layer finds at the same
+        addresses; W4A8 rewrites INT4 scales into its layout in place on first use (and MXFP4 scales are compacted to
+        E8M0 bytes at load), so pools built earlier would hold the old storage."""
         if lid in self.pooled:
             return
         self.pooled.add(lid)
         L = self.experts_per_rank
-        w1, w2, w3 = (_local(getattr(experts, name)) for name in ("w1", "w2", "w3"))
-        s1, s2, s3 = (_local(getattr(experts, f"{name}_scale_inv")) for name in ("w1", "w2", "w3"))
+        (w1, w2, w3), (s1, s2, s3) = _stacks(experts)
         self.gate_up.construct_local_master_ptr_pool(
             lid,
             [w1[e] for e in range(L)],
@@ -204,16 +226,12 @@ class Packed4UltraEPState:
         )
 
 
-def _local(t: Tensor) -> Tensor:
-    return t.to_local() if hasattr(t, "to_local") else t
-
-
 class _LoraFetch(torch.autograd.Function):
     """Native expert LoRA factors -> the ``L + S`` slots' factors (PEFT layout); the backward returns the spares'
     gradients to their owners through UltraEP's ``grad_reduce``."""
 
     @staticmethod
-    def forward(ctx, state: Packed4UltraEPState, lid: int, names: tuple, *factors: Tensor):
+    def forward(ctx, state: FrozenUltraEPState, lid: int, names: tuple, *factors: Tensor):
         L, S = state.experts_per_rank, state.spares
         staged = {}
         for i, name in enumerate(names):
@@ -230,7 +248,10 @@ class _LoraFetch(torch.autograd.Function):
         out: list[Tensor] = []
         for name in names:
             rank, width_in, width_out = state.lora_shapes[name]
-            block, names_in_block = (spare_fc1, state.fc1_names) if name in state.fc1_names else (spare_fc2, state.fc2_names)
+            if name in state.fc1_names:
+                block, names_in_block = spare_fc1, state.fc1_names
+            else:
+                block, names_in_block = spare_fc2, state.fc2_names
             start = sum(state.lora_width[n] for n in names_in_block[: names_in_block.index(name)])
             spare = block[:, start : start + state.lora_width[name]]
             full = torch.cat([staged[name], spare], dim=0)
@@ -243,11 +264,16 @@ class _LoraFetch(torch.autograd.Function):
     def backward(ctx, *grads: Tensor):
         state, lid, names = ctx.state, ctx.lid, ctx.names
         L, S = state.experts_per_rank, state.spares
+        device = state.lora_grads.device
         staged_grads = {}
         for i, name in enumerate(names):
             rank, width_in, width_out = state.lora_shapes[name]
-            ga = grads[2 * i] if grads[2 * i] is not None else torch.zeros(((L + S) * rank, width_in), device=state.lora_grads.device)
-            gb = grads[2 * i + 1] if grads[2 * i + 1] is not None else torch.zeros((width_out, rank * (L + S)), device=state.lora_grads.device)
+            ga = grads[2 * i]
+            if ga is None:
+                ga = torch.zeros(((L + S) * rank, width_in), device=device)
+            gb = grads[2 * i + 1]
+            if gb is None:
+                gb = torch.zeros((width_out, rank * (L + S)), device=device)
             staged_grads[name] = _stage(ga.float(), gb.float(), rank, L + S)
         fc1 = torch.cat([staged_grads[n][L:] for n in state.fc1_names], dim=1)
         state.lora.local_replica_fc1_grad_buffer.copy_(fc1.reshape(S, -1))
@@ -267,10 +293,10 @@ class _LoraFetch(torch.autograd.Function):
         return tuple(out)
 
 
-class Packed4UltraEPPlan:
-    """One MoE call's UltraEP placement for packed-4-bit experts: physical routes and the spares' weights."""
+class FrozenUltraEPPlan:
+    """One MoE call's UltraEP placement for frozen quantized experts: physical routes and the spares' weights."""
 
-    def __init__(self, state: Packed4UltraEPState, lid: int, building: bool, recompute: bool) -> None:
+    def __init__(self, state: FrozenUltraEPState, lid: int, building: bool, recompute: bool) -> None:
         self.state = state
         self.lid = lid
         self.building = building
@@ -288,7 +314,9 @@ class Packed4UltraEPPlan:
                 raise RuntimeError("UltraEP: a recompute found no routing from its forward")
             physical = kept.popleft()
             if physical.shape != selected.shape:
-                raise RuntimeError(f"UltraEP: recompute routes {tuple(selected.shape)}, its forward {tuple(physical.shape)}")
+                raise RuntimeError(
+                    f"UltraEP: recompute routes {tuple(selected.shape)}, its forward {tuple(physical.shape)}"
+                )
             return physical
         physical = selected.to(torch.int64).contiguous().clone()
         self.state.gate_up.reroute_sparse(self.lid, physical)
@@ -310,8 +338,10 @@ class Packed4UltraEPPlan:
         return torch.cat([values, spare])
 
     def extend(self, experts, weights: tuple, scales: tuple, ab: dict, scalars: dict) -> tuple:
-        """The call's ``L + S`` slot stacks: codes, scales (as passed, with ``Int4InterleavedScales`` /
-        ``Nvfp4Scales`` rebuilt around the extended tensors), LoRA factors and per-expert scalars."""
+        """The call's ``L + S`` slot stacks: codes, scales (as passed: block-FP8 or group-scale tensors, with
+        ``Int4InterleavedScales`` / ``Nvfp4Scales`` rebuilt around the extended tensors), LoRA factors and per-expert
+        scalars, native experts first. One plan serves every dispatch chunk of its MoE call, so the spares are fetched
+        once."""
         from arctic_platform.model.implementations.fp8 import Int4InterleavedScales
         from arctic_platform.model.implementations.fp8 import Nvfp4Scales
 
@@ -326,17 +356,27 @@ class Packed4UltraEPPlan:
         gu, dn = state.gate_up, state.down
         spare_w1 = gu.local_replica_fc1_weight_buffer.view(S, *w1.shape[1:])
         spare_w3 = gu.local_replica_fc2_weight_buffer.view(S, *w3.shape[1:])
-        spare_w2 = torch.cat([dn.local_replica_fc1_weight_buffer.view(S, -1), dn.local_replica_fc2_weight_buffer.view(S, -1)], 1)
-        ext_w = (torch.cat([w1, spare_w1]), torch.cat([w2, spare_w2.view(S, *w2.shape[1:])]), torch.cat([w3, spare_w3]))
+        spare_w2 = torch.cat(
+            [dn.local_replica_fc1_weight_buffer.view(S, -1), dn.local_replica_fc2_weight_buffer.view(S, -1)], 1
+        ).view(S, *w2.shape[1:])
+        ext_w = (torch.cat([w1, spare_w1]), torch.cat([w2, spare_w2]), torch.cat([w3, spare_w3]))
 
         def raw(scale):
-            return scale.scale if isinstance(scale, Int4InterleavedScales) else scale.block if isinstance(scale, Nvfp4Scales) else scale
+            if isinstance(scale, Int4InterleavedScales):
+                return scale.scale
+            if isinstance(scale, Nvfp4Scales):
+                return scale.block
+            return scale
 
         s1, s2, s3 = (raw(s) for s in scales)
         spare_s1 = gu.local_replica_fc1_weight_scale_buffer.view(S, *s1.shape[1:])
         spare_s3 = gu.local_replica_fc2_weight_scale_buffer.view(S, *s3.shape[1:])
         spare_s2 = torch.cat(
-            [dn.local_replica_fc1_weight_scale_buffer.view(S, -1), dn.local_replica_fc2_weight_scale_buffer.view(S, -1)], 1
+            [
+                dn.local_replica_fc1_weight_scale_buffer.view(S, -1),
+                dn.local_replica_fc2_weight_scale_buffer.view(S, -1),
+            ],
+            1,
         ).view(S, *s2.shape[1:])
         ext_raw = (torch.cat([s1, spare_s1]), torch.cat([s2, spare_s2]), torch.cat([s3, spare_s3]))
 
@@ -347,10 +387,10 @@ class Packed4UltraEPPlan:
                 return Nvfp4Scales(tensor, self._scalars(scalars[f"{name}_scale_2"]))
             return tensor
 
-        ext_s = tuple(rewrap(o, t, n) for o, t, n in zip(scales, ext_raw, ("w1", "w2", "w3")))
+        ext_s = tuple(rewrap(o, t, n) for o, t, n in zip(scales, ext_raw, _NAMES))
         ext_ab = {}
         if ab:
-            names = tuple(n for n in state.lora_names)
+            names = tuple(state.lora_names)
             factors = [t for n in names for t in ab[n][:2]]
             fetched = _LoraFetch.apply(state, lid, names, *factors)
             for i, n in enumerate(names):
@@ -361,19 +401,21 @@ class Packed4UltraEPPlan:
         return self.cache
 
 
-_STATES: dict[int, Packed4UltraEPState] = {}
+_STATES: dict[int, FrozenUltraEPState] = {}
 
 
-def packed4_ultraep_plan(module, experts, group, selected: Tensor, ab: dict, building: bool) -> Packed4UltraEPPlan:
+def frozen_ultraep_plan(
+    module, experts, group, selected: Tensor, ab: dict, building: bool
+) -> FrozenUltraEPPlan:
     """This MoE call's plan: planned from ``selected`` unless the call is a recompute (``building`` False), which
     reuses its forward's placement and routing."""
     key = id(group)
     if key not in _STATES:
-        _STATES[key] = Packed4UltraEPState(group, experts, ab, ultraep_spares())
+        _STATES[key] = FrozenUltraEPState(group, experts, ab, ultraep_spares())
     state = _STATES[key]
     lid = state.layer(module)
     if building:
         if torch.is_grad_enabled():  # a graph-building forward: whatever its last one kept has been recomputed
             state.kept_routes.setdefault(lid, deque()).clear()
         state.gate_up.update_placement_sparse(lid, selected.to(torch.int64).contiguous())
-    return Packed4UltraEPPlan(state, lid, building=building and torch.is_grad_enabled(), recompute=not building)
+    return FrozenUltraEPPlan(state, lid, building=building and torch.is_grad_enabled(), recompute=not building)

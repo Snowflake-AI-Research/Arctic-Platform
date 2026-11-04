@@ -183,6 +183,8 @@ def vllm_layer_converter(model: nn.Module):
 
 def build_iter_full_vllm_weights(model: nn.Module):
     """Iterator yielding ``(vllm_name, full_tensor)`` on rank 0 for weight sync."""
+    from arctic_platform.model.implementations.moe.expert_placement import cat_expert_shards
+
     convert_layer = vllm_layer_converter(model)
 
     import deepspeed.utils.groups as ds_groups
@@ -243,7 +245,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     ]
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
-                        layer_sd[name] = torch.cat(shards, dim=0)
+                        layer_sd[name] = cat_expert_shards(tensor, shards)
                     else:
                         wait_for_export_collective(local)
                 elif is_master:

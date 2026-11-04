@@ -17,9 +17,13 @@ from arctic_platform.model.implementations.debug.token_combine import maybe_use_
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
+from .config import DISPATCH_EP_BACKENDS
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
+from .expert_placement import apply_expert_placement
+from .expert_placement import expert_export_rows
+from .expert_placement import tag_expert_adapter
 from .layers.moe import LatentMoE
 from .layers.moe import MoE
 from .logging_utils import get_logger
@@ -79,7 +83,7 @@ def patch_deepspeed_moe_detection() -> None:
 def apply_ep_with_mesh(model: nn.Module, config: Any, ep_mesh: DeviceMesh) -> None:
     if not uses_dispatch_ep(config.ep_comm_backend):
         raise NotImplementedError(
-            f"EP comm backend must be one of ('deepep', 'uccl'), got {config.ep_comm_backend!r}."
+            f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {config.ep_comm_backend!r}."
         )
     for transformer_block in get_language_model(model).layers:
         block_mlp = getattr(transformer_block, "mlp", None)
@@ -149,6 +153,7 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
             if parameter.requires_grad and getattr(parameter, "group_name", None) is None:
                 parameter.allreduce = False
                 parameter.group_name = ep_group_name
+                tag_expert_adapter(parameter, module)
                 count += 1
     return count
 
@@ -176,15 +181,16 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
-        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
+    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool, dest: torch.Tensor | None):
+        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere), gathered row ``i`` at
+        row ``dest[i]`` when given (a static expert placement's logical order, ``expert_export_rows``).
 
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
         """
         # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
         if local.dtype != torch.uint8:
-            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master, dest)
             return None if full is None else full.view(local.dtype)
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
@@ -198,6 +204,8 @@ def build_iter_full_hf_weights(model: nn.Module):
             dist.gather(local, gather_list, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(local)
+            if full is not None and dest is not None:
+                full = torch.empty_like(full).index_copy_(0, dest.to(full.device), full)
             return full
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
         if is_master:
@@ -215,7 +223,11 @@ def build_iter_full_hf_weights(model: nn.Module):
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
-                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                    if dest is None:
+                        full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                        continue
+                    for j in range(n):  # placed experts: one expert row per copy
+                        full[int(dest[r * rows + start + j])].copy_(buffer[r, j])
         return full
 
     def iterator(*, include_skipped: bool = False):
@@ -251,7 +263,8 @@ def build_iter_full_hf_weights(model: nn.Module):
                         continue
                     local = tensor.data.contiguous()
                     world = dist.get_world_size(group=ep_group)
-                    full = _gather_to_master(local, world, ep_group, is_master)
+                    dest = expert_export_rows(tensor, local.shape[0] * world)
+                    full = _gather_to_master(local, world, ep_group, is_master, dest)
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -307,6 +320,8 @@ def setup_model_local_no_train(
     adapter.reset_runtime_moe_buffers(model)
     count = convert_dtensors_to_local(model)
     logger.info(f"Unwrapped {count} DTensor parameters into local tensors")
+    # Before DeepSpeed partitions the experts: their rows, gradients and optimizer state are in placement slot order.
+    apply_expert_placement(model, logger)
     enable_tiled_mlp(
         model,
         is_target=lambda module: isinstance(module, adapter.shared_expert_type),
@@ -374,7 +389,8 @@ def load_moe_model(
 
     from .runtime_options import apply_moe_runtime_options
 
-    # Before the model is built: offload, sharding, W4A8 and UltraEP read these settings while it is built and run.
+    # Before the model is built: offload, sharding, W4A8, UltraEP, the online replicas and the expert placement read
+    # these settings while it is built and run, so every module reads this load's settings.
     apply_moe_runtime_options(options)
     world_size = dist.get_world_size()
     if world_size % ep_size:
@@ -395,7 +411,7 @@ def load_moe_model(
     )
     ep_backend = options.ep_comm_backend
     if not uses_dispatch_ep(ep_backend):
-        raise NotImplementedError(f"EP comm backend must be one of ('deepep', 'uccl'), got {ep_backend!r}.")
+        raise NotImplementedError(f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {ep_backend!r}.")
 
     dp_replicate = world_size // ep_size
     model_config = adapter.build_model_config(

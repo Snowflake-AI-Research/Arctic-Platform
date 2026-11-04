@@ -12,22 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Keep the frozen routed-expert weights in pinned host memory; copy each layer's in around every call of the layer.
+"""Keep the frozen routed-expert weights in pinned host memory; copy each layer's in around every call of its experts.
 
 GLM-5.3's block-FP8 routed experts are 91 GiB per GPU at EP8, which leaves too little of an H200 for a 256K-token
 sequence. With LoRA they are frozen and every layer reads them twice per step: in its forward and in its
 activation-checkpoint recompute (the backward reuses the recompute's copy). So each rank keeps its experts' codes in
 one host buffer, registered with CUDA, and a layer's codes (1.2 GiB per GPU for GLM-5.3) are copied in on a side
-stream for each call, into one of two persistent GPU buffers by the layer's parity (so a layer's codes always sit at
-the same addresses, which UltraEP's spare-slot copies read in place). The next layer in call order (forward: the next one; backward: the previous one) is prefetched
-while the current one runs, so the copy overlaps compute.
+stream for each call, into one of two persistent GPU buffers by the layer's parity: a layer's codes always sit at the
+same addresses (which UltraEP's spare slots, ``moe/ultraep_frozen.py``, read in place), and no call allocates. The
+next layer in call order (forward: the next one; backward: the previous one) is prefetched while the current one runs,
+so the copy overlaps compute.
 
-As in ``frozen_shard``, the offload happens at the first call, after PEFT and DeepSpeed have wrapped the model; the
-expert parameters keep their objects with empty data, and during a call each is replaced by a temporary parameter
-viewing the copied bytes. The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with
-``save_for_backward`` (``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the
-recompute's copy lives until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales
-stay on the GPU (W4A8 rewrites INT4 scales in place on first use). A model with offloaded experts cannot export them.
+The offload happens at the first call, after PEFT and DeepSpeed have wrapped the model; the expert parameters keep
+their objects with empty data, and during a call each is replaced by a temporary parameter viewing the copied bytes.
+The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with ``save_for_backward``
+(``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the recompute's copy lives
+until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales stay on the GPU (block
+FP8's FP32 scales are a 4,096th of the codes' bytes; W4A8 rewrites INT4 group scales in place on first use). A model
+with offloaded experts cannot export them.
+
+A layer whose experts are not recomputed (``ac_config.layers`` leaves its block out of checkpointing) saves its
+expert weights for backward, so a copy of its codes would live until then and hold a buffer the next layers need: such
+layers keep their codes on the GPU and are not managed.
 """
 
 from __future__ import annotations
@@ -94,7 +100,8 @@ class FrozenExpertOffload:
 
     def __init__(self, layers: list[nn.Module]) -> None:
         self.layers = layers
-        # Per layer: [(experts module, name, param, shape, dtype, offset in the layer's bytes, nbytes)], host offset, size.
+        # Per layer: [(experts module, name, param, shape, dtype, offset in the layer's bytes, nbytes)], its offset
+        # in the host buffer, and its size.
         self.entries: list[list[tuple]] = []
         self.host_offsets: list[int] = []
         self.layer_bytes: list[int] = []
@@ -147,11 +154,13 @@ class FrozenExpertOffload:
         for i, entries in enumerate(self.entries):
             base = self.host_offsets[i]
             for _, _, param, _, dtype, start, nbytes in entries:
-                self.host[base + start : base + start + nbytes].copy_(param.data.contiguous().view(torch.uint8).view(-1))
+                self.host[base + start : base + start + nbytes].copy_(
+                    param.data.contiguous().view(torch.uint8).view(-1)
+                )
                 param.data = torch.empty(0, dtype=dtype, device=param.device)
         self.stream = torch.cuda.Stream()
         # The codes' GPU blocks went back to PyTorch's cache; hand them to the driver too, or NCCL and DeepEP, which
-        # allocate outside the cache, still see the memory as taken (out of memory in an NCCL call without sharding).
+        # allocate outside the cache, still see the memory as taken (out of memory in an NCCL call).
         torch.cuda.empty_cache()
         size = max(self.layer_bytes, default=0)
         device = torch.device("cuda", torch.cuda.current_device())
@@ -275,8 +284,10 @@ def install_frozen_expert_offload(layers: nn.ModuleList) -> FrozenExpertOffload:
     installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
     each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. PEFT may
     wrap the experts after this returns (the trainer applies LoRA to the loaded model), so each layer binds its hooks
-    to the call sites at its first call. Layers whose experts are not recomputed (``ac_config.layers`` leaves them out)
-    keep their codes on the GPU: their saved tensors hold them until backward.
+    to the call sites at its first call.
+
+    Layers whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their
+    saved tensors hold them until backward.
     """
     managed = []
     for layer in layers:

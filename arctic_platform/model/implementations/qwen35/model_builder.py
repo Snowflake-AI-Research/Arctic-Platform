@@ -70,7 +70,12 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import (
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
-from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
+from arctic_platform.model.implementations.moe.weights import (
+    dcp_planning_group,
+    load_state_dict,
+    load_state_dict_keys,
+    save_state_dict,
+)
 from arctic_platform.model.implementations.moe.world import get_world
 
 
@@ -608,6 +613,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        process_group=dcp_planning_group(),
     )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:

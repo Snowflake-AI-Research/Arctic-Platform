@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""UltraEP spares for packed-4-bit experts with LoRA (moe/ultraep_packed4.py): copies compute with their owners'
-codes, scales and LoRA factors, and the copies' LoRA gradients return to the owners.
+"""UltraEP spares for packed-4-bit experts with LoRA (moe/ultraep_frozen.py, the frozen quantized path that block-FP8
+experts take too): copies compute with their owners' codes, scales and LoRA factors, and the copies' LoRA gradients
+return to the owners.
 
 Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_packed4.py [w4a8 | fp8]
 """
@@ -43,7 +44,7 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups_reference
-    from arctic_platform.model.implementations.moe import ultraep_packed4
+    from arctic_platform.model.implementations.moe import ultraep_frozen
     from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
     group = dist.new_group(list(range(world)))
@@ -103,7 +104,7 @@ def main():
         1,
     )
     module = torch.nn.Module()
-    plan = ultraep_packed4.packed4_ultraep_plan(module, experts, group, selected, ab, building=True)
+    plan = ultraep_frozen.frozen_ultraep_plan(module, experts, group, selected, ab, building=True)
     physical = plan.remap(selected)
     p2l = plan.state.gate_up.physical_to_logical_map[plan.lid].long()
     assert torch.equal(p2l[physical], selected), "remap keeps every token on a copy of its expert"

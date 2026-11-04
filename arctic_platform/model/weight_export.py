@@ -339,10 +339,12 @@ def _gather_ep_expert_lora(parameter: Any, *, kind: str, rank: int) -> torch.Ten
     ``lora_A`` is ``[experts * r, in]`` (expert-major), so the rank shards stack. ``lora_B`` is ``[out, r * experts]``
     with the expert index fastest, so each rank's experts interleave into the global tensor.
     """
+    from arctic_platform.model.implementations.moe.expert_placement import cat_expert_shards
+
     shards = _gather_ep_shards(parameter)
     if kind == "A":
-        return torch.cat(shards, dim=0)
-    return torch.cat([shard.view(shard.shape[0], rank, -1) for shard in shards], dim=2).flatten(1)
+        return cat_expert_shards(parameter, shards)
+    return cat_expert_shards(parameter, [shard.view(shard.shape[0], rank, -1) for shard in shards], dim=2).flatten(1)
 
 
 def gather_peft_adapter_state_dict(model: nn.Module, *, rank: int, is_zero3: bool) -> dict[str, torch.Tensor]:
@@ -572,6 +574,7 @@ def iter_lora_weights(
         raise ValueError("weight_format='lora' requires a PEFT model")
     validate_lora_sync_trainable_parameters(model)
 
+    from arctic_platform.model.implementations.moe.expert_placement import cat_expert_shards
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
     # Families whose module tree differs from the served checkpoint rename adapter tensors here.
@@ -598,7 +601,7 @@ def iter_lora_weights(
             if is_master:
                 yield (
                     rename(_expert_lora_vllm_key(prefix, weight_name, kind)),
-                    torch.cat(shards, dim=0).contiguous(),
+                    cat_expert_shards(parameter, shards).contiguous(),
                 )
             else:
                 wait_for_export_collective(local)
@@ -618,7 +621,7 @@ def iter_lora_weights(
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
             dist.all_gather(shards, local, group=group)
             if is_master:
-                yield export_name, torch.cat(shards, dim=0)
+                yield export_name, cat_expert_shards(parameter, shards)
             else:
                 wait_for_export_collective(local)
         elif is_master:
