@@ -164,6 +164,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
         parts = name.split(".")
@@ -181,6 +182,10 @@ def build_iter_full_hf_weights(model: nn.Module):
         A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
         slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
         """
+        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
+        if local.dtype != torch.uint8:
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            return None if full is None else full.view(local.dtype)
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
@@ -191,6 +196,8 @@ def build_iter_full_hf_weights(model: nn.Module):
                 full = None
                 gather_list = None
             dist.gather(local, gather_list, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(local)
             return full
         step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
         if is_master:
@@ -202,7 +209,10 @@ def build_iter_full_hf_weights(model: nn.Module):
         for start in range(0, rows, step):
             n = min(step, rows - start)
             outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            dist.gather(local[start:start + n].contiguous(), outputs, dst=0, group=ep_group)
+            chunk = local[start:start + n].contiguous()
+            dist.gather(chunk, outputs, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
                     full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])

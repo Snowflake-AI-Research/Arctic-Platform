@@ -24,10 +24,10 @@ import types
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.fp8 import compute_weight
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
     fused_sparse_mla_backward_available,
 )
@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_a
 from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
@@ -53,12 +54,6 @@ _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
 # Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
 _SCORE_BUDGET_BYTES = 1 << 30
 SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
-
-
-def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
-    if group is None or dist.get_world_size(group) == 1:
-        return tensor
-    return torch.cat(dist_nn.all_gather(tensor.contiguous(), group=group), dim=1)
 
 
 @torch.no_grad()
@@ -593,8 +588,8 @@ def _sparse_attention_forward(
         dim=-1,
     )
     kv_pass = self.kv_a_layernorm(kv_pass)
-    kv_pass_full = _gather_sequence(kv_pass, self._cp_group)
-    k_position_full = _gather_sequence(k_position, self._cp_group)
+    kv_pass_full = gather_sequence(kv_pass, self._cp_group)
+    k_position_full = gather_sequence(k_position, self._cp_group)
 
     if self.indexer is not None:
         global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
@@ -618,7 +613,8 @@ def _sparse_attention_forward(
     else:
         topk_indices = prev_topk_indices
 
-    kv_b_weight = self.kv_b_proj.weight.view(
+    # The absorbed path reads the weight rather than calling the module, so a LoRA delta has to be added here.
+    kv_b_weight = compute_weight(self.kv_b_proj).view(
         self.num_heads,
         self.qk_nope_head_dim + self.v_head_dim,
         self.kv_lora_rank,
@@ -655,8 +651,11 @@ def _sparse_attention_forward(
             )
             self._ap_flashinfer_dispatch_reported = True
     elif backend == "flashmla":
-        # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
-        padding = 576 - sparse_query.shape[-1]
+        query_width = sparse_query.shape[-1]
+        # FlashMLA's forward and the fused TileLang backward take the rope-free 512-wide latent as is: 18.3 + 112 ms
+        # against 19.7 + 129 ms zero-padded to 576 for one CP8 rank at 256K on H200. FlashMLA's reference-backward
+        # fallback keeps the padding, which leaves the dot products unchanged.
+        padding = 0 if _fused_sparse_mla_backward_available() else 576 - query_width
         if padding:
             sparse_query = F.pad(sparse_query, (0, padding))
             sparse_kv = F.pad(sparse_kv, (0, padding))
@@ -671,9 +670,10 @@ def _sparse_attention_forward(
         )
         if not getattr(self, "_ap_flashmla_dispatch_reported", False):
             get_logger().info(
-                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=576 backward=fused",
+                "GLM53_FLASHMLA_EXECUTED rank=%s query_width=%s kernel_width=%s backward=fused",
                 dist.get_rank() if dist.is_initialized() else 0,
-                576 - padding,
+                query_width,
+                sparse_query.shape[-1],
             )
             self._ap_flashmla_dispatch_reported = True
     else:

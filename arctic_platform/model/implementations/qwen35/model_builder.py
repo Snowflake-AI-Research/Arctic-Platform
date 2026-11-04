@@ -377,8 +377,10 @@ def get_model(
     model_config.use_grouped_mm = config.moe_use_grouped_mm
     # Read by the custom Qwen3.5-MoE decoder, which a composite model builds from its text config.
     model_config.fp32_parity = config.fp32_parity
+    model_config.fp32_routed_weighting = config.fp32_routed_weighting
     if getattr(model_config, "text_config", None) is not None:
         model_config.text_config.fp32_parity = config.fp32_parity
+        model_config.text_config.fp32_routed_weighting = config.fp32_routed_weighting
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.

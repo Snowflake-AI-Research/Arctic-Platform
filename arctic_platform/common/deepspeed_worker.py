@@ -299,7 +299,13 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+        # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
+        # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
+        # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
+        data_types = dict(ds_config.get("data_types") or {})
+        if data_types.get("grad_accum_dtype") is None:
+            data_types["grad_accum_dtype"] = "fp32"
+        ds_config["data_types"] = data_types
 
         return ds_config
 

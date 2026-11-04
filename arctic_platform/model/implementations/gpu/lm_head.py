@@ -174,9 +174,16 @@ def _get_sequence_chunked_logprob_fn():
         chunk_exp[target_rows, target_columns] = 0.0
         return m_new, s * exp_old + chunk_exp.sum(dim=-1)
 
+    def softcap_logits(logits, softcap):
+        """Gemma's ``softcap * tanh(logits / softcap)``, with the ``tanh`` kept for its derivative."""
+        if softcap is None:
+            return logits, None
+        squashed = torch.tanh(logits / softcap)
+        return squashed * softcap, squashed
+
     class SequenceChunkedLogProbFn(torch.autograd.Function):
-        """Compute ``log_softmax(hidden @ weight.T / temperature)[label]`` per
-        row of ``hidden``, tiling over (token, vocab) so peak memory is
+        """Compute ``log_softmax(softcap(hidden @ weight.T) / temperature)[label]``
+        per row of ``hidden``, tiling over (token, vocab) so peak memory is
         ``O(token_chunk_size * vocab_chunk_size)`` instead of ``O(N * V)``.
 
         The forward caches the per-row log-partition ``logz`` for backward;
@@ -198,6 +205,7 @@ def _get_sequence_chunked_logprob_fn():
             fp32_lm_head: bool,
             action_masks=None,
             group_token_ids=None,
+            softcap=None,
         ):
             if hidden.dim() != 2 or weight.dim() != 2:
                 raise ValueError(
@@ -257,7 +265,8 @@ def _get_sequence_chunked_logprob_fn():
                         logits_chunk = hidden_chunk @ weight_chunk.t()
                     if bias is not None:
                         logits_chunk = logits_chunk + bias[vocab_start:vocab_end].to(logits_chunk.dtype)
-                    scaled_logits = logits_chunk.to(torch.float32) * inv_t_chunk
+                    capped_logits, _ = softcap_logits(logits_chunk.to(torch.float32), softcap)
+                    scaled_logits = capped_logits * inv_t_chunk
                     apply_lm_head_action_masks_(
                         scaled_logits,
                         token_masks,
@@ -297,6 +306,7 @@ def _get_sequence_chunked_logprob_fn():
             ctx.token_chunk_size = token_chunk_size
             ctx.vocab_chunk_size = vocab_chunk_size
             ctx.fp32_lm_head = fp32_lm_head
+            ctx.softcap = softcap
             ctx.grouped = grouped
             if grouped is None:
                 return logprobs
@@ -310,6 +320,7 @@ def _get_sequence_chunked_logprob_fn():
             token_chunk_size: int = ctx.token_chunk_size
             vocab_chunk_size: int = ctx.vocab_chunk_size
             fp32_lm_head: bool = ctx.fp32_lm_head
+            softcap = ctx.softcap
             action_masks = ctx.action_masks
             grouped = ctx.grouped
 
@@ -348,7 +359,8 @@ def _get_sequence_chunked_logprob_fn():
                     if bias is not None:
                         bias_chunk = bias[vocab_start:vocab_end]
                         logits_chunk = logits_chunk + (bias_chunk.float() if fp32_lm_head else bias_chunk)
-                    scaled_logits = logits_chunk.to(torch.float32) * inv_t_chunk
+                    capped_logits, squashed = softcap_logits(logits_chunk.to(torch.float32), softcap)
+                    scaled_logits = capped_logits * inv_t_chunk
                     apply_lm_head_action_masks_(
                         scaled_logits,
                         token_masks,
@@ -380,6 +392,8 @@ def _get_sequence_chunked_logprob_fn():
                         )
                     # Chain rule for temperature scaling: scaled = logits * inv_t.
                     grad_logits = grad_logits * inv_t_chunk
+                    if squashed is not None:
+                        grad_logits = grad_logits * (1 - squashed * squashed)
 
                     grad_logits_proj = grad_logits.to(w_proj.dtype)
                     grad_hidden[start:end].add_(grad_logits_proj @ w_proj)
@@ -393,6 +407,7 @@ def _get_sequence_chunked_logprob_fn():
                 None,
                 None,
                 grad_bias.to(bias.dtype) if grad_bias is not None else None,
+                None,
                 None,
                 None,
                 None,
@@ -486,12 +501,14 @@ def chunked_lm_head_logprobs(
     fp32_lm_head: bool,
     action_masks=None,
     group_token_ids=None,
+    softcap: float | None = None,
 ):
     """Per-token and optional grouped log probabilities via tiled matmuls.
 
     Flattens ``[B, S, *]`` to ``[B*S, *]`` so the autograd Function can iterate
     a 1-D token axis. When ``group_token_ids`` is present, returns
-    ``(logprobs [B,S], group_log_probs [B,S,M+1])``.
+    ``(logprobs [B,S], group_log_probs [B,S,M+1])``. ``softcap`` applies
+    Gemma's ``final_logit_softcapping`` to the logits before temperature.
     """
     import torch
 
@@ -539,6 +556,7 @@ def chunked_lm_head_logprobs(
         bool(fp32_lm_head),
         lm_head_action_masks,
         group_token_ids,
+        float(softcap) if softcap else None,
     )
     if group_token_ids is None:
         return outputs.reshape(batch_size, seq_len)
@@ -706,6 +724,7 @@ def enable_chunked_lm_head_logprobs(
                 fp32_lm_head=self._dss_chunked_lm_head_fp32,
                 action_masks=action_masks,
                 group_token_ids=group_token_ids,
+                softcap=self._dss_chunked_lm_head_softcap,
             )
         }
         if group_token_ids is not None:
@@ -717,7 +736,18 @@ def enable_chunked_lm_head_logprobs(
     model._dss_chunked_lm_head_token_chunk_size = int(token_chunk_size)
     model._dss_chunked_lm_head_vocab_chunk_size = int(vocab_chunk_size)
     model._dss_chunked_lm_head_fp32 = bool(fp32_lm_head)
+    model._dss_chunked_lm_head_softcap = _final_logit_softcapping(model)
     model._dss_chunked_lm_head_logprobs = True
+
+
+def _final_logit_softcapping(model) -> float | None:
+    """Gemma's logit cap, which the original forward applies and the chunked branch has to as well."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    softcap = getattr(text_config, "final_logit_softcapping", None)
+    return float(softcap) if softcap else None
 
 
 def enable_fp32_lm_head(model) -> None:
