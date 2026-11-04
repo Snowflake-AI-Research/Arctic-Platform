@@ -224,12 +224,19 @@ def ep_checkpoint_engine(monkeypatch):
         def __init__(self):
             self.module = FixtureMoE()
             self.checkpoint_engine = CheckpointStorage()
+            self.optimizer = SimpleNamespace(update_lp_params=lambda: None)
             self.calls = []
             self.saved_checkpoint = None
             self.native_expert_names = set()
 
         def zero_optimization_partition_weights(self):
             return self.partition_weights
+
+        def zero_load_from_fp32_weights(self):
+            return True
+
+        def _load_zero_checkpoint(self, load_dir, tag, load_optimizer_states=True):
+            return True
 
         @property
         def param_names(self):
@@ -784,10 +791,10 @@ def test_ep_checkpoint_syncs_data_before_rename_and_directory_after(tmp_path, mo
         monkeypatch.setattr(common.os, name, record)
     tensor = torch.empty(0) if empty else torch.ones(4)
     common._save_ep_checkpoint_shard({"module": {"expert": tensor}}, tmp_path / "expert.pt")
-    assert events[-5:] == ["fdatasync", "replace", "fsync", "fsync", "fsync"]
+    assert events[-3:] == ["fdatasync", "replace", "fsync"]
 
 
-def test_ep_checkpoint_syncs_new_tag_and_save_directory_ancestors(tmp_path, monkeypatch):
+def test_ep_checkpoint_syncs_only_owned_tag_directory(tmp_path, monkeypatch):
     synced = []
     native = common.os.fsync
 
@@ -798,7 +805,7 @@ def test_ep_checkpoint_syncs_new_tag_and_save_directory_ancestors(tmp_path, monk
     monkeypatch.setattr(common.os, "fsync", record)
     save_dir = tmp_path / "new-root" / "checkpoints"
     common._save_ep_checkpoint_shard({"module": {"expert": torch.ones(1)}}, save_dir / "tag" / "expert.pt")
-    assert synced == [save_dir / "tag", save_dir, save_dir.parent, tmp_path]
+    assert synced == [save_dir / "tag"]
 
 
 @pytest.mark.parametrize("save_wrapped", [False, True])
@@ -837,6 +844,39 @@ def test_ep_checkpoint_legacy_dense_fallback_for_ep_one(ep_checkpoint_engine, tm
     assert not hasattr(engine, "_ap_ep_legacy_parameters")
 
 
+@pytest.mark.parametrize("optimizer_states", [False, True])
+@pytest.mark.parametrize("zero_files", [False, True])
+def test_ep_checkpoint_legacy_ep_resume_requires_and_restores_zero_masters(
+    ep_checkpoint_engine, tmp_path, monkeypatch, optimizer_states, zero_files
+):
+    engine = ep_checkpoint_engine
+    engine.module.frozen.requires_grad_(True)
+    expected = {name: tensor.clone() for name, tensor in engine.module.state_dict().items()}
+    engine.saved_checkpoint = dict(module={name: torch.zeros_like(value) for name, value in expected.items()})
+    tag = tmp_path / "legacy"
+    tag.mkdir()
+    if zero_files:
+        (tag / "zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
+    restored = []
+
+    def update():
+        engine.module.load_state_dict(expected)
+        restored.append(True)
+
+    engine.optimizer.update_lp_params = update
+    if optimizer_states and zero_files:
+        engine._load_checkpoint(tmp_path, "legacy", load_optimizer_states=True)
+        assert restored == []
+        assert engine._load_zero_checkpoint(tmp_path, "legacy")
+        assert restored == [True]
+        for name, value in engine.module.state_dict().items():
+            torch_assert_equal(value, expected[name])
+    else:
+        with pytest.raises(FileNotFoundError, match="rank-local shard"):
+            engine._load_checkpoint(tmp_path, "legacy", load_optimizer_states=optimizer_states)
+    assert restored == ([True] if optimizer_states and zero_files else [])
+
+
 @pytest.mark.parametrize("code", [22, 38, 95])
 def test_ep_checkpoint_tolerates_unsupported_directory_sync(tmp_path, monkeypatch, code):
     path = tmp_path / "existing-save" / "tag" / "expert.pt"
@@ -849,8 +889,31 @@ def test_ep_checkpoint_tolerates_unsupported_directory_sync(tmp_path, monkeypatc
 
     monkeypatch.setattr(common.os, "fsync", sync)
     common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(1))), path)
-    assert synced == [path.parent, path.parent.parent, tmp_path]
-    torch.testing.assert_close(torch.load(path, weights_only=True)["module"]["expert"], torch.ones(1), rtol=0, atol=0)
+    assert synced == [path.parent]
+
+
+@pytest.mark.parametrize("operation", ["fdatasync", "posix_fadvise"])
+@pytest.mark.parametrize("code", [22, 38, 95])
+def test_ep_checkpoint_tolerates_unsupported_file_sync(tmp_path, monkeypatch, operation, code):
+    def unsupported(*args):
+        raise OSError(code, "filesystem operation unsupported")
+
+    monkeypatch.setattr(common.os, operation, unsupported)
+    path = tmp_path / "expert.pt"
+    common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(2))), path)
+    torch_assert_equal(torch.load(path, weights_only=True)["module"]["expert"], torch.ones(2))
+
+
+def test_ep_checkpoint_rejects_shifted_in_range_storage_offset(tmp_path, monkeypatch):
+    native = common.os.pwritev
+
+    def shifted(descriptor, buffers, offset):
+        return native(descriptor, buffers, offset + 1)
+
+    monkeypatch.setattr(common.os, "pwritev", shifted)
+    with pytest.raises(ValueError, match="payload verification"):
+        common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(2))), tmp_path / "expert.pt")
+    assert not (tmp_path / "expert.pt").exists()
 
 
 @pytest.mark.parametrize("interval,expected_syncs", [("0", 1), ("1", 3), ("33554432", 1)])

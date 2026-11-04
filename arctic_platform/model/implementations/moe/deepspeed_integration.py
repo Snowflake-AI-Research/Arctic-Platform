@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import tempfile
 from dataclasses import dataclass
@@ -104,6 +105,15 @@ def _ep_checkpoint_tensor_chunks(tensor: torch.Tensor, max_bytes: int):
             yield from _ep_checkpoint_tensor_chunks(part, max_bytes)
 
 
+def _checkpoint_sync(operation, *args) -> None:
+    try:
+        operation(*args)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}:
+            raise
+        get_logger().info("Checkpoint filesystem does not support %s", operation.__name__)
+
+
 def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     """Write local expert tensors without copying their ZeRO backing buffers to the host.
 
@@ -121,12 +131,6 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         raise ValueError(f"{sync_env} must be a non-negative integer") from error
     if sync_bytes < 0:
         raise ValueError(f"{sync_env} must be a non-negative integer")
-    directories_to_sync = [path.parent, path.parent.parent, path.parent.parent.parent]
-    ancestor = path.parent
-    while not ancestor.exists():
-        ancestor = ancestor.parent
-        if ancestor not in directories_to_sync:
-            directories_to_sync.append(ancestor)
     path.parent.mkdir(parents=True, exist_ok=True)
     tensors = state["module"]
     with tempfile.TemporaryDirectory(prefix=".ap-ep-checkpoint-", dir=path.parent) as directory:
@@ -154,15 +158,18 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
             raise ValueError("AP expert checkpoint storage offsets are invalid or overlapping")
         staging = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cpu")
         descriptor = os.open(temporary, os.O_WRONLY)
+        checksums = {}
         try:
             pending_bytes = 0
             for name, tensor in tensors.items():
                 start = 0
+                checksum = hashlib.sha256()
                 for source in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
                     count = source.numel()
                     chunk = staging.narrow(0, 0, count)
                     chunk.copy_(source, non_blocking=False)
                     data = memoryview(chunk.numpy())
+                    checksum.update(data)
                     written = 0
                     while written < count:
                         size = os.pwritev(descriptor, [data[written:]], offsets[name] + start + written)
@@ -171,27 +178,32 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
                         written += size
                     pending_bytes += count
                     if sync_bytes > 0 and pending_bytes >= sync_bytes:
-                        os.fdatasync(descriptor)
-                        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+                        _checkpoint_sync(os.fdatasync, descriptor)
+                        _checkpoint_sync(os.posix_fadvise, descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
                         pending_bytes = 0
                     start += count
+                checksums[name] = checksum.digest()
             # Also sync archive metadata when the shard contains only empty tensors.
-            os.fdatasync(descriptor)
-            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+            _checkpoint_sync(os.fdatasync, descriptor)
+            _checkpoint_sync(os.posix_fadvise, descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
         finally:
             os.close(descriptor)
+        # Validate actual ZIP tensor records, independently of the private offsets used for writing.
+        written_state = torch.load(temporary, map_location="cpu", weights_only=True, mmap=True)["module"]
+        for name, tensor in written_state.items():
+            checksum = hashlib.sha256()
+            for chunk in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
+                checksum.update(memoryview(chunk.numpy()))
+            if checksum.digest() != checksums[name]:
+                raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
+        del written_state
         os.replace(temporary, path)
-        # Persist the tag entry and every newly created ancestor, not just the shard rename.
-        for directory_path in directories_to_sync:
-            directory_descriptor = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_descriptor)
-            except OSError as error:
-                if error.errno not in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}:
-                    raise
-                get_logger().info("Directory fsync is unsupported for %s", directory_path)
-            finally:
-                os.close(directory_descriptor)
+        # DeepSpeed creates the checkpoint tree; only our shard's rename is owned here.
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _checkpoint_sync(os.fsync, directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
 
 
 def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
@@ -205,6 +217,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     original_module_state_dict = engine_type.module_state_dict
     original_non_moe_state_dict = engine_type._get_non_moe_state_dict
     original_frozen_attributes = engine_type._get_zero_frozen_param_attributes
+    original_zero_load = getattr(engine_type, "_load_zero_checkpoint", None)
     load_signature = signature(original_load)
     module_load_signature = signature(original_module_load)
     module_state_signature = signature(original_module_state_dict)
@@ -304,13 +317,32 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
         local_state = {}
         legacy_parameters = {}
+        restore_legacy_masters = False
         for group_name, named_parameters in parameters.items():
             identity = _ep_checkpoint_identity(group_name)
             path = _ep_checkpoint_path(arguments["load_dir"], arguments["tag"], identity)
             if not path.is_file():
-                # Old dense-only saves cannot identify the correct expert rank when EP spans several ranks.
                 if identity["ep_size"] == 1:
                     legacy_parameters.update(named_parameters)
+                    continue
+                # Dense experts are rank-zero values in legacy EP saves. Only saved ZeRO masters can replace them.
+                from deepspeed.runtime.utils import is_optimized_parameter
+
+                if (
+                    original_zero_load is not None
+                    and arguments["load_optimizer_states"]
+                    and not arguments["load_module_only"]
+                    and callable(getattr(self.optimizer, "update_lp_params", None))
+                    and self.zero_load_from_fp32_weights()
+                    and all(is_optimized_parameter(parameter) for parameter in named_parameters.values())
+                    and any((Path(arguments["load_dir"]) / arguments["tag"]).glob("*optim_states.pt"))
+                ):
+                    legacy_parameters.update(named_parameters)
+                    restore_legacy_masters = True
+                    get_logger().warning(
+                        "Loading legacy EP checkpoint without AP shards; rank-local experts will be restored "
+                        "from ZeRO master weights. Model-only and frozen-expert legacy EP loads are unsupported."
+                    )
                     continue
                 raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
             # AP sidefiles are always Torch ZIP archives, even with a different dense checkpoint engine.
@@ -345,11 +377,32 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             local_state.update(canonical_state)
         self._ap_ep_checkpoint_state = local_state
         self._ap_ep_legacy_parameters = legacy_parameters
+        self._ap_ep_restore_legacy_masters = restore_legacy_masters
         try:
             return original_load(*bound.args, **bound.kwargs)
+        except BaseException:
+            del self._ap_ep_restore_legacy_masters
+            raise
         finally:
             del self._ap_ep_checkpoint_state
             del self._ap_ep_legacy_parameters
+
+    if original_zero_load is not None:
+        @wraps(original_zero_load)
+        def load_zero(self, *args, **kwargs):
+            restoring = getattr(self, "_ap_ep_restore_legacy_masters", False)
+            try:
+                result = original_zero_load(self, *args, **kwargs)
+                if restoring:
+                    if not result:
+                        raise RuntimeError("Legacy EP resume requires successfully loaded ZeRO master weights")
+                    # Native ordinary resume leaves low-precision model values from the dense checkpoint intact.
+                    self.optimizer.update_lp_params()
+                return result
+            finally:
+                self.__dict__.pop("_ap_ep_restore_legacy_masters", None)
+
+        engine_type._load_zero_checkpoint = load_zero
 
     @wraps(original_module_load)
     def load_module(self, *args, **kwargs):
