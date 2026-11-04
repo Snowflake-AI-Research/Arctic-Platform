@@ -726,31 +726,59 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
 
 def _auxiliary_model(count=1):
     model = torch.nn.Module()
-    model.config = types.SimpleNamespace(
-        text_config=types.SimpleNamespace(
-            model_type="glm5_next_text", num_hidden_layers=2, num_nextn_predict_layers=count
-        )
-    )
+    model.config = _tiny_config()
+    text = model.config.text_config
+    text.num_hidden_layers = 2
+    text.num_nextn_predict_layers = count
+    text.layer_types = text.layer_types[-2:]
+    text.mlp_layer_types = text.mlp_layer_types[-2:]
+    text.indexer_types = text.indexer_types[-2:]
     return model
+
+
+def _auxiliary_payload():
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    prefix = "model.language_model.layers.2."
+    names = auxiliary_weights._required_layer_names(_auxiliary_model().config, prefix, set())
+    tensors = {name: torch.ones(2, dtype=torch.bfloat16) for name in names}
+    tensors[prefix + "enorm.weight"] = torch.ones(4, dtype=torch.float32)
+    tensors[prefix + "mlp.experts.0.down_proj.weight"] = torch.ones(4, 4).to(torch.float8_e4m3fn)
+    tensors[prefix + "mlp.experts.0.down_proj.weight_scale_inv"] = torch.ones(1, 1, dtype=torch.float32)
+    return tensors
 
 
 def _auxiliary_checkpoint(tmp_path):
     from safetensors.torch import save_file
 
     prefix = "model.language_model.layers.2."
-    tensors = {
-        prefix + "eh_proj.weight": torch.ones(2, 4, dtype=torch.bfloat16),
-        prefix + "enorm.weight": torch.ones(4, dtype=torch.float32),
-        prefix + "hnorm.weight": torch.ones(4, dtype=torch.bfloat16),
-        prefix + "mlp.experts.0.down_proj.weight": torch.ones(4, 4).to(torch.float8_e4m3fn),
-        prefix + "mlp.experts.0.down_proj.weight_scale_inv": torch.ones(1, 1, dtype=torch.float32),
-        "model.language_model.layers.0.input_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16),
-    }
+    tensors = _auxiliary_payload()
+    tensors["model.language_model.layers.0.input_layernorm.weight"] = torch.zeros(4, dtype=torch.bfloat16)
     save_file(tensors, tmp_path / "model-00001.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": dict.fromkeys(tensors, "model-00001.safetensors")})
     )
     return {name: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_glm53_capture_rejects_missing_non_auxiliary_prediction_tensor(tmp_path, monkeypatch, indexed):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    tensors = _auxiliary_payload()
+    missing = "model.language_model.layers.2.self_attn.o_proj.weight"
+    assert missing in tensors
+    tensors.pop(missing)
+    save_file(tensors, tmp_path / "model.safetensors")
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict.fromkeys(tensors, "model.safetensors")))
+        )
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="incomplete.*o_proj"):
+        auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
 
 
 def test_glm53_captures_auxiliary_mixed_dtypes_without_trainables(tmp_path, monkeypatch):

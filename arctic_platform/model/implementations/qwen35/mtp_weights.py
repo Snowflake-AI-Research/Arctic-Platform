@@ -26,7 +26,9 @@ import torch.distributed as dist
 from torch import nn
 
 from arctic_platform.model.implementations.moe.preserved_weights import PreservedWeight as _PreservedWeight
-from arctic_platform.model.implementations.moe.preserved_weights import capture_original_weights as _capture_original_weights
+from arctic_platform.model.implementations.moe.preserved_weights import (
+    capture_original_weights as _capture_original_weights,
+)
 from arctic_platform.model.implementations.moe.preserved_weights import open_preserved_weight
 from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
@@ -155,7 +157,7 @@ def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, descript
 
 
 def finish_preserved_weight_export(preserved, emitted: set[str], *, description: str):
-    """Reach the same completion collective on every rank, including sidecar failures."""
+    """Reach completion on sidecar errors or close; every rank must drain or close the export iterator."""
     distributed = dist.is_initialized()
     is_master = not distributed or dist.get_rank() == 0
     failure: list[str | None] = [None]
@@ -172,15 +174,18 @@ def finish_preserved_weight_export(preserved, emitted: set[str], *, description:
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
         raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
-    if is_master:
-        try:
+    try:
+        if is_master:
             for name, tensor in preserved.weights:
                 yield name, tensor
-        except Exception as exc:
-            cause = exc
-            failure[0] = f"{type(exc).__name__}: {exc}"
-    if distributed:
-        dist.broadcast_object_list(failure, src=0)
+    except BaseException as exc:
+        cause = exc
+        failure[0] = f"{type(exc).__name__}: sidecar export interrupted: {exc}"
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        if distributed:
+            dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
         raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
 

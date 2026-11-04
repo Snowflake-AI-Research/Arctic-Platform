@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+from copy import copy
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 from torch import nn
 
@@ -42,13 +44,43 @@ def _layer_prefixes(config) -> tuple[str, ...]:
     return tuple(f"model.language_model.layers.{index}." for index in range(layers, layers + count))
 
 
-def _capture(source_path: Path, prefixes: tuple[str, ...]):
+def _required_layer_names(config, prefix: str, inventory: set[str]) -> set[str]:
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
+
+    text = copy(getattr(config, "text_config", config))
+    index = int(prefix.rstrip(".").split(".")[-1])
+    # Prediction layers extend the final decoder layout when the HF config lists only active layers.
+    for attribute in ("layer_types", "mlp_layer_types", "indexer_types"):
+        values = list(getattr(text, attribute))
+        setattr(text, attribute, values + [values[-1]] * max(0, index + 1 - len(values)))
+    with torch.device("meta"):
+        layer = Glm5NextTextDecoderLayer(text, index)
+    suffixes = set(layer.state_dict())
+    for stem, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn")):
+        for field in ("fn", "base", "scale"):
+            name = f"{stem}.{field}"
+            if name in suffixes:
+                suffixes.remove(name)
+                suffixes.add(f"{target}_{field}")
+    # Shipped checkpoints may store fused experts or one projection per expert.
+    packed = "mlp.experts.gate_up_proj"
+    if packed in suffixes and prefix + packed not in inventory:
+        suffixes.difference_update({packed, "mlp.experts.down_proj"})
+        suffixes.update(
+            f"mlp.experts.{expert}.{projection}.weight"
+            for expert in range(text.n_routed_experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        )
+    return {prefix + suffix for suffix in suffixes | {"eh_proj.weight", "enorm.weight", "hnorm.weight"}}
+
+
+def _capture(source_path: Path, prefixes: tuple[str, ...], config):
     preserved: list[_PreservedShardWeight] = capture_original_weights(source_path, None, prefixes=prefixes)
     expected = {weight.name for weight in preserved}
     for prefix in prefixes:
-        required = {prefix + suffix for suffix in ("eh_proj.weight", "enorm.weight", "hnorm.weight")}
+        required = _required_layer_names(config, prefix, expected)
         if not required <= expected:
-            raise ValueError(f"GLM original prediction layer is incomplete: {prefix}")
+            raise ValueError(f"GLM original prediction layer is incomplete: missing={sorted(required - expected)}")
     index_identity = preserved[0].index_identity if preserved else None
     return tuple(sorted(expected)), tuple(sorted(preserved, key=lambda weight: weight.name)), index_identity
 
@@ -66,7 +98,7 @@ def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
     cause = None
     if is_master:
         try:
-            names, weights, index_identity = _capture(source_path, prefixes)
+            names, weights, index_identity = _capture(source_path, prefixes, model.config)
             state = (prefixes, names, weights, index_identity)
         except Exception as exc:
             cause = exc
