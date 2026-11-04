@@ -155,11 +155,90 @@ def split_expert_param_groups(param_groups: list) -> list:
 _OFFLOADED_SNAPSHOT_CHUNK_BYTES = 16 * 1024 * 1024
 
 
+def _scratch_filesystem_type(directory: Path) -> str:
+    resolved = directory.resolve()
+    selected = (0, "unknown")
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields, separator, filesystem = line.partition(" - ")
+        if not separator:
+            continue
+        mountpoint = fields.split()[4]
+        for escaped, literal in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+            mountpoint = mountpoint.replace(escaped, literal)
+        mount = Path(mountpoint)
+        if (resolved == mount or mount in resolved.parents) and len(mount.parts) > selected[0]:
+            selected = (len(mount.parts), filesystem.split()[0])
+    return selected[1]
+
+
 class _OffloadedGradientStorage:
     """Reuse bounded staging when FP32 offload snapshots outgrow a small CPU tensor."""
 
     def __init__(self):
         self.staging = None
+        try:
+            self.sync_bytes = int(
+                os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
+            )
+        except ValueError as error:
+            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be a nonnegative integer") from error
+        if self.sync_bytes < 0:
+            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be nonnegative")
+        allow_memory = os.environ.get("ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED", "0")
+        if allow_memory not in {"0", "1"}:
+            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED must be 0 or 1")
+        self.allow_memory = allow_memory == "1"
+        self.directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
+        try:
+            self.prepare_directory(self.directory)
+        except OSError as error:
+            self.use_fallback(error)
+        logger.info("Offloaded gradient snapshot scratch directory: %s", self.directory)
+
+    def prepare_directory(self, directory):
+        directory.mkdir(exist_ok=True)
+        filesystem = _scratch_filesystem_type(directory)
+        if filesystem in {"tmpfs", "ramfs"} and not self.allow_memory:
+            raise ValueError(
+                f"Offloaded gradient scratch {directory} is on {filesystem}; choose disk-backed "
+                "ARCTIC_OFFLOADED_GRADIENT_TMPDIR or explicitly set ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED=1"
+            )
+        if not os.access(directory, os.W_OK | os.X_OK):
+            raise PermissionError(f"Offloaded gradient scratch is not writable: {directory}")
+
+    def use_fallback(self, error):
+        fallback = Path(tempfile.gettempdir())
+        if fallback == self.directory or (
+            not isinstance(error, (PermissionError, FileNotFoundError))
+            and error.errno not in {errno.ENOSPC, errno.EOPNOTSUPP, errno.ENOTDIR, errno.EROFS}
+        ):
+            raise error
+        self.prepare_directory(fallback)
+        logger.warning(
+            "Offloaded gradient scratch %s is unavailable (%s); falling back to %s (filesystem=%s)",
+            self.directory,
+            error,
+            fallback,
+            _scratch_filesystem_type(fallback),
+        )
+        self.directory = fallback
+
+    def allocate(self, size):
+        def reserve():
+            file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=self.directory)
+            try:
+                os.posix_fallocate(file.fileno(), 0, size)
+                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+            except BaseException:
+                file.close()
+                raise
+            return file
+
+        try:
+            return reserve()
+        except OSError as error:
+            self.use_fallback(error)
+            return reserve()
 
     def snapshot(self, source):
         size = source.numel() * source.element_size()
@@ -194,46 +273,8 @@ class _OffloadedGradientFile:
         self.storage = storage
         self.shape = source.shape
         self.size = source.numel() * source.element_size()
-        try:
-            self.sync_bytes = int(
-                os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
-            )
-        except ValueError as error:
-            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be a nonnegative integer") from error
-        if self.sync_bytes < 0:
-            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be nonnegative")
-        directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
-
-        def allocate(path):
-            path.mkdir(exist_ok=True)
-            file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=path)
-            try:
-                # Reserve blocks now: ftruncate alone would defer ENOSPC until a backward write.
-                os.posix_fallocate(file.fileno(), 0, self.size)
-                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
-            except BaseException:
-                file.close()
-                raise
-            return file
-
-        try:
-            self.file = allocate(directory)
-        except OSError as error:
-            fallback = Path(tempfile.gettempdir())
-            if fallback == directory or (
-                not isinstance(error, (PermissionError, FileNotFoundError))
-                and error.errno not in {errno.ENOSPC, errno.EOPNOTSUPP, errno.ENOTDIR, errno.EROFS}
-            ):
-                raise
-            logger.warning(
-                "Offloaded gradient scratch %s is unavailable (%s); falling back to %s, which may be memory-backed",
-                directory,
-                error,
-                fallback,
-            )
-            directory = fallback
-            self.file = allocate(directory)
-        logger.info("Offloaded gradient snapshot scratch directory: %s", directory)
+        self.sync_bytes = storage.sync_bytes
+        self.file = storage.allocate(self.size)
 
     def copy_(self, source):
         self._transfer(source, writing=True)
@@ -299,10 +340,10 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     """
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
+    if not getattr(optimizer, "cpu_offload", False):
+        return False
     if type(optimizer) is not DeepSpeedZeroOptimizer:
         logger.warning("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
-        return False
-    if not optimizer.cpu_offload:
         return False
     compact_groups = [
         group_idx

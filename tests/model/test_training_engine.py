@@ -650,7 +650,7 @@ def test_offloaded_snapshot_reservation_falls_back_before_writing(monkeypatch, t
     try:
         assert [directory for directory, _ in opened] == [preferred, fallback]
         assert opened[0][1].closed
-        assert any(record.levelname == "WARNING" and "memory-backed" in record.message for record in caplog.records)
+        assert any(record.levelname == "WARNING" and "filesystem=" in record.message for record in caplog.records)
         snapshot.copy_(source)
         restored = torch.empty_like(source)
         snapshot.restore(restored)
@@ -664,6 +664,72 @@ def test_offloaded_snapshot_rejects_invalid_sync_bytes(monkeypatch, value):
     monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", value)
     with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be"):
         deepspeed_engine._OffloadedGradientFile(torch.ones(1), deepspeed_engine._OffloadedGradientStorage())
+
+
+@pytest.mark.parametrize("value", ["invalid", "-1"])
+def test_offloaded_release_validates_settings_before_installing_hooks(monkeypatch, value):
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    optimizer = object.__new__(DeepSpeedZeroOptimizer)
+    optimizer.cpu_offload = True
+    optimizer.bit16_groups = [[]]
+    optimizer._use_compact_grad_partition_buffer = lambda group: True
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", value)
+    with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES"):
+        deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+
+
+def test_offloaded_scratch_setup_is_cached_across_snapshots(monkeypatch, tmp_path, caplog):
+    preferred = tmp_path / "unwritable"
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(preferred))
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    original = deepspeed_engine.Path.mkdir
+    attempts = []
+
+    def mkdir(path, *args, **kwargs):
+        attempts.append(path)
+        if path == preferred:
+            raise PermissionError("unwritable scratch")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(deepspeed_engine.Path, "mkdir", mkdir)
+    storage = deepspeed_engine._OffloadedGradientStorage()
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", "bad-after-setup")
+    for _ in range(2):
+        snapshot = deepspeed_engine._OffloadedGradientFile(torch.ones(55), storage)
+        snapshot.file.close()
+    assert attempts == [preferred, tmp_path]
+    assert len([record for record in caplog.records if "falling back" in record.message]) == 1
+
+
+@pytest.mark.parametrize("filesystem", ["tmpfs", "ramfs"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_offloaded_scratch_refuses_memory_backed_filesystems(monkeypatch, tmp_path, filesystem, fallback):
+    preferred = tmp_path / "missing-parent" / "scratch" if fallback else tmp_path
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(preferred))
+    monkeypatch.delenv("ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED", raising=False)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(deepspeed_engine, "_scratch_filesystem_type", lambda path: filesystem)
+    with pytest.raises(ValueError, match=f"is on {filesystem}"):
+        deepspeed_engine._OffloadedGradientStorage()
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED", "1")
+    storage = deepspeed_engine._OffloadedGradientStorage()
+    assert storage.directory == tmp_path
+
+
+def test_offloaded_scratch_mountinfo_uses_deepest_mount_and_decodes_spaces(monkeypatch, tmp_path):
+    directory = tmp_path / "fast storage" / "scratch"
+    directory.mkdir(parents=True)
+    original = deepspeed_engine.Path.read_text
+    escaped = str(directory.parent).replace(" ", "\\040")
+
+    def read(path, *args, **kwargs):
+        if str(path) == "/proc/self/mountinfo":
+            return f"1 0 0:1 / / rw - ext4 /dev/root rw\n2 1 0:2 / {escaped} rw - tmpfs tmpfs rw\n"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(deepspeed_engine.Path, "read_text", read)
+    assert deepspeed_engine._scratch_filesystem_type(directory) == "tmpfs"
 
 
 @pytest.mark.parametrize("phase", ["posix_fallocate", "posix_fadvise"])
