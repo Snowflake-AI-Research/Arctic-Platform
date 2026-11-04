@@ -909,6 +909,25 @@ def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
             reader(tmp_path)
 
 
+def test_checkpoint_readers_accept_hub_symlinks_outside_snapshot(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    blob = tmp_path / "blobs" / "hash"
+    blob.parent.mkdir()
+    save_file({"a": torch.tensor([1.0])}, blob)
+    source = tmp_path / "snapshots" / "revision"
+    source.mkdir(parents=True)
+    (source / "shard.safetensors").symlink_to(blob)
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "shard.safetensors"}}))
+    assert weights.load_state_dict_keys(source) == ["a"]
+    torch_assert_equal(weights.load_state_dict(source)["a"], torch.tensor([1.0]))
+    converted = tmp_path / "converted"
+    weights.convert_safetensor_checkpoint(source, converted, lambda state: state, lambda names: [names])
+    torch_assert_equal(weights.load_state_dict(converted)["a"], torch.tensor([1.0]))
+
+
 @pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
 def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family):
     from types import SimpleNamespace

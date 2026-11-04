@@ -46,12 +46,12 @@ def _checkpoint_tensor_locations(source_dir: Path) -> dict[str, Path]:
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if not isinstance(weight_map, dict) or len(weight_map) == 0:
             raise ValueError(f"Checkpoint index requires a nonempty weight_map: {index_path}")
-        root = source_dir.resolve()
         for name, filename in weight_map.items():
             if not isinstance(name, str) or not isinstance(filename, str):
                 raise ValueError(f"Checkpoint index tensor names and shard paths must be strings: {index_path}")
             path = source_dir / filename
-            if Path(filename).is_absolute() or not path.resolve().is_relative_to(root):
+            # Hub snapshots link shards into ../../blobs; constrain index names, not symlink targets.
+            if Path(filename).is_absolute() or ".." in Path(filename).parts:
                 raise ValueError(f"Checkpoint shard path must stay inside its source directory: {filename}")
             locations[name] = path
         shard_paths = sorted(set(locations.values()))

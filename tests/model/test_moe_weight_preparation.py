@@ -50,6 +50,7 @@ def test_prepare_weight_conversion_writes_with_the_load_writer_rule(monkeypatch,
     source = tmp_path / "source"
     cache = tmp_path / "cache" / "prime"
     calls = []
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "test-launch")
     monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
     hf_keys = ["model.layers.0.mlp.experts.0.gate_proj.weight"]
     monkeypatch.setattr(builder, "load_state_dict_keys", lambda path: hf_keys)
@@ -57,7 +58,7 @@ def test_prepare_weight_conversion_writes_with_the_load_writer_rule(monkeypatch,
     monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: scope == "node-local")
     monkeypatch.setattr(builder, "conversion_cache_ready", lambda path: False)
     monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *a, **k: calls.append(("node", k)))
-    monkeypatch.setattr(builder, "wait_for_conversion_cache", lambda path: calls.append(("wait", {})))
+    monkeypatch.setattr(builder, "wait_for_conversion_cache", lambda path, **kwargs: calls.append(("wait", kwargs)))
     config = SimpleNamespace(dequantize_checkpoint=False)
 
     result = builder.prepare_weight_conversion(_FakePrimeModel(), config, source, rank=rank, local_rank=0)
@@ -100,10 +101,9 @@ def test_shared_conversion_cache_propagates_writer_failure_and_allows_retry(monk
     with pytest.raises(OSError, match="conversion failed"):
         conversion_cache.ensure_node_local_conversion_cache(*arguments, rank=0, local_rank=0, stream_convert_fn=failed)
     failure_path = cache.with_name("prime.failed")
-    marker_time = failure_path.stat().st_mtime
-    monkeypatch.setattr(conversion_cache.time, "time", lambda: marker_time - 1)
+    token = json.loads(failure_path.read_text())["attempt_id"]
     with pytest.raises(RuntimeError, match="writer failed.*conversion failed"):
-        conversion_cache.wait_for_conversion_cache(cache)
+        conversion_cache.wait_for_conversion_cache(cache, attempt_id=token)
     abandoned = cache.with_name("prime.tmp-rank0-pid999999")
     abandoned.mkdir()
 
@@ -168,54 +168,16 @@ def test_shared_conversion_retry_waiter_starts_before_writer(monkeypatch, tmp_pa
 
 
 def test_shared_conversion_waiter_detects_killed_writer(monkeypatch, tmp_path):
-    import subprocess
-    import sys
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
     from arctic_platform.model.implementations.moe import conversion_cache
 
     cache = tmp_path / "prime"
-    lock = tmp_path / ".prime.lock"
-    writer = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import fcntl, sys, time; f = open(sys.argv[1], 'w'); "
-                "fcntl.flock(f, fcntl.LOCK_EX); print('LOCKED', flush=True); time.sleep(30)"
-            ),
-            str(lock),
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    observed = threading.Event()
-    original_flock = conversion_cache.fcntl.flock
-
-    def flock(file, operation):
-        try:
-            return original_flock(file, operation)
-        except BlockingIOError:
-            observed.set()
-            raise
-
-    monkeypatch.setattr(conversion_cache.fcntl, "flock", flock)
-    try:
-        assert writer.stdout.readline().strip() == "LOCKED"
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            waiter = executor.submit(conversion_cache.wait_for_conversion_cache, cache, timeout=3, poll_interval=0.01)
-            assert observed.wait(2)
-            writer.kill()
-            writer.wait(timeout=2)
-            with pytest.raises(RuntimeError, match="writer exited without publishing"):
-                waiter.result(timeout=3)
-        assert not cache.with_name("prime.failed").exists()
-    finally:
-        if writer.poll() is None:
-            writer.kill()
-        writer.wait(timeout=2)
-        writer.stdout.close()
+    conversion_cache._write_cache_marker(cache.with_name("prime.in-progress"), dict(attempt_id="killed", heartbeat=0))
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    with pytest.raises(RuntimeError, match="writer stopped heartbeating"):
+        conversion_cache.wait_for_conversion_cache(cache, timeout=3600, writer_idle_timeout=2)
+    assert clock[0] == 2
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
@@ -229,7 +191,14 @@ def test_conversion_failure_marker_cannot_replace_original_exception(monkeypatch
         raise original
 
     monkeypatch.setattr(conversion_cache, "_write_conversion_cache", fail)
-    monkeypatch.setattr(Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(OSError("full disk")))
+    native = conversion_cache._write_cache_marker
+
+    def marker(path, value):
+        if path.name.endswith(".failed"):
+            raise UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogate")
+        native(path, value)
+
+    monkeypatch.setattr(conversion_cache, "_write_cache_marker", marker)
     with pytest.raises(error_type, match="original conversion failure") as error:
         conversion_cache.ensure_node_local_conversion_cache(
             tmp_path,
@@ -245,6 +214,149 @@ def test_conversion_failure_marker_cannot_replace_original_exception(monkeypatch
     assert error.value is original
 
 
+def test_shared_writer_can_start_late_without_lock_visibility_or_clock_agreement(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    conversion_cache._write_cache_marker(cache.with_name("prime.failed"), dict(attempt_id="old", error="stale"))
+    conversion_cache._write_cache_marker(cache.with_name("prime.in-progress"), dict(attempt_id="old", heartbeat=0))
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache.time, "time", lambda: -1000000)
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", lambda *args: pytest.fail("shared waiter must not use flock"))
+    monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: clock[0] >= 36)
+
+    def sleep(delay):
+        clock[0] += delay
+        if clock[0] == 35:
+            conversion_cache._write_cache_marker(
+                cache.with_name("prime.in-progress"), dict(attempt_id="new", heartbeat=0)
+            )
+
+    monkeypatch.setattr(conversion_cache.time, "sleep", sleep)
+    conversion_cache.wait_for_conversion_cache(cache, timeout=60, poll_interval=1)
+    assert clock[0] == 36
+
+
+def test_node_local_concurrent_failure_converts_only_once(monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node-local")
+    cache = tmp_path / "prime"
+    entered, release = threading.Event(), threading.Event()
+    writes = []
+    native_flock = conversion_cache.fcntl.flock
+    waiting = threading.Event()
+
+    def flock(file, operation):
+        if operation == conversion_cache.fcntl.LOCK_EX and entered.is_set():
+            waiting.set()
+        return native_flock(file, operation)
+
+    def fail(*args, **kwargs):
+        writes.append(1)
+        entered.set()
+        assert release.wait(3)
+        raise ValueError("deterministic failure \ud800")
+
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", flock)
+    monkeypatch.setattr(conversion_cache, "_write_conversion_cache", fail)
+    args = (tmp_path, cache, lambda state: None, "HF", "PrimeRL", lambda path: {}, lambda *args: None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        writer = pool.submit(conversion_cache.ensure_node_local_conversion_cache, *args, rank=0, local_rank=0)
+        assert entered.wait(3)
+        waiter = pool.submit(conversion_cache.ensure_node_local_conversion_cache, *args, rank=1, local_rank=1)
+        assert waiting.wait(3)
+        release.set()
+        with pytest.raises(ValueError, match="deterministic failure"):
+            writer.result(timeout=3)
+        with pytest.raises(RuntimeError, match="writer failed"):
+            waiter.result(timeout=3)
+    assert writes == [1]
+
+
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_late_rank_observes_same_attempt_failure_without_reconversion(monkeypatch, tmp_path, scope):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "failed-launch")
+    writes = []
+
+    def fail(*args, **kwargs):
+        writes.append(1)
+        raise OSError("writer exited before the waiter arrived")
+
+    monkeypatch.setattr(conversion_cache, "_write_conversion_cache", fail)
+    cache = tmp_path / "prime"
+    args = (tmp_path, cache, lambda state: None, "HF", "PrimeRL", lambda path: {}, lambda *args: None)
+    with pytest.raises(OSError, match="writer exited"):
+        conversion_cache.ensure_node_local_conversion_cache(*args, rank=0, local_rank=0)
+    with pytest.raises(RuntimeError, match="writer failed.*writer exited"):
+        if scope == "shared":
+            conversion_cache.wait_for_conversion_cache(cache, timeout=0)
+        else:
+            conversion_cache.ensure_node_local_conversion_cache(*args, rank=1, local_rank=1)
+    assert writes == [1]
+
+
+def test_explicit_retry_ignores_old_failure_even_with_skewed_clocks(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    conversion_cache._write_cache_marker(cache.with_name("prime.failed"), dict(attempt_id="old", error="old failure"))
+    conversion_cache._write_cache_marker(cache.with_name("prime.in-progress"), dict(attempt_id="old", heartbeat=0))
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        conversion_cache.time, "time", lambda: pytest.fail("attempt identity must not use wall clocks")
+    )
+    monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: clock[0] >= 36)
+
+    def sleep(delay):
+        clock[0] += delay
+        if clock[0] == 35:
+            conversion_cache._write_cache_marker(
+                cache.with_name("prime.in-progress"), dict(attempt_id="retry", heartbeat=0)
+            )
+
+    monkeypatch.setattr(conversion_cache.time, "sleep", sleep)
+    conversion_cache.wait_for_conversion_cache(cache, timeout=60, poll_interval=1, attempt_id="retry")
+    assert clock[0] == 36
+
+
+def test_distributed_conversion_agrees_on_attempt_and_standalone_shared_requires_one(monkeypatch):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    rank = [0]
+    agreed = []
+    monkeypatch.setattr(dist, "get_rank", lambda: rank[0])
+
+    def broadcast(tokens, *, src):
+        assert src == 0
+        if rank[0] == 0:
+            agreed.append(tokens[0])
+        else:
+            tokens[0] = agreed[0]
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    writer = conversion_cache.conversion_cache_attempt_id(shared=True)
+    rank[0] = 1
+    assert conversion_cache.conversion_cache_attempt_id(shared=True) == writer
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="DSS_WEIGHT_CONVERSION_ATTEMPT_ID"):
+        conversion_cache.conversion_cache_attempt_id(shared=True)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "launcher-retry")
+    assert conversion_cache.conversion_cache_attempt_id(shared=True) == "launcher-retry"
+
+
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
 def test_prepare_weight_conversion_selects_the_checkpoint_streamer(monkeypatch, tmp_path, builder_name):
     import importlib
@@ -254,6 +366,7 @@ def test_prepare_weight_conversion_selects_the_checkpoint_streamer(monkeypatch, 
     stream = lambda source, target: None  # noqa: E731
     model.convert_to_prime_checkpoint = stream
     calls = []
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "test-launch")
     monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
     monkeypatch.setattr(
         builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
@@ -285,7 +398,12 @@ def _adapter(events, *, random_init=False):
 
     def build_model_config(model_name, ep_size, dp_replicate, optimization_dtype, attn, options):
         events.append(("config", model_name, ep_size, dp_replicate, optimization_dtype, attn, options))
-        return SimpleNamespace(debug=SimpleNamespace(random_init=random_init), optimization_dtype=optimization_dtype)
+        return SimpleNamespace(
+            debug=SimpleNamespace(random_init=random_init),
+            optimization_dtype=optimization_dtype,
+            fused_lm_head_token_chunk_size=None,
+            fp32_lm_head=False,
+        )
 
     def get_model(config, *, device, dtype):
         events.append(("model", device.type, dtype))
@@ -299,9 +417,9 @@ def _adapter(events, *, random_init=False):
     return MoEDeepSpeedAdapter(
         dtype_map={"bfloat16": "bf16-dtype"},
         get_model=get_model,
-        configure_moe_ep_backend=unused,
-        configure_family_backend=unused,
-        inject_lm_head=unused,
+        configure_moe_ep_backend=lambda *args: events.append(("backend",)),
+        configure_family_backend=lambda *args: events.append(("family",)),
+        inject_lm_head=lambda *args, **kwargs: events.append(("lm_head",)),
         apply_sequence_parallelism=unused,
         apply_ac=unused,
         load_dcp_from_hf=unused,
@@ -337,6 +455,9 @@ def test_prepare_moe_weights_converts_from_a_meta_model_with_the_load_config():
     assert events == [
         ("config", "org/model", 16, 2, "bfloat16", "sdpa", "options"),
         ("model", "meta", "bf16-dtype"),
+        ("backend",),
+        ("family",),
+        ("lm_head",),
         ("prepare", "meta-model", Path("/source"), 8, 0),
     ]
 
@@ -587,6 +708,7 @@ def test_real_family_written_cache_is_reused_by_loading(monkeypatch, tmp_path, f
         weight_conversion_cache_dir=str(cache_root),
     )
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "test-launch")
     monkeypatch.setattr(builder, "resolve_weight_source", lambda config: source)
     original_write = conversion_cache._write_conversion_cache
     writes = []
@@ -614,3 +736,108 @@ def test_real_family_written_cache_is_reused_by_loading(monkeypatch, tmp_path, f
     builder.load_dcp_from_hf(model, config, None)
     assert loaded == [prepared]
     assert writes == [prepared], "load must reuse the actually published preparation cache"
+
+
+@pytest.mark.parametrize("family", ["qwen3_5_moe", "generic_moe", "glm_moe_dsa", "glm5_next", "qwen4_exp"])
+@pytest.mark.parametrize("dequantize", [False, True])
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_adapter_preparation_and_runtime_load_reuse_the_written_cache(
+    monkeypatch, tmp_path, family, dequantize, scope
+):
+    from dataclasses import replace
+
+    import torch
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+    from arctic_platform.model.implementations.moe import deepspeed_integration as integration
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.implementations.moe.weights import save_state_dict
+    from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+    from arctic_platform.testing_utils import torch_assert_equal
+
+    implementation = dict(
+        qwen3_5_moe="qwen35", generic_moe="qwen35", glm_moe_dsa="glm52", glm5_next="glm53", qwen4_exp="qwen38"
+    )[family]
+    module = importlib.import_module(f"arctic_platform.model.implementations.{implementation}.deepspeed_integration")
+    adapter = module._generic_adapter() if family == "generic_moe" else module._adapter()
+    builder_name = "glm52" if family == "glm_moe_dsa" else "qwen35"
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_name}.model_builder")
+    original = _tiny_preparation_model(family)
+    source, cache_root = tmp_path / "source", tmp_path / "cache"
+    expected = {
+        name: torch.arange(value.numel(), dtype=torch.float32).reshape(value.shape).to(value.dtype)
+        for name, value in original.state_dict().items()
+    }
+    hf = original.convert_to_hf({name: value.clone() for name, value in expected.items()})
+    if dequantize and builder_name == "qwen35":
+        # Exercise the scale-sensitive cache identity, independently of packed-weight arithmetic.
+        hf["conversion_probe.scale"] = torch.ones(1)
+    save_state_dict(hf, source)
+    original.config.save_pretrained(source)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "adapter-launch")
+    attn = dict(glm5_next="sparse_mla", qwen4_exp="qsa_flex").get(family, "sdpa")
+    options_type = GlmMoeDsaOptions if family == "glm_moe_dsa" else Qwen3_5MoeOptions
+    options = options_type(
+        weight_conversion_cache_dir=str(cache_root),
+        moe_use_grouped_mm=False,
+        fused_cross_entropy=False,
+        fused_lm_head_token_chunk_size=2,
+    )
+    build_config = adapter.build_model_config
+
+    def configured(*args):
+        config = replace(build_config(*args), fsdp_cpu_offload=True)
+        if builder_name == "qwen35":
+            config.dequantize_checkpoint = dequantize
+        return config
+
+    adapter = replace(adapter, build_model_config=configured)
+    writes, loaded, classifications = [], [], []
+    native_write = conversion_cache._write_conversion_cache
+    native_prepare = adapter.prepare_weight_conversion
+
+    def write(*args, **kwargs):
+        writes.append(args[1])
+        return native_write(*args, **kwargs)
+
+    def classify(model, config, source, **kwargs):
+        path = native_prepare(model, config, source, **kwargs)
+        classifications.append((model.is_prime_state_dict(model.state_dict()), path))
+        return path
+
+    adapter = replace(adapter, prepare_weight_conversion=classify)
+    monkeypatch.setattr(conversion_cache, "_write_conversion_cache", write)
+    monkeypatch.setattr(builder, "prepare_weight_conversion", classify)
+    monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    monkeypatch.setattr(builder, "_init_buffers_post_meta", lambda *args: None, raising=False)
+    monkeypatch.setattr(type(original), "init_buffers_post_meta", lambda self: None, raising=False)
+
+    def load(state, *, storage_reader):
+        path = Path(storage_reader.path)
+        loaded.append(path)
+        converted = load_state_dict(path)
+        for name, value in expected.items():
+            torch_assert_equal(converted[name], value)
+
+    monkeypatch.setattr(builder, "dcp_load", load)
+    prepared = integration.prepare_moe_weights(
+        adapter,
+        model_name=str(source),
+        optimization_dtype="float32",
+        attn_implementation=attn,
+        ep_size=1,
+        world_size=1,
+        options=options,
+        rank=0,
+        local_rank=0,
+    )
+    config = configured(str(source), 1, 1, "float32", attn, options)
+    integration.setup_model_local_no_train(adapter, config, SimpleNamespace(ep_enabled=False), None)
+    assert prepared.name == ("prime-dequantized" if dequantize and builder_name == "qwen35" else "prime")
+    assert classifications == [(True, prepared), (True, prepared)]
+    assert loaded == [prepared]
+    assert writes == [prepared], "the runtime adapter must not convert again after standalone preparation"

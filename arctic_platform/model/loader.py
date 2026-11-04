@@ -299,9 +299,11 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 def prepare_model_weights(spec: ModelSpec, *, world_size: int, rank: int, local_rank: int) -> Path | None:
     """Fill the converted-weight cache ``build_model(spec)`` will load from, on this node, without a process group.
 
-    ``world_size`` is the training job's process count; ``rank`` and ``local_rank`` name the process the cache
-    writer is chosen by (rank 0 for a shared cache, local rank 0 for a node-local one). Returns the cache path, or
-    None when the spec's loader converts nothing.
+    ``world_size`` is the training job's process count; ``rank`` must be its global rank.
+    Rank 0 writes a shared cache; the first local process holding the cache lock writes a node-local cache.
+    Standalone shared-cache preparation requires the same ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID`` on every process,
+    with a new value for each retry. All callers wait for a ready cache or an attempt-scoped failure.
+    Returns the cache path, or None when the spec's loader converts nothing.
     """
     name = spec.loader
     assert name is not None, "spec.loader must be resolved before prepare_model_weights"

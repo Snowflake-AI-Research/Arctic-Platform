@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, Pre
 
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
@@ -264,8 +265,12 @@ def prepare_weight_conversion(
 
     The distributed load and the per-node preparation that may run before it both call this, so they resolve the
     same cache path. ``rank`` must be the global rank: only global rank 0 writes a shared cache, under a file
-    lock; other ranks wait up to one hour for its publication. For node-local caches, the file lock chooses
-    whichever local process arrives first as writer. A returned path is ready to load.
+    lock; other ranks wait for publication under ``DSS_WEIGHT_CONVERSION_TIMEOUT`` (default 3600 seconds).
+    Before a process group exists, shared-cache launchers must set the same ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID``
+    for every process and choose a new value on retry. Distributed loads broadcast an attempt ID automatically.
+    Writer startup uses the overall timeout; an observed writer that stops heartbeating fails within 120 seconds.
+    For node-local caches, the file lock chooses whichever local process arrives first as writer.
+    A returned path is ready to load.
     """
     if not isinstance(model, PreTrainedModelPrimeRL):
         return None
@@ -284,7 +289,9 @@ def prepare_weight_conversion(
     )
     snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
     stream_convert_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
-    if conversion_cache_is_node_local(snapshot_path) or rank == 0:
+    node_local = conversion_cache_is_node_local(snapshot_path)
+    attempt_id = conversion_cache_attempt_id(shared=not node_local and not conversion_cache_ready(snapshot_path))
+    if node_local or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,
             snapshot_path,
@@ -296,9 +303,10 @@ def prepare_weight_conversion(
             rank=rank,
             local_rank=local_rank,
             stream_convert_fn=stream_convert_fn,
+            attempt_id=attempt_id,
         )
     else:
-        wait_for_conversion_cache(snapshot_path)
+        wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)
     return snapshot_path
 
 

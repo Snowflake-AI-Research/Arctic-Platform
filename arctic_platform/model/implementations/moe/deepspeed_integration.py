@@ -272,6 +272,20 @@ def build_iter_full_hf_weights(model: nn.Module):
     return iterator
 
 
+def _configure_model_for_weight_loading(adapter, model, config, *, fused_cross_entropy=False):
+    adapter.configure_moe_ep_backend(model, config)
+    adapter.configure_family_backend(config)
+    chunk_size = (
+        config.fused_lm_head_token_chunk_size if isinstance(config.fused_lm_head_token_chunk_size, int) else None
+    )
+    adapter.inject_lm_head(
+        model,
+        chunk_size=chunk_size,
+        fused_cross_entropy=fused_cross_entropy,
+        fp32_lm_head=config.fp32_lm_head,
+    )
+
+
 def setup_model_local_no_train(
     adapter: MoEDeepSpeedAdapter,
     config: Any,
@@ -289,18 +303,7 @@ def setup_model_local_no_train(
         device=torch.device("meta"),
         dtype=adapter.dtype_map[config.optimization_dtype],
     )
-    adapter.configure_moe_ep_backend(model, config)
-    adapter.configure_family_backend(config)
-
-    chunk_size = (
-        config.fused_lm_head_token_chunk_size if isinstance(config.fused_lm_head_token_chunk_size, int) else None
-    )
-    adapter.inject_lm_head(
-        model,
-        chunk_size=chunk_size,
-        fused_cross_entropy=fused_cross_entropy,
-        fp32_lm_head=config.fp32_lm_head,
-    )
+    _configure_model_for_weight_loading(adapter, model, config, fused_cross_entropy=fused_cross_entropy)
     if parallel_dims.ep_enabled:
         apply_ep_with_mesh(model, config, ep_mesh)
     adapter.apply_sequence_parallelism(model, sp_size, sp_group)
@@ -378,6 +381,9 @@ def prepare_moe_weights(
 
     ``rank`` is the global training rank, not a per-node counter. Shared caches have one global-rank-zero
     writer; other ranks wait for readiness. Node-local caches use one file-lock-selected writer on each node.
+    Before distributed initialization, shared-cache processes must receive one common
+    ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID`` from their launcher, changed on every retry. The writer's heartbeat
+    and failure records use this identity, not shared-lock coherence or synchronized wall clocks.
     """
     if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
         return None
@@ -400,6 +406,7 @@ def prepare_moe_weights(
         device=torch.device("meta"),
         dtype=adapter.dtype_map[model_config.optimization_dtype],
     )
+    _configure_model_for_weight_loading(adapter, model, model_config)
     source_path = adapter.resolve_weight_source(model_config)
     return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
