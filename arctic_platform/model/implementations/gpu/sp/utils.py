@@ -324,10 +324,19 @@ def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: b
 
 def _request_signature(microbatches, meta, processing, loss_scales, device):
     """Compare accidental input drift with bounded device-side byte moments, not a host tensor copy."""
+
+    def scalar(value):
+        if isinstance(value, torch.Tensor) and value.numel() == 1:
+            return value.item()
+        raise TypeError(f"SP request metadata must be JSON values or scalar tensors, got {type(value).__name__}")
+
     checksum = hashlib.sha256()
     checksum.update(
         json.dumps(
-            dict(meta=meta, processing=processing, loss_scales=loss_scales), sort_keys=True, allow_nan=False
+            dict(meta=meta, processing=processing, loss_scales=loss_scales),
+            sort_keys=True,
+            allow_nan=False,
+            default=scalar,
         ).encode()
     )
     moments = torch.zeros(3, dtype=torch.int64, device=device)

@@ -436,6 +436,13 @@ def test_sp_signature_failure_has_request_context_and_reaches_flag_reduce(monkey
     assert reductions == [1]
 
 
+def test_sp_signature_accepts_scalar_tensor_metadata():
+    batch = _batch()
+    plain = sp._request_signature([batch], dict(calculate_entropy=False), {}, [1.0], "cpu")
+    tensor = sp._request_signature([batch], dict(calculate_entropy=torch.tensor([False])), {}, [1.0], "cpu")
+    assert torch.equal(plain, tensor)
+
+
 def test_sp_tensor_signature_does_not_copy_payload_to_host(monkeypatch):
     batch = _batch()
     monkeypatch.setattr(torch.Tensor, "cpu", lambda *args, **kwargs: pytest.fail("host payload copy"))

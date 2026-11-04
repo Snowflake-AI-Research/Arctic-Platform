@@ -58,6 +58,10 @@ when only `vllm_config` is set. Engine choice is also controlled by the client
 Client create order is `sampling` → `log_prob` → `training` so the training
 NCCL rendezvous is last.
 
+**Sequence parallelism is currently supported only by training engines using ZeRO stage 2.** The sequence-parallel degree (`sp_size`) may exceed one for the training job, but a separate `log_prob` or reference job must use `sp_size=1`. Do not reuse the actor's parallelism configuration for the reference engine. `JobConfig` rejects an unsupported reference configuration before creating workers.
+
+**A failed sequence-parallel training request terminates all training workers.** Cancelling a Ray request does not interrupt a worker blocked inside a distributed collective. The server kills the training actors without restart, retains the original request error, and rejects further training operations. Partial gradients cannot be reused; destroy the failed job and create a new job from the last completed checkpoint.
+
 `checkpoint_path` is **required** for new training jobs (asserted at init and
 at save).
 

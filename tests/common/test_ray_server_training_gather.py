@@ -18,8 +18,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import tempfile
 import time
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -28,6 +32,7 @@ import torch
 
 from arctic_platform.common.ray_server import ArcticRLRayServer
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import execute_subprocess_async
 
 
 class _Remote:
@@ -97,7 +102,96 @@ def _server(workers):
     return server
 
 
+def _run_native_sp_worker_abort(rendezvous: str, ray_root: str) -> None:
+    import ray
+    import torch.distributed as dist
+
+    class CollectiveWorker:
+        def initialize(self, rank):
+            self.rank = rank
+            dist.init_process_group(
+                "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=120)
+            )
+
+        def forward(self):
+            dist.barrier()
+            if self.rank == 0:
+                raise RuntimeError("injected model forward failure")
+            dist.all_reduce(torch.ones(1))
+            raise AssertionError("blocked peer unexpectedly completed")
+
+    ray.init(address="local", num_cpus=2, num_gpus=0, include_dashboard=False, log_to_driver=False, _temp_dir=ray_root)
+    workers = []
+    try:
+        actor = ray.remote(num_cpus=1)(CollectiveWorker)
+        workers = [actor.remote() for _ in range(2)]
+        ray.get([worker.initialize.remote(rank) for rank, worker in enumerate(workers)], timeout=60)
+        server = _server(workers)
+        server.jobs[1]["sp_size"] = 2
+        refs = [worker.forward.remote() for worker in workers]
+        started = time.monotonic()
+
+        async def run():
+            try:
+                await asyncio.wait_for(server._gather_training_refs(lambda: refs), timeout=15)
+            except RuntimeError as error:
+                assert "injected model forward failure" in str(error), error
+                assert server._training_failure is error
+            else:
+                raise AssertionError("model failure was not propagated")
+            assert server._training_failed
+            assert server._training_workers_aborted
+
+        asyncio.run(run())
+        ready, pending = ray.wait(refs, num_returns=2, timeout=10)
+        assert not pending and len(ready) == 2, "failed request left a collective peer running"
+        assert time.monotonic() - started < 25
+        for worker in workers:
+            try:
+                ray.get(worker.forward.remote(), timeout=10)
+            except ray.exceptions.RayActorError:
+                pass
+            else:
+                raise AssertionError("aborted worker was restarted")
+        print("NATIVE_SP_WORKER_ABORT_PASS", flush=True)
+    finally:
+        for worker in workers:
+            ray.kill(worker, no_restart=True)
+        ray.shutdown()
+
+
 class TestGatherTrainingRefs(TestCasePlus):
+    def test_native_sp_model_failure_terminates_blocked_gloo_peer(self):
+        scratch = Path(self.get_auto_remove_tmp_dir())
+        env = self.get_env()
+        env["PYTHONPATH"] = os.pathsep.join((str(Path(__file__).parent), env.get("PYTHONPATH", "")))
+        env.pop("RAY_ADDRESS", None)
+        execute_subprocess_async(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from test_ray_server_training_gather import _run_native_sp_worker_abort; "
+                    f"_run_native_sp_worker_abort({str(scratch / 'gloo')!r}, {str(scratch / 'ray')!r})"
+                ),
+            ],
+            env=env,
+            timeout=120,
+        )
+
+    def test_sp_abort_preserves_primary_error_and_kills_each_actor_once(self):
+        server = _server([object(), object()])
+        server.jobs[1]["sp_size"] = 2
+        error = RuntimeError("primary model failure")
+        with patch("arctic_platform.common.ray_server.ray.kill", side_effect=RuntimeError("Ray disconnected")) as kill:
+            server._abort_sequence_parallel_workers(error)
+            server._abort_sequence_parallel_workers(RuntimeError("later failure"))
+        self.assertEqual(kill.call_count, 2)
+        self.assertIs(server._training_failure, error)
+        self.assertTrue(server._training_failed)
+        for call in kill.call_args_list:
+            self.assertEqual(call.kwargs, {"no_restart": True})
+
     def test_membership_rpc_yields_to_the_actor_event_loop(self):
         async def run():
             hold = asyncio.Event()

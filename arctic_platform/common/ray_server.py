@@ -806,6 +806,22 @@ class ArcticRLRayServer:
         if self._training_failure is None:
             self._training_failure = error or asyncio.CancelledError()
 
+    def _abort_sequence_parallel_workers(self, error: BaseException) -> None:
+        """Cancellation cannot interrupt a worker thread blocked in a distributed collective."""
+        if getattr(self, "_training_workers_aborted", False) or not any(
+            job.get("job_type") == "training" and resolve_parallelism_degree(job.get("sp_size"), "sp_size") > 1
+            for job in self.jobs.values()
+        ):
+            return
+        self._mark_training_failed(error)
+        self._training_workers_aborted = True
+        for worker in self.training_workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                # Keep the request's failure as the primary exception even if Ray is already disconnected.
+                logger.exception("could not terminate failed sequence-parallel worker")
+
     async def _await_training_refs(self, submit_refs, *, latch: bool = True, check_failed: bool = True):
         """Await refs. Caller must already hold ``_training_op_lock`` for training refs.
 
@@ -813,7 +829,9 @@ class ArcticRLRayServer:
         this process, and marks the workers failed. The step result is
         discarded, and a later training op is refused while a data-parallel
         collective may still be running. Cancelling this await (client
-        disconnect, timeout) does the same.
+        disconnect, timeout) does the same. Sequence-parallel failures also
+        terminate every training actor without restart, releasing blocked
+        collectives and discarding partial gradients.
 
         ``latch=False`` is the sampling-worker path: a sampler error is raised
         and does not block later ``step`` / ``weight_sync``. ``check_failed=False``
@@ -856,6 +874,12 @@ class ArcticRLRayServer:
                 raise errors[0]
         except asyncio.CancelledError:
             cancelled_collective = True
+            if latch:
+                self._abort_sequence_parallel_workers(asyncio.CancelledError())
+            raise
+        except BaseException as error:
+            if latch:
+                self._abort_sequence_parallel_workers(error)
             raise
         finally:
             _cancel_unfinished()

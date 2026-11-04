@@ -266,6 +266,16 @@ class TestDpSizeDividesBySp(TestCasePlus):
                 ds_config={"sequence_parallel_size": 4},
             )
 
+    def test_reference_job_rejects_sp_before_worker_creation(self):
+        for config in (
+            dict(ds_worker_config=dict(sp_size=2)),
+            dict(ds_config=dict(sequence_parallel_size=2)),
+            dict(log_prob_config=dict(sequence_parallel_size=2)),
+        ):
+            with self.assertRaisesRegex(ValueError, "log_prob/reference jobs do not support sequence parallelism"):
+                JobConfig(model_name="m", job_type="log_prob", **config)
+        self.assertEqual(JobConfig(model_name="m", job_type="log_prob").sp_size, 1)
+
     def test_job_config_dump_keeps_client_wire_shape(self):
         # model_dump() is forwarded verbatim to workers; sp_size is derived, not a field.
         dumped = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2}).model_dump()
@@ -282,12 +292,10 @@ class TestDpSizeDividesBySp(TestCasePlus):
         self.assertEqual(job_config.sp_size, 1)
 
     def test_log_prob_job_falls_back_to_ds_config_when_log_prob_omits_sp(self):
-        job_config = JobConfig(
-            model_name="m",
-            job_type="log_prob",
-            ds_config={"sequence_parallel_size": 2},
-        )
-        self.assertEqual(job_config.sp_size, 2)
+        config = dict(model_name="m", job_type="log_prob", ds_config=dict(sequence_parallel_size=2))
+        self.assertEqual(sp_size_from_job_config(config), 2)
+        with self.assertRaisesRegex(ValueError, "log_prob/reference jobs do not support sequence parallelism"):
+            JobConfig(**config)
 
     def test_training_job_ignores_log_prob_config_sp(self):
         job_config = JobConfig(
