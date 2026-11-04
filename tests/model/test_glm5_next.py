@@ -759,7 +759,10 @@ def test_glm53_captures_auxiliary_mixed_dtypes_without_trainables(tmp_path, monk
     original = _auxiliary_checkpoint(tmp_path)
     model = _auxiliary_model()
     monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.Tensor, "clone", lambda *args, **kwargs: pytest.fail("inactive layer cloned"))
     auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    records = getattr(model, auxiliary_weights.STATE_ATTRIBUTE)[2]
+    assert all(not isinstance(record, torch.Tensor) and not hasattr(record, "tensor") for record in records)
     exported = dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))
     assert set(exported) == set(original)
     assert not dict(model.named_parameters()) and not dict(model.named_buffers())
@@ -780,6 +783,25 @@ def test_glm53_auxiliary_capture_rejects_missing_and_changed_shards(tmp_path, mo
     index.write_text(json.dumps(mapping))
     with pytest.raises(RuntimeError, match="Cannot preserve"):
         auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_glm53_lazy_auxiliary_export_requires_immutable_source(tmp_path, monkeypatch, indexed):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    original = _auxiliary_checkpoint(tmp_path)
+    index = tmp_path / "model.safetensors.index.json"
+    if not indexed:
+        index.rename(tmp_path / "unused-index.json")
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    model = _auxiliary_model()
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    assert set(dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))) == set(original)
+    shard = tmp_path / "model-00001.safetensors"
+    with shard.open("ab") as stream:
+        stream.write(b"changed")
+    with pytest.raises(RuntimeError, match="shard changed"):
+        list(auxiliary_weights.iter_preserved_auxiliary_weights(model))
 
 
 def test_glm53_auxiliary_source_failure_reaches_peers(tmp_path, monkeypatch):
@@ -822,6 +844,7 @@ def test_glm53_full_hf_export_auxiliary_scope(monkeypatch, include_skipped, rank
     monkeypatch.setattr(glm.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(glm.torch.distributed, "broadcast_object_list", lambda value, src: None)
     monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", auxiliary)]))
+    monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
     exported = dict(glm._build_iter_full_hf_weights_with_auxiliary(model)(include_skipped=include_skipped))
     assert exported["trained.weight"] is ordinary
     assert ("inactive.weight" in exported) == (include_skipped and rank == 0)
@@ -839,5 +862,6 @@ def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
     )
     monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", value)]))
+    monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
     with pytest.raises(RuntimeError, match="collides"):
         list(glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True))

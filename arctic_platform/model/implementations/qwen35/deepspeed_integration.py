@@ -218,6 +218,7 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
     ordinary = _build_iter_full_hf_weights(model)
 
     def iterator(*, include_skipped: bool = False):
+        from .mtp_weights import finish_preserved_weight_export
         from .mtp_weights import prepare_preserved_weights_for_export
 
         preserved = (
@@ -228,10 +229,8 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
         for name, tensor in ordinary(include_skipped=include_skipped):
             names.add(name)
             yield name, tensor
-        for name, tensor in preserved:
-            if name in names:
-                raise RuntimeError(f"Original MTP tensor collides with live HF export: {name}")
-            yield name, tensor
+        if include_skipped:
+            yield from finish_preserved_weight_export(preserved, names, description="Original MTP")
 
     return iterator
 

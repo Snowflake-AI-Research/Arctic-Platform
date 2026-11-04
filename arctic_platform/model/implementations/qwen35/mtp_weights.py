@@ -231,7 +231,7 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
         setattr(model, _STATE_ATTRIBUTE, tuple(sorted(preserved, key=lambda weight: weight.name)))
 
 
-def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str):
+def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str, validate=None):
     """Validate rank zero's sidecar before any ordinary export collective."""
     distributed = dist.is_initialized()
     is_master = not distributed or dist.get_rank() == 0
@@ -240,7 +240,11 @@ def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, descript
     cause = None
     if is_master:
         try:
-            weights = tuple(iterator(model))
+            if validate is None:
+                weights = tuple(iterator(model))
+            else:
+                validate(model)
+                weights = iterator(model)
         except Exception as exc:
             cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
@@ -249,6 +253,27 @@ def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, descript
     if failure[0] is not None:
         raise RuntimeError(f"Cannot export preserved {description}: {failure[0]}") from cause
     return weights
+
+
+def finish_preserved_weight_export(preserved, emitted: set[str], *, description: str):
+    """Reach the same completion collective on every rank, including sidecar failures."""
+    distributed = dist.is_initialized()
+    is_master = not distributed or dist.get_rank() == 0
+    failure: list[str | None] = [None]
+    cause = None
+    if is_master:
+        try:
+            for name, tensor in preserved:
+                if name in emitted:
+                    raise RuntimeError(f"{description} tensor collides with live HF export: {name}")
+                yield name, tensor
+        except Exception as exc:
+            cause = exc
+            failure[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
 
 
 def iter_preserved_mtp_weights(model: nn.Module):

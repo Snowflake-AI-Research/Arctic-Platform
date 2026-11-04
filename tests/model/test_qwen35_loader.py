@@ -400,6 +400,53 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
         next(iterator)
 
 
+@pytest.mark.parametrize("family,fault", [("qwen", "collision"), ("glm", "collision"), ("glm", "read")])
+def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, family, fault):
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    rank = [0]
+    broadcasts = []
+    name = "inactive.weight"
+    value = torch.ones(1)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        if rank[0] == 0:
+            broadcasts.append(message[0])
+        else:
+            message[0] = broadcasts.pop(0)
+
+    def sidecar(model):
+        if fault == "read":
+            raise OSError("source disappeared during export")
+        yield name, value
+
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(
+        qwen,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([(name, value)] if rank[0] == 0 else []),
+    )
+    if family == "qwen":
+        # Qwen validates its resident tensors eagerly; this test exercises a late collision.
+        monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", sidecar)
+        exporter = qwen._build_iter_full_hf_weights_with_mtp
+    else:
+        monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", sidecar)
+        monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
+        exporter = glm._build_iter_full_hf_weights_with_auxiliary
+    model = _mtp_export_model()
+    for current in (0, 1):
+        rank[0] = current
+        with pytest.raises(RuntimeError, match="collides|source disappeared"):
+            list(exporter(model)(include_skipped=True))
+    assert broadcasts == []
+
+
 def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):
     import torch
 

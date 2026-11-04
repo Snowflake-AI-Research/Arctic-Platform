@@ -28,10 +28,12 @@ from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
+from arctic_platform.model.implementations.qwen35.mtp_weights import finish_preserved_weight_export
 from arctic_platform.model.implementations.qwen35.mtp_weights import prepare_preserved_weights_for_export
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 from .auxiliary_weights import iter_preserved_auxiliary_weights
+from .auxiliary_weights import validate_preserved_auxiliary_weights
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
 
@@ -82,7 +84,10 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
     def iterator(*, include_skipped: bool = False):
         preserved = (
             prepare_preserved_weights_for_export(
-                model, iter_preserved_auxiliary_weights, description="GLM prediction layers"
+                model,
+                iter_preserved_auxiliary_weights,
+                description="GLM prediction layers",
+                validate=validate_preserved_auxiliary_weights,
             )
             if include_skipped
             else ()
@@ -91,10 +96,8 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
         for name, tensor in ordinary(include_skipped=include_skipped):
             emitted.add(name)
             yield name, tensor
-        for name, tensor in preserved:
-            if name in emitted:
-                raise RuntimeError(f"GLM prediction tensor collides with a live HF weight: {name}")
-            yield name, tensor
+        if include_skipped:
+            yield from finish_preserved_weight_export(preserved, emitted, description="GLM prediction")
 
     return iterator
 
