@@ -75,6 +75,12 @@ def patch_deepspeed_moe_detection() -> None:
                 num_experts = getattr(experts, "num_experts", None)
             if num_experts is not None:
                 self.num_experts.append(num_experts)
+        from .dense_shard import is_dense_shard
+
+        # Node shards of replicated weights (dense_shard.py) are reduced over their expert-data-parallel group, which
+        # ZeRO does only for a model it knows to have MoE layers.
+        if not self.has_moe_layers and any(is_dense_shard(parameter) for parameter in self.module.parameters()):
+            self.has_moe_layers = True
 
     ds_engine.DeepSpeedEngine._configure_distributed_model = patched
     ds_engine.DeepSpeedEngine._ap_moe_patched = True

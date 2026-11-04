@@ -49,6 +49,9 @@ _NO_DECAY = (
     "norm_query.weight",
     "norm_conv.weight",
 )
+# A parameter carrying this attribute is exempt from weight decay whatever its name (a dense shard of biases and norm
+# weights, moe/dense_shard.py).
+NO_WEIGHT_DECAY_ATTR = "_ap_no_weight_decay"
 _OPTIMIZER_ALIASES = {
     "fusedadam": "fused_adam",
     "fused_adam": "fused_adam",
@@ -145,7 +148,14 @@ def split_expert_param_groups(param_groups: list) -> list:
     for index, group in enumerate(param_groups):
         group.setdefault("name", f"group_{index}")
         named.append(group)
-    return configure_moe_param_groups(named)
+    groups = configure_moe_param_groups(named)
+    # DeepSpeed collects the expert groups' names in a set, which each process iterates in its own order (string
+    # hashing): with two names (the experts' and the dense shards', moe/dense_shard.py) the ranks would list the MoE
+    # groups in different orders, and ZeRO's per-group norm and all-gather collectives would pair different groups
+    # across ranks. The sort is stable, so each name's groups keep their order.
+    dense = [group for group in groups if not group.get("moe")]
+    moe = [group for group in groups if group.get("moe")]
+    return dense + sorted(moe, key=lambda group: group["name"])
 
 
 def initialize_training_engine(
@@ -173,7 +183,7 @@ def initialize_training_engine(
         fused = optimizer.fused is not False
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
-        if ep_size > 1:
+        if ep_size > 1 or _has_dense_shards(model):
             built.param_groups[:] = split_expert_param_groups(list(built.param_groups))
     if preserved or marked_fp32:
         from deepspeed.runtime.engine import DeepSpeedEngine
@@ -195,6 +205,14 @@ def initialize_training_engine(
         engine, *_ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         built = None
     return engine, built, choice
+
+
+def _has_dense_shards(model) -> bool:
+    """Whether the model holds node shards of replicated weights (moe/dense_shard.py), which ZeRO must reduce over
+    their expert-data-parallel group like expert parameters."""
+    from arctic_platform.model.implementations.moe.dense_shard import is_dense_shard
+
+    return any(is_dense_shard(param) for param in model.parameters())
 
 
 def resolve_optimizer_name(name: str, ds_config: dict) -> str:
@@ -260,12 +278,12 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
     decay_params = [
         param
         for name, param in model.named_parameters()
-        if param.requires_grad and not any(token in name.lower() for token in _NO_DECAY)
+        if param.requires_grad and not exempt_from_weight_decay(name, param)
     ]
     no_decay_params = [
         param
         for name, param in model.named_parameters()
-        if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
+        if param.requires_grad and exempt_from_weight_decay(name, param)
     ]
     # ZeRO flattens each group into one buffer of its first parameter's dtype, so
     # parameters kept in FP32 through the bf16 cast need groups of their own.
@@ -306,6 +324,11 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         betas=betas,
         eps=optimizer.eps,
     )
+
+
+def exempt_from_weight_decay(name: str, param) -> bool:
+    """Biases and norm weights, by name, and parameters marked ``NO_WEIGHT_DECAY_ATTR``."""
+    return bool(getattr(param, NO_WEIGHT_DECAY_ATTR, False)) or any(token in name.lower() for token in _NO_DECAY)
 
 
 def _data_parallel_size(world_size: int, sequence_parallel: int) -> int:

@@ -62,6 +62,7 @@ SWITCHES = {
     "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
     # expert_replicas is set apart (test_online_replicas_*): it cannot be on together with ultraep_spares.
     "expert_replicas_ema": ("moe.expert_replicas", "replica_ema", "ARL_EXPERT_REPLICAS_EMA", 0.25, 0.5),
+    "shard_dense": ("moe.dense_shard", "dense_sharding_requested", "ARL_SHARD_DENSE", True, False),
 }
 REPLICAS_ENV = "ARL_EXPERT_REPLICAS"
 PLACEMENT_ENV = "ARL_EXPERT_PLACEMENT"
@@ -120,6 +121,19 @@ def test_offload_environment_off_values(monkeypatch, value):
     monkeypatch.setenv("ARL_OFFLOAD_FROZEN_EXPERTS", value)
     apply_moe_runtime_options(MoeRuntimeOptions())
     assert not _module("moe.frozen_offload").frozen_expert_offload_requested()
+
+
+def test_the_dense_shard_group_size_takes_the_option_then_the_environment(monkeypatch):
+    dense_shard = _module("moe.dense_shard")
+    monkeypatch.delenv(dense_shard.SHARD_DENSE_GROUP_SIZE_ENV, raising=False)
+    apply_moe_runtime_options(MoeRuntimeOptions())
+    assert dense_shard.configured_group_size() is None  # the ranks of one host
+    monkeypatch.setenv(dense_shard.SHARD_DENSE_GROUP_SIZE_ENV, "4")
+    assert dense_shard.configured_group_size() == 4
+    apply_moe_runtime_options(GlmMoeDsaOptions(shard_dense=True, shard_dense_group_size=2))
+    assert dense_shard.configured_group_size() == 2 and dense_shard.dense_sharding_requested()
+    with pytest.raises(ValidationError):
+        MoeRuntimeOptions(shard_dense_group_size=1)
 
 
 def test_ipc_symm_is_written_for_ultraep():
