@@ -622,7 +622,7 @@ def test_offloaded_file_snapshot_closes_enospc_without_retry(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("failure", ["ENOSPC", "EOPNOTSUPP"])
-def test_offloaded_snapshot_reservation_falls_back_before_writing(monkeypatch, tmp_path, failure):
+def test_offloaded_snapshot_reservation_falls_back_before_writing(monkeypatch, tmp_path, failure, caplog):
     import errno
 
     preferred = tmp_path / "preferred"
@@ -650,12 +650,20 @@ def test_offloaded_snapshot_reservation_falls_back_before_writing(monkeypatch, t
     try:
         assert [directory for directory, _ in opened] == [preferred, fallback]
         assert opened[0][1].closed
+        assert any(record.levelname == "WARNING" and "memory-backed" in record.message for record in caplog.records)
         snapshot.copy_(source)
         restored = torch.empty_like(source)
         snapshot.restore(restored)
         torch_assert_equal(restored, source)
     finally:
         snapshot.file.close()
+
+
+@pytest.mark.parametrize("value", ["invalid", "-1"])
+def test_offloaded_snapshot_rejects_invalid_sync_bytes(monkeypatch, value):
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", value)
+    with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be"):
+        deepspeed_engine._OffloadedGradientFile(torch.ones(1), deepspeed_engine._OffloadedGradientStorage())
 
 
 @pytest.mark.parametrize("phase", ["posix_fallocate", "posix_fadvise"])

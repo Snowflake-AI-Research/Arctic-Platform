@@ -194,9 +194,12 @@ class _OffloadedGradientFile:
         self.storage = storage
         self.shape = source.shape
         self.size = source.numel() * source.element_size()
-        self.sync_bytes = int(
-            os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
-        )
+        try:
+            self.sync_bytes = int(
+                os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
+            )
+        except ValueError as error:
+            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be a nonnegative integer") from error
         if self.sync_bytes < 0:
             raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be nonnegative")
         directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
@@ -222,8 +225,11 @@ class _OffloadedGradientFile:
                 and error.errno not in {errno.ENOSPC, errno.EOPNOTSUPP, errno.ENOTDIR, errno.EROFS}
             ):
                 raise
-            logger.info(
-                "Offloaded gradient scratch %s is unavailable (%s); falling back to %s", directory, error, fallback
+            logger.warning(
+                "Offloaded gradient scratch %s is unavailable (%s); falling back to %s, which may be memory-backed",
+                directory,
+                error,
+                fallback,
             )
             directory = fallback
             self.file = allocate(directory)
@@ -294,7 +300,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
     if type(optimizer) is not DeepSpeedZeroOptimizer:
-        logger.info("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
+        logger.warning("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
         return False
     if not optimizer.cpu_offload:
         return False
