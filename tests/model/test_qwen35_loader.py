@@ -28,6 +28,7 @@ from arctic_platform.model import build_model
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -234,7 +235,39 @@ def test_prediction_weight_export_builders_are_family_scoped():
     assert qwen._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
     assert flash._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
     assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
-    assert qwen._generic_adapter().hf_weight_export is qwen._build_iter_full_hf_weights
+    assert qwen._generic_adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
+
+
+@pytest.mark.parametrize("family", ["generic", "qwen35", "qwen38"])
+def test_configured_mtp_is_exported_by_each_qwen_adapter(tmp_path, monkeypatch, family):
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as flash
+
+    model = _mtp_export_model()
+    if family != "qwen35":
+        model.config.text_config.model_type = "qwen4_exp_text"
+    payload = {
+        name: torch.tensor([index], dtype=torch.bfloat16)
+        for index, name in enumerate(sorted(mtp_weights._configured_names(model)))
+    }
+    save_file(payload, tmp_path / "model.safetensors")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        qwen, "_build_iter_full_hf_weights", lambda model: lambda **kwargs: iter([("model.weight", torch.ones(1))])
+    )
+    adapter = (
+        qwen._generic_adapter() if family == "generic" else qwen._adapter() if family == "qwen35" else flash._adapter()
+    )
+    exported = dict(adapter.hf_weight_export(model)(include_skipped=True))
+    assert set(exported) == {"model.weight", *payload}
+    for name, tensor in payload.items():
+        torch_assert_equal(exported[name], tensor)
 
 
 def test_qwen_hf_export_without_include_skipped_never_reads_mtp_sidecar(monkeypatch):

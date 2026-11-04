@@ -387,7 +387,7 @@ def _generic_adapter() -> MoEDeepSpeedAdapter:
         _adapter(),
         apply_sequence_parallelism=_apply_generic_sequence_parallelism,
         vllm_weight_export=build_iter_full_vllm_weights,
-        hf_weight_export=_build_iter_full_hf_weights,
+        hf_weight_export=_build_iter_full_hf_weights_with_mtp,
     )
 
 
