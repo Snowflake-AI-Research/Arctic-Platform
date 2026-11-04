@@ -230,16 +230,9 @@ def test_production_preparation_collects_identity_before_keys_and_propagates_fre
     assert events[:2] == [("broadcast", 0), ("keys", 0)]
     assert cache._ACTIVE_ATTEMPT.get() is None
     rank[0] = 1
-    if scope == "shared":
-        with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
-            builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
-    else:
-        with pytest.raises(OSError, match="local conversion failed"):
-            builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
-        assert ("conversion", 1) in events
-        failure = cache._read_cache_marker(tmp_path / "prime.failed")
-        assert failure["attempt_id"] == tokens[0]
-        assert "local conversion failed" in failure["error"]
+    with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
+        builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
+    assert ("conversion", 1) not in events
     assert len([event for event in events if event[0] == "broadcast"]) == 2
     assert cache._ACTIVE_ATTEMPT.get() is None
 
@@ -411,10 +404,16 @@ def test_abandoned_cleanup_preserves_live_or_recent_workspaces(monkeypatch, tmp_
     recent = tmp_path / "prime.tmp-rank2-pid125-recent"
     for workspace in (old, live, recent):
         workspace.mkdir()
-    ancient = cache.time.time() - cache._ABANDONED_CACHE_AGE - 60
-    os.utime(old, (ancient, ancient))
-    os.utime(live, (ancient, ancient))
-    live.with_name(f"{live.name}.owner").touch()
+    clock = [0]
+    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache, "_WORKSPACE_OBSERVATIONS", {})
+    owner = live.with_name(f"{live.name}.owner")
+    owner.touch()
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert old.exists()
+    clock[0] = cache._ABANDONED_CACHE_AGE + 1
+    os.utime(owner, ns=(1, 1))
+    (recent / "new-shard").touch()
     cache._cleanup_abandoned_conversion_workspaces(destination)
     assert not old.exists()
     assert live.exists()
@@ -867,6 +866,46 @@ def test_prepare_moe_weights_converts_from_a_meta_model_with_the_load_config():
         ("lm_head",),
         ("prepare", "meta-model", Path("/source"), 8, 0),
     ]
+
+
+def _prepare_subset_rank_process(rank, rendezvous, result):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        if rank == 0:
+            events = []
+            _prepare(_adapter(events), ep_size=1, world_size=2, rank=0)
+            result.put(events[-1])
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_preparation_on_subset_of_initialized_group_has_no_collectives(monkeypatch, tmp_path):
+    import multiprocessing
+
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", "/data-fast/subset-prepare-test")
+    context = multiprocessing.get_context("spawn")
+    result = context.Queue()
+    processes = [
+        context.Process(target=_prepare_subset_rank_process, args=(rank, (tmp_path / "gloo").as_uri(), result))
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        assert result.get(timeout=30) == ("prepare", "meta-model", Path("/source"), 0, 0)
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        result.close()
 
 
 def test_prepare_moe_weights_skips_random_init_and_rejects_an_indivisible_world():

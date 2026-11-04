@@ -365,7 +365,7 @@ def load_moe_model_for_deepspeed(
     return model
 
 
-@record_conversion_preparation_failure
+@record_conversion_preparation_failure(distributed=False)
 def prepare_moe_weights(
     adapter: MoEDeepSpeedAdapter,
     *,
@@ -407,6 +407,8 @@ def prepare_moe_weights(
     if model_config.debug.random_init:
         return None
     validate_standalone_conversion_attempt(model_config)
+    source_path = adapter.resolve_weight_source(model_config)
+    validate_standalone_conversion_attempt(model_config, source_path)
     model = adapter.get_model(
         model_config,
         device=torch.device("meta"),
@@ -415,7 +417,6 @@ def prepare_moe_weights(
     _configure_model_for_weight_loading(adapter, model, model_config)
     # EP/SP, activation checkpointing and fused CE do not affect today's substring-based format classifier.
     # Keep this setup aligned with loading if classification ever becomes sensitive to the full parameter keys.
-    source_path = adapter.resolve_weight_source(model_config)
     return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
 

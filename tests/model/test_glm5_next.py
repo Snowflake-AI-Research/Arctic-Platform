@@ -1134,3 +1134,79 @@ def test_glm53_packed_hf_fp8_rejects_missing_scales(missing_projection):
 
     with pytest.raises(ValueError, match="missing its scale"):
         convert_hf_layer_to_prime(state, 3)
+
+
+@pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
+def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_path, monkeypatch, builder_family):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
+    models = [Glm5NextForConditionalGenerationPrimeRL(_tiny_config()) for _ in range(2)]
+    source = tmp_path / "source"
+    source.mkdir()
+    hf_name = "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
+    save_file({hf_name: torch.ones(8, 16)}, source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {hf_name: "model.safetensors"}}))
+    cache = tmp_path / "prime"
+    local = threading.local()
+    converting, reader_observed_lock = threading.Event(), threading.Event()
+    barriers = {0: 0, 1: 0}
+    original_marker = conversion_cache._read_cache_marker
+    original_wait = conversion_cache.wait_for_conversion_cache
+
+    def read_marker(path):
+        marker = original_marker(path)
+        if path.name.endswith(".in-progress") and marker.get("attempt_id") is not None:
+            reader_observed_lock.set()
+        return marker
+
+    def fail_conversion(source, destination):
+        converting.set()
+        assert reader_observed_lock.wait(3), "reader must observe the active writer's attempt marker"
+        raise OSError("injected shared conversion failure")
+
+    def barrier():
+        barriers[local.rank] += 1
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "shared-failure-test")
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(
+        builder, "get_world", lambda: SimpleNamespace(rank=local.rank, local_rank=0, is_master=local.rank == 0)
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(conversion_cache, "_read_cache_marker", read_marker)
+    monkeypatch.setattr(
+        builder,
+        "wait_for_conversion_cache",
+        lambda path, **kwargs: original_wait(path, timeout=3, poll_interval=0.01, **kwargs),
+    )
+    monkeypatch.setattr(models[0], "convert_to_prime_checkpoint", fail_conversion)
+    monkeypatch.setattr(
+        builder, "dcp_load", lambda *args, **kwargs: pytest.fail("failed conversion must not reach DCP")
+    )
+    config = SimpleNamespace(
+        name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
+    )
+
+    def load(rank):
+        local.rank = rank
+        builder.load_dcp_from_hf(models[rank], config, SimpleNamespace())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(load, 0)
+        assert converting.wait(3)
+        reader = executor.submit(load, 1)
+        with pytest.raises(OSError, match="injected shared conversion failure"):
+            writer.result(timeout=5)
+        with pytest.raises(RuntimeError, match="writer failed"):
+            reader.result(timeout=5)
+    assert barriers == {0: 1, 1: 1}, "both ranks passed only the pre-conversion barrier"
+    assert not cache.exists()

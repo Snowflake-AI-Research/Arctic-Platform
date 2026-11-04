@@ -22,6 +22,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
+    conversion_preparation_root,
     ensure_node_local_conversion_cache,
     get_checkpoint_converter,
     record_conversion_preparation_failure,
@@ -314,13 +315,14 @@ def prepare_weight_conversion(
             attempt_id=attempt_id,
             node_local=node_local,
             fresh_attempt=fresh_attempt,
+            preparation_root=conversion_preparation_root(config, source_path),
         )
     else:
         wait_for_conversion_cache(
             snapshot_path,
             attempt_id=attempt_id,
             fresh_attempt=fresh_attempt,
-            preparation_root=getattr(config, "weight_conversion_cache_dir", None),
+            preparation_root=conversion_preparation_root(config, source_path),
         )
     return snapshot_path
 
