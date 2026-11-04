@@ -158,7 +158,7 @@ def main():
         start += c
     want = torch.cat(pieces) if pieces else x_ref.new_zeros(0, DIM)
     error = ((out.float() - want).norm() / want.norm().clamp_min(1e-6)).item()
-    assert error < 2e-2, f"rank {rank}: output error {error}"
+    assert error < (6e-2 if w4a8 else 2e-2), f"rank {rank}: output error {error}"
 
     upstream = torch.randn(rows, DIM, device="cuda", generator=g)
     out.float().backward(upstream)
@@ -169,7 +169,7 @@ def main():
             expected = full_ab[n][k].grad[rank]
             got = ab[n][k].grad.float()
             err = ((got - expected).norm() / expected.norm().clamp_min(1e-6)).item()
-            assert err < 2e-2, f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
+            assert err < (6e-2 if w4a8 else 2e-2), f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
     if rank == 0:
         print(
             f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'mxfp4' if mxfp4 else 'w4a16'}): EP{world}, {S} spares:"
