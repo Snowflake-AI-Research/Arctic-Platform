@@ -627,8 +627,9 @@ def stash_frozen(ctx, weight, scale) -> list[Tensor]:
     """Keep a GEMM's frozen ``(weight, scale)`` for its backward; returns the tensors to add to ``save_for_backward``.
 
     Parameters ride on ``ctx``: they live anyway, and activation offload must not copy them. Anything else (the
-    per-call copies of ``moe/frozen_offload.py``, tagged ``_ap_transient``) goes through ``save_for_backward``, so
-    activation checkpointing frees it after the forward instead of every layer's graph holding it until backward.
+    per-call copies of ``moe/frozen_offload.py``, tagged ``_ap_transient``, and UltraEP's per-call native + spare
+    stacks, ``moe/ultraep_frozen.py``) goes through ``save_for_backward``, so activation checkpointing frees it after
+    the forward instead of every layer's graph holding it until backward.
     """
     leaves, rebuild = _frozen_leaves(weight, scale)
     if all(isinstance(t, nn.Parameter) and not getattr(t, "_ap_transient", False) for t in leaves):

@@ -69,6 +69,8 @@ EXPECTED_KEYS = {
     "peft": ("trainer", "mode"),
     "zorro_train": ("trainer", "mode"),
     "moe.frozen_expert_offload": ("trainer", "memory"),
+    "moe.ultraep_spares": ("trainer", "speed"),
+    "moe.ultraep_ipc_symm": ("trainer", "robustness"),
 }
 EXPECTED_PROFILES = {
     "huggingface",
@@ -535,7 +537,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 26 options x 9 profiles = 234 cells, ")
+        assert out[0].startswith("check passed: 28 options x 9 profiles = 252 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

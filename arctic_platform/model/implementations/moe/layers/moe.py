@@ -514,8 +514,18 @@ class GroupedExperts(nn.Module):
             s2 = _maybe_to_local(self.w2_scale_inv)
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
+            call = getattr(self, "_arl_ultraep_call", None)
             if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
-                return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab, scores)
+                weights, scales = (w1, w2, w3), (s1, s2, s3)
+                if call is not None:
+                    # UltraEP's spare slots: the call's experts are the native ones, then this rank's copies.
+                    weights, scales, ab = call.extend(self, weights, scales, ab)
+                return self._forward_fp8_decoded(x, num_tokens_per_expert, weights, scales, ab, scores)
+            if call is not None:
+                raise NotImplementedError(
+                    "UltraEP's spare slots need the decoded grouped block-FP8 experts: moe.grouped_mm on CUDA, with "
+                    "unfused expert LoRA"
+                )
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
@@ -875,6 +885,13 @@ class MoE(nn.Module):
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
+        num_experts = experts.num_experts
+        plan = self._ultraep_plan(experts, group, selected_experts_indices)
+        if plan is not None:
+            # Tokens go to physical slots (native experts and this call's spares); the experts fetch the spares.
+            selected_experts_indices = plan.remap(selected_experts_indices)
+            num_experts = plan.num_slots
+            experts._arl_ultraep_call = plan
         # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
         # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
         use_sonic = (
@@ -895,7 +912,7 @@ class MoE(nn.Module):
                 x[start:end],
                 selected_experts_indices[start:end],
                 top_scores[start:end],
-                num_experts=experts.num_experts,
+                num_experts=num_experts,
                 group=group,
                 score_before_experts=self.score_before_experts,
             )
@@ -941,6 +958,7 @@ class MoE(nn.Module):
             pending_state = next_pending_state
 
         routed_outputs.append(run_pending_chunk(pending_state))
+        experts._arl_ultraep_call = None
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -948,6 +966,23 @@ class MoE(nn.Module):
         # Dummy padding chunks append their rows after the real tokens; drop them.
         routed_output = routed_output[: x.shape[0]]
         return routed_output if shared_output is None else shared_output + routed_output
+
+    def _ultraep_plan(self, experts: nn.Module, group, selected_experts_indices: torch.Tensor):
+        """UltraEP's plan for this call (``moe/ultraep_frozen.py``) when spare slots are configured, else None. A
+        recompute reuses its forward's placement and physical routes."""
+        from ..ultraep_frozen import frozen_ultraep_plan
+        from ..ultraep_frozen import ultraep_spares
+
+        if not ultraep_spares() or group is None:
+            return None
+        if getattr(experts, "fp8_block_size", None) is None:
+            raise NotImplementedError("UltraEP's spare slots serve frozen block-FP8 routed experts only")
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        _install_recompute_detector()
+        ab = getattr(experts, "_ap_lora_ab", getattr(experts, "_dss_lora_ab", {}))
+        return frozen_ultraep_plan(self, experts, group, selected_experts_indices, ab, building=not _in_recompute())
 
     def forward(
         self,

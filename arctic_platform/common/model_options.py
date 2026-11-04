@@ -165,6 +165,28 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.ultraep_spares",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest"
+            " frozen block-FP8 experts and their LoRA inside the owner's NVLink domain. 0 turns it off."
+        ),
+        source="`loader_options.ultraep_spares`; `ARL_ULTRAEP_SPARES` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.ultraep_ipc_symm",
+        runs_in="trainer",
+        goal="robustness",
+        why=(
+            "Map UltraEP's peer buffers through CUDA IPC handles: torch symmetric memory refuses ranks that each see"
+            " only their own GPU, as DSS runs them."
+        ),
+        source="`loader_options.ultraep_ipc_symm`; `ULTRA_EP_IPC_SYMM` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

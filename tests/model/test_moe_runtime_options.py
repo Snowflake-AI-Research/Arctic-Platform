@@ -18,6 +18,7 @@ option leaves each switch's environment variable in charge. CPU only."""
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 from pydantic import ValidationError
@@ -37,6 +38,7 @@ SWITCHES = {
         True,
         False,
     ),
+    "ultraep_spares": ("moe.ultraep_frozen", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
 }
 
 
@@ -52,6 +54,7 @@ def _env_value(value) -> str:
 def _clean(monkeypatch):
     for _, _, env, _, _ in SWITCHES.values():
         monkeypatch.delenv(env, raising=False)
+    monkeypatch.delenv("ULTRA_EP_IPC_SYMM", raising=False)
     yield
     apply_moe_runtime_options(MoeRuntimeOptions())  # leave every switch to its environment variable again
 
@@ -61,9 +64,12 @@ def _switches():
 
 
 def test_glm_loader_options_carry_the_runtime_fields():
-    options = GlmMoeDsaOptions.model_validate({field: spec[3] for field, spec in SWITCHES.items()})
+    options = GlmMoeDsaOptions.model_validate(
+        {field: spec[3] for field, spec in SWITCHES.items()} | {"ultraep_ipc_symm": True}
+    )
     apply_moe_runtime_options(options)
     assert _switches() == {field: spec[3] for field, spec in SWITCHES.items()}
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
 
 
 def test_options_override_the_environment(monkeypatch):
@@ -91,9 +97,10 @@ def test_offload_environment_off_values(monkeypatch, value):
 @pytest.mark.parametrize("options_cls", [GenericMoeOptions, Qwen3_5MoeOptions])
 def test_other_moe_loaders_refuse_the_runtime_fields(options_cls, monkeypatch):
     """Only glm_moe_dsa installs these modules; the other MoE loaders refuse the fields instead of ignoring them."""
-    for field, spec in SWITCHES.items():
+    fields = {field: spec[3] for field, spec in SWITCHES.items()} | {"ultraep_ipc_symm": True}
+    for field, value in fields.items():
         with pytest.raises(ValidationError):
-            options_cls.model_validate({field: spec[3]})
+            options_cls.model_validate({field: value})
     # Their loads leave every switch to its environment variable.
     for spec in SWITCHES.values():
         monkeypatch.setenv(spec[2], _env_value(spec[3]))
@@ -101,9 +108,20 @@ def test_other_moe_loaders_refuse_the_runtime_fields(options_cls, monkeypatch):
     assert _switches() == {field: spec[3] for field, spec in SWITCHES.items()}
 
 
+def test_ipc_symm_is_written_for_ultraep():
+    apply_moe_runtime_options(MoeRuntimeOptions(ultraep_ipc_symm=True))
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
+    apply_moe_runtime_options(MoeRuntimeOptions(ultraep_ipc_symm=False))
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "0"
+    apply_moe_runtime_options(MoeRuntimeOptions())  # unset: UltraEP's own variable stays as it is
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "0"
+
+
 def test_unknown_runtime_fields_are_refused():
     with pytest.raises(ValidationError):
         GlmMoeDsaOptions.model_validate({"frozen_expert_ofload": True})
+    with pytest.raises(ValidationError):
+        MoeRuntimeOptions(ultraep_spares=-1)
     # The W4AFP8 ladder's other switches are not on this branch.
     for field in ("shard_frozen_dense", "w4a8_experts"):
         with pytest.raises(ValidationError):

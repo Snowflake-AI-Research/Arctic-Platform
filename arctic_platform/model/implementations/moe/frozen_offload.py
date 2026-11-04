@@ -19,8 +19,9 @@ sequence. With LoRA they are frozen and every layer reads them twice per step: i
 activation-checkpoint recompute (the backward reuses the recompute's copy). So each rank keeps its experts' codes in
 one host buffer, registered with CUDA, and a layer's codes (1.2 GiB per GPU for GLM-5.3) are copied in on a side
 stream for each call, into one of two persistent GPU buffers by the layer's parity: a layer's codes always sit at the
-same addresses, and no call allocates. The next layer in call order (forward: the next one; backward: the previous
-one) is prefetched while the current one runs, so the copy overlaps compute.
+same addresses (which UltraEP's spare slots, ``moe/ultraep_frozen.py``, read in place), and no call allocates. The
+next layer in call order (forward: the next one; backward: the previous one) is prefetched while the current one runs,
+so the copy overlaps compute.
 
 The offload happens at the first call, after PEFT and DeepSpeed have wrapped the model; the expert parameters keep
 their objects with empty data, and during a call each is replaced by a temporary parameter viewing the copied bytes.
@@ -106,8 +107,8 @@ class FrozenExpertOffload:
         self.resident: list[int] = [-1, -1]
         self.events: list[torch.cuda.Event | None] = [None, None]
         # Two persistent GPU buffers: layer i always copies into buffers[i % 2], so its codes keep their addresses
-        # from call to call and no call allocates. Each buffer remembers the temporaries of the layer that last used
-        # it, to refuse an overwrite while they live.
+        # from call to call (UltraEP's pointer pools read them in place) and no call allocates. Each buffer
+        # remembers the temporaries of the layer that last used it, to refuse an overwrite while they live.
         self.buffers: list[torch.Tensor] = []
         self.holders: list[tuple[int, list]] = [(-1, []), (-1, [])]
         self.installed: set[int] = set()

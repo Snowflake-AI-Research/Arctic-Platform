@@ -14,8 +14,8 @@
 # limitations under the License.
 """Per-job settings of the MoE runtime that would otherwise be worker environment variables.
 
-``MoeRuntimeOptions`` is a base of the ``glm_moe_dsa`` loader's options (``GlmMoeDsaOptions``), the loader that
-installs these modules, so a job sets its fields like any other loader option (DSS:
+``MoeRuntimeOptions`` is a base of the ``glm_moe_dsa`` loader's options (``GlmMoeDsaOptions``), the loader these
+modules serve, so a job sets its fields like any other loader option (DSS:
 ``training_config.model_options.moe.*``, or the ``prime_rl`` block). Each field steers one module that keeps its
 environment variable as the fallback: a field left unset (None) leaves that variable in charge, so a job that sets
 none of them runs exactly as before. ``apply_moe_runtime_options`` hands the fields to their modules once per model
@@ -25,6 +25,7 @@ load, before the model is built; the other MoE loaders have no such fields, whic
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 from pydantic import BaseModel
@@ -34,11 +35,13 @@ from pydantic import Field
 # field -> module that reads it, relative to arctic_platform.model.implementations
 _MODULES = {
     "frozen_expert_offload": "moe.frozen_offload",
+    "ultraep_spares": "moe.ultraep_frozen",
 }
+_ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Memory settings of the MoE runtime. None: the environment variable decides."""
+    """Memory and expert-balance settings of the MoE runtime. None: the environment variable decides."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -50,6 +53,23 @@ class MoeRuntimeOptions(BaseModel):
             "must be recomputed. Unset: ARL_OFFLOAD_FROZEN_EXPERTS."
         ),
     )
+    ultraep_spares: int | None = Field(
+        None,
+        ge=0,
+        description=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest "
+            "frozen block-FP8 experts and their LoRA inside the NVLink domain (moe/ultraep_frozen.py). 0 turns "
+            "UltraEP off. Unset: ARL_ULTRAEP_SPARES."
+        ),
+    )
+    ultraep_ipc_symm: bool | None = Field(
+        None,
+        description=(
+            "Map UltraEP's peer buffers through CUDA IPC handles instead of torch symmetric memory, whose rendezvous "
+            "refuses ranks that each see only their own GPU (as DSS runs them). Written to ULTRA_EP_IPC_SYMM, which "
+            "UltraEP reads, before its buffers are allocated. Unset: ULTRA_EP_IPC_SYMM."
+        ),
+    )
 
 
 def apply_moe_runtime_options(options: Any) -> None:
@@ -59,3 +79,6 @@ def apply_moe_runtime_options(options: Any) -> None:
     for field, module_name in _MODULES.items():
         module = importlib.import_module(f"arctic_platform.model.implementations.{module_name}")
         module.configure_from_options(getattr(options, field, None))
+    ipc_symm = getattr(options, "ultraep_ipc_symm", None)
+    if ipc_symm is not None:
+        os.environ[_ULTRA_EP_IPC_SYMM_ENV] = "1" if ipc_symm else "0"
