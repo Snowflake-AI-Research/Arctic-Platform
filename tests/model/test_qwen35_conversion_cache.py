@@ -20,6 +20,123 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize("race", [False, True])
+def test_conversion_publication_recovers_incomplete_destination_and_concurrent_winner(monkeypatch, tmp_path, race):
+    import errno
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    destination.mkdir()
+    (destination / "old-shard.safetensors").touch()
+    native_replace = cache.os.replace
+    raced = []
+
+    def ready(path, name):
+        path.mkdir(exist_ok=True)
+        (path / name).touch()
+        (path / "model.safetensors.index.json").write_text(json.dumps(dict(weight_map=dict(weight=name))))
+
+    def replace(source, target):
+        if race and target == destination and not raced:
+            raced.append(True)
+            ready(destination, "winner.safetensors")
+            raise OSError(errno.ENOTEMPTY, "concurrent publisher")
+        return native_replace(source, target)
+
+    monkeypatch.setattr(cache.os, "replace", replace)
+    cache._write_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "Prime",
+        lambda path: {},
+        lambda state, target: ready(target, "candidate.safetensors"),
+        rank=0,
+        local_rank=0,
+    )
+    assert cache.conversion_cache_ready(destination)
+    assert (destination / ("winner.safetensors" if race else "candidate.safetensors")).exists()
+    assert list(tmp_path.glob("prime.stale-*")) == []
+    assert list(tmp_path.glob("prime.tmp-*")) == []
+
+
+@pytest.mark.parametrize("marker", ["failed", "in-progress", "preparation"])
+def test_reused_attempt_waiter_ignores_baseline_generations_before_late_writer(monkeypatch, tmp_path, marker):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "reused")
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    marker_path = (
+        cache._preparation_marker_path("reused").with_suffix(".failed")
+        if marker == "preparation"
+        else tmp_path / f"prime.{marker}"
+    )
+    cache._write_cache_marker(marker_path, dict(attempt_id="reused", writer_id="old", heartbeat=0, error="stale"))
+    clock = [0]
+    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+
+    def sleep(delay):
+        clock[0] += delay
+        if clock[0] == 35:
+            cache._write_cache_marker(
+                tmp_path / "prime.in-progress", dict(attempt_id="reused", writer_id="new", heartbeat=0)
+            )
+        if clock[0] == 36:
+            destination.mkdir()
+            (destination / "weights.safetensors").touch()
+            (destination / "model.safetensors.index.json").write_text(
+                json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+            )
+
+    monkeypatch.setattr(cache.time, "sleep", sleep)
+    cache.wait_for_conversion_cache(
+        destination,
+        timeout=60,
+        poll_interval=1,
+        writer_idle_timeout=2,
+        writer_start_timeout=60,
+        attempt_id="reused",
+    )
+    assert clock[0] == 36
+
+
+@pytest.mark.parametrize("stale_progress", [False, True])
+def test_local_nonzero_rank_can_start_retry_with_reused_failure_id(monkeypatch, tmp_path, stale_progress):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    cache._write_cache_marker(tmp_path / "prime.failed", dict(attempt_id="reused", writer_id="old", error="old"))
+    if stale_progress:
+        cache._write_cache_marker(
+            tmp_path / "prime.in-progress", dict(attempt_id="reused", writer_id="old", heartbeat=0)
+        )
+
+    def save(state, target):
+        target.mkdir()
+        (target / "weights.safetensors").touch()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+        )
+
+    cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "Prime",
+        lambda path: {},
+        save,
+        rank=1,
+        local_rank=1,
+        attempt_id="reused",
+        node_local=True,
+    )
+    assert cache.conversion_cache_ready(destination)
+
+
 def test_conversion_cache_ready_requires_index_and_referenced_shards(tmp_path):
     from arctic_platform.model import conversion_cache_ready
 
@@ -344,7 +461,9 @@ def test_conversion_cache_detects_killed_writer_from_heartbeat(monkeypatch, tmp_
     monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(conversion_cache.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
     with pytest.raises(RuntimeError, match="writer stopped heartbeating"):
-        conversion_cache.wait_for_conversion_cache(cache, timeout=3600, writer_idle_timeout=2, attempt_id="killed")
+        conversion_cache.wait_for_conversion_cache(
+            cache, timeout=3600, writer_idle_timeout=2, attempt_id="killed", fresh_attempt=True
+        )
     assert clock[0] == 2
 
 
@@ -405,9 +524,9 @@ def test_conversion_cache_late_rank_sees_current_attempt_failure(monkeypatch, tm
         conversion_cache.ensure_node_local_conversion_cache(*args, rank=0, local_rank=0)
     with pytest.raises(RuntimeError, match="writer failed.*injected interrupt"):
         if scope == "shared":
-            conversion_cache.wait_for_conversion_cache(cache, timeout=0)
+            conversion_cache.wait_for_conversion_cache(cache, timeout=0, fresh_attempt=True)
         else:
-            conversion_cache.ensure_node_local_conversion_cache(*args, rank=1, local_rank=1)
+            conversion_cache.ensure_node_local_conversion_cache(*args, rank=1, local_rank=1, fresh_attempt=True)
     assert calls == [1]
 
 
@@ -516,7 +635,7 @@ def test_conversion_cache_setup_failure_reaches_waiter_without_progress(monkeypa
         )
     assert not cache.with_name("prime.in-progress").exists()
     with pytest.raises(RuntimeError, match="writer failed.*writer setup failed"):
-        conversion_cache.wait_for_conversion_cache(cache, timeout=0, attempt_id="setup-failure")
+        conversion_cache.wait_for_conversion_cache(cache, timeout=0, attempt_id="setup-failure", fresh_attempt=True)
 
 
 def test_conversion_cache_preserves_other_writer_temporary_files_without_coherent_lock(monkeypatch, tmp_path):
@@ -630,7 +749,7 @@ def test_shared_waiter_observes_failure_before_first_progress_marker(monkeypatch
             node_local=False,
         )
     with pytest.raises(RuntimeError, match="writer failed.*startup marker failed"):
-        conversion_cache.wait_for_conversion_cache(destination, timeout=0, attempt_id="setup")
+        conversion_cache.wait_for_conversion_cache(destination, timeout=0, attempt_id="setup", fresh_attempt=True)
 
 
 def test_pre_cache_preparation_failure_reaches_shared_waiters(monkeypatch, tmp_path):
@@ -646,7 +765,9 @@ def test_pre_cache_preparation_failure_reaches_shared_waiters(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="checkpoint discovery failed"):
         prepare(rank=0)
     with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
-        conversion_cache.wait_for_conversion_cache(tmp_path / "prime", timeout=0, attempt_id="source-failure")
+        conversion_cache.wait_for_conversion_cache(
+            tmp_path / "prime", timeout=0, attempt_id="source-failure", fresh_attempt=True
+        )
 
 
 def test_shared_waiter_bounds_writer_death_before_startup(monkeypatch, tmp_path):
