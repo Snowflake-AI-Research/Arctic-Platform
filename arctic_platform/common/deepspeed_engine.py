@@ -176,6 +176,7 @@ class _OffloadedGradientStorage:
 
     def __init__(self):
         self.staging = None
+        self.snapshots = {}
         try:
             self.sync_bytes = int(
                 os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
@@ -240,16 +241,21 @@ class _OffloadedGradientStorage:
             self.use_fallback(error)
             return reserve()
 
-    def snapshot(self, source):
+    def snapshot(self, source, *, group_idx=None):
         size = source.numel() * source.element_size()
         if size <= _OFFLOADED_SNAPSHOT_CHUNK_BYTES:
             return source.detach().to(device="cpu", non_blocking=False)
-        snapshot = _OffloadedGradientFile(source, self)
+        snapshot = self.snapshots.get(group_idx) if group_idx is not None else None
+        if snapshot is None:
+            snapshot = _OffloadedGradientFile(source, self)
         try:
             snapshot.copy_(source)
         except BaseException:
             snapshot.file.close()
+            self.snapshots.pop(group_idx, None)
             raise
+        if group_idx is not None:
+            self.snapshots[group_idx] = snapshot
         return snapshot
 
     def buffer(self, source):
@@ -325,7 +331,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     compact FP32 GPU partition until ``step()``. Once every local parameter has been copied, retain a separate
     FP32 snapshot and release the GPU partition. Small snapshots use CPU tensors; larger ones use unlinked local
     scratch files with a shared 16 MiB staging buffer and chunkwise page-cache eviction. Reuse that storage across
-    backwards in the same update. A later
+    backwards and optimizer updates without recreating or reserving its file. A later
     backward restores the snapshot only when recreating its GPU partition, preserving the cumulative sum even when
     master gradients are BF16. Release completed groups during every reduction, including non-boundary microsteps.
     Partial groups are released after the native reduction epilogue, waiting for CPU copies before snapshotting.
@@ -397,7 +403,9 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
         if snapshot is None:
             source = partition.flat_partition.detach()
             retained[group_idx] = (
-                storage.snapshot(source) if storage is not None else source.to(device="cpu", non_blocking=False)
+                storage.snapshot(source, group_idx=group_idx)
+                if storage is not None
+                else source.to(device="cpu", non_blocking=False)
             )
         else:
             snapshot.copy_(partition.flat_partition.detach())

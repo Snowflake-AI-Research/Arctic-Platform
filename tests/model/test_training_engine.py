@@ -495,6 +495,35 @@ def test_offloaded_file_snapshot_reuses_bounded_storage_and_restores_exactly(mon
     snapshot.file.close()
 
 
+def test_offloaded_storage_reuses_files_across_group_snapshots(monkeypatch, tmp_path):
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path))
+    storage = deepspeed_engine._OffloadedGradientStorage()
+    native = storage.allocate
+    allocations = []
+
+    def allocate(size):
+        allocations.append(size)
+        return native(size)
+
+    monkeypatch.setattr(storage, "allocate", allocate)
+    source = torch.arange(55, dtype=torch.float32)
+    initial = storage.snapshot(source, group_idx=0)
+    other = storage.snapshot(source, group_idx=1)
+    try:
+        for update in range(3):
+            source.add_(update + 1)
+            assert storage.snapshot(source, group_idx=0) is initial
+            restored = torch.empty_like(source)
+            initial.restore(restored)
+            torch_assert_equal(restored, source)
+        assert allocations == [220, 220]
+        assert storage.snapshots == {0: initial, 1: other}
+    finally:
+        initial.file.close()
+        other.file.close()
+
+
 @pytest.mark.parametrize("failure", ["mkdir", "open"])
 def test_offloaded_file_snapshot_falls_back_from_unwritable_scratch(monkeypatch, tmp_path, failure):
     directory = tmp_path / "unavailable"
