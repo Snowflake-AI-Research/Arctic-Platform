@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import dataclass
 from functools import wraps
 from inspect import signature
 from math import prod
 from pathlib import Path
 from urllib.parse import quote
 
-from dataclasses import dataclass
 from typing import Any
 from typing import Callable
 from typing import Mapping
@@ -144,9 +144,16 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
                     os.fdatasync(descriptor)
                     os.posix_fadvise(descriptor, offsets[name] + start, count, os.POSIX_FADV_DONTNEED)
                     start += count
+            # Also sync archive metadata when the shard contains only empty tensors.
+            os.fdatasync(descriptor)
         finally:
             os.close(descriptor)
         os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
 
 
 def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
@@ -157,9 +164,27 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     original_module_load = engine_type.load_module_state_dict
     original_module_state_dict = engine_type.module_state_dict
     original_non_moe_state_dict = engine_type._get_non_moe_state_dict
+    original_frozen_attributes = engine_type._get_zero_frozen_param_attributes
     load_signature = signature(original_load)
     module_load_signature = signature(original_module_load)
     module_state_signature = signature(original_module_state_dict)
+
+    @wraps(original_frozen_attributes)
+    def frozen_attributes(self, attr_func):
+        parameters = getattr(self, "_ap_ep_checkpoint_save_parameters", None)
+        if parameters is None:
+            return original_frozen_attributes(self, attr_func)
+        excluded = {
+            parameter for named_parameters in parameters.values() for parameter in named_parameters.values()
+        }
+
+        def dense_attribute(parameter):
+            # Filter before the native fragment callback copies frozen experts to CPU.
+            return None if parameter in excluded else attr_func(parameter)
+
+        attributes = original_frozen_attributes(self, dense_attribute)
+        excluded_names = {self.param_names[parameter] for parameter in excluded}
+        return {name: value for name, value in attributes.items() if name not in excluded_names}
 
     @wraps(original_module_state_dict)
     def module_state_dict(self, *args, **kwargs):
@@ -243,7 +268,8 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             path = _ep_checkpoint_path(arguments["load_dir"], arguments["tag"], identity)
             if not path.is_file():
                 raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
-            shard = self.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
+            # AP sidefiles are always Torch ZIP archives, even with a different dense checkpoint engine.
+            shard = torch.load(path, map_location="cpu", weights_only=True)
             if (
                 not isinstance(shard, dict)
                 or type(shard.get("version")) is not int
@@ -263,6 +289,8 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             for name, value in shard["module"].items():
                 if not isinstance(value, torch.Tensor) or value.shape != named_parameters[name].shape:
                     raise ValueError(f"AP expert-parallel checkpoint tensor shape does not match for {name}: {path}")
+                if value.dtype != named_parameters[name].dtype:
+                    raise ValueError(f"AP expert-parallel checkpoint tensor dtype does not match for {name}: {path}")
             local_state.update(shard["module"])
         self._ap_ep_checkpoint_state = local_state
         try:
@@ -285,13 +313,16 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS) is not None:
             fragments = dict(checkpoint[FROZEN_PARAM_FRAGMENTS])
             fragments.update(
-                (name, value) for name, value in self._ap_ep_checkpoint_state.items() if name in fragments
+                (self.param_names[self.module.get_parameter(name)], value)
+                for name, value in self._ap_ep_checkpoint_state.items()
+                if not self.module.get_parameter(name).requires_grad
             )
             checkpoint[FROZEN_PARAM_FRAGMENTS] = fragments
         bound.arguments["checkpoint"] = checkpoint
         return original_module_load(*bound.args, **bound.kwargs)
 
     engine_type._get_non_moe_state_dict = non_moe_state_dict
+    engine_type._get_zero_frozen_param_attributes = frozen_attributes
     engine_type.module_state_dict = module_state_dict
     engine_type._save_moe_checkpoint = wrap_save(engine_type._save_moe_checkpoint)
     # Frozen expert-only models follow DeepSpeed's ordinary checkpoint path.

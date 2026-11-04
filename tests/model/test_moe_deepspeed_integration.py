@@ -26,7 +26,9 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 from arctic_platform.model.implementations.moe import deepspeed_integration as common
+from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 def test_shared_setup_runs_family_hooks_in_order(monkeypatch):
@@ -223,6 +225,17 @@ def ep_checkpoint_engine(monkeypatch):
         def zero_optimization_partition_weights(self):
             return self.partition_weights
 
+        @property
+        def param_names(self):
+            return {parameter: name for name, parameter in self.module.named_parameters()}
+
+        def _get_zero_frozen_param_attributes(self, attr_func):
+            return {
+                self.param_names[parameter]: attr_func(parameter)
+                for parameter in self.module.parameters()
+                if not parameter.requires_grad
+            }
+
         def _get_non_moe_state_dict(self, full_state_dict):
             for name in self.native_expert_names:
                 full_state_dict.pop(name, None)
@@ -234,11 +247,9 @@ def ep_checkpoint_engine(monkeypatch):
                 module=self.module_state_dict(exclude_frozen_parameters=exclude_frozen_parameters),
             )
             if not exclude_frozen_parameters:
-                self.saved_checkpoint["frozen_param_fragments"] = {
-                    name: torch.zeros_like(parameter)
-                    for name, parameter in self.module.named_parameters()
-                    if not parameter.requires_grad
-                }
+                self.saved_checkpoint["frozen_param_fragments"] = self._get_zero_frozen_param_attributes(
+                    lambda parameter: parameter.detach().cpu().clone()
+                )
             return "saved"
 
         def module_state_dict(self, destination=None, prefix="", keep_vars=False, exclude_frozen_parameters=False):
@@ -316,7 +327,7 @@ def test_ep_checkpoint_restores_rank_local_trainable_and_frozen_weights(ep_check
     assert not hasattr(engine, "_ap_ep_checkpoint_state")
     assert not hasattr(engine, "_ap_ep_checkpoint_save_parameters")
     assert "expert" not in engine.saved_checkpoint["module"]
-    assert torch.count_nonzero(engine.saved_checkpoint["frozen_param_fragments"]["frozen"]) == 0
+    assert "frozen" not in engine.saved_checkpoint["frozen_param_fragments"]
 
 
 @pytest.mark.parametrize("save_method", ["_save_moe_checkpoint", "_save_checkpoint"])
@@ -672,7 +683,9 @@ def test_ep_checkpoint_uses_distinct_paths_for_same_size_groups(ep_checkpoint_en
     torch.testing.assert_close(engine.module.frozen, torch.tensor([3.0, 4.0]), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("failure", ["missing", "version", "identity", "coverage", "shape", "non_tensor", "policy"])
+@pytest.mark.parametrize(
+    "failure", ["missing", "version", "identity", "coverage", "shape", "dtype", "non_tensor", "policy"]
+)
 def test_ep_checkpoint_rejects_incompatible_shard_before_loading(ep_checkpoint_engine, tmp_path, failure):
     engine = ep_checkpoint_engine
     engine._save_moe_checkpoint(tmp_path, "tiny")
@@ -690,6 +703,8 @@ def test_ep_checkpoint_rejects_incompatible_shard_before_loading(ep_checkpoint_e
             del state["module"]["expert"]
         elif failure == "shape":
             state["module"]["expert"] = torch.zeros(3)
+        elif failure == "dtype":
+            state["module"]["expert"] = state["module"]["expert"].bfloat16()
         elif failure == "non_tensor":
             state["module"]["expert"] = [1, 2]
         else:
@@ -702,6 +717,106 @@ def test_ep_checkpoint_rejects_incompatible_shard_before_loading(ep_checkpoint_e
         engine._load_checkpoint(tmp_path, "tiny")
     assert len(engine.calls) == before
     assert not hasattr(engine, "_ap_ep_checkpoint_state")
+
+
+def test_ep_checkpoint_frozen_callbacks_never_copy_experts(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    engine.module.add_module("dense", nn.Linear(2, 2))
+    engine.module.dense.bias.requires_grad_(False)
+    copied = []
+    native = engine._get_zero_frozen_param_attributes
+
+    def attributes(callback):
+        def observed(parameter):
+            copied.append(engine.param_names[parameter])
+            return callback(parameter)
+
+        return native(observed)
+
+    engine._get_zero_frozen_param_attributes = attributes
+    engine._save_checkpoint(tmp_path, "frozen")
+    assert copied == ["dense.bias"]
+    assert set(engine.saved_checkpoint["frozen_param_fragments"]) == {"dense.bias"}
+    assert set(engine._get_zero_frozen_param_attributes(lambda parameter: parameter.shape)) == {"frozen", "dense.bias"}
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_ep_checkpoint_syncs_data_before_rename_and_directory_after(tmp_path, monkeypatch, empty):
+    events = []
+    for name in ("fdatasync", "replace", "fsync"):
+        native = getattr(common.os, name)
+
+        def record(*args, native=native, name=name):
+            events.append(name)
+            return native(*args)
+
+        monkeypatch.setattr(common.os, name, record)
+    tensor = torch.empty(0) if empty else torch.ones(4)
+    common._save_ep_checkpoint_shard({"module": {"expert": tensor}}, tmp_path / "expert.pt")
+    assert events[-3:] == ["fdatasync", "replace", "fsync"]
+
+
+@require_torch_gpu
+@require_deepspeed
+@pytest.mark.parametrize("moe_save", [False, True])
+@pytest.mark.parametrize("exclude_frozen", [False, True])
+def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_rank_group, moe_save, exclude_frozen):
+    import deepspeed
+    import deepspeed.utils.groups as groups
+
+    model = nn.Module()
+    model.dense = nn.Linear(2, 2)
+    model.dense.bias.requires_grad_(False)
+    model.experts = common.MoE.__new__(common.MoE)
+    nn.Module.__init__(model.experts)
+    model.experts.weight = nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+    model.experts.frozen = nn.Parameter(torch.tensor([3.0, 4.0]), requires_grad=False)
+    engine, *_ = deepspeed.initialize(
+        model=model.cuda(),
+        optimizer=torch.optim.AdamW(model.parameters()),
+        config=dict(
+            train_micro_batch_size_per_gpu=1,
+            zero_allow_untested_optimizer=True,
+            zero_optimization=dict(stage=2),
+        ),
+    )
+    group_name = "ep_size_1"
+    monkeypatch.setitem(groups._EXPERT_PARALLEL_GROUP, group_name, torch.distributed.group.WORLD)
+    monkeypatch.setitem(groups._EXPERT_DATA_PARALLEL_GROUP, group_name, torch.distributed.group.WORLD)
+    for parameter in model.experts.parameters():
+        parameter.allreduce = False
+        parameter.group_name = group_name
+    engine.has_moe_layers = moe_save
+    engine.num_experts = [1] if moe_save else []
+    patched_methods = (
+        "_get_non_moe_state_dict",
+        "_get_zero_frozen_param_attributes",
+        "module_state_dict",
+        "_save_moe_checkpoint",
+        "_save_checkpoint",
+        "_load_checkpoint",
+        "load_module_state_dict",
+    )
+    for name in patched_methods:
+        monkeypatch.setattr(type(engine), name, getattr(type(engine), name))
+    common._patch_deepspeed_ep_checkpoints(type(engine))
+    expected = {name: value.detach().clone() for name, value in model.named_parameters()}
+    assert engine.save_checkpoint(str(tmp_path), tag="native", exclude_frozen_parameters=exclude_frozen)
+    dense = torch.load(engine._get_ckpt_name(str(tmp_path), "native"), weights_only=False)
+    assert not any(name.startswith("experts.") for name in dense["module"])
+    fragments = dense.get("frozen_param_fragments")
+    if fragments is not None:
+        assert set(fragments) == {"dense.bias"}
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(100)
+    path, _ = engine.load_checkpoint(
+        str(tmp_path), tag="native", load_optimizer_states=False, load_module_strict=not exclude_frozen
+    )
+    assert path is not None
+    for name, parameter in model.named_parameters():
+        target = expected[name] + 100 if exclude_frozen and not parameter.requires_grad else expected[name]
+        torch_assert_equal(parameter, target)
 
 
 def test_ep_checkpoint_failure_clears_local_state(ep_checkpoint_engine, tmp_path):
