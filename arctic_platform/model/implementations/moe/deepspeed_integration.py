@@ -27,6 +27,9 @@ from .parallel_dims import ParallelDims
 from .vlm import get_language_model
 
 
+_EXPORT_GATHER_BYTES = 64 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class MoEDeepSpeedAdapter:
     dtype_map: Mapping[str, torch.dtype]
@@ -163,6 +166,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
         parts = name.split(".")
@@ -176,9 +180,12 @@ def build_iter_full_hf_weights(model: nn.Module):
 
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
         """Gather checkpoint-only shards into host memory without an all-gather copy on every rank."""
+        if local.dtype != torch.uint8:
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            return None if full is None else full.view(local.dtype)
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
-        step = max(1, (64 * 1024 * 1024) // max(row_bytes * world, 1))
+        step = max(1, _EXPORT_GATHER_BYTES // max(row_bytes * world, 1))
         step = min(step, max(rows, 1))
         full = (
             torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
@@ -198,7 +205,10 @@ def build_iter_full_hf_weights(model: nn.Module):
                 ]
             else:
                 outputs = None
-            dist.gather(local[start : start + count].contiguous(), outputs, dst=0, group=ep_group)
+            chunk = local[start : start + count].contiguous()
+            dist.gather(chunk, outputs, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for rank in range(world):
                     full[rank * rows + start : rank * rows + start + count].copy_(buffer[rank, :count])
@@ -241,7 +251,9 @@ def build_iter_full_hf_weights(model: nn.Module):
                             layer_state[name] = full
                         del full
                         continue
-                    full = _gather_ep_weight_to_cpu(tensor, ep_group, is_master=is_master)
+                    full = _gather_ep_weight_to_cpu(
+                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                    )
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -423,6 +435,8 @@ def _gather_ep_weight_to_cpu(
 ) -> torch.Tensor | None:
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
     local = tensor.detach().contiguous()
     ep_size = dist.get_world_size(group=ep_group)
     if local.ndim == 0:
@@ -441,14 +455,14 @@ def _gather_ep_weight_to_cpu(
         return full
     if ep_size == 1:
         if full is not None:
-            full.copy_(local)
+            full.view(torch.uint8).copy_(local.view(torch.uint8))
         return full
 
     # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
-    flat = local.view(-1)
-    chunk_elements = min(flat.numel(), max_gather_bytes // (ep_size * local.element_size()))
-    gathered = torch.empty(ep_size * chunk_elements, dtype=local.dtype, device=local.device)
-    full_shards = full.view(ep_size, flat.numel()) if full is not None else None
+    flat = local.view(torch.uint8).view(-1)
+    chunk_elements = min(flat.numel(), max_gather_bytes // ep_size)
+    gathered = torch.empty(ep_size * chunk_elements, dtype=torch.uint8, device=local.device)
+    full_shards = full.view(torch.uint8).view(ep_size, flat.numel()) if full is not None else None
     use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
     for offset in range(0, flat.numel(), chunk_elements):
         count = min(chunk_elements, flat.numel() - offset)
@@ -462,4 +476,6 @@ def _gather_ep_weight_to_cpu(
         if full_shards is not None:
             for rank, shard in enumerate(outputs.view(ep_size, count)):
                 full_shards[rank, offset : offset + count].copy_(shard)
+        else:
+            wait_for_export_collective(inputs)
     return full

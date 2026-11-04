@@ -231,6 +231,11 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     contract = weight_export_contract(model)
     if contract is not None and contract.vllm is not None:
         return False
+    # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
+    for name, _ in model.named_parameters():
+        export_name = hf_export_parameter_name(name)
+        if export_name is not None and export_name.startswith("model.language_model."):
+            return True
     return bool(hf_sync_name_map(model, checkpoint_dir))
 
 
@@ -306,6 +311,17 @@ def _expert_parallel_group(parameter: Any):
     return ds_groups._get_expert_parallel_group(parameter.group_name)
 
 
+def wait_for_export_collective(tensor: torch.Tensor) -> None:
+    """Block until the collective that sends ``tensor`` has completed on this rank.
+
+    An NCCL collective returns once it is queued, and its watchdog timeout starts counting then. A rank that only
+    contributes shards to the master's export would queue every collective of the export at once while the master
+    converts and sends layer by layer, so any export longer than the group timeout aborts the job.
+    """
+    if tensor.is_cuda:
+        torch.cuda.current_stream(tensor.device).synchronize()
+
+
 def _gather_ep_shards(parameter: Any) -> list[torch.Tensor]:
     import torch.distributed as dist
 
@@ -313,6 +329,7 @@ def _gather_ep_shards(parameter: Any) -> list[torch.Tensor]:
     local = parameter.data.contiguous()
     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
     dist.all_gather(shards, local, group=group)
+    wait_for_export_collective(local)
     return shards
 
 
@@ -583,6 +600,8 @@ def iter_lora_weights(
                     rename(_expert_lora_vllm_key(prefix, weight_name, kind)),
                     torch.cat(shards, dim=0).contiguous(),
                 )
+            else:
+                wait_for_export_collective(local)
         elif is_master:
             yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
@@ -595,10 +614,13 @@ def iter_lora_weights(
 
             group = _expert_parallel_group(parameter)
             assert not is_master or dist.get_rank(group=group) == 0
-            shards = [torch.empty_like(parameter.data) for _ in range(dist.get_world_size(group=group))]
-            dist.all_gather(shards, parameter.data.contiguous(), group=group)
+            local = parameter.data.contiguous()
+            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
+            dist.all_gather(shards, local, group=group)
             if is_master:
                 yield export_name, torch.cat(shards, dim=0)
+            else:
+                wait_for_export_collective(local)
         elif is_master:
             yield export_name, parameter.data
 
