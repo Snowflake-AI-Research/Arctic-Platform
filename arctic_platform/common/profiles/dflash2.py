@@ -54,6 +54,7 @@ def register(registry: Registry) -> None:
             "numerics.reduce_dtype": "no equivalent option",
             "numerics.fp32_parity": "this loader has no fp32_parity option",
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
+            "numerics.fp32_routed_weighting": "the draft has no routed experts",
             "liger": "the loader rejects `patches.liger`",
             "compile.fullgraph": "the loader rejects `patches.compile`",
             "peft": "the loader rejects `patches.peft`: the draft is trained in full",

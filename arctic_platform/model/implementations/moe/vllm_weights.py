@@ -188,6 +188,8 @@ def build_iter_full_vllm_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
     is_vlm = bool(getattr(model, "_is_vlm", False))
     layer_prefix_pattern = (
         "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
@@ -242,6 +244,8 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
+                    else:
+                        wait_for_export_collective(local)
                 elif is_master:
                     layer_sd[name] = tensor.data
 
