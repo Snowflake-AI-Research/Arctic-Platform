@@ -193,13 +193,12 @@ class _OffloadedGradientFile:
         self.storage = storage
         self.shape = source.shape
         self.size = source.numel() * source.element_size()
-        fast = Path("/data-fast/tmp")
-        if fast.parent.is_dir():
-            fast.mkdir(exist_ok=True)
-            directory = str(fast)
-        else:
-            directory = tempfile.gettempdir()
-        self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+        directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+        except OSError:
+            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=tempfile.gettempdir())
         os.ftruncate(self.file.fileno(), self.size)
         os.posix_fadvise(self.file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
 
@@ -299,6 +298,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
             optimizer.params_already_reduced[optimizer.get_param_id(partition_param)]
             for partition_param in optimizer.params_in_partition[group_idx]
         ):
+            optimizer._wait_for_offload_copies()
             release_partition(group_idx)
 
     def epilogue_then_release(*args, **kwargs):

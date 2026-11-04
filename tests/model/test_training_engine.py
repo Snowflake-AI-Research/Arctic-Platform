@@ -494,6 +494,57 @@ def test_offloaded_file_snapshot_reuses_bounded_storage_and_restores_exactly(mon
     snapshot.file.close()
 
 
+@pytest.mark.parametrize("failure", ["mkdir", "open"])
+def test_offloaded_file_snapshot_falls_back_from_unwritable_scratch(monkeypatch, tmp_path, failure):
+    directory = tmp_path / "unavailable"
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(directory))
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    native_mkdir = deepspeed_engine.Path.mkdir
+    native_file = deepspeed_engine.tempfile.TemporaryFile
+    opened = []
+
+    def mkdir(path, *args, **kwargs):
+        if path == directory and failure == "mkdir":
+            raise PermissionError("unwritable scratch directory")
+        return native_mkdir(path, *args, **kwargs)
+
+    def temporary_file(*args, **kwargs):
+        opened.append(str(kwargs["dir"]))
+        if str(kwargs["dir"]) == str(directory) and failure == "open":
+            raise PermissionError("unwritable scratch file")
+        return native_file(*args, **kwargs)
+
+    monkeypatch.setattr(deepspeed_engine.Path, "mkdir", mkdir)
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", temporary_file)
+    source = torch.arange(8, dtype=torch.float32)
+    snapshot = deepspeed_engine._OffloadedGradientFile(source, deepspeed_engine._OffloadedGradientStorage())
+    try:
+        snapshot.copy_(source)
+        restored = torch.empty_like(source)
+        snapshot.restore(restored)
+        torch_assert_equal(restored, source)
+        assert opened[-1] == str(tmp_path)
+    finally:
+        snapshot.file.close()
+
+
+def test_offloaded_file_snapshot_honors_scratch_override(monkeypatch, tmp_path):
+    directory = tmp_path / "scratch"
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(directory))
+    native_file = deepspeed_engine.tempfile.TemporaryFile
+    opened = []
+
+    def temporary_file(*args, **kwargs):
+        opened.append(kwargs["dir"])
+        return native_file(*args, **kwargs)
+
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", temporary_file)
+    source = torch.arange(8, dtype=torch.float32)
+    snapshot = deepspeed_engine._OffloadedGradientFile(source, deepspeed_engine._OffloadedGradientStorage())
+    snapshot.file.close()
+    assert opened == [directory]
+
+
 @pytest.mark.parametrize("operation", ["pwritev", "preadv"])
 def test_offloaded_file_snapshot_completes_partial_io(monkeypatch, tmp_path, operation):
     monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
@@ -1091,8 +1142,9 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
 @pytest.mark.parametrize("boundary", [False, True])
 @pytest.mark.parametrize("file_snapshots", [False, True])
 @pytest.mark.parametrize("failure_phase", [None, "native", "wait"])
+@pytest.mark.parametrize("release_mode", ["epilogue", "copy"])
 def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
-    monkeypatch, boundary, file_snapshots, failure_phase
+    monkeypatch, boundary, file_snapshots, failure_phase, release_mode
 ):
     import inspect
     from types import SimpleNamespace
@@ -1112,6 +1164,8 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
                 1: object(),
             }
             self.pending = False
+            self.params_in_partition = {0: [0, 1]}
+            self.params_already_reduced = {0: True, 1: True}
 
         def _use_compact_grad_partition_buffer(self, group_idx):
             return group_idx == 0
@@ -1120,7 +1174,7 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
             return param
 
         def copy_grads_in_partition(self, param, group_idx=None):
-            return None
+            return NativeOptimizer.independent_gradient_partition_epilogue(self, "request", complete=True)
 
         def _get_compact_grad_partition_buffer(self, group_idx):
             if self.averaged_gradients[group_idx] is None:
@@ -1160,9 +1214,16 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
     noncompact_partition = optimizer.averaged_gradients[1]
     assert deepspeed_engine.release_offloaded_grad_partitions(optimizer)
     retained = inspect.getclosurevars(optimizer.step).nonlocals["retained"]
+
+    def reduce():
+        if release_mode == "copy":
+            optimizer.copy_grads_in_partition(0, 0)
+        else:
+            assert optimizer.independent_gradient_partition_epilogue("request", complete=True) == "reduced"
+
     if failure_phase in ("native", "wait"):
         with pytest.raises(RuntimeError) as caught:
-            optimizer.independent_gradient_partition_epilogue("request", complete=True)
+            reduce()
         assert caught.value is failure
         assert events == [("native", ("request",), {"complete": True})] + (
             [("wait",)] if failure_phase == "wait" else []
@@ -1171,7 +1232,7 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
         assert optimizer.averaged_gradients[1] is noncompact_partition
         assert retained == {}
         return
-    assert optimizer.independent_gradient_partition_epilogue("request", complete=True) == "reduced"
+    reduce()
     assert events == [("native", ("request",), {"complete": True}), ("wait",)]
     assert optimizer.averaged_gradients[1] is noncompact_partition
     assert optimizer.averaged_gradients[0] is None
