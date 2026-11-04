@@ -562,6 +562,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             world = get_world()
             # Models whose snapshot cannot sit in host memory convert shard by shard.
             stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
+            if stream_convert_fn is None:
+                target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
+                stream_convert_fn = getattr(model, f"convert_to_{target_format}_checkpoint", None)
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,

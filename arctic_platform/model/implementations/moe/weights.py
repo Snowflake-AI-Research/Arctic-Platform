@@ -63,12 +63,25 @@ def convert_safetensor_checkpoint(
 ) -> None:
     """Convert complete dependency groups, retaining only one group in memory."""
     locations: dict[str, Path] = {}
-    for shard_path in sorted(source_dir.glob("*.safetensors")):
+    index_path = source_dir / SAFE_WEIGHTS_INDEX_NAME
+    if index_path.is_file():
+        with index_path.open(encoding="utf-8") as stream:
+            weight_map = json.load(stream)["weight_map"]
+        locations = {name: source_dir / shard for name, shard in weight_map.items()}
+        shard_paths = sorted(set(locations.values()))
+    else:
+        shard_paths = sorted(source_dir.glob("*.safetensors"))
+    for shard_path in shard_paths:
         with safe_open(shard_path, framework="pt", device="cpu") as shard:
-            for name in shard.keys():
-                if name in locations:
-                    raise ValueError(f"Duplicate checkpoint tensor: {name}")
-                locations[name] = shard_path
+            if index_path.is_file():
+                missing = {name for name, path in locations.items() if path == shard_path} - set(shard.keys())
+                if missing:
+                    raise ValueError(f"Indexed checkpoint tensors missing from {shard_path}: {sorted(missing)}")
+            else:
+                for name in shard.keys():
+                    if name in locations:
+                        raise ValueError(f"Duplicate checkpoint tensor: {name}")
+                    locations[name] = shard_path
     if not locations:
         raise ValueError(f"No safetensors weights in {source_dir}")
     groups = [tuple(group) for group in partition_fn(tuple(locations))]
@@ -88,7 +101,9 @@ def convert_safetensor_checkpoint(
             with safe_open(shard_path, framework="pt", device="cpu") as shard:
                 for name in selected:
                     state[name] = shard.get_tensor(name)
-        convert_fn(state)
+        converted = convert_fn(state)
+        if converted is not None:
+            state = converted
         if not state or set(state).intersection(weight_map):
             raise ValueError("Checkpoint conversion produced empty or overlapping groups")
         split = split_torch_state_dict_into_shards(

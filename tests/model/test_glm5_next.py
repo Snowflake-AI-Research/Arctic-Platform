@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
 import json
 import types
 from unittest.mock import Mock
@@ -866,3 +867,65 @@ def test_checkpoint_conversion_shard_failure_never_publishes_index(tmp_path, mon
     assert len(calls) == 2
     assert calls[0].is_file()
     assert not (destination / "model.safetensors.index.json").exists()
+
+
+def test_checkpoint_conversion_uses_source_index_and_converter_return(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "unindexed": torch.tensor([3.0])}, source / "indexed.safetensors")
+    save_file({"a": torch.tensor([99.0])}, source / "stray.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "indexed.safetensors"}}))
+    destination = tmp_path / "converted"
+    convert_safetensor_checkpoint(source, destination, lambda state: {"b": state["a"] + 1}, lambda names: [names])
+    converted = load_state_dict(destination)
+    assert set(converted) == {"b"}
+    torch_assert_equal(converted["b"], torch.tensor([2.0]))
+
+
+@pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
+def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family):
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
+    model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+    state = {
+        name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape)
+        for name, weight in model.state_dict().items()
+    }
+    source = tmp_path / "source"
+    source.mkdir()
+    hf = model.convert_to_hf({name: weight.clone() for name, weight in state.items()})
+    save_file({name: weight.clone().contiguous() for name, weight in hf.items()}, source / "model.safetensors")
+    cache = tmp_path / "prime"
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: True)
+    monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(builder, "dcp_load", lambda *args, **kwargs: None)
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    if builder_family == "glm52":
+        monkeypatch.setattr(builder, "_init_buffers_post_meta", lambda *args: None)
+    monkeypatch.setattr(builder, "HuggingFaceStorageReader", lambda **kwargs: None)
+
+    def refuse_bulk_load(*args):
+        raise AssertionError("GLM5-next conversion must not bulk-load the checkpoint")
+
+    monkeypatch.setattr(builder, "load_state_dict", refuse_bulk_load)
+    config = SimpleNamespace(
+        name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
+    )
+    builder.load_dcp_from_hf(model, config, SimpleNamespace())
+    converted = load_state_dict(cache)
+    assert set(converted) == set(state)
+    for name, weight in state.items():
+        torch_assert_equal(converted[name], weight)
