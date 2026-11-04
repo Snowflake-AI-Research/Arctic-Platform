@@ -405,6 +405,64 @@ def test_peft_adapter_checkpoint_strips_activation_checkpoint_wrappers(tmp_path)
         torch.testing.assert_close(reloaded(hidden), model(hidden))
 
 
+def test_save_peft_adapters_writes_the_families_served_lora_names(tmp_path):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name as served_name
+
+    class _Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_a_proj = nn.Linear(4, 4, bias=False)
+            self.kv_proj = nn.Linear(4, 4, bias=False)
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _Attention()
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_Layer() for _ in range(2)])
+
+    class _Family(nn.Module):
+        vllm_lora_name = staticmethod(served_name)
+
+        def __init__(self):
+            super().__init__()
+            self.model = _Inner()
+
+    lora = LoraConfig(r=4, lora_alpha=4, target_modules=r".*self_attn\.(q_a_proj|kv_proj)$", init_lora_weights=False)
+    model = get_peft_model(_Family(), lora)
+    layers = model.base_model.model.model.layers
+    for index, layer in enumerate(layers):
+        layers[index] = checkpoint_wrapper(layer)
+
+    save_peft_adapters(model, str(tmp_path))
+
+    adapter_dir = tmp_path / PEFT_ADAPTER_DIRNAME
+    saved = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert set(saved) == {
+        f"base_model.model.layers.{index}.attn.{module}.lora_{kind}.weight"
+        for index in range(2)
+        for module in ("wq_a", "wkv")
+        for kind in "AB"
+    }
+    trained = {
+        name.replace("._checkpoint_wrapped_module", "").replace(".default.weight", ".weight"): p
+        for name, p in model.named_parameters()
+        if "lora_" in name
+    }
+    for name, parameter in trained.items():
+        torch.testing.assert_close(saved[served_name(name)], parameter, rtol=0, atol=0)
+    with open(adapter_dir / "adapter_config.json") as f:
+        assert json.load(f)["target_modules"] == ["wkv", "wq_a"]
+
+
 def test_save_peft_adapters_writes_peft_names_under_activation_checkpointing(tmp_path):
     from peft import LoraConfig
     from peft import get_peft_model
