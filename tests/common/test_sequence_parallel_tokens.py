@@ -84,10 +84,9 @@ def test_token_partition_accepts_prediction_aligned_primerl_response_masks():
     source["loss_mask"] = masks
     source["old_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
     source["teacher_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
-    source["temperature"] = torch.ones_like(masks, dtype=torch.float32)
     local, packed, mask, _, part = sp.prepare_token_partition(source, sp_info=_info())
     torch_assert_equal(packed["loss_mask"], masks[mask].unsqueeze(0))
-    torch_assert_equal(local["temperature"], packed["temperature"][:, part.start : part.stop])
+    torch_assert_equal(local["loss_mask"], packed["loss_mask"][:, part.start : part.stop])
     assert not bool((packed["loss_mask"] & (packed["labels"] == -100)).any())
 
 
@@ -283,7 +282,8 @@ class _Engine:
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
         ids = kwargs["input_ids"]
-        return {"logits": torch.nn.functional.one_hot(ids % 4, 4).float() @ self.weight.T}
+        logits = torch.nn.functional.one_hot(ids % 4, 4).float() @ self.weight.T
+        return {"logits": logits / kwargs.get("temperature", 1.0)}
 
     def backward(self, loss, *, scale_wrt_gas):
         self.backward_calls.append((loss.detach().clone(), scale_wrt_gas))
@@ -298,7 +298,8 @@ def _live_group(monkeypatch, part):
     return group
 
 
-def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(monkeypatch):
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(monkeypatch, temperature):
     from arctic_platform.rl.processors import functional
     from arctic_platform.rl.processors import run_pipeline
     from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
@@ -314,14 +315,14 @@ def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(m
         baseline_engine,
         (),
         packed,
-        {"cu_seqlens": cu, "dp_size": 2},
+        {"cu_seqlens": cu, "dp_size": 2, "temperature": temperature},
         {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
         "cpu",
         pack=False,
         backward=False,
         return_tensors=True,
     )
-    peer_logits = _Engine()(**{"input_ids": packed["input_ids"][:, 4:]})
+    peer_logits = _Engine()(**{"input_ids": packed["input_ids"][:, 4:], "temperature": temperature})
     peer_batch = {"labels": packed["labels"][:, 4:]}
     peer_logprobs = compute_logprobs_post(peer_logits, peer_batch, {}, "cpu")["logprobs"]
     gather_calls = []
@@ -335,13 +336,14 @@ def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(m
     result = sp.run_sequence_parallel_grpo(
         engine,
         source,
-        {"dp_size": 2},
+        {"dp_size": 2, "temperature": temperature},
         {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
         "cpu",
         sp_info=_info(),
         sp_group=group,
     )
     assert len(engine.calls) == len(gather_calls) == len(engine.backward_calls) == 1
+    assert engine.calls[0]["temperature"] == temperature
     torch_assert_equal(engine.calls[0]["input_ids"], packed["input_ids"][:, :4])
     torch_assert_equal(engine.calls[0]["labels"], packed["labels"][:, :4])
     torch_assert_equal(engine.calls[0]["routed_experts"], packed["routed_experts"][:, :4])
@@ -453,6 +455,7 @@ def _selected_sp_reducer(monkeypatch):
     optimizer.partition_gradients = True
     optimizer.reduce_scatter = True
     optimizer.postscale_gradients = True
+    optimizer.gradient_average = True
     optimizer.gradient_predivide_factor = 1.0
     optimizer.dp_process_group = dp_group
     engine = SimpleNamespace(
@@ -479,6 +482,7 @@ def test_sp_execution_selected_reducer_binds_dense_sequence_data_group(monkeypat
         "partition",
         "scatter",
         "postscale",
+        "sum",
         "predivide",
         "group",
         "members",
@@ -501,6 +505,8 @@ def test_sp_execution_rejects_unselected_reducer_or_group_settings(monkeypatch, 
         optimizer.reduce_scatter = False
     elif fault == "postscale":
         optimizer.postscale_gradients = False
+    elif fault == "sum":
+        optimizer.gradient_average = False
     elif fault == "predivide":
         optimizer.gradient_predivide_factor = 2.0
     elif fault == "group":

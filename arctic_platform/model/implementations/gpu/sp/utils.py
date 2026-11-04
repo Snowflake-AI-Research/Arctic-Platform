@@ -48,7 +48,6 @@ TOKEN_FIELDS = frozenset(
         "prox_logp_shifted",
         "ref_log_probs_shifted",
         "teacher_log_probs_shifted",
-        "temperature",
         "versions",
         "rollout_is_weights",
         "routed_experts",
@@ -118,7 +117,10 @@ def prepare_token_partition(
         raise ValueError("SP batch must be a dictionary")
     unsupported = set(batch) - TOKEN_FIELDS - {"attention_mask"}
     if unsupported:
-        raise ValueError(f"undeclared SP token fields: {sorted(unsupported)}")
+        raise ValueError(
+            f"undeclared SP token fields: {sorted(unsupported)}; "
+            "optional GRPO masks, KL weights and prompt-group/count fields are not supported by this SP route"
+        )
     ids, attention = batch.get("input_ids"), batch.get("attention_mask")
     if (
         not isinstance(ids, torch.Tensor)
@@ -284,6 +286,7 @@ def verify_sequence_parallel_reduction(engine, *, sp_info: dict, sp_group) -> No
         or not optimizer.partition_gradients
         or not optimizer.reduce_scatter
         or not optimizer.postscale_gradients
+        or not optimizer.gradient_average
         or optimizer.gradient_predivide_factor != 1.0
         or optimizer.dp_process_group is not engine.seq_data_parallel_group
         or set(dist.get_process_group_ranks(optimizer.dp_process_group)) != set(range(world))
