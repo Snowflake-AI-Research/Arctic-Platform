@@ -15,6 +15,7 @@
 
 """The conversion half of the MoE loaders runs without a process group and fills the cache the load then reads."""
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,7 +57,7 @@ def test_prepare_weight_conversion_writes_with_the_load_writer_rule(monkeypatch,
     monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: scope == "node-local")
     monkeypatch.setattr(builder, "conversion_cache_ready", lambda path: False)
     monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *a, **k: calls.append(("node", k)))
-    monkeypatch.setattr(builder, "_write_conversion_cache", lambda *a, **k: calls.append(("shared", k)))
+    monkeypatch.setattr(builder, "wait_for_conversion_cache", lambda path: calls.append(("wait", {})))
     config = SimpleNamespace(dequantize_checkpoint=False)
 
     result = builder.prepare_weight_conversion(_FakePrimeModel(), config, source, rank=rank, local_rank=0)
@@ -65,7 +66,43 @@ def test_prepare_weight_conversion_writes_with_the_load_writer_rule(monkeypatch,
     if scope == "node-local":
         assert [(kind, k["rank"], k["local_rank"]) for kind, k in calls] == [("node", rank, 0)]
     else:
-        assert [kind for kind, _ in calls] == (["shared"] if rank == 0 else [])
+        assert [kind for kind, _ in calls] == (["node"] if rank == 0 else ["wait"])
+
+
+def test_shared_conversion_cache_waits_for_publication_and_times_out(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    checks = iter([False, False, True])
+    sleeps = []
+    monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: next(checks))
+    monkeypatch.setattr(conversion_cache.time, "sleep", sleeps.append)
+    conversion_cache.wait_for_conversion_cache(cache, timeout=10)
+    assert sleeps == [0.25, 0.25]
+    monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: False)
+    with pytest.raises(TimeoutError, match="did not become ready"):
+        conversion_cache.wait_for_conversion_cache(cache, timeout=0)
+
+
+@pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
+def test_prepare_weight_conversion_selects_the_checkpoint_streamer(monkeypatch, tmp_path, builder_name):
+    import importlib
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_name}.model_builder")
+    model = _FakePrimeModel()
+    stream = lambda source, target: None  # noqa: E731
+    model.convert_to_prime_checkpoint = stream
+    calls = []
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
+    monkeypatch.setattr(
+        builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
+    )
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *a: tmp_path / "prime")
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: False)
+    monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *a, **kw: calls.append(kw))
+    config = SimpleNamespace(dequantize_checkpoint=False)
+    assert builder.prepare_weight_conversion(model, config, tmp_path, rank=0, local_rank=0) == tmp_path / "prime"
+    assert calls[0]["stream_convert_fn"] is stream
 
 
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
@@ -207,3 +244,139 @@ def test_every_converting_moe_loader_registers_a_weight_hook(name):
     from arctic_platform.model import loader
 
     assert loader._LOADERS[name].prepare_weights is not None
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_preparation_rejects_incomplete_conversion_before_returning_a_path(monkeypatch, tmp_path, streaming):
+    from arctic_platform.model.implementations.qwen35 import model_builder as builder
+
+    model = _FakePrimeModel()
+
+    def incomplete(*args):
+        target = args[-1]
+        target.mkdir(parents=True)
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict(weight="missing.safetensors")))
+        )
+
+    if streaming:
+        model.convert_to_prime_checkpoint = incomplete
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
+    monkeypatch.setattr(
+        builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
+    )
+    monkeypatch.setattr(builder, "load_state_dict", lambda path: {})
+    monkeypatch.setattr(builder, "save_state_dict", incomplete)
+    cache = tmp_path / "prime"
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: True)
+    with pytest.raises(RuntimeError, match="did not publish a complete checkpoint"):
+        builder.prepare_weight_conversion(
+            model, SimpleNamespace(dequantize_checkpoint=False), tmp_path, rank=0, local_rank=0
+        )
+    assert not cache.exists()
+
+
+def _tiny_preparation_model(family):
+    import torch
+
+    if family == "glm5_next":
+        from test_glm5_next import _tiny_config
+
+        from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
+            Glm5NextForConditionalGenerationPrimeRL,
+        )
+
+        config, model_type = _tiny_config(), Glm5NextForConditionalGenerationPrimeRL
+    elif family == "qwen4_exp":
+        from test_qwen4_exp import _tiny_config
+
+        from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
+            Qwen4ExpForConditionalGenerationPrimeRL,
+        )
+
+        config, model_type = _tiny_config(), Qwen4ExpForConditionalGenerationPrimeRL
+    elif family == "qwen3_5_moe":
+        from test_qwen35_moe_numerics import _tiny_config
+
+        from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+        config, model_type = _tiny_config(), Qwen3_5MoeForCausalLM
+    else:
+        if family == "glm_moe_dsa":
+            from arctic_platform.model.implementations.glm52.models.glm_moe_dsa import GlmMoeDsaConfig as Config
+            from arctic_platform.model.implementations.glm52.models.glm_moe_dsa import (
+                GlmMoeDsaForCausalLM as model_type,
+            )
+        else:
+            from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import (
+                Qwen3MoeConfig as Config,
+            )
+            from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import (
+                Qwen3MoeForCausalLM as model_type,
+            )
+
+        config = Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_experts=4,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=0,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=4,
+            pad_token_id=0,
+            use_grouped_mm=False,
+        )
+    config._attn_implementation = "sdpa"
+    with torch.device("meta"):
+        return model_type(config)
+
+
+@pytest.mark.parametrize("family", ["qwen3_5_moe", "generic_moe", "glm_moe_dsa", "glm5_next", "qwen4_exp"])
+def test_real_family_preparation_and_loading_choose_the_same_cache(monkeypatch, tmp_path, family):
+    from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
+
+    builder_name = "glm52" if family == "glm_moe_dsa" else "qwen35"
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_name}.model_builder")
+    model = _tiny_preparation_model(family)
+    hf_keys = dict.fromkeys(
+        [
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj",
+        ]
+    )
+    assert model.is_hf_state_dict(hf_keys)
+    monkeypatch.setattr(builder, "load_state_dict_keys", lambda path: hf_keys)
+    source, cache = tmp_path / "source", tmp_path / "prime"
+    monkeypatch.setattr(builder, "resolve_weight_source", lambda config: source)
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: True)
+    monkeypatch.setattr(builder, "conversion_cache_ready", lambda path: True)
+    monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *args, **kwargs: None)
+    config = SimpleNamespace(
+        fsdp_cpu_offload=True, debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False
+    )
+    prepared = builder.prepare_weight_conversion(model, config, source, rank=0, local_rank=0)
+    inject_prime_lm_head(model, chunk_size=2, fused_cross_entropy=False, fp32_lm_head=False)
+    loaded = []
+    monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0))
+    monkeypatch.setattr(builder.torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(builder, "dcp_load", lambda state, *, storage_reader: loaded.append(Path(storage_reader.path)))
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    monkeypatch.setattr(builder, "_init_buffers_post_meta", lambda *args: None, raising=False)
+    monkeypatch.setattr(type(model), "init_buffers_post_meta", lambda self: None, raising=False)
+    builder.load_dcp_from_hf(model, config, None)
+    assert prepared == cache
+    assert loaded == [prepared]

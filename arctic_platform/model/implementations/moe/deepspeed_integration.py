@@ -375,11 +375,16 @@ def prepare_moe_weights(
     Runs without a process group, on a meta-device model, so one process per node can convert before the training
     job starts and the distributed load then finds a ready cache. Returns the cache path, or None when the family
     has no conversion step, the checkpoint already matches the model's format, or the model is randomly initialized.
+
+    ``rank`` is the global training rank, not a per-node counter. Shared caches have one global-rank-zero
+    writer; other ranks wait for readiness. Node-local caches use one file-lock-selected writer on each node.
     """
     if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
         return None
     if world_size % ep_size:
         raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"global rank={rank} must be in [0, world_size={world_size})")
     model_config = adapter.build_model_config(
         model_name,
         ep_size,

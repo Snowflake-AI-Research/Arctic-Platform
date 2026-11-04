@@ -77,6 +77,18 @@ def conversion_cache_is_node_local(path: Path) -> bool:
     return any(resolved == root or root in resolved.parents for root in node_local_roots)
 
 
+def wait_for_conversion_cache(path: Path, *, timeout: float = 3600, poll_interval: float = 0.25) -> None:
+    """Wait for the global-rank-zero shared writer to publish an indexed, complete cache."""
+    if timeout < 0 or poll_interval <= 0:
+        raise ValueError("cache timeout must be nonnegative and poll_interval must be positive")
+    deadline = time.monotonic() + timeout
+    while not conversion_cache_ready(path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Converted weight cache did not become ready within {timeout}s: {path}")
+        time.sleep(min(poll_interval, remaining))
+
+
 def _write_conversion_cache(
     source_path: Path,
     snapshot_path: Path,
@@ -110,6 +122,8 @@ def _write_conversion_cache(
     if stream_convert_fn is not None:
         try:
             stream_convert_fn(source_path, tmp_path)
+            if not conversion_cache_ready(tmp_path):
+                raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
             os.replace(tmp_path, snapshot_path)
             committed = True
         finally:
@@ -133,6 +147,8 @@ def _write_conversion_cache(
         save_state_dict_fn(snapshot_state_dict, tmp_path)
         t_save = time.perf_counter()
         del snapshot_state_dict
+        if not conversion_cache_ready(tmp_path):
+            raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
         os.replace(tmp_path, snapshot_path)
         committed = True
     finally:

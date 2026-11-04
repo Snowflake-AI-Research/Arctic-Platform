@@ -52,7 +52,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     resolve_conversion_cache_path,
-    _write_conversion_cache,
+    wait_for_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from .models import (
@@ -522,7 +522,9 @@ def prepare_weight_conversion(
     """Fill the converted-weight cache ``model`` loads from and return its path, or None when no conversion applies.
 
     The distributed load and the per-node preparation that may run before it both call this, so they resolve the
-    same cache path. ``rank`` 0 writes a shared (not node-local) cache; ``local_rank`` 0 writes a node-local one.
+    same cache path. ``rank`` must be the global rank: only global rank 0 writes a shared cache, under a file
+    lock; other ranks wait up to one hour for its publication. For node-local caches, the file lock chooses
+    whichever local process arrives first as writer. A returned path is ready to load.
     """
     if not isinstance(model, PreTrainedModelPrimeRL):
         return None
@@ -545,7 +547,10 @@ def prepare_weight_conversion(
     snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
     # Models whose snapshot cannot sit in host memory convert shard by shard.
     stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
-    if conversion_cache_is_node_local(snapshot_path):
+    if stream_convert_fn is None:
+        target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
+        stream_convert_fn = getattr(model, f"convert_to_{target_format}_checkpoint", None)
+    if conversion_cache_is_node_local(snapshot_path) or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,
             snapshot_path,
@@ -558,19 +563,8 @@ def prepare_weight_conversion(
             local_rank=local_rank,
             stream_convert_fn=stream_convert_fn,
         )
-    elif not conversion_cache_ready(snapshot_path) and rank == 0:
-        _write_conversion_cache(
-            source_path,
-            snapshot_path,
-            convert_fn,
-            src_fmt,
-            dst_fmt,
-            load_state_dict,
-            save_state_dict,
-            rank=rank,
-            local_rank=local_rank,
-            stream_convert_fn=stream_convert_fn,
-        )
+    else:
+        wait_for_conversion_cache(snapshot_path)
     return snapshot_path
 
 
