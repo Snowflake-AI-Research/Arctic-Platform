@@ -193,8 +193,11 @@ With `colocate=True`:
 | `ARCTIC_INFERENCE_ENABLED` | Set when `arctic_inference_config` is present |
 | `NCCL_TOPO_FILE` | Stale inherited `/proc/self/fd/*` values are dropped in the worker (avoids OFI topology deadlock) |
 | `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` | Directory for large ZeRO-1/2 CPU-offload FP32 gradient snapshots; defaults to `/data-fast/tmp` |
+| `ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES` | Bytes between scratch-file syncs; defaults to 16 MiB. Set `0` for one sync per complete snapshot |
 
-**Large offloaded gradient snapshots need disk-backed scratch space.** Snapshots larger than 16 MiB use unlinked temporary files and bounded staging buffers. Set `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` to writable local disk storage with enough free space. If the directory cannot be created or a file cannot be opened, the worker logs a fallback to the system temporary directory; check that directory is disk-backed rather than tmpfs when host memory is constrained. The worker does not create missing parent directories. A subsequent I/O error, including a full disk, aborts the operation rather than retrying on another filesystem. The worker logs the selected directory.
+**Large offloaded gradient snapshots need disk-backed scratch space.** Snapshots larger than 16 MiB use unlinked temporary files and bounded staging buffers. Set `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` to writable local disk storage with enough free space. The worker reserves file blocks before the first snapshot write, so a full disk or unsupported allocation fails immediately and triggers a logged fallback to the system temporary directory. Directory/file permission failures also trigger fallback. Check that the fallback is disk-backed rather than tmpfs when host memory is constrained. The worker does not create missing parent directories, closes failed allocations and logs the selected directory. Later I/O errors abort without retrying a partially written snapshot.
+
+**Scratch sync frequency trades host memory for backward latency.** The default syncs and evicts every 16 MiB to bound dirty page-cache memory. Set `ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES=0` to sync and evict once after writing the complete snapshot, avoiding a blocking sync per chunk at the cost of dirty pages that can grow to the partition size. A positive byte threshold selects less frequent bounded syncs. Reads do not sync; no performance improvement is claimed without a workload measurement.
 
 ## Gotchas
 

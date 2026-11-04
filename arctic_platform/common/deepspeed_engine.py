@@ -26,6 +26,7 @@ one engine-construction path.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import tempfile
@@ -193,20 +194,40 @@ class _OffloadedGradientFile:
         self.storage = storage
         self.shape = source.shape
         self.size = source.numel() * source.element_size()
+        self.sync_bytes = int(
+            os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
+        )
+        if self.sync_bytes < 0:
+            raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be nonnegative")
         directory = Path(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", "/data-fast/tmp"))
+
+        def allocate(path):
+            path.mkdir(exist_ok=True)
+            file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=path)
+            try:
+                # Reserve blocks now: ftruncate alone would defer ENOSPC until a backward write.
+                os.posix_fallocate(file.fileno(), 0, self.size)
+                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+            except BaseException:
+                file.close()
+                raise
+            return file
+
         try:
-            directory.mkdir(exist_ok=True)
-            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+            self.file = allocate(directory)
         except OSError as error:
             fallback = Path(tempfile.gettempdir())
+            if fallback == directory or (
+                not isinstance(error, (PermissionError, FileNotFoundError))
+                and error.errno not in {errno.ENOSPC, errno.EOPNOTSUPP, errno.ENOTDIR, errno.EROFS}
+            ):
+                raise
             logger.info(
                 "Offloaded gradient scratch %s is unavailable (%s); falling back to %s", directory, error, fallback
             )
             directory = fallback
-            self.file = tempfile.TemporaryFile(prefix="ap-fp32-grad-", dir=directory)
+            self.file = allocate(directory)
         logger.info("Offloaded gradient snapshot scratch directory: %s", directory)
-        os.ftruncate(self.file.fileno(), self.size)
-        os.posix_fadvise(self.file.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
 
     def copy_(self, source):
         self._transfer(source, writing=True)
@@ -221,6 +242,7 @@ class _OffloadedGradientFile:
         flat = tensor.view(-1)
         descriptor = self.file.fileno()
         operation = os.pwritev if writing else os.preadv
+        synced_offset = 0
         for offset in range(0, flat.numel(), staging.numel()):
             length = min(staging.numel(), flat.numel() - offset)
             chunk = staging.narrow(0, 0, length)
@@ -235,11 +257,18 @@ class _OffloadedGradientFile:
                     raise OSError("offloaded snapshot I/O made no progress")
                 transferred += count
             if writing:
-                # Flush each chunk before advisory eviction so dirty pages cannot grow with model size.
-                os.fdatasync(descriptor)
+                end = byte_offset + len(view)
+                if self.sync_bytes > 0 and end - synced_offset >= self.sync_bytes:
+                    # Bounded dirty pages by default; zero selects one sync per complete snapshot.
+                    os.fdatasync(descriptor)
+                    os.posix_fadvise(descriptor, synced_offset, end - synced_offset, os.POSIX_FADV_DONTNEED)
+                    synced_offset = end
             else:
                 flat.narrow(0, offset, length).copy_(chunk, non_blocking=False)
-            os.posix_fadvise(descriptor, byte_offset, len(view), os.POSIX_FADV_DONTNEED)
+                os.posix_fadvise(descriptor, byte_offset, len(view), os.POSIX_FADV_DONTNEED)
+        if writing and synced_offset < self.size:
+            os.fdatasync(descriptor)
+            os.posix_fadvise(descriptor, synced_offset, self.size - synced_offset, os.POSIX_FADV_DONTNEED)
 
 
 def release_offloaded_grad_partitions(optimizer) -> bool:
@@ -265,7 +294,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
     if type(optimizer) is not DeepSpeedZeroOptimizer:
-        logger.debug("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
+        logger.info("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
         return False
     if not optimizer.cpu_offload:
         return False
@@ -314,6 +343,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
         if optimizer._use_compact_grad_partition_buffer(group_idx) and all(
             optimizer.params_already_reduced[optimizer.get_param_id(partition_param)]
             for partition_param in optimizer.params_in_partition[group_idx]
+            if partition_param.requires_grad and partition_param.numel() > 0
         ):
             optimizer._wait_for_offload_copies()
             release_partition(group_idx)

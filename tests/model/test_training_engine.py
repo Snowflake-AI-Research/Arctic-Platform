@@ -621,6 +621,92 @@ def test_offloaded_file_snapshot_closes_enospc_without_retry(monkeypatch, tmp_pa
     assert files[0].closed
 
 
+@pytest.mark.parametrize("failure", ["ENOSPC", "EOPNOTSUPP"])
+def test_offloaded_snapshot_reservation_falls_back_before_writing(monkeypatch, tmp_path, failure):
+    import errno
+
+    preferred = tmp_path / "preferred"
+    fallback = tmp_path / "fallback"
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(preferred))
+    monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(fallback))
+    original_file = deepspeed_engine.tempfile.TemporaryFile
+    original_allocate = deepspeed_engine.os.posix_fallocate
+    opened = []
+
+    def create(*args, **kwargs):
+        file = original_file(*args, **kwargs)
+        opened.append((kwargs["dir"], file))
+        return file
+
+    def allocate(descriptor, offset, size):
+        if len(opened) == 1:
+            raise OSError(getattr(errno, failure), failure)
+        return original_allocate(descriptor, offset, size)
+
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", create)
+    monkeypatch.setattr(deepspeed_engine.os, "posix_fallocate", allocate)
+    source = torch.arange(55, dtype=torch.float32)
+    snapshot = deepspeed_engine._OffloadedGradientFile(source, deepspeed_engine._OffloadedGradientStorage())
+    try:
+        assert [directory for directory, _ in opened] == [preferred, fallback]
+        assert opened[0][1].closed
+        snapshot.copy_(source)
+        restored = torch.empty_like(source)
+        snapshot.restore(restored)
+        torch_assert_equal(restored, source)
+    finally:
+        snapshot.file.close()
+
+
+@pytest.mark.parametrize("phase", ["posix_fallocate", "posix_fadvise"])
+def test_offloaded_snapshot_initialization_closes_on_io_error(monkeypatch, tmp_path, phase):
+    import errno
+
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path))
+    original_file = deepspeed_engine.tempfile.TemporaryFile
+    files = []
+
+    def create(*args, **kwargs):
+        file = original_file(*args, **kwargs)
+        files.append(file)
+        return file
+
+    def fail(*args):
+        raise OSError(errno.EIO, "injected allocation failure")
+
+    monkeypatch.setattr(deepspeed_engine.tempfile, "TemporaryFile", create)
+    monkeypatch.setattr(deepspeed_engine.os, phase, fail)
+    with pytest.raises(OSError, match="injected allocation failure"):
+        deepspeed_engine._OffloadedGradientFile(torch.ones(55), deepspeed_engine._OffloadedGradientStorage())
+    assert len(files) == 1
+    assert files[0].closed
+
+
+@pytest.mark.parametrize("sync_bytes,expected", [(0, 1), (64, 4), (128, 2)])
+def test_offloaded_snapshot_sync_frequency_is_configurable(monkeypatch, tmp_path, sync_bytes, expected):
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path))
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(sync_bytes))
+    monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
+    original_sync = deepspeed_engine.os.fdatasync
+    syncs = []
+
+    def sync(descriptor):
+        syncs.append(descriptor)
+        return original_sync(descriptor)
+
+    monkeypatch.setattr(deepspeed_engine.os, "fdatasync", sync)
+    source = torch.arange(55, dtype=torch.float32)
+    snapshot = deepspeed_engine._OffloadedGradientStorage().snapshot(source)
+    try:
+        assert len(syncs) == expected
+        restored = torch.empty_like(source)
+        snapshot.restore(restored)
+        torch_assert_equal(restored, source)
+        assert len(syncs) == expected, "reads must not sync the file"
+    finally:
+        snapshot.file.close()
+
+
 class _PartialGradientModel(torch.nn.Module):
     def __init__(self, *, participation, reentrant):
         super().__init__()
@@ -1258,21 +1344,27 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
     class NativeOptimizer:
         def __init__(self):
             self.cpu_offload = True
-            self.bit16_groups = [[0, 1], [2]]
+            self.parameters = [
+                torch.nn.Parameter(torch.ones(1)),
+                torch.nn.Parameter(torch.ones(1)),
+                torch.nn.Parameter(torch.ones(1), requires_grad=False),
+                torch.nn.Parameter(torch.empty(0)),
+            ]
+            self.bit16_groups = [self.parameters, [torch.nn.Parameter(torch.ones(1))]]
             self.accumulated_grads_in_cpu = {}
             self.averaged_gradients = {
                 0: SimpleNamespace(flat_partition=torch.tensor([1.0, 2.0])),
                 1: object(),
             }
             self.pending = False
-            self.params_in_partition = {0: [0, 1]}
-            self.params_already_reduced = {0: True, 1: True}
+            self.params_in_partition = {0: self.parameters}
+            self.params_already_reduced = {0: True, 1: True, 2: False, 3: False}
 
         def _use_compact_grad_partition_buffer(self, group_idx):
             return group_idx == 0
 
         def get_param_id(self, param):
-            return param
+            return next(index for index, candidate in enumerate(self.parameters) if candidate is param)
 
         def copy_grads_in_partition(self, param, group_idx=None):
             return NativeOptimizer.independent_gradient_partition_epilogue(self, "request", complete=True)
@@ -1321,7 +1413,7 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
 
     def reduce():
         if release_mode == "copy":
-            optimizer.copy_grads_in_partition(0, 0)
+            optimizer.copy_grads_in_partition(optimizer.parameters[0], 0)
         else:
             assert optimizer.independent_gradient_partition_epilogue("request", complete=True) == "reduced"
 
