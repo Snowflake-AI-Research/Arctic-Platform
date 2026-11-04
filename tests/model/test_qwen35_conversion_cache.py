@@ -647,7 +647,7 @@ def test_conversion_cache_preserves_other_writer_temporary_files_without_coheren
     (other / "live-shard").write_bytes(b"other node is still writing")
     failed = cache.with_name("prime.failed")
     conversion_cache._write_cache_marker(failed, dict(attempt_id="other-attempt", error="other failure"))
-    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node-local")
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
     monkeypatch.setattr(conversion_cache.fcntl, "flock", lambda *args: None)
 
     def convert(source, destination):
@@ -671,6 +671,43 @@ def test_conversion_cache_preserves_other_writer_temporary_files_without_coheren
     assert (other / "live-shard").read_bytes() == b"other node is still writing"
     assert not failed.exists()
     assert conversion_cache.conversion_cache_ready(cache)
+
+
+def test_shared_conversion_sweeps_observed_dead_workspace_during_conversion(monkeypatch, tmp_path):
+    import time
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    orphan = destination.with_name("prime.tmp-rank0-pid123-old")
+    orphan.mkdir()
+    owner = orphan.with_name(f"{orphan.name}.owner")
+    cache._write_cache_marker(owner, dict(host="another-node", pid=123))
+    monkeypatch.setattr(cache, "_ABANDONED_CACHE_AGE", 0.02)
+    monkeypatch.setattr(cache, "_CACHE_HEARTBEAT_INTERVAL", 0.01)
+
+    def convert(source, output):
+        deadline = time.monotonic() + 2
+        while orphan.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not orphan.exists(), "shared cleanup never made a second liveness observation"
+        assert not owner.exists()
+        _write_ready_cache(output)
+
+    cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "PrimeRL",
+        lambda path: {},
+        lambda *args: None,
+        rank=0,
+        local_rank=0,
+        stream_convert_fn=convert,
+        node_local=False,
+    )
+    assert cache.conversion_cache_ready(destination)
 
 
 def test_conversion_marker_write_failure_removes_only_its_own_temporary_file(monkeypatch, tmp_path):
@@ -787,7 +824,7 @@ def test_shared_waiter_bounds_writer_death_before_startup(monkeypatch, tmp_path)
     assert clock[0] == 40
 
 
-def test_cleanup_preserves_live_workspace_and_removes_only_abandoned_workspaces(tmp_path):
+def test_cleanup_preserves_live_workspace_and_removes_only_abandoned_workspaces(monkeypatch, tmp_path):
     import os
 
     from arctic_platform.model.implementations.moe import conversion_cache
@@ -796,10 +833,16 @@ def test_cleanup_preserves_live_workspace_and_removes_only_abandoned_workspaces(
     old, live, recent = [tmp_path / f"prime.tmp-rank0-pid123-{name}" for name in ("old", "live", "recent")]
     for directory in (old, live, recent):
         directory.mkdir()
-    ancient = conversion_cache.time.time() - conversion_cache._ABANDONED_CACHE_AGE - 60
-    for directory in (old, live):
-        os.utime(directory, (ancient, ancient))
-    live.with_name(f"{live.name}.owner").touch()
+    clock = [0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache, "_WORKSPACE_OBSERVATIONS", {})
+    owner = live.with_name(f"{live.name}.owner")
+    owner.touch()
+    conversion_cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert old.exists()
+    clock[0] = conversion_cache._ABANDONED_CACHE_AGE + 1
+    os.utime(owner, ns=(1, 1))
+    (recent / "new-shard").touch()
     conversion_cache._cleanup_abandoned_conversion_workspaces(destination)
     assert not old.exists()
     assert live.exists()
@@ -880,16 +923,9 @@ def test_production_loading_propagates_fresh_attempt_and_early_failure(monkeypat
     assert events[:2] == [("broadcast", 0), ("keys", 0)]
     assert cache._ACTIVE_ATTEMPT.get() is None
     rank[0] = 1
-    if scope == "shared":
-        with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
-            builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
-    else:
-        with pytest.raises(OSError, match="local conversion failed"):
-            builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
-        assert ("conversion", 1) in events
-        failure = cache._read_cache_marker(tmp_path / "prime.failed")
-        assert failure["attempt_id"] == tokens[0]
-        assert "local conversion failed" in failure["error"]
+    with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
+        builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+    assert ("conversion", 1) not in events
     assert tokens and len([event for event in events if event[0] == "broadcast"]) == 2
     assert cache._ACTIVE_ATTEMPT.get() is None
 
@@ -914,12 +950,12 @@ def test_abandoned_conversion_sweep_removes_stale_owner_and_destination_artifact
     timestamp = time.time() - 61
     for artifact in (owner, orphan, stale):
         os.utime(artifact, (timestamp, timestamp))
-    cache._cleanup_abandoned_conversion_workspaces(destination)
+    cache._cleanup_abandoned_conversion_workspaces(destination, node_local=True)
     assert not old.exists()
     assert not owner.exists()
     assert not orphan.exists()
     assert not stale.exists()
-    assert recent.exists()
+    assert not recent.exists()
 
 
 @pytest.mark.parametrize("live", [False, True])
@@ -1043,3 +1079,72 @@ def test_successful_production_load_ignores_preparation_marker_cleanup_error(mon
     assert len(removed) == 2
     assert not cache._preparation_marker_path("cleanup-error", tmp_path).with_suffix(".failed").exists()
     assert cache._ACTIVE_ATTEMPT.get() is None
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_sibling_preparation_failure_is_visible_outside_writer_cwd(monkeypatch, tmp_path, fresh):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    source, cwd = tmp_path / "source", tmp_path / "cwd"
+    source.mkdir()
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "sibling-launch")
+    config = SimpleNamespace(name=str(source), weight_conversion_cache_dir="")
+
+    @cache.record_conversion_preparation_failure
+    def prepare(config, rank):
+        raise ValueError("source discovery failed")
+
+    with pytest.raises(ValueError, match="source discovery failed"):
+        prepare(config, rank=0)
+    root = cache.conversion_preparation_root(config, source)
+    assert root == source
+    assert len(list(source.glob(".preparation-*.failed"))) == 1
+    assert list(cwd.iterdir()) == []
+    error = RuntimeError if fresh else TimeoutError
+    with pytest.raises(error, match="source discovery failed"):
+        cache.wait_for_conversion_cache(
+            source / "prime", timeout=0, attempt_id="sibling-launch", fresh_attempt=fresh, preparation_root=root
+        )
+
+
+def test_shared_workspace_cleanup_observes_generations_not_server_clock(monkeypatch, tmp_path):
+    import os
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    live = tmp_path / "prime.tmp-rank0-pid123-live"
+    dead = tmp_path / "prime.tmp-rank1-pid124"
+    live.mkdir()
+    dead.mkdir()
+    owner = live.with_name(f"{live.name}.owner")
+    cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=0))
+    os.utime(owner, ns=(1, 1))
+    clock = [0]
+    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache.time, "time", lambda: pytest.fail("server and client clocks are not comparable"))
+    monkeypatch.setattr(cache, "_WORKSPACE_OBSERVATIONS", {})
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert live.exists() and dead.exists()
+    clock[0] = cache._ABANDONED_CACHE_AGE + 1
+    cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=1))
+    os.utime(owner, ns=(1, 1))
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert live.exists()
+    assert not dead.exists()
+
+
+def test_node_local_locked_retry_reclaims_old_format_workspace_immediately(tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    workspace = tmp_path / "prime.tmp-rank0-pid123"
+    workspace.mkdir()
+    (workspace / "partial-shard").touch()
+    with cache._conversion_writer_lock(tmp_path / ".prime.lock", node_local=True):
+        cache._cleanup_abandoned_conversion_workspaces(destination, node_local=True)
+    assert not workspace.exists()

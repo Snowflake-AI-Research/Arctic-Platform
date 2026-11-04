@@ -22,6 +22,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
+    conversion_preparation_root,
     ensure_node_local_conversion_cache,
     get_checkpoint_converter,
     record_conversion_preparation_failure,
@@ -316,6 +317,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     attempt_id=attempt_id,
                     node_local=True,
                     fresh_attempt=fresh_attempt,
+                    preparation_root=conversion_preparation_root(config, source_path),
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 ensure_node_local_conversion_cache(
@@ -332,13 +334,14 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     attempt_id=attempt_id,
                     node_local=False,
                     fresh_attempt=fresh_attempt,
+                    preparation_root=conversion_preparation_root(config, source_path),
                 )
             elif not conversion_cache_ready(snapshot_path):
                 wait_for_conversion_cache(
                     snapshot_path,
                     attempt_id=attempt_id,
                     fresh_attempt=fresh_attempt,
-                    preparation_root=getattr(config, "weight_conversion_cache_dir", None),
+                    preparation_root=conversion_preparation_root(config, source_path),
                 )
 
     torch.distributed.barrier()
