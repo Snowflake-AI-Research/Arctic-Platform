@@ -1383,6 +1383,42 @@ class TestCortexSharedHelper:
         assert "load_balancer" not in out["context"]
         assert "zorro_train_load_balancer" not in out["context"]
 
+    def test_zorro_fwd_bwd_short_prompt_keeps_response_tokens_for_the_worker(self):
+        """The unpacked worker slices at ``max_prompt_len``. A shorter prompt
+        that stays in the client layout still has every response token in that
+        slice. Left-aligning would move the first response token into the
+        prompt columns and drop it from the loss.
+        """
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        max_prompt_len = 3
+        ids = torch.tensor([[0, 5, 6, 7, 8]])
+        attn = torch.tensor([[0, 1, 1, 1, 1]])
+        response_mask = torch.tensor([[0, 0, 0, 1, 1]])
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((1, 5)),
+                    "response_mask": response_mask,
+                    "prompts": torch.tensor([[0, 5, 6]]),
+                },
+                "meta": {"zorro_train_enable": True, "max_prompt_len": max_prompt_len, "pad_token_id": 0},
+            }
+        )
+        sent_ids = out["kwargs"]["input_ids"]
+        sent_attn = out["kwargs"]["attention_mask"].bool()
+        sent_resp = out["kwargs"]["response_mask"].bool()
+        assert torch.equal(sent_ids, ids)
+        response_ids = sent_ids[:, max_prompt_len:][sent_attn[:, max_prompt_len:]]
+        response_loss = sent_resp[:, max_prompt_len:][sent_attn[:, max_prompt_len:]]
+        assert response_ids.tolist() == [7, 8]
+        assert response_loss.tolist() == [True, True]
+        assert int(sent_resp.sum()) == int(response_loss.sum())
+
 
 class TestCortexPredictNextFrame:
     """SkyRL scores ``input_ids[i]`` at column ``i``; Cortex weights column ``i``
