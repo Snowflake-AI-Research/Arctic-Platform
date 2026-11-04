@@ -834,6 +834,10 @@ def test_production_loading_propagates_fresh_attempt_and_early_failure(monkeypat
         def convert_to_prime(self, state):
             return state
 
+        def stream_convert_to_prime(self, source, destination):
+            events.append(("conversion", rank[0]))
+            raise OSError("local conversion failed")
+
     rank, tokens, events = [0], [], []
     monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
@@ -880,9 +884,12 @@ def test_production_loading_propagates_fresh_attempt_and_early_failure(monkeypat
         with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
             builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
     else:
-        cache._write_cache_marker(tmp_path / "prime.failed", dict(attempt_id=tokens[0], error="conversion failed"))
-        with pytest.raises(RuntimeError, match="conversion failed"):
+        with pytest.raises(OSError, match="local conversion failed"):
             builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+        assert ("conversion", 1) in events
+        failure = cache._read_cache_marker(tmp_path / "prime.failed")
+        assert failure["attempt_id"] == tokens[0]
+        assert "local conversion failed" in failure["error"]
     assert tokens and len([event for event in events if event[0] == "broadcast"]) == 2
     assert cache._ACTIVE_ATTEMPT.get() is None
 
@@ -913,3 +920,126 @@ def test_abandoned_conversion_sweep_removes_stale_owner_and_destination_artifact
     assert not orphan.exists()
     assert not stale.exists()
     assert recent.exists()
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_preparation_heartbeat_covers_slow_setup_and_detects_dead_setup(monkeypatch, tmp_path, live):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    marker = cache._preparation_marker_path("launch", tmp_path).with_suffix(".in-progress")
+    destination = tmp_path / "prime"
+    clock = [0]
+    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+
+    def sleep(delay):
+        clock[0] += delay
+        if clock[0] == 1 or live:
+            cache._write_cache_marker(marker, dict(attempt_id="launch", heartbeat=clock[0]))
+        if live and clock[0] == 6:
+            destination.mkdir()
+            (destination / "weights.safetensors").touch()
+            (destination / "model.safetensors.index.json").write_text(
+                json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+            )
+
+    monkeypatch.setattr(cache.time, "sleep", sleep)
+    arguments = dict(
+        timeout=10,
+        poll_interval=1,
+        writer_idle_timeout=2,
+        writer_start_timeout=2,
+        attempt_id="launch",
+        preparation_root=tmp_path,
+    )
+    if live:
+        cache.wait_for_conversion_cache(destination, **arguments)
+        assert clock[0] == 6
+    else:
+        with pytest.raises(RuntimeError, match="writer stopped heartbeating"):
+            cache.wait_for_conversion_cache(destination, **arguments)
+        assert clock[0] == 3
+
+
+def test_preparation_failure_does_not_wait_for_blocked_heartbeat(monkeypatch, tmp_path):
+    import threading
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    native = cache._write_cache_marker
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "launch")
+    monkeypatch.setattr(cache, "_CACHE_HEARTBEAT_JOIN_TIMEOUT", 0.01)
+
+    def write(path, value):
+        if path.name.endswith(".in-progress"):
+            entered.set()
+            assert release.wait(5)
+            finished.set()
+        else:
+            native(path, value)
+
+    monkeypatch.setattr(cache, "_write_cache_marker", write)
+
+    @cache.record_conversion_preparation_failure
+    def prepare(config, rank):
+        assert entered.wait(5)
+        raise ValueError("original setup failure")
+
+    try:
+        with pytest.raises(ValueError, match="original setup failure"):
+            prepare(SimpleNamespace(weight_conversion_cache_dir=tmp_path), rank=0)
+        failure = cache._read_cache_marker(cache._preparation_marker_path("launch", tmp_path).with_suffix(".failed"))
+        assert failure["error"] == "original setup failure"
+        assert cache._ACTIVE_ATTEMPT.get() is None
+    finally:
+        release.set()
+        assert finished.wait(5)
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+def test_successful_production_load_ignores_preparation_marker_cleanup_error(monkeypatch, tmp_path, family):
+    import importlib
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    loaded, removed = [], []
+    native_unlink = Path.unlink
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "cleanup-error")
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+
+    class Model:
+        config = SimpleNamespace(tie_word_embeddings=False)
+
+        def to_empty(self, *, device):
+            return self
+
+        def state_dict(self):
+            return {}
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(".preparation-") and path.suffix == ".failed":
+            removed.append(path)
+            raise PermissionError("marker cleanup denied")
+        return native_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(builder, "fix_model_post_empty", lambda model: None)
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    monkeypatch.setattr(builder, "dcp_load", lambda state, *, storage_reader: loaded.append(storage_reader.path))
+    config = SimpleNamespace(
+        name=str(tmp_path),
+        fsdp_cpu_offload=True,
+        debug=SimpleNamespace(random_init=False),
+        weight_conversion_cache_dir=str(tmp_path),
+    )
+    builder.load_dcp_from_hf(Model(), config, None)
+    assert len(loaded) == 1
+    assert len(removed) == 2
+    assert not cache._preparation_marker_path("cleanup-error", tmp_path).with_suffix(".failed").exists()
+    assert cache._ACTIVE_ATTEMPT.get() is None

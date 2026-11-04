@@ -22,6 +22,7 @@ WEIGHT_CONVERSION_CACHE_SCOPE_ENV = "DSS_WEIGHT_CONVERSION_CACHE_SCOPE"
 WEIGHT_CONVERSION_ATTEMPT_ID_ENV = "DSS_WEIGHT_CONVERSION_ATTEMPT_ID"
 DEFAULT_WEIGHT_CONVERSION_CACHE_DIR = "/data-fast/prime-rl-weight-cache"
 _CACHE_HEARTBEAT_INTERVAL = 1
+_CACHE_HEARTBEAT_JOIN_TIMEOUT = 2
 _ABANDONED_CACHE_AGE = 60
 _ACTIVE_ATTEMPT = ContextVar("weight_conversion_attempt", default=None)
 
@@ -32,7 +33,7 @@ def _preparation_marker_path(attempt_id: str, cache_root=None) -> Path:
 
 
 def record_conversion_preparation_failure(function):
-    """Report pre-cache setup failures using the launcher's common attempt identity."""
+    """Report setup liveness and failures before checkpoint discovery or model construction."""
     parameters = signature(function)
 
     @wraps(function)
@@ -43,6 +44,9 @@ def record_conversion_preparation_failure(function):
         attempt, fresh_attempt = conversion_cache_attempt_id()
         context = _ACTIVE_ATTEMPT.set((attempt, fresh_attempt))
         marker = None
+        stop = threading.Event()
+        thread = None
+        writer_id = uuid.uuid4().hex
         try:
             arguments = parameters.bind_partial(*args, **kwargs).arguments
             rank = arguments.get("rank")
@@ -54,10 +58,34 @@ def record_conversion_preparation_failure(function):
             if attempt and rank == 0:
                 marker = _preparation_marker_path(attempt, getattr(config, "weight_conversion_cache_dir", None))
             if marker is not None:
-                marker.with_suffix(".failed").unlink(missing_ok=True)
+                try:
+                    marker.with_suffix(".failed").unlink(missing_ok=True)
+                except OSError:
+                    logger.info("Could not clear previous weight preparation failure", exc_info=True)
+
+                def heartbeat():
+                    count = 0
+                    while not stop.is_set():
+                        try:
+                            marker.parent.mkdir(parents=True, exist_ok=True)
+                            _write_cache_marker(
+                                marker.with_suffix(".in-progress"),
+                                dict(attempt_id=attempt, writer_id=writer_id, heartbeat=count),
+                            )
+                        except Exception:
+                            logger.warning("Could not record weight preparation liveness; retrying", exc_info=True)
+                        count += 1
+                        if stop.wait(_CACHE_HEARTBEAT_INTERVAL):
+                            break
+
+                thread = threading.Thread(target=heartbeat, daemon=True)
+                thread.start()
             result = function(*args, **kwargs)
             if marker is not None:
-                marker.with_suffix(".failed").unlink(missing_ok=True)
+                try:
+                    marker.with_suffix(".failed").unlink(missing_ok=True)
+                except OSError:
+                    logger.info("Could not clear weight preparation failure after success", exc_info=True)
             return result
         except BaseException as error:
             if marker is not None:
@@ -68,6 +96,14 @@ def record_conversion_preparation_failure(function):
                     logger.warning("Could not record weight preparation failure", exc_info=True)
             raise
         finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=_CACHE_HEARTBEAT_JOIN_TIMEOUT)
+            if marker is not None and (thread is None or not thread.is_alive()):
+                try:
+                    marker.with_suffix(".in-progress").unlink(missing_ok=True)
+                except OSError:
+                    logger.info("Could not remove weight preparation progress marker", exc_info=True)
             _ACTIVE_ATTEMPT.reset(context)
 
     return wrapped
@@ -224,6 +260,22 @@ def conversion_cache_attempt_id(*, shared: bool = False) -> tuple[str | None, bo
     return tokens[0], True
 
 
+def validate_standalone_conversion_attempt(config, source_path: Path | None = None) -> None:
+    """Reject unidentified shared-cache preparation before downloads, model construction or key scans."""
+    import torch.distributed as dist
+
+    if dist.is_initialized() or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV):
+        return
+    root = resolve_conversion_cache_root(getattr(config, "weight_conversion_cache_dir", None))
+    if conversion_cache_is_node_local(Path(root)):
+        return
+    source_path = Path(getattr(config, "name", "")) if source_path is None else source_path
+    for fmt in ("prime", "prime-dequantized", "hf"):
+        if conversion_cache_ready(resolve_conversion_cache_path(config, source_path, fmt)):
+            return
+    conversion_cache_attempt_id(shared=True)
+
+
 def wait_for_conversion_cache(
     path: Path,
     *,
@@ -243,6 +295,7 @@ def wait_for_conversion_cache(
     Callers that guarantee a newly generated, never-reused attempt ID may set fresh_attempt to observe terminal
     failures published before the waiter starts.
     Startup is separately bounded (300 seconds by default, configurable for slow independent launchers).
+    Preparation heartbeats cover checkpoint discovery and model setup before conversion starts.
     Once observed, unchanged heartbeats bound killed-writer waits.
     """
     attempt_id = attempt_id or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV)
@@ -259,17 +312,28 @@ def wait_for_conversion_cache(
     progress_path = path.with_name(f"{path.name}.in-progress")
     initial_failure = {} if fresh_attempt else _read_cache_marker(failure_path)
     initial_progress = {} if fresh_attempt else _read_cache_marker(progress_path)
-    preparation_path = (
-        _preparation_marker_path(attempt_id, preparation_root).with_suffix(".failed") if attempt_id else None
-    )
+    preparation_marker = _preparation_marker_path(attempt_id, preparation_root) if attempt_id else None
+    preparation_path = preparation_marker.with_suffix(".failed") if preparation_marker else None
+    preparation_progress = preparation_marker.with_suffix(".in-progress") if preparation_marker else None
     initial_preparation = _read_cache_marker(preparation_path) if preparation_path and not fresh_attempt else {}
-    observed = None
+    initial_preparation_progress = (
+        _read_cache_marker(preparation_progress) if preparation_progress and not fresh_attempt else {}
+    )
+    observed: dict[str, dict] = {}
     last_progress = time.monotonic()
     while not conversion_cache_ready(path):
-        if attempt_id is not None:
+        if preparation_path is not None and preparation_progress is not None:
             setup_failure = _read_cache_marker(preparation_path)
             if setup_failure != initial_preparation and setup_failure.get("attempt_id") == attempt_id:
                 raise RuntimeError(f"Weight preparation writer failed: {setup_failure.get('error')}")
+            setup_progress = _read_cache_marker(preparation_progress)
+            if (
+                setup_progress != initial_preparation_progress
+                and setup_progress.get("attempt_id") == attempt_id
+                and setup_progress != observed.get("preparation")
+            ):
+                observed["preparation"] = setup_progress
+                last_progress = time.monotonic()
         failure = _read_cache_marker(failure_path)
         if (
             failure != initial_failure
@@ -280,19 +344,18 @@ def wait_for_conversion_cache(
         progress = _read_cache_marker(progress_path)
         token = progress.get("attempt_id")
         if token is not None and progress != initial_progress and (attempt_id is None or token == attempt_id):
-            current = (token, progress.get("writer_id"), progress.get("heartbeat"), progress.get("generation"))
-            if current != observed:
-                observed = current
+            if progress != observed.get("conversion"):
+                observed["conversion"] = progress
                 last_progress = time.monotonic()
             failure = _read_cache_marker(failure_path)
             if failure != initial_failure and failure.get("attempt_id") == token:
                 raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure.get('error')}")
-            if time.monotonic() - last_progress >= writer_idle_timeout:
-                raise RuntimeError(f"Converted weight cache writer stopped heartbeating without publishing: {path}")
+        if observed and time.monotonic() - last_progress >= writer_idle_timeout:
+            raise RuntimeError(f"Converted weight cache writer stopped heartbeating without publishing: {path}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"Converted weight cache did not become ready within {timeout}s: {path}")
-        if observed is None and time.monotonic() - started >= writer_start_timeout:
+        if not observed and time.monotonic() - started >= writer_start_timeout:
             raise TimeoutError(
                 f"Converted weight cache writer did not publish startup progress within {writer_start_timeout}s:"
                 f" {path}"
@@ -367,7 +430,7 @@ def _write_conversion_cache(
 
     def finish():
         stop.set()
-        owner_thread.join()
+        owner_thread.join(timeout=_CACHE_HEARTBEAT_JOIN_TIMEOUT)
         owner_path.unlink(missing_ok=True)
         if not committed and tmp_path.exists():
             shutil.rmtree(tmp_path)
@@ -539,7 +602,7 @@ def ensure_node_local_conversion_cache(
             finally:
                 stop.set()
                 if thread is not None and thread.ident is not None:
-                    thread.join()
+                    thread.join(timeout=_CACHE_HEARTBEAT_JOIN_TIMEOUT)
                 try:
                     if _read_cache_marker(progress_path).get("writer_id") == writer_id:
                         progress_path.unlink(missing_ok=True)
