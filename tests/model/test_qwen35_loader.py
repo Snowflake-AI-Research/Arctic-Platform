@@ -306,7 +306,7 @@ def test_qwen_hf_export_without_include_skipped_never_reads_mtp_sidecar(monkeypa
     assert calls == [("ordinary", False)]
 
 
-def test_qwen_full_hf_export_appends_mtp_only_after_ordinary_stream_exhausts(monkeypatch):
+def test_qwen_full_hf_export_validates_mtp_first_and_appends_after_ordinary_stream(monkeypatch):
     import torch
 
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
@@ -338,7 +338,7 @@ def test_qwen_full_hf_export_appends_mtp_only_after_ordinary_stream_exhausts(mon
     exported = list(qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True))
 
     assert exported == [("model.weight", ordinary_tensor), ("mtp.fc.weight", mtp_tensor)]
-    assert events == [("ordinary-start", True), ("ordinary-exhausted",), ("sidecar-start",)]
+    assert events == [("sidecar-start",), ("ordinary-start", True), ("ordinary-exhausted",)]
 
 
 def test_qwen_full_hf_export_nonmaster_finishes_ordinary_stream_without_sidecar(monkeypatch):
@@ -407,12 +407,14 @@ def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):
 
     model = _mtp_export_model()
     ordinary_tensor = torch.tensor([1.0])
+    ordinary_calls = []
 
     def ordinary_builder(built_model):
         assert built_model is model
 
         def iterator(*, include_skipped=False):
             assert include_skipped is True
+            ordinary_calls.append(include_skipped)
             yield "model.weight", ordinary_tensor
 
         return iterator
@@ -421,9 +423,9 @@ def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     iterator = qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)
-    assert next(iterator) == ("model.weight", ordinary_tensor)
     with pytest.raises(RuntimeError, match="requires captured original MTP weights"):
         next(iterator)
+    assert ordinary_calls == []
 
 
 def test_qwen_full_hf_export_without_configured_mtp_needs_no_capture(monkeypatch):
