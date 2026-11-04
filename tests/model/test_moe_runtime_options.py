@@ -383,3 +383,14 @@ def test_load_moe_model_applies_the_options_before_it_builds_the_model(monkeypat
 def test_every_moe_loader_takes_the_deepep_v2_settings(options_cls):
     assert options_cls(deepep_v2_num_sms=0, deepep_v2_max_tokens=4096).deepep_v2_num_sms == 0
 
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_refuses_deepep_v2_recompute_without_the_replay(options_cls):
+    """A whole-block recompute dispatches through DeepEP V2 with its forward's handle, which the combine replay
+    carries; every MoE loader refuses the backend under full checkpointing without it."""
+    with pytest.raises(ValidationError, match="combine_replay"):
+        options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full"})
+    assert options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full", "combine_replay": True}).ac_config
+    assert options_cls(ep_comm_backend="deepep_v2").ep_comm_backend == "deepep_v2"
+    assert options_cls(ep_comm_backend="uccl", ac_config={"mode": "full"}).ac_config.combine_replay is False
+

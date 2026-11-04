@@ -26,6 +26,7 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config_validation import validate_deepep_v2_recompute
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
@@ -81,14 +82,7 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
 
     @model_validator(mode="after")
     def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
-        """DeepEP V2's unordered kernels deliver each expert's rows in arrival order, so a whole-block recompute must
-        dispatch with its forward's handle, which the combine replay carries (distributed/deepep_v2.py)."""
-        ac = self.ac_config
-        if self.ep_comm_backend == "deepep_v2" and ac is not None and ac.mode == "full" and not ac.combine_replay:
-            raise ValueError(
-                "ep_comm_backend='deepep_v2' recomputes a checkpointed block's dispatch with its forward's handle, "
-                "which ac_config.combine_replay carries: set ac_config.combine_replay=true"
-            )
+        validate_deepep_v2_recompute(self.ep_comm_backend, self.ac_config)
         return self
 
 

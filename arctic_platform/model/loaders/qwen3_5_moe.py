@@ -26,6 +26,7 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config_validation import validate_deepep_v2_recompute
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
@@ -91,6 +92,11 @@ class Qwen3_5MoeOptions(MoeRuntimeOptions):
     @model_validator(mode="after")
     def _check_lm_head(self) -> Self:
         validate_lm_head_fused_ce_config(self.model_dump())
+        return self
+
+    @model_validator(mode="after")
+    def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
+        validate_deepep_v2_recompute(self.ep_comm_backend, self.ac_config)
         return self
 
 
