@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
+from arctic_platform.common.deepspeed_engine import release_offloaded_grad_partitions
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import dp_sp_world_size
@@ -194,7 +195,9 @@ class DeepSpeedWorker:
             # Forward-only (log-prob) engines are initialized without an
             # optimizer so DeepSpeed allocates no optimizer state.
             init_kwargs["model_parameters"] = model.parameters()
-        self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
+        self.engine, engine_optimizer, _, _ = deepspeed.initialize(**init_kwargs)
+        if self._has_optimizer and engine_optimizer is not None:
+            release_offloaded_grad_partitions(engine_optimizer)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
         gpu_id = torch.cuda.current_device()

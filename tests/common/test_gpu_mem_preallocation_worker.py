@@ -45,10 +45,13 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     model = torch.nn.Identity()
     model._arctic_gpu_mem_preallocation = reserve
     observed = []
+    optimizer = SimpleNamespace(cpu_offload=True)
+    installed_hooks = []
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
     monkeypatch.setattr(worker, "ds_training_config", lambda *args: {})
+    monkeypatch.setattr(mod, "release_offloaded_grad_partitions", installed_hooks.append)
 
     def build(spec):
         observed.append(spec.debug)
@@ -57,7 +60,7 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     def initialize(**kwargs):
         assert worker._gpu_mem_preallocation is reserve
         assert kwargs["model"] is model
-        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+        return SimpleNamespace(local_rank=0, global_steps=0), optimizer, None, None
 
     monkeypatch.setattr(mod, "build_model", build)
     monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
@@ -75,6 +78,7 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     )
     assert observed == [{"gpu_mem_preallocate_gib": 20}]
     assert worker._gpu_mem_preallocation is reserve
+    assert installed_hooks == [optimizer]
 
 
 def test_destroy_retains_buffer_through_sender_and_communicator_teardown(monkeypatch):
