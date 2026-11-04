@@ -35,11 +35,20 @@ from pydantic import ConfigDict
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
-from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
-_NO_DECAY = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
+# Qwen3.8-Flash-Next's PLE names its RMSNorms norm_key/norm_query/norm_conv, which "norm.weight" does not match.
+_NO_DECAY = (
+    "bias",
+    "layer_norm.weight",
+    "layernorm.weight",
+    "norm.weight",
+    "ln_f.weight",
+    "norm_key.weight",
+    "norm_query.weight",
+    "norm_conv.weight",
+)
 _OPTIMIZER_ALIASES = {
     "fusedadam": "fused_adam",
     "fused_adam": "fused_adam",
@@ -161,9 +170,7 @@ def initialize_training_engine(
     # Marks first: the optimizer groups split on them.
     preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused
-        if fused is None:
-            fused = not is_glm_moe_model(model_path)
+        fused = optimizer.fused is not False
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
@@ -226,10 +233,8 @@ def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bo
         reason = "AdamW ran as the faster fused GPU implementation (FusedAdam)"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    elif optimizer.fused is False:
-        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     else:
-        reason = "FusedAdam isn't supported for this model, so standard AdamW ran"
+        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     return {"implementation": implementation, "reason": reason}
 
 
@@ -265,7 +270,7 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
     # ZeRO flattens each group into one buffer of its first parameter's dtype, so
     # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [
-        {"params": [param for param in params if keeps_fp32(param) == fp32], "weight_decay": decay}
+        {"params": _aligned_first([param for param in params if keeps_fp32(param) == fp32]), "weight_decay": decay}
         for params, decay in ((decay_params, optimizer.weight_decay), (no_decay_params, 0.0))
         for fp32 in (False, True)
     ]
@@ -314,6 +319,18 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     if not isinstance(zero_config, dict):
         return False
     return bool(zero_config.get("offload_optimizer"))
+
+
+def _aligned_first(params: list) -> list:
+    """``params`` with every parameter whose size is not a multiple of 8 elements moved to the end.
+
+    ZeRO flattens a group's parameters back to back and makes each one a view at its offset in that buffer, so
+    one parameter of, say, 3 elements leaves every parameter after it 2-byte aligned. cuBLAS then cannot use
+    Hopper's GEMMs on those weights (TMA needs 16-byte-aligned operands) and falls back to its SM80 kernels:
+    GLM-5.3-Flash's 3-element mHC scales, in its BF16 groups, sent 75% of the cuBLAS GEMM time there.
+    The sort is stable, so the order within each half is the model's.
+    """
+    return sorted(params, key=lambda param: param.numel() % 8 != 0)
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
