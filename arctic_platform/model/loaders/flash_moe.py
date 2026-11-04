@@ -58,11 +58,11 @@ class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
 
 
-def _matches(model_type: str):
+def _matches(family: str):
     def matches(ctx: LoaderContext) -> bool:
         if ctx.spec.parallelism.expert_parallel <= 1:
             return False
-        return ctx.hf_model_type == model_type or ctx.hf_text_model_type == model_type
+        return ctx.hf_model_family == family
 
     return matches
 

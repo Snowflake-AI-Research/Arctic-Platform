@@ -55,6 +55,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     get_checkpoint_converter,
     record_conversion_preparation_failure,
     resolve_conversion_cache_path,
+    validate_standalone_conversion_attempt,
     wait_for_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
@@ -537,6 +538,7 @@ def prepare_weight_conversion(
     """
     if not isinstance(model, PreTrainedModelPrimeRL):
         return None
+    validate_standalone_conversion_attempt(config, source_path)
     snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
     model_keys = dict.fromkeys(model.state_dict().keys())
     if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
@@ -558,7 +560,9 @@ def prepare_weight_conversion(
     target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
     stream_convert_fn = get_checkpoint_converter(model, target_format)
     node_local = conversion_cache_is_node_local(snapshot_path)
-    attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local)
+    attempt_id, fresh_attempt = conversion_cache_attempt_id(
+        shared=not node_local and not conversion_cache_ready(snapshot_path)
+    )
     if node_local or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,

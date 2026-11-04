@@ -145,6 +145,46 @@ class _FakePrimeModel:
 
 
 @pytest.mark.parametrize("family", ["qwen35", "glm52"])
+def test_successful_production_prepare_ignores_preparation_marker_cleanup_error(monkeypatch, tmp_path, family):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    destination = tmp_path / "prime"
+    destination.mkdir()
+    (destination / "weights.safetensors").touch()
+    (destination / "model.safetensors.index.json").write_text(
+        json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+    )
+    removed = []
+    native_unlink = Path.unlink
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "cleanup-error")
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
+    monkeypatch.setattr(
+        builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
+    )
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(".preparation-") and path.suffix == ".failed":
+            removed.append(path)
+            raise PermissionError("marker cleanup denied")
+        return native_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    config = SimpleNamespace(
+        name=str(tmp_path),
+        dequantize_checkpoint=False,
+        weight_conversion_cache_dir=str(tmp_path),
+    )
+    assert builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=0, local_rank=0) == destination
+    assert len(removed) == 2
+    assert not cache._preparation_marker_path("cleanup-error", tmp_path).with_suffix(".failed").exists()
+    assert cache._ACTIVE_ATTEMPT.get() is None
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
 @pytest.mark.parametrize("scope", ["shared", "node-local"])
 def test_production_preparation_collects_identity_before_keys_and_propagates_fresh_failure(
     monkeypatch, tmp_path, family, scope
@@ -178,16 +218,28 @@ def test_production_preparation_collects_identity_before_keys_and_propagates_fre
     monkeypatch.setattr(builder, "load_state_dict_keys", keys)
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: tmp_path / "prime")
     monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: scope == "node-local")
+
+    def stream(self, source, destination):
+        events.append(("conversion", rank[0]))
+        raise OSError("local conversion failed")
+
+    monkeypatch.setattr(_FakePrimeModel, "stream_convert_to_prime", stream, raising=False)
     config = SimpleNamespace(dequantize_checkpoint=False, weight_conversion_cache_dir=str(tmp_path))
     with pytest.raises(ValueError, match="checkpoint discovery failed"):
         builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=0, local_rank=0)
     assert events[:2] == [("broadcast", 0), ("keys", 0)]
     assert cache._ACTIVE_ATTEMPT.get() is None
     rank[0] = 1
-    if scope == "node-local":
-        cache._write_cache_marker(tmp_path / "prime.failed", dict(attempt_id=tokens[0], error="conversion failed"))
-    with pytest.raises(RuntimeError, match="checkpoint discovery failed|conversion failed"):
-        builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
+    if scope == "shared":
+        with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
+            builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
+    else:
+        with pytest.raises(OSError, match="local conversion failed"):
+            builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
+        assert ("conversion", 1) in events
+        failure = cache._read_cache_marker(tmp_path / "prime.failed")
+        assert failure["attempt_id"] == tokens[0]
+        assert "local conversion failed" in failure["error"]
     assert len([event for event in events if event[0] == "broadcast"]) == 2
     assert cache._ACTIVE_ATTEMPT.get() is None
 
@@ -1209,3 +1261,150 @@ def test_adapter_preparation_and_runtime_load_reuse_the_written_cache(
     assert loaded == [prepared]
     assert writes == [prepared], "the runtime adapter must not convert again after standalone preparation"
     assert configured_sms == [options.deepep_num_sms, options.deepep_num_sms]
+
+
+def test_shared_prepare_rejects_missing_identity_before_model_or_download(monkeypatch, tmp_path):
+    from dataclasses import replace
+
+    import torch.distributed as dist
+
+    events = []
+    adapter = _adapter(events)
+    original = adapter.build_model_config
+
+    def config(*args):
+        result = original(*args)
+        result.name = str(tmp_path / "source")
+        result.weight_conversion_cache_dir = str(tmp_path / "cache")
+        return result
+
+    adapter = replace(adapter, build_model_config=config)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    with pytest.raises(ValueError, match="common DSS_WEIGHT_CONVERSION_ATTEMPT_ID"):
+        _prepare(adapter)
+    assert [event[0] for event in events] == ["config"]
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+def test_standalone_ready_shared_cache_does_not_require_attempt_identity(monkeypatch, tmp_path, family):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = source / "prime"
+    destination.mkdir()
+    (destination / "weights.safetensors").touch()
+    (destination / "model.safetensors.index.json").write_text(
+        json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+    )
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
+    monkeypatch.setattr(
+        builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
+    )
+    config = SimpleNamespace(name=str(source), dequantize_checkpoint=False, weight_conversion_cache_dir=tmp_path)
+    cache.validate_standalone_conversion_attempt(config)
+    assert builder.prepare_weight_conversion(_FakePrimeModel(), config, source, rank=1, local_rank=1) == destination
+
+
+def _slow_shared_preparation_process(source, root, family, rank, entered, waiting, results):
+    import os
+    import time
+    from dataclasses import replace
+
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    os.environ["DSS_WEIGHT_CONVERSION_ATTEMPT_ID"] = "slow-preparation"
+    os.environ["DSS_WEIGHT_CONVERSION_CACHE_SCOPE"] = "shared"
+    os.environ["DSS_WEIGHT_CONVERSION_CACHE_DIR"] = str(root)
+    cache._CACHE_HEARTBEAT_INTERVAL = 0.01
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    builder.PreTrainedModelPrimeRL = _FakePrimeModel
+    native_wait = builder.wait_for_conversion_cache
+    adapter = _adapter([])
+    original_config = adapter.build_model_config
+
+    def config(*args):
+        result = original_config(*args)
+        result.name = str(source)
+        result.weight_conversion_cache_dir = str(root)
+        result.dequantize_checkpoint = False
+        return result
+
+    def model(config, *, device, dtype):
+        if rank == 0:
+            entered.set()
+            assert waiting.wait(30), "peer did not enter the real cache waiter"
+            time.sleep(0.2)
+        return _FakePrimeModel()
+
+    def stream(self, source_path, destination):
+        destination.mkdir()
+        save_file({"model.layers.0.mlp.experts.w1": torch.ones(1)}, destination / "weights.safetensors")
+        (destination / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map={"model.layers.0.mlp.experts.w1": "weights.safetensors"}))
+        )
+
+    def wait(path, **kwargs):
+        assert entered.wait(30), "writer did not enter model construction"
+        waiting.set()
+        return native_wait(path, timeout=5, poll_interval=0.01, writer_start_timeout=0.05, **kwargs)
+
+    _FakePrimeModel.stream_convert_to_prime = stream
+    builder.wait_for_conversion_cache = wait
+    adapter = replace(
+        adapter,
+        build_model_config=config,
+        get_model=model,
+        resolve_weight_source=builder.resolve_weight_source,
+        prepare_weight_conversion=builder.prepare_weight_conversion,
+    )
+    try:
+        destination = _prepare(adapter, model_name=str(source), ep_size=1, world_size=2, rank=rank, local_rank=rank)
+        results.put((rank, cache.conversion_cache_ready(destination), None))
+    except BaseException as error:
+        results.put((rank, False, repr(error)))
+        raise
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+def test_real_process_shared_prepare_heartbeats_before_conversion(tmp_path, family):
+    import multiprocessing
+
+    import torch
+    from safetensors.torch import save_file
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"model.layers.0.mlp.experts.0.gate_proj.weight": torch.ones(1)}, source / "model.safetensors")
+    context = multiprocessing.get_context("spawn")
+    entered, waiting, results = context.Event(), context.Event(), context.Queue()
+    processes = [
+        context.Process(
+            target=_slow_shared_preparation_process,
+            args=(source, tmp_path / "cache", family, rank, entered, waiting, results),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=60)
+            assert process.exitcode == 0
+        assert sorted(results.get(timeout=5) for _ in processes) == [(0, True, None), (1, True, None)]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
