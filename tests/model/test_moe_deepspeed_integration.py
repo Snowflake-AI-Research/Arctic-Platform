@@ -185,12 +185,18 @@ def ep_checkpoint_engine(monkeypatch):
     deepspeed.utils = utils
     checkpoint = ModuleType("deepspeed.checkpoint")
     checkpoint.constants = constants
+    runtime = ModuleType("deepspeed.runtime")
+    runtime_utils = ModuleType("deepspeed.runtime.utils")
+    runtime_utils.is_optimized_parameter = lambda parameter: parameter.requires_grad and parameter.numel() > 0
+    runtime.utils = runtime_utils
     for name, module in (
         ("deepspeed", deepspeed),
         ("deepspeed.utils", utils),
         ("deepspeed.utils.groups", groups),
         ("deepspeed.checkpoint", checkpoint),
         ("deepspeed.checkpoint.constants", constants),
+        ("deepspeed.runtime", runtime),
+        ("deepspeed.runtime.utils", runtime_utils),
     ):
         monkeypatch.setitem(sys.modules, name, module)
 
@@ -233,7 +239,7 @@ def ep_checkpoint_engine(monkeypatch):
             return {
                 self.param_names[parameter]: attr_func(parameter)
                 for parameter in self.module.parameters()
-                if not parameter.requires_grad
+                if not runtime_utils.is_optimized_parameter(parameter)
             }
 
         def _get_non_moe_state_dict(self, full_state_dict):
@@ -295,8 +301,10 @@ def ep_checkpoint_engine(monkeypatch):
                 self.module.load_state_dict(checkpoint["module"], strict=strict)
             else:
                 custom_load_fn(src=checkpoint["module"], dst=self.module)
-            for name, value in checkpoint.get("frozen_param_fragments", {}).items():
-                self.module.get_parameter(name).data.copy_(value)
+            if checkpoint.get("frozen_param_fragments") is not None:
+                for parameter in self.module.parameters():
+                    if not runtime_utils.is_optimized_parameter(parameter):
+                        parameter.data.copy_(checkpoint["frozen_param_fragments"][self.param_names[parameter]])
 
     fixture_save_checkpoint = Engine._save_checkpoint
     original_save_shard = common._save_ep_checkpoint_shard
@@ -740,6 +748,28 @@ def test_ep_checkpoint_frozen_callbacks_never_copy_experts(ep_checkpoint_engine,
     assert set(engine._get_zero_frozen_param_attributes(lambda parameter: parameter.shape)) == {"frozen", "dense.bias"}
 
 
+def test_ep_checkpoint_empty_trainable_expert_restores_frozen_fragment(ep_checkpoint_engine, tmp_path):
+    engine = ep_checkpoint_engine
+    empty = nn.Parameter(torch.empty(0))
+    empty.allreduce = False
+    empty.group_name = engine.module.expert.group_name
+    engine.module.register_parameter("empty_expert", empty)
+    engine._save_checkpoint(tmp_path, "empty")
+    assert "empty_expert" not in engine.saved_checkpoint["frozen_param_fragments"]
+    assert engine._load_checkpoint(tmp_path, "empty")[0] == "loaded"
+    assert engine.module.empty_expert.shape == torch.Size([0])
+    assert engine.module.empty_expert.requires_grad
+
+
+def test_ep_checkpoint_patch_is_idempotent(ep_checkpoint_engine):
+    engine_type = type(ep_checkpoint_engine)
+    save = engine_type._save_checkpoint
+    load = engine_type.load_module_state_dict
+    common._patch_deepspeed_ep_checkpoints(engine_type)
+    assert engine_type._save_checkpoint is save
+    assert engine_type.load_module_state_dict is load
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_ep_checkpoint_syncs_data_before_rename_and_directory_after(tmp_path, monkeypatch, empty):
     events = []
@@ -771,6 +801,7 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
     nn.Module.__init__(model.experts)
     model.experts.weight = nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 2))
     model.experts.frozen = nn.Parameter(torch.tensor([3.0, 4.0]), requires_grad=False)
+    model.experts.empty_trainable = nn.Parameter(torch.empty(0))
     engine, *_ = deepspeed.initialize(
         model=model.cuda(),
         optimizer=torch.optim.AdamW(model.parameters()),
@@ -799,6 +830,7 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
     )
     for name in patched_methods:
         monkeypatch.setattr(type(engine), name, getattr(type(engine), name))
+    monkeypatch.setattr(type(engine), "_ap_ep_ckpt_patched", False, raising=False)
     common._patch_deepspeed_ep_checkpoints(type(engine))
     expected = {name: value.detach().clone() for name, value in model.named_parameters()}
     assert engine.save_checkpoint(str(tmp_path), tag="native", exclude_frozen_parameters=exclude_frozen)

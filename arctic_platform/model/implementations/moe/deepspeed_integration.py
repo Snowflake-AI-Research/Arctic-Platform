@@ -157,6 +157,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
 
 
 def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
+    if getattr(engine_type, "_ap_ep_ckpt_patched", False):
+        return
     import deepspeed.utils.groups as ds_groups
     from deepspeed.checkpoint.constants import FROZEN_PARAM_FRAGMENTS
 
@@ -269,7 +271,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             if not path.is_file():
                 raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
             # AP sidefiles are always Torch ZIP archives, even with a different dense checkpoint engine.
-            shard = torch.load(path, map_location="cpu", weights_only=True)
+            shard = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             if (
                 not isinstance(shard, dict)
                 or type(shard.get("version")) is not int
@@ -311,11 +313,13 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         )
         # DeepSpeed restores frozen fragments after the module, so both must use the local shard.
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS) is not None:
+            from deepspeed.runtime.utils import is_optimized_parameter
+
             fragments = dict(checkpoint[FROZEN_PARAM_FRAGMENTS])
             fragments.update(
                 (self.param_names[self.module.get_parameter(name)], value)
                 for name, value in self._ap_ep_checkpoint_state.items()
-                if not self.module.get_parameter(name).requires_grad
+                if not is_optimized_parameter(self.module.get_parameter(name))
             )
             checkpoint[FROZEN_PARAM_FRAGMENTS] = fragments
         bound.arguments["checkpoint"] = checkpoint
@@ -329,6 +333,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     engine_type._save_checkpoint = wrap_save(engine_type._save_checkpoint)
     engine_type._load_checkpoint = load
     engine_type.load_module_state_dict = load_module
+    engine_type._ap_ep_ckpt_patched = True
 
 
 def patch_deepspeed_moe_detection() -> None:
