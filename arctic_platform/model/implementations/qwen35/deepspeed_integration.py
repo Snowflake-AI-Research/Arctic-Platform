@@ -239,6 +239,7 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
             # Drain ordinary collectives on every rank, but never publish a colliding live tensor.
             if not collision:
                 yield name, tensor
+            del tensor
         if preserved is not None:
             yield from finish_preserved_weight_export(preserved, names, description="Original MTP")
 

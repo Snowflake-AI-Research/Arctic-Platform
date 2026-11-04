@@ -102,6 +102,7 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
             collision = collision or (preserved is not None and name in preserved.names)
             if not collision:
                 yield name, tensor
+            del tensor
         if preserved is not None:
             yield from finish_preserved_weight_export(preserved, emitted, description="GLM prediction")
 

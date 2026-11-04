@@ -281,6 +281,56 @@ def test_prediction_weight_export_builders_are_family_scoped():
     assert qwen._generic_adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
 
 
+@pytest.mark.parametrize("family", ["qwen35", "glm53", "qwen38", "qwen38-split"])
+def test_prediction_export_wrappers_release_tensors_before_next_gather(monkeypatch, family):
+    import gc
+    import weakref
+
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as flash
+
+    model = _mtp_export_model()
+    model.config.text_config.mtp_num_hidden_layers = 0
+    model.config.text_config.split_ngram_parts = 3 if family == "qwen38-split" else 1
+    references = []
+    gathered = []
+    name = "model.ple.ple_embedding.ngram_embedding.weight" if family == "qwen38-split" else "model.weight"
+
+    def ordinary(**kwargs):
+        for index in range(2):
+            gc.collect()
+            assert all(reference() is None for reference in references), "wrapper retained the previous gather"
+            tensor = torch.ones(6, 2)
+            references.append(weakref.ref(tensor))
+            gathered.append(index)
+            yield name, tensor
+            del tensor
+
+    ordinary.weight_names = lambda **kwargs: frozenset({name})
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
+    if family == "glm53":
+        exporter = glm._build_iter_full_hf_weights_with_auxiliary(model)
+    else:
+        exporter = (
+            qwen._build_iter_full_hf_weights_with_mtp(model)
+            if family == "qwen35"
+            else flash._build_iter_full_hf_weights(model)
+        )
+    count = 0
+    for _, tensor in exporter(include_skipped=family == "qwen38-split"):
+        assert tensor.shape[1] == 2
+        count += 1
+        del tensor
+    assert gathered == [0, 1]
+    assert count == (6 if family == "qwen38-split" else 2)
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
 @pytest.mark.parametrize("family", ["generic", "qwen35", "qwen38"])
 def test_configured_mtp_is_exported_by_each_qwen_adapter(tmp_path, monkeypatch, family):
     import torch

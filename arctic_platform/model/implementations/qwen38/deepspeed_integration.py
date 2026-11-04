@@ -90,8 +90,10 @@ def _build_iter_full_hf_weights(model: nn.Module):
                 for index, shard in enumerate(tensor.tensor_split(parts, dim=0)):
                     # HF sizes shards by backing storage, so split views need independent storage.
                     yield f"{prefix}.shard_{index}.weight", shard.clone()
+                    del shard
             else:
                 yield name, tensor
+            del tensor
 
     def weight_names(*, include_skipped: bool = False):
         names = ordinary.weight_names(include_skipped=include_skipped)
