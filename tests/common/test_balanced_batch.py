@@ -67,11 +67,12 @@ def test_zorro_thousands_of_single_row_groups_assign():
 
 
 def test_zorro_infeasible_hundreds_of_groups_raise():
-    # Each rank holds 100 groups of 3 and has one spare row. The search hits the
-    # node budget before it finishes proving that the 301st group cannot land.
+    # Each rank holds 100 groups of 3 and has one spare row, so the 301st group
+    # cannot land. Equal sizes prove that without running the search.
     groups = [[3 * index, 3 * index + 1, 3 * index + 2] for index in range(301)]
-    with pytest.raises(ValueError, match="search budget exhausted after 100000 nodes"):
+    with pytest.raises(ValueError, match="do not fit") as raised:
         assign_zorro_groups(groups, [1.0] * 301, num_shards=3, num_rows=903)
+    assert "budget" not in str(raised.value)
 
 
 def test_zorro_proven_infeasible_groups_do_not_fit():
@@ -323,6 +324,23 @@ def test_stamp_and_apply_keep_explicit_true():
     apply_balance_metadata(applied, off, prompts, prompts)
     assert applied["balance_batch"] is False
     assert "prompt_group_ids" not in applied
+    kept = {}
+    apply_balance_metadata(
+        kept,
+        {"balance_batch": False, "prompt_group_ids": meta["prompt_group_ids"]},
+        prompts,
+        prompts,
+    )
+    assert kept["balance_batch"] is False
+    assert kept["prompt_group_ids"].tolist() == [0, 0, 1, 1]
+
+
+def test_string_zorro_flag_is_not_group_balance():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    mask = torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 0, 0]])
+    assignment = assign_balanced_batch(2, {"zorro_train_enable": "false"}, attention_mask=mask)
+    assert assignment is not None
 
 
 def test_legacy_balancer_keys_are_ignored():

@@ -46,7 +46,7 @@ def assign_balanced_batch(
     """
     if _balance_disabled(meta):
         return None
-    if meta.get("zorro_train_enable"):
+    if meta.get("zorro_train_enable") is True:
         return _assign_prompt_groups(
             num_shards,
             meta,
@@ -268,6 +268,14 @@ def assign_zorro_groups(
                 f"prompt group of {size} rows does not fit in a rank cap of {cap} "
                 f"(batch_size={num_rows}, num_shards={num_shards})"
             )
+    # Equal group sizes prove the pack before the search. Each rank can hold
+    # cap // size groups, and one spare row per rank cannot hold another group.
+    sizes = [len(groups[index]) for index in order]
+    if sizes and len(set(sizes)) == 1 and sizes[0] > 0 and len(groups) > num_shards * (cap // sizes[0]):
+        raise ValueError(
+            f"prompt groups do not fit into {num_shards} ranks of {cap} rows "
+            f"(batch_size={num_rows}, num_shards={num_shards})"
+        )
     try:
         placed = _pack_groups([len(group) for group in groups], costs, order, num_shards, cap)
     except _SearchBudgetExceeded as exc:

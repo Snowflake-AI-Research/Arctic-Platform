@@ -82,8 +82,9 @@ def apply_balance_metadata(context: dict, meta: dict, input_ids, prompts) -> dic
 
     ``True`` and ``False`` are both kept. A missing switch stays missing, and
     the server treats that as balance on. ``prompt_group_ids`` are copied from
-    the client stamp; this function does not derive them. Legacy balancer keys
-    are removed.
+    the client stamp even when balancing is off, because a prompt-mean loss
+    counts rows by that key. This function does not derive them. Only a real
+    ``True`` turns ZoRRo on. Legacy balancer keys are removed.
     """
     import torch
 
@@ -94,13 +95,14 @@ def apply_balance_metadata(context: dict, meta: dict, input_ids, prompts) -> dic
         context["balance_batch"] = balance_batch
     else:
         context.pop("balance_batch", None)
-    if meta.get("zorro_train_enable"):
+    if meta.get("zorro_train_enable") is True:
         context["zorro_train_enable"] = True
         for key in ZORRO_SPLIT_KEYS:
             if key in meta:
                 context[key] = meta[key]
+    # Kept even when balancing is off: prompt-mean counts rows by this key.
     group_ids = meta.get("prompt_group_ids")
-    if meta.get("balance_batch") is not False and torch.is_tensor(group_ids):
+    if torch.is_tensor(group_ids):
         context["prompt_group_ids"] = group_ids
     else:
         context.pop("prompt_group_ids", None)

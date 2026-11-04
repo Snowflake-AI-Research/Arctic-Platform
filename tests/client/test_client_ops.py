@@ -1117,7 +1117,7 @@ class TestCortexSharedHelper:
                 },
             )
 
-    def test_zorro_fwd_bwd_keeps_the_client_layout(self):
+    def test_zorro_fwd_bwd_left_aligns_and_names_prompt_groups(self):
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -1136,14 +1136,25 @@ class TestCortexSharedHelper:
                     "prompts": prompts,
                     "old_log_probs": old,
                 },
-                "meta": {"zorro_train_enable": True, "max_prompt_len": 3, "balance_batch": True},
+                "meta": {
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                    "balance_batch": True,
+                    "temperature": 0.7,
+                    "calculate_entropy": True,
+                },
             }
         )
-        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0], [1, 2, 3, 4, 0]]
+        assert out["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]
         assert torch.equal(out["kwargs"]["prompts"], prompts)
+        assert out["kwargs"]["response_mask"].tolist() == [[0, 0, 1, 1, 0], [0, 0, 1, 1, 0]]
         assert "old_log_probs" not in out["kwargs"]
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
+        assert out["context"]["temperature"] == 0.7
+        assert out["context"]["calculate_entropy"] is True
+        assert out["context"]["prompt_group_ids"].tolist() == [0, 1]
 
 
 class TestCortexShimSaveWeightsFailsLoud:
