@@ -44,7 +44,7 @@ def hf_text_model_type(model_path: str) -> str:
 
 
 def is_glm_moe_model(model_path: str) -> bool:
-    return hf_text_model_type(model_path) == "glm_moe_dsa"
+    return hf_text_model_type(model_path) in {"glm_moe_dsa", "glm5_next_text"}
 
 
 def build_moe_model(

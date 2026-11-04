@@ -36,35 +36,34 @@ def convert_hf_layer_to_tt(state_dict: dict[str, Tensor], layer_idx: int):
         w3 = gate_up_proj[:, moe_dim:, :]  # up
         w2 = down_proj  # down
     else:
-        # Old per-expert format
-        num_experts = len([k for k in state_dict.keys() if f"model.layers.{i}.mlp.experts" in k and "gate_proj" in k])
+        # Old per-expert format; block-FP8 checkpoints add a ``weight_scale_inv`` next to every weight.
+        prefix = f"model.layers.{i}.mlp.experts."
+        num_experts = len([k for k in state_dict.keys() if k.startswith(prefix) and k.endswith(".gate_proj.weight")])
         if num_experts == 0:
             return
 
-        dim, moe_dim = state_dict[f"model.layers.{i}.mlp.experts.0.down_proj.weight"].shape
-        dtype = state_dict[f"model.layers.{i}.mlp.experts.0.down_proj.weight"].dtype
-        w1 = torch.empty((num_experts, moe_dim, dim), dtype=dtype)
-        w2 = torch.empty((num_experts, dim, moe_dim), dtype=dtype)
-        w3 = torch.empty((num_experts, moe_dim, dim), dtype=dtype)
-        for j in range(num_experts):
-            w1[j].copy_(state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight"))
-            w2[j].copy_(state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.down_proj.weight"))
-            w3[j].copy_(state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.up_proj.weight"))
+        for name, hf_name in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+            for suffix, key in (("", "weight"), ("_scale_inv", "weight_scale_inv")):
+                if f"{prefix}0.{hf_name}.{key}" not in state_dict:
+                    continue
+                stacked = torch.stack([state_dict.pop(f"{prefix}{j}.{hf_name}.{key}") for j in range(num_experts)])
+                state_dict[f"model.layers.{i}.mlp.experts.{name}{suffix}"] = stacked
+        w1 = state_dict.pop(f"model.layers.{i}.mlp.experts.w1")
+        w2 = state_dict.pop(f"model.layers.{i}.mlp.experts.w2")
+        w3 = state_dict.pop(f"model.layers.{i}.mlp.experts.w3")
 
     state_dict[f"model.layers.{i}.mlp.experts.w1"] = w1
     state_dict[f"model.layers.{i}.mlp.experts.w2"] = w2
     state_dict[f"model.layers.{i}.mlp.experts.w3"] = w3
 
-    # Shared expert: mlp.shared_expert.{gate,up,down}_proj -> shared_expert.{w1,w3,w2}
+    # Shared expert: mlp.shared_expert.{gate,up,down}_proj -> shared_expert.{w1,w3,w2} (with FP8 scales if present)
     se_gate_key = f"model.layers.{i}.mlp.shared_expert.gate_proj.weight"
     if se_gate_key in state_dict:
-        state_dict[f"model.layers.{i}.shared_expert.w1.weight"] = state_dict.pop(se_gate_key)
-        state_dict[f"model.layers.{i}.shared_expert.w2.weight"] = state_dict.pop(
-            f"model.layers.{i}.mlp.shared_expert.down_proj.weight"
-        )
-        state_dict[f"model.layers.{i}.shared_expert.w3.weight"] = state_dict.pop(
-            f"model.layers.{i}.mlp.shared_expert.up_proj.weight"
-        )
+        for name, hf_name in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+            for key in ("weight", "weight_scale_inv"):
+                hf_key = f"model.layers.{i}.mlp.shared_expert.{hf_name}.{key}"
+                if hf_key in state_dict:
+                    state_dict[f"model.layers.{i}.shared_expert.{name}.{key}"] = state_dict.pop(hf_key)
 
     # Shared expert gate: mlp.shared_expert_gate.weight -> shared_expert_gate.weight
     seg_key = f"model.layers.{i}.mlp.shared_expert_gate.weight"
