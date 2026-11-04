@@ -433,4 +433,3 @@ def test_w8a8_experts_reach_the_experts_built_after_the_load():
         GroupedExperts(256, 128, 2, use_grouped_mm=True)
     with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
         GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128, packed4="int4")
-
