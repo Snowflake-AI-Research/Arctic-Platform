@@ -88,6 +88,7 @@ def _write_conversion_cache(
     *,
     rank: int,
     local_rank: int,
+    stream_convert_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
     tmp_path = snapshot_path.with_name(f"{snapshot_path.name}.tmp-rank{rank}-pid{os.getpid()}")
     if tmp_path.exists():
@@ -106,6 +107,24 @@ def _write_conversion_cache(
     )
     committed = False
     t0 = time.perf_counter()
+    if stream_convert_fn is not None:
+        try:
+            stream_convert_fn(source_path, tmp_path)
+            os.replace(tmp_path, snapshot_path)
+            committed = True
+        finally:
+            if not committed and tmp_path.exists():
+                shutil.rmtree(tmp_path)
+        logger.info(
+            "Streamed %s→%s cache written to %s in %.1fs rank=%d local_rank=%d",
+            src_fmt,
+            dst_fmt,
+            snapshot_path,
+            time.perf_counter() - t0,
+            rank,
+            local_rank,
+        )
+        return
     try:
         snapshot_state_dict = load_state_dict_fn(source_path)
         t_load = time.perf_counter()
@@ -147,6 +166,7 @@ def ensure_node_local_conversion_cache(
     *,
     rank: int,
     local_rank: int,
+    stream_convert_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
     if conversion_cache_ready(snapshot_path):
         if local_rank == 0:
@@ -175,6 +195,7 @@ def ensure_node_local_conversion_cache(
                     save_state_dict_fn,
                     rank=rank,
                     local_rank=local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
             elif local_rank == 0:
                 logger.info(

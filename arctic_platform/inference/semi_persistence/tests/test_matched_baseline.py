@@ -128,7 +128,7 @@ def test_plain_worker_applies_it_before_building_engine_args():
     applied = src.find("matched_baseline.apply(engine_kwargs)")
     built = src.find("_create_async_engine_args(", applied)
     assert applied != -1 and built > applied
-    assert src.find("restore_and_wrap", 0, applied) != -1, "must come after the semi_p branch returns"
+    assert "if not semi_p and matched_baseline.requested():" in src, "plain engines only"
 
 
 def test_below_tp2_nothing_changes():

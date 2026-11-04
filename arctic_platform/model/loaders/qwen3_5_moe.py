@@ -35,6 +35,8 @@ from arctic_platform.model.loader import register_loader
 
 
 class DebugModelOptions(BaseModel):
+    """Loader debug options (provider ``DebugModelConfig`` fields only)."""
+
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     random_init: bool = False
@@ -54,6 +56,10 @@ class Qwen3_5MoeOptions(BaseModel):
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
+    moe_use_sonicmoe: bool = Field(
+        False,
+        description="Run BF16 routed experts through SonicMoE on the EP receive buffer when that kernel applies.",
+    )
     fused_cross_entropy: bool | Literal["liger"] = Field("liger", description="LM-head fused CE backend.")
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = Field(
         "disabled", description="Chunked LM-head logprobs token size."
@@ -88,7 +94,7 @@ class Qwen3_5MoeOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    return ctx.hf_model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or ctx.hf_text_model_type == "qwen3_5_moe_text"
+    return ctx.hf_model_family == "qwen3_5_moe"
 
 
 def _validate_spec(spec: ModelSpec) -> None:

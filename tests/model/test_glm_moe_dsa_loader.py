@@ -169,7 +169,10 @@ def test_runtime_config_is_derived_from_validated_options():
         ep_comm_backend="uccl",
         sparse_mla_backend="flashmla",
         ac_config={"freq": 2},
-        debug={"num_layers": 6, "random_init": True},
+        debug={
+            "num_layers": 6,
+            "random_init": True,
+        },
     )
     config = _build_model_config(
         "local",
@@ -190,6 +193,17 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac is options.ac_config
     assert config.debug.num_layers == 6
     assert config.debug.random_init is True
+
+
+def test_full_determinism_reaches_the_fixed_order_fold():
+    """The shared MoE builder reads ``debug.full_determinism`` off these options to install the fixed-order fold."""
+    from arctic_platform.model.implementations.debug.determinism import full_determinism_enabled
+    from arctic_platform.model.implementations.glm52.deepspeed_integration import _build_model_config
+
+    options = GlmMoeDsaOptions(debug={"full_determinism": True})
+
+    assert full_determinism_enabled(options.model_dump())
+    assert _build_model_config("local", 2, 1, "bfloat16", "sdpa", options).debug.full_determinism is True
 
 
 class TestStandaloneImports(TestCasePlus):

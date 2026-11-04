@@ -1,6 +1,6 @@
 """CPU completion ordering; real vLLM methods, synthetic storage, no GPU kernels.
 
-VLLM_SOURCE_ROOT may name a vLLM 0.31.0 checkout on CPU-only test hosts.
+VLLM_SOURCE_ROOT may name a vLLM 0.32.0 checkout on CPU-only test hosts.
 Otherwise read the installed vLLM package without importing its GPU runtime.
 """
 
@@ -107,7 +107,7 @@ def manager_methods(monkeypatch):
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
     ns["original_window_cap"] = ns["WindowSpec"].max_admission_blocks_per_request
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.31.0"
+    vllm.__version__ = "0.32.0"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
     from arctic_platform.inference.vllm import required_patches
@@ -118,8 +118,7 @@ def manager_methods(monkeypatch):
         ("xgrammar_stop_mask", "ensure_xgrammar_stop_mask_fix"),
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
-        ("dflash2_nan_fix", "apply_dflash2_nan_fixes"),
-        ("glm5next_indexer_page", "apply_glm5next_indexer_page_fix"),
+        ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
         ("glm5next_lora", "ensure_glm5next_lora"),

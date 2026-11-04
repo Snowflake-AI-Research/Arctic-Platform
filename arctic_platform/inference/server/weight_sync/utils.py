@@ -401,6 +401,65 @@ class _FP8InplaceUpdater:
         return len(self._bufs)
 
 
+# Param-name patterns that are legitimately NOT shipped by a BF16 sender:
+# rotary frequency buffers, and FP8 / GPTQ quantization metadata that only
+# exists on a quantized receiver.
+_NON_SYNCED_HF_NAME_PATTERNS = (
+    ".inv_freq",
+    ".weight_scale",
+    ".input_scale",
+    ".weight_zero_point",
+    ".weight_qzeros",
+    ".weight_g_idx",
+    ".weight_packed",
+    ".weight_shape",
+)
+
+
+def _name_is_non_synced(name: str) -> bool:
+    return any(pat in name for pat in _NON_SYNCED_HF_NAME_PATTERNS)
+
+
+def compute_expected_hf_param_names(model: nn.Module) -> set[str]:
+    """HF-style names a vLLM model can accept from a BF16 sender.
+
+    Fused ``QKVParallelLinear`` and ``gate_up_proj`` modules are expanded to
+    the unfused HF names. The walk uses module types, not ``param.data``, so
+    it still works when weights are offloaded.
+    """
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    expected: set[str] = set()
+    fused_names: set[str] = set()
+
+    def _parent_of(mod_path: str) -> str:
+        return mod_path.rsplit(".", 1)[0] if "." in mod_path else ""
+
+    for mod_path, mod in model.named_modules():
+        if isinstance(mod, QKVParallelLinear):
+            parent = _parent_of(mod_path)
+            for orig in ("q_proj", "k_proj", "v_proj"):
+                key = f"{parent}.{orig}.weight" if parent else f"{orig}.weight"
+                expected.add(key)
+            fused_names.add(f"{mod_path}.weight")
+        elif isinstance(mod, MergedColumnParallelLinear):
+            leaf = mod_path.rsplit(".", 1)[-1] if "." in mod_path else mod_path
+            if leaf == "gate_up_proj":
+                parent = _parent_of(mod_path)
+                for orig in ("gate_proj", "up_proj"):
+                    key = f"{parent}.{orig}.weight" if parent else f"{orig}.weight"
+                    expected.add(key)
+                fused_names.add(f"{mod_path}.weight")
+
+    for name, _ in model.named_parameters():
+        if name in fused_names or _name_is_non_synced(name):
+            continue
+        expected.add(name)
+
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Non-quantized direct-to-parameter writer (zero temp allocation for TP=1)
 # ---------------------------------------------------------------------------

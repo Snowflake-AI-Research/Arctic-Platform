@@ -65,6 +65,7 @@ CLUSTER_OPS = frozenset(
     {
         "list-jobs",
         "get-job",
+        "get-experiment-run",
         "cancel-job",
         "capacity",
         "list-checkpoints",

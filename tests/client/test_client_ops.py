@@ -243,6 +243,50 @@ class TestOpMapping:
         assert _last(client).op == "wake-training"
 
 
+class TestSyncWeightsChecksum:
+    """``sync_weights``'s ``checksum_match`` must be acted on, not only logged (see ``ArcticRLRayServer.weight_sync``)."""
+
+    class _MismatchTransport(FakeTransport):
+        """A transport whose weight-sync op reports a failed checksum; every other op is a plain no-op."""
+
+        def call(self, request: Request) -> dict:
+            self.calls.append(request)
+            if request.op == "operation" and request.body.get("operation_type") == "weight-sync":
+                return {
+                    "sent_l2_sq": 32.5,
+                    "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+                    "checksum_rtol": 1e-9,
+                    "checksum_match": False,
+                    "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+                }
+            return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
+
+        async def acall(self, request: Request) -> dict:
+            return self.call(request)
+
+    def _build_mismatch(self, monkeypatch, cls):
+        monkeypatch.setattr(base_module, "make_transport", self._MismatchTransport)
+        return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_raises_on_checksum_mismatch(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        with pytest.raises(RuntimeError, match="did not prove delivery"):
+            _call(client, "sync_weights")
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_strict_checksum_false_returns_the_dict_instead(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        out = _call(client, "sync_weights", strict_checksum=False)
+        assert out["checksum_match"] is False
+        assert out["checksum_error"]
+
+    def test_sync_weights_missing_checksum_does_not_raise(self, client):
+        """A transport that never computed a checksum (the default ``FakeTransport``) is not a reported failure."""
+        out = _call(client, "sync_weights")
+        assert "checksum_match" not in out
+
+
 class TestLifecycle:
     def test_reconnect_config_copies_job_ids(self, client):
         """reconnect_config bakes the live job ids into a fresh config."""
@@ -371,8 +415,19 @@ class TestClusterRequestBuilders:
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
+                ),
+            ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
             (
                 cluster_requests.export_checkpoint_request("job-1", "step-1"),
@@ -402,6 +457,7 @@ class TestClusterRequestBuilders:
         requests = (
             cluster_requests.list_jobs_request(),
             cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
             cluster_requests.cancel_job_request("job"),
             cluster_requests.capacity_request(),
             cluster_requests.list_checkpoints_request("job"),
@@ -418,8 +474,8 @@ class TestClusterClientMethods:
         """Account-level ops need no stored handle."""
         _call(client, "list_jobs", "running")
         assert _last(client) == cluster_requests.list_jobs_request("running")
-        _call(client, "capacity", "H200")
-        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
         _call(client, "cancel_job", "job-9")
         assert _last(client) == cluster_requests.cancel_job_request("job-9")
 
@@ -623,6 +679,54 @@ class TestUnifiedConfigDoesNotReadEnv:
         assert cfg.backend.type == "onprem"
 
 
+class TestCortexModelOptions:
+    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+        cfg = ArcticClientConfig(
+            model_name="model",
+            training_gpus=1,
+            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+        )
+        before = cfg.model_dump()
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_training_options_use_the_supported_server_channel(self):
+        from arctic_platform.client import CortexConfig
+
+        options = {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {"token_chunk_size": 1024, "fp32": False, "cross_entropy": False},
+        }
+        cfg = ArcticClientConfig(
+            model_name="model",
+            max_seq_len=262144,
+            training_gpus=8,
+            sampling_gpus=8,
+            backend=CortexConfig(base_url="http://mock"),
+            training={"ds_worker_config": {"ep_size": 8, "model_options": options}},
+        )
+        before = cfg.model_dump()
+        sub_jobs = cfg.to_cortex()
+        assert [sub["job_type"] for sub in sub_jobs] == ["sampling", "training"]
+        assert sub_jobs[0]["inference_config"]["n_gpus"] == 8
+        training = sub_jobs[1]["training_config"]
+        assert training["model_options"] == options
+        assert training["max_seq_len"] == 262144
+        assert training["ep_size"] == 8
+        assert "prime_rl" not in training
+        assert cfg.model_dump() == before
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_absent_options_do_not_add_a_transport_block(self):
+        cfg = ArcticClientConfig(model_name="model", training_gpus=1)
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert "model_options" not in training
+        assert "prime_rl" not in training
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
@@ -661,6 +765,21 @@ class TestCortexNoopOffload:
 
     def test_leaves_untouched_when_nothing_to_drop(self):
         assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
+
+
+class TestCortexSamplingSubJob:
+    def test_forwards_tensor_parallel_size(self):
+        """Neutrino's sampler reads TP from vllm_config and defaults to 1; n_gpus does not set it."""
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            sampling_gpus=16,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            sampling={"vllm": {"tensor_parallel_size": 16}},
+        )
+        (sampling,) = [sub for sub in cfg.to_cortex() if "inference_config" in sub]
+        assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 16
 
 
 class TestCortexBackendOnlyConstruction:

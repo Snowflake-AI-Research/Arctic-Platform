@@ -224,6 +224,8 @@ def test_a_built_chat_grammar_passes_through(engine_params):
         "Grammar error: unsatisfiable schema",
         "Invalid grammar specification: bad key",
         "Failed to transform json schema into a regex: unsupported",
+        "Failed to transform regex into a grammar: bad pattern",
+        "Failed to transform choices into a grammar: empty choice",
         "Regex uses unsupported feature for structured outputs: lookaround. "
         "Only basic matching constructs are supported",
     ],

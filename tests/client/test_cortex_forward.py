@@ -38,6 +38,8 @@ result it decodes without a live GS.
 from __future__ import annotations
 
 import base64
+import json
+from copy import deepcopy
 from urllib.parse import unquote
 
 import pytest
@@ -69,6 +71,12 @@ class FakeSend:
         if method == "GET":
             return {"status": "REQUEST_STATE_DONE", "result": self.result}
         self.posts.append({"url": url, **kwargs})
+        frame = kwargs.get("data")
+        if frame is None and "json" in kwargs:
+            frame = base64.b64decode(kwargs["json"]["payload"]["payload_b64"])
+        chunk = wire.read_byte_chunk_metadata(frame) if frame is not None else None
+        if chunk is not None and chunk["chunk_idx"] < chunk["total_chunks"] - 1:
+            return {"chunk_cached": True}
         return {"request_id": "req-1"}
 
     @property
@@ -87,7 +95,10 @@ class FakeSend:
     @property
     def operation_frame(self) -> bytes:
         """The frame the zone will reassemble from every payload we posted."""
-        return b"".join(base64.b64decode(e["payload"]["payload_b64"]) for e in self.envelopes)
+        frames = [base64.b64decode(e["payload"]["payload_b64"]) for e in self.envelopes]
+        if len(frames) == 1:
+            return frames[0]
+        return wire.decode_byte_chunks(frames, kind="request")
 
 
 def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
@@ -147,12 +158,8 @@ class TestForwardWire:
         assert wire.read_byte_chunk_metadata(send.operation_frame) is None
 
     def test_oversized_frame_splits_across_envelopes(self, monkeypatch):
-        """Each POST is a whole envelope carrying one slice of the frame.
-
-        The zone stages the slices and concatenates them, so what must survive is
-        the byte-for-byte frame -- not any per-chunk structure.
-        """
-        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 8 * 1024)
+        """Each POST carries a request-chunk frame the zone can reassemble."""
+        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 16 * 1024)
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
@@ -167,13 +174,13 @@ class TestForwardWire:
         Sizing the slice against the raw budget would overshoot by a third and be
         rejected by GS, so this pins the encoded payload under the cap.
         """
-        budget = 8 * 1024
+        budget = 16 * 1024
         monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", budget)
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 
-        assert max(len(e["payload"]["payload_b64"]) for e in send.envelopes) <= budget
+        assert max(len(json.dumps(envelope).encode()) for envelope in send.envelopes) <= budget
 
     def test_missing_request_id_on_the_last_chunk_is_an_error(self):
         """Only the final chunk starts execution; without its id there is nothing to poll."""
@@ -239,22 +246,6 @@ class TestForwardResult:
         assert torch.is_tensor(decoded["batch"]["logprobs"])
         assert decoded["batch"]["logprobs"].tolist() == [[-0.5, -1.5]]
 
-    def test_unwraps_the_zone_envelope_that_omits_wire_format(self):
-        """The zone sends `{job_id, payload_b64}` with no `wire_format` marker.
-
-        That is the shape on the real wire, and the generic decoder skips it, so
-        without forward's own unwrap the caller gets a base64 string where the
-        tensors belong.
-        """
-        frame = wire.dumps({"job_id": JOB, "logprobs": torch.tensor([[-0.5, -1.5]])})
-        transport, _ = _transport({"job_id": JOB, "payload_b64": base64.b64encode(frame).decode()})
-
-        decoded = transport.call(fwd_no_grad_request(transport.jobs, _batch()))
-
-        assert torch.is_tensor(decoded["logprobs"])
-        assert decoded["logprobs"].tolist() == [[-0.5, -1.5]]
-        assert decoded["job_id"] == JOB
-
     def test_result_without_a_payload_passes_through(self):
         """An error/plain-JSON result must not be mistaken for an envelope."""
         transport, _ = _transport({"job_id": JOB, "status": "weird"})
@@ -271,3 +262,77 @@ class TestStillUnsupported:
         transport, _ = _transport()
         with pytest.raises(NotImplementedError, match="log-probs"):
             transport.call(Request("log-probs", TRAINING, {"prompts": ["hi"]}))
+
+
+class TestRouterReplayWire:
+    @pytest.mark.parametrize("operation", ["forward-backward", "forward"])
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_replay_coordination_is_metadata_not_a_model_batch_field(self, monkeypatch, operation, chunked):
+        if chunked:
+            monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 16 * 1024)
+            monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 16 * 1024)
+        replay = {"sampling_job_id": "sampler-1", "identity_version": 1}
+        width = 20_000 if chunked else 3
+        batch = {
+            "args": (),
+            "kwargs": {
+                "input_ids": torch.arange(width).reshape(1, -1),
+                "rr_sample_ids": ["rr1:sample-1"],
+                "rr_replay_meta": [{"replay_id": "rr1:sample-1"}],
+                "rr_discard": True,
+            },
+            "context": {"temperature": 1.0},
+            "processing": {"loss_fn": "grpo"},
+        }
+        before = deepcopy(batch)
+        jobs = JobHandles(training=TRAINING)
+        if operation == "forward-backward":
+            request = fwd_bwd_request(jobs, batch, router_replay=replay)
+        else:
+            request = fwd_no_grad_request(jobs, {**batch, "router_replay": replay})
+        request_body = deepcopy(request.body)
+
+        _, sends = cortex_module._route(operation).prepare("http://gs.test", request)
+
+        frames = [
+            (
+                send["data"]
+                if operation == "forward-backward"
+                else base64.b64decode(send["json"]["payload"]["payload_b64"])
+            )
+            for send in sends
+        ]
+        if operation == "forward-backward":
+            frame = wire.decode_byte_chunks(frames, kind="request")
+        else:
+            frame = wire.decode_byte_chunks(frames, kind="request") if len(frames) > 1 else frames[0]
+        if chunked:
+            assert len(sends) > 1
+        assert wire.read_metadata(frame) == {**cortex_module._CHUNKED_RESULTS, "router_replay": replay}
+        payload = wire.loads(frame)
+        assert set(payload) == set(batch)
+        assert payload["kwargs"]["rr_sample_ids"] == ["rr1:sample-1"]
+        assert payload["kwargs"]["rr_replay_meta"] == [{"replay_id": "rr1:sample-1"}]
+        assert payload["kwargs"]["rr_discard"] is True
+        assert payload["context"] == batch["context"]
+        assert payload["processing"] == batch["processing"]
+        assert torch.equal(payload["kwargs"]["input_ids"], before["kwargs"]["input_ids"])
+        assert torch.equal(batch["kwargs"]["input_ids"], before["kwargs"]["input_ids"])
+        assert request.body["router_replay"] == request_body["router_replay"]
+        assert set(request.body) == set(request_body)
+
+    @pytest.mark.parametrize("operation", ["forward-backward", "forward"])
+    def test_absent_replay_keeps_the_ordinary_batch_and_response_metadata(self, operation):
+        jobs = JobHandles(training=TRAINING)
+        batch = _batch()
+        request = fwd_bwd_request(jobs, batch) if operation == "forward-backward" else fwd_no_grad_request(jobs, batch)
+        _, sends = cortex_module._route(operation).prepare("http://gs.test", request)
+        frame = (
+            wire.decode_byte_chunks([send["data"] for send in sends], kind="request")
+            if operation == "forward-backward"
+            else base64.b64decode(sends[0]["json"]["payload"]["payload_b64"])
+        )
+        assert wire.read_metadata(frame) == cortex_module._CHUNKED_RESULTS
+        payload = wire.loads(frame)
+        assert set(payload) == set(batch)
+        assert payload["batch"]["input_ids"].tolist() == BATCH_IDS

@@ -31,14 +31,24 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
-from pydantic import Field
 
+from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
-from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
-_NO_DECAY = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
+# Qwen3.8-Flash-Next's PLE names its RMSNorms norm_key/norm_query/norm_conv, which "norm.weight" does not match.
+_NO_DECAY = (
+    "bias",
+    "layer_norm.weight",
+    "layernorm.weight",
+    "norm.weight",
+    "ln_f.weight",
+    "norm_key.weight",
+    "norm_query.weight",
+    "norm_conv.weight",
+)
 _OPTIMIZER_ALIASES = {
     "fusedadam": "fused_adam",
     "fused_adam": "fused_adam",
@@ -49,20 +59,6 @@ _OPTIMIZER_ALIASES = {
     "cpuadam": "deepspeed_cpu_adam",
     "deep_speed_cpu_adam": "deepspeed_cpu_adam",
 }
-
-
-class OptimizerSettings(BaseModel):
-    """Optimizer block handed to DeepSpeed after the caller has resolved aliases."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = "AdamW"
-    lr: float = 1e-5
-    weight_decay: float = 0.0
-    betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
-    eps: float = 1e-8
-    # ``None`` lets the model family decide. GLM-MoE leaves FusedAdam off.
-    fused: bool | None = None
 
 
 class TrainingEngineSpec(BaseModel):
@@ -171,24 +167,23 @@ def initialize_training_engine(
     """
     built = None
     choice = None
+    # Marks first: the optimizer groups split on them.
+    preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused
-        if fused is None:
-            fused = not is_glm_moe_model(model_path)
+        fused = optimizer.fused is not False
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
         choice = optimizer_choice(optimizer, ds_config, fused=fused)
         if ep_size > 1:
             built.param_groups[:] = split_expert_param_groups(list(built.param_groups))
-    preserved, marked_scales = preserve_fp8_params_through_ds_cast(model)
-    if preserved:
+    if preserved or marked_fp32:
         from deepspeed.runtime.engine import DeepSpeedEngine
 
         logger.info(
-            "rank=%d preserving %d FP8 parameters and %d FP32 block scales through the "
+            "rank=%d preserving %d FP8 parameters and %d FP32 parameters through the "
             "DeepSpeed dtype cast (deepspeed_param_cast_guard=%d)",
             rank,
             preserved,
-            marked_scales,
+            marked_fp32,
             int(bool(getattr(DeepSpeedEngine, "_ap_fp8_param_cast_guard", False))),
         )
     import deepspeed
@@ -202,15 +197,26 @@ def initialize_training_engine(
     return engine, built, choice
 
 
-def resolve_optimizer_name(name: str, ds_config: dict) -> str:
-    """Map a caller optimizer name onto the implementation DeepSpeed will run."""
-    resolved = name.strip().lower().replace("-", "_")
-    if resolved in {"", "adam", "adamw"}:
-        return "deepspeed_cpu_adam" if _optimizer_cpu_offload_enabled(ds_config) else "fused_adam"
-    if resolved not in _OPTIMIZER_ALIASES:
+def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) -> str:
+    """Resolve defaults by offload policy, while preserving explicit optimizer choices."""
+    normalized_name = name.strip().lower().replace("-", "_")
+    cpu_offload = _optimizer_cpu_offload_enabled(ds_config)
+
+    if normalized_name in {"", "adam", "adamw"}:
+        if not cpu_offload:
+            return "fused_adam"
+        elif fused:
+            return "deepspeed_cpu_adam"
+        else:
+            return "torch_cpu_adamw"
+
+    optimizer_name = _OPTIMIZER_ALIASES.get(normalized_name)
+    if optimizer_name is None:
         supported = ", ".join(sorted(set(_OPTIMIZER_ALIASES.values())))
         raise ValueError(f"Unsupported optimizer {name!r}; supported values: {supported}")
-    return _OPTIMIZER_ALIASES[resolved]
+    if optimizer_name == "torch_adamw" and cpu_offload:
+        return "torch_cpu_adamw"
+    return optimizer_name
 
 
 def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
@@ -219,6 +225,8 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
         return "fused_adam"
     if optimizer_name == "deepspeed_cpu_adam":
         return "deepspeed_cpu_adam"
+    if optimizer_name == "torch_cpu_adamw":
+        return "deepspeed_cpu_adam_nonfused"
     if optimizer_name in ("torch_adamw", "fused_adam"):
         return "torch_adamw"
     raise AssertionError(f"Unhandled optimizer {optimizer_name!r}")
@@ -226,9 +234,11 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
 
 def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bool) -> dict[str, str]:
     """The implementation a job runs and the customer-facing reason."""
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
     implementation = optimizer_implementation(optimizer_name, fused=fused)
-    if implementation == "deepspeed_cpu_adam":
+    if implementation == "deepspeed_cpu_adam_nonfused":
+        reason = "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic"
+    elif implementation == "deepspeed_cpu_adam":
         reason = (
             "optimizer state is offloaded to CPU, so the CPU implementation (CPUAdam) ran"
             if _optimizer_cpu_offload_enabled(ds_config)
@@ -238,10 +248,8 @@ def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bo
         reason = "AdamW ran as the faster fused GPU implementation (FusedAdam)"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    elif optimizer.fused is False:
-        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     else:
-        reason = "FusedAdam isn't supported for this model, so standard AdamW ran"
+        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     return {"implementation": implementation, "reason": reason}
 
 
@@ -255,14 +263,14 @@ def cpu_adam_fp32_optimizer_states(ds_config: dict) -> bool:
 def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool):
     """Build AdamW with decay disabled on bias and norm parameters.
 
-    GPU ``FusedAdam`` by default, or ``DeepSpeedCPUAdam`` when ZeRO optimizer
-    offload is enabled.
+    Generic AdamW uses fused implementations unless the model or caller disables
+    them. Explicit CPUAdam remains selected regardless of that policy.
     """
-    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config)
-    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name == "deepspeed_cpu_adam":
+    optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
+    if _optimizer_cpu_offload_enabled(ds_config) and optimizer_name in ("deepspeed_cpu_adam", "torch_cpu_adamw"):
         logger.info(
-            "training_config.ds_config.zero_optimization.offload_optimizer is configured; "
-            "using optimizer='deepspeed_cpu_adam'"
+            "training_config.ds_config.zero_optimization.offload_optimizer is configured; using optimizer=%r",
+            optimizer_name,
         )
     decay_params = [
         param
@@ -274,9 +282,12 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         for name, param in model.named_parameters()
         if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
     ]
+    # ZeRO flattens each group into one buffer of its first parameter's dtype, so
+    # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [
-        {"params": decay_params, "weight_decay": optimizer.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": _aligned_first([param for param in params if keeps_fp32(param) == fp32]), "weight_decay": decay}
+        for params, decay in ((decay_params, optimizer.weight_decay), (no_decay_params, 0.0))
+        for fp32 in (False, True)
     ]
     param_groups = [group for group in param_groups if group["params"]]
     betas = (optimizer.betas[0], optimizer.betas[1])
@@ -291,10 +302,10 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             eps=optimizer.eps,
             adam_w_mode=True,
         )
-    if implementation == "deepspeed_cpu_adam":
+    if implementation in ("deepspeed_cpu_adam", "deepspeed_cpu_adam_nonfused"):
         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
-        return DeepSpeedCPUAdam(
+        built = DeepSpeedCPUAdam(
             param_groups,
             lr=optimizer.lr,
             betas=betas,
@@ -302,6 +313,11 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             adamw_mode=True,
             fp32_optimizer_states=cpu_adam_fp32_optimizer_states(ds_config),
         )
+        if implementation == "deepspeed_cpu_adam_nonfused":
+            from arctic_platform.common.cpu_adam import configure_nonfused_cpu_adam
+
+            return configure_nonfused_cpu_adam(built)
+        return built
     import torch
 
     return torch.optim.AdamW(
@@ -323,6 +339,18 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     if not isinstance(zero_config, dict):
         return False
     return bool(zero_config.get("offload_optimizer"))
+
+
+def _aligned_first(params: list) -> list:
+    """``params`` with every parameter whose size is not a multiple of 8 elements moved to the end.
+
+    ZeRO flattens a group's parameters back to back and makes each one a view at its offset in that buffer, so
+    one parameter of, say, 3 elements leaves every parameter after it 2-byte aligned. cuBLAS then cannot use
+    Hopper's GEMMs on those weights (TMA needs 16-byte-aligned operands) and falls back to its SM80 kernels:
+    GLM-5.3-Flash's 3-element mHC scales, in its BF16 groups, sent 75% of the cuBLAS GEMM time there.
+    The sort is stable, so the order within each half is the model's.
+    """
+    return sorted(params, key=lambda param: param.numel() % 8 != 0)
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
