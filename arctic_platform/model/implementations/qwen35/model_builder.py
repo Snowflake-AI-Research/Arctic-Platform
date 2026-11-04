@@ -48,6 +48,7 @@ from .config import ModelConfig
 from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
@@ -560,6 +561,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            attempt_id = conversion_cache_attempt_id(shared=not node_local_cache)
             # Models whose snapshot cannot sit in host memory convert shard by shard.
             stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
             if stream_convert_fn is None:
@@ -577,6 +579,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     rank=world.rank,
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
+                    attempt_id=attempt_id,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 ensure_node_local_conversion_cache(
@@ -590,10 +593,11 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     rank=world.rank,
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
+                    attempt_id=attempt_id,
                 )
 
             elif not conversion_cache_ready(snapshot_path):
-                wait_for_conversion_cache(snapshot_path)
+                wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()

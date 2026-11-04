@@ -909,6 +909,25 @@ def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
             reader(tmp_path)
 
 
+def test_checkpoint_readers_accept_hub_symlinks_outside_snapshot(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    blob = tmp_path / "blobs" / "hash"
+    blob.parent.mkdir()
+    save_file({"a": torch.tensor([1.0])}, blob)
+    source = tmp_path / "snapshots" / "revision"
+    source.mkdir(parents=True)
+    (source / "shard.safetensors").symlink_to(blob)
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "shard.safetensors"}}))
+    assert weights.load_state_dict_keys(source) == ["a"]
+    torch_assert_equal(weights.load_state_dict(source)["a"], torch.tensor([1.0]))
+    converted = tmp_path / "converted"
+    weights.convert_safetensor_checkpoint(source, converted, lambda state: state, lambda names: [names])
+    torch_assert_equal(weights.load_state_dict(converted)["a"], torch.tensor([1.0]))
+
+
 @pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
 @pytest.mark.parametrize("scope", ["node-local", "shared"])
 def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family, scope):
@@ -936,6 +955,7 @@ def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch
     cache = tmp_path / "prime"
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "streamed-load-test")
     monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     monkeypatch.setattr(builder, "dcp_load", lambda *args, **kwargs: None)
@@ -980,33 +1000,35 @@ def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_p
     local = threading.local()
     converting, reader_observed_lock = threading.Event(), threading.Event()
     barriers = {0: 0, 1: 0}
-    original_flock = conversion_cache.fcntl.flock
+    original_marker = conversion_cache._read_cache_marker
     original_wait = conversion_cache.wait_for_conversion_cache
 
-    def flock(file, operation):
-        try:
-            return original_flock(file, operation)
-        except BlockingIOError:
+    def read_marker(path):
+        marker = original_marker(path)
+        if path.name.endswith(".in-progress") and marker.get("attempt_id") is not None:
             reader_observed_lock.set()
-            raise
+        return marker
 
     def fail_conversion(source, destination):
         converting.set()
-        assert reader_observed_lock.wait(3), "reader must observe the active writer"
+        assert reader_observed_lock.wait(3), "reader must observe the active writer's attempt marker"
         raise OSError("injected shared conversion failure")
 
     def barrier():
         barriers[local.rank] += 1
 
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "shared-failure-test")
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
     monkeypatch.setattr(
         builder, "get_world", lambda: SimpleNamespace(rank=local.rank, local_rank=0, is_master=local.rank == 0)
     )
     monkeypatch.setattr(torch.distributed, "barrier", barrier)
-    monkeypatch.setattr(conversion_cache.fcntl, "flock", flock)
+    monkeypatch.setattr(conversion_cache, "_read_cache_marker", read_marker)
     monkeypatch.setattr(
-        builder, "wait_for_conversion_cache", lambda path: original_wait(path, timeout=3, poll_interval=0.01)
+        builder,
+        "wait_for_conversion_cache",
+        lambda path, **kwargs: original_wait(path, timeout=3, poll_interval=0.01, **kwargs),
     )
     monkeypatch.setattr(models[0], "convert_to_prime_checkpoint", fail_conversion)
     monkeypatch.setattr(
@@ -1028,5 +1050,5 @@ def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_p
             writer.result(timeout=5)
         with pytest.raises(RuntimeError, match="writer failed|writer exited without publishing"):
             reader.result(timeout=5)
-    assert barriers == {0: 1, 1: 1}, "neither rank may enter the post-conversion barrier"
+    assert barriers == {0: 1, 1: 1}, "both ranks passed only the pre-conversion barrier"
     assert not cache.exists()

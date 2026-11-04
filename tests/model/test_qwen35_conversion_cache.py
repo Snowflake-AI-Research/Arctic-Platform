@@ -17,6 +17,8 @@ import builtins
 import json
 from pathlib import Path
 
+import pytest
+
 
 def test_conversion_cache_ready_requires_index_and_referenced_shards(tmp_path):
     from arctic_platform.model import conversion_cache_ready
@@ -158,7 +160,8 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
-    assert leftovers == []
+    assert sorted(leftovers) == ["prime.failed", "prime.in-progress"]
+    assert "disk full" in (cache_path.parent / "prime.failed").read_text()
 
 
 def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp_path):
@@ -306,3 +309,103 @@ def test_conversion_cache_root_precedence_matches_runtime(monkeypatch, tmp_path)
         assert resolve_conversion_cache_path(sibling_config, source, "prime") == sibling_conversion_cache_path(
             source, "prime"
         )
+
+
+def test_conversion_cache_retry_allows_late_writer_and_clock_skew(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    conversion_cache._write_cache_marker(cache.with_name("prime.failed"), dict(attempt_id="old", error="stale"))
+    conversion_cache._write_cache_marker(cache.with_name("prime.in-progress"), dict(attempt_id="old", heartbeat=0))
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache.time, "time", lambda: pytest.fail("must not compare wall clocks"))
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", lambda *args: pytest.fail("must not probe shared flock"))
+    monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: clock[0] >= 36)
+
+    def sleep(delay):
+        clock[0] += delay
+        if clock[0] == 35:
+            conversion_cache._write_cache_marker(
+                cache.with_name("prime.in-progress"), dict(attempt_id="retry", heartbeat=0)
+            )
+
+    monkeypatch.setattr(conversion_cache.time, "sleep", sleep)
+    conversion_cache.wait_for_conversion_cache(cache, timeout=60, poll_interval=1, attempt_id="retry")
+    assert clock[0] == 36
+
+
+def test_conversion_cache_detects_killed_writer_from_heartbeat(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    conversion_cache._write_cache_marker(cache.with_name("prime.in-progress"), dict(attempt_id="killed", heartbeat=0))
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    with pytest.raises(RuntimeError, match="writer stopped heartbeating"):
+        conversion_cache.wait_for_conversion_cache(cache, timeout=3600, writer_idle_timeout=2, attempt_id="killed")
+    assert clock[0] == 2
+
+
+def test_conversion_cache_local_failure_is_not_repeated_by_waiting_rank(monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    cache = tmp_path / "prime"
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+    native_flock = conversion_cache.fcntl.flock
+
+    def flock(fd, operation):
+        if operation == conversion_cache.fcntl.LOCK_EX and entered.is_set():
+            waiting.set()
+        return native_flock(fd, operation)
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        raise ValueError("conversion failed \ud800")
+
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", flock)
+    monkeypatch.setattr(conversion_cache, "_write_conversion_cache", fail)
+    args = (tmp_path, cache, lambda state: None, "HF", "PrimeRL", lambda path: {}, lambda *args: None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        writer = pool.submit(conversion_cache.ensure_node_local_conversion_cache, *args, rank=0, local_rank=0)
+        assert entered.wait(3)
+        reader = pool.submit(conversion_cache.ensure_node_local_conversion_cache, *args, rank=1, local_rank=1)
+        assert waiting.wait(3)
+        release.set()
+        with pytest.raises(ValueError, match="conversion failed"):
+            writer.result(timeout=3)
+        with pytest.raises(RuntimeError, match="writer failed"):
+            reader.result(timeout=3)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_conversion_cache_late_rank_sees_current_attempt_failure(monkeypatch, tmp_path, scope):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "launch")
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise KeyboardInterrupt("injected interrupt")
+
+    monkeypatch.setattr(conversion_cache, "_write_conversion_cache", fail)
+    cache = tmp_path / "prime"
+    args = (tmp_path, cache, lambda state: None, "HF", "PrimeRL", lambda path: {}, lambda *args: None)
+    with pytest.raises(KeyboardInterrupt, match="injected interrupt"):
+        conversion_cache.ensure_node_local_conversion_cache(*args, rank=0, local_rank=0)
+    with pytest.raises(RuntimeError, match="writer failed.*injected interrupt"):
+        if scope == "shared":
+            conversion_cache.wait_for_conversion_cache(cache, timeout=0)
+        else:
+            conversion_cache.ensure_node_local_conversion_cache(*args, rank=1, local_rank=1)
+    assert calls == [1]
