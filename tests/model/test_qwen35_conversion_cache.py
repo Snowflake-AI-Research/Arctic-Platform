@@ -160,7 +160,7 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
-    assert sorted(leftovers) == ["prime.failed", "prime.in-progress"]
+    assert sorted(leftovers) == ["prime.failed"]
     assert "disk full" in (cache_path.parent / "prime.failed").read_text()
 
 
@@ -409,3 +409,161 @@ def test_conversion_cache_late_rank_sees_current_attempt_failure(monkeypatch, tm
         else:
             conversion_cache.ensure_node_local_conversion_cache(*args, rank=1, local_rank=1)
     assert calls == [1]
+
+
+def test_conversion_cache_real_heartbeat_recovers_while_waiter_observes_progress(monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    writer_started, reader_started, recovered = threading.Event(), threading.Event(), threading.Event()
+    original_write = conversion_cache._write_cache_marker
+    original_read = conversion_cache._read_cache_marker
+    heartbeats, observed = [], []
+
+    def marker(path, value):
+        if path.name.endswith(".in-progress"):
+            heartbeats.append(value["heartbeat"])
+            if value["heartbeat"] == 1:
+                raise OSError("transient shared filesystem error")
+        original_write(path, value)
+
+    def read(path):
+        value = original_read(path)
+        if threading.current_thread().name.startswith("cache-reader") and value.get("heartbeat", 0) >= 2:
+            observed.append(value["heartbeat"])
+            recovered.set()
+        return value
+
+    def convert(source, destination):
+        writer_started.set()
+        assert reader_started.wait(3)
+        assert recovered.wait(3), "waiter must observe real heartbeat progress after the failed write"
+        _write_ready_cache(destination)
+
+    def wait():
+        reader_started.set()
+        conversion_cache.wait_for_conversion_cache(
+            cache, timeout=3, poll_interval=0.005, writer_idle_timeout=1, attempt_id="heartbeat-retry"
+        )
+
+    monkeypatch.setattr(conversion_cache, "_CACHE_HEARTBEAT_INTERVAL", 0.02)
+    monkeypatch.setattr(conversion_cache, "_write_cache_marker", marker)
+    monkeypatch.setattr(conversion_cache, "_read_cache_marker", read)
+    with (
+        ThreadPoolExecutor(max_workers=1) as writer_pool,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="cache-reader") as reader_pool,
+    ):
+        writer = writer_pool.submit(
+            conversion_cache.ensure_node_local_conversion_cache,
+            tmp_path,
+            cache,
+            lambda state: None,
+            "HF",
+            "PrimeRL",
+            lambda path: {},
+            lambda *args: None,
+            rank=0,
+            local_rank=0,
+            stream_convert_fn=convert,
+            attempt_id="heartbeat-retry",
+        )
+        assert writer_started.wait(3)
+        reader = reader_pool.submit(wait)
+        writer.result(timeout=5)
+        reader.result(timeout=5)
+    assert heartbeats[:3] == [0, 1, 2]
+    assert len(observed) > 0
+    assert conversion_cache.conversion_cache_ready(cache)
+    assert not cache.with_name("prime.in-progress").exists()
+
+
+@pytest.mark.parametrize("phase", ["lock", "first-marker"])
+def test_conversion_cache_setup_failure_reaches_waiter_without_progress(monkeypatch, tmp_path, phase):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+
+    if phase == "lock":
+
+        def fail(*args):
+            raise OSError("writer setup failed")
+
+        monkeypatch.setattr(conversion_cache.fcntl, "flock", fail)
+    else:
+        original = conversion_cache._write_cache_marker
+
+        def marker(path, value):
+            if path.name.endswith(".in-progress"):
+                raise OSError("writer setup failed")
+            original(path, value)
+
+        monkeypatch.setattr(conversion_cache, "_write_cache_marker", marker)
+    with pytest.raises(OSError, match="writer setup failed"):
+        conversion_cache.ensure_node_local_conversion_cache(
+            tmp_path,
+            cache,
+            lambda state: None,
+            "HF",
+            "PrimeRL",
+            lambda path: {},
+            lambda *args: None,
+            rank=0,
+            local_rank=0,
+            attempt_id="setup-failure",
+        )
+    assert not cache.with_name("prime.in-progress").exists()
+    with pytest.raises(RuntimeError, match="writer failed.*writer setup failed"):
+        conversion_cache.wait_for_conversion_cache(cache, timeout=0, attempt_id="setup-failure")
+
+
+def test_conversion_cache_preserves_other_writer_temporary_files_without_coherent_lock(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    other = cache.with_name("prime.tmp-rank0-pid123")
+    other.mkdir()
+    (other / "live-shard").write_bytes(b"other node is still writing")
+    failed = cache.with_name("prime.failed")
+    conversion_cache._write_cache_marker(failed, dict(attempt_id="other-attempt", error="other failure"))
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node-local")
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", lambda *args: None)
+
+    def convert(source, destination):
+        assert destination != other
+        assert (other / "live-shard").read_bytes() == b"other node is still writing"
+        _write_ready_cache(destination)
+
+    conversion_cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        cache,
+        lambda state: None,
+        "HF",
+        "PrimeRL",
+        lambda path: {},
+        lambda *args: None,
+        rank=0,
+        local_rank=0,
+        stream_convert_fn=convert,
+        attempt_id="this-attempt",
+    )
+    assert (other / "live-shard").read_bytes() == b"other node is still writing"
+    assert conversion_cache._read_cache_marker(failed)["attempt_id"] == "other-attempt"
+    assert conversion_cache.conversion_cache_ready(cache)
+
+
+def test_conversion_marker_write_failure_removes_only_its_own_temporary_file(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    other = tmp_path / "prime.in-progress.other.tmp"
+    other.write_bytes(b"another writer")
+
+    def fail(*args):
+        raise OSError("marker rename failed")
+
+    monkeypatch.setattr(conversion_cache.os, "replace", fail)
+    with pytest.raises(OSError, match="marker rename failed"):
+        conversion_cache._write_cache_marker(tmp_path / "prime.in-progress", dict(attempt_id="this-attempt"))
+    assert list(tmp_path.iterdir()) == [other]

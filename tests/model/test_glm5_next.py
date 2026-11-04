@@ -892,6 +892,23 @@ def test_checkpoint_conversion_uses_source_index_and_converter_return(tmp_path):
     torch_assert_equal(converted["b"], torch.tensor([2.0]))
 
 
+def test_unindexed_checkpoint_readers_keep_last_file_wins_on_duplicate_names(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    save_file({"a": torch.tensor([1.0]), "first-only": torch.zeros(1)}, tmp_path / "consolidated.safetensors")
+    save_file({"a": torch.tensor([2.0]), "last-only": torch.ones(1)}, tmp_path / "model.safetensors")
+    assert set(weights.load_state_dict_keys(tmp_path)) == {"a", "first-only", "last-only"}
+    loaded = weights.load_state_dict(tmp_path)
+    assert set(loaded) == {"a", "first-only", "last-only"}
+    torch_assert_equal(loaded["a"], torch.tensor([2.0]))
+    with pytest.raises(ValueError, match="Duplicate checkpoint tensor: a"):
+        weights.convert_safetensor_checkpoint(
+            tmp_path, tmp_path / "converted", lambda state: state, lambda names: [names]
+        )
+
+
 @pytest.mark.parametrize("index", [{}, {"weight_map": []}, {"weight_map": {"a": "../outside.safetensors"}}])
 def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
     from arctic_platform.model.implementations.moe import weights
@@ -930,7 +947,10 @@ def test_checkpoint_readers_accept_hub_symlinks_outside_snapshot(tmp_path):
 
 @pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
 @pytest.mark.parametrize("scope", ["node-local", "shared"])
-def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family, scope):
+@pytest.mark.parametrize("converter_api", ["checkpoint", "stream"])
+def test_glm53_load_selects_streaming_checkpoint_converter(
+    tmp_path, monkeypatch, builder_family, scope, converter_api
+):
     from types import SimpleNamespace
 
     from safetensors.torch import save_file
@@ -968,6 +988,10 @@ def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch
         raise AssertionError("GLM5-next conversion must not bulk-load the checkpoint")
 
     monkeypatch.setattr(builder, "load_state_dict", refuse_bulk_load)
+    if converter_api == "stream":
+        convert_checkpoint = model.convert_to_prime_checkpoint
+        monkeypatch.setattr(model, "stream_convert_to_prime", convert_checkpoint, raising=False)
+        monkeypatch.setattr(model, "convert_to_prime_checkpoint", refuse_bulk_load)
     config = SimpleNamespace(
         name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
     )
@@ -1048,7 +1072,7 @@ def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_p
         reader = executor.submit(load, 1)
         with pytest.raises(OSError, match="injected shared conversion failure"):
             writer.result(timeout=5)
-        with pytest.raises(RuntimeError, match="writer failed|writer exited without publishing"):
+        with pytest.raises(RuntimeError, match="writer failed"):
             reader.result(timeout=5)
     assert barriers == {0: 1, 1: 1}, "both ranks passed only the pre-conversion barrier"
     assert not cache.exists()

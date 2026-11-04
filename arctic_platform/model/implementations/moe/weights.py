@@ -35,8 +35,15 @@ def get_max_layer_num(state_dict: dict[str, Tensor], layer_prefix: str = "model.
     return max_num + 1
 
 
-def _checkpoint_tensor_locations(source_dir: Path) -> dict[str, Path]:
-    """Use the source index for every reader, ignoring unindexed tensors and shards."""
+def _group_tensor_locations(locations: dict[str, Path]) -> dict[Path, list[str]]:
+    by_shard: dict[Path, list[str]] = {}
+    for name, path in locations.items():
+        by_shard.setdefault(path, []).append(name)
+    return by_shard
+
+
+def _checkpoint_tensor_locations(source_dir: Path, *, strict_duplicates: bool = False) -> dict[str, Path]:
+    """Follow the index when present; otherwise retain readers' sorted, last-file-wins behavior."""
     locations: dict[str, Path] = {}
     index_path = source_dir / SAFE_WEIGHTS_INDEX_NAME
     indexed = index_path.is_file()
@@ -54,18 +61,19 @@ def _checkpoint_tensor_locations(source_dir: Path) -> dict[str, Path]:
             if Path(filename).is_absolute() or ".." in Path(filename).parts:
                 raise ValueError(f"Checkpoint shard path must stay inside its source directory: {filename}")
             locations[name] = path
-        shard_paths = sorted(set(locations.values()))
+        by_shard = _group_tensor_locations(locations)
+        shard_paths = sorted(by_shard)
     else:
         shard_paths = sorted(source_dir.glob("*.safetensors"))
     for shard_path in shard_paths:
         with safe_open(shard_path, framework="pt", device="cpu") as shard:
             if indexed:
-                missing = {name for name, path in locations.items() if path == shard_path} - set(shard.keys())
+                missing = set(by_shard[shard_path]) - set(shard.keys())
                 if len(missing) > 0:
                     raise ValueError(f"Indexed checkpoint tensors missing from {shard_path}: {sorted(missing)}")
             else:
                 for name in shard.keys():
-                    if name in locations:
+                    if strict_duplicates and name in locations:
                         raise ValueError(f"Duplicate checkpoint tensor: {name}")
                     locations[name] = shard_path
     return locations
@@ -80,11 +88,10 @@ def load_state_dict(save_dir: Path) -> dict[str, Tensor]:
     """Load a state dict from a local directory with safetensor files."""
     locations = _checkpoint_tensor_locations(save_dir)
     state_dict = {}
-    for safetensor_path in sorted(set(locations.values())):
+    for safetensor_path, names in sorted(_group_tensor_locations(locations).items()):
         with safe_open(safetensor_path, framework="pt", device="cpu") as f:
-            for key, path in locations.items():
-                if path == safetensor_path:
-                    state_dict[key] = f.get_tensor(key)
+            for key in names:
+                state_dict[key] = f.get_tensor(key)
     return state_dict
 
 
@@ -95,7 +102,7 @@ def convert_safetensor_checkpoint(
     partition_fn: Callable[[tuple[str, ...]], Iterable[Iterable[str]]],
 ) -> None:
     """Convert complete dependency groups, retaining only one group in memory."""
-    locations = _checkpoint_tensor_locations(source_dir)
+    locations = _checkpoint_tensor_locations(source_dir, strict_duplicates=True)
     if not locations:
         raise ValueError(f"No safetensors weights in {source_dir}")
     groups = [tuple(group) for group in partition_fn(tuple(locations))]

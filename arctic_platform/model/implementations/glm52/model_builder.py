@@ -23,6 +23,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_is_node_local,
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
+    get_checkpoint_converter,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
 )
@@ -297,7 +298,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
             attempt_id = conversion_cache_attempt_id(shared=not node_local_cache)
-            stream_convert_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
+            stream_convert_fn = get_checkpoint_converter(model, fmt)
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
