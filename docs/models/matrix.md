@@ -25,6 +25,7 @@ each loader's own validation. The reasons follow the table.
 | `moe.comm_backend` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.comm_sms` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.frozen_expert_offload` | trainer | memory | no | no | n/a | no | no | yes | n/a | no | no |
 | `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no | yes | yes | yes |
@@ -53,6 +54,7 @@ each loader's own validation. The reasons follow the table.
 - `moe.comm_backend`: The expert-parallel all-to-all backend. Today: `loader_options.ep_comm_backend`.
 - `moe.comm_sms`: Streaming multiprocessors reserved for expert-parallel communication. Today: `loader_options.deepep_num_sms`.
 - `moe.comm_token_chunk`: Token chunk size of the expert-parallel dispatch. Today: `loader_options.deepep_token_chunk_size`.
+- `moe.frozen_expert_offload`: Frozen routed experts in pinned host memory, copied into two GPU buffers per experts call with the next layer prefetched (LoRA). Today: `loader_options.frozen_expert_offload`; `ARL_OFFLOAD_FROZEN_EXPERTS` when unset.
 - `moe.grouped_mm`: Run the experts as one grouped matmul. Today: `loader_options.moe_use_grouped_mm`.
 - `moe.sonicmoe`: Run BF16 routed experts through SonicMoE on the expert-parallel receive buffer when that kernel applies. Off keeps the grouped GEMM path. Today: `loader_options.moe_use_sonicmoe`.
 - `numerics.fp32_parity`: Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights under bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and under full activation checkpointing every decoder layer after the first holds the residual as a second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product, output gate and hyper-connection mix and injection in fp32. Today: `loader_options.fp32_parity`. Remove when: no job needs the residual adds, rotary embedding and beta gate in the input dtype.
@@ -68,12 +70,13 @@ each loader's own validation. The reasons follow the table.
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
@@ -84,12 +87,13 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
@@ -98,7 +102,7 @@ Extends `generic_moe`.
 
 ## `dflash2`
 
-17 of 25 options unsupported.
+17 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -114,6 +118,7 @@ Extends `generic_moe`.
 - `moe.comm_backend` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.comm_sms` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.frozen_expert_offload` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.sonicmoe` (n/a): the loader rejects expert parallelism and has no expert options
 - `numerics.fp32_parity` (no): this loader has no fp32_parity option
@@ -126,12 +131,13 @@ Extends `generic_moe`.
 
 ## `generic_moe`
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
@@ -142,18 +148,19 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm_moe_dsa`
 
-8 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -166,7 +173,7 @@ Extends `generic_moe`.
 
 ## `huggingface`
 
-7 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -175,6 +182,7 @@ Extends `generic_moe`.
 - `moe.comm_backend` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_sms` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the huggingface loader rejects expert parallelism and has no expert options
+- `moe.frozen_expert_offload` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.sonicmoe` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `numerics.fp32_routed_weighting` (no): no equivalent option; only glm5_next and qwen4_exp have one
@@ -183,12 +191,13 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-7 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
@@ -198,12 +207,13 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`

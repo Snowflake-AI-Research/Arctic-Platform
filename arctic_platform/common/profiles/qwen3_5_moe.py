@@ -56,6 +56,7 @@ def register(registry: Registry) -> None:
             "compile.fullgraph": "the loader rejects `patches.compile`",
             "peft": "the loader rejects `patches.peft`: expert adapter integration is not yet supported",
             "zorro_train": "the loader rejects `patches.zorro_train`",
+            "moe.frozen_expert_offload": "only the glm_moe_dsa loader offloads frozen routed experts",
         },
         not_applicable={
             "attention.sparse_mla": "Qwen3.5-MoE has no sparse MLA attention",

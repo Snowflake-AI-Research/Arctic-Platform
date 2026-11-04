@@ -154,6 +154,17 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.frozen_expert_offload",
+        runs_in="trainer",
+        goal="memory",
+        why=(
+            "Frozen routed experts in pinned host memory, copied into two GPU buffers per experts call with the next"
+            " layer prefetched (LoRA)."
+        ),
+        source="`loader_options.frozen_expert_offload`; `ARL_OFFLOAD_FROZEN_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",
