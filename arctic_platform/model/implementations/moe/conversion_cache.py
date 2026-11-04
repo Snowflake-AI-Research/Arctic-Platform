@@ -383,7 +383,7 @@ def wait_for_conversion_cache(
         _read_cache_marker(preparation_progress) if preparation_progress and not fresh_attempt else {}
     )
     baseline_errors = [
-        marker.get("error")
+        str(marker["error"])
         for marker in (initial_failure, initial_preparation)
         if attempt_id is not None and marker.get("attempt_id") == attempt_id and marker.get("error")
     ]
