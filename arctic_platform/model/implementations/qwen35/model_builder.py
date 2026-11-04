@@ -52,6 +52,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_is_node_local,
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
+    get_checkpoint_converter,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
 )
@@ -551,10 +552,8 @@ def prepare_weight_conversion(
     )
     snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
     # Models whose snapshot cannot sit in host memory convert shard by shard.
-    stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
-    if stream_convert_fn is None:
-        target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
-        stream_convert_fn = getattr(model, f"convert_to_{target_format}_checkpoint", None)
+    target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
+    stream_convert_fn = get_checkpoint_converter(model, target_format)
     node_local = conversion_cache_is_node_local(snapshot_path)
     attempt_id = conversion_cache_attempt_id(shared=not node_local and not conversion_cache_ready(snapshot_path))
     if node_local or rank == 0:

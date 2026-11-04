@@ -23,6 +23,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_is_node_local,
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
+    get_checkpoint_converter,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
 )
@@ -288,7 +289,7 @@ def prepare_weight_conversion(
         "state dict. Trying to auto-convert..."
     )
     snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
-    stream_convert_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
+    stream_convert_fn = get_checkpoint_converter(model, fmt)
     node_local = conversion_cache_is_node_local(snapshot_path)
     attempt_id = conversion_cache_attempt_id(shared=not node_local and not conversion_cache_ready(snapshot_path))
     if node_local or rank == 0:
