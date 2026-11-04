@@ -24,6 +24,7 @@ source admission and constructor capacity remain the operational caller's work.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import math
 from dataclasses import dataclass
@@ -318,10 +319,13 @@ def validate_sequence_parallel_microbatches(
     backward: bool = True,
     ep_group=None,
     loss_scales=None,
+    request_check: Callable[[], None] | None = None,
+    sp_group=None,
 ) -> dict:
     """Validate the entire request before any model call or gradient-boundary mutation."""
     failure = None
     index = None
+    signature = None
     try:
         membership = sp_info() if callable(sp_info) else sp_info
         _, world, ranks, _ = _membership(membership)
@@ -335,6 +339,11 @@ def validate_sequence_parallel_microbatches(
                 configured_dp is not None and configured_dp != logical_dp
             ):
                 raise ValueError("SP meta dp_size does not match actual logical-DP membership")
+        if request_check is not None:
+            request_check()
+        loss_scales = loss_scales() if callable(loss_scales) else loss_scales
+        if loss_scales is not None and len(loss_scales) != len(microbatches):
+            raise ValueError("SP packed loss scale count must match the microbatch count")
         if loss_scales is not None and any(
             isinstance(scale, bool) or not isinstance(scale, Real) or not math.isfinite(scale) or scale < 0
             for scale in loss_scales
@@ -342,6 +351,14 @@ def validate_sequence_parallel_microbatches(
             raise ValueError("SP packed loss scale must be finite and nonnegative")
         for index, microbatch in enumerate(microbatches):
             prepare_token_partition(microbatch, sp_info=membership)
+        if sp_group is not None:
+            checksum = hashlib.sha256()
+            for microbatch in microbatches:
+                for name in sorted(TOKEN_FIELDS & microbatch.keys() | {"attention_mask"}):
+                    tensor = microbatch[name].detach().contiguous().cpu()
+                    checksum.update(f"{name}:{tensor.dtype}:{tuple(tensor.shape)}:".encode())
+                    checksum.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
+            signature = torch.tensor(list(checksum.digest()), dtype=torch.uint8, device=device)
     except Exception as error:
         context = "request" if index is None else f"microbatch {index}"
         failure_type = ValueError if isinstance(error, ValueError) else RuntimeError
@@ -353,6 +370,14 @@ def validate_sequence_parallel_microbatches(
             failure = ValueError("SP request preflight failed on another logical-DP shard")
     if failure is not None:
         raise failure
+    if synchronize and signature is not None:
+        signatures = [torch.empty_like(signature) for _ in ranks]
+        dist.all_gather(signatures, signature, group=sp_group)
+        mismatch = any(not torch.equal(signature, peer) for peer in signatures)
+        flag = torch.tensor(int(mismatch), dtype=torch.int32, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item():
+            raise ValueError("SP members must receive identical token rows and loss inputs")
     return membership
 
 

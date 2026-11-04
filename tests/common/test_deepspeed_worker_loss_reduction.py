@@ -161,6 +161,11 @@ class _SPAccumulationEngine(_Engine):
 
 def _sp_execution_worker(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda output, value, **kwargs: [peer.copy_(value) for peer in output],
+    )
     worker = _worker(_SPAccumulationEngine())
     worker.world_size = 4
     worker.sp_size = 2
@@ -333,6 +338,54 @@ def test_sp_preflight_collectively_rejects_runtime_and_request_errors(monkeypatc
     with pytest.raises((RuntimeError, ValueError), match="preflight runtime error|ep_size=1|dp_size"):
         worker.forward_backward(request)
     assert reductions == [1]
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
+
+
+@pytest.mark.parametrize("fault", ["local-loss", "peer-loss", "reducer"])
+def test_sp_loss_setup_errors_reach_failure_collective_before_boundary(monkeypatch, fault):
+    from arctic_platform.rl import processors
+
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    flags = []
+
+    def reduce(flag, **kwargs):
+        flags.append(flag.item())
+        if fault == "peer-loss" and len(flags) == 3:
+            flag.fill_(1)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected rank-local loss setup failure")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    monkeypatch.setattr(
+        deepspeed_worker,
+        "verify_sequence_parallel_reduction",
+        fail if fault == "reducer" else lambda *args, **kwargs: None,
+    )
+    if fault == "local-loss":
+        monkeypatch.setattr(processors, "resolve_packed_loss_reduction", fail)
+    with pytest.raises((RuntimeError, ValueError), match="loss setup failure|another logical-DP shard"):
+        worker.forward_backward(request)
+    assert flags == [0, 0, 0 if fault == "peer-loss" else 1]
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
+
+
+def test_sp_request_rejects_different_member_rows_before_loss_or_model(monkeypatch):
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    flags = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda flag, **kwargs: flags.append(flag.item()))
+
+    def gather(output, value, **kwargs):
+        for peer in output:
+            peer.copy_(value)
+        output[-1][0] ^= 1
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    with pytest.raises(ValueError, match="identical token rows"):
+        worker.forward_backward(request)
+    assert flags == [0, 1]
     assert worker.engine.events == []
     assert worker.engine.parameter.grad is None
 

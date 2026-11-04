@@ -268,6 +268,8 @@ class DeepSpeedWorker:
 
         ep_size = spec.parallelism.expert_parallel
         sp_size = spec.parallelism.sequence_parallel
+        if ep_size > 1 and sp_size > 1:
+            raise ValueError("SP GRPO currently requires ep_size=1; EP>1 gradient parity is not established")
         self.mpu, self.sp_group, self.sp_rank, self.ep_group = None, None, 0, None
         if ep_size == sp_size == 1:
             return None
@@ -537,9 +539,8 @@ class DeepSpeedWorker:
                 processing=processing,
                 backward=backward,
                 ep_group=getattr(self, "ep_group", None),
+                sp_group=self.sp_group,
             )
-            if backward:
-                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
 
         # Resolve before selecting a specialized pipeline so class registry
         # precedence applies equally to SFT and RL names. Do not fill a missing
@@ -549,44 +550,48 @@ class DeepSpeedWorker:
         from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        if loss_object is None and loss_fn is not None:
-            loss_object = resolve_loss(loss_fn)
-        if loss_object is not None:
-            loss_object.model_call_count_callback(
-                [num_micro_batches],
-                processing.get("config") or {},
-            )
-        legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
-        use_sft_pipeline = (
-            legacy_sft_loss is not None
-            and loss_object is not None
-            and loss_object.is_legacy_adapter_for(legacy_sft_loss)
-        )
-
-        if use_sft_pipeline:
-            self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
-
+        use_sft_pipeline = False
         loss_reduction = None
-        if not use_sft_pipeline:
-            from arctic_platform.rl.processors import resolve_packed_loss_reduction
 
-            loss_reduction = resolve_packed_loss_reduction(
-                processing,
-                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
-                require_declared=False,
-                loss_object=loss_object,
+        def prepare_loss():
+            nonlocal loss_object, use_sft_pipeline, loss_reduction
+            if sp_info is not None and backward:
+                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
+            if loss_object is None and loss_fn is not None:
+                loss_object = resolve_loss(loss_fn)
+            if loss_object is not None:
+                loss_object.model_call_count_callback([num_micro_batches], processing.get("config") or {})
+            legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
+            use_sft_pipeline = (
+                legacy_sft_loss is not None
+                and loss_object is not None
+                and loss_object.is_legacy_adapter_for(legacy_sft_loss)
             )
+            if use_sft_pipeline:
+                self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
+            else:
+                from arctic_platform.rl.processors import resolve_packed_loss_reduction
+
+                loss_reduction = resolve_packed_loss_reduction(
+                    processing,
+                    [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
+                    require_declared=False,
+                    loss_object=loss_object,
+                )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
-        if sp_info is not None and loss_reduction is not None:
+        if sp_info is not None:
             validate_sequence_parallel_microbatches(
-                [],
+                micro_batch_data,
                 sp_info=sp_info,
                 synchronize=True,
                 device=self._device,
-                loss_scales=loss_reduction.loss_scales,
+                request_check=prepare_loss,
+                loss_scales=lambda: loss_reduction.loss_scales if loss_reduction is not None else None,
             )
+        else:
+            prepare_loss()
 
         for i, micro_batch in enumerate(micro_batch_data):
 

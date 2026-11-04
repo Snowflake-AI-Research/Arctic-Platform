@@ -51,15 +51,15 @@ def runtime(monkeypatch):
     return SimpleNamespace(mod=mod, worker=worker, ep=ep, sp=sp, mpu=mpu, calls=calls)
 
 
-def _spec(ep=8, sp=8):
+def _spec(ep=1, sp=8):
     return SimpleNamespace(parallelism=SimpleNamespace(expert_parallel=ep, sequence_parallel=sp))
 
 
 def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):
     config = {"zero_optimization": {"stage": 2}}
     result = runtime.worker._setup_model_parallel_groups(_spec(), config, {"ep_group_layout": "packed"})
-    assert runtime.calls == [(8, 8, {"world_size": 16, "gpus_per_node": 8, "ep_group_layout": "packed"})]
-    assert result == {"ep_group": runtime.ep, "sp_group": runtime.sp}
+    assert runtime.calls == [(8, 1, {"world_size": 16, "gpus_per_node": 8, "ep_group_layout": "packed"})]
+    assert result == {"ep_group": None, "sp_group": runtime.sp}
     assert runtime.worker.mpu is runtime.mpu
     assert config["sequence_parallel_size"] == 8
 
@@ -67,7 +67,7 @@ def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):
 @pytest.mark.parametrize("worker_config", [{}, {"ep_group_layout": "auto"}, {"ep_group_layout": "packed"}])
 def test_worker_groups_ep_only_uses_replicated_setup(runtime, worker_config):
     original = deepcopy(worker_config)
-    result = runtime.worker._setup_model_parallel_groups(_spec(sp=1), {}, worker_config)
+    result = runtime.worker._setup_model_parallel_groups(_spec(ep=8, sp=1), {}, worker_config)
     assert runtime.calls == [(1, 8, {"world_size": 16, "gpus_per_node": None, **worker_config})]
     assert worker_config == original
     assert result == {"ep_group": runtime.ep, "sp_group": None}
@@ -77,6 +77,13 @@ def test_worker_groups_ep_only_uses_replicated_setup(runtime, worker_config):
 def test_worker_groups_dense_route_does_not_create_or_gather(runtime, monkeypatch):
     monkeypatch.setattr(runtime.mod.dist, "all_gather_object", lambda *args: pytest.fail("unexpected collective"))
     assert runtime.worker._setup_model_parallel_groups(_spec(ep=1, sp=1), {}, {}) is None
+    assert runtime.calls == []
+
+
+def test_worker_rejects_expert_and_sequence_parallelism_before_group_creation(runtime, monkeypatch):
+    monkeypatch.setattr(runtime.mod.dist, "all_gather_object", lambda *args: pytest.fail("unexpected collective"))
+    with pytest.raises(ValueError, match="requires ep_size=1"):
+        runtime.worker._setup_model_parallel_groups(_spec(ep=8, sp=8), {}, {})
     assert runtime.calls == []
 
 
@@ -102,7 +109,7 @@ def test_worker_groups_unsupported_placement_fails_before_creation(runtime, monk
     [
         (_spec(ep=6), {}),
         (_spec(sp=3), {}),
-        (_spec(), {"zero_optimization": {"stage": 3}}),
+        (_spec(ep=8, sp=1), {"zero_optimization": {"stage": 3}}),
         (_spec(), {"sequence_parallel_size": 4}),
     ],
 )
@@ -130,7 +137,7 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     def build(selected, *, parallel_groups):
         events.append("model")
         assert selected is spec
-        assert parallel_groups == {"ep_group": runtime.ep, "sp_group": runtime.sp}
+        assert parallel_groups == {"ep_group": None, "sp_group": runtime.sp}
         return SimpleNamespace(model=model)
 
     def initialize(**kwargs):
@@ -152,13 +159,13 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     request = {
         "model_name": "synthetic",
         "job_type": "training",
-        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 8, "sp_size": 8},
+        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 1, "sp_size": 8},
         "ds_config": {"zero_optimization": {"stage": 2}, "bf16": {"enabled": True, "bf16_optimizer_states": True}},
     }
     original = deepcopy(request)
     assert worker.initialize("localhost", request)
     assert request == original
-    assert events == ["distributed", "groups", "model", "preserve", "engine"]
+    assert events == ["distributed", "groups", "model", "engine"]
 
 
 @pytest.mark.parametrize(
