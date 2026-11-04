@@ -58,7 +58,7 @@ def load_state_dict(save_dir: Path) -> dict[str, Tensor]:
 def convert_safetensor_checkpoint(
     source_dir: Path,
     save_dir: Path,
-    convert_fn: Callable[[dict[str, Tensor]], object],
+    convert_fn: Callable[[dict[str, Tensor]], dict[str, Tensor] | None],
     partition_fn: Callable[[tuple[str, ...]], Iterable[Iterable[str]]],
 ) -> None:
     """Convert complete dependency groups, retaining only one group in memory."""
@@ -66,8 +66,8 @@ def convert_safetensor_checkpoint(
     index_path = source_dir / SAFE_WEIGHTS_INDEX_NAME
     if index_path.is_file():
         with index_path.open(encoding="utf-8") as stream:
-            weight_map = json.load(stream)["weight_map"]
-        locations = {name: source_dir / shard for name, shard in weight_map.items()}
+            source_weight_map = json.load(stream)["weight_map"]
+        locations = {name: source_dir / shard for name, shard in source_weight_map.items()}
         shard_paths = sorted(set(locations.values()))
     else:
         shard_paths = sorted(source_dir.glob("*.safetensors"))
