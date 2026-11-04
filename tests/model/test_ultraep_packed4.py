@@ -172,8 +172,8 @@ def main():
             assert err < 2e-2, f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
     if rank == 0:
         print(
-            f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'mxfp4' if mxfp4 else 'w4a16'}): EP{world}, {S} spares: copies"
-            " compute with their owners' weights and LoRA, LoRA gradients return; rank load max/mean"
+            f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'mxfp4' if mxfp4 else 'w4a16'}): EP{world}, {S} spares:"
+            " copies compute with their owners' weights and LoRA, LoRA gradients return; rank load max/mean"
             f" {(logical.max() / logical.float().mean()).item():.3f} ->"
             f" {(loads.max() / loads.float().mean()).item():.3f}"
         )

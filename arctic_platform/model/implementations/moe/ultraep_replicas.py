@@ -70,7 +70,8 @@ def ultraep_spares() -> int:
 
 
 def frozen_quantized(experts) -> bool:
-    """Experts whose base weights are frozen quantized codes (block FP8 or packed 4-bit), the ``ultraep_frozen`` path."""
+    """Experts whose base weights are frozen quantized codes (block FP8 or packed 4-bit): the ``ultraep_frozen``
+    path."""
     return getattr(experts, "fp8_block_size", None) is not None or getattr(experts, "packed4", None) is not None
 
 

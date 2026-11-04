@@ -16,10 +16,10 @@
 
 ``MoeRuntimeOptions`` is a base of the MoE loaders' ``loader_options`` models (glm_moe_dsa, qwen3_5_moe, which the
 deepseek_v4 / deepseek_v41 and flash_moe loaders validate with too, and generic_moe), so a job sets these fields like
-any other loader option (DSS: ``training_config.model_options.moe.*``, or the ``prime_rl`` block). Each field steers one module that keeps its
-environment variable as the fallback: a field left unset (None) leaves that variable in charge, so a job that sets
-none of them runs exactly as before. ``apply_moe_runtime_options`` hands the fields to their modules once per model
-load, before the model is built.
+any other loader option (DSS: ``training_config.model_options.moe.*``, or the ``prime_rl`` block). Each field steers
+one module that keeps its environment variable as the fallback: a field left unset (None) leaves that variable in
+charge, so a job that sets none of them runs exactly as before. ``apply_moe_runtime_options`` hands the fields to
+their modules once per model load, before the model is built.
 """
 
 from __future__ import annotations
