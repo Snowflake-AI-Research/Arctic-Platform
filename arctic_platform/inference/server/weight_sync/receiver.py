@@ -947,6 +947,19 @@ class WeightSyncExtension:
             raise RuntimeError("vLLM LoRA manager not created (model not loaded yet?).")
         return adapter_manager
 
+    def served_lora_names(self, names: list[str]) -> list[str]:
+        """Rename trainer adapter tensors the way LoRA weight sync does before building a ``LoRAModel``."""
+        prefix = _served_lm_module_prefix(getattr(self.model_runner, "model", None))
+        return [_remap_lora_key(name, prefix) for name in names]
+
+    def unbound_lora_modules(self, lora_int_id: int) -> list[str]:
+        """Modules of a registered adapter that no served LoRA layer will read."""
+        adapter_manager = self._lora_adapter_manager()
+        lora_model = adapter_manager.get_adapter(lora_int_id)
+        if lora_model is None:
+            raise RuntimeError(f"LoRA adapter id {lora_int_id} is not registered")
+        return sorted(set(lora_model.loras) - set(adapter_manager.modules))
+
     def sync_lora_weights_broadcast(
         self,
         master_addr: str,
