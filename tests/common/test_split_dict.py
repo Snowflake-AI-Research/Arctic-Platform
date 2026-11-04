@@ -222,6 +222,13 @@ class TestDpSizeDividesBySp(TestCasePlus):
     def test_sp_size_from_training_config(self):
         self.assertEqual(sp_size_from_job_config({"training_config": {"sp_size": 4}}), 4)
 
+    def test_sp_size_from_worker_alias(self):
+        job = JobConfig(model_name="m", ds_worker_config={"sp_size": 2})
+        self.assertEqual(job.sp_size, 2)
+        self.assertEqual(sp_size_from_job_config(job.model_dump()), 2)
+        with self.assertRaises(ValueError):
+            JobConfig(model_name="m", ds_worker_config={"sp_size": 2}, training_config={"sp_size": 4})
+
     def test_sp_size_unset_is_one(self):
         self.assertEqual(sp_size_from_job_config({}), 1)
         self.assertEqual(sp_size_from_job_config(None), 1)
