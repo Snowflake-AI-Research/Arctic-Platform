@@ -77,7 +77,7 @@ def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> Non
 
 
 def _build_iter_full_hf_weights(model: nn.Module):
-    ordinary = qwen_ds._build_iter_full_hf_weights(model)
+    ordinary = qwen_ds._build_iter_full_hf_weights_with_mtp(model)
     config = getattr(model.config, "text_config", model.config)
     parts = getattr(config, "split_ngram_parts", 1)
     if not isinstance(parts, int) or isinstance(parts, bool) or parts < 1:
