@@ -17,6 +17,14 @@ WEIGHT_CONVERSION_CACHE_DIR_ENV = "DSS_WEIGHT_CONVERSION_CACHE_DIR"
 WEIGHT_CONVERSION_CACHE_SCOPE_ENV = "DSS_WEIGHT_CONVERSION_CACHE_SCOPE"
 WEIGHT_CONVERSION_ATTEMPT_ID_ENV = "DSS_WEIGHT_CONVERSION_ATTEMPT_ID"
 DEFAULT_WEIGHT_CONVERSION_CACHE_DIR = "/data-fast/prime-rl-weight-cache"
+_CACHE_HEARTBEAT_INTERVAL = 1
+
+
+def get_checkpoint_converter(model, fmt: str) -> Callable[[Path, Path], None] | None:
+    converter = getattr(model, f"stream_convert_to_{fmt}", None)
+    if converter is None:
+        converter = getattr(model, f"convert_to_{fmt}_checkpoint", None)
+    return converter
 
 
 def sibling_conversion_cache_path(source_path: Path, fmt: str) -> Path:
@@ -90,8 +98,14 @@ def _read_cache_marker(path: Path) -> dict:
 
 def _write_cache_marker(path: Path, marker: dict) -> None:
     temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(marker), encoding="utf-8", errors="replace")
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(marker), encoding="utf-8", errors="replace")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            logger.info("Could not remove temporary conversion marker %s", temporary, exc_info=True)
 
 
 def conversion_cache_attempt_id(*, shared: bool = False) -> str | None:
@@ -134,6 +148,9 @@ def wait_for_conversion_cache(
     observed = None
     last_progress = time.monotonic()
     while not conversion_cache_ready(path):
+        failure = _read_cache_marker(failure_path)
+        if attempt_id is not None and failure.get("attempt_id") == attempt_id:
+            raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure.get('error')}")
         progress = _read_cache_marker(progress_path)
         token = progress.get("attempt_id")
         if token is not None and token != old_failure and (attempt_id is None or token == attempt_id):
@@ -165,9 +182,8 @@ def _write_conversion_cache(
     local_rank: int,
     stream_convert_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
-    tmp_path = snapshot_path.with_name(f"{snapshot_path.name}.tmp-rank{rank}-pid{os.getpid()}")
-    if tmp_path.exists():
-        shutil.rmtree(tmp_path)
+    # A unique workspace avoids pid collisions across nodes and never reclaims another writer's live files.
+    tmp_path = snapshot_path.with_name(f"{snapshot_path.name}.tmp-rank{rank}-pid{os.getpid()}-{uuid.uuid4().hex}")
     if snapshot_path.exists():
         shutil.rmtree(snapshot_path)
 
@@ -261,45 +277,57 @@ def ensure_node_local_conversion_cache(
         return
 
     attempt_id = attempt_id or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV)
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     failure_path = snapshot_path.with_name(f"{snapshot_path.name}.failed")
-    initial_failure = _read_cache_marker(failure_path).get("attempt_id")
-    initial_writer = _read_cache_marker(snapshot_path.with_name(f"{snapshot_path.name}.in-progress")).get("attempt_id")
-    lock_path = snapshot_path.parent / f".{snapshot_path.name}.lock"
-    with open(lock_path, "w", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    progress_path = snapshot_path.with_name(f"{snapshot_path.name}.in-progress")
+    token = attempt_id or uuid.uuid4().hex
+    failure_recorded = False
+
+    def record_failure(error):
+        nonlocal failure_recorded
+        failure_recorded = True
         try:
-            if not conversion_cache_ready(snapshot_path):
+            _write_cache_marker(
+                failure_path, dict(attempt_id=token, error=f"rank={rank}: {type(error).__name__}: {error}"),
+            )
+        except Exception:
+            logger.warning("Could not record conversion failure for %s", snapshot_path, exc_info=True)
+
+    initial_failure = _read_cache_marker(failure_path).get("attempt_id")
+    initial_writer = _read_cache_marker(progress_path).get("attempt_id")
+    lock_path = snapshot_path.parent / f".{snapshot_path.name}.lock"
+    try:
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if conversion_cache_ready(snapshot_path):
+                    return
                 failure = _read_cache_marker(failure_path)
                 if failure.get("attempt_id") is not None and (
                     failure["attempt_id"] == attempt_id
                     or failure["attempt_id"] != initial_failure
                     or (initial_failure is None and failure["attempt_id"] == initial_writer)
                 ):
+                    failure_recorded = True
                     raise RuntimeError(f"Converted weight cache writer failed for {snapshot_path}: {failure.get('error')}")
-                failure_path.unlink(missing_ok=True)
-                # Every writer holds this cache's lock; abandoned temporary directories are not live writers.
-                for abandoned in snapshot_path.parent.glob(f"{snapshot_path.name}.tmp-rank*-pid*"):
-                    if abandoned.is_dir():
-                        shutil.rmtree(abandoned)
-                token = attempt_id or uuid.uuid4().hex
-                progress_path = snapshot_path.with_name(f"{snapshot_path.name}.in-progress")
                 stop = threading.Event()
-                _write_cache_marker(progress_path, dict(attempt_id=token, heartbeat=0))
-
-                def heartbeat():
-                    count = 0
-                    while not stop.wait(1):
-                        count += 1
-                        try:
-                            _write_cache_marker(progress_path, dict(attempt_id=token, heartbeat=count))
-                        except Exception:
-                            logger.info("Could not update conversion heartbeat for %s", snapshot_path, exc_info=True)
-                            return
-
-                thread = threading.Thread(target=heartbeat, daemon=True)
-                thread.start()
+                thread = None
                 try:
+                    _write_cache_marker(progress_path, dict(attempt_id=token, heartbeat=0))
+
+                    def heartbeat():
+                        count = 0
+                        while not stop.wait(_CACHE_HEARTBEAT_INTERVAL):
+                            count += 1
+                            try:
+                                _write_cache_marker(progress_path, dict(attempt_id=token, heartbeat=count))
+                            except Exception:
+                                logger.warning(
+                                    "Could not update conversion heartbeat for %s; retrying", snapshot_path, exc_info=True,
+                                )
+
+                    thread = threading.Thread(target=heartbeat, daemon=True)
+                    thread.start()
                     _write_conversion_cache(
                         source_path,
                         snapshot_path,
@@ -313,24 +341,21 @@ def ensure_node_local_conversion_cache(
                         stream_convert_fn=stream_convert_fn,
                     )
                 except BaseException as error:
-                    try:
-                        _write_cache_marker(
-                            failure_path,
-                            dict(attempt_id=token, error=f"rank={rank}: {type(error).__name__}: {error}"),
-                        )
-                    except Exception:
-                        logger.info("Could not record conversion failure for %s", snapshot_path, exc_info=True)
+                    # Publish failure before releasing the lock, so a waiting local rank cannot retry it.
+                    record_failure(error)
                     raise
                 finally:
                     stop.set()
-                    thread.join()
-            elif local_rank == 0:
-                logger.info(
-                    "Reusing existing %s→%s conversion cache at %s (rank=%d)",
-                    src_fmt,
-                    dst_fmt,
-                    snapshot_path,
-                    rank,
-                )
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    if thread is not None and thread.ident is not None:
+                        thread.join()
+                    try:
+                        if _read_cache_marker(progress_path).get("attempt_id") == token:
+                            progress_path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.info("Could not remove conversion progress marker for %s", snapshot_path, exc_info=True)
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except BaseException as error:
+        if not failure_recorded:
+            record_failure(error)
+        raise

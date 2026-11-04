@@ -162,7 +162,7 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path, monkeypatch, s
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
-    assert sorted(leftovers) == ["prime.failed", "prime.in-progress"]
+    assert sorted(leftovers) == ["prime.failed"]
     assert "disk full" in (cache_path.parent / "prime.failed").read_text()
     assert not conversion_cache.conversion_cache_ready(cache_path)
 
