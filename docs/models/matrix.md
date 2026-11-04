@@ -30,6 +30,7 @@ each loader's own validation. The reasons follow the table.
 | `moe.expert_replicas_ema` | trainer | speed | no | no | n/a | no | no | yes | n/a | no | no |
 | `moe.frozen_expert_offload` | trainer | memory | no | no | n/a | no | no | yes | n/a | no | no |
 | `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
+| `moe.shard_dense` | trainer | memory | no | no | n/a | no | no | yes | n/a | no | no |
 | `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
 | `moe.ultraep_ipc_symm` | trainer | robustness | no | no | n/a | no | no | yes | n/a | no | no |
 | `moe.ultraep_spares` | trainer | speed | no | no | n/a | no | no | yes | n/a | no | no |
@@ -64,6 +65,7 @@ each loader's own validation. The reasons follow the table.
 - `moe.expert_replicas_ema`: Weight of the newest micro-batch's routed counts in the online replicas' load estimate. Today: `loader_options.expert_replicas_ema`; `ARL_EXPERT_REPLICAS_EMA` when unset.
 - `moe.frozen_expert_offload`: Frozen routed experts in pinned host memory, copied into two GPU buffers per experts call with the next layer prefetched (LoRA). Today: `loader_options.frozen_expert_offload`; `ARL_OFFLOAD_FROZEN_EXPERTS` when unset.
 - `moe.grouped_mm`: Run the experts as one grouped matmul. Today: `loader_options.moe_use_grouped_mm`.
+- `moe.shard_dense`: Full fine-tuning: the trainable weights every GPU holds whole (attention, shared experts, dense MLPs, router, norms, embedding, LM head) sharded over the GPUs of each node, gathered around each layer call and reduce-scattered in its backward. Today: `loader_options.shard_dense`; `ARL_SHARD_DENSE` when unset.
 - `moe.sonicmoe`: Run BF16 routed experts through SonicMoE on the expert-parallel receive buffer when that kernel applies. Off keeps the grouped GEMM path. Today: `loader_options.moe_use_sonicmoe`.
 - `moe.ultraep_ipc_symm`: Map UltraEP's peer buffers through CUDA IPC handles: torch symmetric memory refuses ranks that each see only their own GPU, as DSS runs them. Today: `loader_options.ultraep_ipc_symm`; `ULTRA_EP_IPC_SYMM` when unset.
 - `moe.ultraep_spares`: Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest experts inside the owner's NVLink domain: trained BF16 experts (full fine-tuning), or frozen block-FP8 experts with their LoRA. 0 turns it off. Today: `loader_options.ultraep_spares`; `ARL_ULTRAEP_SPARES` when unset.
@@ -80,7 +82,7 @@ each loader's own validation. The reasons follow the table.
 
 Extends `generic_moe`.
 
-14 of 31 options unsupported.
+15 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -90,6 +92,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
@@ -102,7 +105,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-14 of 31 options unsupported.
+15 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -112,6 +115,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
@@ -122,7 +126,7 @@ Extends `generic_moe`.
 
 ## `dflash2`
 
-17 of 31 options unsupported.
+17 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -143,6 +147,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas_ema` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.frozen_expert_offload` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the loader rejects expert parallelism and has no expert options
+- `moe.shard_dense` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.sonicmoe` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.ultraep_ipc_symm` (n/a): the loader rejects expert parallelism and has no expert options
 - `moe.ultraep_spares` (n/a): the loader rejects expert parallelism and has no expert options
@@ -156,7 +161,7 @@ Extends `generic_moe`.
 
 ## `generic_moe`
 
-14 of 31 options unsupported.
+15 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -166,6 +171,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
@@ -178,7 +184,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-12 of 31 options unsupported.
+13 of 32 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -187,6 +193,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
@@ -195,7 +202,7 @@ Extends `generic_moe`.
 
 ## `glm_moe_dsa`
 
-8 of 31 options unsupported.
+8 of 32 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -208,7 +215,7 @@ Extends `generic_moe`.
 
 ## `huggingface`
 
-7 of 31 options unsupported.
+7 of 32 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -222,6 +229,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas_ema` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.frozen_expert_offload` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
+- `moe.shard_dense` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.sonicmoe` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.ultraep_ipc_symm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.ultraep_spares` (n/a): the huggingface loader rejects expert parallelism and has no expert options
@@ -231,7 +239,7 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-13 of 31 options unsupported.
+14 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -241,6 +249,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
@@ -252,7 +261,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-12 of 31 options unsupported.
+13 of 32 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -262,6 +271,7 @@ Extends `generic_moe`.
 - `moe.expert_replicas` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)
 - `moe.expert_replicas_ema` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)
 - `moe.frozen_expert_offload` (no): only the glm_moe_dsa loader offloads frozen routed experts
+- `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `moe.ultraep_ipc_symm` (no): only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)
 - `moe.ultraep_spares` (no): only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one

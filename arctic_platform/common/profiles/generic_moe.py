@@ -62,6 +62,7 @@ def register(registry: Registry) -> None:
             "moe.expert_replicas": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)",
             "moe.expert_replicas_ema": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)",
             "moe.expert_placement": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_PLACEMENT)",
+            "moe.shard_dense": "only the glm_moe_dsa loader shards the replicated weights",
         },
         not_applicable={
             "attention.sparse_mla": "no model family behind this loader uses sparse MLA attention",

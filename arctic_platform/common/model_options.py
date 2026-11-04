@@ -219,6 +219,18 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.shard_dense",
+        runs_in="trainer",
+        goal="memory",
+        why=(
+            "Full fine-tuning: the trainable weights every GPU holds whole (attention, shared experts, dense MLPs,"
+            " router, norms, embedding, LM head) sharded over the GPUs of each node, gathered around each layer call"
+            " and reduce-scattered in its backward."
+        ),
+        source="`loader_options.shard_dense`; `ARL_SHARD_DENSE` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

@@ -134,6 +134,12 @@ def load_glm_moe_dsa(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm52 import load_glm_moe_dsa_model
 
     options = GlmMoeDsaOptions.model_validate(ctx.spec.loader_options)
+    from arctic_platform.model.implementations.moe.dense_shard import resolve_dense_sharding
+
+    if ctx.spec.patches.peft and resolve_dense_sharding(options.shard_dense):
+        raise ValueError(
+            "shard_dense shards trainable weights for full fine-tuning; it does not support PEFT (LoRA) models"
+        )
     assert ctx.spec.attn_implementation is not None
     model = load_glm_moe_dsa_model(
         model_name=ctx.spec.model_path_or_name,

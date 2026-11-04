@@ -158,6 +158,13 @@ def load_glm_moe_dsa_model(
     ep_group=None,
     options: GlmMoeDsaOptions,
 ) -> nn.Module:
+    from arctic_platform.model.implementations.moe.dense_shard import resolve_dense_sharding
+
+    if resolve_dense_sharding(options.shard_dense) and options.tiled_mlp_token_chunk_size is not None:
+        raise ValueError(
+            "shard_dense gathers a layer's weights only around its calls, and the tiled MLP reads the shared "
+            "experts' weights again in its backward: unset tiled_mlp_token_chunk_size"
+        )
     model = _load_moe_model(
         _adapter(),
         load_moe_model_for_deepspeed,
@@ -172,8 +179,16 @@ def load_glm_moe_dsa_model(
         patch_moe_detection=patch_deepspeed_moe_detection,
         device_mesh_type=DeviceMesh,
     )
+    from arctic_platform.model.implementations.moe.dense_shard import dense_sharding_requested
     from arctic_platform.model.implementations.moe.frozen_offload import frozen_expert_offload_requested
 
+    if dense_sharding_requested():
+        if frozen_expert_offload_requested():
+            raise ValueError("shard_dense is for full fine-tuning; frozen_expert_offload is for frozen (LoRA) experts")
+        from arctic_platform.model.implementations.moe.dense_shard import configured_group_size
+        from arctic_platform.model.implementations.moe.dense_shard import install_model_dense_shards
+
+        install_model_dense_shards(model, configured_group_size())
     if frozen_expert_offload_requested():
         from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
         from arctic_platform.model.implementations.moe.logging_utils import get_logger
