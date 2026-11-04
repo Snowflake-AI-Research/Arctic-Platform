@@ -108,6 +108,32 @@ def convert_hf_layer_to_prime(
     ):
         _rename(state_dict, f"{attn}.{source}", f"{attn}.{target}")
 
+    mlp_prefix = f"{prefix}.mlp."
+    packed_key = f"{mlp_prefix}experts.gate_up_proj"
+    if packed_key in state_dict or f"{packed_key}.weight" in state_dict:
+        from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_glm_moe_dsa import (
+            convert_hf_layer_to_tt,
+        )
+
+        # GLM-5.3 nests the same MoE tensor layout under its language-model prefix.
+        converter_prefix = f"model.layers.{layer_idx}.mlp."
+        mlp_state = {
+            converter_prefix + name[len(mlp_prefix) :]: tensor
+            for name, tensor in state_dict.items()
+            if name.startswith(mlp_prefix)
+        }
+        convert_hf_layer_to_tt(mlp_state, layer_idx)
+        for expert_kind in ("experts", "shared_expert"):
+            for projection in ("w1", "w2", "w3"):
+                weight_key = f"{converter_prefix}{expert_kind}.{projection}"
+                if mlp_state[weight_key].dtype == torch.float8_e4m3fn and f"{weight_key}_scale_inv" not in mlp_state:
+                    raise ValueError(f"GLM-5.3 native FP8 weight {weight_key} is missing its scale")
+        for name in tuple(state_dict):
+            if name.startswith(mlp_prefix):
+                del state_dict[name]
+        state_dict.update({mlp_prefix + name[len(converter_prefix) :]: tensor for name, tensor in mlp_state.items()})
+        return state_dict
+
     expert_ids = _expert_indices(state_dict, prefix)
     if expert_ids:
         if expert_ids != list(range(len(expert_ids))):
