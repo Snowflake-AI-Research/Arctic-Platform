@@ -874,17 +874,39 @@ def test_checkpoint_conversion_uses_source_index_and_converter_return(tmp_path):
 
     from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
     from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.implementations.moe.weights import load_state_dict_keys
 
     source = tmp_path / "source"
     source.mkdir()
     save_file({"a": torch.tensor([1.0]), "unindexed": torch.tensor([3.0])}, source / "indexed.safetensors")
     save_file({"a": torch.tensor([99.0])}, source / "stray.safetensors")
     (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "indexed.safetensors"}}))
+    assert load_state_dict_keys(source) == ["a"]
+    original = load_state_dict(source)
+    assert set(original) == {"a"}
+    torch_assert_equal(original["a"], torch.tensor([1.0]))
     destination = tmp_path / "converted"
     convert_safetensor_checkpoint(source, destination, lambda state: {"b": state["a"] + 1}, lambda names: [names])
     converted = load_state_dict(destination)
     assert set(converted) == {"b"}
     torch_assert_equal(converted["b"], torch.tensor([2.0]))
+
+
+@pytest.mark.parametrize("index", [{}, {"weight_map": []}, {"weight_map": {"a": "../outside.safetensors"}}])
+def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
+    from arctic_platform.model.implementations.moe import weights
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    readers = [
+        weights.load_state_dict_keys,
+        weights.load_state_dict,
+        lambda source: weights.convert_safetensor_checkpoint(
+            source, source / "converted", lambda state: state, lambda names: [names]
+        ),
+    ]
+    for reader in readers:
+        with pytest.raises(ValueError, match="Checkpoint"):
+            reader(tmp_path)
 
 
 @pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
