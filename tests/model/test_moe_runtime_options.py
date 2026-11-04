@@ -46,6 +46,7 @@ SWITCHES = {
     "expert_replicas_ema": ("moe.expert_replicas", "replica_ema", "ARL_EXPERT_REPLICAS_EMA", 0.25, 0.5),
 }
 REPLICAS_ENV = "ARL_EXPERT_REPLICAS"
+PLACEMENT_ENV = "ARL_EXPERT_PLACEMENT"
 
 
 def _module(name):
@@ -61,6 +62,7 @@ def _clean(monkeypatch):
     for _, _, env, _, _ in SWITCHES.values():
         monkeypatch.delenv(env, raising=False)
     monkeypatch.delenv(REPLICAS_ENV, raising=False)
+    monkeypatch.delenv(PLACEMENT_ENV, raising=False)
     monkeypatch.delenv("ULTRA_EP_IPC_SYMM", raising=False)
     yield
     apply_moe_runtime_options(MoeRuntimeOptions())  # leave every switch to its environment variable again
@@ -104,7 +106,11 @@ def test_offload_environment_off_values(monkeypatch, value):
 @pytest.mark.parametrize("options_cls", [GenericMoeOptions, Qwen3_5MoeOptions])
 def test_other_moe_loaders_refuse_the_runtime_fields(options_cls, monkeypatch):
     """Only glm_moe_dsa installs these modules; the other MoE loaders refuse the fields instead of ignoring them."""
-    fields = {field: spec[3] for field, spec in SWITCHES.items()} | {"ultraep_ipc_symm": True, "expert_replicas": 2}
+    fields = {field: spec[3] for field, spec in SWITCHES.items()} | {
+        "ultraep_ipc_symm": True,
+        "expert_replicas": 2,
+        "expert_placement": "/nodes/placement.json",
+    }
     for field, value in fields.items():
         with pytest.raises(ValidationError):
             options_cls.model_validate({field: value})
@@ -189,3 +195,29 @@ def test_ipc_symm_is_in_the_environment_when_ultraep_allocates(monkeypatch, conf
     state = trainable.UltraEPState(object(), 3, trainable.ultraep_spares(), torch.zeros(3, 4, 8), torch.zeros(3, 8, 4))
     assert state.spares == 2
     assert observed == [seen, seen]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["/nodes/placement.json", '{"ep_size": 2, "layers": {"0": [1, 0]}}', {"ep_size": 2, "layers": {"0": [1, 0]}}],
+)
+def test_expert_placement_takes_a_path_the_json_or_the_object(value):
+    assert GlmMoeDsaOptions(expert_placement=value).expert_placement == value
+
+
+@pytest.mark.parametrize("value", ["", "  ", "{not json", '{"ep_size": 2}', {"layers": [1, 0]}, {"ep_size": 2}])
+def test_malformed_expert_placements_are_refused(value):
+    with pytest.raises(ValidationError):
+        GlmMoeDsaOptions(expert_placement=value)
+
+
+def test_the_placement_option_wins_and_the_environment_is_the_fallback(monkeypatch):
+    placement = _module("moe.expert_placement")
+    configured = {"ep_size": 2, "layers": {"3": [1, 0]}}
+    monkeypatch.setenv(PLACEMENT_ENV, "/nodes/placement.json")
+    apply_moe_runtime_options(GlmMoeDsaOptions(expert_placement=configured))
+    assert placement.placement_value() == configured
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert placement.placement_value() == "/nodes/placement.json"
+    monkeypatch.delenv(PLACEMENT_ENV)
+    assert placement.placement_value() is None

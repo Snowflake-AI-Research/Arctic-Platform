@@ -61,6 +61,7 @@ def register(registry: Registry) -> None:
             "moe.ultraep_ipc_symm": "only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)",
             "moe.expert_replicas": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)",
             "moe.expert_replicas_ema": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)",
+            "moe.expert_placement": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_PLACEMENT)",
         },
         not_applicable={
             "attention.sparse_mla": "Qwen3.5-MoE has no sparse MLA attention",
