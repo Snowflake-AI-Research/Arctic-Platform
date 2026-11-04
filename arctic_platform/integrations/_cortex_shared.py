@@ -622,7 +622,9 @@ def _to_cortex_unpacked_verl_grpo(
             "response length from the attention_mask columns at or past prompts.shape[1]"
         )
     if "pad_token_id" not in meta:
-        raise ValueError("unpacked verl_grpo fwd_bwd requires meta['pad_token_id']: the worker unpads the rows with it")
+        raise ValueError(
+            "unpacked verl_grpo fwd_bwd requires meta['pad_token_id']: the worker unpads the rows with it"
+        )
     response_mask = tensors.get("response_mask", loss_mask)
     width = tuple(attention_mask.shape)
     for name, value in (
@@ -696,7 +698,9 @@ def _verl_grpo_wire(
     if torch.is_tensor(tensors.get("position_ids")):
         kwargs_out["position_ids"] = tensors["position_ids"]
     context: dict[str, Any] = {
-        key: value for key, value in meta.items() if key != "dp_size" and not torch.is_tensor(value) and value is not None
+        key: value
+        for key, value in meta.items()
+        if key != "dp_size" and not torch.is_tensor(value) and value is not None
     }
     context.update(
         input_ids=input_ids,
