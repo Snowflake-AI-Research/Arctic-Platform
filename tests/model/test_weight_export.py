@@ -677,6 +677,19 @@ def test_requires_hf_weight_sync_honors_model_flag_and_vllm_contract():
     assert not requires_hf_weight_sync(nn.Linear(2, 2))
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.language_model.layers.0.weight",
+        "base_model.model.model.language_model.layers.0._checkpoint_wrapped_module.weight",
+    ],
+)
+def test_requires_hf_weight_sync_for_a_nested_language_model_without_load_renames(name):
+    assert hf_checkpoint_name_map(_named(name)) == {}
+    assert requires_hf_weight_sync(_named(name))
+    assert not requires_hf_weight_sync(_named("model.layers.0.weight", "lm_head.weight"))
+
+
 def test_generic_vllm_export_streams_unwrapped_names_without_a_contract():
     model = _named("layers.0._checkpoint_wrapped_module.weight")
 
