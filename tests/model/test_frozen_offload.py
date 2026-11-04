@@ -33,6 +33,18 @@ SHAPES = {"w1": (HIDDEN, DIM), "w2": (DIM, HIDDEN), "w3": (HIDDEN, DIM)}
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
+@pytest.fixture(params=[False, True], ids=["w8a16", "w8a8"])
+def expert_gemms(request):
+    """The experts' forward GEMMs: decoded to BF16, or W8A8 (moe.w8a8_experts, DeepGEMM on Hopper)."""
+    from arctic_platform.model.implementations.kernels import fp8_grouped_w8a8
+
+    if request.param and (not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9):
+        pytest.skip("W8A8 experts run DeepGEMM's SM90 kernels")
+    fp8_grouped_w8a8.configure_from_options(request.param)
+    yield request.param
+    fp8_grouped_w8a8.configure_from_options(None)
+
+
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -95,11 +107,13 @@ def _run(model: nn.ModuleList, x: torch.Tensor):
 
 @requires_cuda
 @pytest.mark.parametrize("lora", [("w1", "w2", "w3"), ("w1", "w3")], ids=["all", "gate-up"])
-def test_offloaded_expert_codes_match_resident_ones(lora):
-    """Without down-projection LoRA the routing weights fold into the down projection (``scored_swiglu_down``)."""
+def test_offloaded_expert_codes_match_resident_ones(lora, expert_gemms):
+    """Without down-projection LoRA the routing weights fold into the down projection (``scored_swiglu_down``). The
+    W8A8 GEMMs read the copied codes in place."""
     from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
 
     reference, offloaded = _model(0, lora), _model(0, lora)
+    assert all(layer._checkpoint_wrapped_module.experts.w8a8 == expert_gemms for layer in offloaded)
     offload = install_frozen_expert_offload(offloaded)
     code_bytes = EXPERTS * HIDDEN * DIM * 3  # E4M3 codes of w1, w2, w3 per layer
     x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
@@ -179,12 +193,13 @@ def test_offload_leaves_layers_that_are_not_recomputed_on_the_gpu():
 
 
 @requires_cuda
-def test_layers_not_recomputed_keep_their_codes_on_the_gpu():
+def test_layers_not_recomputed_keep_their_codes_on_the_gpu(expert_gemms):
     """Their saved tensors hold the codes until backward; the recomputed layers still match resident experts."""
     from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
 
     plain = (LAYERS - 1,)
     reference, offloaded = _model(0, plain=plain), _model(0, plain=plain)
+    assert offloaded[LAYERS - 1].experts.w8a8 == expert_gemms
     offload = install_frozen_expert_offload(offloaded)
     assert len(offload.layers) == LAYERS - 1
     x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)

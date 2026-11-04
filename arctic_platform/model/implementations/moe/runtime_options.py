@@ -41,6 +41,7 @@ _SETTERS = {
     "frozen_expert_offload": ("moe.frozen_offload", "configure_from_options"),
     "shard_frozen_dense": ("moe.frozen_shard", "configure_from_options"),
     "w4a8_experts": ("kernels.w4a8", "configure_from_options"),
+    "w8a8_experts": ("kernels.fp8_grouped_w8a8", "configure_from_options"),
     # One spare count for UltraEP's three paths (moe/ultraep_replicas.py picks one from the experts).
     "ultraep_spares": ("moe.ultraep_replicas", "configure_from_options"),
     "expert_replicas": ("moe.expert_replicas", "configure_spares"),
@@ -51,8 +52,8 @@ _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Memory, expert-balance and deepep_v2 settings of the MoE runtime. None: the environment variable decides.
-    UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is on."""
+    """Memory, expert-balance, expert-GEMM and deepep_v2 settings of the MoE runtime. None: the environment variable
+    decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -87,6 +88,15 @@ class MoeRuntimeOptions(BaseModel):
             "full or frozen without an adapter (moe/ultraep_replicas.py); frozen block-FP8 or packed 4-bit (INT4, "
             "NVFP4, MXFP4) experts with their LoRA (moe/ultraep_frozen.py). 0 turns UltraEP off. Unset: "
             "ARL_ULTRAEP_SPARES."
+        ),
+    )
+    w8a8_experts: bool | None = Field(
+        None,
+        description=(
+            "Run the frozen block-FP8 routed experts' forward GEMMs as W8A8 (activations quantized to E4M3 per token "
+            "per 128 inputs) through DeepGEMM on Hopper, instead of decoding the weights to BF16; input gradients "
+            "stay BF16 GEMMs on the decoded weights (kernels/fp8_grouped_w8a8.py). Refused for experts that are not "
+            "block FP8. Unset: ARL_W8A8_EXPERTS."
         ),
     )
     ultraep_ipc_symm: bool | None = Field(

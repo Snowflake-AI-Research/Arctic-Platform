@@ -58,6 +58,7 @@ SWITCHES = {
         False,
     ),
     "w4a8_experts": ("kernels.w4a8", "w4a8_experts_requested", "ARL_W4A8_EXPERTS", True, False),
+    "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
     "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
     # expert_replicas is set apart (test_online_replicas_*): it cannot be on together with ultraep_spares.
     "expert_replicas_ema": ("moe.expert_replicas", "replica_ema", "ARL_EXPERT_REPLICAS_EMA", 0.25, 0.5),
@@ -393,3 +394,17 @@ def test_every_moe_loader_refuses_deepep_v2_recompute_without_the_replay(options
     assert options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full", "combine_replay": True}).ac_config
     assert options_cls(ep_comm_backend="deepep_v2").ep_comm_backend == "deepep_v2"
     assert options_cls(ep_comm_backend="uccl", ac_config={"mode": "full"}).ac_config.combine_replay is False
+
+
+def test_w8a8_experts_reach_the_experts_built_after_the_load():
+    """GroupedExperts read the switch when they are built, which the loader does after applying the options."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    apply_moe_runtime_options(GlmMoeDsaOptions(w8a8_experts=True))
+    assert GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128).w8a8
+    # A checkpoint without block-FP8 experts (BF16, or packed 4-bit) is refused rather than run W8A16.
+    with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
+        GroupedExperts(256, 128, 2, use_grouped_mm=True)
+    with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
+        GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128, packed4="int4")
+
