@@ -829,6 +829,7 @@ def test_adapter_preparation_and_runtime_load_reuse_the_written_cache(
 
     from arctic_platform.model.implementations.moe import conversion_cache
     from arctic_platform.model.implementations.moe import deepspeed_integration as integration
+    from arctic_platform.model.implementations.moe.distributed import ep_backend
     from arctic_platform.model.implementations.moe.weights import load_state_dict
     from arctic_platform.model.implementations.moe.weights import save_state_dict
     from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
@@ -842,6 +843,16 @@ def test_adapter_preparation_and_runtime_load_reuse_the_written_cache(
     adapter = module._generic_adapter() if family == "generic_moe" else module._adapter()
     builder_name = "glm52" if family == "glm_moe_dsa" else "qwen35"
     builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_name}.model_builder")
+    configured_sms = []
+
+    def backend(name):
+        assert name == "deepep"
+        return SimpleNamespace(configure_num_sms=configured_sms.append)
+
+    # These CPU tests keep model setup real but do not configure a native GPU dispatch runtime.
+    monkeypatch.setattr(ep_backend, "get_ep_comm_module", backend)
+    if builder_name == "qwen35":
+        monkeypatch.setattr(builder, "get_ep_comm_module", backend)
     original = _tiny_preparation_model(family)
     source, cache_root = tmp_path / "source", tmp_path / "cache"
     expected = {
@@ -920,3 +931,4 @@ def test_adapter_preparation_and_runtime_load_reuse_the_written_cache(
     assert classifications == [(True, prepared), (True, prepared)]
     assert loaded == [prepared]
     assert writes == [prepared], "the runtime adapter must not convert again after standalone preparation"
+    assert configured_sms == [options.deepep_num_sms, options.deepep_num_sms]
