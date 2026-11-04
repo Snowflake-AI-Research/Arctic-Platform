@@ -507,6 +507,7 @@ Requires a matching vLLM + ArcticInference build. Design/tuning:
 |-----------|--------------|---------|
 | **verl** | `arctic_platform/integrations/verl/` (`ArcticRLClientWrapper`, `arctic.yaml`) | [`recipes/rl/verl/`](../recipes/rl/verl/) |
 | **SkyRL** | Driven from SkyRL's `integrations/arctic_rl/` | [`recipes/rl/skyrl/`](../recipes/rl/skyrl/) |
+| **TRL** | `arctic_platform/integrations/trl/` (on-prem). Cortex GSM8K uses the recipe-local `arctic_trl_cortex` adapter | [`recipes/rl/trl/`](../recipes/rl/trl/) |
 
 verl bootstrap sketch:
 
