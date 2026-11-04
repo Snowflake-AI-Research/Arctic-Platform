@@ -77,6 +77,47 @@ def conversion_cache_is_node_local(path: Path) -> bool:
     return any(resolved == root or root in resolved.parents for root in node_local_roots)
 
 
+def wait_for_conversion_cache(
+    path: Path, *, timeout: float = 3600, poll_interval: float = 0.25, writer_start_timeout: float = 30
+) -> None:
+    """Wait for a live writer; ignore old failures and detect a writer killed without a failure marker."""
+    if timeout < 0 or poll_interval <= 0 or writer_start_timeout <= 0:
+        raise ValueError("cache timeout must be nonnegative and polling/start intervals must be positive")
+    started_at = time.time()
+    deadline = time.monotonic() + timeout
+    writer_deadline = time.monotonic() + writer_start_timeout
+    failure_path = path.with_name(f"{path.name}.failed")
+    lock_path = path.parent / f".{path.name}.lock"
+    writer_seen = False
+    while not conversion_cache_ready(path):
+        try:
+            if failure_path.stat().st_mtime >= started_at:
+                raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure_path.read_text()}")
+        except FileNotFoundError:
+            pass
+        try:
+            with open(lock_path, "r", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    writer_seen = True
+                else:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    # The writer publishes under this lock; recheck after observing its release.
+                    if conversion_cache_ready(path):
+                        return
+                    if writer_seen:
+                        raise RuntimeError(f"Converted weight cache writer exited without publishing: {path}")
+        except FileNotFoundError:
+            pass
+        if not writer_seen and time.monotonic() >= writer_deadline:
+            raise TimeoutError(f"Converted weight cache writer did not start within {writer_start_timeout}s: {path}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Converted weight cache did not become ready within {timeout}s: {path}")
+        time.sleep(min(poll_interval, remaining))
+
+
 def _write_conversion_cache(
     source_path: Path,
     snapshot_path: Path,
@@ -110,6 +151,8 @@ def _write_conversion_cache(
     if stream_convert_fn is not None:
         try:
             stream_convert_fn(source_path, tmp_path)
+            if not conversion_cache_ready(tmp_path):
+                raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
             os.replace(tmp_path, snapshot_path)
             committed = True
         finally:
@@ -133,6 +176,8 @@ def _write_conversion_cache(
         save_state_dict_fn(snapshot_state_dict, tmp_path)
         t_save = time.perf_counter()
         del snapshot_state_dict
+        if not conversion_cache_ready(tmp_path):
+            raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
         os.replace(tmp_path, snapshot_path)
         committed = True
     finally:
@@ -185,18 +230,32 @@ def ensure_node_local_conversion_cache(
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
             if not conversion_cache_ready(snapshot_path):
-                _write_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict_fn,
-                    save_state_dict_fn,
-                    rank=rank,
-                    local_rank=local_rank,
-                    stream_convert_fn=stream_convert_fn,
-                )
+                failure_path = snapshot_path.with_name(f"{snapshot_path.name}.failed")
+                failure_path.unlink(missing_ok=True)
+                # Every writer holds this cache's lock; abandoned temporary directories are not live writers.
+                for abandoned in snapshot_path.parent.glob(f"{snapshot_path.name}.tmp-rank*-pid*"):
+                    if abandoned.is_dir():
+                        shutil.rmtree(abandoned)
+                try:
+                    _write_conversion_cache(
+                        source_path,
+                        snapshot_path,
+                        convert_fn,
+                        src_fmt,
+                        dst_fmt,
+                        load_state_dict_fn,
+                        save_state_dict_fn,
+                        rank=rank,
+                        local_rank=local_rank,
+                        stream_convert_fn=stream_convert_fn,
+                    )
+                except BaseException as error:
+                    if not conversion_cache_is_node_local(snapshot_path):
+                        try:
+                            failure_path.write_text(f"rank={rank}: {type(error).__name__}: {error}", encoding="utf-8")
+                        except OSError:
+                            logger.info("Could not record conversion failure for %s", snapshot_path, exc_info=True)
+                    raise
             elif local_rank == 0:
                 logger.info(
                     "Reusing existing %s→%s conversion cache at %s (rank=%d)",

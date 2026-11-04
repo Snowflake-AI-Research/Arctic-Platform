@@ -52,7 +52,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     resolve_conversion_cache_path,
-    _write_conversion_cache,
+    wait_for_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from .models import (
@@ -579,7 +579,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
-                _write_conversion_cache(
+                ensure_node_local_conversion_cache(
                     source_path,
                     snapshot_path,
                     convert_fn,
@@ -591,6 +591,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
                 )
+
+            elif not conversion_cache_ready(snapshot_path):
+                wait_for_conversion_cache(snapshot_path)
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()

@@ -910,7 +910,8 @@ def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
 
 
 @pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
-def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family):
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch, builder_family, scope):
     from types import SimpleNamespace
 
     from safetensors.torch import save_file
@@ -928,9 +929,13 @@ def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch
     source.mkdir()
     hf = model.convert_to_hf({name: weight.clone() for name, weight in state.items()})
     save_file({name: weight.clone().contiguous() for name, weight in hf.items()}, source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(hf, "model.safetensors")})
+    )
+    save_file({"stray.weight": torch.ones(1)}, source / "stray.safetensors")
     cache = tmp_path / "prime"
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
-    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: True)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
     monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     monkeypatch.setattr(builder, "dcp_load", lambda *args, **kwargs: None)
@@ -951,3 +956,77 @@ def test_glm53_load_selects_streaming_checkpoint_converter(tmp_path, monkeypatch
     assert set(converted) == set(state)
     for name, weight in state.items():
         torch_assert_equal(converted[name], weight)
+
+
+@pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
+def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_path, monkeypatch, builder_family):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
+    models = [Glm5NextForConditionalGenerationPrimeRL(_tiny_config()) for _ in range(2)]
+    source = tmp_path / "source"
+    source.mkdir()
+    hf_name = "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
+    save_file({hf_name: torch.ones(8, 16)}, source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {hf_name: "model.safetensors"}}))
+    cache = tmp_path / "prime"
+    local = threading.local()
+    converting, reader_observed_lock = threading.Event(), threading.Event()
+    barriers = {0: 0, 1: 0}
+    original_flock = conversion_cache.fcntl.flock
+    original_wait = conversion_cache.wait_for_conversion_cache
+
+    def flock(file, operation):
+        try:
+            return original_flock(file, operation)
+        except BlockingIOError:
+            reader_observed_lock.set()
+            raise
+
+    def fail_conversion(source, destination):
+        converting.set()
+        assert reader_observed_lock.wait(3), "reader must observe the active writer"
+        raise OSError("injected shared conversion failure")
+
+    def barrier():
+        barriers[local.rank] += 1
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(
+        builder, "get_world", lambda: SimpleNamespace(rank=local.rank, local_rank=0, is_master=local.rank == 0)
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", flock)
+    monkeypatch.setattr(
+        builder, "wait_for_conversion_cache", lambda path: original_wait(path, timeout=3, poll_interval=0.01)
+    )
+    monkeypatch.setattr(models[0], "convert_to_prime_checkpoint", fail_conversion)
+    monkeypatch.setattr(
+        builder, "dcp_load", lambda *args, **kwargs: pytest.fail("failed conversion must not reach DCP")
+    )
+    config = SimpleNamespace(
+        name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
+    )
+
+    def load(rank):
+        local.rank = rank
+        builder.load_dcp_from_hf(models[rank], config, SimpleNamespace())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(load, 0)
+        assert converting.wait(3)
+        reader = executor.submit(load, 1)
+        with pytest.raises(OSError, match="injected shared conversion failure"):
+            writer.result(timeout=5)
+        with pytest.raises(RuntimeError, match="writer failed|writer exited without publishing"):
+            reader.result(timeout=5)
+    assert barriers == {0: 1, 1: 1}, "neither rank may enter the post-conversion barrier"
+    assert not cache.exists()
