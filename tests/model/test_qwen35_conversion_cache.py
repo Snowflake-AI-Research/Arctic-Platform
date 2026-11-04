@@ -160,7 +160,9 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
-    assert leftovers == []
+    assert leftovers == ["prime.failed"]
+    assert "disk full" in (cache_path.parent / "prime.failed").read_text()
+    assert not conversion_cache.conversion_cache_ready(cache_path)
 
 
 def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp_path):
@@ -216,34 +218,6 @@ def _write_ready_cache(path: Path) -> None:
     (path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}})
     )
-
-
-def test_conflicting_checkpoint_callbacks_preserve_existing_cache(tmp_path):
-    from arctic_platform.model.implementations.moe.conversion_cache import _write_conversion_cache
-
-    cache = tmp_path / "prime"
-    _write_ready_cache(cache)
-    before = {path.name: path.read_bytes() for path in cache.iterdir()}
-
-    def unexpected(*args):
-        raise AssertionError("ambiguous callbacks must not run")
-
-    with pytest.raises(ValueError, match="only one checkpoint conversion callback"):
-        _write_conversion_cache(
-            tmp_path,
-            cache,
-            unexpected,
-            "HF",
-            "PrimeRL",
-            unexpected,
-            unexpected,
-            rank=0,
-            local_rank=0,
-            convert_checkpoint_fn=unexpected,
-            stream_convert_fn=unexpected,
-        )
-
-    assert {path.name: path.read_bytes() for path in cache.iterdir()} == before
 
 
 def test_resolve_conversion_cache_prefers_ready_sibling_over_hashed_scratch(tmp_path):
@@ -338,7 +312,7 @@ def test_conversion_cache_root_precedence_matches_runtime(monkeypatch, tmp_path)
         )
 
 
-@pytest.mark.parametrize("callback_name", ["convert_checkpoint_fn", "stream_convert_fn"])
+@pytest.mark.parametrize("callback_name", ["stream_convert_fn"])
 def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 
@@ -377,7 +351,7 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
 
 
 @pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
-@pytest.mark.parametrize("callback_name", ["convert_checkpoint_fn", "stream_convert_fn"])
+@pytest.mark.parametrize("callback_name", ["stream_convert_fn"])
 def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 

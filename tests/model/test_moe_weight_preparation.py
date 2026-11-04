@@ -84,6 +84,39 @@ def test_shared_conversion_cache_waits_for_publication_and_times_out(monkeypatch
         conversion_cache.wait_for_conversion_cache(cache, timeout=0)
 
 
+def test_shared_conversion_cache_propagates_writer_failure_and_allows_retry(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    cache = tmp_path / "prime"
+    source = tmp_path / "source"
+    source.mkdir()
+    arguments = (source, cache, lambda state: None, "HF", "PrimeRL", lambda path: {}, lambda *args: None)
+
+    def failed(source, destination):
+        destination.mkdir(parents=True)
+        raise OSError("conversion failed")
+
+    with pytest.raises(OSError, match="conversion failed"):
+        conversion_cache.ensure_node_local_conversion_cache(*arguments, rank=0, local_rank=0, stream_convert_fn=failed)
+    monkeypatch.setattr(conversion_cache.time, "sleep", lambda delay: pytest.fail("failure must not wait"))
+    with pytest.raises(RuntimeError, match="writer failed.*conversion failed"):
+        conversion_cache.wait_for_conversion_cache(cache)
+    abandoned = cache.with_name("prime.tmp-rank0-pid999999")
+    abandoned.mkdir()
+
+    def successful(source, destination):
+        assert not abandoned.exists()
+        destination.mkdir(parents=True)
+        (destination / "weights.safetensors").write_bytes(b"ready")
+        (destination / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
+        )
+
+    conversion_cache.ensure_node_local_conversion_cache(*arguments, rank=0, local_rank=0, stream_convert_fn=successful)
+    conversion_cache.wait_for_conversion_cache(cache)
+    assert not cache.with_name("prime.failed").exists()
+
+
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
 def test_prepare_weight_conversion_selects_the_checkpoint_streamer(monkeypatch, tmp_path, builder_name):
     import importlib
@@ -345,7 +378,12 @@ def _tiny_preparation_model(family):
 
 
 @pytest.mark.parametrize("family", ["qwen3_5_moe", "generic_moe", "glm_moe_dsa", "glm5_next", "qwen4_exp"])
-def test_real_family_preparation_and_loading_choose_the_same_cache(monkeypatch, tmp_path, family):
+@pytest.mark.parametrize("dequantize", [False, True])
+def test_real_family_preparation_and_loading_choose_the_same_cache(monkeypatch, tmp_path, family, dequantize):
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.conversion_cache import hashed_conversion_cache_path
     from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
 
     builder_name = "glm52" if family == "glm_moe_dsa" else "qwen35"
@@ -358,16 +396,25 @@ def test_real_family_preparation_and_loading_choose_the_same_cache(monkeypatch, 
         ]
     )
     assert model.is_hf_state_dict(hf_keys)
-    monkeypatch.setattr(builder, "load_state_dict_keys", lambda path: hf_keys)
-    source, cache = tmp_path / "source", tmp_path / "prime"
+    source, cache_root = tmp_path / "source", tmp_path / "explicit-cache"
+    source.mkdir()
+    if dequantize:
+        hf_keys["model.layers.0.mlp.experts.0.gate_proj.scale"] = None
+    save_file({name: torch.ones(1) for name in hf_keys}, source / "model.safetensors")
     monkeypatch.setattr(builder, "resolve_weight_source", lambda config: source)
-    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
     monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: True)
     monkeypatch.setattr(builder, "conversion_cache_ready", lambda path: True)
     monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *args, **kwargs: None)
     config = SimpleNamespace(
-        fsdp_cpu_offload=True, debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False
+        fsdp_cpu_offload=True,
+        debug=SimpleNamespace(random_init=False),
+        dequantize_checkpoint=dequantize,
+        weight_conversion_cache_dir=str(cache_root),
     )
+    fmt = "prime-dequantized" if dequantize and builder_name == "qwen35" else "prime"
+    cache = hashed_conversion_cache_path(cache_root, source, fmt)
+    calls = []
+    monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", lambda *args, **kwargs: calls.append(args[1]))
     prepared = builder.prepare_weight_conversion(model, config, source, rank=0, local_rank=0)
     inject_prime_lm_head(model, chunk_size=2, fused_cross_entropy=False, fp32_lm_head=False)
     loaded = []
@@ -380,3 +427,4 @@ def test_real_family_preparation_and_loading_choose_the_same_cache(monkeypatch, 
     builder.load_dcp_from_hf(model, config, None)
     assert prepared == cache
     assert loaded == [prepared]
+    assert calls == [cache, cache]
