@@ -53,6 +53,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     get_checkpoint_converter,
+    record_conversion_preparation_failure,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
 )
@@ -507,6 +508,7 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
+@record_conversion_preparation_failure
 def resolve_weight_source(config: ModelConfig) -> Path:
     """Return the local checkpoint directory ``config.name`` loads from."""
     if not Path(config.name).exists():
@@ -518,17 +520,19 @@ def resolve_weight_source(config: ModelConfig) -> Path:
     return Path(config.name)
 
 
+@record_conversion_preparation_failure
 def prepare_weight_conversion(
     model: nn.Module, config: ModelConfig, source_path: Path, *, rank: int, local_rank: int
 ) -> Path | None:
     """Fill the converted-weight cache ``model`` loads from and return its path, or None when no conversion applies.
 
     The distributed load and the per-node preparation that may run before it both call this, so they resolve the
-    same cache path. ``rank`` must be the global rank: only global rank 0 writes a shared cache, under a file
+    same cache path. ``rank`` must be the global rank: only global rank 0 writes a shared cache without a file
     lock; other ranks wait for publication under ``DSS_WEIGHT_CONVERSION_TIMEOUT`` (default 3600 seconds).
     Before a process group exists, shared-cache launchers must set the same ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID``
     for every process and choose a new value on retry. Distributed loads broadcast an attempt ID automatically.
-    Writer startup uses the overall timeout; an observed writer that stops heartbeating fails within 120 seconds.
+    Startup is bounded by ``DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT`` (default 300 seconds); an observed
+    writer that stops heartbeating fails within 120 seconds.
     For node-local caches, the file lock chooses whichever local process arrives first as writer.
     A returned path is ready to load.
     """
@@ -555,7 +559,7 @@ def prepare_weight_conversion(
     target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
     stream_convert_fn = get_checkpoint_converter(model, target_format)
     node_local = conversion_cache_is_node_local(snapshot_path)
-    attempt_id = conversion_cache_attempt_id(shared=not node_local and not conversion_cache_ready(snapshot_path))
+    attempt_id = conversion_cache_attempt_id(shared=not node_local)
     if node_local or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,
@@ -569,6 +573,7 @@ def prepare_weight_conversion(
             local_rank=local_rank,
             stream_convert_fn=stream_convert_fn,
             attempt_id=attempt_id,
+            node_local=node_local,
         )
     else:
         wait_for_conversion_cache(snapshot_path, attempt_id=attempt_id)

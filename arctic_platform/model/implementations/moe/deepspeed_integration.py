@@ -19,6 +19,7 @@ from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
 from .distributed.ep_backend import uses_dispatch_ep
+from .conversion_cache import record_conversion_preparation_failure
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
 from .layers.moe import LatentMoE
@@ -361,6 +362,7 @@ def load_moe_model_for_deepspeed(
     return model
 
 
+@record_conversion_preparation_failure
 def prepare_moe_weights(
     adapter: MoEDeepSpeedAdapter,
     *,
@@ -407,6 +409,8 @@ def prepare_moe_weights(
         dtype=adapter.dtype_map[model_config.optimization_dtype],
     )
     _configure_model_for_weight_loading(adapter, model, model_config)
+    # EP/SP, activation checkpointing and fused CE do not affect today's substring-based format classifier.
+    # Keep this setup aligned with loading if classification ever becomes sensitive to the full parameter keys.
     source_path = adapter.resolve_weight_source(model_config)
     return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 

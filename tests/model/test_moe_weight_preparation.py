@@ -117,8 +117,130 @@ def test_shared_conversion_cache_propagates_writer_failure_and_allows_retry(monk
 
     conversion_cache.ensure_node_local_conversion_cache(*arguments, rank=0, local_rank=0, stream_convert_fn=successful)
     conversion_cache.wait_for_conversion_cache(cache)
-    assert json.loads(failure_path.read_text())["attempt_id"] == token
+    assert not failure_path.exists()
     assert not cache.with_name("prime.in-progress").exists()
+
+
+@pytest.mark.parametrize("same_attempt", [False, True])
+def test_cache_retry_and_shared_writer_do_not_require_flock(monkeypatch, tmp_path, same_attempt):
+    import errno
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    cache._write_cache_marker(
+        destination.with_name("prime.failed"), dict(attempt_id="retry" if same_attempt else "old", error="old failure")
+    )
+
+    def unsupported(*args):
+        raise OSError(errno.ENOLCK, "shared filesystem has no flock")
+
+    monkeypatch.setattr(cache.fcntl, "flock", unsupported)
+
+    def write(source, target):
+        target.mkdir()
+        (target / "model.safetensors").touch()
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict(weight="model.safetensors")))
+        )
+
+    cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "Prime",
+        lambda path: {},
+        lambda *args: None,
+        rank=0,
+        local_rank=0,
+        attempt_id="retry",
+        node_local=False,
+        stream_convert_fn=write,
+    )
+    assert cache.conversion_cache_ready(destination)
+    assert not destination.with_name("prime.failed").exists()
+
+
+def test_preparation_errors_before_cache_selection_reach_waiters(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "early-failure")
+
+    @cache.record_conversion_preparation_failure
+    def prepare(*, rank):
+        raise RuntimeError("meta model setup failed")
+
+    with pytest.raises(RuntimeError, match="meta model setup failed"):
+        prepare(rank=0)
+    with pytest.raises(RuntimeError, match="Weight preparation writer failed.*meta model setup failed"):
+        cache.wait_for_conversion_cache(tmp_path / "prime", timeout=0, attempt_id="early-failure")
+
+
+def test_writer_killed_before_first_marker_has_bounded_startup(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    clock = [0.0]
+    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache.time, "sleep", lambda interval: clock.__setitem__(0, clock[0] + interval))
+    with pytest.raises(TimeoutError, match="startup progress within 40"):
+        cache.wait_for_conversion_cache(
+            tmp_path / "prime",
+            timeout=3600,
+            writer_start_timeout=40,
+            poll_interval=1,
+            attempt_id="killed-before-start",
+        )
+    assert clock[0] == 40
+
+
+def test_abandoned_cleanup_preserves_live_or_recent_workspaces(monkeypatch, tmp_path):
+    import os
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    old = tmp_path / "prime.tmp-rank0-pid123-old"
+    live = tmp_path / "prime.tmp-rank1-pid124-live"
+    recent = tmp_path / "prime.tmp-rank2-pid125-recent"
+    for workspace in (old, live, recent):
+        workspace.mkdir()
+    ancient = cache.time.time() - cache._ABANDONED_CACHE_AGE - 60
+    os.utime(old, (ancient, ancient))
+    os.utime(live, (ancient, ancient))
+    live.with_name(f"{live.name}.owner").touch()
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert not old.exists()
+    assert live.exists()
+    assert recent.exists()
+
+
+def test_publication_keeps_cache_published_by_another_writer(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+
+    def save(state, target):
+        for path, filename in ((target, "candidate.safetensors"), (destination, "winner.safetensors")):
+            path.mkdir()
+            (path / filename).touch()
+            (path / "model.safetensors.index.json").write_text(json.dumps(dict(weight_map=dict(weight=filename))))
+
+    cache._write_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "Prime",
+        lambda path: {},
+        save,
+        rank=0,
+        local_rank=0,
+    )
+    assert (destination / "winner.safetensors").exists()
+    assert not (destination / "candidate.safetensors").exists()
 
 
 def test_shared_conversion_retry_waiter_starts_before_writer(monkeypatch, tmp_path):
