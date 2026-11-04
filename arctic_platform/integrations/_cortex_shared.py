@@ -126,12 +126,13 @@ def to_cortex_fwd_bwd_payload(
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
 
-    Rows are left-aligned on the way out (see :func:`_left_align_batch`).
-    Cortex's packer rejects any other layout. ZoRRo keeps the original
-    ``prompts`` block and sends ``prompt_group_ids`` from those rows, because
-    the aligned columns no longer start at the prompt. Both paths drop
-    ``old_log_probs``. The server re-derives π_old. Only a real ``True``
-    selects the ZoRRo path.
+    Non-ZoRRo rows are left-aligned on the way out (see :func:`_left_align_batch`).
+    Cortex's packer rejects any other layout. ZoRRo rows stay in the client
+    layout: left-aligning them moves response tokens into the prompt slice the
+    unpacked worker reads. A packed job that asks for ZoRRo is refused. ZoRRo
+    sends ``prompt_group_ids`` derived from the original ``prompts`` block.
+    Both paths drop ``old_log_probs``. The server re-derives π_old. Only a
+    real ``True`` selects the ZoRRo path.
     """
     import torch
 
@@ -250,13 +251,14 @@ def _to_cortex_zorro_fwd_bwd(
     advantages,
     loss_mask,
 ) -> dict:
-    """ZoRRo wire shape for the packed executor.
+    """ZoRRo wire shape. Rows stay in the client layout.
 
-    Full-width rows are left-aligned, the same rule as every other packed
-    request. ``prompts`` stays the original prompt block. When the caller did
-    not send ``prompt_group_ids``, they are derived from that block so grouping
-    does not read the aligned columns. ``old_log_probs`` is dropped, and the
-    server re-derives π_old.
+    The unpacked worker slices the response at ``max_prompt_len``. Left-aligning
+    a shorter prompt moves response tokens into that slice and drops them from
+    the loss, so rows are sent as the client built them. A packed job that asks
+    for ZoRRo is refused before this runs. ``prompts`` is the original prompt
+    block. When the caller did not send ``prompt_group_ids``, they are derived
+    from that block. ``old_log_probs`` is dropped, and the server re-derives π_old.
     """
     import torch
 
@@ -264,25 +266,16 @@ def _to_cortex_zorro_fwd_bwd(
     if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
         raise ValueError("ZoRRo fwd_bwd requires batch['prompts'] with width max_prompt_len")
     response_mask = tensors.get("response_mask", loss_mask)
-    forwarded = {"input_ids": input_ids}
-    for key in ("position_ids", "labels"):
-        if key in tensors:
-            forwarded[key] = tensors[key]
-    scored = {"advantages": advantages, "loss_mask": loss_mask}
-    if torch.is_tensor(response_mask):
-        scored["response_mask"] = response_mask
-    forwarded, scored, attention_mask = _left_align_batch(forwarded, attention_mask, scored)
-    input_ids = forwarded["input_ids"]
-    response_mask = scored.pop("response_mask", response_mask)
     kwargs_out: dict[str, Any] = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "prompts": prompts,
         "response_mask": response_mask,
     }
-    for key in ("position_ids", "labels"):
-        if key in forwarded:
-            kwargs_out[key] = forwarded[key]
+    if torch.is_tensor(tensors.get("position_ids")):
+        kwargs_out["position_ids"] = tensors["position_ids"]
+    if torch.is_tensor(tensors.get("labels")):
+        kwargs_out["labels"] = tensors["labels"]
 
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
@@ -292,8 +285,8 @@ def _to_cortex_zorro_fwd_bwd(
 
     context: dict[str, Any] = {
         "input_ids": input_ids,
-        "advantages": scored["advantages"],
-        "loss_mask": scored["loss_mask"],
+        "advantages": advantages,
+        "loss_mask": loss_mask,
         **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
     }
     from arctic_platform.common.balance_metadata import apply_balance_metadata

@@ -1117,7 +1117,7 @@ class TestCortexSharedHelper:
                 },
             )
 
-    def test_zorro_fwd_bwd_left_aligns_and_names_prompt_groups(self):
+    def test_zorro_fwd_bwd_keeps_client_layout_and_names_prompt_groups(self):
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -1145,10 +1145,10 @@ class TestCortexSharedHelper:
                 },
             }
         )
-        assert out["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8, 0], [1, 2, 3, 4, 0]]
-        assert out["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
         assert torch.equal(out["kwargs"]["prompts"], prompts)
-        assert out["kwargs"]["response_mask"].tolist() == [[0, 0, 1, 1, 0], [0, 0, 1, 1, 0]]
+        assert torch.equal(out["kwargs"]["response_mask"], torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]))
         assert "old_log_probs" not in out["kwargs"]
         assert out["context"]["zorro_train_enable"] is True
         assert out["context"]["max_prompt_len"] == 3
