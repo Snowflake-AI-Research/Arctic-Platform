@@ -230,6 +230,12 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
         ),
         (
+            OptimizerSettings(),
+            _ZERO2,
+            False,
+            ("torch_adamw", "FusedAdam isn't supported for this model, so standard AdamW ran"),
+        ),
+        (
             OptimizerSettings(fused=False),
             _OFFLOAD,
             False,
@@ -264,6 +270,19 @@ def test_optimizer_choice_matches_the_class_built(optimizer, ds_config, fused, e
 def test_optimizer_implementation_rejects_unknown_names():
     with pytest.raises(AssertionError, match="Unhandled optimizer"):
         optimizer_implementation("sgd", fused=True)
+
+
+@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
+def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
+    class Adam:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
+    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
+    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
+        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
+    assert f"using optimizer='{expected}'" in caplog.text
 
 
 def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
@@ -543,7 +562,7 @@ def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
 
 
 @pytest.mark.parametrize("force_cpu_optimizer", [None, True, False])
-def test_initialize_cpu_offload_honors_nonfused_setting(monkeypatch, force_cpu_optimizer):
+def test_initialize_cpu_offload_honors_explicit_nonfused_policy(monkeypatch, force_cpu_optimizer):
     calls = {}
 
     class _CPUAdam(torch.optim.Optimizer):
@@ -1918,16 +1937,3 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
     torch_assert_equal(optimizer._get_compact_grad_partition_buffer(0).flat_partition, torch.tensor([5.0, 6.0]))
     optimizer.reset_cpu_buffers()
     assert retained == {}
-
-
-@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
-def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
-    class Adam:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
-    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
-    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
-        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
-    assert f"using optimizer='{expected}'" in caplog.text

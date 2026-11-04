@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
+import weakref
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
@@ -626,6 +627,34 @@ def test_peft_checkpoint_rejects_colliding_portable_names(tmp_path, monkeypatch)
         save_peft_adapters(model, str(tmp_path))
 
 
+def test_peft_normalization_failure_preserves_the_saved_adapter(tmp_path, monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
+    weights_path = tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors"
+    original_bytes = []
+
+    def failed_save(tensors, filename, **kwargs):
+        original_bytes.append(weights_path.read_bytes())
+        assert Path(filename) != weights_path
+        Path(filename).write_bytes(b"incomplete normalization")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr("safetensors.torch.save_file", failed_save)
+    with pytest.raises(OSError, match="injected write failure"):
+        save_peft_adapters(model, str(tmp_path))
+
+    assert weights_path.read_bytes() == original_bytes[0]
+    saved = load_file(weights_path)
+    assert len(saved) == 2
+    assert all("_checkpoint_wrapped_module" in name for name in saved)
+    assert list(weights_path.parent.glob(".adapter-*")) == []
+
+
 def test_iter_lora_weights_rejects_non_lora_trainables():
     model = _Model(
         [
@@ -894,6 +923,19 @@ def test_requires_hf_weight_sync_honors_model_flag_and_vllm_contract():
     assert not requires_hf_weight_sync(nn.Linear(2, 2))
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.language_model.layers.0.weight",
+        "base_model.model.model.language_model.layers.0._checkpoint_wrapped_module.weight",
+    ],
+)
+def test_requires_hf_weight_sync_for_a_nested_language_model_without_load_renames(name):
+    assert hf_checkpoint_name_map(_named(name)) == {}
+    assert requires_hf_weight_sync(_named(name))
+    assert not requires_hf_weight_sync(_named("model.layers.0.weight", "lm_head.weight"))
+
+
 def test_generic_vllm_export_streams_unwrapped_names_without_a_contract():
     model = _named("layers.0._checkpoint_wrapped_module.weight")
 
@@ -953,29 +995,67 @@ def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
         list(iter_model_weights(model, weight_format, is_master=True, is_zero3=False))
 
 
-def test_peft_normalization_failure_preserves_the_saved_adapter(tmp_path, monkeypatch):
-    from peft import LoraConfig
-    from peft import get_peft_model
-    from safetensors.torch import load_file
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+@pytest.mark.parametrize("rank", [0, 1])
+def test_vllm_ep_export_frees_each_gather_before_the_next(monkeypatch, rank):
+    """Every rank all-gathers each expert tensor whole; one gather's buffers must be gone before the next is allocated,
+    and while rank 0 hands its tensors out."""
+    import deepspeed.utils.groups as ds_groups
+    from torch.utils._python_dispatch import TorchDispatchMode
 
-    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
-    model.base_model.model.proj = checkpoint_wrapper(model.base_model.model.proj)
-    weights_path = tmp_path / PEFT_ADAPTER_DIRNAME / "adapter_model.safetensors"
-    original_bytes = []
+    from arctic_platform.model.implementations.moe.deepspeed_integration import tag_expert_params_for_deepspeed
+    from arctic_platform.model.implementations.moe.layers.moe import MoE
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
-    def failed_save(tensors, filename, **kwargs):
-        original_bytes.append(weights_path.read_bytes())
-        assert Path(filename) != weights_path
-        Path(filename).write_bytes(b"incomplete normalization")
-        raise OSError("injected write failure")
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            num_experts=4,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            use_grouped_mm=False,
+            attn_implementation="sdpa",
+        )
+    )
+    for module in model.modules():  # this rank's expert-parallel half, as DeepEPExpertParallel leaves it
+        if isinstance(module, MoE):
+            for name, parameter in list(module.experts.named_parameters(recurse=False)):
+                module.experts.register_parameter(name, nn.Parameter(parameter.data[: len(parameter) // 2].clone()))
+    tag_expert_params_for_deepspeed(model, "ep_size_2")
 
-    monkeypatch.setattr("safetensors.torch.save_file", failed_save)
-    with pytest.raises(OSError, match="injected write failure"):
-        save_peft_adapters(model, str(tmp_path))
+    gathered = []
 
-    assert weights_path.read_bytes() == original_bytes[0]
-    saved = load_file(weights_path)
-    assert len(saved) == 2
-    assert all("_checkpoint_wrapped_module" in name for name in saved)
-    assert list(weights_path.parent.glob(".adapter-*")) == []
+    def all_gather(outputs, local, group=None):
+        for output in outputs:
+            output.copy_(local)
+            gathered.append(weakref.ref(output))
+
+    def alive():
+        return sum(ref() is not None for ref in gathered)
+
+    class AliveAtAllocation(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.overloadpacket is torch.ops.aten.empty_like:
+                at_allocation.append(alive())
+            return func(*args, **(kwargs or {}))
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(ds_groups, "_get_expert_parallel_group", lambda group_name: None)
+    at_allocation, at_yield = [], []
+    with AliveAtAllocation():
+        for _, tensor in build_iter_full_vllm_weights(model)():
+            at_yield.append(alive())
+            del tensor
+
+    assert len(gathered) == 12  # 2 layers x 3 expert tensors x 2 buffers
+    assert at_allocation == [0] * 12
+    assert not any(at_yield) and bool(at_yield) == (rank == 0)

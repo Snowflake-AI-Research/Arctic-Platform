@@ -410,95 +410,6 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
 _EXPORT_GATHER_BYTES = 64 * 1024 * 1024
 
 
-def _gather_ep_weight_to_cpu(
-    tensor: torch.Tensor,
-    ep_group,
-    *,
-    is_master: bool,
-    max_gather_bytes: int = 64 * 1024 * 1024,
-) -> torch.Tensor | None:
-    import torch.distributed as dist
-
-    local = tensor.detach().contiguous()
-    ep_size = dist.get_world_size(group=ep_group)
-    if local.ndim == 0:
-        raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
-    if max_gather_bytes < ep_size * local.element_size():
-        raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
-
-    from arctic_platform.model.weight_export import wait_for_export_collective
-
-    # Collect exact bytes so NCCL/Gloo need no support for packed or float8 export dtypes.
-    if local.dtype != torch.uint8:
-        gathered = _gather_ep_weight_to_cpu(
-            local.view(torch.uint8), ep_group, is_master=is_master, max_gather_bytes=max_gather_bytes
-        )
-        return None if gathered is None else gathered.view(local.dtype)
-
-    full = None
-    if is_master:
-        full = torch.empty(
-            (ep_size * local.shape[0], *local.shape[1:]),
-            dtype=local.dtype,
-            device="cpu",
-        )
-    if local.numel() == 0:
-        return full
-    if ep_size == 1:
-        if full is not None:
-            full.copy_(local)
-        return full
-
-    # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
-    flat = local.view(-1)
-    chunk_elements = min(flat.numel(), max_gather_bytes // (ep_size * local.element_size()))
-    gathered = torch.empty(ep_size * chunk_elements, dtype=local.dtype, device=local.device)
-    full_shards = full.view(ep_size, flat.numel()) if full is not None else None
-    use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
-    for offset in range(0, flat.numel(), chunk_elements):
-        count = min(chunk_elements, flat.numel() - offset)
-        outputs = gathered[: ep_size * count]
-        inputs = flat[offset : offset + count]
-        if use_direct_buffer:
-            # NCCL's list gather allocates another packed output; write into the bounded buffer directly.
-            dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
-        else:
-            dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
-        if not is_master:
-            wait_for_export_collective(inputs)
-        if full_shards is not None:
-            for rank, shard in enumerate(outputs.view(ep_size, count)):
-                full_shards[rank, offset : offset + count].copy_(shard)
-    return full
-
-
-def _gather_ep_shards_to_rank0_host(local: torch.Tensor, ep_group) -> torch.Tensor | None:
-    """Gather an EP-sharded tensor to rank 0's host memory with one GPU piece buffer per rank."""
-    import torch.distributed as dist
-
-    ranks = dist.get_process_group_ranks(ep_group)
-    if 0 not in ranks:
-        return None
-    is_master = dist.get_rank() == 0
-    world, rows = dist.get_world_size(group=ep_group), local.shape[0]
-    pieces = local.tensor_split(world)
-    full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
-    received = torch.empty_like(pieces[0])
-    start = 0
-    for piece in pieces:
-        for group_rank, rank in enumerate(ranks):
-            if rank == 0:
-                if full is not None:
-                    full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(piece)
-                continue
-            buffer = piece if dist.get_rank() == rank else received[: len(piece)]
-            dist.broadcast(buffer, src=rank, group=ep_group)
-            if full is not None:
-                full[group_rank * rows + start : group_rank * rows + start + len(piece)].copy_(received[: len(piece)])
-        start += len(piece)
-    return full
-
-
 def build_iter_full_hf_weights(model: nn.Module):
     model_type = type(model)
     if getattr(model_type, "convert_layer_to_hf", None) is None:
@@ -510,6 +421,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
         parts = name.split(".")
@@ -520,6 +432,42 @@ def build_iter_full_hf_weights(model: nn.Module):
         else:
             return -1
         return int(index) if index.isdigit() else -1
+
+    def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
+        """Gather checkpoint-only shards into host memory without an all-gather copy on every rank."""
+        if local.dtype != torch.uint8:
+            full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
+            return None if full is None else full.view(local.dtype)
+        rows = local.shape[0]
+        row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
+        step = max(1, _EXPORT_GATHER_BYTES // max(row_bytes * world, 1))
+        step = min(step, max(rows, 1))
+        full = (
+            torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        )
+        buffer = (
+            torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            if is_master and local.device.type != "cpu"
+            else None
+        )
+        for start in range(0, rows, step):
+            count = min(step, rows - start)
+            if buffer is not None:
+                outputs = [buffer[rank, :count] for rank in range(world)]
+            elif full is not None:
+                outputs = [
+                    full[rank * rows + start : rank * rows + start + count] for rank in range(world)
+                ]
+            else:
+                outputs = None
+            chunk = local[start : start + count].contiguous()
+            dist.gather(chunk, outputs, dst=0, group=ep_group)
+            if not is_master:
+                wait_for_export_collective(chunk)
+            if full is not None and buffer is not None:
+                for rank in range(world):
+                    full[rank * rows + start : rank * rows + start + count].copy_(buffer[rank, :count])
+        return full
 
     def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
@@ -547,13 +495,12 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
-                    # Only the master's EP replica participates in export.
+                    # Only the master's EP replica participates; gather its shards into bounded CPU output.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
                     if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
-                        # Only checkpoints export these (Qwen3.8's 95 GiB n-gram table); gathered on a GPU, it OOMs.
                         local = tensor.data.contiguous()
-                        full = _gather_ep_shards_to_rank0_host(local, ep_group)
+                        full = _gather_to_master(local, dist.get_world_size(group=ep_group), ep_group, is_master)
                         if is_master:
                             layer_state[name] = full
                         del full
@@ -773,3 +720,58 @@ def load_moe_model(
     )
     maybe_use_fixed_order_row_sum(model, options.model_dump())
     return model
+
+
+def _gather_ep_weight_to_cpu(
+    tensor: torch.Tensor,
+    ep_group,
+    *,
+    is_master: bool,
+    max_gather_bytes: int = 64 * 1024 * 1024,
+) -> torch.Tensor | None:
+    import torch.distributed as dist
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
+    local = tensor.detach().contiguous()
+    ep_size = dist.get_world_size(group=ep_group)
+    if local.ndim == 0:
+        raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
+    if max_gather_bytes < ep_size * local.element_size():
+        raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    full = None
+    if is_master:
+        full = torch.empty(
+            (ep_size * local.shape[0], *local.shape[1:]),
+            dtype=local.dtype,
+            device="cpu",
+        )
+    if local.numel() == 0:
+        return full
+    if ep_size == 1:
+        if full is not None:
+            full.view(torch.uint8).copy_(local.view(torch.uint8))
+        return full
+
+    # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
+    flat = local.view(torch.uint8).view(-1)
+    chunk_elements = min(flat.numel(), max_gather_bytes // ep_size)
+    gathered = torch.empty(ep_size * chunk_elements, dtype=torch.uint8, device=local.device)
+    full_shards = full.view(torch.uint8).view(ep_size, flat.numel()) if full is not None else None
+    use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
+    for offset in range(0, flat.numel(), chunk_elements):
+        count = min(chunk_elements, flat.numel() - offset)
+        outputs = gathered[: ep_size * count]
+        inputs = flat[offset : offset + count]
+        if use_direct_buffer:
+            # NCCL's list gather allocates another packed output; write into the bounded buffer directly.
+            dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
+        else:
+            dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if full_shards is not None:
+            for rank, shard in enumerate(outputs.view(ep_size, count)):
+                full_shards[rank, offset : offset + count].copy_(shard)
+        else:
+            wait_for_export_collective(inputs)
+    return full
