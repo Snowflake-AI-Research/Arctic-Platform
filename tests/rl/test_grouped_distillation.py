@@ -22,6 +22,7 @@ import math
 import pytest
 import torch
 
+from arctic_platform.common.near_certain_logprobs import META_KEY as NEAR_CERTAIN_LOGPROBS_META_KEY
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
 from arctic_platform.rl.processors import LOSS_FNS
@@ -1050,7 +1051,8 @@ def test_native_unpad_round_trips_token_outputs_with_trailing_dimensions():
 @pytest.mark.parametrize("beta", [0.0, 1.0])
 @pytest.mark.parametrize("kind", ["dense", "moe"])
 def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(beta, kind):
-    """Both heads keep KL's zero gradient at a near-certain match; the head's float32 q * sum(grad) left 1.3e-5."""
+    """With ``numerics.near_certain_logprobs`` on, both heads keep KL's zero gradient at a near-certain match; the
+    head's float32 q * sum(grad) left 1.3e-5."""
     set_seed(0)
     vocab = 2 * 8192 + 37
     weight = torch.zeros(vocab, 2)
@@ -1067,9 +1069,10 @@ def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(be
             vocab_chunk_size=5000,
             fp32_lm_head=True,
             group_token_ids=ids,
+            near_certain_logprobs=True,
         )
     else:
-        head = FusedOutputLinear(2, vocab, 2, fp32_lm_head=True)
+        head = FusedOutputLinear(2, vocab, 2, fp32_lm_head=True, near_certain_logprobs=True)
         groups = torch.func.functional_call(head, {"weight": weight}, (hidden, ids[..., 0]), {"group_token_ids": ids})[
             "group_log_probs"
         ]
@@ -1078,9 +1081,12 @@ def test_kd_gradient_vanishes_when_a_near_certain_student_matches_its_teacher(be
     outside = torch.ones(vocab, dtype=torch.bool)
     outside[ids[0, 0]] = False
     teacher = torch.cat([logits[ids[0, 0]], logits[outside].logsumexp(0, keepdim=True)]).log_softmax(0)
-    context = dict(
-        teacher_token_ids=ids, teacher_log_probs=teacher[None, None, :-1], teacher_tail_log_prob=teacher[-1:][None]
-    )
+    context = {
+        "teacher_token_ids": ids,
+        "teacher_log_probs": teacher[None, None, :-1],
+        "teacher_tail_log_prob": teacher[-1:][None],
+        NEAR_CERTAIN_LOGPROBS_META_KEY: True,
+    }
     kd_sum, _ = grouped_divergence({"group_log_probs": groups}, context, torch.ones(1, 1), Divergence.KL, beta)
     kd_sum.backward()
 

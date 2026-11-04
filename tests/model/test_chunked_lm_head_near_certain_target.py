@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A near-certain target keeps its log-probability and its gradient in both chunked LM heads.
+"""With ``numerics.near_certain_logprobs`` on (the default), a near-certain target keeps its log-probability and its
+gradient in both chunked LM heads.
 
 When the target logit leads the logsumexp of the other logits by a margin ``m``, its log-probability is
 ``-log(1 + exp(-m))``. A logsumexp that sums the target's own ``exp(0) = 1`` with the rest rounds that to exactly 0
@@ -35,13 +36,21 @@ LABELS = torch.tensor([5, 37, 60])
 TARGET_LOGIT = 30.0
 
 
-def _head(kind, hidden, labels):
+def _head(kind, hidden, labels, near_certain_logprobs=True):
     if kind == "moe":
-        head = FusedOutputLinear(VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=True)
+        head = FusedOutputLinear(
+            VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=True, near_certain_logprobs=near_certain_logprobs
+        )
         output = torch.func.functional_call(head, {"weight": torch.eye(VOCAB_SIZE)}, (hidden, labels))
         return output["logprobs"], output["entropy"]
     logprobs = chunked_lm_head_logprobs(
-        hidden, torch.eye(VOCAB_SIZE), labels, token_chunk_size=2, vocab_chunk_size=16, fp32_lm_head=True
+        hidden,
+        torch.eye(VOCAB_SIZE),
+        labels,
+        token_chunk_size=2,
+        vocab_chunk_size=16,
+        fp32_lm_head=True,
+        near_certain_logprobs=near_certain_logprobs,
     )
     return logprobs, None
 
@@ -90,6 +99,42 @@ def _near_certain_logits(margin, target_logit=TARGET_LOGIT):
 
 
 @pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_heads_with_the_option_off_round_a_near_certain_target_to_zero(kind):
+    """With ``numerics.near_certain_logprobs`` off, the heads compute ``x[t] - logsumexp(x)``, so a target 20 nats
+    ahead of the rest reports a log-probability and a target gradient of exactly 0."""
+    logits = _near_certain_logits(20.0)
+    rows = torch.arange(len(LABELS))
+    hidden = logits.reshape(1, len(LABELS), VOCAB_SIZE).requires_grad_(True)
+    actual, _ = _head(kind, hidden, LABELS.reshape(1, -1), near_certain_logprobs=False)
+    actual.sum().backward()
+
+    assert (actual == 0).all()
+    assert (hidden.grad.reshape(len(LABELS), -1)[rows, LABELS] == 0).all()
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_heads_with_the_option_off_match_float32_log_softmax(kind):
+    """Off, value, gradient and entropy follow float32 ``log_softmax`` at a margin float32 resolves."""
+    logits = _near_certain_logits(4.0)
+    rows = torch.arange(len(LABELS))
+    hidden = logits.reshape(1, len(LABELS), VOCAB_SIZE).requires_grad_(True)
+    actual, entropy = _head(kind, hidden, LABELS.reshape(1, -1), near_certain_logprobs=False)
+    actual.sum().backward()
+
+    reference = logits.clone().requires_grad_(True)
+    log_probs = torch.log_softmax(reference, -1)
+    expected = log_probs[rows, LABELS]
+    expected.sum().backward()
+
+    torch_assert_close(actual.reshape(-1), expected.detach(), rtol=1e-5, atol=1e-6)
+    # The target entry is g - p with p near 1, so both sides carry float32 cancellation of ~ulp(1).
+    torch_assert_close(hidden.grad.reshape(len(LABELS), -1), reference.grad, rtol=1e-5, atol=1e-6)
+    if entropy is not None:
+        expected_entropy = -(log_probs.exp() * log_probs).sum(-1).detach()
+        torch_assert_close(entropy.reshape(-1), expected_entropy, rtol=0.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
 @pytest.mark.parametrize("target_logit", [30.0, 100.0])
 @pytest.mark.parametrize("margin", [17.0, 20.0])
 def test_near_certain_target_precision_does_not_depend_on_the_max_logit(kind, target_logit, margin):
@@ -135,7 +180,7 @@ def test_near_certain_target_gradient_with_grouped_outputs(kind, margin):
     hidden = logits.reshape(1, len(LABELS), VOCAB_SIZE).requires_grad_(True)
     labels = LABELS.reshape(1, -1)
     if kind == "moe":
-        head = FusedOutputLinear(VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=True)
+        head = FusedOutputLinear(VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=True, near_certain_logprobs=True)
         output = torch.func.functional_call(
             head, {"weight": torch.eye(VOCAB_SIZE)}, (hidden, labels), {"group_token_ids": group_token_ids}
         )
@@ -149,6 +194,7 @@ def test_near_certain_target_gradient_with_grouped_outputs(kind, margin):
             vocab_chunk_size=16,
             fp32_lm_head=True,
             group_token_ids=group_token_ids,
+            near_certain_logprobs=True,
         )
     torch.autograd.backward((actual, actual_groups), (logprob_gradients, group_gradients))
 
@@ -180,11 +226,17 @@ def test_near_certain_target_with_bfloat16_lm_head(kind, margin):
     weight = torch.eye(VOCAB_SIZE, dtype=torch.bfloat16)
     labels = LABELS.reshape(1, -1)
     if kind == "moe":
-        head = FusedOutputLinear(VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=False)
+        head = FusedOutputLinear(VOCAB_SIZE, VOCAB_SIZE, 2, fp32_lm_head=False, near_certain_logprobs=True)
         actual = torch.func.functional_call(head, {"weight": weight}, (hidden, labels))["logprobs"]
     else:
         actual = chunked_lm_head_logprobs(
-            hidden, weight, labels, token_chunk_size=2, vocab_chunk_size=16, fp32_lm_head=False
+            hidden,
+            weight,
+            labels,
+            token_chunk_size=2,
+            vocab_chunk_size=16,
+            fp32_lm_head=False,
+            near_certain_logprobs=True,
         )
     actual.sum().backward()
 

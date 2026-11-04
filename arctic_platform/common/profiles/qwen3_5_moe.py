@@ -47,6 +47,7 @@ def register(registry: Registry) -> None:
             "numerics.reduce_dtype",
             "numerics.optimization_dtype",
             "numerics.fp32_parity",
+            "numerics.near_certain_logprobs",
         ],
         unsupported={
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",

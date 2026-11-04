@@ -145,6 +145,10 @@ class GroupedLogProbAccumulator:
         self.candidate_logits[rows] = torch.where(in_tile, candidate_logits, self.candidate_logits[rows])
         self.tail_logits[rows] = torch.logaddexp(self.tail_logits[rows], scaled_logits.logsumexp(-1))
 
+    def plain_log_probs(self, log_normalizer: torch.Tensor) -> torch.Tensor:
+        """``groups - logz``: rounds a near-certain bucket's log-probability to exactly 0 in float32."""
+        return self.groups - log_normalizer.to(torch.float32)[:, None]
+
     def normalized_log_probs(self, token_chunk_size: int) -> torch.Tensor:
         # (bucket - peak) - softplus(logsumexp(others - peak)) keeps a near-certain bucket's tiny log-probability,
         # which groups - logz rounds to exactly 0 in float32. A repeated candidate token counts once. Token chunks

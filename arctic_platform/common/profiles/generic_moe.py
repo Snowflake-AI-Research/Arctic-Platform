@@ -46,6 +46,7 @@ def register(registry: Registry) -> None:
             "attention.backend",
             "numerics.reduce_dtype",
             "numerics.optimization_dtype",
+            "numerics.near_certain_logprobs",
         ],
         unsupported={
             "numerics.fp32_parity": "no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp",

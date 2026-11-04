@@ -227,6 +227,21 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "numerics.near_certain_logprobs",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Keep a near-certain target's log-probability and gradient. The chunked LM heads leave each row's target"
+            " out of the softmax sum, the grouped heads normalize against the largest bucket, grouped distillation"
+            " sums the bucket gradients to zero in float64, and compute_logprobs leaves the argmax out of its sum."
+            " On by default. Off computes x[t] - logsumexp(x) on each path, which in float32 rounds a target within"
+            " about 6e-8 of probability 1 to a log-probability and gradient of exactly 0."
+        ),
+        remove_when="no job needs log-probabilities that round near-certain targets to 0",
+        source="`loader_options.near_certain_logprobs`",
+        registry=registry,
+    )
+    register_option(
         "numerics.optimization_dtype",
         runs_in="trainer",
         goal="parity",

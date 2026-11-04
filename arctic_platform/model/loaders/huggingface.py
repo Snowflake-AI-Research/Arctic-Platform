@@ -23,6 +23,8 @@ from pydantic import model_validator
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
 
+from arctic_platform.common.near_certain_logprobs import LOADER_OPTION_DESCRIPTION as NEAR_CERTAIN_LOGPROBS_DESCRIPTION
+from arctic_platform.common.near_certain_logprobs import mark_model as mark_near_certain_logprobs
 from arctic_platform.common.text_config_overrides import apply_text_config_overrides
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
@@ -62,6 +64,7 @@ class HuggingfaceOptions(BaseModel):
             " unaffected."
         ),
     )
+    near_certain_logprobs: bool = Field(True, description=NEAR_CERTAIN_LOGPROBS_DESCRIPTION)
 
     @model_validator(mode="after")
     def _fp32_residual_needs_fp32_parity(self) -> HuggingfaceOptions:
@@ -146,4 +149,5 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         )
 
         configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
+    mark_near_certain_logprobs(model, options.near_certain_logprobs)
     return LoadedModel(model=model)

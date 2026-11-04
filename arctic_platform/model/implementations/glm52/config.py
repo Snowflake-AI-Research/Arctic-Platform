@@ -54,5 +54,7 @@ class ModelConfig:
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
+    # Keep a near-certain target's logprob and gradient in the chunked LM head and the RL post-processors.
+    near_certain_logprobs: bool = True
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)

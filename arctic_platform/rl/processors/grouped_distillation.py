@@ -26,6 +26,7 @@ from numbers import Real
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from arctic_platform.common.near_certain_logprobs import meta_enabled as near_certain_logprobs_enabled
 from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
@@ -371,7 +372,7 @@ def grouped_divergence(
     log_teacher, log_student = (
         value.double().masked_fill(padding.to(value.device), -math.inf) for value in (log_teacher, student_rows)
     )
-    if log_student.requires_grad:
+    if log_student.requires_grad and near_certain_logprobs_enabled(context):
         # Over distinct ids the buckets are a log-softmax, so this leaves the logit gradient unchanged; summing to
         # zero in float64 keeps the head's float32 q * sum(grad) from cancelling near-certain buckets' gradients.
         # Autograd keeps no copy of log_student, so the hook rebuilds q from the float32 rows.

@@ -30,6 +30,7 @@ each loader's own validation. The reasons follow the table.
 | `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no | yes | yes | yes |
 | `numerics.fp32_residual` | trainer | parity | no | no | no | no | no | no | yes | no | no |
 | `numerics.fp32_routed_weighting` | trainer | parity | no | no | no | no | yes | no | no | no | yes |
+| `numerics.near_certain_logprobs` | trainer | parity | yes | yes | no | yes | yes | yes | yes | yes | yes |
 | `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes |
 | `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
 | `peft` | trainer | mode | no | no | no | no | no | no | yes | no | no |
@@ -58,6 +59,7 @@ each loader's own validation. The reasons follow the table.
 - `numerics.fp32_parity`: Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights under bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and under full activation checkpointing every decoder layer after the first holds the residual as a second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the end of each layer. On GLM-5.3-Flash it rounds each RMSNorm once, after the weight multiply; on Qwen3.8-Flash-Next it evaluates the QSA rotary embedding, softmax probabilities, P·V product, output gate and hyper-connection mix and injection in fp32. Today: `loader_options.fp32_parity`. Remove when: no job needs the residual adds, rotary embedding and beta gate in the input dtype.
 - `numerics.fp32_residual`: Experimental. With fp32_parity on, carry the residual stream of the stock dense Qwen3.5 family in fp32 between decoder layers, from the embeddings on, instead of rounding it to the branch dtype after each fused add. Checked on CPU against a reference and under checkpointing, offload and compile; its effect on GPU training is not yet measured. Under full activation checkpointing each decoder layer after the first holds an fp32 residual at its boundary, twice the bytes of a bf16 one. Today: `loader_options.fp32_residual`. Remove when: GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity.
 - `numerics.fp32_routed_weighting`: GLM-5.3-Flash and Qwen3.8-Flash-Next BF16 experts multiply the down projection's fp32 accumulator by the routing weight and round once, as vLLM's Triton fused MoE kernel does, instead of rounding the expert output and then weighting it. Bit-identical to that kernel where a sampler rank computes whole experts; under sampler tensor parallelism each rank rounds its own partial sum. Off by default: it runs one fp32-output GEMM per local expert in place of the grouped GEMM, and on H200 the routed experts' forward plus backward takes 16-19% longer. Today: `loader_options.fp32_routed_weighting`. Remove when: a grouped GEMM with a weighted fp32 epilogue makes it cheap enough to fold into fp32_parity.
+- `numerics.near_certain_logprobs`: Keep a near-certain target's log-probability and gradient. The chunked LM heads leave each row's target out of the softmax sum, the grouped heads normalize against the largest bucket, grouped distillation sums the bucket gradients to zero in float64, and compute_logprobs leaves the argmax out of its sum. On by default. Off computes x[t] - logsumexp(x) on each path, which in float32 rounds a target within about 6e-8 of probability 1 to a log-probability and gradient of exactly 0. Today: `loader_options.near_certain_logprobs`. Remove when: no job needs log-probabilities that round near-certain targets to 0.
 - `numerics.optimization_dtype`: The dtype the trainer keeps and optimizes the weights in: bfloat16 or float32. Today: `ModelSpec.dtype` on the custom MoE loaders.
 - `numerics.reduce_dtype`: The dtype gradients are reduced in. Today: `loader_options.reduce_dtype`.
 - `peft`: Train adapters (LoRA) instead of the full weights. Today: `patches.peft`.
@@ -68,7 +70,7 @@ each loader's own validation. The reasons follow the table.
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -84,7 +86,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -98,7 +100,7 @@ Extends `generic_moe`.
 
 ## `dflash2`
 
-17 of 25 options unsupported.
+18 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -119,6 +121,7 @@ Extends `generic_moe`.
 - `numerics.fp32_parity` (no): this loader has no fp32_parity option
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): the draft has no routed experts
+- `numerics.near_certain_logprobs` (no): the draft objective computes its own cross-entropy
 - `numerics.reduce_dtype` (no): no equivalent option
 - `peft` (no): the loader rejects `patches.peft`: the draft is trained in full
 - `tiled_mlp.token_chunk_size` (no): the loader rejects `patches.tiled_mlp`
@@ -126,7 +129,7 @@ Extends `generic_moe`.
 
 ## `generic_moe`
 
-8 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -142,7 +145,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+6 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -153,7 +156,7 @@ Extends `generic_moe`.
 
 ## `glm_moe_dsa`
 
-8 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -166,7 +169,7 @@ Extends `generic_moe`.
 
 ## `huggingface`
 
-7 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -183,7 +186,7 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-7 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -198,7 +201,7 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+6 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`

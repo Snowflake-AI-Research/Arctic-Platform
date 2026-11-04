@@ -57,6 +57,9 @@ from typing import Any
 
 import torch
 
+from arctic_platform.common.near_certain_logprobs import META_KEY as NEAR_CERTAIN_LOGPROBS_META_KEY
+from arctic_platform.common.near_certain_logprobs import model_enabled as near_certain_logprobs_enabled
+
 # Shared registries live in arctic_platform.common.registry (used by RL + SFT).
 from arctic_platform.common.registry import LOSS_FNS  # noqa: F401  # re-exported
 from arctic_platform.common.registry import POST_PROCESSORS
@@ -597,6 +600,7 @@ def run_pipeline(
     # Later posts in this call may read earlier posts' outputs. Copy so the
     # worker's shared GAS ``meta`` is not mutated.
     post_meta = {**meta}
+    post_meta.setdefault(NEAR_CERTAIN_LOGPROBS_META_KEY, near_certain_logprobs_enabled(engine))
     with prof_post_fwd():
         for name in post_names:
             # tname_post = timers.start(f"pipe post-fwd [{name}]")

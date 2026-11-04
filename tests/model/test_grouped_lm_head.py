@@ -47,7 +47,7 @@ def _dense_groups(logits, token_ids):
     return torch.cat((candidates, tail), -1) - logits.logsumexp(-1, keepdim=True)
 
 
-def _head(kind, hidden, weight, labels, token_ids, chunks, **kwargs):
+def _head(kind, hidden, weight, labels, token_ids, chunks, near_certain_logprobs=True, **kwargs):
     token_chunk, vocab_chunk = chunks
     if kind == "moe":
         head = FusedOutputLinear(
@@ -55,6 +55,7 @@ def _head(kind, hidden, weight, labels, token_ids, chunks, **kwargs):
             weight.shape[0],
             token_chunk,
             fp32_lm_head=True,
+            near_certain_logprobs=near_certain_logprobs,
         )
         if token_ids is not None:
             kwargs["group_token_ids"] = token_ids
@@ -67,6 +68,7 @@ def _head(kind, hidden, weight, labels, token_ids, chunks, **kwargs):
         vocab_chunk_size=vocab_chunk,
         fp32_lm_head=True,
         group_token_ids=token_ids,
+        near_certain_logprobs=near_certain_logprobs,
         **kwargs,
     )
 
@@ -290,7 +292,8 @@ def test_moe_output_cast_preserves_group_log_probs():
 @pytest.mark.parametrize("kind,chunks", [("moe", (2, None)), ("dense", (2, 5000))])
 @pytest.mark.parametrize("width", [0, 4])
 def test_near_certain_bucket_keeps_its_log_probability(kind, chunks, width):
-    """Near-certain candidate and tail buckets retain their tiny negative log-probabilities."""
+    """With ``numerics.near_certain_logprobs`` on, near-certain candidate and tail buckets retain their tiny negative
+    log-probabilities."""
     weight = torch.zeros(VOCAB, 2)
     weight[8192, 0] = 30.0
     weight[VOCAB - 1, 1] = 20.0
@@ -298,7 +301,7 @@ def test_near_certain_bucket_keeps_its_log_probability(kind, chunks, width):
     labels = torch.tensor([[8192, VOCAB - 1]])
     token_ids = torch.tensor([[[8192, 5, 8192, -1], [5, 6, 7, 8]]], dtype=torch.int32)[..., :width]
 
-    output = _head(kind, hidden, weight, labels, token_ids, chunks)
+    output = _head(kind, hidden, weight, labels, token_ids, chunks, near_certain_logprobs=True)
     groups = output["group_log_probs"] if kind == "moe" else output[1]
 
     expected = _dense_groups((hidden @ weight.T).double(), token_ids)

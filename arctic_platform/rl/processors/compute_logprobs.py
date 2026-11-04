@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
 
 import torch
 
+from arctic_platform.common.near_certain_logprobs import meta_enabled as near_certain_logprobs_enabled
 from arctic_platform.common.registry import register_post_processor
 
 # Target fp32 slice size for the chunked log_softmax. Peak memory of the fp32
@@ -35,7 +37,13 @@ _LOGPROB_SLICE_BYTES = 1 * (2**30)  # 1 GiB
 
 
 def _eager_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
-    """Upcast to fp32 and return log_softmax over vocab at the label column."""
+    """Upcast to fp32, log_softmax over vocab, gather the label column."""
+    lp = torch.log_softmax(logits_chunk.float(), dim=-1)
+    return lp.gather(-1, labels_chunk.unsqueeze(-1)).squeeze(-1)
+
+
+def _eager_near_certain_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
+    """Upcast to fp32 and return log_softmax over vocab at the label column, keeping a near-certain label."""
     # Not torch.log_softmax: it sums the argmax's own exp(0) = 1, rounding a near-certain label's logprob and gradient
     # to exactly 0 (https://jonbarron.info/softmaxfix/; arXiv:2610.36427 for the log1p below).
     logits = logits_chunk.float()
@@ -48,17 +56,19 @@ def _eager_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Te
     return label_logits - torch.log1p(others)
 
 
-_compiled_log_softmax_gather = None
+_compiled_log_softmax_gather: dict[bool, Any] = {}
 
 
-def _log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
+def _log_softmax_gather(
+    logits_chunk: torch.Tensor, labels_chunk: torch.Tensor, near_certain_logprobs: bool = True
+) -> torch.Tensor:
     """Eager on CPU; Cortex ``torch.compile`` fuse when CUDA is available."""
-    global _compiled_log_softmax_gather
+    eager = _eager_near_certain_log_softmax_gather if near_certain_logprobs else _eager_log_softmax_gather
     if os.environ.get("DSS_LOGPROB_COMPILE", "1") != "0" and torch.cuda.is_available():
-        if _compiled_log_softmax_gather is None:
-            _compiled_log_softmax_gather = torch.compile(_eager_log_softmax_gather)
-        return _compiled_log_softmax_gather(logits_chunk, labels_chunk)
-    return _eager_log_softmax_gather(logits_chunk, labels_chunk)
+        if near_certain_logprobs not in _compiled_log_softmax_gather:
+            _compiled_log_softmax_gather[near_certain_logprobs] = torch.compile(eager)
+        return _compiled_log_softmax_gather[near_certain_logprobs](logits_chunk, labels_chunk)
+    return eager(logits_chunk, labels_chunk)
 
 
 @register_post_processor("compute_logprobs")
@@ -69,6 +79,8 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
     token axis so each slice fits ``_LOGPROB_SLICE_BYTES``. Prefer request
     ``labels`` (SP-aligned) over ``roll(input_ids)``. Zero ignore_index=-100
     positions. Pass through when the model already returned ``logprobs``.
+    ``meta["near_certain_logprobs"]`` (``numerics.near_certain_logprobs``)
+    keeps a near-certain label's logprob and gradient.
     """
     del device
     logprobs = model_outputs.get("logprobs")
@@ -116,7 +128,8 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
 
     logit_shards = torch.chunk(logits_2d, num_shards, dim=0)
     label_shards = torch.chunk(labels_1d, num_shards, dim=0)
-    out = [_log_softmax_gather(ls, ys) for ls, ys in zip(logit_shards, label_shards)]
+    near_certain = near_certain_logprobs_enabled(context)
+    out = [_log_softmax_gather(ls, ys, near_certain) for ls, ys in zip(logit_shards, label_shards)]
 
     logprobs = torch.cat(out).view_as(labels)
     logprobs = torch.where(valid_labels, logprobs, torch.zeros_like(logprobs))

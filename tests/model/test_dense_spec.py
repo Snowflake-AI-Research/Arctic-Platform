@@ -110,6 +110,8 @@ def test_loader_fields_in_training_options_are_rejected():
         _spec(training_options={"fp32_parity": False})
     with pytest.raises(ValueError, match="not in training_options; move fp32_parity, fp32_residual"):
         _spec(training_options={"fp32_parity": False, "fp32_residual": True})
+    with pytest.raises(ValueError, match="not in training_options; move near_certain_logprobs"):
+        _spec(training_options={"near_certain_logprobs": True})
 
 
 def test_loader_options_are_forwarded_whole(monkeypatch):
@@ -133,8 +135,8 @@ def test_loader_options_are_validated_by_the_huggingface_schema():
     parity_off = _spec(loader_options={"fp32_parity": False})
     residual_on = _spec(loader_options={"fp32_residual": True})
 
-    assert parity_off.loader_options == {"fp32_parity": False, "fp32_residual": False}
-    assert residual_on.loader_options == {"fp32_parity": True, "fp32_residual": True}
+    assert parity_off.loader_options == {"fp32_parity": False, "fp32_residual": False, "near_certain_logprobs": True}
+    assert residual_on.loader_options == {"fp32_parity": True, "fp32_residual": True, "near_certain_logprobs": True}
     with pytest.raises(ValidationError, match="fp32_residual requires fp32_parity"):
         _spec(loader_options={"fp32_parity": False, "fp32_residual": True})
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):

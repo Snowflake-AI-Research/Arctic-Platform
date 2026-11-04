@@ -80,6 +80,7 @@ def _build_model_config(
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
+        near_certain_logprobs=options.near_certain_logprobs,
         debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 
