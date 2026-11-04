@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 from dataclasses import dataclass
@@ -63,7 +64,11 @@ def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parame
     for name, parameter in model.named_parameters():
         if getattr(parameter, "allreduce", True) is False:
             group_name = parameter.group_name
-            groups.setdefault(group_name, {})[name] = parameter
+            name = canonical_parameter_name(name)
+            parameters = groups.setdefault(group_name, {})
+            if name in parameters:
+                raise ValueError(f"AP expert checkpoint has duplicate canonical parameter name: {name}")
+            parameters[name] = parameter
     return groups
 
 
@@ -104,11 +109,19 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
 
     AP-owned sidefiles use a regular torch ZIP archive, independently of the dense checkpoint's serialization
     setting. Reserve compact storage records first, then fill them with a single 16 MiB CPU staging buffer.
-    Flushing and evicting each chunk bounds dirty page-cache growth as well as anonymous host memory.
+    ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES sets the sync/eviction interval (16 MiB by default, 0 for end-only).
+    Only the AP shard is synced here; DeepSpeed owns durability of dense/optimizer files and the latest pointer.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    directories_to_sync = [path.parent, path.parent.parent]
+    sync_env = "ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES"
+    try:
+        sync_bytes = int(os.environ.get(sync_env, str(16 * 1024 * 1024)))
+    except ValueError as error:
+        raise ValueError(f"{sync_env} must be a non-negative integer") from error
+    if sync_bytes < 0:
+        raise ValueError(f"{sync_env} must be a non-negative integer")
+    directories_to_sync = [path.parent, path.parent.parent, path.parent.parent.parent]
     ancestor = path.parent
     while not ancestor.exists():
         ancestor = ancestor.parent
@@ -130,9 +143,19 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
             records = torch.load(temporary, weights_only=True)["module"]
         offsets = {name: tensor.untyped_storage()._checkpoint_offset for name, tensor in records.items()}
         del records
+        records_end = temporary.stat().st_size
+        ranges = sorted(
+            (offsets[name], offsets[name] + tensor.numel() * tensor.element_size())
+            for name, tensor in tensors.items() if tensor.numel() > 0
+        )
+        if any(start < 0 or end > records_end for start, end in ranges) or any(
+            left[1] > right[0] for left, right in zip(ranges, ranges[1:])
+        ):
+            raise ValueError("AP expert checkpoint storage offsets are invalid or overlapping")
         staging = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cpu")
         descriptor = os.open(temporary, os.O_WRONLY)
         try:
+            pending_bytes = 0
             for name, tensor in tensors.items():
                 start = 0
                 for source in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
@@ -146,11 +169,15 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
                         if size <= 0:
                             raise OSError("AP expert checkpoint write made no progress")
                         written += size
-                    os.fdatasync(descriptor)
-                    os.posix_fadvise(descriptor, offsets[name] + start, count, os.POSIX_FADV_DONTNEED)
+                    pending_bytes += count
+                    if sync_bytes > 0 and pending_bytes >= sync_bytes:
+                        os.fdatasync(descriptor)
+                        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+                        pending_bytes = 0
                     start += count
             # Also sync archive metadata when the shard contains only empty tensors.
             os.fdatasync(descriptor)
+            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
         finally:
             os.close(descriptor)
         os.replace(temporary, path)
@@ -159,6 +186,10 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
             directory_descriptor = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_descriptor)
+            except OSError as error:
+                if error.errno not in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}:
+                    raise
+                get_logger().info("Directory fsync is unsupported for %s", directory_path)
             finally:
                 os.close(directory_descriptor)
 
@@ -272,10 +303,15 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         if self.zero_optimization_partition_weights():
             raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
         local_state = {}
+        legacy_parameters = {}
         for group_name, named_parameters in parameters.items():
             identity = _ep_checkpoint_identity(group_name)
             path = _ep_checkpoint_path(arguments["load_dir"], arguments["tag"], identity)
             if not path.is_file():
+                # Old dense-only saves cannot identify the correct expert rank when EP spans several ranks.
+                if identity["ep_size"] == 1:
+                    legacy_parameters.update(named_parameters)
+                    continue
                 raise FileNotFoundError(f"AP expert-parallel checkpoint is missing its rank-local shard: {path}")
             # AP sidefiles are always Torch ZIP archives, even with a different dense checkpoint engine.
             shard = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
@@ -288,24 +324,32 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
                 or not isinstance(shard.get("module"), dict)
             ):
                 raise ValueError(f"AP expert-parallel checkpoint shard metadata does not match: {path}")
+            canonical_state = {}
+            for name, value in shard["module"].items():
+                canonical_name = canonical_parameter_name(name)
+                if canonical_name in canonical_state:
+                    raise ValueError(f"AP expert-parallel checkpoint has duplicate canonical names: {path}")
+                canonical_state[canonical_name] = value
             expected_names = {
                 name
                 for name, parameter in named_parameters.items()
                 if parameter.requires_grad or not shard["exclude_frozen_parameters"]
             }
-            if set(shard["module"]) != expected_names:
+            if set(canonical_state) != expected_names:
                 raise ValueError(f"AP expert-parallel checkpoint parameter coverage does not match: {path}")
-            for name, value in shard["module"].items():
+            for name, value in canonical_state.items():
                 if not isinstance(value, torch.Tensor) or value.shape != named_parameters[name].shape:
                     raise ValueError(f"AP expert-parallel checkpoint tensor shape does not match for {name}: {path}")
                 if value.dtype != named_parameters[name].dtype:
                     raise ValueError(f"AP expert-parallel checkpoint tensor dtype does not match for {name}: {path}")
-            local_state.update(shard["module"])
+            local_state.update(canonical_state)
         self._ap_ep_checkpoint_state = local_state
+        self._ap_ep_legacy_parameters = legacy_parameters
         try:
             return original_load(*bound.args, **bound.kwargs)
         finally:
             del self._ap_ep_checkpoint_state
+            del self._ap_ep_legacy_parameters
 
     @wraps(original_module_load)
     def load_module(self, *args, **kwargs):
@@ -315,6 +359,12 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         bound.apply_defaults()
         checkpoint = dict(bound.arguments["checkpoint"])
         checkpoint["module"] = dict(checkpoint["module"])
+        for name, parameter in self._ap_ep_legacy_parameters.items():
+            value = checkpoint["module"].get(name)
+            if not isinstance(value, torch.Tensor) or value.shape != parameter.shape or value.dtype != parameter.dtype:
+                raise FileNotFoundError(
+                    f"AP expert-parallel checkpoint has neither a rank-local shard nor compatible dense expert {name}"
+                )
         checkpoint["module"].update(
             (canonical_parameter_name(name), value) for name, value in self._ap_ep_checkpoint_state.items()
         )
@@ -322,11 +372,14 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS) is not None:
             from deepspeed.runtime.utils import is_optimized_parameter
 
+            live_parameters = {
+                canonical_parameter_name(name): parameter for name, parameter in self.module.named_parameters()
+            }
             fragments = dict(checkpoint[FROZEN_PARAM_FRAGMENTS])
             fragments.update(
-                (self.param_names[self.module.get_parameter(name)], value)
+                (self.param_names[live_parameters[name]], value)
                 for name, value in self._ap_ep_checkpoint_state.items()
-                if not is_optimized_parameter(self.module.get_parameter(name))
+                if not is_optimized_parameter(live_parameters[name])
             )
             checkpoint[FROZEN_PARAM_FRAGMENTS] = fragments
         bound.arguments["checkpoint"] = checkpoint

@@ -648,10 +648,11 @@ def test_ep_checkpoint_restores_activation_wrapped_weights(
     getattr(engine, save_method)(tmp_path, "wrapped", exclude_frozen_parameters=exclude_frozen)
     shard = engine.checkpoint_engine.load(engine.checkpoint_engine.saved_paths[0], torch.device("cpu"))
     assert set(shard["module"]) == {
-        name for name, parameter in engine.module.named_parameters() if parameter.requires_grad or not exclude_frozen
+        common.canonical_parameter_name(name)
+        for name, parameter in engine.module.named_parameters()
+        if parameter.requires_grad or not exclude_frozen
     }
-    if placement == "block":
-        assert all("_checkpoint_wrapped_module" in name for name in shard["module"])
+    assert all("_checkpoint_wrapped_module" not in name for name in shard["module"])
     assert all("_checkpoint_wrapped_module" not in name for name in engine.saved_checkpoint["module"])
     with torch.no_grad():
         for parameter in engine.module.parameters():
@@ -783,7 +784,7 @@ def test_ep_checkpoint_syncs_data_before_rename_and_directory_after(tmp_path, mo
         monkeypatch.setattr(common.os, name, record)
     tensor = torch.empty(0) if empty else torch.ones(4)
     common._save_ep_checkpoint_shard({"module": {"expert": tensor}}, tmp_path / "expert.pt")
-    assert events[-4:] == ["fdatasync", "replace", "fsync", "fsync"]
+    assert events[-5:] == ["fdatasync", "replace", "fsync", "fsync", "fsync"]
 
 
 def test_ep_checkpoint_syncs_new_tag_and_save_directory_ancestors(tmp_path, monkeypatch):
@@ -798,6 +799,80 @@ def test_ep_checkpoint_syncs_new_tag_and_save_directory_ancestors(tmp_path, monk
     save_dir = tmp_path / "new-root" / "checkpoints"
     common._save_ep_checkpoint_shard({"module": {"expert": torch.ones(1)}}, save_dir / "tag" / "expert.pt")
     assert synced == [save_dir / "tag", save_dir, save_dir.parent, tmp_path]
+
+
+@pytest.mark.parametrize("save_wrapped", [False, True])
+def test_ep_checkpoint_resumes_across_activation_wrapping(ep_checkpoint_engine, tmp_path, save_wrapped):
+    engine = ep_checkpoint_engine
+    module = engine.module
+    engine.module = nn.Sequential(checkpoint_wrapper(module) if save_wrapped else module)
+    expected = {name: tensor.clone() for name, tensor in engine.module.state_dict().items()}
+    engine._save_moe_checkpoint(tmp_path, "cross-wrapping")
+    engine.module = nn.Sequential(module if save_wrapped else checkpoint_wrapper(module))
+    with torch.no_grad():
+        for parameter in engine.module.parameters():
+            parameter.zero_()
+    engine._load_checkpoint(tmp_path, "cross-wrapping")
+    for name, tensor in engine.module.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_ep_checkpoint_legacy_dense_fallback_for_ep_one(ep_checkpoint_engine, tmp_path, monkeypatch, complete):
+    engine = ep_checkpoint_engine
+    groups = sys.modules["deepspeed.utils.groups"]
+    monkeypatch.setattr(groups, "_get_expert_parallel_world_size", lambda name: 1)
+    expected = {name: value.detach().clone() for name, value in engine.module.state_dict().items()}
+    engine.saved_checkpoint = dict(module=expected if complete else {})
+    with torch.no_grad():
+        for parameter in engine.module.parameters():
+            parameter.zero_()
+    if complete:
+        engine._load_checkpoint(tmp_path, "legacy")
+        for name, parameter in engine.module.named_parameters():
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+    else:
+        with pytest.raises(FileNotFoundError, match="neither a rank-local shard nor compatible dense expert"):
+            engine._load_checkpoint(tmp_path, "legacy")
+    assert not hasattr(engine, "_ap_ep_legacy_parameters")
+
+
+@pytest.mark.parametrize("code", [22, 38, 95])
+def test_ep_checkpoint_tolerates_unsupported_directory_sync(tmp_path, monkeypatch, code):
+    path = tmp_path / "existing-save" / "tag" / "expert.pt"
+    path.parent.mkdir(parents=True)
+    synced = []
+
+    def sync(descriptor):
+        synced.append(Path(common.os.readlink(f"/proc/self/fd/{descriptor}")))
+        raise OSError(code, "unsupported directory sync")
+
+    monkeypatch.setattr(common.os, "fsync", sync)
+    common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(1))), path)
+    assert synced == [path.parent, path.parent.parent, tmp_path]
+    torch.testing.assert_close(torch.load(path, weights_only=True)["module"]["expert"], torch.ones(1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("interval,expected_syncs", [("0", 1), ("1", 3), ("33554432", 1)])
+def test_ep_checkpoint_configurable_sync_interval(tmp_path, monkeypatch, interval, expected_syncs):
+    monkeypatch.setenv("ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES", interval)
+    calls = []
+    native = common.os.fdatasync
+
+    def sync(descriptor):
+        calls.append(descriptor)
+        native(descriptor)
+
+    monkeypatch.setattr(common.os, "fdatasync", sync)
+    common._save_ep_checkpoint_shard(dict(module=dict(one=torch.ones(2), two=torch.ones(3))), tmp_path / "expert.pt")
+    assert len(calls) == expected_syncs
+
+
+@pytest.mark.parametrize("interval", ["bad", "-1"])
+def test_ep_checkpoint_rejects_invalid_sync_interval(tmp_path, monkeypatch, interval):
+    monkeypatch.setenv("ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES", interval)
+    with pytest.raises(ValueError, match="ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES"):
+        common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(1))), tmp_path / "expert.pt")
 
 
 @require_torch_gpu
