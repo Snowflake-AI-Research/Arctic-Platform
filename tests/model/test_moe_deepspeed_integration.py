@@ -962,7 +962,7 @@ def test_ep_checkpoint_verification_switch(monkeypatch, tmp_path, verify):
         assert not path.exists()
     else:
         common._save_ep_checkpoint_shard(dict(module=dict(weight=torch.ones(2))), path)
-        assert readbacks == ([True] if verify == "1" else [])
+        assert readbacks == [True]
         torch_assert_equal(native_load(path, weights_only=True)["module"]["weight"], torch.ones(2))
 
 
@@ -993,7 +993,9 @@ def test_ep_checkpoint_tolerates_unsupported_file_sync(tmp_path, monkeypatch, op
     torch_assert_equal(torch.load(path, weights_only=True)["module"]["expert"], torch.ones(2))
 
 
-def test_ep_checkpoint_rejects_shifted_in_range_storage_offset(tmp_path, monkeypatch):
+@pytest.mark.parametrize("verify", ["0", "1"])
+def test_ep_checkpoint_rejects_shifted_in_range_storage_offset(tmp_path, monkeypatch, verify):
+    monkeypatch.setenv("ARCTIC_EXPERT_CHECKPOINT_VERIFY", verify)
     native = common.os.pwritev
 
     def shifted(descriptor, buffers, offset):
@@ -1003,6 +1005,45 @@ def test_ep_checkpoint_rejects_shifted_in_range_storage_offset(tmp_path, monkeyp
     with pytest.raises(ValueError, match="payload verification"):
         common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.ones(2))), tmp_path / "expert.pt")
     assert not (tmp_path / "expert.pt").exists()
+
+
+@pytest.mark.parametrize("elastic", [False, True])
+def test_legacy_ep_optimizer_old_filename_and_elastic_metadata(ep_checkpoint_engine, tmp_path, elastic):
+    engine = ep_checkpoint_engine
+    path = Path(engine._get_zero_ckpt_name(tmp_path, "legacy"))
+    path.parent.mkdir()
+    path = path.with_name(path.name.removesuffix("_optim_states.pt") + "optim_states.pt")
+    base = dict(param_groups=[dict(moe=True, name="ep_size_2")])
+    torch.save(
+        dict(optimizer_state_dict=dict(partition_count=[1], base_optimizer_state=[base] if elastic else base)),
+        path,
+    )
+    if elastic:
+        with pytest.raises(ValueError, match="non-elastic"):
+            common._validate_legacy_ep_zero_layout(engine, tmp_path, "legacy", dict(group_name="ep_size_2", ep_size=2))
+    else:
+        common._validate_legacy_ep_zero_layout(engine, tmp_path, "legacy", dict(group_name="ep_size_2", ep_size=2))
+
+
+def test_ep_checkpoint_cleans_only_stale_workspace_for_current_shard(tmp_path):
+    import os
+    import time
+
+    path = tmp_path / "expert.pt"
+    stale = tmp_path / ".ap-ep-checkpoint-expert-old"
+    stale.mkdir()
+    recent = tmp_path / ".ap-ep-checkpoint-expert-recent"
+    recent.mkdir()
+    other = tmp_path / ".ap-ep-checkpoint-other-old"
+    other.mkdir()
+    timestamp = time.time() - 61
+    for directory in (stale, other):
+        os.utime(directory, (timestamp, timestamp))
+    common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.arange(8.0))), path)
+    assert not stale.exists()
+    assert recent.exists()
+    assert other.exists()
+    torch_assert_equal(torch.load(path, weights_only=True)["module"]["expert"], torch.arange(8.0))
 
 
 @pytest.mark.parametrize("interval,expected_syncs", [("0", 1), ("1", 3), ("33554432", 1)])

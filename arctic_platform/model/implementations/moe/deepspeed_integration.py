@@ -5,7 +5,9 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from functools import wraps
 from inspect import signature
@@ -117,14 +119,25 @@ def _checkpoint_sync(operation, *args) -> None:
 def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> None:
     """Require this rank's native ZeRO archive and matching expert group/partition metadata."""
     path = Path(engine._get_zero_ckpt_name(directory, tag))
+    if not path.is_file() and path.name.endswith("_optim_states.pt"):
+        path = path.with_name(path.name.removesuffix("_optim_states.pt") + "optim_states.pt")
     if not path.is_file():
         raise FileNotFoundError(f"Legacy EP checkpoint is missing this rank's ZeRO optimizer file: {path}")
     saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
-    optimizer = saved.get("optimizer_state_dict", {})
-    groups = optimizer.get("base_optimizer_state", {}).get("param_groups", [])
+    optimizer = saved.get("optimizer_state_dict", {}) if isinstance(saved, dict) else None
+    base = optimizer.get("base_optimizer_state") if isinstance(optimizer, dict) else None
+    if not isinstance(base, dict):
+        raise ValueError("Legacy EP resume requires non-elastic ZeRO optimizer metadata")
+    groups = base.get("param_groups")
     counts = optimizer.get("partition_count")
     current_counts = engine.optimizer.partition_count
-    if counts != current_counts or len(groups) != len(counts):
+    if (
+        not isinstance(groups, list)
+        or not isinstance(counts, list)
+        or any(not isinstance(group, dict) for group in groups)
+        or counts != current_counts
+        or len(groups) != len(counts)
+    ):
         raise ValueError("Legacy EP checkpoint DP/EP partition layout does not match the current optimizer")
     matching = [group for group in groups if group.get("moe") and group.get("name") == identity["group_name"]]
     # AP registers native expert groups as ep_size_N; a different saved N must never recover local experts.
@@ -138,7 +151,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     AP-owned sidefiles use a regular torch ZIP archive, independently of the dense checkpoint's serialization
     setting. Reserve compact storage records first, then fill them with a single 16 MiB CPU staging buffer.
     ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES sets the sync/eviction interval (16 MiB by default, 0 for end-only).
-    Full cold-read checksum verification is enabled by default; ARCTIC_EXPERT_CHECKPOINT_VERIFY=0 disables it.
+    Full cold-read checksum verification is enabled by default; ARCTIC_EXPERT_CHECKPOINT_VERIFY=0 keeps only
+    metadata and first/last-byte checks on every tensor.
     Only the AP shard is synced here; DeepSpeed owns durability of dense/optimizer files and the latest pointer.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -156,7 +170,12 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         raise ValueError(f"{verify_env} must be 0 or 1")
     path.parent.mkdir(parents=True, exist_ok=True)
     tensors = state["module"]
-    with tempfile.TemporaryDirectory(prefix=".ap-ep-checkpoint-", dir=path.parent) as directory:
+    prefix = f".ap-ep-checkpoint-{path.stem}-"
+    # Only this shard's writer owns these workspaces; other EP ranks may still be saving.
+    for workspace in path.parent.glob(f"{prefix}*"):
+        if workspace.is_dir() and time.time() - workspace.stat().st_mtime > 60:
+            shutil.rmtree(workspace)
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=path.parent) as directory:
         temporary = Path(directory) / path.name
         # Real empty tensors can fill the entire expert layout under deterministic initialization.
         with FakeTensorMode():
@@ -168,8 +187,12 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         del layout
         with FakeTensorMode():
             records = torch.load(temporary, weights_only=True)["module"]
-        offsets = {name: tensor.untyped_storage()._checkpoint_offset for name, tensor in records.items()}
+        offsets = {
+            name: getattr(tensor.untyped_storage(), "_checkpoint_offset", None) for name, tensor in records.items()
+        }
         del records
+        if any(type(offset) is not int for offset in offsets.values()):
+            raise RuntimeError("AP expert checkpoint requires torch storage-offset serialization support (torch>=2.7)")
         records_end = temporary.stat().st_size
         ranges = sorted(
             (offsets[name], offsets[name] + tensor.numel() * tensor.element_size())
@@ -183,16 +206,21 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         staging = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cpu")
         descriptor = os.open(temporary, os.O_WRONLY)
         checksums = {}
+        samples = {}
         try:
             pending_bytes = 0
             for name, tensor in tensors.items():
                 start = 0
                 checksum = hashlib.sha256()
+                first, last = b"", b""
                 for source in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
                     count = source.numel()
                     chunk = staging.narrow(0, 0, count)
                     chunk.copy_(source, non_blocking=False)
                     data = memoryview(chunk.numpy())
+                    if not first:
+                        first = bytes(data[:8])
+                    last = (last + bytes(data[-8:]))[-8:]
                     if verify == "1":
                         checksum.update(data)
                     written = 0
@@ -208,21 +236,29 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
                         pending_bytes = 0
                     start += count
                 checksums[name] = checksum.digest()
+                samples[name] = (first, last)
             # Also sync archive metadata when the shard contains only empty tensors.
             _checkpoint_sync(os.fdatasync, descriptor)
             _checkpoint_sync(os.posix_fadvise, descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
         finally:
             os.close(descriptor)
         # Validate actual ZIP tensor records, independently of the private offsets used for writing.
-        if verify == "1":
-            written_state = torch.load(temporary, map_location="cpu", weights_only=True, mmap=True)["module"]
-            for name, tensor in written_state.items():
+        written_state = torch.load(temporary, map_location="cpu", weights_only=True, mmap=True)["module"]
+        if set(written_state) != set(tensors):
+            raise ValueError("AP expert checkpoint tensor inventory verification failed")
+        for name, tensor in written_state.items():
+            if tensor.shape != tensors[name].shape or tensor.dtype != tensors[name].dtype:
+                raise ValueError(f"AP expert checkpoint tensor metadata verification failed for {name}")
+            data = tensor.view(-1).view(torch.uint8)
+            if (data[:8].numpy().tobytes(), data[-8:].numpy().tobytes()) != samples[name]:
+                raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
+            if verify == "1":
                 checksum = hashlib.sha256()
                 for chunk in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
                     checksum.update(memoryview(chunk.numpy()))
                 if checksum.digest() != checksums[name]:
                     raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
-            del written_state
+        del written_state
         os.replace(temporary, path)
         # DeepSpeed creates the checkpoint tree; only our shard's rename is owned here.
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
