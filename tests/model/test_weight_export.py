@@ -131,6 +131,21 @@ def test_iter_model_weights_forwards_complete_hf_export_mode():
     assert received == [True]
 
 
+@pytest.mark.parametrize("include_skipped", (False, True))
+def test_generic_hf_export_adds_persistent_buffers_only_to_complete_checkpoints(include_skipped):
+    model = nn.Module()
+    model.layer = nn.Linear(2, 2, bias=False)
+    model.layer.register_buffer("layer_scalar", torch.tensor([0.5]))
+    model.layer.register_buffer("inv_freq", torch.ones(1), persistent=False)
+
+    exported = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False, include_skipped=include_skipped))
+
+    expected = {"layer.weight", "layer.layer_scalar"} if include_skipped else {"layer.weight"}
+    assert set(exported) == expected
+    if include_skipped:
+        assert exported["layer.layer_scalar"] is model.layer.layer_scalar
+
+
 def test_iter_lora_weights_normalizes_dense_adapter_names():
     tensor = torch.ones(2, 2)
     model = _Model(

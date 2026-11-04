@@ -1146,6 +1146,8 @@ class NemotronHRouter(nn.Module):
     and bias correction for load balancing.
     """
 
+    _dss_weight_export_buffers = frozenset({"e_score_correction_bias"})
+
     def __init__(
         self,
         dim: int,

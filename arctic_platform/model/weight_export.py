@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import glob
+import itertools
 import json
 import logging
 import os
@@ -140,7 +141,7 @@ def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
     renamings = [transform for transform in reverse if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in reverse if isinstance(transform, WeightConverter)]
     names: dict[str, str] = {}
-    for name, _ in model.named_parameters():
+    for name, _ in itertools.chain(model.named_parameters(), _named_persistent_buffers(model)):
         export_name = hf_export_parameter_name(name)
         if export_name is None:
             continue
@@ -209,6 +210,10 @@ def hf_sync_name_map(model: nn.Module, checkpoint_dir: str | None = None) -> dic
             # Tied-embedding checkpoints omit lm_head.
             elif export_name not in saved and export_name != "lm_head.weight":
                 unmapped.append(export_name)
+        for name, _ in _named_persistent_buffers(model):
+            export_name = hf_export_parameter_name(name)
+            if export_name in names and names[export_name] in saved:
+                renames[export_name] = names[export_name]
         if renames and unmapped:
             raise RuntimeError(
                 f"weight_format='hf' name translation is incomplete: {len(renames)} parameter(s) map onto "
@@ -647,12 +652,20 @@ def iter_lora_weights(
             yield export_name, parameter.data
 
 
+def _named_persistent_buffers(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    for module_name, module in model.named_modules():
+        for name, buffer in module.named_buffers(recurse=False):
+            if name not in module._non_persistent_buffers_set:
+                yield f"{module_name}.{name}" if module_name else name, buffer
+
+
 def _iter_generic_weights(
     model: nn.Module,
     weight_format: WeightFormat,
     *,
     is_master: bool,
     is_zero3: bool,
+    include_skipped: bool,
     checkpoint_dir: str | None,
 ) -> WeightIterator:
     if _has_ep_sharded_parameters(model):
@@ -677,6 +690,12 @@ def _iter_generic_weights(
         if is_master:
             assert tensor is not None
             yield export_name, tensor
+    if include_skipped and is_master:
+        # Constant checkpoint state: the sampler loads it with the model, so weight sync leaves it out.
+        for name, buffer in _named_persistent_buffers(model):
+            export_name = hf_export_parameter_name(name)
+            if export_name is not None:
+                yield names.get(export_name, export_name), buffer
 
 
 def iter_model_weights(
@@ -693,6 +712,7 @@ def iter_model_weights(
     Models without a family contract stream ``named_parameters()``: unchanged for
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
     :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+    ``include_skipped`` asks for a complete checkpoint, which adds persistent buffers.
     """
     if weight_format not in ("hf", "vllm", "lora"):
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
@@ -718,5 +738,6 @@ def iter_model_weights(
         weight_format,
         is_master=is_master,
         is_zero3=is_zero3,
+        include_skipped=include_skipped,
         checkpoint_dir=checkpoint_dir,
     )
