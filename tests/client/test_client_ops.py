@@ -1980,6 +1980,8 @@ class TestCortexUnpackedVerlGrpo:
         from arctic_platform.client import CortexConfig
         from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
 
+        import torch
+
         seen = {}
 
         class Client:
@@ -1989,7 +1991,7 @@ class TestCortexUnpackedVerlGrpo:
 
             async def fwd_no_grad(self, payload):
                 seen["fwd_no_grad"] = payload
-                return {"logprobs": [[0.0] * 5, [0.0] * 5]}
+                return {"logprobs": torch.zeros(2, 5)}
 
         config = ArcticClientConfig(
             model_name="m",
