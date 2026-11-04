@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Mapping
+from typing import cast
 from urllib.parse import quote
 
 import torch
@@ -41,7 +42,6 @@ from .layers.moe import MoE
 from .logging_utils import get_logger
 from .parallel_dims import ParallelDims
 from .vlm import get_language_model
-
 
 _EXPORT_GATHER_BYTES = 64 * 1024 * 1024
 
@@ -141,7 +141,7 @@ def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> N
     saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
     optimizer = saved.get("optimizer_state_dict", {}) if isinstance(saved, dict) else None
     base = optimizer.get("base_optimizer_state") if isinstance(optimizer, dict) else None
-    if not isinstance(base, dict):
+    if not isinstance(optimizer, dict) or not isinstance(base, dict):
         raise ValueError("Legacy EP resume requires non-elastic ZeRO optimizer metadata")
     groups = base.get("param_groups")
     counts = optimizer.get("partition_count")
@@ -260,12 +260,13 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         del layout
         with FakeTensorMode():
             records = torch.load(temporary, weights_only=True)["module"]
-        offsets = {
+        raw_offsets = {
             name: getattr(tensor.untyped_storage(), "_checkpoint_offset", None) for name, tensor in records.items()
         }
         del records
-        if any(type(offset) is not int for offset in offsets.values()):
+        if any(type(offset) is not int for offset in raw_offsets.values()):
             raise RuntimeError("AP expert checkpoint requires torch storage-offset serialization support (torch>=2.7)")
+        offsets = cast(dict[str, int], raw_offsets)
         _validate_ep_checkpoint_storage_offsets(temporary, tensors, offsets)
         records_end = temporary.stat().st_size
         ranges = sorted(
@@ -323,8 +324,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         for name, tensor in written_state.items():
             if tensor.shape != tensors[name].shape or tensor.dtype != tensors[name].dtype:
                 raise ValueError(f"AP expert checkpoint tensor metadata verification failed for {name}")
-            data = tensor.view(-1).view(torch.uint8)
-            if (data[:8].numpy().tobytes(), data[-8:].numpy().tobytes()) != samples[name]:
+            payload_bytes = tensor.view(-1).view(torch.uint8)
+            if (payload_bytes[:8].numpy().tobytes(), payload_bytes[-8:].numpy().tobytes()) != samples[name]:
                 raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
             if verify == "1":
                 checksum = hashlib.sha256()
@@ -723,9 +724,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         step = max(1, _EXPORT_GATHER_BYTES // max(row_bytes * world, 1))
         step = min(step, max(rows, 1))
-        full = (
-            torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
-        )
+        full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
         buffer = (
             torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
             if is_master and local.device.type != "cpu"
@@ -736,9 +735,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             if buffer is not None:
                 outputs = [buffer[rank, :count] for rank in range(world)]
             elif full is not None:
-                outputs = [
-                    full[rank * rows + start : rank * rows + start + count] for rank in range(world)
-                ]
+                outputs = [full[rank * rows + start : rank * rows + start + count] for rank in range(world)]
             else:
                 outputs = None
             chunk = local[start : start + count].contiguous()
