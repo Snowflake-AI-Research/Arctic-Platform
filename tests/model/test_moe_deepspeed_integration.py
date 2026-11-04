@@ -783,7 +783,21 @@ def test_ep_checkpoint_syncs_data_before_rename_and_directory_after(tmp_path, mo
         monkeypatch.setattr(common.os, name, record)
     tensor = torch.empty(0) if empty else torch.ones(4)
     common._save_ep_checkpoint_shard({"module": {"expert": tensor}}, tmp_path / "expert.pt")
-    assert events[-3:] == ["fdatasync", "replace", "fsync"]
+    assert events[-4:] == ["fdatasync", "replace", "fsync", "fsync"]
+
+
+def test_ep_checkpoint_syncs_new_tag_and_save_directory_ancestors(tmp_path, monkeypatch):
+    synced = []
+    native = common.os.fsync
+
+    def record(descriptor):
+        synced.append(Path(common.os.readlink(f"/proc/self/fd/{descriptor}")))
+        native(descriptor)
+
+    monkeypatch.setattr(common.os, "fsync", record)
+    save_dir = tmp_path / "new-root" / "checkpoints"
+    common._save_ep_checkpoint_shard({"module": {"expert": torch.ones(1)}}, save_dir / "tag" / "expert.pt")
+    assert synced == [save_dir / "tag", save_dir, save_dir.parent, tmp_path]
 
 
 @require_torch_gpu

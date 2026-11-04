@@ -9,11 +9,10 @@ from functools import wraps
 from inspect import signature
 from math import prod
 from pathlib import Path
-from urllib.parse import quote
-
 from typing import Any
 from typing import Callable
 from typing import Mapping
+from urllib.parse import quote
 
 import torch
 import torch.nn as nn
@@ -109,6 +108,12 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    directories_to_sync = [path.parent, path.parent.parent]
+    ancestor = path.parent
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+        if ancestor not in directories_to_sync:
+            directories_to_sync.append(ancestor)
     path.parent.mkdir(parents=True, exist_ok=True)
     tensors = state["module"]
     with tempfile.TemporaryDirectory(prefix=".ap-ep-checkpoint-", dir=path.parent) as directory:
@@ -149,11 +154,13 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         finally:
             os.close(descriptor)
         os.replace(temporary, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        # Persist the tag entry and every newly created ancestor, not just the shard rename.
+        for directory_path in directories_to_sync:
+            directory_descriptor = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
 
 
 def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
