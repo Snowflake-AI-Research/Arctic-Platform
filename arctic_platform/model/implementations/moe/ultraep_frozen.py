@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""UltraEP spare expert slots for frozen block-FP8 routed experts trained with expert LoRA (``ARL_ULTRAEP_SPARES``).
+"""UltraEP spare expert slots for frozen block-FP8 routed experts trained with expert LoRA (``ARL_ULTRAEP_SPARES``),
+the block-FP8 path of ``moe/ultraep_replicas.py``'s ``ultraep_plan`` (which also owns the spare count).
 
 UltraEP (https://github.com/Dots-Infra/UltraEP) plans, every MoE call, which of the call's hottest experts get a copy
 in each EP rank's ``S`` spare slots, reroutes tokens to the copies, and moves the copies' weights and gradients over
@@ -36,7 +37,6 @@ addresses in every call; so a layer's pools are built at its first fetch, inside
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from typing import Any
 
@@ -44,24 +44,11 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-ULTRAEP_SPARES_ENV = "ARL_ULTRAEP_SPARES"
+from .ultraep_replicas import ultraep_spares
+
 # Placement maps and pointer pools are sized per layer; GLM-5.3 has 75 MoE layers.
 _MAX_LAYERS = 128
 _NAMES = ("w1", "w2", "w3")
-
-
-_configured: int | None = None  # loader option moe.ultraep_spares (moe/runtime_options.py); None: the env
-
-
-def configure_from_options(value: int | None) -> None:
-    global _configured
-    _configured = value
-
-
-def ultraep_spares() -> int:
-    if _configured is not None:
-        return _configured
-    return int(os.environ.get(ULTRAEP_SPARES_ENV, "0") or 0)
 
 
 def _lora_layout(ab: dict, experts: int) -> dict:

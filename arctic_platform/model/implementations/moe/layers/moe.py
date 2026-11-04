@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass
 from dataclasses import replace
+from typing import TYPE_CHECKING
 from typing import Literal
 from typing import cast
 
@@ -22,6 +23,9 @@ from ...kernels.sonic_experts import sonic_routed_experts
 from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
 from ..routing_weights import weighted_down_projection
+
+if TYPE_CHECKING:
+    from ..expert_replicas import ExpertReplicaManager
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -361,6 +365,26 @@ def _add_into_rows(out: torch.Tensor, delta: torch.Tensor, rows: int, cols: slic
     return _AddIntoRows.apply(out, delta, rows, cols.start, cols.stop)
 
 
+class _ReplicaCall:
+    """One MoE call's spare-slot plan for BF16 experts (``moe/expert_replicas.py``, ``moe/ultraep_replicas.py``);
+    fetches the spares' weights once and reuses them across the call's dispatch chunks."""
+
+    def __init__(self, plan, group):
+        self.plan = plan
+        self.group = group
+        self.weights = None
+
+    def extend(self, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if self.weights is None:
+            self.weights = self.plan.fetch(weights, self.group)
+        return self.weights
+
+
+def _with_replica_slots(experts: nn.Module, *weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    call = getattr(experts, "_arl_replica_call", None)
+    return weights if call is None else call.extend(*weights)
+
+
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -575,6 +599,7 @@ class GroupedExperts(nn.Module):
         w1 = _maybe_to_local(self.w1)
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
+        w1, w2, w3 = _with_replica_slots(self, w1, w2, w3)
         if self.use_grouped_mm:
             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit, scores)
@@ -775,6 +800,10 @@ class MoE(nn.Module):
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
         self.use_sonicmoe = moe_args.use_sonicmoe
+        # Online redundant experts (moe/expert_replicas.py), registered on the first forward with expert_replicas.
+        self._replica_index = -1
+        self._replica_manager: ExpertReplicaManager | None = None
+        self._replica_counts: torch.Tensor | None = None
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -870,7 +899,10 @@ class MoE(nn.Module):
         x: torch.Tensor,
         selected_experts_indices: torch.Tensor,
         top_scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``num_tokens_per_expert``, the router's per-expert counts, feeds the online replicas' load estimate; a
+        caller without it has them counted from ``selected_experts_indices``."""
         ep_comm = get_ep_comm_module(self.ep_comm_backend)
         combine_tokens = ep_comm.combine_tokens
         dispatch_tokens_async = ep_comm.dispatch_tokens_async
@@ -886,12 +918,17 @@ class MoE(nn.Module):
         group = get_ep_group(experts)
         chunk_size = self.deepep_token_chunk_size or x.shape[0]
         num_experts = experts.num_experts
-        plan = self._ultraep_plan(experts, group, selected_experts_indices)
+        plan = self._expert_replica_plan(experts, group, selected_experts_indices, num_tokens_per_expert)
         if plan is not None:
-            # Tokens go to physical slots (native experts and this call's spares); the experts fetch the spares.
+            # Tokens go to physical slots (native experts and the plan's spares). The experts extend their stacks
+            # with the spares once per call: block-FP8 ones through the frozen UltraEP plan (codes, scales, LoRA),
+            # BF16 ones by fetching the owners' weights (_ReplicaCall).
             selected_experts_indices = plan.remap(selected_experts_indices)
             num_experts = plan.num_slots
-            experts._arl_ultraep_call = plan
+            if experts.fp8_block_size is not None:
+                experts._arl_ultraep_call = plan
+            else:
+                experts._arl_replica_call = _ReplicaCall(plan, group)
         # BF16 experts run on the receive buffer as delivered (kernels/sonic_experts.py) when use_sonicmoe is set,
         # called through self.experts so that PEFT merges any expert LoRA into the weights they read.
         use_sonic = (
@@ -959,6 +996,7 @@ class MoE(nn.Module):
 
         routed_outputs.append(run_pending_chunk(pending_state))
         experts._arl_ultraep_call = None
+        experts._arl_replica_call = None
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -967,22 +1005,62 @@ class MoE(nn.Module):
         routed_output = routed_output[: x.shape[0]]
         return routed_output if shared_output is None else shared_output + routed_output
 
-    def _ultraep_plan(self, experts: nn.Module, group, selected_experts_indices: torch.Tensor):
-        """UltraEP's plan for this call (``moe/ultraep_frozen.py``) when spare slots are configured, else None. A
-        recompute reuses its forward's placement and physical routes."""
-        from ..ultraep_frozen import frozen_ultraep_plan
-        from ..ultraep_frozen import ultraep_spares
+    def _expert_replica_plan(
+        self,
+        experts: nn.Module,
+        group,
+        selected_experts_indices: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None,
+    ):
+        """This call's spare-slot plan, or None without spare slots. With ``ultraep_spares``, UltraEP plans every
+        forward from its own routing (``moe/ultraep_replicas.py``: BF16 experts, trained or frozen; block-FP8 experts
+        through ``moe/ultraep_frozen.py``) and a recompute reuses its forward's routes. With ``expert_replicas``, the
+        in-house online replicas (``moe/expert_replicas.py``, BF16 experts) replan from the routed counts when the
+        first registered layer starts a graph-building forward. Either way a micro-batch's forward, recompute and
+        backward route identically."""
+        from ..expert_replicas import manager_for
+        from ..expert_replicas import replica_spares
+        from ..ultraep_replicas import ultraep_plan
+        from ..ultraep_replicas import ultraep_spares
+        from .checkpointing import _PATCHED_METHODS_ATTR
 
-        if not ultraep_spares() or group is None:
+        if group is None or not (ultraep_spares() or replica_spares()):
             return None
-        if getattr(experts, "fp8_block_size", None) is None:
-            raise NotImplementedError("UltraEP's spare slots serve frozen block-FP8 routed experts only")
+        if "_run_local_routed_experts" in getattr(self, _PATCHED_METHODS_ATTR, ()):
+            raise NotImplementedError(
+                "spare expert slots (ultraep_spares, expert_replicas) need the experts recomputed inside their MoE "
+                "call: selective activation checkpointing of routed_experts recomputes them after it, without the "
+                "call's spares; checkpoint whole blocks (ac_config.mode='full') instead"
+            )
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
         from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
 
         _install_recompute_detector()
-        ab = getattr(experts, "_ap_lora_ab", getattr(experts, "_dss_lora_ab", {}))
-        return frozen_ultraep_plan(self, experts, group, selected_experts_indices, ab, building=not _in_recompute())
+        if ultraep_spares():
+            return ultraep_plan(self, experts, group, selected_experts_indices, building=not _in_recompute())
+        if experts.fp8_block_size is not None:
+            raise NotImplementedError(
+                "the online expert replicas (expert_replicas) serve BF16 routed experts; block-FP8 experts take "
+                "UltraEP's spare slots (ultraep_spares)"
+            )
+        manager, counts = self._replica_manager, self._replica_counts
+        if manager is None or counts is None:
+            manager = self._replica_manager = manager_for(group)
+            counts = self._replica_counts = torch.zeros(
+                experts.num_experts, dtype=torch.long, device=selected_experts_indices.device
+            )
+            self._replica_index = manager.register(self)
+        building = torch.is_grad_enabled() and not _in_recompute()
+        if building and self._replica_index == 0:
+            manager.replan()
+        if building:
+            with torch.no_grad():
+                if num_tokens_per_expert is None:
+                    chosen = selected_experts_indices[selected_experts_indices >= 0]
+                    num_tokens_per_expert = torch.bincount(chosen, minlength=experts.num_experts)
+                counts.add_(num_tokens_per_expert.to(torch.long))
+        plan = manager.plans[self._replica_index]
+        return plan if plan is not None and plan.active else None
 
     def forward(
         self,
@@ -1025,7 +1103,9 @@ class MoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
+            routed_output = self._run_deepep_routed_experts(
+                x, selected_experts_indices, top_scores, num_tokens_per_expert
+            )
             return routed_output.reshape(bs, slen, dim)
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)

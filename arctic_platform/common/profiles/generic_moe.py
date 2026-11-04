@@ -57,8 +57,10 @@ def register(registry: Registry) -> None:
             "peft": "the loader rejects `patches.peft`: expert adapter integration is not yet supported",
             "zorro_train": "the loader rejects `patches.zorro_train`",
             "moe.frozen_expert_offload": "only the glm_moe_dsa loader offloads frozen routed experts",
-            "moe.ultraep_spares": "only the glm_moe_dsa loader gives frozen block-FP8 experts UltraEP's spare slots",
-            "moe.ultraep_ipc_symm": "only the glm_moe_dsa loader gives frozen block-FP8 experts UltraEP's spare slots",
+            "moe.ultraep_spares": "only the glm_moe_dsa loader takes it (elsewhere: ARL_ULTRAEP_SPARES)",
+            "moe.ultraep_ipc_symm": "only the glm_moe_dsa loader takes it (elsewhere: ULTRA_EP_IPC_SYMM)",
+            "moe.expert_replicas": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS)",
+            "moe.expert_replicas_ema": "only the glm_moe_dsa loader takes it (elsewhere: ARL_EXPERT_REPLICAS_EMA)",
         },
         not_applicable={
             "attention.sparse_mla": "no model family behind this loader uses sparse MLA attention",
