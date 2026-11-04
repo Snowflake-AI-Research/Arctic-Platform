@@ -15,9 +15,11 @@
 
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""New synthetic token-domain controls, not native SP/runtime admission."""
+"""Synthetic token-domain controls and tiny native ZeRO2 reduction parity."""
 
 import math
+import os
+import sys
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -25,6 +27,11 @@ import pytest
 import torch
 
 from arctic_platform.model.implementations.gpu.sp import utils as sp
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import execute_subprocess_async
+from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import require_torch_multi_gpu
+from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -63,6 +70,25 @@ def test_token_partition_aligns_cross_slice_target_before_packing():
     assert set(source) == set(original)
     for name in source:
         torch_assert_equal(source[name], original[name])
+
+
+def test_token_partition_accepts_prediction_aligned_primerl_response_masks():
+    source = _batch()
+    # prime_rl.arctic.context rolls each rollout's response mask left and clears its final position.
+    current_masks = [torch.tensor([False, False, True]), torch.tensor([False, False, True, True, True])]
+    masks = torch.zeros_like(source["attention_mask"], dtype=torch.bool)
+    for row, current in enumerate(current_masks):
+        shifted = torch.roll(current, shifts=-1)
+        shifted[-1] = False
+        masks[row, : current.numel()] = shifted
+    source["loss_mask"] = masks
+    source["old_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
+    source["teacher_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
+    source["temperature"] = torch.ones_like(masks, dtype=torch.float32)
+    local, packed, mask, _, part = sp.prepare_token_partition(source, sp_info=_info())
+    torch_assert_equal(packed["loss_mask"], masks[mask].unsqueeze(0))
+    torch_assert_equal(local["temperature"], packed["temperature"][:, part.start : part.stop])
+    assert not bool((packed["loss_mask"] & (packed["labels"] == -100)).any())
 
 
 def test_token_partition_slices_router_layers_without_flattening_or_duplicate_rows():
@@ -502,3 +528,129 @@ def test_token_local_pipeline_rejects_unsupported_route_before_model(monkeypatch
             sp_group=group,
         )
     assert engine.calls == []
+
+
+class TestNativeSequenceParallelReduction(TestCasePlus):
+    @require_deepspeed
+    @require_torch_multi_gpu
+    def test_grpo_loss_gradients_and_norm_match_unpartitioned_reference(self):
+        if torch.cuda.device_count() < 4:
+            self.skipTest("native SP2/DP2 and SP4/DP1 parity requires four CUDA devices")
+        for size in (2, 4):
+            env = self.get_env()
+            env["NATIVE_SP_SIZE"] = str(size)
+            execute_subprocess_async(
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node=4",
+                    __file__,
+                    "--native-sp-parity",
+                ],
+                env=env,
+                timeout=180,
+            )
+
+
+def _native_sequence_parallel_parity():
+    import deepspeed
+    from deepspeed.utils import safe_get_full_grad
+
+    from arctic_platform.model.parallel.groups import setup_parallel_groups
+    from arctic_platform.rl.processors import run_pipeline
+
+    rank = int(os.environ["RANK"])
+    size = int(os.environ["NATIVE_SP_SIZE"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    deepspeed.init_distributed("nccl", auto_mpi_discovery=False)
+    world = sp.dist.get_world_size()
+    assert world == 4 and size in (2, 4)
+    mpu, group, _, local_rank = setup_parallel_groups(size, 1, world_size=world, gpus_per_node=4)
+    ranks = sp.dist.get_process_group_ranks(group)
+    info = dict(rank=rank, world_size=world, sp_size=size, sp_rank=local_rank, sp_ranks=ranks)
+
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(4, 8)
+
+        def forward(self, input_ids, **kwargs):
+            hidden = torch.nn.functional.one_hot(input_ids % 4, 4).float()
+            return dict(logits=self.projection(hidden))
+
+        def backward(self, loss, *, scale_wrt_gas):
+            assert scale_wrt_gas is False
+            loss.backward()
+
+    set_seed(11)
+    model = TinyPolicy().cuda()
+    reference = deepcopy(model)
+    engine, *_ = deepspeed.initialize(
+        model=model,
+        optimizer=torch.optim.AdamW(model.parameters(), lr=0.001),
+        mpu=mpu,
+        config=dict(
+            train_micro_batch_size_per_gpu=1,
+            gradient_accumulation_steps=1,
+            gradient_clipping=0,
+            zero_allow_untested_optimizer=True,
+            zero_optimization=dict(stage=2, reduce_scatter=True),
+        ),
+    )
+    sp.verify_sequence_parallel_reduction(engine, sp_info=info, sp_group=group)
+    engine.set_gradient_accumulation_boundary(True)
+    full = dict(
+        input_ids=torch.tensor([[1, 2, 3, 4], [5, 6, 7, 1], [2, 4, 6, 7], [3, 5, 1, 2]], device="cuda"),
+        attention_mask=torch.ones(4, 4, dtype=torch.long, device="cuda"),
+        loss_mask=torch.tensor([[1, 1, 1, 0]] * 4, device="cuda"),
+        advantages=torch.tensor([[0.5] * 4, [1.0] * 4, [1.5] * 4, [2.0] * 4], device="cuda"),
+        old_log_probs_shifted=torch.full((4, 4), -2.0, device="cuda"),
+    )
+    singleton = dict(rank=0, world_size=1, sp_size=1, sp_rank=0, sp_ranks=[0])
+    _, packed, _, cu, _ = sp.prepare_token_partition(full, sp_info=singleton)
+    processing = dict(post=["compute_logprobs"], loss_fn="grpo", config=dict(loss_agg_mode="token-mean"))
+    baseline = run_pipeline(
+        reference,
+        (),
+        packed,
+        dict(cu_seqlens=cu, dp_size=1, batch_num_tokens=12),
+        processing,
+        "cuda",
+        pack=False,
+        backward=True,
+    )
+    dp_size = world // size
+    replica = ranks[0] // size
+    rows = 4 // dp_size
+    batch = {name: value[replica * rows : (replica + 1) * rows] for name, value in full.items()}
+    candidate = sp.run_sequence_parallel_grpo(
+        engine,
+        batch,
+        dict(dp_size=dp_size, batch_num_tokens=12),
+        processing,
+        "cuda",
+        sp_info=info,
+        sp_group=group,
+    )
+    averaged_loss = torch.tensor(candidate["avg_loss"] / world, device="cuda")
+    sp.dist.all_reduce(averaged_loss)
+    # FP32 GEMM/reduction ordering differs between complete rows and token slices.
+    torch_assert_close(averaged_loss, torch.tensor(baseline["avg_loss"], device="cuda"), rtol=0, atol=1e-6)
+    for (name, parameter), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
+        torch_assert_close(
+            safe_get_full_grad(parameter), expected.grad, rtol=0, atol=1e-6, msg=lambda msg: f"{name}: {msg}"
+        )
+    expected_norm = torch.linalg.vector_norm(torch.cat([p.grad.flatten() for p in reference.parameters()]))
+    engine.step()
+    torch_assert_close(
+        torch.as_tensor(engine.optimizer._global_grad_norm, device="cuda"), expected_norm, rtol=0, atol=1e-6
+    )
+    if rank == 0:
+        print(f"NATIVE_SP_PARITY_PASS sp={size} dp={dp_size} loss={averaged_loss.item()} norm={expected_norm.item()}")
+    sp.dist.destroy_process_group()
+
+
+if __name__ == "__main__" and "--native-sp-parity" in sys.argv:
+    _native_sequence_parallel_parity()

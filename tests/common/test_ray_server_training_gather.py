@@ -24,6 +24,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import torch
+
 from arctic_platform.common.ray_server import ArcticRLRayServer
 from arctic_platform.testing_utils import TestCasePlus
 
@@ -96,6 +98,50 @@ def _server(workers):
 
 
 class TestGatherTrainingRefs(TestCasePlus):
+    def test_membership_rpc_yields_to_the_actor_event_loop(self):
+        async def run():
+            hold = asyncio.Event()
+            started = asyncio.Event()
+
+            async def membership():
+                started.set()
+                await hold.wait()
+                return {"sp_size": 2}
+
+            server = _server([])
+            workers = [SimpleNamespace(get_sequence_parallel_info=_Remote(membership)) for _ in range(2)]
+            payload = dict(batch={}, meta={}, processing=dict(loss_fn="grpo", post=["compute_logprobs"]))
+            with (
+                patch("arctic_platform.common.ray_server.ray.get", side_effect=AssertionError("ray.get")),
+                patch("arctic_platform.common.ray_server.ray_split_batch", return_value=(["shard"], None)) as split,
+            ):
+                task = asyncio.create_task(server._split_model_batch(payload, workers, sp_size=2, backward=True))
+                await asyncio.wait_for(started.wait(), timeout=1)
+                self.assertFalse(task.done())
+                hold.set()
+                _, _, info = await task
+                self.assertEqual(info, [{"sp_size": 2}, {"sp_size": 2}])
+                self.assertEqual(split.call_args.kwargs["worker_sp_info"], info)
+
+        asyncio.run(run())
+
+    def test_forward_accepts_a_legacy_job_without_an_sp_size_key(self):
+        async def forward(shard):
+            return dict(batch=dict(logprobs=torch.ones(1, 2)), metrics={}, avg_loss=1.0)
+
+        server = _server([SimpleNamespace(forward_no_grad=_Remote(forward))])
+        payload = dict(batch=dict(input_ids=torch.tensor([[1, 2]])), meta={}, processing={})
+        with patch("arctic_platform.rl.processors.prepare_request_loss", return_value=None):
+            result = asyncio.run(server.forward(1, payload))
+        self.assertEqual(result["job_id"], 1)
+        self.assertEqual(result["avg_loss"], 1.0)
+
+    def test_log_probs_rejects_sp_before_tokenization_or_worker_dispatch(self):
+        server = _server([])
+        server.jobs[1] = dict(job_type="log_prob", engine="deepspeed", sp_size=2)
+        with self.assertRaisesRegex(ValueError, "log_probs does not support sequence-parallel"):
+            asyncio.run(server.log_probs(1, dict(prompts=["hello"], top_k=1)))
+
     def test_step_does_not_call_ray_get(self):
         hold = asyncio.Event()
         hold.set()

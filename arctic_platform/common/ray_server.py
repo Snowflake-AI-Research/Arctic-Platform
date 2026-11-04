@@ -56,6 +56,7 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.common.utils.server_models import resolve_parallelism_degree
 from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
 from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
@@ -638,21 +639,6 @@ class ArcticRLRayServerState(ArcticRLServerState):
             self.n_bundles = 0
             self.placement_group = None
 
-    def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
-        worker_sp_info = None
-        if sp_size > 1:
-            _, _, meta, processing = unpack_batch(batch)
-            validate_sequence_parallel_grpo(meta, processing, backward=backward)
-            worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
-        shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
-        return shards, reorder, worker_sp_info
-
-    @staticmethod
-    def _logical_model_results(results, worker_sp_info, *, sp_size: int):
-        if worker_sp_info is None:
-            return results
-        return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
-
     async def shutdown(self) -> dict[str, Any]:
         """Release all workers and colocated placement groups owned by this state."""
         async with self._shutdown_lock:
@@ -907,12 +893,12 @@ class ArcticRLRayServer:
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
 
-    def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
+    async def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
         worker_sp_info = None
         if sp_size > 1:
             _, _, meta, processing = unpack_batch(batch)
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
-            worker_sp_info = ray.get([worker.get_sequence_parallel_info.remote() for worker in workers])
+            worker_sp_info = await asyncio.gather(*[worker.get_sequence_parallel_info.remote() for worker in workers])
         shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
         return shards, reorder, worker_sp_info
 
@@ -961,8 +947,8 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        sp_size = self.jobs[job_id]["sp_size"]
-        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+        sp_size = resolve_parallelism_degree(self.jobs[job_id].get("sp_size"), "sp_size")
+        shards, reorder_indices, worker_sp_info = await self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=True
         )
         _attach_loss_object_to_shards(shards, loss_object)
@@ -1039,8 +1025,8 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        sp_size = info["sp_size"]
-        shards, reorder_indices, worker_sp_info = self._split_model_batch(
+        sp_size = resolve_parallelism_degree(info.get("sp_size"), "sp_size")
+        shards, reorder_indices, worker_sp_info = await self._split_model_batch(
             batch, workers, sp_size=sp_size, backward=False
         )
         _attach_loss_object_to_shards(shards, loss_object)
@@ -1651,6 +1637,12 @@ class ArcticRLRayServer:
             full_texts = request.prompts
 
         if info.get("engine") == "deepspeed":
+            sp_size = resolve_parallelism_degree(info.get("sp_size"), "sp_size")
+            if sp_size > 1:
+                raise ValueError(
+                    "log_probs does not support sequence-parallel DeepSpeed jobs; use forward with "
+                    "the supported compute_logprobs/token-mean GRPO payload"
+                )
             tokenizer = self.log_prob_tokenizer
             encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
             workers = self.log_prob_workers
@@ -1658,7 +1650,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=sp_size)
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

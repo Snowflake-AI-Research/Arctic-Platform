@@ -48,6 +48,7 @@ TOKEN_FIELDS = frozenset(
         "prox_logp_shifted",
         "ref_log_probs_shifted",
         "teacher_log_probs_shifted",
+        "temperature",
         "versions",
         "rollout_is_weights",
         "routed_experts",
