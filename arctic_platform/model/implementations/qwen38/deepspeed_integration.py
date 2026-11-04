@@ -88,7 +88,8 @@ def _build_iter_full_hf_weights(model: nn.Module):
             if include_skipped and parts > 1 and name.endswith(".ple.ple_embedding.ngram_embedding.weight"):
                 prefix = name.removesuffix(".weight")
                 for index, shard in enumerate(tensor.tensor_split(parts, dim=0)):
-                    yield f"{prefix}.shard_{index}.weight", shard
+                    # HF sizes shards by backing storage, so split views need independent storage.
+                    yield f"{prefix}.shard_{index}.weight", shard.clone()
             else:
                 yield name, tensor
 

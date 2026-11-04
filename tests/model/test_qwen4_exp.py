@@ -863,6 +863,7 @@ def test_qwen38_checkpoint_export_preserves_mtp_while_splitting_ple(monkeypatch,
     from safetensors.torch import load_file
     from safetensors.torch import save_file
 
+    from arctic_platform.model.implementations.moe import weights
     from arctic_platform.model.implementations.qwen35 import mtp_weights
     from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
 
@@ -890,7 +891,26 @@ def test_qwen38_checkpoint_export_preserves_mtp_while_splitting_ple(monkeypatch,
         ple_name.replace(".weight", ".shard_0.weight"),
         ple_name.replace(".weight", ".shard_1.weight"),
     }
-    # Serialization must accept the split views as well as the preserved MTP sidecar.
+    shards = [checkpoint[ple_name.replace(".weight", f".shard_{index}.weight")] for index in range(2)]
+    assert len({tensor.untyped_storage().data_ptr() for tensor in shards}) == 2
+    split = weights.split_torch_state_dict_into_shards
+    monkeypatch.setattr(
+        weights,
+        "split_torch_state_dict_into_shards",
+        lambda state, **kwargs: split(state, max_shard_size=48, **kwargs),
+    )
+    sharded_output = tmp_path / "sharded"
+    weights.save_state_dict(dict(checkpoint), sharded_output)
+    sharded = weights.load_state_dict(sharded_output)
+    assert set(sharded) == set(checkpoint)
+    for name, tensor in checkpoint.items():
+        torch.testing.assert_close(sharded[name], tensor, rtol=0, atol=0)
+    index = json.loads((sharded_output / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["total_size"] == sum(t.numel() * t.element_size() for t in checkpoint.values())
+    for filename in set(index["weight_map"].values()):
+        tensors = load_file(str(sharded_output / filename))
+        assert sum(t.numel() * t.element_size() for t in tensors.values()) <= 48
+    # Direct serialization also preserves exact tensor values and MTP coverage.
     output = tmp_path / "export.safetensors"
     save_file(checkpoint, str(output))
     restored = load_file(str(output))

@@ -233,6 +233,8 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
 
 def iter_preserved_mtp_weights(model: nn.Module):
     """Yield unchanged original weights without registering parameters or buffers."""
+    if model.__dict__.get("_ap_weights_random_initialized", False):
+        return
     expected = _configured_names(model)
     if not expected:
         return

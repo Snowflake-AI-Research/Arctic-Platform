@@ -521,6 +521,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     logger = get_logger()
     model.__dict__.pop("_ap_preserved_mtp_weights", None)
     model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
+    model._ap_weights_random_initialized = config.debug.random_init
     if config.debug.random_init:
         logger.warning("Randomly initializing model. Skipping loading weights from HF.")
         _init_buffers_post_meta()

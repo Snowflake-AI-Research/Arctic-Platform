@@ -98,6 +98,8 @@ def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
 
 def iter_preserved_auxiliary_weights(model: nn.Module):
     """Export the captured schema unchanged, without registering trainable tensors."""
+    if model.__dict__.get("_ap_weights_random_initialized", False):
+        return
     prefixes = _layer_prefixes(getattr(model, "config", None))
     if not prefixes:
         return

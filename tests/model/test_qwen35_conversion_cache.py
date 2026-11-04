@@ -640,8 +640,11 @@ def _rewrite_mtp_index(source, mutate):
     index_path.write_text(json.dumps(index))
 
 
-def test_qwen_random_dcp_load_clears_preserved_prediction_weights(monkeypatch):
+@pytest.mark.parametrize("family", ["qwen4_exp_text", "glm5_next_text"])
+def test_qwen_random_dcp_load_clears_preserved_prediction_weights(monkeypatch, family):
     from types import SimpleNamespace
+
+    import torch
 
     from arctic_platform.model.implementations.qwen35 import model_builder
 
@@ -655,6 +658,9 @@ def test_qwen_random_dcp_load_clears_preserved_prediction_weights(monkeypatch):
             events.append(("init_buffers",))
 
     model = FakeModel()
+    model.config = SimpleNamespace(
+        model_type=family, mtp_num_hidden_layers=1, num_nextn_predict_layers=1, num_hidden_layers=2
+    )
     model._ap_preserved_mtp_weights = ("stale",)
     model._ap_preserved_glm_auxiliary_weights = ("stale",)
     config = SimpleNamespace(fsdp_cpu_offload=False, debug=SimpleNamespace(random_init=True))
@@ -669,6 +675,27 @@ def test_qwen_random_dcp_load_clears_preserved_prediction_weights(monkeypatch):
     assert events == [("to_empty", "cuda"), ("init_buffers",), ("random_init",)]
     assert "_ap_preserved_mtp_weights" not in model.__dict__
     assert "_ap_preserved_glm_auxiliary_weights" not in model.__dict__
+    assert model._ap_weights_random_initialized
+    from arctic_platform.model.implementations.glm53.auxiliary_weights import iter_preserved_auxiliary_weights
+    from arctic_platform.model.implementations.qwen35.mtp_weights import iter_preserved_mtp_weights
+
+    assert list(iter_preserved_mtp_weights(model)) == []
+    assert list(iter_preserved_auxiliary_weights(model)) == []
+
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm_ds
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+
+    dense = torch.ones(1)
+    monkeypatch.setattr(
+        qwen_ds, "_build_iter_full_hf_weights", lambda model: lambda **kwargs: iter([("dense", dense)])
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    builder = (
+        qwen_ds._build_iter_full_hf_weights_with_mtp
+        if family == "qwen4_exp_text"
+        else glm_ds._build_iter_full_hf_weights_with_auxiliary
+    )
+    assert dict(builder(model)(include_skipped=True)) == {"dense": dense}
 
 
 def _capture_mtp_provenance_locally(monkeypatch, source):
