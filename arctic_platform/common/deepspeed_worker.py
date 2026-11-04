@@ -51,6 +51,7 @@ from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
 from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
 from arctic_platform.model.implementations.gpu.sp.utils import verify_sequence_parallel_reduction
 
 logger = logging.getLogger(__name__)
@@ -530,6 +531,9 @@ class DeepSpeedWorker:
                 raise ValueError("SP model route requires named token inputs, not positional arguments")
             validate_sequence_parallel_grpo(meta_data, processing, backward=backward)
             sp_info = self.get_sequence_parallel_info()
+            validate_sequence_parallel_microbatches(
+                micro_batch_data, sp_info=sp_info, synchronize=True, device=self._device
+            )
             if backward:
                 verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
 

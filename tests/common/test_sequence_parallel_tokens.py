@@ -299,14 +299,19 @@ def _live_group(monkeypatch, part):
 
 
 @pytest.mark.parametrize("temperature", [1.0, 0.7])
-def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(monkeypatch, temperature):
+@pytest.mark.parametrize("loss_sp_size", [1, 2])
+def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(monkeypatch, temperature, loss_sp_size):
     from arctic_platform.rl.processors import functional
     from arctic_platform.rl.processors import run_pipeline
     from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 
-    # The loss sees complete logical rows; this fixture only simulates the
-    # model's token gather, not a native DeepSpeed loss-reduction group.
-    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_world_size", lambda: 1)
+    # A native loss SP group must not add a differentiable reduction to this token-level objective.
+    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_world_size", lambda: loss_sp_size)
+    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_group", lambda: object())
+    monkeypatch.setattr(
+        functional, "_sequence_parallel_sum", lambda *args, **kwargs: pytest.fail("replicated loss reduced again")
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     source = _batch()
     _, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info())
     group = _live_group(monkeypatch, part)
@@ -553,6 +558,27 @@ def test_token_local_pipeline_rejects_unsupported_route_before_model(monkeypatch
             sp_group=group,
         )
     assert engine.calls == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"importance_sampling_level": "sequence"},
+        {"m2_threshold": 0.1},
+        {"ratio_m2_threshold": 0.1},
+        {"ratio_seq_mask": True},
+        {"aux_ce_weight": 0},
+        {"echo_global_num_sequences": 4},
+        {"dp_size": True},
+        {"dp_size": 0},
+        {"dp_size": 1.5},
+    ],
+)
+def test_sp_rejects_sequence_level_and_echo_loss_config_before_dispatch(config):
+    with pytest.raises(ValueError, match="token-level|positive integer"):
+        sp.validate_sequence_parallel_grpo(
+            {}, dict(post=["compute_logprobs"], loss_fn="grpo", config=config), backward=True
+        )
 
 
 class TestNativeSequenceParallelReduction(TestCasePlus):

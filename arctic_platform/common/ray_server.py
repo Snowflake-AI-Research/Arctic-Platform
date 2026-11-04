@@ -900,6 +900,16 @@ class ArcticRLRayServer:
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
             worker_sp_info = await asyncio.gather(*[worker.get_sequence_parallel_info.remote() for worker in workers])
         shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+        if worker_sp_info is not None:
+            from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
+
+            # Admit every logical-DP shard before dispatching any worker. Workers repeat
+            # this for their actual GAS slices before mutating accumulation state.
+            for shard, info in zip(shards, worker_sp_info):
+                _, shard_batch, _, _ = unpack_batch(shard)
+                validate_sequence_parallel_microbatches(
+                    shard_batch if isinstance(shard_batch, list) else [shard_batch], sp_info=info
+                )
         return shards, reorder, worker_sp_info
 
     @staticmethod

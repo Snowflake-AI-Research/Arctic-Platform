@@ -113,7 +113,10 @@ class TestGatherTrainingRefs(TestCasePlus):
             payload = dict(batch={}, meta={}, processing=dict(loss_fn="grpo", post=["compute_logprobs"]))
             with (
                 patch("arctic_platform.common.ray_server.ray.get", side_effect=AssertionError("ray.get")),
-                patch("arctic_platform.common.ray_server.ray_split_batch", return_value=(["shard"], None)) as split,
+                patch(
+                    "arctic_platform.common.ray_server.ray_split_batch", return_value=([payload, payload], None)
+                ) as split,
+                patch("arctic_platform.model.implementations.gpu.sp.utils.validate_sequence_parallel_microbatches"),
             ):
                 task = asyncio.create_task(server._split_model_batch(payload, workers, sp_size=2, backward=True))
                 await asyncio.wait_for(started.wait(), timeout=1)

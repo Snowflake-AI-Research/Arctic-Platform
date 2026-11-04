@@ -255,6 +255,45 @@ class _TokenLocalEngine:
 def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: bool) -> None:
     """Reject unsupported objectives before dispatching any token-local model."""
     config = processing.get("config") or {}
+    if not isinstance(config, dict):
+        raise ValueError("SP GRPO config must be a dictionary")
+    # The logical rows are already replicated after the logprob gather. Sequence-level
+    # loss collectives would reduce that replication a second time in autograd.
+    allowed = {
+        "eps_clip",
+        "eps_clip_higher",
+        "c_clip",
+        "behav_imp_weight_cap",
+        "current_version",
+        "prox_logp_method",
+        "use_sapo_loss",
+        "sapo_tau_pos",
+        "sapo_tau_neg",
+        "use_decoupled_loss",
+        "use_cispo_loss",
+        "is_weight_clip_max",
+        "teacher_tau",
+        "teacher_clip",
+        "teacher_clip_negative",
+        "loss_agg_mode",
+        "dp_size",
+        "batch_num_tokens",
+        "global_batch_size",
+        "entropy_coeff",
+        "use_kl_loss",
+        "kl_loss_coef",
+        "kl_loss_type",
+        "sampler_kl_coef",
+        "sampler_kl_type",
+        "sampler_kl_ratio_cap",
+        "importance_sampling_level",
+    }
+    unsupported = set(config) - allowed
+    if unsupported or config.get("importance_sampling_level", "token") != "token":
+        raise ValueError(f"SP GRPO supports token-level loss config only; unsupported keys: {sorted(unsupported)}")
+    for value in (config.get("dp_size"), meta.get("dp_size")):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError("SP dp_size must be a positive integer")
     if (
         type(backward) is not bool
         or processing.get("loss_fn") != "grpo"
@@ -265,6 +304,25 @@ def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: b
         or any(name in meta for name in TOKEN_FIELDS | {"cu_seqlens", "fwd_meta_keys", "action_masks"})
     ):
         raise ValueError("SP adapter supports only the selected compute_logprobs/token-mean grpo route")
+
+
+def validate_sequence_parallel_microbatches(
+    microbatches: list[dict], *, sp_info: dict, synchronize: bool = False, device=None
+) -> None:
+    """Validate the entire request before any model call or gradient-boundary mutation."""
+    failure = None
+    try:
+        for index, microbatch in enumerate(microbatches):
+            prepare_token_partition(microbatch, sp_info=sp_info)
+    except ValueError as error:
+        failure = ValueError(f"SP microbatch {index}: {error}")
+    if synchronize:
+        flag = torch.tensor(int(failure is not None), dtype=torch.int32, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item() and failure is None:
+            failure = ValueError("SP request preflight failed on another logical-DP shard")
+    if failure is not None:
+        raise failure
 
 
 def verify_sequence_parallel_reduction(engine, *, sp_info: dict, sp_group) -> None:

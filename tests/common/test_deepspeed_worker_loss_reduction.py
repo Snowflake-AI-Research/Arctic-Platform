@@ -159,7 +159,8 @@ class _SPAccumulationEngine(_Engine):
         super().step()
 
 
-def _sp_execution_worker():
+def _sp_execution_worker(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     worker = _worker(_SPAccumulationEngine())
     worker.world_size = 4
     worker.sp_size = 2
@@ -189,7 +190,7 @@ def _sp_execution_worker():
 
 @pytest.mark.parametrize("backward", [True, False])
 def test_sp_execution_worker_preserves_objective_gas_scales_boundaries_and_steps(monkeypatch, backward):
-    worker, info, request = _sp_execution_worker()
+    worker, info, request = _sp_execution_worker(monkeypatch)
     guards, calls = [], []
     monkeypatch.setattr(
         deepspeed_worker, "verify_sequence_parallel_reduction", lambda engine, **kwargs: guards.append(kwargs)
@@ -235,7 +236,7 @@ def test_sp_execution_worker_preserves_objective_gas_scales_boundaries_and_steps
 
 
 def test_sp_execution_worker_rejects_unselected_reducer_before_model(monkeypatch):
-    worker, _, request = _sp_execution_worker()
+    worker, _, request = _sp_execution_worker(monkeypatch)
 
     def reject(*args, **kwargs):
         raise ValueError("unselected reducer")
@@ -251,7 +252,7 @@ def test_sp_execution_worker_rejects_unselected_reducer_before_model(monkeypatch
 
 
 def test_sp_execution_worker_rejects_membership_changed_during_execution(monkeypatch):
-    worker, info, request = _sp_execution_worker()
+    worker, info, request = _sp_execution_worker(monkeypatch)
     monkeypatch.setattr(deepspeed_worker, "verify_sequence_parallel_reduction", lambda *args, **kwargs: None)
 
     def selected(*args, **kwargs):
@@ -264,7 +265,7 @@ def test_sp_execution_worker_rejects_membership_changed_during_execution(monkeyp
 
 
 def test_sp_execution_worker_rechecks_reducer_before_publishing_result(monkeypatch):
-    worker, _, request = _sp_execution_worker()
+    worker, _, request = _sp_execution_worker(monkeypatch)
     calls = []
 
     def verify(*args, **kwargs):
@@ -280,6 +281,27 @@ def test_sp_execution_worker_rechecks_reducer_before_publishing_result(monkeypat
     with pytest.raises(ValueError, match="selected reducer changed"):
         worker.forward_backward(request)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("fault", ["second-odd", "peer-odd", "unknown-field"])
+def test_sp_request_preflight_rejects_every_microbatch_before_model_or_boundary(monkeypatch, fault):
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    if fault == "second-odd":
+        request["batch"][1] = {name: tensor[:, :3] for name, tensor in request["batch"][1].items()}
+    elif fault == "unknown-field":
+        request["batch"][1]["prompt_group_ids"] = torch.ones(1, 4)
+    else:
+        monkeypatch.setattr(torch.distributed, "all_reduce", lambda flag, **kwargs: flag.fill_(1))
+    monkeypatch.setattr(
+        deepspeed_worker, "run_sequence_parallel_grpo", lambda *args, **kwargs: pytest.fail("model ran")
+    )
+    monkeypatch.setattr(
+        deepspeed_worker, "verify_sequence_parallel_reduction", lambda *args, **kwargs: pytest.fail("reducer ran")
+    )
+    with pytest.raises(ValueError, match="microbatch 1|another logical-DP shard"):
+        worker.forward_backward(request)
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
 
 
 def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object():
