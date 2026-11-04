@@ -41,7 +41,17 @@ _module_cache = None
 _stride_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
+_configured: bool | None = None  # loader option moe.w4a8_experts (moe/runtime_options.py); None: the env
+
+
+def configure_from_options(value: bool | None) -> None:
+    global _configured
+    _configured = value
+
+
 def w4a8_experts_requested() -> bool:
+    if _configured is not None:
+        return _configured
     return os.environ.get(ARL_W4A8_EXPERTS_ENV, "0") not in ("", "0", "false", "False")
 
 
