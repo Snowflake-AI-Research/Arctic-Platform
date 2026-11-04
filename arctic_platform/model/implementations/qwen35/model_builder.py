@@ -53,6 +53,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     get_checkpoint_converter,
+    record_conversion_preparation_failure,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
 )
@@ -507,6 +508,7 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
+@record_conversion_preparation_failure
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -579,6 +581,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
                     attempt_id=attempt_id,
+                    node_local=True,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 ensure_node_local_conversion_cache(
@@ -593,6 +596,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     local_rank=world.local_rank,
                     stream_convert_fn=stream_convert_fn,
                     attempt_id=attempt_id,
+                    node_local=False,
                 )
 
             elif not conversion_cache_ready(snapshot_path):

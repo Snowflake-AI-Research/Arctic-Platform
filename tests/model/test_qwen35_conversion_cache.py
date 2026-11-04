@@ -550,7 +550,7 @@ def test_conversion_cache_preserves_other_writer_temporary_files_without_coheren
         attempt_id="this-attempt",
     )
     assert (other / "live-shard").read_bytes() == b"other node is still writing"
-    assert conversion_cache._read_cache_marker(failed)["attempt_id"] == "other-attempt"
+    assert not failed.exists()
     assert conversion_cache.conversion_cache_ready(cache)
 
 
@@ -567,3 +567,119 @@ def test_conversion_marker_write_failure_removes_only_its_own_temporary_file(mon
     with pytest.raises(OSError, match="marker rename failed"):
         conversion_cache._write_cache_marker(tmp_path / "prime.in-progress", dict(attempt_id="this-attempt"))
     assert list(tmp_path.iterdir()) == [other]
+
+
+@pytest.mark.parametrize("same_attempt", [False, True])
+def test_shared_conversion_retries_without_filesystem_lock_support(monkeypatch, tmp_path, same_attempt):
+    import errno
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    destination = tmp_path / "prime"
+    conversion_cache._write_cache_marker(
+        destination.with_name("prime.failed"),
+        dict(attempt_id="retry" if same_attempt else "old", error="previous failure"),
+    )
+
+    def unsupported(*args):
+        raise OSError(errno.ENOLCK, "shared filesystem has no flock")
+
+    monkeypatch.setattr(conversion_cache.fcntl, "flock", unsupported)
+    conversion_cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "Prime",
+        lambda path: {},
+        lambda *args: None,
+        rank=0,
+        local_rank=0,
+        attempt_id="retry",
+        node_local=False,
+        stream_convert_fn=lambda source, target: _write_ready_cache(target),
+    )
+    assert conversion_cache.conversion_cache_ready(destination)
+    assert not destination.with_name("prime.failed").exists()
+
+
+def test_shared_waiter_observes_failure_before_first_progress_marker(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    native = conversion_cache._write_cache_marker
+
+    def marker(path, value):
+        if path.name.endswith(".in-progress"):
+            raise OSError("startup marker failed")
+        native(path, value)
+
+    monkeypatch.setattr(conversion_cache, "_write_cache_marker", marker)
+    destination = tmp_path / "prime"
+    with pytest.raises(OSError, match="startup marker failed"):
+        conversion_cache.ensure_node_local_conversion_cache(
+            tmp_path,
+            destination,
+            lambda state: None,
+            "HF",
+            "Prime",
+            lambda path: {},
+            lambda *args: None,
+            rank=0,
+            local_rank=0,
+            attempt_id="setup",
+            node_local=False,
+        )
+    with pytest.raises(RuntimeError, match="writer failed.*startup marker failed"):
+        conversion_cache.wait_for_conversion_cache(destination, timeout=0, attempt_id="setup")
+
+
+def test_pre_cache_preparation_failure_reaches_shared_waiters(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "source-failure")
+
+    @conversion_cache.record_conversion_preparation_failure
+    def prepare(*, rank):
+        raise RuntimeError("checkpoint discovery failed")
+
+    with pytest.raises(RuntimeError, match="checkpoint discovery failed"):
+        prepare(rank=0)
+    with pytest.raises(RuntimeError, match="Weight preparation writer failed.*checkpoint discovery failed"):
+        conversion_cache.wait_for_conversion_cache(tmp_path / "prime", timeout=0, attempt_id="source-failure")
+
+
+def test_shared_waiter_bounds_writer_death_before_startup(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    clock = [0.0]
+    monkeypatch.setattr(conversion_cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(conversion_cache.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    with pytest.raises(TimeoutError, match="startup progress within 40"):
+        conversion_cache.wait_for_conversion_cache(
+            tmp_path / "prime",
+            timeout=3600,
+            writer_start_timeout=40,
+            poll_interval=1,
+            attempt_id="killed-before-start",
+        )
+    assert clock[0] == 40
+
+
+def test_cleanup_preserves_live_workspace_and_removes_only_abandoned_workspaces(tmp_path):
+    import os
+
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    destination = tmp_path / "prime"
+    old, live, recent = [tmp_path / f"prime.tmp-rank0-pid123-{name}" for name in ("old", "live", "recent")]
+    for directory in (old, live, recent):
+        directory.mkdir()
+    ancient = conversion_cache.time.time() - conversion_cache._ABANDONED_CACHE_AGE - 60
+    for directory in (old, live):
+        os.utime(directory, (ancient, ancient))
+    live.with_name(f"{live.name}.owner").touch()
+    conversion_cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert not old.exists()
+    assert live.exists()
+    assert recent.exists()
