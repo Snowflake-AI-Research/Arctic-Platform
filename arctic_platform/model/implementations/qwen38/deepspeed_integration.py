@@ -139,4 +139,15 @@ def load_qwen4_exp_model(
         device_mesh_type=DeviceMesh,
     )
     qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
+    from arctic_platform.model.implementations.moe.frozen_offload import frozen_expert_offload_requested
+
+    if frozen_expert_offload_requested():
+        from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        offload = install_frozen_expert_offload(get_language_model(model).layers)
+        get_logger().info(
+            f"Frozen routed-expert weights of {len(offload.layers)} layers offloaded to host memory at the first call"
+        )
     return model
