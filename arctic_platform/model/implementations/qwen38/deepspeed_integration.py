@@ -93,6 +93,21 @@ def _build_iter_full_hf_weights(model: nn.Module):
             else:
                 yield name, tensor
 
+    def weight_names(*, include_skipped: bool = False):
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        if not include_skipped or parts == 1:
+            return names
+        return frozenset(
+            exported
+            for name in names
+            for exported in (
+                tuple(f"{name.removesuffix('.weight')}.shard_{index}.weight" for index in range(parts))
+                if name.endswith(".ple.ple_embedding.ngram_embedding.weight")
+                else (name,)
+            )
+        )
+
+    setattr(iterator, "weight_names", weight_names)
     return iterator
 
 

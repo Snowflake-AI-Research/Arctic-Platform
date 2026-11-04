@@ -105,6 +105,11 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
         if preserved is not None:
             yield from finish_preserved_weight_export(preserved, emitted, description="GLM prediction")
 
+    def weight_names(*, include_skipped: bool = False):
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        return names | frozenset(preserved_auxiliary_names(model)) if include_skipped else names
+
+    setattr(iterator, "weight_names", weight_names)
     return iterator
 
 

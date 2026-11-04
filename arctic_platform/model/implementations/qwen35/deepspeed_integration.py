@@ -242,6 +242,13 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
         if preserved is not None:
             yield from finish_preserved_weight_export(preserved, names, description="Original MTP")
 
+    def weight_names(*, include_skipped: bool = False):
+        from .mtp_weights import preserved_mtp_names
+
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        return names | frozenset(preserved_mtp_names(model)) if include_skipped else names
+
+    iterator.weight_names = weight_names
     return iterator
 
 

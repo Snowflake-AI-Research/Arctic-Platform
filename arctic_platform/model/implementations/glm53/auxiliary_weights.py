@@ -31,6 +31,7 @@ from arctic_platform.model.implementations.moe.preserved_weights import open_pre
 from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
 STATE_ATTRIBUTE = "_ap_preserved_glm_auxiliary_weights"
+_FAILURE_ATTRIBUTE = "_ap_preserved_glm_auxiliary_failure"
 
 
 def _layer_prefixes(config) -> tuple[str, ...]:
@@ -86,8 +87,9 @@ def _capture(source_path: Path, prefixes: tuple[str, ...], config):
 
 
 def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
-    """Record original inactive-layer locations on rank zero before HF conversion."""
+    """Record inactive-layer locations; unavailable originals fail full export, not ordinary loading."""
     model.__dict__.pop(STATE_ATTRIBUTE, None)
+    model.__dict__.pop(_FAILURE_ATTRIBUTE, None)
     prefixes = _layer_prefixes(getattr(model, "config", None))
     if not prefixes:
         return
@@ -95,18 +97,17 @@ def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
     is_master = not distributed or dist.get_rank() == 0
     state = None
     failure: list[str | None] = [None]
-    cause = None
     if is_master:
         try:
             names, weights, index_identity = _capture(source_path, prefixes, model.config)
             state = (prefixes, names, weights, index_identity)
         except Exception as exc:
-            cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
     if distributed:
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
-        raise RuntimeError(f"Cannot preserve original GLM prediction layers: {failure[0]}") from cause
+        setattr(model, _FAILURE_ATTRIBUTE, failure[0])
+        return
     if is_master:
         setattr(model, STATE_ATTRIBUTE, state)
 
@@ -115,6 +116,9 @@ def validate_preserved_auxiliary_weights(model: nn.Module) -> None:
     """Check immutable source generations without reading or retaining tensor payloads."""
     if model.__dict__.get("_ap_weights_random_initialized", False):
         return
+    failure = getattr(model, _FAILURE_ATTRIBUTE, None)
+    if failure is not None:
+        raise RuntimeError(f"Cannot preserve original GLM prediction layers: {failure}")
     prefixes = _layer_prefixes(getattr(model, "config", None))
     if not prefixes:
         return

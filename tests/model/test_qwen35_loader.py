@@ -227,6 +227,49 @@ def _mtp_export_model(layer_count=1):
     return model
 
 
+def _glm_prediction_model():
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+
+    model = nn.Identity()
+    model.config = Glm5NextTextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_topk=4,
+        index_kpool=2,
+        linear_num_heads=2,
+        linear_head_dim=4,
+        hc_mult=2,
+        layer_types=["deepseek_sparse_attention"],
+        mlp_layer_types=["sparse"],
+    )
+    return model
+
+
+def _glm_prediction_tensors(model):
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    names = auxiliary_weights._required_layer_names(model.config, "model.language_model.layers.1.", set())
+    return {name: torch.ones(2) for name in names}
+
+
 def test_prediction_weight_export_builders_are_family_scoped():
     from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
@@ -258,13 +301,19 @@ def test_configured_mtp_is_exported_by_each_qwen_adapter(tmp_path, monkeypatch, 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     mtp_weights.capture_mtp_weights(model, tmp_path)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(
-        qwen, "_build_iter_full_hf_weights", lambda model: lambda **kwargs: iter([("model.weight", torch.ones(1))])
-    )
+
+    def ordinary(**kwargs):
+        yield "model.weight", torch.ones(1)
+
+    ordinary.weight_names = lambda **kwargs: frozenset({"model.weight"})
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
     adapter = (
         qwen._generic_adapter() if family == "generic" else qwen._adapter() if family == "qwen35" else flash._adapter()
     )
-    exported = dict(adapter.hf_weight_export(model)(include_skipped=True))
+    exporter = adapter.hf_weight_export(model)
+    assert exporter.weight_names(include_skipped=True) == {"model.weight", *payload}
+    assert exporter.weight_names(include_skipped=False) == {"model.weight"}
+    exported = dict(exporter(include_skipped=True))
     assert set(exported) == {"model.weight", *payload}
     for name, tensor in payload.items():
         torch_assert_equal(exported[name], tensor)
@@ -286,6 +335,7 @@ def test_qwen_hf_export_without_include_skipped_never_reads_mtp_sidecar(monkeypa
             calls.append(("ordinary", include_skipped))
             yield "model.weight", ordinary_tensor
 
+        iterator.weight_names = lambda **kwargs: frozenset({"model.weight"})
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
@@ -325,6 +375,7 @@ def test_qwen_full_hf_export_validates_mtp_first_and_appends_after_ordinary_stre
             yield "model.weight", ordinary_tensor
             events.append(("ordinary-exhausted",))
 
+        iterator.weight_names = lambda **kwargs: frozenset({"model.weight"})
         return iterator
 
     def iter_sidecar(built_model):
@@ -370,6 +421,7 @@ def test_qwen_full_hf_export_nonmaster_finishes_ordinary_stream_without_sidecar(
                 yield
             events.append(("ordinary-exhausted",))
 
+        iterator.weight_names = lambda **kwargs: frozenset({"model.weight"})
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
@@ -401,6 +453,7 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
             assert include_skipped is True
             yield "mtp.fc.weight", live
 
+        iterator.weight_names = lambda **kwargs: frozenset({"mtp.fc.weight"})
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
@@ -431,14 +484,9 @@ def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, m
     from arctic_platform.model.implementations.qwen35 import mtp_weights as qwen
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    model = nn.Identity()
     if family == "glm":
-        from types import SimpleNamespace
-
-        model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
-        tensors = {
-            f"model.language_model.layers.1.{suffix}.weight": torch.ones(2) for suffix in ("eh_proj", "enorm", "hnorm")
-        }
+        model = _glm_prediction_model()
+        tensors = _glm_prediction_tensors(model)
         capture, iterator = glm.capture_auxiliary_weights, glm.iter_preserved_auxiliary_weights
     else:
         model = _mtp_export_model()
@@ -461,28 +509,25 @@ def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, m
 
 def test_glm_prediction_capture_rejects_nonregular_shard_without_blocking(tmp_path, monkeypatch):
     import os
-    from types import SimpleNamespace
 
     import torch
 
     from arctic_platform.model.implementations.glm53 import auxiliary_weights as glm
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    model = nn.Identity()
-    model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
-    names = [f"model.language_model.layers.1.{suffix}.weight" for suffix in ("eh_proj", "enorm", "hnorm")]
+    model = _glm_prediction_model()
+    names = _glm_prediction_tensors(model)
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps(dict(weight_map=dict.fromkeys(names, "fifo.safetensors")))
     )
     os.mkfifo(tmp_path / "fifo.safetensors")
+    glm.capture_auxiliary_weights(model, tmp_path)
     with pytest.raises(RuntimeError, match="not a regular file"):
-        glm.capture_auxiliary_weights(model, tmp_path)
+        glm.validate_preserved_auxiliary_weights(model)
 
 
 @pytest.mark.parametrize("family", ["qwen", "glm"])
 def test_prediction_export_rechecks_source_after_tensor_read(tmp_path, monkeypatch, family):
-    from types import SimpleNamespace
-
     import torch
     from safetensors.torch import save_file
 
@@ -491,20 +536,19 @@ def test_prediction_export_rechecks_source_after_tensor_read(tmp_path, monkeypat
     from arctic_platform.model.implementations.qwen35 import mtp_weights as qwen
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    model = _mtp_export_model() if family == "qwen" else nn.Identity()
     if family == "glm":
-        model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
-        names = {f"model.language_model.layers.1.{suffix}.weight" for suffix in ("eh_proj", "enorm", "hnorm")}
+        model = _glm_prediction_model()
+        tensors = _glm_prediction_tensors(model)
         capture, iterator = glm.capture_auxiliary_weights, glm.iter_preserved_auxiliary_weights
     else:
-        names = qwen._configured_names(model)
+        model = _mtp_export_model()
+        tensors = {name: torch.ones(2) for name in qwen._configured_names(model)}
         capture, iterator = qwen.capture_mtp_weights, qwen.iter_preserved_mtp_weights
     shard = tmp_path / "model.safetensors"
-    tensors = {name: torch.ones(2) for name in names}
     save_file(tensors, shard)
     capture(model, tmp_path)
     replacement = tmp_path / "replacement.safetensors"
-    save_file({name: torch.zeros(2) for name in names}, replacement)
+    save_file({name: torch.zeros_like(tensor) for name, tensor in tensors.items()}, replacement)
     native = preserved_weights.safe_open
 
     class Reader:
@@ -532,24 +576,22 @@ def test_prediction_export_rechecks_source_after_tensor_read(tmp_path, monkeypat
 
 
 def test_glm_prediction_capture_checks_indexed_inventory(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     import torch
     from safetensors.torch import save_file
 
     from arctic_platform.model.implementations.glm53 import auxiliary_weights
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    model = nn.Identity()
-    model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=1, num_nextn_predict_layers=1)
+    model = _glm_prediction_model()
     prefix = "model.language_model.layers.1."
-    names = {prefix + suffix + ".weight" for suffix in ("eh_proj", "enorm", "hnorm")}
-    save_file({name: torch.ones(2) for name in names | {prefix + "unindexed.weight"}}, tmp_path / "model.safetensors")
+    tensors = _glm_prediction_tensors(model)
+    save_file({**tensors, prefix + "unindexed.weight": torch.ones(2)}, tmp_path / "model.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(dict(weight_map=dict.fromkeys(names, "model.safetensors")))
+        json.dumps(dict(weight_map=dict.fromkeys(tensors, "model.safetensors")))
     )
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
     with pytest.raises(RuntimeError, match="does not match checkpoint index"):
-        auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+        auxiliary_weights.validate_preserved_auxiliary_weights(model)
 
 
 @pytest.mark.parametrize("family,fault", [("qwen", "collision"), ("glm", "collision"), ("glm", "read")])
@@ -581,12 +623,12 @@ def test_preserved_export_completion_failure_reaches_both_ranks(monkeypatch, fam
             raise OSError("source disappeared during export")
         yield name, value
 
+    def ordinary(**kwargs):
+        return iter([(live_name, value)] if rank[0] == 0 else [])
+
+    ordinary.weight_names = lambda **kwargs: frozenset({live_name})
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
-    monkeypatch.setattr(
-        qwen,
-        "_build_iter_full_hf_weights",
-        lambda model: lambda **kwargs: iter([(live_name, value)] if rank[0] == 0 else []),
-    )
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
     if family == "qwen":
         monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", sidecar)
         monkeypatch.setattr(mtp_weights, "validate_preserved_mtp_weights", lambda model: None)
@@ -623,6 +665,7 @@ def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):
             ordinary_calls.append(include_skipped)
             yield "model.weight", ordinary_tensor
 
+        iterator.weight_names = lambda **kwargs: frozenset({"model.weight"})
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
@@ -649,6 +692,7 @@ def test_qwen_full_hf_export_without_configured_mtp_needs_no_capture(monkeypatch
             assert include_skipped is True
             yield "model.weight", ordinary_tensor
 
+        iterator.weight_names = lambda **kwargs: frozenset({"model.weight"})
         return iterator
 
     monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)

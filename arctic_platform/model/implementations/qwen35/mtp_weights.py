@@ -33,6 +33,7 @@ from arctic_platform.model.implementations.moe.preserved_weights import open_pre
 from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
 _STATE_ATTRIBUTE = "_ap_preserved_mtp_weights"
+_FAILURE_ATTRIBUTE = "_ap_preserved_mtp_failure"
 _BASE_NAMES = (
     "fc.weight",
     "norm.weight",
@@ -87,7 +88,7 @@ class _PreservedExport:
     names: frozenset[str]
 
 
-def _configured_names(model: nn.Module) -> set[str]:
+def _configured_names(model: nn.Module, inventory: set[str] | None = None) -> set[str]:
     config = getattr(model, "config", None)
     text_config = getattr(config, "text_config", config)
     model_type = getattr(text_config, "model_type", None)
@@ -102,14 +103,29 @@ def _configured_names(model: nn.Module) -> set[str]:
         raise ValueError("Qwen mtp_num_hidden_layers must be a nonnegative integer")
     if count == 0:
         return set()
-    return {f"mtp.{name}" for name in base_names} | {
+    expected = {f"mtp.{name}" for name in base_names} | {
         f"mtp.layers.{index}.{name}" for index in range(count) for name in layer_names
     }
+    if inventory is not None:
+        for index in range(count):
+            prefix = f"mtp.layers.{index}.mlp.experts."
+            if prefix + "gate_up_proj" in inventory:
+                continue
+            experts = getattr(text_config, "num_experts", None)
+            if type(experts) is int and experts > 0:
+                expected.difference_update({prefix + "gate_up_proj", prefix + "down_proj"})
+                expected.update(
+                    f"{prefix}{expert}.{projection}.weight"
+                    for expert in range(experts)
+                    for projection in ("gate_proj", "up_proj", "down_proj")
+                )
+    return expected
 
 
 def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
-    """Record rank zero's immutable source locations without retaining tensor payloads."""
+    """Record immutable source locations; unavailable sidecars fail full export, not ordinary loading."""
     model.__dict__.pop(_STATE_ATTRIBUTE, None)
+    model.__dict__.pop(_FAILURE_ATTRIBUTE, None)
     expected = _configured_names(model)
     if not expected:
         return
@@ -118,19 +134,25 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
     is_master = not distributed or dist.get_rank() == 0
     preserved: list[_PreservedWeight] = []
     failure: list[str | None] = [None]
-    cause = None
     if is_master:
         try:
-            preserved = _capture_original_weights(source_path, expected)
+            preserved = _capture_original_weights(source_path, None, prefixes=("mtp.",))
+            inventory = {weight.name for weight in preserved}
+            expected = _configured_names(model, inventory)
+            if inventory != expected:
+                raise ValueError(
+                    f"original prediction inventory mismatch: missing={sorted(expected - inventory)}, "
+                    f"unexpected={sorted(inventory - expected)}"
+                )
         except Exception as exc:
-            cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
 
     # A source failure on the serializer rank must not strand peers in the following DCP barrier.
     if distributed:
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
-        raise RuntimeError(f"Cannot preserve original Qwen MTP weights: {failure[0]}") from cause
+        setattr(model, _FAILURE_ATTRIBUTE, failure[0])
+        return
     if is_master:
         setattr(model, _STATE_ATTRIBUTE, tuple(sorted(preserved, key=lambda weight: weight.name)))
 
@@ -193,7 +215,11 @@ def finish_preserved_weight_export(preserved, emitted: set[str], *, description:
             raise
     finally:
         if distributed:
-            dist.broadcast_object_list(failure, src=0)
+            try:
+                dist.broadcast_object_list(failure, src=0)
+            except Exception:
+                if cause is None:
+                    raise
     if failure[0] is not None:
         raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
 
@@ -208,10 +234,13 @@ def validate_preserved_mtp_weights(model: nn.Module) -> None:
     """Validate metadata and original source generations before ordinary export collectives."""
     if model.__dict__.get("_ap_weights_random_initialized", False):
         return
-    expected = _configured_names(model)
+    failure = getattr(model, _FAILURE_ATTRIBUTE, None)
+    if failure is not None:
+        raise RuntimeError(f"Cannot preserve original Qwen MTP weights: {failure}")
+    preserved = getattr(model, _STATE_ATTRIBUTE, ())
+    expected = _configured_names(model, {weight.name for weight in preserved})
     if not expected:
         return
-    preserved = getattr(model, _STATE_ATTRIBUTE, ())
     names = [weight.name for weight in preserved]
     if len(names) != len(set(names)) or set(names) != expected:
         raise RuntimeError("Full Qwen HF export requires captured original MTP weights")

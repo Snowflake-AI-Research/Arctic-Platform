@@ -456,8 +456,9 @@ def test_capture_mtp_weights_propagates_master_failure_to_nonmaster(monkeypatch,
         preserved_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())
     )
 
+    mtp_weights.capture_mtp_weights(model, tmp_path / "unavailable-on-peer")
     with pytest.raises(RuntimeError, match="inventory mismatch"):
-        mtp_weights.capture_mtp_weights(model, tmp_path / "unavailable-on-peer")
+        mtp_weights.validate_preserved_mtp_weights(model)
 
 
 def test_capture_mtp_weights_is_noop_for_model_without_mtp(monkeypatch, tmp_path):
@@ -510,9 +511,57 @@ def test_capture_mtp_weights_rejects_incomplete_or_mismatched_inventory(monkeypa
     model = _mtp_model()
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
 
+    mtp_weights.capture_mtp_weights(model, source)
     with pytest.raises(RuntimeError, match=match):
-        mtp_weights.capture_mtp_weights(model, source)
+        mtp_weights.validate_preserved_mtp_weights(model)
     assert "_ap_preserved_mtp_weights" not in model.__dict__
+
+
+def test_missing_mtp_allows_ordinary_export_but_rejects_full_export(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as integration
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    calls = []
+
+    def ordinary(**kwargs):
+        calls.append(True)
+        yield "weight", model.weight
+
+    ordinary.weight_names = lambda **kwargs: frozenset({"weight"})
+    monkeypatch.setattr(integration, "_build_iter_full_hf_weights", lambda model: ordinary)
+    exporter = integration._build_iter_full_hf_weights_with_mtp(model)
+    assert list(exporter())[0][0] == "weight"
+    with pytest.raises(RuntimeError, match="Cannot export preserved.*missing="):
+        list(exporter(include_skipped=True))
+    assert calls == [True]
+
+
+def test_mtp_accepts_complete_per_expert_layout(monkeypatch, tmp_path):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    model.config.text_config.num_experts = 2
+    payload = _mtp_payload()
+    prefix = "mtp.layers.0.mlp.experts."
+    payload.pop(prefix + "gate_up_proj")
+    payload.pop(prefix + "down_proj")
+    payload.update(
+        {
+            f"{prefix}{expert}.{projection}.weight": torch.ones(2, 2)
+            for expert in range(2)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+    )
+    source = tmp_path / "original"
+    _write_mtp_checkpoint(source, payload)
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, source)
+    assert set(dict(mtp_weights.iter_preserved_mtp_weights(model))) == set(payload)
 
 
 @pytest.mark.parametrize("remote", [False, True])
@@ -858,11 +907,12 @@ def test_live_export_metadata_inventory_matches_real_layer_mapping(monkeypatch, 
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: list(range(ep_size)))
     monkeypatch.setattr(dist, "get_world_size", lambda **kwargs: ep_size)
 
-    def gather(tensor, outputs, **kwargs):
+    def all_gather(outputs, tensor, **kwargs):
+        assert len(outputs) == ep_size
         for output in outputs:
             output.copy_(tensor)
 
-    monkeypatch.setattr(dist, "gather", gather)
+    monkeypatch.setattr(dist, "all_gather", all_gather)
     exporter = build_iter_full_hf_weights(Model())
     names = exporter.weight_names(include_skipped=True)
     assert seen_meta == [True]
@@ -971,7 +1021,7 @@ def test_capture_mtp_index_provenance_rejects_missing_index_entry(monkeypatch, t
     _write_mtp_checkpoint(source, payload)
     _rewrite_mtp_index(source, lambda weight_map: weight_map.pop("mtp.fc.weight"))
 
-    with pytest.raises(RuntimeError, match="missing="):
+    with pytest.raises(RuntimeError, match="missing=|does not match checkpoint index"):
         _capture_mtp_provenance_locally(monkeypatch, source)
 
 
@@ -987,7 +1037,7 @@ def test_capture_mtp_index_provenance_rejects_extra_index_entry(monkeypatch, tmp
         ),
     )
 
-    with pytest.raises(RuntimeError, match="unexpected="):
+    with pytest.raises(RuntimeError, match="unexpected=|does not match checkpoint index"):
         _capture_mtp_provenance_locally(monkeypatch, source)
 
 
