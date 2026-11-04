@@ -6,8 +6,12 @@ import errno
 import hashlib
 import os
 import shutil
+import struct
 import tempfile
+import threading
 import time
+import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from inspect import signature
@@ -39,6 +43,9 @@ from .parallel_dims import ParallelDims
 from .vlm import get_language_model
 
 
+_EXPORT_GATHER_BYTES = 64 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class MoEDeepSpeedAdapter:
     dtype_map: Mapping[str, torch.dtype]
@@ -57,7 +64,6 @@ class MoEDeepSpeedAdapter:
 
 
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
-_EXPORT_GATHER_BYTES = 1 << 30
 
 
 def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
@@ -119,10 +125,19 @@ def _checkpoint_sync(operation, *args) -> None:
 def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> None:
     """Require this rank's native ZeRO archive and matching expert group/partition metadata."""
     path = Path(engine._get_zero_ckpt_name(directory, tag))
-    if not path.is_file() and path.name.endswith("_optim_states.pt"):
-        path = path.with_name(path.name.removesuffix("_optim_states.pt") + "optim_states.pt")
-    if not path.is_file():
+    alternate = path.with_name(
+        path.name.removeprefix("bf16_") if path.name.startswith("bf16_") else "bf16_" + path.name
+    )
+    candidates = [path, alternate]
+    candidates += [
+        candidate.with_name(candidate.name.removesuffix("_optim_states.pt") + "optim_states.pt")
+        for candidate in candidates
+        if candidate.name.endswith("_optim_states.pt")
+    ]
+    found = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if found is None:
         raise FileNotFoundError(f"Legacy EP checkpoint is missing this rank's ZeRO optimizer file: {path}")
+    path = found
     saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
     optimizer = saved.get("optimizer_state_dict", {}) if isinstance(saved, dict) else None
     base = optimizer.get("base_optimizer_state") if isinstance(optimizer, dict) else None
@@ -145,6 +160,69 @@ def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> N
         raise ValueError("Legacy EP checkpoint expert-parallel size/group does not match the current model")
 
 
+def _validate_ep_checkpoint_storage_offsets(path: Path, tensors: dict, offsets: dict) -> None:
+    """Check private Torch offsets against the ZIP records before writing any payload."""
+    with zipfile.ZipFile(path) as archive, path.open("rb") as stream:
+        records = {
+            info.filename.rsplit("/", 1)[-1]: info
+            for info in archive.infolist()
+            if info.filename.rsplit("/", 2)[-2] == "data"
+        }
+        if set(records) != {str(index) for index in range(len(tensors))}:
+            raise ValueError("AP expert checkpoint storage record inventory is invalid")
+        for index, (name, tensor) in enumerate(tensors.items()):
+            record = records[str(index)]
+            stream.seek(record.header_offset)
+            header = stream.read(30)
+            if len(header) != 30 or header[:4] != b"PK\x03\x04":
+                raise ValueError("AP expert checkpoint ZIP local header is invalid")
+            filename_bytes, extra_bytes = struct.unpack_from("<HH", header, 26)
+            actual_offset = record.header_offset + 30 + filename_bytes + extra_bytes
+            if (
+                record.compress_type != zipfile.ZIP_STORED
+                or record.file_size != tensor.numel() * tensor.element_size()
+                or offsets[name] != actual_offset
+                or actual_offset + record.file_size > archive.start_dir
+            ):
+                raise ValueError(f"AP expert checkpoint storage offset does not match ZIP record for {name}")
+
+
+@contextmanager
+def _ep_checkpoint_workspace(path: Path):
+    prefix = f".ap-ep-checkpoint-{path.stem}-"
+    # Sweep this rank's leftovers in every tag, without touching other ranks' active saves.
+    for tag in path.parent.parent.iterdir():
+        if not tag.is_dir():
+            continue
+        for workspace in tag.glob(f"{prefix}*"):
+            try:
+                owner = workspace / ".owner"
+                stamp = owner.stat().st_mtime if owner.exists() else workspace.stat().st_mtime
+                if workspace.is_dir() and time.time() - stamp > 60:
+                    shutil.rmtree(workspace)
+            except FileNotFoundError:
+                pass
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=path.parent) as directory:
+        owner = Path(directory) / ".owner"
+        owner.touch()
+        stopped = threading.Event()
+
+        def heartbeat():
+            while not stopped.wait(1):
+                try:
+                    owner.touch()
+                except OSError:
+                    get_logger().info("Could not refresh expert checkpoint workspace heartbeat", exc_info=True)
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+        try:
+            yield Path(directory)
+        finally:
+            stopped.set()
+            thread.join(timeout=2)
+
+
 def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     """Write local expert tensors without copying their ZeRO backing buffers to the host.
 
@@ -152,7 +230,7 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     setting. Reserve compact storage records first, then fill them with a single 16 MiB CPU staging buffer.
     ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES sets the sync/eviction interval (16 MiB by default, 0 for end-only).
     Full cold-read checksum verification is enabled by default; ARCTIC_EXPERT_CHECKPOINT_VERIFY=0 keeps only
-    metadata and first/last-byte checks on every tensor.
+    ZIP storage boundaries, metadata and first/last-byte checks on every tensor.
     Only the AP shard is synced here; DeepSpeed owns durability of dense/optimizer files and the latest pointer.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -170,13 +248,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         raise ValueError(f"{verify_env} must be 0 or 1")
     path.parent.mkdir(parents=True, exist_ok=True)
     tensors = state["module"]
-    prefix = f".ap-ep-checkpoint-{path.stem}-"
-    # Only this shard's writer owns these workspaces; other EP ranks may still be saving.
-    for workspace in path.parent.glob(f"{prefix}*"):
-        if workspace.is_dir() and time.time() - workspace.stat().st_mtime > 60:
-            shutil.rmtree(workspace)
-    with tempfile.TemporaryDirectory(prefix=prefix, dir=path.parent) as directory:
-        temporary = Path(directory) / path.name
+    with _ep_checkpoint_workspace(path) as directory:
+        temporary = directory / path.name
         # Real empty tensors can fill the entire expert layout under deterministic initialization.
         with FakeTensorMode():
             layout = {
@@ -193,6 +266,7 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         del records
         if any(type(offset) is not int for offset in offsets.values()):
             raise RuntimeError("AP expert checkpoint requires torch storage-offset serialization support (torch>=2.7)")
+        _validate_ep_checkpoint_storage_offsets(temporary, tensors, offsets)
         records_end = temporary.stat().st_size
         ranges = sorted(
             (offsets[name], offsets[name] + tensor.numel() * tensor.element_size())
@@ -441,10 +515,8 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         self._ap_ep_restore_legacy_masters = restore_legacy_masters
         try:
             return original_load(*bound.args, **bound.kwargs)
-        except BaseException:
-            del self._ap_ep_restore_legacy_masters
-            raise
         finally:
+            self.__dict__.pop("_ap_ep_restore_legacy_masters", None)
             del self._ap_ep_checkpoint_state
             del self._ap_ep_legacy_parameters
 
@@ -643,45 +715,39 @@ def build_iter_full_hf_weights(model: nn.Module):
         return int(index) if index.isdigit() else -1
 
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
-        """The EP group's shards of ``local`` concatenated on the master (``None`` elsewhere).
-
-        A gather larger than ``_EXPORT_GATHER_BYTES`` (Qwen3.8's EP-sharded n-gram embedding: 102 GB) goes in row
-        slices through one small device buffer into master host memory, so no GPU ever holds the whole tensor.
-        """
-        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
+        """Gather checkpoint-only shards into host memory without an all-gather copy on every rank."""
         if local.dtype != torch.uint8:
             full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
             return None if full is None else full.view(local.dtype)
         rows = local.shape[0]
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
-        if row_bytes * rows * world <= _EXPORT_GATHER_BYTES:
-            if is_master:
-                full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device=local.device)
-                gather_list = list(full.chunk(world, dim=0))
-            else:
-                full = None
-                gather_list = None
-            dist.gather(local, gather_list, dst=0, group=ep_group)
-            if not is_master:
-                wait_for_export_collective(local)
-            return full
-        step = max(1, _EXPORT_GATHER_BYTES // (row_bytes * world))
-        if is_master:
-            full = torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu")
-            buffer = torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
-        else:
-            full = None
-            buffer = None
+        step = max(1, _EXPORT_GATHER_BYTES // max(row_bytes * world, 1))
+        step = min(step, max(rows, 1))
+        full = (
+            torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        )
+        buffer = (
+            torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
+            if is_master and local.device.type != "cpu"
+            else None
+        )
         for start in range(0, rows, step):
-            n = min(step, rows - start)
-            outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            chunk = local[start : start + n].contiguous()
+            count = min(step, rows - start)
+            if buffer is not None:
+                outputs = [buffer[rank, :count] for rank in range(world)]
+            elif full is not None:
+                outputs = [
+                    full[rank * rows + start : rank * rows + start + count] for rank in range(world)
+                ]
+            else:
+                outputs = None
+            chunk = local[start : start + count].contiguous()
             dist.gather(chunk, outputs, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
-                for r in range(world):
-                    full[r * rows + start : r * rows + start + n].copy_(buffer[r, :n])
+                for rank in range(world):
+                    full[rank * rows + start : rank * rows + start + count].copy_(buffer[rank, :count])
         return full
 
     def iterator(*, include_skipped: bool = False):
@@ -710,13 +776,19 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
-                    # Only the master consumes the export: gather its EP group's shards straight into one output
-                    # (no per-rank shard lists, no concatenation copy), and leave other EP replicas idle.
+                    # Only the master's EP replica participates; gather its shards into bounded CPU output.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
-                    local = tensor.data.contiguous()
-                    world = dist.get_world_size(group=ep_group)
-                    full = _gather_to_master(local, world, ep_group, is_master)
+                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                        local = tensor.data.contiguous()
+                        full = _gather_to_master(local, dist.get_world_size(group=ep_group), ep_group, is_master)
+                        if is_master:
+                            layer_state[name] = full
+                        del full
+                        continue
+                    full = _gather_ep_weight_to_cpu(
+                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                    )
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
@@ -887,3 +959,58 @@ def load_moe_model(
     )
     maybe_use_fixed_order_row_sum(model, options.model_dump())
     return model
+
+
+def _gather_ep_weight_to_cpu(
+    tensor: torch.Tensor,
+    ep_group,
+    *,
+    is_master: bool,
+    max_gather_bytes: int = 64 * 1024 * 1024,
+) -> torch.Tensor | None:
+    import torch.distributed as dist
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
+    local = tensor.detach().contiguous()
+    ep_size = dist.get_world_size(group=ep_group)
+    if local.ndim == 0:
+        raise ValueError("expert-parallel export requires a tensor sharded along dimension zero")
+    if max_gather_bytes < ep_size * local.element_size():
+        raise ValueError("max_gather_bytes must hold at least one expert-parallel element per rank")
+
+    full = None
+    if is_master:
+        full = torch.empty(
+            (ep_size * local.shape[0], *local.shape[1:]),
+            dtype=local.dtype,
+            device="cpu",
+        )
+    if local.numel() == 0:
+        return full
+    if ep_size == 1:
+        if full is not None:
+            full.view(torch.uint8).copy_(local.view(torch.uint8))
+        return full
+
+    # Stage bounded, group-ordered chunks on CPU instead of retaining full GPU shards.
+    flat = local.view(torch.uint8).view(-1)
+    chunk_elements = min(flat.numel(), max_gather_bytes // ep_size)
+    gathered = torch.empty(ep_size * chunk_elements, dtype=torch.uint8, device=local.device)
+    full_shards = full.view(torch.uint8).view(ep_size, flat.numel()) if full is not None else None
+    use_direct_buffer = local.is_cuda and dist.get_backend(group=ep_group) == "nccl"
+    for offset in range(0, flat.numel(), chunk_elements):
+        count = min(chunk_elements, flat.numel() - offset)
+        outputs = gathered[: ep_size * count]
+        inputs = flat[offset : offset + count]
+        if use_direct_buffer:
+            # NCCL's list gather allocates another packed output; write into the bounded buffer directly.
+            dist.all_gather_into_tensor(outputs, inputs, group=ep_group)
+        else:
+            dist.all_gather(list(outputs.view(ep_size, count).unbind(0)), inputs, group=ep_group)
+        if full_shards is not None:
+            for rank, shard in enumerate(outputs.view(ep_size, count)):
+                full_shards[rank, offset : offset + count].copy_(shard)
+        else:
+            wait_for_export_collective(inputs)
+    return full
