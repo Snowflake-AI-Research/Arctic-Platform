@@ -50,7 +50,6 @@ from arctic_platform.model import build_model
 from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
-from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
 from arctic_platform.model.implementations.gpu.sp.utils import verify_sequence_parallel_reduction
 
@@ -529,10 +528,15 @@ class DeepSpeedWorker:
         if self.sp_size > 1:
             if args:
                 raise ValueError("SP model route requires named token inputs, not positional arguments")
-            validate_sequence_parallel_grpo(meta_data, processing, backward=backward)
-            sp_info = self.get_sequence_parallel_info()
-            validate_sequence_parallel_microbatches(
-                micro_batch_data, sp_info=sp_info, synchronize=True, device=self._device
+            sp_info = validate_sequence_parallel_microbatches(
+                micro_batch_data,
+                sp_info=self.get_sequence_parallel_info,
+                synchronize=True,
+                device=self._device,
+                meta=meta_data,
+                processing=processing,
+                backward=backward,
+                ep_group=getattr(self, "ep_group", None),
             )
             if backward:
                 verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
@@ -574,6 +578,15 @@ class DeepSpeedWorker:
             )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
+
+        if sp_info is not None and loss_reduction is not None:
+            validate_sequence_parallel_microbatches(
+                [],
+                sp_info=sp_info,
+                synchronize=True,
+                device=self._device,
+                loss_scales=loss_reduction.loss_scales,
+            )
 
         for i, micro_batch in enumerate(micro_batch_data):
 

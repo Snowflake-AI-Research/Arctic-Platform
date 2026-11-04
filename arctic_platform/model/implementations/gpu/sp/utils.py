@@ -28,6 +28,7 @@ import importlib
 import math
 from dataclasses import dataclass
 from numbers import Real
+from typing import Callable
 
 import torch
 import torch.distributed as dist
@@ -307,15 +308,44 @@ def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: b
 
 
 def validate_sequence_parallel_microbatches(
-    microbatches: list[dict], *, sp_info: dict, synchronize: bool = False, device=None
-) -> None:
+    microbatches: list[dict],
+    *,
+    sp_info: dict | Callable[[], dict],
+    synchronize: bool = False,
+    device=None,
+    meta: dict | None = None,
+    processing: dict | None = None,
+    backward: bool = True,
+    ep_group=None,
+    loss_scales=None,
+) -> dict:
     """Validate the entire request before any model call or gradient-boundary mutation."""
     failure = None
+    index = None
     try:
+        membership = sp_info() if callable(sp_info) else sp_info
+        _, world, ranks, _ = _membership(membership)
+        if ep_group is not None:
+            raise ValueError("SP GRPO currently requires ep_size=1; EP>1 gradient parity is not established")
+        if meta is not None and processing is not None:
+            validate_sequence_parallel_grpo(meta, processing, backward=backward)
+            logical_dp = world // len(ranks)
+            configured_dp = (processing.get("config") or {}).get("dp_size")
+            if meta.get("dp_size", logical_dp) != logical_dp or (
+                configured_dp is not None and configured_dp != logical_dp
+            ):
+                raise ValueError("SP meta dp_size does not match actual logical-DP membership")
+        if loss_scales is not None and any(
+            isinstance(scale, bool) or not isinstance(scale, Real) or not math.isfinite(scale) or scale < 0
+            for scale in loss_scales
+        ):
+            raise ValueError("SP packed loss scale must be finite and nonnegative")
         for index, microbatch in enumerate(microbatches):
-            prepare_token_partition(microbatch, sp_info=sp_info)
-    except ValueError as error:
-        failure = ValueError(f"SP microbatch {index}: {error}")
+            prepare_token_partition(microbatch, sp_info=membership)
+    except Exception as error:
+        context = "request" if index is None else f"microbatch {index}"
+        failure_type = ValueError if isinstance(error, ValueError) else RuntimeError
+        failure = failure_type(f"SP {context}: {error}")
     if synchronize:
         flag = torch.tensor(int(failure is not None), dtype=torch.int32, device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
@@ -323,6 +353,7 @@ def validate_sequence_parallel_microbatches(
             failure = ValueError("SP request preflight failed on another logical-DP shard")
     if failure is not None:
         raise failure
+    return membership
 
 
 def verify_sequence_parallel_reduction(engine, *, sp_info: dict, sp_group) -> None:

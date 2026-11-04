@@ -304,6 +304,39 @@ def test_sp_request_preflight_rejects_every_microbatch_before_model_or_boundary(
     assert worker.engine.parameter.grad is None
 
 
+@pytest.mark.parametrize("fault", ["runtime", "membership", "expert-parallel", "dp"])
+def test_sp_preflight_collectively_rejects_runtime_and_request_errors(monkeypatch, fault):
+    from arctic_platform.model.implementations.gpu.sp import utils as sp
+
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    reductions = []
+
+    def reduce(flag, **kwargs):
+        reductions.append(flag.item())
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("local preflight runtime error")
+
+    if fault == "runtime":
+        monkeypatch.setattr(sp, "prepare_token_partition", fail)
+    elif fault == "membership":
+        worker.get_sequence_parallel_info = fail
+    elif fault == "expert-parallel":
+        worker.ep_group = object()
+    else:
+        request["meta"]["dp_size"] = 1
+    monkeypatch.setattr(
+        deepspeed_worker, "verify_sequence_parallel_reduction", lambda *args, **kwargs: pytest.fail("reducer ran")
+    )
+    with pytest.raises((RuntimeError, ValueError), match="preflight runtime error|ep_size=1|dp_size"):
+        worker.forward_backward(request)
+    assert reductions == [1]
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
+
+
 def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object():
     _StatefulWeightedLoss.instances = 0
     _StatefulWeightedLoss.events = []
