@@ -15,9 +15,10 @@
 """Shard each decoder layer's frozen replicated weights across ranks; gather them around every call of the layer.
 
 With LoRA every non-expert weight (attention, shared and dense MLPs, router, norms) is frozen and replicated on all
-ranks: about 16 GiB per GPU for GLM-5.3 in FP8, twice that in BF16. Frozen weights need no gradient reduction, so a
-rank can keep 1/world of their bytes and all-gather the layer's weights when the layer runs, in its forward and in
-its activation-checkpoint recompute, as ZeRO-3 does for its parameters. Expert parameters (EP-sharded, tagged
+ranks: about 16 GiB per GPU for GLM-5.3 in FP8, twice that in BF16 (DeepSeek-V4.1 loads its dense layers in BF16).
+Frozen weights need no gradient reduction, so a rank can keep 1/world of their bytes and all-gather the layer's
+weights when the layer runs, in its forward and in its activation-checkpoint recompute, as ZeRO-3 does for its
+parameters. Expert parameters (EP-sharded, tagged
 ``allreduce=False``) and trainable parameters are left alone.
 
 Sharding happens at each layer's first call, so it sees the model after PEFT and DeepSpeed have wrapped it. The
@@ -59,6 +60,9 @@ class FrozenLayerShard:
 
     def _targets(self):
         for module in self.layer.modules():
+            # Tables already split across the EP ranks (DeepSeek-V4.1's Engram rows) are not replicated.
+            if getattr(module, "_dss_shard_on_ep", False):
+                continue
             for name, param in module._parameters.items():
                 if param is None or param.requires_grad or param.numel() == 0:
                     continue

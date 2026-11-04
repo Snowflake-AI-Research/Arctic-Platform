@@ -16,7 +16,7 @@
 experts take too): copies compute with their owners' codes, scales and LoRA factors, and the copies' LoRA gradients
 return to the owners.
 
-Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_packed4.py [w4a8 | fp8]
+Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_packed4.py [w4a8 | fp8 | mxfp4]
 """
 
 import os
@@ -37,6 +37,7 @@ def _gather(t):
 def main():
     w4a8 = "w4a8" in sys.argv[1:]
     fp8 = "fp8" in sys.argv[1:]  # block-FP8 experts (the FP8 release), 128 x 128 FP32 scales
+    mxfp4 = "mxfp4" in sys.argv[1:]  # DeepSeek-V4.1's MXFP4 experts, E8M0 scales
     if w4a8:
         os.environ["ARL_W4A8_EXPERTS"] = "1"
     os.environ["ARL_ULTRAEP_SPARES"] = str(S)
@@ -44,13 +45,14 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups_reference
+    from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_reference
     from arctic_platform.model.implementations.moe import ultraep_frozen
     from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
     group = dist.new_group(list(range(world)))
     torch.manual_seed(100 + rank)
     experts = GroupedExperts(
-        DIM, HIDDEN, L, use_grouped_mm=True, fp8_block_size=128, packed4=None if fp8 else "int4"
+        DIM, HIDDEN, L, use_grouped_mm=True, fp8_block_size=128, packed4=None if fp8 else "mxfp4" if mxfp4 else "int4"
     ).cuda()
     shapes = {"w1": (HIDDEN, DIM), "w2": (DIM, HIDDEN), "w3": (HIDDEN, DIM)}
     for name, (rows, cols) in shapes.items():
@@ -70,11 +72,18 @@ def main():
         getattr(experts, name).data.copy_(
             ((codes[..., 0::2] & 15) | ((codes[..., 1::2] & 15) << 4)).to(torch.uint8).view(torch.int8)
         )
-        getattr(experts, f"{name}_scale_inv").data.copy_(
-            (torch.rand(L, rows, cols // 128, device="cuda") * 0.01 + 1e-3).bfloat16()
-        )
+        if mxfp4:  # FP32 powers of two, compacted to E8M0 bytes as after loading
+            exponent = torch.randint(118, 123, (L, rows, cols // 32), dtype=torch.uint8, device="cuda")
+            getattr(experts, f"{name}_scale_inv").data.copy_(exponent.view(torch.float8_e8m0fnu).float())
+        else:
+            getattr(experts, f"{name}_scale_inv").data.copy_(
+                (torch.rand(L, rows, cols // 128, device="cuda") * 0.01 + 1e-3).bfloat16()
+            )
         if w4a8:
             getattr(experts, f"{name}_input_scale").data.fill_(1.0)
+    if mxfp4:
+        experts.compact_mxfp4_scales()
+        assert experts.w1_scale_inv.dtype == torch.uint8
     ab = {}
     for name, (out_f, in_f) in shapes.items():
         a = torch.nn.Parameter((torch.randn(L * RANK, in_f, device="cuda") * 0.05).bfloat16())
@@ -88,6 +97,8 @@ def main():
     def decode(weight, scale):
         if fp8:
             return torch.stack([dequantize_from_fp8_blockwise(weight[e], scale[e], 128).float() for e in range(L)])
+        if mxfp4:
+            return dequantize_mxfp4_reference(weight, scale)
         return dequantize_int4_groups_reference(weight, scale)
 
     ref_w = {n: _gather(decode(getattr(experts, n).detach(), raw_scales[n])).flatten(0, 1) for n in shapes}
@@ -147,7 +158,7 @@ def main():
         start += c
     want = torch.cat(pieces) if pieces else x_ref.new_zeros(0, DIM)
     error = ((out.float() - want).norm() / want.norm().clamp_min(1e-6)).item()
-    assert error < (6e-2 if w4a8 else 2e-2), f"rank {rank}: output error {error}"
+    assert error < 2e-2, f"rank {rank}: output error {error}"
 
     upstream = torch.randn(rows, DIM, device="cuda", generator=g)
     out.float().backward(upstream)
@@ -158,11 +169,11 @@ def main():
             expected = full_ab[n][k].grad[rank]
             got = ab[n][k].grad.float()
             err = ((got - expected).norm() / expected.norm().clamp_min(1e-6)).item()
-            assert err < (6e-2 if w4a8 else 2e-2), f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
+            assert err < 2e-2, f"rank {rank}: {n} {'AB'[k]} gradient error {err}"
     if rank == 0:
         print(
-            f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'w4a16'}): EP{world}, {S} spares: copies compute with their"
-            " owners' weights and LoRA, LoRA gradients return; rank load max/mean"
+            f"ok ({'w4a8' if w4a8 else 'fp8' if fp8 else 'mxfp4' if mxfp4 else 'w4a16'}): EP{world}, {S} spares: copies"
+            " compute with their owners' weights and LoRA, LoRA gradients return; rank load max/mean"
             f" {(logical.max() / logical.float().mean()).item():.3f} ->"
             f" {(loads.max() / loads.float().mean()).item():.3f}"
         )

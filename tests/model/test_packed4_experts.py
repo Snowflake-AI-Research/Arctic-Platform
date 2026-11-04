@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups_reference
+from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_reference
 from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_nvfp4_reference
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the decode kernels run on CUDA")
@@ -254,11 +255,161 @@ def test_w4a8_experts_match_the_decoded_bf16_experts(monkeypatch):
     assert module._scales_interleaved and module.w1_scale_inv.shape == (experts, dim // 128, hidden)
 
 
+def _random_mxfp4(experts, rows, cols, device="cpu"):
+    packed = torch.randint(-128, 128, (experts, rows, cols // 2), dtype=torch.int8, device=device)
+    # E8M0 exponents around 2^-7 .. 2^-3, the official checkpoint's range for 2304 x 5120 experts.
+    exponent = torch.randint(120, 125, (experts, rows, cols // 32), dtype=torch.uint8, device=device)
+    return packed, exponent.view(torch.float8_e8m0fnu).float(), exponent
+
+
+def _lora(experts, rank, in_f, out_f, device):
+    a = torch.nn.Parameter((torch.randn(experts * rank, in_f, device=device) * 0.05).bfloat16())
+    b = torch.nn.Parameter((torch.randn(out_f, rank * experts, device=device) * 0.05).bfloat16())
+    return a, b
+
+
+def _lora_delta(a, b, e, experts, rank, scaling):
+    # PEFT's ParamWrapper layout: A [E * r, in] expert-major, B [out, r * E] with the expert index fastest.
+    a_e = a.float().view(experts, rank, -1)[e]
+    b_e = b.float().view(b.shape[0], rank, experts)[:, :, e]
+    return (b_e @ a_e) * scaling
+
+
+def test_mxfp4_reference_matches_deepseek_v4_dequantize():
+    from arctic_platform.model.implementations.deepseek_v4.dequantize import dequantize_mxfp4
+
+    packed, scale, exponent = _random_mxfp4(3, 16, 256)
+    want = dequantize_mxfp4(packed, scale)
+    assert torch.equal(dequantize_mxfp4_reference(packed, scale).bfloat16(), want)
+    assert torch.equal(
+        dequantize_mxfp4_reference(packed, exponent).bfloat16(), want
+    ), "E8M0 bytes decode to the same scales"
+    assert torch.equal(
+        dequantize_mxfp4_reference(packed, torch.zeros_like(exponent)),
+        dequantize_mxfp4_reference(packed, torch.full_like(scale, 2.0**-127)),
+    )
+
+
+@cuda
+@pytest.mark.parametrize("e8m0", [False, True])
+@pytest.mark.parametrize("cols", [256, 2304, 5120])
+def test_mxfp4_decode_matches_reference(cols, e8m0):
+    from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_packed
+
+    packed, scale, exponent = _random_mxfp4(3, 96, cols, device="cuda")
+    stored = exponent if e8m0 else scale
+    assert torch.equal(dequantize_mxfp4_packed(packed, stored), dequantize_mxfp4_reference(packed, scale).bfloat16())
+    out = torch.full((3, 200, cols), float("nan"), dtype=torch.bfloat16, device="cuda")
+    dequantize_mxfp4_packed(packed, stored, out=out, out_row=104)
+    assert torch.equal(out[:, 104:], dequantize_mxfp4_reference(packed, scale).bfloat16())
+
+
+@cuda
+def test_mxfp4_grouped_experts_with_lora_match_the_decoded_bf16_experts():
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    torch.manual_seed(0)
+    experts, dim, hidden, rank, scaling = 4, 512, 256, 8, 0.5
+    module = GroupedExperts(dim, hidden, experts, use_grouped_mm=True, packed4="mxfp4", swiglu_limit=10.0).cuda()
+    reference, ab = {}, {}
+    for name, (rows, cols) in (("w1", (hidden, dim)), ("w2", (dim, hidden)), ("w3", (hidden, dim))):
+        packed, scale, _ = _random_mxfp4(experts, rows, cols, device="cuda")
+        getattr(module, name).data.copy_(packed)
+        getattr(module, f"{name}_scale_inv").data.copy_(scale)
+        reference[name] = dequantize_mxfp4_reference(packed, scale).bfloat16().float()
+        ab[name] = (*_lora(experts, rank, cols, rows, "cuda"), rank, scaling)
+    module._ap_lora_ab = ab
+    counts = [5, 0, 17, 9]
+    x = torch.randn(sum(counts), dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    scores = torch.rand(sum(counts), device="cuda", requires_grad=True)
+    out = module(x, torch.tensor(counts, device="cuda"), scores)
+
+    from arctic_platform.model.implementations.moe.layers.moe import _apply_swiglu
+
+    x_ref = x.detach().float().requires_grad_(True)
+    ab_ref = {
+        n: (a.detach().clone().requires_grad_(True), b.detach().clone().requires_grad_(True))
+        for n, (a, b, _, _) in ab.items()
+    }
+    pieces = []
+    for e, rows in enumerate(torch.split(x_ref, counts)):
+        w = {n: reference[n][e] + _lora_delta(*ab_ref[n], e, experts, rank, scaling) for n in reference}
+        pieces.append(_apply_swiglu(rows @ w["w1"].T, rows @ w["w3"].T, 10.0) @ w["w2"].T)
+    want = torch.cat(pieces) * scores[:, None].detach()
+    error = ((out.float() - want).norm() / want.norm()).item()
+    assert error < 2e-2, error
+    grad = torch.randn_like(want)
+    out.float().backward(grad)
+    want.backward(grad)
+    for got, ref, label in [(x.grad, x_ref.grad, "x")] + [
+        (ab[n][k].grad, ab_ref[n][k].grad, f"{n}.{'AB'[k]}") for n in ab for k in (0, 1)
+    ]:
+        err = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+        assert err < 3e-2, (label, err)
+
+
+def test_peft_sizes_mxfp4_expert_lora_from_the_logical_shape():
+    from peft.tuners.lora.layer import ParamWrapper
+
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+    from arctic_platform.model.patches.peft import apply_peft
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(512, 256, 4, use_grouped_mm=True, packed4="mxfp4")
+
+    wrapped = apply_peft(
+        Block(),
+        {
+            "peft_type": "LORA",
+            "r": 8,
+            "lora_alpha": 8,
+            "target_parameters": ["experts.w1", "experts.w2", "experts.w3"],
+        },
+    )
+    shapes = {
+        module.parameter_name: (
+            tuple(module.lora_A["default"].weight.shape),
+            tuple(module.lora_B["default"].weight.shape),
+        )
+        for module in wrapped.modules()
+        if isinstance(module, ParamWrapper)
+    }
+    assert shapes == {"w1": ((32, 512), (256, 32)), "w2": ((32, 256), (512, 32)), "w3": ((32, 512), (256, 32))}
+
+
+def test_mxfp4_scales_compact_to_e8m0_bytes_exactly():
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import compact_mxfp4_expert_scales
+
+    module = GroupedExperts(64, 32, 2, use_grouped_mm=True, packed4="mxfp4")
+    decoded = {}
+    for name in ("w1", "w2", "w3"):
+        packed = getattr(module, name)
+        packed.data.copy_(torch.randint(-128, 128, packed.shape, dtype=torch.int8))
+        exponent = torch.randint(0, 255, getattr(module, f"{name}_scale_inv").shape, dtype=torch.uint8)
+        exponent.view(-1)[0] = 0  # the subnormal 2^-127
+        getattr(module, f"{name}_scale_inv").data.copy_(exponent.view(torch.float8_e8m0fnu).float())
+        decoded[name] = dequantize_mxfp4_reference(packed.data, getattr(module, f"{name}_scale_inv").data)
+    before = sum(getattr(module, f"{n}_scale_inv").numel() * 4 for n in ("w1", "w2", "w3"))
+    assert compact_mxfp4_expert_scales(nn.ModuleList([module])) == before * 3 // 4
+    for name in ("w1", "w2", "w3"):
+        scale = getattr(module, f"{name}_scale_inv")
+        assert scale.dtype == torch.uint8 and not scale.requires_grad
+        assert torch.equal(dequantize_mxfp4_reference(getattr(module, name).data, scale.data), decoded[name])
+    assert compact_mxfp4_expert_scales(nn.ModuleList([module])) == 0, "idempotent"
+    module.w1_scale_inv.data = torch.full(module.w1_scale_inv.shape, 0.3)
+    with pytest.raises(ValueError, match="powers of two"):
+        module.compact_mxfp4_scales()
+
+
 def test_stash_frozen_keeps_parameters_on_ctx_and_saves_other_stacks():
     import gc
     import weakref
 
     from arctic_platform.model.implementations.fp8 import Int4InterleavedScales
+    from arctic_platform.model.implementations.fp8 import Nvfp4Scales
     from arctic_platform.model.implementations.fp8 import stash_frozen
     from arctic_platform.model.implementations.fp8 import unstash_frozen
 
@@ -275,6 +426,14 @@ def test_stash_frozen_keeps_parameters_on_ctx_and_saves_other_stacks():
     saved = stash_frozen(ctx, (stack, stack), (Int4InterleavedScales(scale, 1), Int4InterleavedScales(scale, 1)))
     (weights, scales), rest = unstash_frozen(ctx, (torch.ones(1), *saved))
     assert weights[0] is stack and scales[1].scale is scale and scales[1].align == 1 and len(rest) == 1
+
+    per_matrix = torch.ones(4)
+    ctx = Ctx()
+    nv_saved = stash_frozen(ctx, (stack, stack), (scale, Nvfp4Scales(scale, per_matrix)))
+    (nv_weights, nv_scales), nv_rest = unstash_frozen(ctx, (torch.ones(1), *nv_saved))
+    assert nv_weights[0] is stack and nv_scales[0] is scale and nv_scales[1].per_matrix is per_matrix
+    assert len(nv_rest) == 1
+    del nv_saved, nv_weights, nv_scales, nv_rest
     # Nothing but the saved tensors keeps the stacks alive: the rebuild closure holds only their structure.
     ref = weakref.ref(stack)
     del stack, weights, scales, saved, rest

@@ -111,9 +111,9 @@ class MoEArgs:
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
-    routed_packed4: Literal["int4", "nvfp4"] | None = None
-    """Routed experts stored as frozen packed 4-bit codes (group-scaled INT4 or NVFP4), decoded to BF16 per grouped
-    GEMM; ``fp8_block_size`` then applies to the shared expert only. None keeps ``fp8_block_size`` for both."""
+    routed_packed4: Literal["int4", "nvfp4", "mxfp4"] | None = None
+    """Routed experts stored as frozen packed 4-bit codes (group-scaled INT4, NVFP4 or MXFP4), decoded to BF16 per
+    grouped GEMM; ``fp8_block_size`` then applies to the shared expert only. None keeps ``fp8_block_size`` for both."""
     routed_int4_group_size: int = 128
     swiglu_limit: float | None = None
 
@@ -399,7 +399,7 @@ class GroupedExperts(nn.Module):
         use_grouped_mm: bool,
         fp8_block_size: int | None = None,
         swiglu_limit: float | None = None,
-        packed4: Literal["int4", "nvfp4"] | None = None,
+        packed4: Literal["int4", "nvfp4", "mxfp4"] | None = None,
         int4_group_size: int = 128,
     ):
         super().__init__()
@@ -448,17 +448,21 @@ class GroupedExperts(nn.Module):
             self.register_parameter("w3_scale_inv", None)
 
     def _init_packed4(
-        self, dim: int, hidden_dim: int, num_experts: int, packed4: Literal["int4", "nvfp4"], group: int
+        self, dim: int, hidden_dim: int, num_experts: int, packed4: Literal["int4", "nvfp4", "mxfp4"], group: int
     ) -> None:
         """Frozen ``[E, out, in // 2]`` byte stacks with their scales, as the converted checkpoint stores them.
 
         INT4 (W4AFP8 checkpoints): int8 bytes, BF16 scales ``[E, out, in // group]``. NVFP4: uint8 bytes, E4M3 scales
         ``[E, out, in // 16]`` (``w*_scale_inv``) and one FP32 scale per expert matrix (``w*_scale_2``, ``[E]``).
+        MXFP4 (DeepSeek-V4): int8 bytes, FP32 power-of-two scales ``[E, out, in // 32]``, which
+        ``compact_mxfp4_scales`` turns into their E8M0 exponent bytes after the checkpoint loads.
         """
         from arctic_platform.model.implementations.fp8 import mark_keep_fp32
 
         if packed4 == "nvfp4":
             group = 16
+        elif packed4 == "mxfp4":
+            group = 32
         if dim % group or hidden_dim % group:
             raise ValueError(f"{packed4} experts need dim={dim} and hidden_dim={hidden_dim} divisible by {group}")
         from arctic_platform.model.implementations.kernels.w4a8 import w4a8_experts_requested
@@ -466,16 +470,14 @@ class GroupedExperts(nn.Module):
         # W4A8 forward (ARL_W4A8_EXPERTS): the checkpoint's static FP8 activation scales, one per expert matrix.
         self.w4a8 = packed4 == "int4" and w4a8_experts_requested()
         self._scales_interleaved = False
-        code_dtype = torch.int8 if packed4 == "int4" else torch.uint8
-        scale_dtype = torch.bfloat16 if packed4 == "int4" else torch.float8_e4m3fn
+        code_dtype = torch.uint8 if packed4 == "nvfp4" else torch.int8
+        scale_dtype = {"int4": torch.bfloat16, "nvfp4": torch.float8_e4m3fn, "mxfp4": torch.float32}[packed4]
         for name, (rows, cols) in (("w1", (hidden_dim, dim)), ("w2", (dim, hidden_dim)), ("w3", (hidden_dim, dim))):
             self.register_parameter(
                 name, nn.Parameter(torch.empty(num_experts, rows, cols // 2, dtype=code_dtype), requires_grad=False)
             )
-            self.register_parameter(
-                f"{name}_scale_inv",
-                nn.Parameter(torch.empty(num_experts, rows, cols // group, dtype=scale_dtype), requires_grad=False),
-            )
+            scale = nn.Parameter(torch.empty(num_experts, rows, cols // group, dtype=scale_dtype), requires_grad=False)
+            self.register_parameter(f"{name}_scale_inv", mark_keep_fp32(scale) if scale_dtype == torch.float32 else scale)
             if packed4 == "nvfp4":
                 self.register_parameter(
                     f"{name}_scale_2",
@@ -516,6 +518,50 @@ class GroupedExperts(nn.Module):
 
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
+
+    def compact_mxfp4_scales(self) -> int:
+        """Store MXFP4 scales as their E8M0 exponent bytes (uint8) instead of FP32: exact for the checkpoint's
+        power-of-two scales, a quarter of the memory. Returns the bytes freed."""
+        if self.packed4 != "mxfp4":
+            return 0
+        freed = 0
+        for name in ("w1", "w2", "w3"):
+            param = getattr(self, f"{name}_scale_inv")
+            scale = _maybe_to_local(param).data
+            if scale.dtype == torch.uint8:
+                continue
+            bits = scale.float().contiguous().view(torch.int32)
+            # Powers of two 2^-126 .. 2^127 have an empty mantissa; E8M0's 0 byte is the subnormal 2^-127.
+            if not bool(((bits & 0x807FFFFF) == 0).logical_or(bits == 0x00400000).all()):
+                raise ValueError(f"{name}_scale_inv holds values that are not E8M0 powers of two")
+            exponent = torch.where(bits == 0x00400000, 0, (bits >> 23) & 0xFF).to(torch.uint8)
+            freed += scale.numel() * (scale.element_size() - 1)
+            param.data = exponent
+            for attr in ("_dss_keep_fp32",):
+                if hasattr(param, attr):
+                    delattr(param, attr)
+        return freed
+
+    def _forward_packed4_reference(
+        self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None
+    ) -> torch.Tensor:
+        """CPU path: the experts decoded to BF16 in PyTorch, through the for-loop experts (no expert LoRA)."""
+        from arctic_platform.model.implementations.kernels import packed4_dequant as p4
+
+        if getattr(self, "_ap_lora_ab", None) or getattr(self, "_dss_lora_ab", None):
+            raise NotImplementedError(f"{self.packed4} experts take expert LoRA on CUDA only")
+
+        def decode(name: str) -> torch.Tensor:
+            weight, scale = _maybe_to_local(getattr(self, name)), self._packed4_scale(name)
+            if self.packed4 == "int4":
+                return p4.dequantize_int4_groups_reference(weight, scale).bfloat16()
+            if self.packed4 == "mxfp4":
+                return p4.dequantize_mxfp4_reference(weight, scale).bfloat16()
+            return p4.dequantize_nvfp4_reference(weight, scale.block, scale.per_matrix).bfloat16()
+
+        w1, w2, w3 = decode("w1"), decode("w2"), decode("w3")
+        out = _run_experts_for_loop_impl(w1, w2, w3, x.bfloat16(), num_tokens_per_expert, self.swiglu_limit).to(x.dtype)
+        return out if scores is None else apply_routing_weights(out, scores)
 
     @staticmethod
     def _grouped_lora_fn(
@@ -622,8 +668,10 @@ class GroupedExperts(nn.Module):
         )
         if scores is not None and not folds_scores:
             return apply_routing_weights(self._forward_deepep(x, num_tokens_per_expert), scores)
+        if self.packed4 is not None and not x.is_cuda:
+            return self._forward_packed4_reference(x, num_tokens_per_expert, scores)
         if self.packed4 is not None:
-            if not (self.use_grouped_mm and x.is_cuda):
+            if not self.use_grouped_mm:
                 raise NotImplementedError(f"{self.packed4} routed experts run as CUDA grouped GEMMs (moe.grouped_mm)")
             for name in ("w1", "w2", "w3"):
                 parametrizations = getattr(self, "parametrizations", None)
@@ -1157,10 +1205,10 @@ class MoE(nn.Module):
     ):
         """This call's spare-slot plan, or None without spare slots. With ``ultraep_spares``, UltraEP plans every
         forward from its own routing (``moe/ultraep_replicas.py``: BF16 experts, trained or frozen; frozen block-FP8
-        and packed 4-bit experts through ``moe/ultraep_frozen.py``) and a recompute reuses its forward's routes. With ``expert_replicas``, the
-        in-house online replicas (``moe/expert_replicas.py``, BF16 experts) replan from the routed counts when the
-        first registered layer starts a graph-building forward. Either way a micro-batch's forward, recompute and
-        backward route identically."""
+        and packed 4-bit experts through ``moe/ultraep_frozen.py``) and a recompute reuses its forward's routes. With
+        ``expert_replicas``, the in-house online replicas (``moe/expert_replicas.py``, BF16 experts) replan from the
+        routed counts when the first registered layer starts a graph-building forward. Either way a micro-batch's
+        forward, recompute and backward route identically."""
         from ..expert_replicas import manager_for
         from ..expert_replicas import replica_spares
         from ..ultraep_replicas import ultraep_plan
@@ -1685,3 +1733,8 @@ class LatentMoE(nn.Module):
             self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
             if self.load_balance_coeff is not None:
                 self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+
+
+def compact_mxfp4_expert_scales(model: nn.Module) -> int:
+    """``GroupedExperts.compact_mxfp4_scales`` on every MXFP4 expert stack of ``model``; returns the bytes freed."""
+    return sum(m.compact_mxfp4_scales() for m in model.modules() if isinstance(m, GroupedExperts))

@@ -20,6 +20,8 @@ Both layouts store a ``[rows, cols]`` matrix as ``[rows, cols // 2]`` bytes, the
   multiply-to-restore scale per ``group`` consecutive columns, ``[rows, cols // group]``.
 - **NVFP4** (ModelOpt): E2M1 nibbles (sign, 2 exponent bits, 1 mantissa bit: 0, 0.5, 1, 1.5, 2, 3, 4, 6), one
   E4M3 scale per 16 columns, ``[rows, cols // 16]``, times one FP32 scale per matrix (``weight_scale_2``).
+- **MXFP4** (OCP microscaling; DeepSeek-V4's routed experts): the same E2M1 nibbles in int8 bytes, one power-of-two
+  scale per 32 columns, ``[rows, cols // 32]``: FP32, or the checkpoint's E8M0 exponent bytes (uint8, ``2^(e - 127)``).
 
 Stacked expert weights add a leading expert dimension to every tensor (the NVFP4 per-matrix scale becomes ``[E]``).
 """
@@ -107,6 +109,40 @@ def _dequant_nvfp4_kernel(
     out_offset = (expert * out_rows + out_row0 + row) * cols + col
     restored = values * (scale.to(tl.float32) * global_scale)
     tl.store(out_ptr + out_offset, restored.to(tl.bfloat16), mask=out_mask)
+
+
+@triton.jit
+def _dequant_mxfp4_kernel(
+    code_ptr,
+    scale_ptr,
+    out_ptr,
+    rows,
+    packed_cols,
+    scale_cols,
+    out_rows,
+    out_row0,
+    E8M0: tl.constexpr,
+    TILE_ROWS: tl.constexpr,
+    TILE_BYTES: tl.constexpr,
+):
+    expert = tl.program_id(2).to(tl.int64)
+    row = (tl.program_id(0) * TILE_ROWS + tl.arange(0, TILE_ROWS)).to(tl.int64)[:, None]
+    byte = (tl.program_id(1) * TILE_BYTES + tl.arange(0, TILE_BYTES))[None, :]
+    mask = (row < rows) & (byte < packed_cols)
+    packed = tl.load(code_ptr + (expert * rows + row) * packed_cols + byte, mask=mask, other=0).to(tl.int32)
+    values = tl.interleave(_e2m1_to_float(packed & 15), _e2m1_to_float((packed >> 4) & 15))
+    cols = packed_cols * 2
+    col = (tl.program_id(1) * (2 * TILE_BYTES) + tl.arange(0, 2 * TILE_BYTES))[None, :]
+    out_mask = (row < rows) & (col < cols)
+    scale_offset = (expert * rows + row) * scale_cols + col // 32
+    if E8M0:
+        exponent = tl.load(scale_ptr + scale_offset, mask=out_mask, other=127).to(tl.int32)
+        # 2^(e - 127) is the FP32 with exponent field e; e = 0 is the subnormal 2^-127 (0x00400000).
+        scale = tl.where(exponent == 0, 0x00400000, exponent << 23).to(tl.float32, bitcast=True)
+    else:
+        scale = tl.load(scale_ptr + scale_offset, mask=out_mask, other=0.0)
+    out_offset = (expert * out_rows + out_row0 + row) * cols + col
+    tl.store(out_ptr + out_offset, (values * scale).to(tl.bfloat16), mask=out_mask)
 
 
 def _checked_out(weight: torch.Tensor, out: torch.Tensor | None, out_row: int) -> torch.Tensor:
@@ -245,6 +281,49 @@ def dequantize_nvfp4(
     return out
 
 
+MXFP4_SCALE_DTYPES = (torch.float32, torch.uint8)
+
+
+def dequantize_mxfp4_packed(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+    out_row: int = 0,
+) -> torch.Tensor:
+    """BF16 copy of a CUDA MXFP4 matrix ``[rows, cols // 2]`` (int8 bytes), or of an expert stack.
+
+    ``scale`` is ``[.., rows, cols // 32]``: FP32 values or E8M0 exponent bytes (uint8). ``out`` and ``out_row`` as in
+    ``dequantize_int4_groups``.
+    """
+    if weight.dtype != torch.int8 or weight.ndim not in (2, 3) or not weight.is_cuda:
+        raise TypeError(f"expected a CUDA int8 [.., rows, cols // 2] MXFP4 weight, got {weight.dtype} {weight.shape}")
+    rows, cols = weight.shape[-2], weight.shape[-1] * 2
+    if scale.dtype not in MXFP4_SCALE_DTYPES or tuple(scale.shape) != (*weight.shape[:-1], cols // 32):
+        raise TypeError(
+            f"MXFP4 scale must be float32 or uint8 (E8M0) [.., {rows}, {cols // 32}], got"
+            f" {scale.dtype} {tuple(scale.shape)}"
+        )
+    out = _checked_out(weight, out, out_row)
+    experts = weight.shape[0] if weight.ndim == 3 else 1
+    if weight.numel():
+        grid = (triton.cdiv(rows, _TILE_ROWS), triton.cdiv(weight.shape[-1], _TILE_BYTES), experts)
+        with torch.cuda.device(weight.device):
+            _dequant_mxfp4_kernel[grid](
+                weight.contiguous(),
+                scale.contiguous(),
+                out,
+                rows,
+                weight.shape[-1],
+                scale.shape[-1],
+                out.shape[-2],
+                out_row,
+                E8M0=scale.dtype == torch.uint8,
+                TILE_ROWS=_TILE_ROWS,
+                TILE_BYTES=_TILE_BYTES,
+            )
+    return out
+
+
 def dequantize_int4_groups_reference(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """FP32 ``unpack(weight) * scale`` in plain PyTorch (CPU or GPU), for tests and the CPU path."""
     packed = weight.to(torch.int16)
@@ -265,3 +344,19 @@ def dequantize_nvfp4_reference(weight: torch.Tensor, scale: torch.Tensor, global
     values = table[codes & 7] * torch.where((codes & 8) != 0, -1.0, 1.0)
     per_matrix = global_scale.float().reshape(-1, 1, 1) if weight.ndim == 3 else global_scale.float().reshape(())
     return values * scale.float().repeat_interleave(16, dim=-1) * per_matrix
+
+
+def mxfp4_scale_values(scale: torch.Tensor) -> torch.Tensor:
+    """FP32 values of MXFP4 scales stored as FP32 or as E8M0 exponent bytes (uint8)."""
+    if scale.dtype == torch.uint8:
+        return scale.view(torch.float8_e8m0fnu).float()
+    return scale.float()
+
+
+def dequantize_mxfp4_reference(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """FP32 MXFP4 decode in plain PyTorch (CPU or GPU), for tests and the CPU path."""
+    codes = weight.view(torch.uint8)
+    codes = torch.stack((codes & 0x0F, codes >> 4), dim=-1).flatten(-2).long()
+    table = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
+    values = table[codes & 7] * torch.where((codes & 8) != 0, -1.0, 1.0)
+    return values * mxfp4_scale_values(scale).repeat_interleave(32, dim=-1)

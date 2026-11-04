@@ -366,7 +366,7 @@ PACKED_4BIT_DTYPES = (torch.int8, torch.uint8)
 
 
 def is_packed_4bit(weight: Tensor) -> bool:
-    """Frozen 4-bit codes, two per byte along the input dimension: INT4 (int8 bytes) or NVFP4 (uint8 bytes)."""
+    """Frozen 4-bit codes, two per byte along the input dimension: INT4 or MXFP4 (int8 bytes), NVFP4 (uint8 bytes)."""
     return weight.dtype in PACKED_4BIT_DTYPES
 
 
@@ -380,6 +380,11 @@ def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tenso
         from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
 
         dequantize_fp8_blocks(weight, scale, cast(int, block_size), out=out, out_row=out_row)
+    elif weight.dtype == torch.int8 and isinstance(scale, Tensor) and scale.dtype != torch.bfloat16:
+        # int8 bytes carry INT4 (BF16 group scales) or MXFP4 (FP32 or E8M0 scales per 32 inputs).
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_packed
+
+        dequantize_mxfp4_packed(weight, scale, out=out, out_row=out_row)
     elif weight.dtype == torch.int8:
         from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups
 
@@ -400,9 +405,11 @@ def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tenso
 def _decode_fp8_to_bf16(weight: Tensor | tuple[Tensor, ...], scale, block_size: int | None) -> Tensor:
     """BF16 copy of a CUDA quantized matrix or expert stack, for one GEMM on the current stream.
 
-    Block FP8 (``block_size`` x ``block_size`` FP32 scales), group-scaled INT4 or NVFP4 (``Nvfp4Scales``), chosen by
-    the weight's dtype. Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one
-    stack. CUDA decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
+    Block FP8 (``block_size`` x ``block_size`` FP32 scales), group-scaled INT4 (BF16 scales, or
+    ``Int4InterleavedScales`` in the W4A8 layout), MXFP4 (FP32 or E8M0 scales) or NVFP4 (``Nvfp4Scales``), chosen by
+    the weight's and the scale's dtypes. Tuples of stacks (e.g. gate and up) are decoded side by side along the output
+    rows into one stack. CUDA decodes land in the shared decode workspace: use the result for one GEMM and do not
+    keep it.
     """
     stacks = weight if isinstance(weight, tuple) else (weight,)
     scales = scale if isinstance(scale, tuple) else (scale,)

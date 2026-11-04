@@ -25,12 +25,12 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
-from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
 from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_experts
 from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
+from arctic_platform.model.implementations.moe.layers.moe import _unwrap_experts
 
 
 @contextmanager
@@ -67,18 +67,13 @@ class DeepseekV41MoE(MoE):
                 top_k=config.num_experts_per_tok,
                 load_balance_coeff=1e-3,
                 swiglu_limit=config.swiglu_limit,
+                # The checkpoint's packed MXFP4 experts stay frozen codes: Arctic's packed 4-bit grouped path decodes
+                # them per grouped GEMM and takes unfused expert LoRA.
+                routed_packed4="mxfp4" if packs_experts(config) else None,
             ),
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
         )
-        if packs_experts(config):
-            self.experts = Mxfp4GroupedExperts(
-                dim=config.hidden_size,
-                hidden_dim=config.moe_intermediate_size,
-                num_experts=config.n_routed_experts,
-                swiglu_limit=config.swiglu_limit,
-            )
-            self.experts.set_ep_comm_backend(self.ep_comm_backend)
         self.layer_idx = layer_idx
         self.is_hash = False
         if config.vision_n_layers > 0:
@@ -88,7 +83,7 @@ class DeepseekV41MoE(MoE):
 
     def init_weights(self, init_std: float, buffer_device: torch.device) -> None:
         super().init_weights(init_std, buffer_device)
-        if not isinstance(self.experts, Mxfp4GroupedExperts):
+        if getattr(self.experts, "packed4", None) is None:
             nn.init.trunc_normal_(self.experts.w3, mean=0.0, std=0.02)
         if self.bias_vl is not None:
             self.bias_vl.zero_()
@@ -121,15 +116,17 @@ class DeepseekV41MoE(MoE):
             self.tokens_per_expert.add_(num_tokens_per_expert)
         selected, num_tokens_per_expert = self._to_expert_slots(selected, num_tokens_per_expert)
 
-        if uses_dispatch_ep(self.ep_comm_backend) and getattr(self.experts, "_ep_group", None) is not None:
+        # With expert LoRA, self.experts is PEFT's ParamWrapper chain around the experts.
+        experts = _unwrap_experts(self.experts)
+        if uses_dispatch_ep(self.ep_comm_backend) and getattr(experts, "_ep_group", None) is not None:
             routed = self._run_deepep_routed_experts(flat, selected, top_scores)
             return routed.reshape(batch, seq_len, dim)
 
         with _integer_histc_on_cpu():
             top_scores, token_indices, num_tokens_per_expert = self.reorderer(top_scores, selected)
         # Grouped mm is CUDA-only; the for-loop is the same expert math on CPU.
-        grouped = self.experts.use_grouped_mm
-        self.experts.use_grouped_mm = grouped and flat.is_cuda
+        grouped = experts.use_grouped_mm
+        experts.use_grouped_mm = grouped and flat.is_cuda
         try:
             routed = self._run_routed_experts(
                 flat,
@@ -138,7 +135,7 @@ class DeepseekV41MoE(MoE):
                 top_scores,
             )
         finally:
-            self.experts.use_grouped_mm = grouped
+            experts.use_grouped_mm = grouped
         out = self.shared_expert(flat) if self.shared_expert is not None else torch.zeros_like(flat)
         routed_indices = token_indices.reshape(-1, 1).expand(-1, dim)
         out = out.scatter_add(dim=0, index=routed_indices, src=routed)
