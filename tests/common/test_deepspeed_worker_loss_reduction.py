@@ -288,11 +288,11 @@ def test_sp_execution_worker_rechecks_reducer_before_publishing_result(monkeypat
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("fault", ["second-odd", "peer-odd", "unknown-field"])
+@pytest.mark.parametrize("fault", ["invalid-second-target", "peer-invalid", "unknown-field"])
 def test_sp_request_preflight_rejects_every_microbatch_before_model_or_boundary(monkeypatch, fault):
     worker, _, request = _sp_execution_worker(monkeypatch)
-    if fault == "second-odd":
-        request["batch"][1] = {name: tensor[:, :3] for name, tensor in request["batch"][1].items()}
+    if fault == "invalid-second-target":
+        request["batch"][1]["loss_mask"][0, -1] = 1
     elif fault == "unknown-field":
         request["batch"][1]["prompt_group_ids"] = torch.ones(1, 4)
     else:
@@ -305,6 +305,103 @@ def test_sp_request_preflight_rejects_every_microbatch_before_model_or_boundary(
     )
     with pytest.raises(ValueError, match="microbatch 1|another logical-DP shard"):
         worker.forward_backward(request)
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
+
+
+@pytest.mark.parametrize("fault", ["unpack", "device-transfer", "split", "gas-count", "positional", "gas-query"])
+def test_sp_worker_request_preparation_errors_reach_failure_collective(monkeypatch, fault):
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    flags = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda flag, **kwargs: flags.append(flag.item()))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("request preparation failed")
+
+    if fault == "unpack":
+        del request["meta"]
+    elif fault == "device-transfer":
+        monkeypatch.setattr(worker, "_move_batch_to_device", fail)
+    elif fault == "split":
+        request["batch"] = request["batch"][0]
+    elif fault == "gas-count":
+        request["batch"].pop()
+    elif fault == "positional":
+        unpack = deepspeed_worker.unpack_batch
+
+        def positional(batch):
+            _, data, meta, processing = unpack(batch)
+            return {"unexpected": True}, data, meta, processing
+
+        monkeypatch.setattr(deepspeed_worker, "unpack_batch", positional)
+    else:
+        monkeypatch.setattr(worker.engine, "gradient_accumulation_steps", fail)
+
+    with pytest.raises((KeyError, RuntimeError, ValueError)):
+        worker.forward_backward(request)
+
+    assert flags == [1]
+    assert worker.engine.events == []
+    assert worker.engine.parameter.grad is None
+
+
+def test_sp_worker_malformed_request_rejects_healthy_peer_at_entry(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    bad_worker, _, bad_request = _sp_execution_worker(monkeypatch)
+    peer_worker, _, peer_request = _sp_execution_worker(monkeypatch)
+    del bad_request["meta"]
+    flags = []
+    rendezvous = Barrier(2, timeout=2)
+
+    def reduce(flag, **kwargs):
+        flags.append(flag.item())
+        rendezvous.wait()
+        flag.fill_(max(flags))
+
+    def run(worker, request):
+        try:
+            worker.forward_backward(request)
+        except Exception as error:
+            return error
+        pytest.fail("malformed SP request unexpectedly reached execution")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bad = executor.submit(run, bad_worker, bad_request)
+        peer = executor.submit(run, peer_worker, peer_request)
+        errors = [bad.result(timeout=5), peer.result(timeout=5)]
+
+    assert sorted(flags) == [0, 1]
+    assert isinstance(errors[0], RuntimeError) and "SP request" in str(errors[0])
+    assert isinstance(errors[1], ValueError) and "another logical-DP shard" in str(errors[1])
+    assert bad_worker.engine.events == peer_worker.engine.events == []
+    assert bad_worker.engine.parameter.grad is peer_worker.engine.parameter.grad is None
+
+
+def test_sp_worker_second_preflight_compares_resolved_loss_scales(monkeypatch):
+    worker, _, request = _sp_execution_worker(monkeypatch)
+    signatures = []
+    flags = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda flag, **kwargs: flags.append(flag.item()))
+    monkeypatch.setattr(deepspeed_worker, "verify_sequence_parallel_reduction", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        deepspeed_worker, "run_sequence_parallel_grpo", lambda *args, **kwargs: pytest.fail("model ran")
+    )
+
+    def gather(output, value, **kwargs):
+        signatures.append(value.clone())
+        for peer in output:
+            peer.copy_(value)
+        if len(signatures) == 2:
+            output[-1][0] ^= 1
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    with pytest.raises(ValueError, match="identical token rows and loss inputs"):
+        worker.forward_backward(request)
+    assert len(signatures) == 2 and not torch.equal(*signatures)
+    assert flags == [0, 0, 0, 1]
     assert worker.engine.events == []
     assert worker.engine.parameter.grad is None
 

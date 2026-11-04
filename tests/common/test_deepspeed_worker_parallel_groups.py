@@ -205,6 +205,19 @@ def test_worker_sp_alias_conflicts_fail_before_model(runtime, monkeypatch, worke
     assert runtime.calls == []
 
 
+def test_log_prob_sp_rejected_at_initialize_before_model_or_engine(runtime, monkeypatch):
+    monkeypatch.setattr(runtime.mod.deepspeed, "init_distributed", lambda: None)
+    monkeypatch.setattr(runtime.mod, "pr0", lambda *args: None)
+    monkeypatch.setattr(runtime.mod, "build_model", lambda *args, **kwargs: pytest.fail("unexpected model"))
+    monkeypatch.setattr(runtime.mod.deepspeed, "initialize", lambda **kwargs: pytest.fail("unexpected engine"))
+    with pytest.raises(ValueError, match="log_prob jobs are not supported"):
+        runtime.worker.initialize(
+            "localhost",
+            dict(model_name="synthetic", job_type="log_prob", ds_worker_config=dict(sp_size=2)),
+        )
+    assert runtime.calls == []
+
+
 @pytest.fixture
 def routing_worker(runtime, monkeypatch):
     worker = runtime.worker

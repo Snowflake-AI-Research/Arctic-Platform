@@ -72,6 +72,37 @@ def test_token_partition_aligns_cross_slice_target_before_packing():
         torch_assert_equal(source[name], original[name])
 
 
+@pytest.mark.parametrize("rank", [2, 0])
+def test_token_partition_aligns_odd_length_with_ignored_separate_document(rank):
+    source = _batch()
+    source["attention_mask"][1, 4] = 0
+    source["loss_mask"][1, 3] = 0
+    original = deepcopy(source)
+    local, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info(rank=rank))
+    assert part.token_count == 7 and part.width == 4
+    assert packed["input_ids"].shape == (1, 7)
+    torch_assert_equal(cu, torch.tensor([0, 3, 7], dtype=torch.int32))
+    if rank == 0:
+        torch_assert_equal(local["position_ids"], torch.tensor([[1, 2, 3, 0]]))
+        torch_assert_equal(local["labels"], torch.tensor([[6, 7, -100, -100]]))
+        assert local["loss_mask"][0, -1] == 0
+        assert local["routed_experts"][0, -1].count_nonzero() == 0
+    restored = sp.restore_token_rows(packed["input_ids"], mask)
+    torch_assert_equal(restored[mask], source["input_ids"][mask])
+    for name in source:
+        torch_assert_equal(source[name], original[name])
+
+
+def test_token_partition_pads_completely_empty_local_slice():
+    batch = dict(input_ids=torch.tensor([[2]]), attention_mask=torch.ones(1, 1, dtype=torch.long))
+    local, packed, _, cu, part = sp.prepare_token_partition(batch, sp_info=_info(rank=0))
+    assert part.width == 1 and packed["input_ids"].shape == (1, 1)
+    torch_assert_equal(local["input_ids"], torch.tensor([[0]]))
+    torch_assert_equal(local["labels"], torch.tensor([[-100]]))
+    torch_assert_equal(local["position_ids"], torch.tensor([[0]]))
+    torch_assert_equal(cu, torch.tensor([0, 1], dtype=torch.int32))
+
+
 def test_token_partition_accepts_prediction_aligned_primerl_response_masks():
     source = _batch()
     # prime_rl.arctic.context rolls each rollout's response mask left and clears its final position.
@@ -203,7 +234,7 @@ def test_token_partition_names_unsupported_optional_grpo_fields(field):
 
 @pytest.mark.parametrize(
     "fault",
-    ["unknown", "left_padding", "empty_row", "nonbinary", "remainder", "shape", "dtype", "active_end", "active_pad"],
+    ["unknown", "left_padding", "empty_row", "nonbinary", "shape", "dtype", "active_end", "active_pad"],
 )
 def test_token_partition_rejects_unsupported_domains_without_input_mutation(fault):
     source = _batch()
@@ -215,8 +246,6 @@ def test_token_partition_rejects_unsupported_domains_without_input_mutation(faul
         source["attention_mask"][0].zero_()
     elif fault == "nonbinary":
         source["attention_mask"][0, 0] = 2
-    elif fault == "remainder":
-        source["attention_mask"][0, 3] = 1
     elif fault == "shape":
         source["advantages"] = torch.ones(2)
     elif fault == "dtype":
@@ -405,6 +434,15 @@ def test_sp_signature_failure_has_request_context_and_reaches_flag_reduce(monkey
             [_batch()], sp_info=_info(), synchronize=True, device="cpu", sp_group=object()
         )
     assert reductions == [1]
+
+
+def test_sp_tensor_signature_does_not_copy_payload_to_host(monkeypatch):
+    batch = _batch()
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda *args, **kwargs: pytest.fail("host payload copy"))
+    signature = sp._request_signature([batch], {}, {}, [1.0], "cpu")
+    batch["routed_experts"][0, 0, 0, 0] += 1
+    assert signature.shape == (56,)
+    assert not torch.equal(signature, sp._request_signature([batch], {}, {}, [1.0], "cpu"))
 
 
 def test_token_partition_rejects_missing_document_boundary_at_later_row():
@@ -642,9 +680,10 @@ class TestNativeSequenceParallelReduction(TestCasePlus):
     def test_grpo_loss_gradients_and_norm_match_unpartitioned_reference(self):
         if torch.cuda.device_count() < 4:
             self.skipTest("native SP2/DP2 and SP4/DP1 parity requires four CUDA devices")
-        for size in (2, 4):
+        for size, odd in ((2, False), (4, False), (2, True), (4, True)):
             env = self.get_env()
             env["NATIVE_SP_SIZE"] = str(size)
+            env["NATIVE_SP_ODD"] = str(int(odd))
             execute_subprocess_async(
                 [
                     sys.executable,
@@ -714,6 +753,13 @@ def _native_sequence_parallel_parity():
         advantages=torch.tensor([[0.5] * 4, [1.0] * 4, [1.5] * 4, [2.0] * 4], device="cuda"),
         old_log_probs_shifted=torch.full((4, 4), -2.0, device="cuda"),
     )
+    odd = os.environ.get("NATIVE_SP_ODD") == "1"
+    if odd:
+        full["attention_mask"][0, 3] = 0
+        full["attention_mask"][2, 2:] = 0
+        full["loss_mask"][0, 2:] = 0
+        full["loss_mask"][2, 1:] = 0
+    active_tokens = int(full["loss_mask"].sum().item())
     singleton = dict(rank=0, world_size=1, sp_size=1, sp_rank=0, sp_ranks=[0])
     _, packed, _, cu, _ = sp.prepare_token_partition(full, sp_info=singleton)
     processing = dict(post=["compute_logprobs"], loss_fn="grpo", config=dict(loss_agg_mode="token-mean"))
@@ -721,7 +767,7 @@ def _native_sequence_parallel_parity():
         reference,
         (),
         packed,
-        dict(cu_seqlens=cu, dp_size=1, batch_num_tokens=12),
+        dict(cu_seqlens=cu, dp_size=1, batch_num_tokens=active_tokens),
         processing,
         "cuda",
         pack=False,
@@ -734,7 +780,7 @@ def _native_sequence_parallel_parity():
     candidate = sp.run_sequence_parallel_grpo(
         engine,
         batch,
-        dict(dp_size=dp_size, batch_num_tokens=12),
+        dict(dp_size=dp_size, batch_num_tokens=active_tokens),
         processing,
         "cuda",
         sp_info=info,
@@ -754,7 +800,10 @@ def _native_sequence_parallel_parity():
         torch.as_tensor(engine.optimizer._global_grad_norm, device="cuda"), expected_norm, rtol=0, atol=1e-6
     )
     if rank == 0:
-        print(f"NATIVE_SP_PARITY_PASS sp={size} dp={dp_size} loss={averaged_loss.item()} norm={expected_norm.item()}")
+        print(
+            f"NATIVE_SP_PARITY_PASS sp={size} dp={dp_size} odd={odd} "
+            f"loss={averaged_loss.item()} norm={expected_norm.item()}"
+        )
     sp.dist.destroy_process_group()
 
 

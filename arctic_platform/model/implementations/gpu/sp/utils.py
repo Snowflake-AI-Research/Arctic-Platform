@@ -69,7 +69,7 @@ class TokenPartition:
 
     @property
     def width(self) -> int:
-        return self.token_count // len(self.ranks)
+        return (self.token_count + len(self.ranks) - 1) // len(self.ranks)
 
     @property
     def start(self) -> int:
@@ -78,6 +78,18 @@ class TokenPartition:
     @property
     def stop(self) -> int:
         return self.start + self.width
+
+
+def _local_token_slice(name: str, value: torch.Tensor, partition: TokenPartition) -> torch.Tensor:
+    local = value[:, partition.start : partition.stop]
+    padding = partition.width - local.shape[1]
+    if padding:
+        tail = value.new_full((1, padding, *value.shape[2:]), -100 if name == "labels" else 0)
+        if name == "position_ids":
+            start = max(0, partition.start - partition.token_count)
+            tail[0] = torch.arange(start, start + padding, device=value.device)
+        local = torch.cat((local, tail), dim=1)
+    return local.contiguous()
 
 
 def _membership(info: dict) -> tuple[int, int, tuple[int, ...], int]:
@@ -112,8 +124,9 @@ def prepare_token_partition(
     removed without changing any valid token or supplied position. Next-token
     labels are constructed per full row *before* packing/slicing; an explicit
     ``labels`` tensor is already prediction aligned and is preserved. Active
-    loss positions must have valid next-token targets. No SP alignment padding
-    or token dropping is invented: nondivisible packed lengths fail pre-model.
+    loss positions must have valid next-token targets. Equal local slices add
+    at most SP-1 ignored tokens in a separate document. Full packed loss tensors
+    and boundaries exclude that alignment tail, preserving every denominator.
     """
     rank, world, ranks, local = _membership(sp_info)
     if not isinstance(batch, dict):
@@ -141,8 +154,6 @@ def prepare_token_partition(
     if bool((mask[:, 1:] & ~mask[:, :-1]).any().item()) or not bool(mask.any(dim=1).all().item()):
         raise ValueError("SP requires nonempty right-padded rows")
     token_count = int(mask.sum().item())
-    if token_count % len(ranks):
-        raise ValueError("packed token count must divide evenly across SP ranks; no padding recipe admitted")
     tensors = dict(batch)
     tensors.pop("attention_mask")
     if "position_ids" not in tensors:
@@ -183,7 +194,7 @@ def prepare_token_partition(
         raise ValueError("SP packed positions must begin at a document boundary")
     cu = torch.cat([starts, starts.new_tensor([token_count])]).to(torch.int32)
     partition = TokenPartition(rank, world, ranks, local, token_count, tuple(ids.shape))
-    local_batch = {name: value[:, partition.start : partition.stop].contiguous() for name, value in packed.items()}
+    local_batch = {name: _local_token_slice(name, value, partition) for name, value in packed.items()}
     return local_batch, packed, mask, cu, partition
 
 
@@ -229,7 +240,7 @@ class _TokenLocalEngine:
             if name in TOKEN_FIELDS:
                 if not torch.is_tensor(value) or value.shape[:2] != (1, part.token_count):
                     raise ValueError(f"model token field {name!r} is not full packed SP input")
-                local_kwargs[name] = value[:, part.start : part.stop].contiguous()
+                local_kwargs[name] = _local_token_slice(name, value, part)
             elif name in {"use_cache", "temperature", "calculate_entropy"}:
                 if torch.is_tensor(value) and value.numel() != 1:
                     raise ValueError(f"SP model scalar {name!r} cannot contain token data")
@@ -250,7 +261,7 @@ class _TokenLocalEngine:
         gathered = dist_nn.all_gather(local_logprobs.contiguous(), group=self.group)
         if len(gathered) != len(part.ranks) or any(value.shape != local_logprobs.shape for value in gathered):
             raise ValueError("SP gather did not return one equal token slice per member")
-        return {"logprobs": torch.cat(gathered, dim=1)}
+        return {"logprobs": torch.cat(gathered, dim=1)[:, : part.token_count]}
 
     def backward(self, loss, *, scale_wrt_gas):
         _check_group(self.partition, self.group)
@@ -311,6 +322,32 @@ def validate_sequence_parallel_grpo(meta: dict, processing: dict, *, backward: b
         raise ValueError("SP adapter supports only the selected compute_logprobs/token-mean grpo route")
 
 
+def _request_signature(microbatches, meta, processing, loss_scales, device):
+    """Compare accidental input drift with bounded device-side byte moments, not a host tensor copy."""
+    checksum = hashlib.sha256()
+    checksum.update(
+        json.dumps(
+            dict(meta=meta, processing=processing, loss_scales=loss_scales), sort_keys=True, allow_nan=False
+        ).encode()
+    )
+    moments = torch.zeros(3, dtype=torch.int64, device=device)
+    offset = 0
+    for index, microbatch in enumerate(microbatches):
+        for name in sorted(TOKEN_FIELDS & microbatch.keys() | {"attention_mask"}):
+            tensor = microbatch[name].detach().contiguous()
+            checksum.update(f"{index}:{name}:{tensor.dtype}:{tuple(tensor.shape)}:".encode())
+            payload = tensor.reshape(-1).view(torch.uint8)
+            for start in range(0, payload.numel(), 1 << 20):
+                values = payload[start : start + (1 << 20)].to(dtype=torch.int64)
+                positions = torch.arange(
+                    offset + 1, offset + 1 + values.numel(), dtype=torch.int64, device=tensor.device
+                )
+                moments += torch.stack((values.sum(), (values * positions).sum(), (values * positions.square()).sum()))
+                offset += values.numel()
+    metadata = torch.tensor(list(checksum.digest()), dtype=torch.uint8, device=device)
+    return torch.cat((metadata, moments.view(torch.uint8)))
+
+
 def validate_sequence_parallel_microbatches(
     microbatches: list[dict],
     *,
@@ -334,6 +371,8 @@ def validate_sequence_parallel_microbatches(
         _, world, ranks, _ = _membership(membership)
         if ep_group is not None:
             raise ValueError("SP GRPO currently requires ep_size=1; EP>1 gradient parity is not established")
+        if request_check is not None:
+            request_check()
         if meta is not None and processing is not None:
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
             logical_dp = world // len(ranks)
@@ -342,8 +381,6 @@ def validate_sequence_parallel_microbatches(
                 configured_dp is not None and configured_dp != logical_dp
             ):
                 raise ValueError("SP meta dp_size does not match actual logical-DP membership")
-        if request_check is not None:
-            request_check()
         loss_scales = loss_scales() if callable(loss_scales) else loss_scales
         if loss_scales is not None and len(loss_scales) != len(microbatches):
             raise ValueError("SP packed loss scale count must match the microbatch count")
@@ -356,20 +393,7 @@ def validate_sequence_parallel_microbatches(
             prepare_token_partition(microbatch, sp_info=membership)
         index = None
         if sp_group is not None:
-            checksum = hashlib.sha256()
-            checksum.update(
-                json.dumps(
-                    dict(meta=meta, processing=processing, loss_scales=loss_scales),
-                    sort_keys=True,
-                    allow_nan=False,
-                ).encode()
-            )
-            for microbatch in microbatches:
-                for name in sorted(TOKEN_FIELDS & microbatch.keys() | {"attention_mask"}):
-                    tensor = microbatch[name].detach().contiguous().cpu()
-                    checksum.update(f"{name}:{tensor.dtype}:{tuple(tensor.shape)}:".encode())
-                    checksum.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
-            signature = torch.tensor(list(checksum.digest()), dtype=torch.uint8, device=device)
+            signature = _request_signature(microbatches, meta, processing, loss_scales, device)
     except Exception as error:
         context = "request" if index is None else f"microbatch {index}"
         failure_type = ValueError if isinstance(error, ValueError) else RuntimeError
@@ -463,8 +487,8 @@ def run_sequence_parallel_grpo(
     contributions and averages logical DP replicas. This source adapter is not
     installed-runtime, native-capacity, router-application or numerical proof.
 
-    This initial route requires packed token counts divisible by the SP degree; callers must select suitable
-    batches. It does not add padding or drop tokens. Preflight failures are collective, but errors inside native
+    Equal model slices include an ignored alignment tail; loss inputs and returned rows exclude it.
+    Preflight failures are collective, but errors inside native
     model/backward collectives (including CUDA OOM) require the launcher to abort the whole process group. Peers
     can otherwise wait until their process-group timeout, and earlier microbatch gradients must not be reused.
     """
