@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from arctic_platform.common.near_certain_logprobs import mark_model as mark_near_certain_logprobs
 from arctic_platform.model.implementations.gpu.action_masks import action_masks_to_lm_head
 from arctic_platform.model.implementations.gpu.action_masks import apply_lm_head_action_masks_
 from arctic_platform.model.implementations.gpu.action_masks import filter_lm_head_action_masks
@@ -58,10 +59,18 @@ def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
 
 
 class FusedOutputLinear(torch.nn.Linear):
-    def __init__(self, in_features: int, out_features: int, chunk_size: int, fp32_lm_head: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        chunk_size: int,
+        fp32_lm_head: bool = False,
+        near_certain_logprobs: bool = True,
+    ):
         super().__init__(in_features, out_features, bias=False)
         self.chunk_size = chunk_size
         self.fp32_lm_head = fp32_lm_head
+        self.near_certain_logprobs = near_certain_logprobs
 
     def forward(
         self,
@@ -106,6 +115,7 @@ class FusedOutputLinear(torch.nn.Linear):
             self.fp32_lm_head,
             lm_head_action_masks,
             group_token_ids,
+            self.near_certain_logprobs,
         )
 
         logprobs = logprobs.reshape(b, s)
@@ -230,8 +240,8 @@ def _online_logsumexp_and_weighted_update(
     s: torch.Tensor,
     t: torch.Tensor,
     chunk_logits: torch.Tensor,
-    target_rows: torch.Tensor,
-    target_columns: torch.Tensor,
+    target_rows: torch.Tensor | None = None,
+    target_columns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     chunk_m = torch.amax(chunk_logits, dim=-1)
     m_new = torch.maximum(m, chunk_m)
@@ -239,8 +249,10 @@ def _online_logsumexp_and_weighted_update(
     finite_chunk = torch.isfinite(chunk_logits)
     shifted = torch.where(finite_chunk, chunk_logits - m_new.unsqueeze(-1), torch.zeros_like(chunk_logits))
     chunk_exp = torch.where(finite_chunk, torch.exp(shifted), torch.zeros_like(chunk_logits))
-    # Each row's target is left out of both sums: a near-certain target's exp(0) = 1 would absorb the rest in fp32.
-    chunk_exp[target_rows, target_columns] = 0.0
+    if target_rows is not None:
+        # Each row's target is left out of both sums: a near-certain target's exp(0) = 1 would absorb the rest in
+        # fp32.
+        chunk_exp[target_rows, target_columns] = 0.0
     weighted_logits = torch.where(finite_chunk, chunk_logits, torch.zeros_like(chunk_logits))
     s_new = s * exp_old + chunk_exp.sum(dim=-1)
     t_new = t * exp_old + (chunk_exp * weighted_logits).sum(dim=-1)
@@ -259,9 +271,13 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         fp32_lm_head: bool,
         action_masks=None,
         group_token_ids: torch.Tensor | None = None,
+        near_certain_logprobs: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """
         Returns per-token logprobs and entropy by chunking over flattened sequence tokens.
+
+        ``near_certain_logprobs`` (``numerics.near_certain_logprobs``) leaves each row's target out of the softmax
+        sum, so a near-certain target's logprob and gradient do not round to exactly 0 in fp32.
         """
         assert hidden.dim() == 2, f"expected hidden [N,H], got {tuple(hidden.shape)}"
         assert weight.dim() == 2, f"expected weight [V,H], got {tuple(weight.shape)}"
@@ -282,7 +298,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         logprobs = torch.empty((n,), device=device, dtype=torch.float32)
         entropy = torch.empty((n,), device=device, dtype=torch.float32)
         logz = torch.empty((n,), device=device, dtype=torch.float32)
-        others_minus_target = torch.empty((n,), device=device, dtype=torch.float32)
+        others_minus_target = torch.empty((n if near_certain_logprobs else 0,), device=device, dtype=torch.float32)
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -316,31 +332,43 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
                 idx = (labels_chunk[rows] - vocab_start).to(torch.long)
                 target_logits[rows] = scaled_logits[rows, idx]
-                m, s, t = _online_logsumexp_and_weighted_update(m, s, t, scaled_logits, rows, idx)
+                if near_certain_logprobs:
+                    m, s, t = _online_logsumexp_and_weighted_update(m, s, t, scaled_logits, rows, idx)
+                else:
+                    m, s, t = _online_logsumexp_and_weighted_update(m, s, t, scaled_logits)
                 if grouped is not None:
                     grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
-            # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]), with the difference formed as
-            # (m - x[t]) + log(s) so it is not rounded at the max logit's scale; the entropy adds the target back.
-            log_s = torch.log(s)
-            others_minus_target_chunk = (m - target_logits) + log_s
-            logz_chunk = torch.logaddexp(m + log_s, target_logits)
             validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
-            target_exp = torch.exp(target_logits - m)
+            if near_certain_logprobs:
+                # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]), with the difference formed as
+                # (m - x[t]) + log(s) so it is not rounded at the max logit's scale; the entropy adds the target
+                # back.
+                log_s = torch.log(s)
+                others_minus_target_chunk = (m - target_logits) + log_s
+                logz_chunk = torch.logaddexp(m + log_s, target_logits)
+                target_exp = torch.exp(target_logits - m)
+                others_minus_target[start:end] = others_minus_target_chunk
+                logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
+                entropy[start:end] = logz_chunk - (t + target_exp * target_logits) / (s + target_exp)
+            else:
+                logz_chunk = m + torch.log(s)
+                logprobs[start:end] = target_logits - logz_chunk
+                entropy[start:end] = logz_chunk - (t / s)
             logz[start:end] = logz_chunk
-            others_minus_target[start:end] = others_minus_target_chunk
-            logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
-            entropy[start:end] = logz_chunk - (t + target_exp * target_logits) / (s + target_exp)
 
         ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_minus_target)
         ctx.action_masks = action_masks
         ctx.chunk_size = chunk_size
         ctx.fp32_lm_head = fp32_lm_head
+        ctx.near_certain_logprobs = near_certain_logprobs
         ctx.grouped = grouped
 
         if grouped is None:
             return logprobs, entropy
-        return logprobs, entropy, grouped.normalized_log_probs(chunk_size)
+        if near_certain_logprobs:
+            return logprobs, entropy, grouped.normalized_log_probs(chunk_size)
+        return logprobs, entropy, grouped.plain_log_probs(logz)
 
     @staticmethod
     def backward(
@@ -357,6 +385,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         action_masks = ctx.action_masks
         chunk_size: int = ctx.chunk_size
         fp32_lm_head: bool = ctx.fp32_lm_head
+        near_certain_logprobs: bool = ctx.near_certain_logprobs
         grouped = ctx.grouped
 
         n, _ = hidden.shape
@@ -405,15 +434,21 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                     )
                     grad_logits.sub_(logz_chunk.unsqueeze(-1)).exp_()
                     # Label term without a host sync: each row's target entry is rewritten, and rows whose label is
-                    # outside this tile write back the entry they have. At the target, 1 - softmax =
-                    # sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero where 1 - exp(z[t] - logz) rounds to 0.
+                    # outside this tile write back the entry they have.
                     local = labels_chunk - vocab_start
                     in_tile = (local >= 0) & (local < vocab_end - vocab_start)
                     idx = local.clamp(0, vocab_end - vocab_start - 1).to(torch.long).unsqueeze(-1)
                     target_probs = grad_logits.gather(1, idx).squeeze(-1)
                     grad_logits.mul_((-normalizer_gradients).unsqueeze(-1))
-                    target_complement = torch.sigmoid(others_minus_target[start:end])
-                    target_grad = grad_chunk * target_complement - (normalizer_gradients - grad_chunk) * target_probs
+                    if near_certain_logprobs:
+                        # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
+                        # where 1 - exp(z[t] - logz) rounds to 0.
+                        target_complement = torch.sigmoid(others_minus_target[start:end])
+                        target_grad = (
+                            grad_chunk * target_complement - (normalizer_gradients - grad_chunk) * target_probs
+                        )
+                    else:
+                        target_grad = grad_chunk - normalizer_gradients * target_probs
                     grad_logits.scatter_(
                         1, idx, torch.where(in_tile, target_grad, grad_logits.gather(1, idx).squeeze(-1)).unsqueeze(-1)
                     )
@@ -432,13 +467,16 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                     grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
                     rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
                     idx = (labels_chunk[rows] - vocab_start).to(torch.long)
-                    # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
-                    # where 1 - exp(z[t] - logz) rounds to 0.
-                    target_complement = torch.sigmoid(others_minus_target[start:end][rows])
-                    grad_logits[rows, idx] = (
-                        grad_chunk[rows] * target_complement
-                        - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
-                    )
+                    if near_certain_logprobs:
+                        # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
+                        # where 1 - exp(z[t] - logz) rounds to 0.
+                        target_complement = torch.sigmoid(others_minus_target[start:end][rows])
+                        grad_logits[rows, idx] = (
+                            grad_chunk[rows] * target_complement
+                            - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
+                        )
+                    else:
+                        grad_logits[rows, idx] += grad_chunk[rows]
                     grouped.add_group_gradients_to_tile(
                         grad_logits,
                         scaled_logits,
@@ -465,6 +503,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -473,6 +512,7 @@ def inject_prime_lm_head(
     chunk_size: int | None = None,
     fused_cross_entropy: bool | str = False,
     fp32_lm_head: bool = False,
+    near_certain_logprobs: bool = True,
 ) -> None:
     """
     Inject a PrimeRL LM head into a model.
@@ -488,6 +528,8 @@ def inject_prime_lm_head(
             - False: no fusion
             - True or "liger": Liger kernel fusion
             - "quack": quack-kernels fusion (chunked linear + CE with CuTe DSL kernels)
+        near_certain_logprobs: ``numerics.near_certain_logprobs``. Keeps a near-certain target's logprob and
+            gradient in the chunked head, and marks the model so the RL post-processors do the same.
     """
     # Guards so we have nicer error messages when a non-standard model is used
     assert hasattr(model, "model"), f"model doesnt have backbone in model.model:\n{model}"
@@ -542,6 +584,7 @@ def inject_prime_lm_head(
             out_features=old_lm_head.out_features,
             chunk_size=chunk_size,
             fp32_lm_head=fp32_lm_head,
+            near_certain_logprobs=near_certain_logprobs,
         )
     else:
         logger.info("Injecting vanilla LM head" + (" with float32 matmul" if fp32_lm_head else ""))
@@ -552,6 +595,7 @@ def inject_prime_lm_head(
         )
     model.lm_head.weight = old_lm_head.weight
     del old_lm_head
+    mark_near_certain_logprobs(model, near_certain_logprobs)
 
     _patch_model_forward(model)
 

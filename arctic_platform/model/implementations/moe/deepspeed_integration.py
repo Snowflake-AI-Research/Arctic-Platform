@@ -298,6 +298,7 @@ def setup_model_local_no_train(
         chunk_size=chunk_size,
         fused_cross_entropy=fused_cross_entropy,
         fp32_lm_head=config.fp32_lm_head,
+        near_certain_logprobs=config.near_certain_logprobs,
     )
     if parallel_dims.ep_enabled:
         apply_ep_with_mesh(model, config, ep_mesh)

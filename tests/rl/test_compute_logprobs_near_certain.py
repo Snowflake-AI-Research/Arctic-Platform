@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The unchunked compute_logprobs path keeps a near-certain label's log-probability and gradient."""
+"""With ``numerics.near_certain_logprobs`` on (the default), the unchunked compute_logprobs path keeps a near-certain
+label's log-probability and gradient."""
 
 import pytest
 import torch
 
+from arctic_platform.common.near_certain_logprobs import META_KEY
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
@@ -25,16 +27,22 @@ from arctic_platform.testing_utils import torch_assert_close
 VOCAB_SIZE = 64
 
 
-def _logprobs(logits, labels):
+def _logprobs(logits, labels, near_certain_logprobs=True):
     logits = logits.clone().requires_grad_(True)
-    out = compute_logprobs_post({"logits": logits}, {}, {"labels": labels}, "cpu")["logprobs"]
+    meta = {"labels": labels, META_KEY: near_certain_logprobs}
+    out = compute_logprobs_post({"logits": logits}, {}, meta, "cpu")["logprobs"]
     out.sum().backward()
     return out.detach(), logits.grad
 
 
-@pytest.mark.parametrize("margin", [4.0, 10.0, 14.0, 17.0, 20.0, 25.0, 40.0])
-def test_near_certain_label_matches_float64_reference(margin):
-    """Value and gradient match float64 at every margin, for a near-certain label and for one beside it."""
+def test_default_keeps_a_near_certain_label():
+    """Without the meta key, a label 20 nats ahead keeps its tiny negative log-probability."""
+    logits, labels = _near_certain_logits(20.0)
+    actual = compute_logprobs_post({"logits": logits}, {}, {"labels": labels}, "cpu")["logprobs"]
+    assert actual[0, 0] < 0
+
+
+def _near_certain_logits(margin):
     set_seed(0)
     logits = torch.randn(1, 2, VOCAB_SIZE)
     logits[..., 5] = 0.0
@@ -42,7 +50,13 @@ def test_near_certain_label_matches_float64_reference(margin):
     others[..., 5] = float("-inf")
     logits += 30.0 - margin - others.logsumexp(-1, keepdim=True)
     logits[..., 5] = 30.0
-    labels = torch.tensor([[5, int(others[0, 1].argmax())]])
+    return logits, torch.tensor([[5, int(others[0, 1].argmax())]])
+
+
+@pytest.mark.parametrize("margin", [4.0, 10.0, 14.0, 17.0, 20.0, 25.0, 40.0])
+def test_near_certain_label_matches_float64_reference(margin):
+    """Value and gradient match float64 at every margin, for a near-certain label and for one beside it."""
+    logits, labels = _near_certain_logits(margin)
 
     actual, grad = _logprobs(logits, labels)
 
@@ -56,14 +70,34 @@ def test_near_certain_label_matches_float64_reference(margin):
     torch_assert_close(grad.double(), reference.grad, rtol=1e-5, atol=1e-30)
 
 
-def test_label_alone_against_minus_infinity_or_overflow_keeps_a_finite_gradient():
+@pytest.mark.parametrize("margin", [4.0, 20.0])
+def test_off_is_float32_log_softmax(margin):
+    """Off: value and gradient are float32 ``log_softmax``'s, which rounds a label 20 nats ahead to 0."""
+    logits, labels = _near_certain_logits(margin)
+    logits = logits.clone().requires_grad_(True)
+    actual = compute_logprobs_post({"logits": logits}, {}, {"labels": labels, META_KEY: False}, "cpu")["logprobs"]
+    actual.sum().backward()
+
+    reference = logits.detach().clone().requires_grad_(True)
+    expected = torch.log_softmax(reference, -1).gather(-1, labels[..., None]).squeeze(-1)
+    expected.sum().backward()
+
+    torch_assert_close(actual.detach(), expected.detach(), rtol=0.0, atol=0.0)
+    torch_assert_close(logits.grad, reference.grad, rtol=0.0, atol=0.0)
+    if margin == 20.0:
+        assert actual[0, 0] == 0
+        assert logits.grad[0, 0, 5] == 0
+
+
+@pytest.mark.parametrize("near_certain_logprobs", [False, True])
+def test_label_alone_against_minus_infinity_or_overflow_keeps_a_finite_gradient(near_certain_logprobs):
     """Every other logit -inf, or pushed to -inf by the max shift: log-probability 0 and an all-zero, finite gradient."""
     logits = torch.full((1, 2, VOCAB_SIZE), float("-inf"))
     logits[0, 0, 3] = 2.0
     logits[0, 1] = -3e38
     logits[0, 1, 3] = 3e38
 
-    actual, grad = _logprobs(logits, torch.tensor([[3, 3]]))
+    actual, grad = _logprobs(logits, torch.tensor([[3, 3]]), near_certain_logprobs)
 
     torch_assert_close(actual, torch.zeros(1, 2))
     torch_assert_close(grad, torch.zeros_like(grad))

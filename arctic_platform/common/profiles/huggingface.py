@@ -15,8 +15,8 @@
 
 """Profile of the default ``huggingface`` loader.
 
-Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity`` and
-``loader_options.fp32_residual``.
+Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity``,
+``loader_options.fp32_residual`` and ``loader_options.near_certain_logprobs``.
 
 The loader reads ``ModelSpec.dtype`` too, but ``numerics.optimization_dtype`` is unsupported here: on this route
 the job sets that dtype, and the key would have no effect.
@@ -53,6 +53,7 @@ def register(registry: Registry) -> None:
             "lm_head.vocab_chunk_size",
             "numerics.fp32_parity",
             "numerics.fp32_residual",
+            "numerics.near_certain_logprobs",
             "liger",
             "attention.backend",
             "compile.fullgraph",

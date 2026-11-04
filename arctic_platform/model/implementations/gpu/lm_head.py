@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
+from arctic_platform.common.near_certain_logprobs import model_enabled as near_certain_logprobs_enabled
 from arctic_platform.model.implementations.gpu.action_masks import action_masks_to_lm_head
 from arctic_platform.model.implementations.gpu.action_masks import apply_lm_head_action_masks_
 from arctic_platform.model.implementations.gpu.action_masks import filter_lm_head_action_masks
@@ -158,11 +159,11 @@ def _get_sequence_chunked_logprob_fn():
 
     from arctic_platform.model.implementations.gpu.grouped_lm_head import GroupedLogProbAccumulator
 
-    def online_logsumexp_update(m, s, chunk_logits, target_rows, target_columns):
-        """Streaming logsumexp over every logit but each row's target: combine
-        the running ``(max, sum_exp)`` state ``(m, s)`` with a new ``[N, k]``
-        chunk's logits, returning the updated state. Standard max-shift trick
-        keeps every exp() in [0, 1].
+    def online_logsumexp_update(m, s, chunk_logits, target_rows=None, target_columns=None):
+        """Streaming logsumexp: combine the running ``(max, sum_exp)`` state
+        ``(m, s)`` with a new ``[N, k]`` chunk's logits, returning the updated
+        state. Standard max-shift trick keeps every exp() in [0, 1]. With
+        ``target_rows``/``target_columns``, each row's target is left out.
         """
         chunk_m = torch.amax(chunk_logits, dim=-1)
         m_new = torch.maximum(m, chunk_m)
@@ -170,8 +171,9 @@ def _get_sequence_chunked_logprob_fn():
         finite_chunk = torch.isfinite(chunk_logits)
         shifted = torch.where(finite_chunk, chunk_logits - m_new.unsqueeze(-1), torch.zeros_like(chunk_logits))
         chunk_exp = torch.where(finite_chunk, torch.exp(shifted), torch.zeros_like(chunk_logits))
-        # A near-certain target's exp(0) = 1 would absorb the rest of the sum in fp32.
-        chunk_exp[target_rows, target_columns] = 0.0
+        if target_rows is not None:
+            # A near-certain target's exp(0) = 1 would absorb the rest of the sum in fp32.
+            chunk_exp[target_rows, target_columns] = 0.0
         return m_new, s * exp_old + chunk_exp.sum(dim=-1)
 
     def softcap_logits(logits, softcap):
@@ -190,6 +192,10 @@ def _get_sequence_chunked_logprob_fn():
         backward then re-materializes logits tile by tile (memory-vs-time
         tradeoff) and assembles
         ``d/d(logits) = grad_logprob * (onehot(target) - softmax(logits))``.
+
+        ``near_certain_logprobs`` (``numerics.near_certain_logprobs``) leaves
+        each row's target out of the softmax sum, so a near-certain target's
+        logprob and gradient do not round to exactly 0 in fp32.
         """
 
         @staticmethod
@@ -206,6 +212,7 @@ def _get_sequence_chunked_logprob_fn():
             action_masks=None,
             group_token_ids=None,
             softcap=None,
+            near_certain_logprobs: bool = True,
         ):
             if hidden.dim() != 2 or weight.dim() != 2:
                 raise ValueError(
@@ -240,7 +247,9 @@ def _get_sequence_chunked_logprob_fn():
 
             logprobs = torch.empty(n_tokens, device=device, dtype=torch.float32)
             logz = torch.empty(n_tokens, device=device, dtype=torch.float32)
-            others_minus_target = torch.empty(n_tokens, device=device, dtype=torch.float32)
+            others_minus_target = torch.empty(
+                n_tokens if near_certain_logprobs else 0, device=device, dtype=torch.float32
+            )
 
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
@@ -279,21 +288,30 @@ def _get_sequence_chunked_logprob_fn():
                     rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
                     idx = (labels_chunk[rows] - vocab_start).to(torch.long)
                     target_logits[rows] = scaled_logits[rows, idx]
-                    m, s = online_logsumexp_update(m, s, scaled_logits, rows, idx)
+                    if near_certain_logprobs:
+                        m, s = online_logsumexp_update(m, s, scaled_logits, rows, idx)
+                    else:
+                        m, s = online_logsumexp_update(m, s, scaled_logits)
                     if grouped is not None:
                         grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
-                # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]). The difference is formed as
-                # (m - x[t]) + log(s): m - x[t] is exactly 0 when the target is the max, whereas m + log(s) would
-                # round at the max logit's scale first. Cache it with logz so backward can rebuild softmax
-                # without re-streaming logits.
-                log_s = torch.log(s)
-                others_minus_target_chunk = (m - target_logits) + log_s
-                logz_chunk = torch.logaddexp(m + log_s, target_logits)
                 validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
+                if near_certain_logprobs:
+                    # log_softmax(x)[t] = -softplus(logsumexp_{j != t}(x) - x[t]). The difference is formed as
+                    # (m - x[t]) + log(s): m - x[t] is exactly 0 when the target is the max, whereas m + log(s)
+                    # would round at the max logit's scale first. Cache it with logz so backward can rebuild
+                    # softmax without re-streaming logits.
+                    log_s = torch.log(s)
+                    others_minus_target_chunk = (m - target_logits) + log_s
+                    logz_chunk = torch.logaddexp(m + log_s, target_logits)
+                    others_minus_target[start:end] = others_minus_target_chunk
+                    logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
+                else:
+                    # log_softmax(x)[t] = x[t] - logsumexp(x). Cache logz so backward can rebuild softmax
+                    # without re-streaming logits.
+                    logz_chunk = m + torch.log(s)
+                    logprobs[start:end] = target_logits - logz_chunk
                 logz[start:end] = logz_chunk
-                others_minus_target[start:end] = others_minus_target_chunk
-                logprobs[start:end] = -torch.nn.functional.softplus(others_minus_target_chunk)
 
             # save_for_backward only takes tensors, so signal bias presence via
             # an attribute and append bias to the saved tuple when present.
@@ -307,10 +325,13 @@ def _get_sequence_chunked_logprob_fn():
             ctx.vocab_chunk_size = vocab_chunk_size
             ctx.fp32_lm_head = fp32_lm_head
             ctx.softcap = softcap
+            ctx.near_certain_logprobs = near_certain_logprobs
             ctx.grouped = grouped
             if grouped is None:
                 return logprobs
-            return logprobs, grouped.normalized_log_probs(token_chunk_size)
+            if near_certain_logprobs:
+                return logprobs, grouped.normalized_log_probs(token_chunk_size)
+            return logprobs, grouped.plain_log_probs(logz)
 
         @staticmethod
         def backward(ctx, grad_logprobs, grad_group_log_probs=None):
@@ -321,6 +342,7 @@ def _get_sequence_chunked_logprob_fn():
             vocab_chunk_size: int = ctx.vocab_chunk_size
             fp32_lm_head: bool = ctx.fp32_lm_head
             softcap = ctx.softcap
+            near_certain_logprobs: bool = ctx.near_certain_logprobs
             action_masks = ctx.action_masks
             grouped = ctx.grouped
 
@@ -376,13 +398,16 @@ def _get_sequence_chunked_logprob_fn():
                     grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
                     rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
                     idx = (labels_chunk[rows] - vocab_start).to(torch.long)
-                    # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
-                    # where 1 - exp(z[t] - logz) rounds to 0.
-                    target_complement = torch.sigmoid(others_minus_target[start:end][rows])
-                    grad_logits[rows, idx] = (
-                        grad_chunk[rows] * target_complement
-                        - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
-                    )
+                    if near_certain_logprobs:
+                        # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
+                        # where 1 - exp(z[t] - logz) rounds to 0.
+                        target_complement = torch.sigmoid(others_minus_target[start:end][rows])
+                        grad_logits[rows, idx] = (
+                            grad_chunk[rows] * target_complement
+                            - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
+                        )
+                    else:
+                        grad_logits[rows, idx] += grad_chunk[rows]
                     if grouped is not None:
                         grouped.add_group_gradients_to_tile(
                             grad_logits,
@@ -407,6 +432,7 @@ def _get_sequence_chunked_logprob_fn():
                 None,
                 None,
                 grad_bias.to(bias.dtype) if grad_bias is not None else None,
+                None,
                 None,
                 None,
                 None,
@@ -502,6 +528,7 @@ def chunked_lm_head_logprobs(
     action_masks=None,
     group_token_ids=None,
     softcap: float | None = None,
+    near_certain_logprobs: bool = True,
 ):
     """Per-token and optional grouped log probabilities via tiled matmuls.
 
@@ -509,6 +536,8 @@ def chunked_lm_head_logprobs(
     a 1-D token axis. When ``group_token_ids`` is present, returns
     ``(logprobs [B,S], group_log_probs [B,S,M+1])``. ``softcap`` applies
     Gemma's ``final_logit_softcapping`` to the logits before temperature.
+    ``near_certain_logprobs`` keeps a near-certain target's logprob and
+    gradient (``numerics.near_certain_logprobs``).
     """
     import torch
 
@@ -557,6 +586,7 @@ def chunked_lm_head_logprobs(
         lm_head_action_masks,
         group_token_ids,
         float(softcap) if softcap else None,
+        bool(near_certain_logprobs),
     )
     if group_token_ids is None:
         return outputs.reshape(batch_size, seq_len)
@@ -725,6 +755,7 @@ def enable_chunked_lm_head_logprobs(
                 action_masks=action_masks,
                 group_token_ids=group_token_ids,
                 softcap=self._dss_chunked_lm_head_softcap,
+                near_certain_logprobs=near_certain_logprobs_enabled(self),
             )
         }
         if group_token_ids is not None:

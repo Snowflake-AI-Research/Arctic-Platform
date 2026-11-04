@@ -290,7 +290,7 @@ class TestHuggingFaceLoader:
         from pydantic import ValidationError
 
         spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
-        assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False}
+        assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False, "near_certain_logprobs": True}
         with pytest.raises(ValidationError, match="not_an_option"):
             ModelSpec(model_path_or_name="qwen", loader="huggingface", loader_options={"not_an_option": 1})
 

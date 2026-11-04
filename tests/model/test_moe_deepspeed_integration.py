@@ -60,6 +60,7 @@ def test_shared_setup_runs_family_hooks_in_order(monkeypatch):
         optimization_dtype="bfloat16",
         fused_lm_head_token_chunk_size="disabled",
         fp32_lm_head=False,
+        near_certain_logprobs=True,
         ac=object(),
     )
 

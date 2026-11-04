@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.common.near_certain_logprobs import LOADER_OPTION_DESCRIPTION as NEAR_CERTAIN_LOGPROBS_DESCRIPTION
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
@@ -65,6 +66,7 @@ class Qwen3_5MoeOptions(BaseModel):
         "disabled", description="Chunked LM-head logprobs token size."
     )
     fp32_lm_head: bool = Field(False, description="Compute the LM head in fp32.")
+    near_certain_logprobs: bool = Field(True, description=NEAR_CERTAIN_LOGPROBS_DESCRIPTION)
     fp32_parity: bool = Field(
         True,
         description=(

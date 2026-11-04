@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.common.near_certain_logprobs import LOADER_OPTION_DESCRIPTION as NEAR_CERTAIN_LOGPROBS_DESCRIPTION
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
@@ -51,6 +52,7 @@ class GenericMoeOptions(BaseModel):
     fused_cross_entropy: bool | Literal["liger"] = False
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
+    near_certain_logprobs: bool = Field(True, description=NEAR_CERTAIN_LOGPROBS_DESCRIPTION)
     tiled_mlp_token_chunk_size: int | None = Field(None, gt=0)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     weight_conversion_cache_dir: str | None = None
