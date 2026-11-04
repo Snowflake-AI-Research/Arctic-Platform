@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -687,7 +688,8 @@ def test_offloaded_release_validates_settings_before_installing_hooks(monkeypatc
 
 
 @pytest.mark.parametrize("large", [False, True])
-def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp_path, large):
+@pytest.mark.parametrize("preferred", ["override", "missing-data-fast"])
+def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp_path, large, preferred):
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
     optimizer = object.__new__(DeepSpeedZeroOptimizer)
@@ -701,7 +703,18 @@ def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp
     optimizer._use_compact_grad_partition_buffer = lambda group: True
     optimizer._wait_for_offload_copies = lambda: None
     optimizer.finalize_gradient_accumulation_boundary = lambda: None
-    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path / "missing" / "scratch"))
+    if preferred == "override":
+        monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path / "missing" / "scratch"))
+    else:
+        monkeypatch.delenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", raising=False)
+        native_mkdir = Path.mkdir
+
+        def missing_data_fast(path, *args, **kwargs):
+            if path == Path("/data-fast/tmp"):
+                raise FileNotFoundError("missing /data-fast parent")
+            return native_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", missing_data_fast)
     monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(deepspeed_engine, "_scratch_filesystem_type", lambda path: "tmpfs")
     if large:

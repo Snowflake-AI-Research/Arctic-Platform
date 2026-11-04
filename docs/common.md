@@ -192,11 +192,13 @@ With `colocate=True`:
 | `ARL_LOG_DP_SHARD_TOKENS` | Debug per-DP token stats |
 | `ARCTIC_INFERENCE_ENABLED` | Set when `arctic_inference_config` is present |
 | `NCCL_TOPO_FILE` | Stale inherited `/proc/self/fd/*` values are dropped in the worker (avoids OFI topology deadlock) |
-| `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` | Directory for large ZeRO-1/2 CPU-offload FP32 gradient snapshots; defaults to `/data-fast/tmp` |
+| `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` | Disk-backed directory for large ZeRO-1/2 CPU-offload FP32 gradient snapshots; defaults to `/data-fast/tmp`. Set explicitly when `/data-fast` is absent |
 | `ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES` | Bytes between scratch-file syncs; defaults to 16 MiB. Set `0` for one sync per complete snapshot |
 | `ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED` | Explicitly permit tmpfs/ramfs snapshot storage with `1`; defaults to `0` |
 
 **Large offloaded gradient snapshots need disk-backed scratch space.** Snapshots larger than 16 MiB use unlinked temporary files and bounded staging buffers. Set `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` to writable local disk storage with enough free space. Directory and environment settings are validated once when partition release is installed, before the first backward. The worker reserves file blocks before the first snapshot write, so a full disk or unsupported allocation fails immediately and triggers a logged fallback to the system temporary directory. Directory/file permission failures also trigger fallback. Both the selected directory and fallback are checked against Linux mount information; tmpfs and ramfs are refused unless `ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED=1` explicitly permits host-memory consumption. The worker does not create missing parent directories, closes failed allocations, logs the selected directory once and caches any fallback. Later I/O errors abort without retrying a partially written snapshot.
+
+**Containers without `/data-fast` require an explicit scratch directory for large partitions.** Before engine initialization, create a writable directory on a disk-backed volume and set `ARCTIC_OFFLOADED_GRADIENT_TMPDIR` to that directory. If `/data-fast` is absent and the system temporary directory is tmpfs or ramfs, initialization intentionally fails rather than reserving multi-GB partitions in host RAM. Partitions of 16 MiB or smaller do not require disk scratch.
 
 **Scratch sync frequency trades host memory for backward latency.** The default syncs and evicts every 16 MiB to bound dirty page-cache memory. Set `ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES=0` to sync and evict once after writing the complete snapshot, avoiding a blocking sync per chunk at the cost of dirty pages that can grow to the partition size. A positive byte threshold selects less frequent bounded syncs. Reads do not sync; no performance improvement is claimed without a workload measurement.
 
