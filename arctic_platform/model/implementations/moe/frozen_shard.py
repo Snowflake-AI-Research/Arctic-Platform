@@ -141,5 +141,15 @@ def install_frozen_layer_shards(layers: nn.ModuleList, group: dist.ProcessGroup 
     return shards
 
 
+_configured: bool | None = None  # loader option moe.shard_frozen_dense (moe/runtime_options.py); None: the env
+
+
+def configure_from_options(value: bool | None) -> None:
+    global _configured
+    _configured = value
+
+
 def frozen_dense_sharding_requested() -> bool:
+    if _configured is not None:
+        return _configured
     return os.environ.get(SHARD_FROZEN_DENSE_ENV, "0") not in ("", "0", "false", "False")

@@ -154,6 +154,58 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.frozen_expert_offload",
+        runs_in="trainer",
+        goal="memory",
+        why=(
+            "Frozen routed experts in pinned host memory, copied into two GPU buffers per experts call with the next"
+            " layer prefetched (LoRA)."
+        ),
+        source="`loader_options.frozen_expert_offload`; `ARL_OFFLOAD_FROZEN_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.shard_frozen_dense",
+        runs_in="trainer",
+        goal="memory",
+        why="Each recomputed layer's frozen replicated weights sharded over the ranks, all-gathered per call (LoRA).",
+        source="`loader_options.shard_frozen_dense`; `ARL_SHARD_FROZEN_DENSE` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.w4a8_experts",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "INT4 routed experts run with FP8 activations at the checkpoint's static scales instead of decoded to"
+            " BF16."
+        ),
+        source="`loader_options.w4a8_experts`; `ARL_W4A8_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.ultraep_spares",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest"
+            " experts inside the owner's NVLink domain. 0 turns it off."
+        ),
+        source="`loader_options.ultraep_spares`; `ARL_ULTRAEP_SPARES` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.ultraep_ipc_symm",
+        runs_in="trainer",
+        goal="robustness",
+        why=(
+            "Map UltraEP's peer buffers through CUDA IPC handles: torch symmetric memory refuses ranks that each see"
+            " only their own GPU, as DSS runs them."
+        ),
+        source="`loader_options.ultraep_ipc_symm`; `ULTRA_EP_IPC_SYMM` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

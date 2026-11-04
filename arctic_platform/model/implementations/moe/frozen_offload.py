@@ -43,7 +43,17 @@ _ALIGN = 256
 _NAMES = ("w1", "w2", "w3")
 
 
+_configured: bool | None = None  # loader option moe.frozen_expert_offload (moe/runtime_options.py); None: the env
+
+
+def configure_from_options(value: bool | None) -> None:
+    global _configured
+    _configured = value
+
+
 def frozen_expert_offload_requested() -> bool:
+    if _configured is not None:
+        return _configured
     return os.environ.get(OFFLOAD_FROZEN_EXPERTS_ENV, "0") not in ("", "0", "false", "False")
 
 

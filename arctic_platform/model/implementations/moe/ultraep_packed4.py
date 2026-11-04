@@ -46,7 +46,17 @@ ULTRAEP_SPARES_ENV = "ARL_ULTRAEP_SPARES"
 _MAX_LAYERS = 128
 
 
+_configured: int | None = None  # loader option moe.ultraep_spares (moe/runtime_options.py); None: the env
+
+
+def configure_from_options(value: int | None) -> None:
+    global _configured
+    _configured = value
+
+
 def ultraep_spares() -> int:
+    if _configured is not None:
+        return _configured
     return int(os.environ.get(ULTRAEP_SPARES_ENV, "0") or 0)
 
 
