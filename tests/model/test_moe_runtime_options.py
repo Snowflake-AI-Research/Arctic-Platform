@@ -19,6 +19,7 @@ environment variable in charge. CPU only."""
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import types
@@ -26,7 +27,14 @@ import types
 import pytest
 import torch
 from pydantic import ValidationError
+from torch import nn
 
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import build_model
+from arctic_platform.model import loader as loader_mod
+from arctic_platform.model.implementations.moe import expert_replicas
+from arctic_platform.model.implementations.moe import ultraep_replicas
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.implementations.moe.runtime_options import apply_moe_runtime_options
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
@@ -232,3 +240,146 @@ def test_deepep_v2_settings_take_the_option_then_the_environment_then_the_defaul
 def test_bad_deepep_v2_settings_are_refused(fields):
     with pytest.raises(ValidationError):
         GlmMoeDsaOptions(**fields)
+
+# The loaders that reject expert parallelism, and so have no MoE runtime.
+_NO_EXPERT_PARALLEL = {"huggingface", "dflash2"}
+LOADER_OPTIONS = sorted(
+    {entry.options for name, entry in loader_mod._LOADERS.items() if name not in _NO_EXPERT_PARALLEL},
+    key=lambda options: options.__name__,
+)
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_takes_the_fields_unset_by_default(options_cls):
+    assert issubclass(options_cls, MoeRuntimeOptions)
+    options = options_cls()
+    assert (options.ultraep_spares, options.ultraep_ipc_symm) == (None, None)
+    assert (options.expert_replicas, options.expert_replicas_ema, options.expert_placement) == (None, None, None)
+    assert (options.frozen_expert_offload, options.shard_frozen_dense, options.w4a8_experts) == (None, None, None)
+    options = options_cls(ultraep_spares=2, ultraep_ipc_symm=True)
+    assert (options.ultraep_spares, options.ultraep_ipc_symm) == (2, True)
+    assert options_cls(expert_replicas=2, expert_replicas_ema=1.0).expert_replicas == 2
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"ultraep_spares": -1},
+        {"expert_replicas": -2},
+        {"expert_replicas_ema": 0.0},
+        {"expert_replicas_ema": 1.5},
+        {"ultraep_spares": 2, "expert_replicas": 2},
+    ],
+)
+def test_bad_values_are_refused(fields):
+    with pytest.raises(ValidationError):
+        GenericMoeOptions(**fields)
+
+
+def test_one_planner_may_be_off_while_the_other_is_on():
+    assert GenericMoeOptions(ultraep_spares=2, expert_replicas=0).ultraep_spares == 2
+
+
+def test_configured_values_win_and_unset_ones_fall_back_to_the_environment(monkeypatch):
+    monkeypatch.setenv("ARL_ULTRAEP_SPARES", "3")
+    monkeypatch.setenv("ARL_EXPERT_REPLICAS", "1")
+    monkeypatch.setenv("ARL_EXPERT_REPLICAS_EMA", "0.25")
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        3,
+        1,
+        0.25,
+    )
+    apply_moe_runtime_options(GenericMoeOptions(ultraep_spares=0, expert_replicas=4, expert_replicas_ema=0.75))
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        0,
+        4,
+        0.75,
+    )
+    # A later load that sets nothing goes back to the environment.
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert ultraep_replicas.ultraep_spares() == 3
+
+
+def test_defaults_without_config_or_environment():
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        0,
+        0,
+        0.5,
+    )
+
+
+def test_an_options_model_without_the_fields_counts_as_unset(monkeypatch):
+    monkeypatch.setenv("ARL_ULTRAEP_SPARES", "2")
+    apply_moe_runtime_options(types.SimpleNamespace(ep_comm_backend="uccl"))
+    assert ultraep_replicas.ultraep_spares() == 2
+
+
+def _checkpoint(tmp_path, model_type: str) -> str:
+    path = tmp_path / model_type
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(path)
+
+
+def test_the_spec_hands_the_fields_to_the_loader(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as integration
+
+    seen = {}
+
+    def load(**kwargs):
+        seen.update(kwargs)
+        return nn.Identity()
+
+    monkeypatch.setattr(integration, "load_generic_moe_model", load)
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "qwen3_moe"),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        loader_options={"ultraep_spares": 2, "ultraep_ipc_symm": True, "expert_replicas_ema": 0.5},
+    )
+    assert spec.loader_options["ultraep_spares"] == 2
+    build_model(spec, parallel_groups={"ep_group": object()})
+    options = seen["options"]
+    assert (options.ultraep_spares, options.ultraep_ipc_symm, options.expert_replicas) == (2, True, None)
+
+
+def test_load_moe_model_applies_the_options_before_it_builds_the_model(monkeypatch):
+    from arctic_platform.model.implementations.moe import deepspeed_integration as common
+
+    order = []
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    class Mesh:
+        @staticmethod
+        def from_group(**kwargs):
+            return object()
+
+    def build_model_config(*args):
+        order.append(("config", ultraep_replicas.ultraep_spares()))
+        return types.SimpleNamespace()
+
+    def family_loader(*args, **kwargs):
+        order.append(("load", ultraep_replicas.ultraep_spares()))
+        return nn.Identity()
+
+    adapter = types.SimpleNamespace(build_model_config=build_model_config)
+    common.load_moe_model(
+        adapter,
+        family_loader,
+        model_name="m",
+        optimization_dtype="bfloat16",
+        attn_implementation="eager",
+        ep_size=2,
+        ep_group=object(),
+        options=GenericMoeOptions(ep_comm_backend="uccl", ultraep_spares=2),
+        patch_moe_detection=lambda: None,
+        device_mesh_type=Mesh,
+    )
+    assert order == [("config", 2), ("load", 2)]
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_takes_the_deepep_v2_settings(options_cls):
+    assert options_cls(deepep_v2_num_sms=0, deepep_v2_max_tokens=4096).deepep_v2_num_sms == 0
+

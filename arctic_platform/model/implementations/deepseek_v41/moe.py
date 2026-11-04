@@ -119,7 +119,8 @@ class DeepseekV41MoE(MoE):
         # With expert LoRA, self.experts is PEFT's ParamWrapper chain around the experts.
         experts = _unwrap_experts(self.experts)
         if uses_dispatch_ep(self.ep_comm_backend) and getattr(experts, "_ep_group", None) is not None:
-            routed = self._run_deepep_routed_experts(flat, selected, top_scores)
+            # The router's counts feed the online replicas' load estimate; UltraEP plans from ``selected`` itself.
+            routed = self._run_deepep_routed_experts(flat, selected, top_scores, num_tokens_per_expert)
             return routed.reshape(batch, seq_len, dim)
 
         with _integer_histc_on_cpu():
