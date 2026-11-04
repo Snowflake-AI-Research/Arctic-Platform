@@ -558,7 +558,7 @@ def prepare_weight_conversion(
     target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
     stream_convert_fn = get_checkpoint_converter(model, target_format)
     node_local = conversion_cache_is_node_local(snapshot_path)
-    attempt_id = conversion_cache_attempt_id(shared=not node_local)
+    attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local)
     if node_local or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,
@@ -573,14 +573,19 @@ def prepare_weight_conversion(
             stream_convert_fn=stream_convert_fn,
             attempt_id=attempt_id,
             node_local=node_local,
+            fresh_attempt=fresh_attempt,
         )
     else:
         wait_for_conversion_cache(
-            snapshot_path, attempt_id=attempt_id, preparation_root=getattr(config, "weight_conversion_cache_dir", None)
+            snapshot_path,
+            attempt_id=attempt_id,
+            fresh_attempt=fresh_attempt,
+            preparation_root=getattr(config, "weight_conversion_cache_dir", None),
         )
     return snapshot_path
 
 
+@record_conversion_preparation_failure
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)

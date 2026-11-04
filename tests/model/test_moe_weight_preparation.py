@@ -144,6 +144,54 @@ class _FakePrimeModel:
         return state_dict
 
 
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+@pytest.mark.parametrize("scope", ["shared", "node-local"])
+def test_production_preparation_collects_identity_before_keys_and_propagates_fresh_failure(
+    monkeypatch, tmp_path, family, scope
+):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    rank, tokens, events = [0], [], []
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        events.append(("broadcast", rank[0]))
+        if rank[0] == 0:
+            tokens.append(message[0])
+        else:
+            message[0] = tokens[0]
+
+    def keys(path):
+        events.append(("keys", rank[0]))
+        if rank[0] == 0:
+            raise ValueError("checkpoint discovery failed")
+        return ["model.layers.0.mlp.experts.0.gate_proj.weight"]
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", _FakePrimeModel)
+    monkeypatch.setattr(builder, "load_state_dict_keys", keys)
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: tmp_path / "prime")
+    monkeypatch.setattr(builder, "conversion_cache_is_node_local", lambda path: scope == "node-local")
+    config = SimpleNamespace(dequantize_checkpoint=False, weight_conversion_cache_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="checkpoint discovery failed"):
+        builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=0, local_rank=0)
+    assert events[:2] == [("broadcast", 0), ("keys", 0)]
+    assert cache._ACTIVE_ATTEMPT.get() is None
+    rank[0] = 1
+    if scope == "node-local":
+        cache._write_cache_marker(tmp_path / "prime.failed", dict(attempt_id=tokens[0], error="conversion failed"))
+    with pytest.raises(RuntimeError, match="checkpoint discovery failed|conversion failed"):
+        builder.prepare_weight_conversion(_FakePrimeModel(), config, tmp_path, rank=1, local_rank=1)
+    assert len([event for event in events if event[0] == "broadcast"]) == 2
+    assert cache._ACTIVE_ATTEMPT.get() is None
+
+
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
 @pytest.mark.parametrize("scope", ["node-local", "shared"])
 @pytest.mark.parametrize("rank", [0, 8])
@@ -183,7 +231,7 @@ def test_shared_conversion_cache_waits_for_publication_and_times_out(monkeypatch
     monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: next(checks))
     monkeypatch.setattr(conversion_cache.time, "sleep", sleeps.append)
     conversion_cache.wait_for_conversion_cache(cache, timeout=10)
-    assert sleeps == [0.25, 0.25]
+    assert sleeps == [1, 1]
     monkeypatch.setattr(conversion_cache, "conversion_cache_ready", lambda path: False)
     with pytest.raises(TimeoutError, match="did not become ready"):
         conversion_cache.wait_for_conversion_cache(cache, timeout=0)
@@ -653,13 +701,15 @@ def test_distributed_conversion_agrees_on_attempt_and_standalone_shared_requires
 
     monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
     writer = conversion_cache.conversion_cache_attempt_id(shared=True)
+    assert writer[0] is not None
+    assert writer[1] is True
     rank[0] = 1
     assert conversion_cache.conversion_cache_attempt_id(shared=True) == writer
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
     with pytest.raises(ValueError, match="DSS_WEIGHT_CONVERSION_ATTEMPT_ID"):
         conversion_cache.conversion_cache_attempt_id(shared=True)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "launcher-retry")
-    assert conversion_cache.conversion_cache_attempt_id(shared=True) == "launcher-retry"
+    assert conversion_cache.conversion_cache_attempt_id(shared=True) == ("launcher-retry", False)
 
 
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
