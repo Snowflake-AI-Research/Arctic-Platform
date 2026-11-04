@@ -819,6 +819,8 @@ def test_glm53_full_hf_export_auxiliary_scope(monkeypatch, include_skipped, rank
         lambda model: lambda **kwargs: iter([("trained.weight", ordinary)]),
     )
     monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(glm.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(glm.torch.distributed, "broadcast_object_list", lambda value, src: None)
     monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", auxiliary)]))
     exported = dict(glm._build_iter_full_hf_weights_with_auxiliary(model)(include_skipped=include_skipped))
     assert exported["trained.weight"] is ordinary

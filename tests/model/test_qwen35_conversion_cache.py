@@ -633,6 +633,65 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
         assert ("barrier",) in events[conversion_index + 1 : load_index]
 
 
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+@pytest.mark.parametrize("fault", ["missing", "changed"])
+def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives(monkeypatch, family, fault):
+    from types import SimpleNamespace
+
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    if family == "qwen":
+        names = sorted(mtp_weights._configured_names(model))
+        attribute = mtp_weights._STATE_ATTRIBUTE
+        builder = qwen._build_iter_full_hf_weights_with_mtp
+    else:
+        model.config = SimpleNamespace(model_type="glm5_next_text", num_hidden_layers=2, num_nextn_predict_layers=1)
+        names = ["model.language_model.layers.2.eh_proj.weight"]
+        attribute = auxiliary_weights.STATE_ATTRIBUTE
+        builder = glm._build_iter_full_hf_weights_with_auxiliary
+    if fault == "changed":
+        weights = tuple(mtp_weights._PreservedWeight(name, torch.ones(2), (2,), torch.float32) for name in names)
+        state = (
+            weights if family == "qwen" else (auxiliary_weights._layer_prefixes(model.config), tuple(names), weights)
+        )
+        setattr(model, attribute, state)
+        weights[0].tensor.resize_(1)
+    ordinary_calls = []
+
+    def ordinary(**kwargs):
+        ordinary_calls.append(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
+    failure = [None]
+    rank = [0]
+    monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
+
+    def broadcast(payload, src):
+        assert src == 0
+        if rank[0] == 0:
+            failure[0] = payload[0]
+        else:
+            payload[0] = failure[0]
+
+    monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast)
+    errors = []
+    for current_rank in (0, 1):
+        rank[0] = current_rank
+        with pytest.raises(RuntimeError, match="Cannot export preserved") as error:
+            list(builder(model)(include_skipped=True))
+        errors.append(str(error.value))
+    assert errors[0] == errors[1]
+    assert ordinary_calls == []
+
+
 def _rewrite_mtp_index(source, mutate):
     index_path = source / "model.safetensors.index.json"
     index = json.loads(index_path.read_text())

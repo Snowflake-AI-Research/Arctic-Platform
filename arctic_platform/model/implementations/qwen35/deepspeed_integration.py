@@ -218,18 +218,20 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
     ordinary = _build_iter_full_hf_weights(model)
 
     def iterator(*, include_skipped: bool = False):
-        import torch.distributed as dist
+        from .mtp_weights import prepare_preserved_weights_for_export
 
+        preserved = (
+            prepare_preserved_weights_for_export(model, iter_preserved_mtp_weights, description="Qwen MTP weights")
+            if include_skipped else ()
+        )
         names: set[str] = set()
         for name, tensor in ordinary(include_skipped=include_skipped):
             names.add(name)
             yield name, tensor
-        # Finish all ordinary collectives before the serializer-only sidecar.
-        if include_skipped and dist.get_rank() == 0:
-            for name, tensor in iter_preserved_mtp_weights(model):
-                if name in names:
-                    raise RuntimeError(f"Original MTP tensor collides with live HF export: {name}")
-                yield name, tensor
+        for name, tensor in preserved:
+            if name in names:
+                raise RuntimeError(f"Original MTP tensor collides with live HF export: {name}")
+            yield name, tensor
 
     return iterator
 

@@ -220,7 +220,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         return full
 
     def iterator(*, include_skipped: bool = False):
-        is_master = dist.get_rank() == 0
+        is_master = not dist.is_initialized() or dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
         skipped_parameter_ids = {

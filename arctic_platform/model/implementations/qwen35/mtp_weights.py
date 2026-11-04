@@ -231,6 +231,26 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
         setattr(model, _STATE_ATTRIBUTE, tuple(sorted(preserved, key=lambda weight: weight.name)))
 
 
+def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str):
+    """Validate rank zero's sidecar before any ordinary export collective."""
+    distributed = dist.is_initialized()
+    is_master = not distributed or dist.get_rank() == 0
+    weights = ()
+    failure: list[str | None] = [None]
+    cause = None
+    if is_master:
+        try:
+            weights = tuple(iterator(model))
+        except Exception as exc:
+            cause = exc
+            failure[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        raise RuntimeError(f"Cannot export preserved {description}: {failure[0]}") from cause
+    return weights
+
+
 def iter_preserved_mtp_weights(model: nn.Module):
     """Yield unchanged original weights without registering parameters or buffers."""
     if model.__dict__.get("_ap_weights_random_initialized", False):

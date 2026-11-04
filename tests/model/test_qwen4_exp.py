@@ -879,6 +879,9 @@ def test_qwen38_checkpoint_export_preserves_mtp_while_splitting_ple(monkeypatch,
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
     mtp_weights.capture_mtp_weights(model, tmp_path)
     ple_name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda: pytest.fail("non-distributed export must not query rank")
+    )
     ple = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     monkeypatch.setattr(
         integration.qwen_ds,
