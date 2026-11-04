@@ -289,6 +289,44 @@ def test_published_keys_convert_and_round_trip(caplog):
     assert torch.equal(counts, torch.zeros_like(counts))
 
 
+def test_checkpoint_fp32_parameters_are_built_in_fp32():
+    model = DeepseekV41ForCausalLM._from_config(_convert_config(), dtype=torch.bfloat16)
+    dtypes = {name: param.dtype for name, param in model.named_parameters()}
+    fp32 = sorted(name for name, dtype in dtypes.items() if dtype == torch.float32)
+    kept = [name for name in dtypes if DeepseekV41ForCausalLM.keeps_fp32_parameter(name)]
+    assert kept and set(kept) <= set(fp32)
+    assert "model.layers.0.attn_hc.fn" in fp32
+    assert "model.layers.3.ffn_hc.scale" in fp32
+    assert "model.layers.1.self_attn.sinks" in fp32
+    assert dtypes["model.layers.0.input_layernorm.weight"] == torch.bfloat16
+    assert dtypes["model.layers.1.self_attn.q_a_proj.weight"] == torch.bfloat16
+
+    hf = model.convert_to_hf(dict(model.state_dict()))
+    assert hf["layers.0.hc_attn_fn"].dtype == torch.float32
+    assert hf["layers.1.attn.attn_sink"].dtype == torch.float32
+
+
+def test_hf_export_writes_published_names_and_loads_back(monkeypatch):
+    from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    model = DeepseekV41ForCausalLM(_convert_config())
+
+    exported = dict(build_iter_full_hf_weights(model)(include_skipped=True))
+    assert not [name for name in exported if name.startswith("model.")]
+    assert "head.weight" in exported and "embed.weight" in exported
+    assert "layers.1.attn.compressor.wgate.weight" in exported
+    assert "layers.0.engram.embed.weight" in exported
+
+    expected = dict(named_weight_sync_tensors(model))
+    loaded = apply_hf_to_prime(dict(exported), model.conversion_chain(model.config))
+    assert sorted(loaded) == sorted(expected)
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor), name
+
+
 def test_source_only_and_unknown_keys_are_rejected():
     model = DeepseekV41ForCausalLM(_convert_config())
     surprises = {
