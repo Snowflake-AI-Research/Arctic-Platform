@@ -224,7 +224,7 @@ def ep_checkpoint_engine(monkeypatch):
         def __init__(self):
             self.module = FixtureMoE()
             self.checkpoint_engine = CheckpointStorage()
-            self.optimizer = SimpleNamespace(update_lp_params=lambda: None)
+            self.optimizer = SimpleNamespace(update_lp_params=lambda: None, partition_count=[1])
             self.calls = []
             self.saved_checkpoint = None
             self.native_expert_names = set()
@@ -237,6 +237,9 @@ def ep_checkpoint_engine(monkeypatch):
 
         def _load_zero_checkpoint(self, load_dir, tag, load_optimizer_states=True):
             return True
+
+        def _get_zero_ckpt_name(self, directory, tag):
+            return str(Path(directory) / tag / "zero_pp_rank_1_mp_rank_00_optim_states.pt")
 
         @property
         def param_names(self):
@@ -856,7 +859,14 @@ def test_ep_checkpoint_legacy_ep_resume_requires_and_restores_zero_masters(
     tag = tmp_path / "legacy"
     tag.mkdir()
     if zero_files:
-        (tag / "zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
+        torch.save(
+            dict(
+                optimizer_state_dict=dict(
+                    partition_count=[1], base_optimizer_state=dict(param_groups=[dict(moe=True, name="ep_size_2")])
+                )
+            ),
+            engine._get_zero_ckpt_name(tmp_path, "legacy"),
+        )
     restored = []
 
     def update():
@@ -872,9 +882,88 @@ def test_ep_checkpoint_legacy_ep_resume_requires_and_restores_zero_masters(
         for name, value in engine.module.state_dict().items():
             torch_assert_equal(value, expected[name])
     else:
-        with pytest.raises(FileNotFoundError, match="rank-local shard"):
+        with pytest.raises(FileNotFoundError, match="rank-local shard|this rank's ZeRO optimizer file"):
             engine._load_checkpoint(tmp_path, "legacy", load_optimizer_states=optimizer_states)
     assert restored == ([True] if optimizer_states and zero_files else [])
+
+
+@pytest.mark.parametrize("failure", ["ep-size", "dp-size", "other-rank"])
+def test_legacy_ep_resume_rejects_incompatible_layout_or_missing_rank(ep_checkpoint_engine, tmp_path, failure):
+    engine = ep_checkpoint_engine
+    engine.module.frozen.requires_grad_(True)
+    path = Path(engine._get_zero_ckpt_name(tmp_path, "legacy"))
+    path.parent.mkdir()
+    if failure == "other-rank":
+        path = path.with_name("zero_pp_rank_0_mp_rank_00_optim_states.pt")
+    torch.save(
+        dict(
+            optimizer_state_dict=dict(
+                partition_count=[2] if failure == "dp-size" else [1],
+                base_optimizer_state=dict(
+                    param_groups=[dict(moe=True, name="ep_size_4" if failure == "ep-size" else "ep_size_2")]
+                ),
+            )
+        ),
+        path,
+    )
+    with pytest.raises((ValueError, FileNotFoundError), match="layout|expert-parallel size|this rank"):
+        engine._load_checkpoint(tmp_path, "legacy")
+    assert engine.calls == []
+
+
+@pytest.mark.parametrize("expert,stage_three", [(True, True), (True, False), (False, True)])
+def test_ap_expert_zero_three_is_rejected_before_native_model_setup(
+    ep_checkpoint_engine, monkeypatch, expert, stage_three
+):
+    engine = ep_checkpoint_engine
+    engine_type = type(engine)
+    engine.partition_weights = stage_three
+    model = engine.module if expert else nn.Linear(2, 2)
+    calls = []
+
+    def native(self, model):
+        calls.append(True)
+        self.module = model
+        self.has_moe_layers = False
+        self.num_experts = []
+
+    monkeypatch.setattr(engine_type, "_configure_distributed_model", native, raising=False)
+    module = ModuleType("deepspeed.runtime.engine")
+    module.DeepSpeedEngine = engine_type
+    monkeypatch.setitem(sys.modules, "deepspeed.runtime.engine", module)
+    monkeypatch.setattr(sys.modules["deepspeed.runtime"], "engine", module, raising=False)
+    monkeypatch.setattr(sys.modules["deepspeed"], "runtime", sys.modules["deepspeed.runtime"], raising=False)
+    common.patch_deepspeed_moe_detection()
+    if expert and stage_three:
+        with pytest.raises(ValueError, match="use ZeRO stage 1 or 2"):
+            engine._configure_distributed_model(model)
+        assert calls == []
+    else:
+        engine._configure_distributed_model(model)
+        assert calls == [True]
+
+
+@pytest.mark.parametrize("verify", ["0", "1", "invalid"])
+def test_ep_checkpoint_verification_switch(monkeypatch, tmp_path, verify):
+    monkeypatch.setenv("ARCTIC_EXPERT_CHECKPOINT_VERIFY", verify)
+    native_load = torch.load
+    readbacks = []
+
+    def load(*args, **kwargs):
+        if kwargs.get("mmap"):
+            readbacks.append(True)
+        return native_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", load)
+    path = tmp_path / "expert.pt"
+    if verify == "invalid":
+        with pytest.raises(ValueError, match="ARCTIC_EXPERT_CHECKPOINT_VERIFY"):
+            common._save_ep_checkpoint_shard(dict(module=dict(weight=torch.ones(2))), path)
+        assert not path.exists()
+    else:
+        common._save_ep_checkpoint_shard(dict(module=dict(weight=torch.ones(2))), path)
+        assert readbacks == ([True] if verify == "1" else [])
+        torch_assert_equal(native_load(path, weights_only=True)["module"]["weight"], torch.ones(2))
 
 
 @pytest.mark.parametrize("code", [22, 38, 95])

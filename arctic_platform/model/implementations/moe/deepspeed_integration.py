@@ -114,12 +114,31 @@ def _checkpoint_sync(operation, *args) -> None:
         get_logger().info("Checkpoint filesystem does not support %s", operation.__name__)
 
 
+def _validate_legacy_ep_zero_layout(engine, directory, tag, identity: dict) -> None:
+    """Require this rank's native ZeRO archive and matching expert group/partition metadata."""
+    path = Path(engine._get_zero_ckpt_name(directory, tag))
+    if not path.is_file():
+        raise FileNotFoundError(f"Legacy EP checkpoint is missing this rank's ZeRO optimizer file: {path}")
+    saved = engine.checkpoint_engine.load(str(path), map_location=torch.device("cpu"))
+    optimizer = saved.get("optimizer_state_dict", {})
+    groups = optimizer.get("base_optimizer_state", {}).get("param_groups", [])
+    counts = optimizer.get("partition_count")
+    current_counts = engine.optimizer.partition_count
+    if counts != current_counts or len(groups) != len(counts):
+        raise ValueError("Legacy EP checkpoint DP/EP partition layout does not match the current optimizer")
+    matching = [group for group in groups if group.get("moe") and group.get("name") == identity["group_name"]]
+    # AP registers native expert groups as ep_size_N; a different saved N must never recover local experts.
+    if identity["group_name"] != f"ep_size_{identity['ep_size']}" or len(matching) != 1:
+        raise ValueError("Legacy EP checkpoint expert-parallel size/group does not match the current model")
+
+
 def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
     """Write local expert tensors without copying their ZeRO backing buffers to the host.
 
     AP-owned sidefiles use a regular torch ZIP archive, independently of the dense checkpoint's serialization
     setting. Reserve compact storage records first, then fill them with a single 16 MiB CPU staging buffer.
     ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES sets the sync/eviction interval (16 MiB by default, 0 for end-only).
+    Full cold-read checksum verification is enabled by default; ARCTIC_EXPERT_CHECKPOINT_VERIFY=0 disables it.
     Only the AP shard is synced here; DeepSpeed owns durability of dense/optimizer files and the latest pointer.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -131,6 +150,10 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         raise ValueError(f"{sync_env} must be a non-negative integer") from error
     if sync_bytes < 0:
         raise ValueError(f"{sync_env} must be a non-negative integer")
+    verify_env = "ARCTIC_EXPERT_CHECKPOINT_VERIFY"
+    verify = os.environ.get(verify_env, "1")
+    if verify not in {"0", "1"}:
+        raise ValueError(f"{verify_env} must be 0 or 1")
     path.parent.mkdir(parents=True, exist_ok=True)
     tensors = state["module"]
     with tempfile.TemporaryDirectory(prefix=".ap-ep-checkpoint-", dir=path.parent) as directory:
@@ -150,7 +173,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         records_end = temporary.stat().st_size
         ranges = sorted(
             (offsets[name], offsets[name] + tensor.numel() * tensor.element_size())
-            for name, tensor in tensors.items() if tensor.numel() > 0
+            for name, tensor in tensors.items()
+            if tensor.numel() > 0
         )
         if any(start < 0 or end > records_end for start, end in ranges) or any(
             left[1] > right[0] for left, right in zip(ranges, ranges[1:])
@@ -169,7 +193,8 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
                     chunk = staging.narrow(0, 0, count)
                     chunk.copy_(source, non_blocking=False)
                     data = memoryview(chunk.numpy())
-                    checksum.update(data)
+                    if verify == "1":
+                        checksum.update(data)
                     written = 0
                     while written < count:
                         size = os.pwritev(descriptor, [data[written:]], offsets[name] + start + written)
@@ -189,14 +214,15 @@ def _save_ep_checkpoint_shard(state: dict, path: Path) -> None:
         finally:
             os.close(descriptor)
         # Validate actual ZIP tensor records, independently of the private offsets used for writing.
-        written_state = torch.load(temporary, map_location="cpu", weights_only=True, mmap=True)["module"]
-        for name, tensor in written_state.items():
-            checksum = hashlib.sha256()
-            for chunk in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
-                checksum.update(memoryview(chunk.numpy()))
-            if checksum.digest() != checksums[name]:
-                raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
-        del written_state
+        if verify == "1":
+            written_state = torch.load(temporary, map_location="cpu", weights_only=True, mmap=True)["module"]
+            for name, tensor in written_state.items():
+                checksum = hashlib.sha256()
+                for chunk in _ep_checkpoint_tensor_chunks(tensor, staging.numel()):
+                    checksum.update(memoryview(chunk.numpy()))
+                if checksum.digest() != checksums[name]:
+                    raise ValueError(f"AP expert checkpoint payload verification failed for {name}")
+            del written_state
         os.replace(temporary, path)
         # DeepSpeed creates the checkpoint tree; only our shard's rename is owned here.
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -227,9 +253,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         parameters = getattr(self, "_ap_ep_checkpoint_save_parameters", None)
         if parameters is None:
             return original_frozen_attributes(self, attr_func)
-        excluded = {
-            parameter for named_parameters in parameters.values() for parameter in named_parameters.values()
-        }
+        excluded = {parameter for named_parameters in parameters.values() for parameter in named_parameters.values()}
 
         def dense_attribute(parameter):
             # Filter before the native fragment callback copies frozen experts to CPU.
@@ -335,8 +359,9 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
                     and callable(getattr(self.optimizer, "update_lp_params", None))
                     and self.zero_load_from_fp32_weights()
                     and all(is_optimized_parameter(parameter) for parameter in named_parameters.values())
-                    and any((Path(arguments["load_dir"]) / arguments["tag"]).glob("*optim_states.pt"))
+                    and callable(getattr(self, "_get_zero_ckpt_name", None))
                 ):
+                    _validate_legacy_ep_zero_layout(self, arguments["load_dir"], arguments["tag"], identity)
                     legacy_parameters.update(named_parameters)
                     restore_legacy_masters = True
                     get_logger().warning(
@@ -388,6 +413,7 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             del self._ap_ep_legacy_parameters
 
     if original_zero_load is not None:
+
         @wraps(original_zero_load)
         def load_zero(self, *args, **kwargs):
             restoring = getattr(self, "_ap_ep_restore_legacy_masters", False)
@@ -457,6 +483,8 @@ def patch_deepspeed_moe_detection() -> None:
     original = ds_engine.DeepSpeedEngine._configure_distributed_model
 
     def patched(self, model):
+        if self.zero_optimization_partition_weights() and _ep_checkpoint_parameters(model):
+            raise ValueError("AP expert-parallel models do not support ZeRO stage 3; use ZeRO stage 1 or 2")
         original(self, model)
         if self.has_moe_layers:
             return
@@ -611,13 +639,13 @@ def build_iter_full_hf_weights(model: nn.Module):
         for start in range(0, rows, step):
             n = min(step, rows - start)
             outputs = [buffer[r, :n] for r in range(world)] if buffer is not None else None
-            chunk = local[start:start + n].contiguous()
+            chunk = local[start : start + n].contiguous()
             dist.gather(chunk, outputs, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for r in range(world):
-                    full[r * rows + start:r * rows + start + n].copy_(buffer[r, :n])
+                    full[r * rows + start : r * rows + start + n].copy_(buffer[r, :n])
         return full
 
     def iterator(*, include_skipped: bool = False):
@@ -633,8 +661,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
             if not include_skipped and (
-                getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
+                getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids
             ):
                 continue
             hf_name = hf_export_param_name(name)
