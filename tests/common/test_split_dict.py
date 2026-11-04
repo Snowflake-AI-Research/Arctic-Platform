@@ -228,6 +228,14 @@ class TestDpSizeDividesBySp(TestCasePlus):
         self.assertEqual(sp_size_from_job_config(job.model_dump()), 2)
         with self.assertRaises(ValueError):
             JobConfig(model_name="m", ds_worker_config={"sp_size": 2}, training_config={"sp_size": 4})
+        for other in (
+            {"ds_worker_config": {"sp_size": 2, "sequence_parallel": 4}},
+            {"ds_config": {"sequence_parallel_size": 4}},
+        ):
+            arguments = dict(model_name="m", ds_worker_config={"sp_size": 2})
+            arguments.update(other)
+            with self.assertRaises(ValueError):
+                JobConfig(**arguments)
 
     def test_sp_size_unset_is_one(self):
         self.assertEqual(sp_size_from_job_config({}), 1)

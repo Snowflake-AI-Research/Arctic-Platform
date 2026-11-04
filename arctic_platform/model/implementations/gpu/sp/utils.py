@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import math
 from dataclasses import dataclass
 from numbers import Real
@@ -159,6 +160,8 @@ def prepare_token_partition(
             raise ValueError(f"SP {name} must be a 2D integer tensor")
     if bool((tensors["position_ids"][mask] < 0).any().item()):
         raise ValueError("SP valid-token positions must be nonnegative")
+    if bool((tensors["position_ids"][:, 0] != 0).any().item()):
+        raise ValueError("SP every row must begin at a document boundary (position_ids=0)")
     if "labels" not in tensors:
         labels = torch.full_like(ids, -100)
         labels[:, :-1] = ids[:, 1:]
@@ -351,8 +354,16 @@ def validate_sequence_parallel_microbatches(
             raise ValueError("SP packed loss scale must be finite and nonnegative")
         for index, microbatch in enumerate(microbatches):
             prepare_token_partition(microbatch, sp_info=membership)
+        index = None
         if sp_group is not None:
             checksum = hashlib.sha256()
+            checksum.update(
+                json.dumps(
+                    dict(meta=meta, processing=processing, loss_scales=loss_scales),
+                    sort_keys=True,
+                    allow_nan=False,
+                ).encode()
+            )
             for microbatch in microbatches:
                 for name in sorted(TOKEN_FIELDS & microbatch.keys() | {"attention_mask"}):
                     tensor = microbatch[name].detach().contiguous().cpu()
@@ -451,6 +462,11 @@ def run_sequence_parallel_grpo(
     a selected SP engine whose dense/expert gradient reduction sums sequence
     contributions and averages logical DP replicas. This source adapter is not
     installed-runtime, native-capacity, router-application or numerical proof.
+
+    This initial route requires packed token counts divisible by the SP degree; callers must select suitable
+    batches. It does not add padding or drop tokens. Preflight failures are collective, but errors inside native
+    model/backward collectives (including CUDA OOM) require the launcher to abort the whole process group. Peers
+    can otherwise wait until their process-group timeout, and earlier microbatch gradients must not be reused.
     """
     # Keep the optional RL runtime outside the model library's import/typecheck boundary.
     processors = importlib.import_module("arctic_platform.rl.processors")

@@ -360,6 +360,61 @@ def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(m
     torch_assert_equal(result["batch"]["logprobs"], sp.restore_token_rows(baseline["batch"]["logprobs"], mask))
 
 
+@pytest.mark.parametrize("difference", ["loss_scales", "processing", "meta"])
+def test_sp_signature_includes_request_loss_inputs(monkeypatch, difference):
+    group = object()
+    signatures = []
+    monkeypatch.setattr(sp.dist, "all_reduce", lambda *args, **kwargs: None)
+
+    def gather(outputs, signature, group):
+        if not signatures:
+            signatures.append(signature.clone())
+        for output in outputs:
+            output.copy_(signatures[0])
+
+    monkeypatch.setattr(sp.dist, "all_gather", gather)
+    meta = dict(dp_size=2, temperature=1.0)
+    processing = dict(post=["compute_logprobs"], loss_fn="grpo", config=dict(loss_agg_mode="token-mean"))
+    scales = [1.0]
+    arguments = dict(
+        sp_info=_info(),
+        synchronize=True,
+        device="cpu",
+        meta=meta,
+        processing=processing,
+        loss_scales=scales,
+        sp_group=group,
+    )
+    sp.validate_sequence_parallel_microbatches([_batch()], **arguments)
+    if difference == "loss_scales":
+        scales[0] = 0.25
+    elif difference == "processing":
+        processing["config"]["entropy_coeff"] = 0.01
+    else:
+        meta["temperature"] = 0.7
+    with pytest.raises(ValueError, match="identical token rows and loss inputs"):
+        sp.validate_sequence_parallel_microbatches([_batch()], **arguments)
+
+
+def test_sp_signature_failure_has_request_context_and_reaches_flag_reduce(monkeypatch):
+    reductions = []
+    monkeypatch.setattr(sp.dist, "all_reduce", lambda flag, **kwargs: reductions.append(flag.item()))
+    monkeypatch.setattr(sp.json, "dumps", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hash failed")))
+    with pytest.raises(RuntimeError, match="SP request: hash failed"):
+        sp.validate_sequence_parallel_microbatches(
+            [_batch()], sp_info=_info(), synchronize=True, device="cpu", sp_group=object()
+        )
+    assert reductions == [1]
+
+
+def test_token_partition_rejects_missing_document_boundary_at_later_row():
+    batch = _batch()
+    batch["position_ids"] = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 2, 3, 4]])
+    batch["position_ids"][1, 0] = 1
+    with pytest.raises(ValueError, match="every row must begin"):
+        sp.prepare_token_partition(batch, sp_info=_info())
+
+
 @pytest.mark.parametrize("backward", [True, False])
 @pytest.mark.parametrize("scale", [0.0, 0.25, 1.0])
 def test_sp_execution_token_loss_scale_changes_only_backward(monkeypatch, backward, scale):

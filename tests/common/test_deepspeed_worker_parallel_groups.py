@@ -100,7 +100,7 @@ def test_worker_groups_unsupported_placement_fails_before_creation(runtime, monk
         runtime.mod.dist, "all_gather_object", lambda output, host: output.__setitem__(slice(None), hosts)
     )
     with pytest.raises(ValueError):
-        runtime.worker._setup_model_parallel_groups(_spec(), {}, {})
+        runtime.worker._setup_model_parallel_groups(_spec(), {"zero_optimization": {"stage": 2}}, {})
     assert runtime.calls == []
 
 
@@ -110,7 +110,7 @@ def test_worker_groups_unsupported_placement_fails_before_creation(runtime, monk
         (_spec(ep=6), {}),
         (_spec(sp=3), {}),
         (_spec(ep=8, sp=1), {"zero_optimization": {"stage": 3}}),
-        (_spec(), {"sequence_parallel_size": 4}),
+        (_spec(), {"zero_optimization": {"stage": 2}, "sequence_parallel_size": 4}),
     ],
 )
 def test_worker_groups_invalid_degrees_or_engine_selector_fail(runtime, spec, config):
@@ -119,7 +119,17 @@ def test_worker_groups_invalid_degrees_or_engine_selector_fail(runtime, spec, co
     assert runtime.calls == []
 
 
-def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request(runtime, monkeypatch):
+@pytest.mark.parametrize("stage", [None, 0, 1, 3])
+def test_sp_worker_rejects_non_stage_two_before_group_creation(runtime, monkeypatch, stage):
+    monkeypatch.setattr(runtime.mod.dist, "all_gather_object", lambda *args: pytest.fail("unexpected collective"))
+    config = {} if stage is None else dict(zero_optimization=dict(stage=stage))
+    with pytest.raises(ValueError, match="ZeRO stage 2 before model initialization"):
+        runtime.worker._setup_model_parallel_groups(_spec(), config, {})
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize("sp_alias", [None, 8])
+def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request(runtime, monkeypatch, sp_alias):
     mod, worker = runtime.mod, runtime.worker
     model = torch.nn.Linear(1, 1)
     events = []
@@ -159,7 +169,12 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     request = {
         "model_name": "synthetic",
         "job_type": "training",
-        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 1, "sp_size": 8},
+        "ds_worker_config": {
+            "attn_implementation": "sparse_mla",
+            "ep_size": 1,
+            "sp_size": sp_alias,
+            "sequence_parallel": 8,
+        },
         "ds_config": {"zero_optimization": {"stage": 2}, "bf16": {"enabled": True, "bf16_optimizer_states": True}},
     }
     original = deepcopy(request)

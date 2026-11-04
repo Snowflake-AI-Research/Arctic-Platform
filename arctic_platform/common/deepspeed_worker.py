@@ -170,9 +170,9 @@ class DeepSpeedWorker:
 
         ds_worker_config = deepcopy(job_config.get("ds_worker_config") or {})
         ds_worker_config["world_size"] = self.world_size
-        if "sp_size" in ds_worker_config:
+        if ds_worker_config.get("sp_size") is not None:
             if (
-                "sequence_parallel" in ds_worker_config
+                ds_worker_config.get("sequence_parallel") is not None
                 and ds_worker_config["sequence_parallel"] != ds_worker_config["sp_size"]
             ):
                 raise ValueError("worker sp_size conflicts with sequence_parallel")
@@ -270,6 +270,8 @@ class DeepSpeedWorker:
         sp_size = spec.parallelism.sequence_parallel
         if ep_size > 1 and sp_size > 1:
             raise ValueError("SP GRPO currently requires ep_size=1; EP>1 gradient parity is not established")
+        if sp_size > 1 and (ds_config.get("zero_optimization") or {}).get("stage") != 2:
+            raise ValueError("SP GRPO requires ZeRO stage 2 before model initialization")
         self.mpu, self.sp_group, self.sp_rank, self.ep_group = None, None, 0, None
         if ep_size == sp_size == 1:
             return None
