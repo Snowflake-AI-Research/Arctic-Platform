@@ -255,6 +255,18 @@ def test_model_parallelism_metadata_detects_shared_linear_heads():
     assert metadata.linear_num_value_heads == 2
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_model_parallelism_metadata_kda_fallback_does_not_enable_linear_attention(nested):
+    text_config = dict(num_attention_heads=4, linear_attn_config=dict(num_heads=4))
+    config = dict(text_config=text_config) if nested else text_config
+
+    metadata = model_parallelism_metadata_from_config(config)
+
+    assert metadata.has_linear_attention is False
+    assert metadata.linear_num_key_heads == 4
+    assert metadata.linear_num_value_heads == 4
+
+
 @pytest.mark.parametrize("heads", [None, 0, -1, True, "2"])
 def test_model_parallelism_metadata_rejects_invalid_shared_linear_heads(heads):
     with pytest.raises(ValueError, match="linear_num_key_heads must be a positive integer"):
