@@ -157,8 +157,11 @@ Log-prob tensors often use a `_shifted` suffix convention (see
 backends — treat unification as WIP.
 
 `fwd_bwd` omits the per-token result `batch` by default (VeRL only reads
-`metrics`). Set `meta.return_fwd_batch` (or Cortex `context.return_fwd_batch`)
-to include the merged `batch` in the response (TRL server-side-loss).
+`metrics`). On the native Arctic Platform server, set `meta.return_fwd_batch`
+to include the merged `batch` in the response (TRL server-side-loss). Cortex
+returns requested post-processing tensors as `post_process_outputs`; request
+`processing.post=["compute_logprobs"]` and `processing.return_post_outputs=true`
+to obtain recomputed logprobs.
 
 Metrics use the shared `{name}.sum` / `{name}.tokens` pairing; see
 [`common.md`](common.md#metric-aggregation).
@@ -427,6 +430,41 @@ requirements name the key and the received value; a rejected context column is
 named with its shape when it is a tensor, otherwise with its value. The ratio-mask and unknown-key rejections list the
 offending keys without values, and a missing `nll_mask` is reported by name.
 The unprefixed `grpo_mixed_v1` applies the same rules.
+
+## Direct weighted log-probability gradients
+
+`loss_fn="weighted_logprob_sum"` accepts prediction-aligned float32
+`logprob_weights = dL/dlogprobs` and a binary `loss_mask`. It computes
+`dp_size * sum(logprob_weights * current_logprobs)` in float32, so DeepSpeed's
+data-parallel gradient average preserves the caller's global-objective token
+gradient. Weights must be finite, match the current logprob shape, and be zero
+outside the mask; current model logprobs must be finite at every position. The
+backend-stamped `batch_num_tokens` value is validated as global scale metadata
+but does not divide the caller-supplied gradients; when it is present, `dp_size`
+is required. Configure
+`processing.post=["compute_logprobs"]`.
+
+This direct objective is intended for client-differentiated sequence losses
+such as DPO. It has no old-policy, importance-ratio, clipping, or advantage
+semantics. Packed microbatch contributions are additive. Correctness requires
+the weights to have been differentiated at the same policy version and
+untempered logprobs that the server uses for backward. For Cortex, request
+`processing.post=["compute_logprobs"]` with
+`processing.return_post_outputs=true` (the default for a nonempty post list).
+Read the recomputed logprobs from `post_process_outputs` and explicitly compare
+them with the logprobs used to differentiate the weights before calling `/step`.
+If any active score is nonfinite or disagrees beyond the caller's agreement
+tolerance, stop the update and do not call `/step`; requesting post outputs does
+not perform this comparison or abort automatically.
+
+Cortex's `avg_loss` is the global linear dot product
+`sum(logprob_weights * current_logprobs)`: averaging the DP-scaled worker loss
+removes the backward compensation factor. Paired reporting metrics sum
+`loss.sum` and `loss.tokens` across shards and packed microbatches; the pooled
+`metrics.loss` is their ratio, the active-token mean of this linear surrogate.
+Neither value is the caller's original sequence-level objective. DPO callers
+can check `avg_loss` against the global weighted dot product before stepping.
+
 
 ## ZoRRo Train
 

@@ -131,6 +131,7 @@ from .stats_tracker import scalar
 from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
+from .weighted_logprob_sum import weighted_logprob_sum_loss
 
 # Generic client-side surrogate (importing registers "weighted_logprob_sum")
 from .weighted_logprob import weighted_logprob_sum
@@ -221,6 +222,7 @@ __all__ = [
     "weighted_logprob_sum",
     "sft_loss",
     "sft_ce_loss",
+    "weighted_logprob_sum_loss",
     "LOGIT_LOSS_FNS",
     "SFT_LOSS_FNS",
     "run_sft_pipeline",

@@ -58,6 +58,7 @@ PUBLIC_LOSS_FNS = frozenset(
         "trl_grpo",
         "weighted_logprob_sum",
         "causal_cross_entropy",
+        "weighted_logprob_sum",
     }
 )
 PUBLIC_POST_PROCESSORS = frozenset(
