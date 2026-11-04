@@ -91,6 +91,8 @@ def _write_conversion_cache(
     convert_checkpoint_fn: Callable | None = None,
     stream_convert_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
+    if convert_checkpoint_fn is not None and stream_convert_fn is not None:
+        raise ValueError("Supply only one checkpoint conversion callback")
     tmp_path = snapshot_path.with_name(f"{snapshot_path.name}.tmp-rank{rank}-pid{os.getpid()}")
     if tmp_path.exists():
         shutil.rmtree(tmp_path)
