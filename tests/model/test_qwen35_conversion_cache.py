@@ -963,6 +963,36 @@ def test_shared_waiter_observes_failure_before_first_progress_marker(monkeypatch
         conversion_cache.wait_for_conversion_cache(destination, timeout=0, attempt_id="setup", fresh_attempt=True)
 
 
+@pytest.mark.parametrize("distributed", [None, False, True])
+def test_preparation_decorator_requires_explicit_collective_opt_in(monkeypatch, tmp_path, distributed):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    broadcasts = []
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda values, src: broadcasts.append((values[:], src)))
+
+    def prepare(config, rank):
+        return cache._ACTIVE_ATTEMPT.get()
+
+    options = {} if distributed is None else {"distributed": distributed}
+    decorated = cache.record_conversion_preparation_failure(heartbeat=False, **options)(prepare)
+    attempt, fresh = decorated(SimpleNamespace(weight_conversion_cache_dir=tmp_path), rank=0)
+    if distributed is True:
+        assert broadcasts == [([attempt], 0)]
+        assert attempt and fresh
+    else:
+        assert broadcasts == []
+        assert (attempt, fresh) == (None, False)
+    assert cache._ACTIVE_ATTEMPT.get() is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_pre_cache_preparation_failure_reaches_shared_waiters(monkeypatch, tmp_path):
     from arctic_platform.model.implementations.moe import conversion_cache
 

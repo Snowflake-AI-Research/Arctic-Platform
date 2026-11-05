@@ -251,7 +251,7 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
-@record_conversion_preparation_failure(heartbeat=False)
+@record_conversion_preparation_failure(distributed=True, heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     """Collectively load weights; every rank in the default process group must call.
 

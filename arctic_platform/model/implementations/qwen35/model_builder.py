@@ -510,7 +510,7 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
-@record_conversion_preparation_failure(heartbeat=False)
+@record_conversion_preparation_failure(distributed=True, heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     """Collectively load weights; every rank in the default process group must call.
 
