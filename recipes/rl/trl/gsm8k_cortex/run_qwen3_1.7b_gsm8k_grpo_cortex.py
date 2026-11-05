@@ -1,6 +1,19 @@
 #!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """TRL async-GRPO on Cortex. CPU-only driver; Cortex owns the GPUs.
 
 ZoRRo is off. ``ArcticRLClient`` is built with ``CortexConfig`` from
@@ -25,7 +38,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import torch
+import torch  # noqa: E402
 
 MAX_TOKEN_LEN_PER_GPU = int(os.environ.get("MAX_TOKEN_LEN_PER_GPU", "16384"))
 
@@ -67,16 +80,23 @@ def cortex_backend():
     endpoint = os.environ.get("ARCTIC_CORTEX_ENDPOINT", "cortex-training")
     pat = os.environ.get("ARCTIC_CORTEX_PAT")
     if not (host and database and schema and pat):
-        raise SystemExit(
-            "Set ARCTIC_CORTEX_HOST, ARCTIC_CORTEX_DATABASE, ARCTIC_CORTEX_SCHEMA, "
-            "and ARCTIC_CORTEX_PAT"
-        )
+        raise SystemExit("Set ARCTIC_CORTEX_HOST, ARCTIC_CORTEX_DATABASE, ARCTIC_CORTEX_SCHEMA, and ARCTIC_CORTEX_PAT")
     return CortexConfig(host=host, database=database, schema=schema, endpoint=endpoint, pat=pat)
 
 
-def build_client(model: str, *, max_seq_len: int, response_len: int, rollout_n: int,
-                 ckpt_dir: str, training_gpus: int, sampling_gpus: int,
-                 tensor_parallel_size: int, seed: int, grad_accum_steps: int = 1):
+def build_client(
+    model: str,
+    *,
+    max_seq_len: int,
+    response_len: int,
+    rollout_n: int,
+    ckpt_dir: str,
+    training_gpus: int,
+    sampling_gpus: int,
+    tensor_parallel_size: int,
+    seed: int,
+    grad_accum_steps: int = 1,
+):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
     from arctic_platform.client.config import SamplingConfig
@@ -127,8 +147,7 @@ def build_client(model: str, *, max_seq_len: int, response_len: int, rollout_n: 
                 # Match C2 on-prem (GPU_MEM_UTIL / VLLM_ENFORCE_EAGER / VLLM_PREFIX_CACHING).
                 "gpu_memory_utilization": float(os.environ.get("GPU_MEM_UTIL", "0.7")),
                 "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
-                "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1")
-                not in ("0", "false", "False"),
+                "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False"),
             }
         ),
         backend=cortex_backend(),
@@ -136,8 +155,9 @@ def build_client(model: str, *, max_seq_len: int, response_len: int, rollout_n: 
     return ArcticRLClient(cfg)
 
 
-def make_trainer(*, model, args, train_dataset, processing_class, rollout_worker, weight_transfer,
-                 arctic_client, cortex_bridge):
+def make_trainer(
+    *, model, args, train_dataset, processing_class, rollout_worker, weight_transfer, arctic_client, cortex_bridge
+):
     from arctic_trl_cortex.upstream import make_trainer_class
 
     return make_trainer_class()(
@@ -159,31 +179,43 @@ def main() -> None:
     ap.add_argument("--num-train-epochs", type=float, default=float(os.environ.get("NUM_TRAIN_EPOCHS", "1")))
     ap.add_argument("--num-generations", type=int, default=int(os.environ.get("NUM_GEN", "8")))
     ap.add_argument("--per-device-bsz", type=int, default=int(os.environ.get("PER_DEVICE_BSZ", "8")))
-    ap.add_argument("--grad-accum", type=int, default=int(os.environ.get("GRAD_ACCUM", "1")),
-                    help="DeepSpeed engine GAS. TRL trainer GAS stays 1.")
+    ap.add_argument(
+        "--grad-accum",
+        type=int,
+        default=int(os.environ.get("GRAD_ACCUM", "1")),
+        help="DeepSpeed engine GAS. TRL trainer GAS stays 1.",
+    )
     ap.add_argument("--max-completion-length", type=int, default=int(os.environ.get("MAX_COMPLETION_LEN", "256")))
     ap.add_argument("--max-seq-len", type=int, default=int(os.environ.get("MAX_SEQ_LEN", "1024")))
     ap.add_argument("--num-prompts", type=int, default=int(os.environ.get("NUM_PROMPTS", "-1")))
     ap.add_argument("--training-gpus", type=int, default=int(os.environ.get("TRAINING_GPUS", "1")))
     ap.add_argument("--sampling-gpus", type=int, default=int(os.environ.get("SAMPLING_GPUS", "1")))
     ap.add_argument("--tensor-parallel", type=int, default=int(os.environ.get("TENSOR_PARALLEL", "1")))
-    ap.add_argument("--old-logprobs-source", choices=("trainer", "sampler"),
-                    default=os.environ.get("OLD_LOGPROBS_SOURCE", "sampler"))
+    ap.add_argument(
+        "--old-logprobs-source",
+        choices=("trainer", "sampler"),
+        default=os.environ.get("OLD_LOGPROBS_SOURCE", "sampler"),
+    )
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     ap.add_argument("--max-staleness", type=int, default=int(os.environ.get("MAX_STALENESS", "0")))
     ap.add_argument("--max-inflight-tasks", type=int, default=int(os.environ.get("MAX_INFLIGHT_TASKS", "-1")))
-    ap.add_argument("--metrics-out", default=os.environ.get(
-        "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_trl_cortex.json")))
+    ap.add_argument(
+        "--metrics-out",
+        default=os.environ.get(
+            "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_trl_cortex.json")
+        ),
+    )
     args = ap.parse_args()
 
+    from arctic_trl_cortex.rollout import ArcticRolloutWorker
+    from arctic_trl_cortex.upstream import CortexModelBridge
     from datasets import load_dataset
     from transformers import AutoConfig
     from transformers import AutoTokenizer
-    from arctic_trl_cortex.rollout import ArcticRolloutWorker
-    from arctic_trl_cortex.upstream import CortexModelBridge
-    from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
     from trl.experimental.async_grpo import AsyncGRPOConfig
     from trl.rewards import accuracy_reward
+
+    from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
 
     chat_template_kwargs = {"enable_thinking": False}
     raw_group_batch = int(os.environ.get("ROLLOUT_GROUP_BATCH", "16"))
@@ -191,11 +223,14 @@ def main() -> None:
     gpu_mem = float(os.environ.get("GPU_MEM_UTIL", "0.7"))
     enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False")
     prefix_cache = os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False")
-    print(f"[e2e] cortex TRL GRPO model={args.model} {args.training_gpus}T+{args.sampling_gpus}S "
-          f"max_steps={args.max_steps} epochs={args.num_train_epochs} old_logprobs={args.old_logprobs_source} "
-          f"generate_group_batch={generate_group_batch} ds_gas={args.grad_accum} trl_gas=1 "
-          f"max_token_len_per_gpu={MAX_TOKEN_LEN_PER_GPU} gpu_mem={gpu_mem} "
-          f"enforce_eager={enforce_eager} prefix_cache={prefix_cache}", flush=True)
+    print(
+        f"[e2e] cortex TRL GRPO model={args.model} {args.training_gpus}T+{args.sampling_gpus}S "
+        f"max_steps={args.max_steps} epochs={args.num_train_epochs} old_logprobs={args.old_logprobs_source} "
+        f"generate_group_batch={generate_group_batch} ds_gas={args.grad_accum} trl_gas=1 "
+        f"max_token_len_per_gpu={MAX_TOKEN_LEN_PER_GPU} gpu_mem={gpu_mem} "
+        f"enforce_eager={enforce_eager} prefix_cache={prefix_cache}",
+        flush=True,
+    )
     print(f"[e2e] client torch.cuda.is_available()={torch.cuda.is_available()}", flush=True)
     patch_cortex_transport_pr55()
 
@@ -206,10 +241,14 @@ def main() -> None:
     try:
         client = build_client(
             args.model,
-            max_seq_len=args.max_seq_len, response_len=args.max_completion_length,
-            rollout_n=args.num_generations, ckpt_dir=ckpt,
-            training_gpus=args.training_gpus, sampling_gpus=args.sampling_gpus,
-            tensor_parallel_size=args.tensor_parallel, seed=args.seed,
+            max_seq_len=args.max_seq_len,
+            response_len=args.max_completion_length,
+            rollout_n=args.num_generations,
+            ckpt_dir=ckpt,
+            training_gpus=args.training_gpus,
+            sampling_gpus=args.sampling_gpus,
+            tensor_parallel_size=args.tensor_parallel,
+            seed=args.seed,
             grad_accum_steps=args.grad_accum,
         )
         print(f"[e2e] client ready; jobs={client.jobs}", flush=True)
@@ -233,8 +272,7 @@ def main() -> None:
             horizon = max(args.max_staleness, 1)
             max_inflight = horizon * args.per_device_bsz * args.grad_accum * world
         print(
-            f"[e2e] max_staleness={args.max_staleness} max_inflight_tasks={max_inflight} "
-            f"world={world}",
+            f"[e2e] max_staleness={args.max_staleness} max_inflight_tasks={max_inflight} world={world}",
             flush=True,
         )
 
@@ -274,9 +312,14 @@ def main() -> None:
             max_token_len_per_gpu=MAX_TOKEN_LEN_PER_GPU,
         )
         rollout_worker = ArcticRolloutWorker(
-            client, dataset, accuracy_reward, tokenizer,
-            num_generations=args.num_generations, max_tokens=args.max_completion_length,
-            temperature=1.0, queue_maxsize=args.per_device_bsz * 8,
+            client,
+            dataset,
+            accuracy_reward,
+            tokenizer,
+            num_generations=args.num_generations,
+            max_tokens=args.max_completion_length,
+            temperature=1.0,
+            queue_maxsize=args.per_device_bsz * 8,
             chat_template_kwargs=chat_template_kwargs,
             old_logprobs_source=args.old_logprobs_source,
             pad_token_id=tokenizer.pad_token_id or 0,
@@ -286,8 +329,13 @@ def main() -> None:
         weight_transfer = ArcticWeightTransfer(client)
 
         trainer = make_trainer(
-            model=stub_model, args=config, train_dataset=dataset, processing_class=tokenizer,
-            rollout_worker=rollout_worker, weight_transfer=weight_transfer, arctic_client=client,
+            model=stub_model,
+            args=config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            rollout_worker=rollout_worker,
+            weight_transfer=weight_transfer,
+            arctic_client=client,
             cortex_bridge=cortex_bridge,
         )
 
