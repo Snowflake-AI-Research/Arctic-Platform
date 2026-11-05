@@ -84,21 +84,18 @@ def test_clip_scale_exact(request, profile, baseline_step, record):
 
 
 @pytest.mark.audit_check(LANDS)
-def test_update_lands_at_launch_lr(profile, reference, step_launch_lr, record):
-    ref, step = require_ok(reference, "local reference"), require_ok(step_launch_lr, "training job step at launch lr")
+def test_update_lands_at_launch_lr(profile, step_launch_lr, record):
+    step = require_ok(step_launch_lr, "training job step at launch lr")
     allowed = profile.expect.get("no_grad_params", [])
-    update = step.get("master_update") or step["update"]
     moved = expected = 0
     per_tensor = []
-    for name, grad in ref["fp32_grads"].items():
-        if audit_lib.matches(allowed, name) or name not in update:
+    for name, (should, did) in step["landing"].items():
+        if audit_lib.matches(allowed, name):
             continue
-        should = grad != 0
-        did = update[name] != 0
-        expected += int(should.sum())
-        moved += int((did & should).sum())
-        if int(should.sum()):
-            per_tensor.append((float((did & should).sum()) / float(should.sum()), name))
+        expected += should
+        moved += did
+        if should:
+            per_tensor.append((did / should, name))
     per_tensor.sort()
     lost = 1.0 - moved / max(expected, 1)
     record(lr=step["lr"], lost_fraction=lost, least_moved=[(n, round(f, 4)) for f, n in per_tensor[:15]])

@@ -87,14 +87,18 @@ reproduced it outside the suite.
 
 Checks that need state the client does not expose skip as coverage gaps (the LM head's input gradient, the config
 class the service's loader resolves, the optimizer implementation). The service also rejects requests with fewer
-rows than data-parallel ranks, so layout jobs send only the full batch.
+rows than data-parallel ranks: short-row requests carry one row per rank, layout jobs send only the full batch, and
+on a data-parallel launch the checks that need a row alone in its request skip.
 
 The reference runs locally on the real checkpoint, one GPU: the model's transformers class, or for a model
 transformers does not implement the checkpoint's own inference code (`reference: deepseek_inference` runs the
 `inference/model.py` DeepSeek ships, with its tilelang kernels replaced by torch and activation quantization off).
 Check any new kernel stand-in against the real kernel before trusting the reference. Checks whose fp32 reference
 (weights, gradients and accumulators, about 16 bytes per parameter) does not fit one local GPU skip with that
-reason; say so in the report rather than scaling the reference down.
+reason; say so in the report rather than scaling the reference down. The checks that read only the service still
+run: the job config and loader, determinism, short rows, gradient coverage, the export, AdamW agreement, the clip
+norm and coefficient, update loss at the launch lr (against the service's own gradient), frozen parameters and
+sampler repeatability.
 
 The baseline job is the catalog's launch config as the service runs it. A layout the service cannot build is a
 finding about the service or the catalog, not a harness artifact, but check the catalog's conventions first (e.g.
@@ -238,7 +242,8 @@ model:
   false positive; resolve which before moving on.
 - If it fails on this model, add `known_issues: {<check id>: {issue: <ISSUE.md URL>, summary: ...}}` to the profile.
   That turns it into a strict xfail, so the check starts failing (XPASS) the day the fix lands, until the entry is
-  removed. Only xfail a deterministic failure; a crash that depends on free memory or timing would flap, so let it
+  removed. Only a failed assertion counts as the known issue: a probe that fails before any comparison still fails.
+  Only xfail a deterministic failure; a crash that depends on free memory or timing would flap, so let it
   fail and record it. Key it `<check id>[<variant>]` (e.g. `parallel.gradients_match_reference[ep1-sp2]`) when only one
   parametrization fails.
 - `not_applicable` needs a reason that is about the model, not about the harness.

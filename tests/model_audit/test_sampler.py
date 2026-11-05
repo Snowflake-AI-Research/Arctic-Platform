@@ -26,6 +26,7 @@ from pathlib import Path
 import audit_lib
 import pytest
 import torch
+from conftest import ISOLATION_GAP
 from conftest import launch_tp
 from conftest import require_ok
 
@@ -89,6 +90,8 @@ def _against(profile, ref, actual_per_row, expected_packed, record, label):
 def test_matches_trainer(profile, reference, trainer_forward, sampler_run, record):
     ref, fwd = require_ok(reference, "local reference"), require_ok(trainer_forward, "training job")
     sampler = require_ok(sampler_run, "sampler")
+    if "isolated_logprobs" not in fwd:
+        pytest.skip(ISOLATION_GAP)
     trainer_packed = torch.cat(fwd["isolated_logprobs"]).unsqueeze(0)
     _against(profile, ref, sampler["alone"], trainer_packed, record, "sampler_vs_trainer")
 

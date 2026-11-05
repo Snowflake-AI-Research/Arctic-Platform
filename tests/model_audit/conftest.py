@@ -115,7 +115,9 @@ def pytest_collection_modifyitems(config, items):
             continue
         issue = _profile_entry(profile.known_issue, check, variant)
         if issue:
-            item.add_marker(pytest.mark.xfail(strict=True, reason=f"{issue.get('issue')} {issue.get('summary', '')}"))
+            # Only a failed comparison is the known issue; a probe that fails first (pytest.fail) still fails.
+            reason = f"{issue.get('issue')} {issue.get('summary', '')}"
+            item.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason=reason))
         gpus = item.get_closest_marker("audit_gpus")
         if gpus and torch.cuda.device_count() < gpus.args[0]:
             item.add_marker(pytest.mark.skip(reason=f"needs {gpus.args[0]} GPU(s); have {torch.cuda.device_count()}"))
@@ -302,14 +304,21 @@ class ProbeRunner:
         return result
 
     def reference(self, profile, ckpt: Path) -> dict:
-        if not torch.cuda.is_available():
-            pytest.skip("the local reference needs a GPU")
-        # fp32 weights, gradients and two gradient accumulators, from a checkpoint stored in the launch dtype.
-        params = audit_lib.checkpoint_bytes(ckpt) / torch.finfo(getattr(torch, profile.dtype)).bits * 8
-        need, have = params * 16, torch.cuda.get_device_properties(0).total_memory
-        if need > 0.8 * have:
-            pytest.skip(f"the fp32 reference needs ~{need / 2**30:.0f} GiB, more than one local GPU has")
+        reason = reference_unavailable(profile, ckpt)
+        if reason:
+            pytest.skip(reason)
         return self.run("reference", profile, ckpt, name=Path(ckpt).name)
+
+
+def reference_unavailable(profile, ckpt: Path) -> str | None:
+    if not torch.cuda.is_available():
+        return "the local reference needs a GPU"
+    # fp32 weights, gradients and two gradient accumulators, from a checkpoint stored in the launch dtype.
+    params = audit_lib.checkpoint_bytes(ckpt) / torch.finfo(getattr(torch, profile.dtype)).bits * 8
+    need, have = params * 16, torch.cuda.get_device_properties(0).total_memory
+    if need > 0.8 * have:
+        return f"the fp32 reference needs ~{need / 2**30:.0f} GiB, more than one local GPU has"
+    return None
 
 
 @pytest.fixture(scope="session")
@@ -335,6 +344,9 @@ def reference(probes, profile, model_ckpt):
 
 
 _CLIENT_TIMEOUT = 4 * 3600
+ISOLATION_GAP = (
+    "coverage gap: a data-parallel job rejects requests with fewer rows than ranks, so rows never run alone"
+)
 FORCED_CLIP = 1e-3
 
 
@@ -414,8 +426,9 @@ class ClientJobs:
             run = self.get(name)
             self.steps[name] = run
             if run.get("status", {}).get("ok"):
+                keep = reference_unavailable(self.profile, self.ckpt) is None
                 self.steps[name] = {
-                    **audit_lib.client_step(self.profile, run),
+                    **audit_lib.client_step(self.profile, run, keep_tensors=keep),
                     "status": run["status"],
                     "_log": run["_log"],
                 }
@@ -439,6 +452,12 @@ def client_baseline(client):
     return client.get("baseline")
 
 
+def _checkpoint_buffers(resumable: Path) -> set[str]:
+    """The buffers a DeepSpeed checkpoint records: exported with the weights, but never trained."""
+    states = next(resumable.glob("*mp_rank_00_model_states.pt"))
+    return set(torch.load(states, map_location="cpu", weights_only=False, mmap=True).get("buffer_names", []))
+
+
 @pytest.fixture(scope="session")
 def trainer_forward(client_baseline):
     run = client_baseline
@@ -446,12 +465,14 @@ def trainer_forward(client_baseline):
         return run
     norms = run["step"]["reply"].get("gradient_norms_per_param") or {}
     exported = audit_lib.read_checkpoint_tensors(Path(run["exports"]["initial"]))
+    buffers = _checkpoint_buffers(Path(run["exports"]["resumable"]))
     return {
         **run["forward"],
         "loader": run["job"]["training"]["training_config"].get("model_provider"),
         "spec": run["job"]["training"],
         "exported": exported,
-        "no_grad_params": sorted(n for n in exported if not norms.get(n)),
+        "buffers": sorted(buffers),
+        "no_grad_params": sorted(n for n in exported if n not in buffers and not norms.get(n)),
         "nonfinite_grad_params": sorted(
             n for n, v in norms.items() if v is None or not torch.isfinite(torch.tensor(v))
         ),

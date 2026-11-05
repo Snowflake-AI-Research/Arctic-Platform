@@ -21,8 +21,9 @@ dict to ``--out``; exported checkpoints are downloaded into the directory of the
 Phases, each run when the body has the sub-job it needs:
 
 - trainer forward: all rows in one request and again; with ``--forwards all`` also in reverse order, each alone,
-  and two-row requests whose second row has 1..8 tokens (a data-parallel job rejects requests with fewer rows than
-  ranks, so the layout jobs send only the full batch);
+  and requests whose last row has 1..8 tokens. A data-parallel job rejects requests with fewer rows than ranks, so
+  the short-row requests carry at least one row per rank, the rows are sent alone only without data parallelism,
+  and the layout jobs send only the full batch;
 - step: a weights-only export, one forward/backward and step at ``--lr`` (the step reports per-parameter gradient
   norms), then weights-only and resumable exports;
 - sampler: prompt log-probs of each row alone, again, and of all rows in one request; with a training sub-job, then
@@ -44,6 +45,7 @@ import time
 import traceback
 import urllib.request
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -167,14 +169,16 @@ class Job:
         if dest.exists():
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
-        fetched = []
-        for item in exported["files"]:
-            if suffixes is None or item["filename"].endswith(suffixes):
-                target = dest / Path(item["filename"]).name
-                urllib.request.urlretrieve(item["url"], target)
-                fetched.append(target.name)
+        wanted = [i for i in exported["files"] if suffixes is None or i["filename"].endswith(suffixes)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            fetched = list(pool.map(lambda i: self._fetch(i["url"], dest / Path(i["filename"]).name), wanted))
         self.log(f"{checkpoint_type} checkpoint {new[0]['checkpoint_id']}: fetched {len(fetched)} file(s) to {dest}")
         return {"saved": _without_urls(saved), "files": _without_urls(exported["files"]), "path": str(dest)}
+
+    @staticmethod
+    def _fetch(url: str, target: Path) -> str:
+        urllib.request.urlretrieve(url, target)
+        return target.name
 
     def generate(self, rows: list[list[int]]) -> list[torch.Tensor]:
         params = {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": 0, "logprobs": 0}
@@ -205,20 +209,27 @@ def _status(fn) -> str:
 
 def run(profile, ckpt: str, body: dict, lr: float, sync_formats: list[str], forwards: str, out_dir: Path, log) -> dict:
     _, rows, pad = audit_lib.probe_inputs(profile, ckpt)
+    training = next((s for s in body["sub_job_configs"] if s["job_type"] == "training"), None)
+    dp = audit_lib.data_parallel_size(training) if training else 1
+    if len(rows) < dp:
+        raise ValueError(f"{len(rows)} audit rows cannot fill a request to {dp} data-parallel ranks")
     job = Job(connect(), body, log)
     result: dict = {"job": {"id": job.id, **{k: v for k, v in job.subs.items()}}, "rows": rows}
     try:
         if "training" in job.subs:
             fwd = {
+                "labels": audit_lib.pack_rows(rows, pad)[2],
                 "packed_logprobs": audit_lib.pack_logprobs(rows, job.forward(rows), pad),
                 "repeat_logprobs": audit_lib.pack_logprobs(rows, job.forward(rows), pad),
             }
             if forwards == "all":
                 reversed_rows = list(reversed(rows))
                 fwd["reversed_logprobs"] = audit_lib.pack_logprobs(reversed_rows, job.forward(reversed_rows), pad)
-                fwd["isolated_logprobs"] = [job.forward([row])[0] for row in rows]
+                if dp == 1:
+                    fwd["isolated_logprobs"] = [job.forward([row])[0] for row in rows]
+                company = rows[1 : max(dp, 2)]
                 fwd["short_rows"] = {
-                    n: _status(lambda n=n: job.forward([rows[1], rows[0][:n]])) for n in audit_lib.SHORT_ROW_LENGTHS
+                    n: _status(lambda n=n: job.forward(company + [rows[0][:n]])) for n in audit_lib.SHORT_ROW_LENGTHS
                 }
             result["forward"] = fwd
             log("trainer forwards done")

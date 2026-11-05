@@ -12,27 +12,11 @@ probe:
   thresholds:
     - {name: sliding_window, position: 1024, reason: "sliding layers stop attending to keys more than sliding_window back"}
 
-tolerances:
-  # Fresh engines on the same weights settle into one of a few numeric states up to 0.004 apart (each exactly
-  # repeatable), so one replica can match the reference and measure 0.
-  engine_noise: 0.004
-
 expect:
   loader: huggingface
   no_grad_params:
     - {pattern: "vision_tower\\.|embed_vision\\.", reason: "text-only RL does not run the vision tower"}
 
-known_issues:
-  trainer.export_round_trip:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/399
-    summary: >-
-      the generic (no family contract) complete HF export walks named_parameters only, so it drops the persistent
-      layer_scalar buffer of every decoder layer (the MoE contract exports buffers). A checkpoint written from it
-      loads with 1.0 there; the real model's values span 0.036-0.99
-  optimizer.clip_scale_exact:
-    issue: https://github.com/deepspeedai/DeepSpeed/pull/8970
-    summary: >-
-      with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
-      with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.30% low here, up to 0.39%)
+known_issues: {}
 
 not_applicable: {}

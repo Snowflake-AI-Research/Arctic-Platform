@@ -23,6 +23,7 @@ from __future__ import annotations
 import audit_lib
 import pytest
 import torch
+from conftest import ISOLATION_GAP
 from conftest import client_job
 from conftest import require_ok
 
@@ -126,9 +127,9 @@ def test_logprobs_match_reference(profile, reference, trainer_forward, record):
 
 
 @pytest.mark.audit_check(DETERMINISTIC)
-def test_deterministic(profile, reference, trainer_forward, record):
-    ref, fwd = require_ok(reference, "local reference"), require_ok(trainer_forward, "training job")
-    mask = ref["labels"] != -100
+def test_deterministic(profile, trainer_forward, record):
+    fwd = require_ok(trainer_forward, "training job")
+    mask = fwd["labels"] != -100
     err = audit_lib.logprob_errors(fwd["repeat_logprobs"], fwd["packed_logprobs"], mask)
     record(**err)
     assert err["max_abs"] <= float(profile.tolerances.get("determinism_atol", 0.0)), err
@@ -152,6 +153,8 @@ def _per_row(profile, rows, packed, other, floor, fp32, record, label):
 @pytest.mark.audit_check(PACKED)
 def test_packed_rows_isolated(profile, reference, trainer_forward, record):
     ref, fwd = require_ok(reference, "local reference"), require_ok(trainer_forward, "training job")
+    if "isolated_logprobs" not in fwd:
+        pytest.skip(ISOLATION_GAP)
     _per_row(
         profile,
         ref["rows"],

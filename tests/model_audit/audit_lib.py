@@ -96,7 +96,6 @@ class Profile:
             "adamw_mismatch_fraction": 1e-3,
             "max_lost_update_fraction": 0.5,
             "grad_norm_rel": 1e-4,
-            "engine_noise": 0.0,
         }
         return {**defaults, **self.raw.get("tolerances", {})}
 
@@ -144,7 +143,12 @@ class Profile:
             sub_jobs.append(sub)
         if sampling is not None:
             sub_jobs.append(_deep_merge(self.launch_sampling(), sampling))
-        return {"hardware": self.client.get("hardware", "H200"), "sub_job_configs": sub_jobs}
+        return {
+            "hardware": self.client.get("hardware", "H200"),
+            # The probe makes no calls while it downloads an export, which takes over 30 minutes at 30B parameters.
+            "idle_timeout_seconds": int(self.client.get("idle_timeout_seconds", 7200)),
+            "sub_job_configs": sub_jobs,
+        }
 
     def optimizer(self, lr: float | None = None) -> dict:
         """The launch optimizer; ``lr`` overrides the learning rate (the direction check uses a visible one)."""
@@ -249,8 +253,8 @@ def read_checkpoint_tensors(path: Path) -> dict:
     return tensors
 
 
-def zero_checkpoint(path: Path) -> dict:
-    """fp32 master weights and Adam moments of a DeepSpeed ZeRO-1/2 checkpoint, merged across ranks, by name."""
+def zero_checkpoint(path: Path, kinds: tuple[str, ...] = ("masters", "exp_avg")) -> dict:
+    """fp32 master weights and Adam moments (``kinds``) of a DeepSpeed ZeRO-1/2 checkpoint, merged across ranks."""
     import torch
 
     path = Path(path)
@@ -261,7 +265,7 @@ def zero_checkpoint(path: Path) -> dict:
         key=lambda f: int(re.search(r"zero_pp_rank_(\d+)_", f.name).group(1)),
     )
     assert rank_files, f"{path} holds no ZeRO optimizer partitions"
-    pieces: dict[str, dict[str, list]] = {"masters": {}, "exp_avg": {}, "exp_avg_sq": {}}
+    pieces: dict[str, dict[str, list]] = {kind: {} for kind in kinds}
     hyper = None
     for file in rank_files:
         state = torch.load(file, map_location="cpu", weights_only=False)["optimizer_state_dict"]
@@ -274,19 +278,24 @@ def zero_checkpoint(path: Path) -> dict:
                 "exp_avg_sq": base["state"][group]["exp_avg_sq"],
             }
             for name, fragment in mapping.items():
-                for kind, flat in flats.items():
-                    pieces[kind].setdefault(name, []).append(flat[fragment.start : fragment.start + fragment.numel])
+                for kind in kinds:
+                    # A copy, so the rank's flat partition is freed once read.
+                    piece = flats[kind][fragment.start : fragment.start + fragment.numel].clone()
+                    pieces[kind].setdefault(name, []).append(piece)
         del state
     names = {name: shape for group in shapes for name, shape in group.items()}
-    out = {
-        kind: {n: torch.cat(parts).view(names[n]) for n, parts in by_name.items()} for kind, by_name in pieces.items()
-    }
+    out = {kind: {n: torch.cat(pieces[kind].pop(n)).view(names[n]) for n in list(pieces[kind])} for kind in kinds}
     return {**out, "hyper": hyper}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------------------------------------------------
+
+
+def data_parallel_size(training_sub_job: dict) -> int:
+    cfg = training_sub_job.get("training_config", {})
+    return max(1, int(cfg.get("n_gpus", 1)) // int(cfg.get("sp_size", 1)))
 
 
 def thresholds(profile: Profile, config: dict) -> list[dict]:
@@ -409,11 +418,12 @@ def adamw_agreement(before, after, grads, opt: dict, lowp, clip: float, grad_dty
     return out
 
 
-def client_step(profile: Profile, run: dict) -> dict:
+def client_step(profile: Profile, run: dict, keep_tensors: bool = True) -> dict:
     """What one service step did, from the step reply and the weights-only and resumable exports around it.
 
     ZeRO keeps Adam's first moment in fp32, and after one step it is ``(1 - beta1)`` times the clipped gradient the
     optimizer consumed; dividing by the clip coefficient of the norm the engine reported gives the reduced gradient.
+    Without ``keep_tensors`` only per-tensor summaries are kept (the per-element tensors feed reference comparisons).
     """
     import torch
 
@@ -422,33 +432,52 @@ def client_step(profile: Profile, run: dict) -> dict:
     after = read_checkpoint_tensors(Path(exports["after_step"]))
     zero = zero_checkpoint(Path(exports["resumable"]))
     hyper = zero["hyper"]
-    consumed = {n: m / (1 - hyper["betas"][0]) for n, m in zero["exp_avg"].items()}
     norms = reply.get("gradient_norms_per_param") or {}
     max_norm = float(run["job"]["training"]["training_config"].get("gradient_clipping") or 0.0)
     clip_norm = reply.get("grad_norm")
     exact = clip_coefficient(float(clip_norm), max_norm) if clip_norm is not None else 1.0
     reduced_norm = math.sqrt(sum(float(v) ** 2 for v in norms.values())) if norms else None
-    consumed_norm = math.sqrt(sum(float(g.double().pow(2).sum()) for g in consumed.values()))
     opt = {"lr": float(run["step"]["lr"]), "eps": hyper["eps"], "weight_decay": hyper["weight_decay"]}
     lowp = getattr(torch, profile.dtype)
+    trained = sorted(zero["exp_avg"])
+    consumed_sq, agreement, landing = 0.0, {}, {}
+    reduced, update, master_update = {}, {}, {}
+    for name in trained:
+        grad = zero["exp_avg"].pop(name).div_(1 - hyper["betas"][0])
+        master = zero["masters"].pop(name, None)
+        consumed_sq += float(grad.double().pow(2).sum())
+        agreement.update(adamw_agreement(before, after, {name: grad}, opt, lowp, 1.0, torch.float32))
+        if name in before:
+            w0 = before[name].float()
+            stored = after[name].float() - w0 if name in after else None
+            moved = master - w0 if master is not None else stored
+            if moved is not None:
+                should = grad != 0
+                landing[name] = (int(should.sum()), int((should & (moved != 0)).sum()))
+            if keep_tensors and stored is not None:
+                update[name] = stored
+            if keep_tensors and master is not None:
+                master_update[name] = moved
+        if keep_tensors:
+            reduced[name] = grad / exact
+    frozen = sorted(set(before) - set(trained))
     return {
         "lr": opt["lr"],
         "loss": run["step"].get("loss"),
         "packed_logprobs": run["forward"]["packed_logprobs"],
-        "reduced_grads": {n: g / exact for n, g in consumed.items()},
+        "reduced_grads": reduced if keep_tensors else None,
         "gradient_norms_per_param": norms,
-        "update": {n: after[n].float() - before[n].float() for n in after if n in before},
-        "master_update": {n: w - before[n].float() for n, w in zero["masters"].items() if n in before},
-        "frozen_params": sorted(set(before) - set(consumed)),
-        "frozen_changed": sorted(
-            n for n in set(before) - set(consumed) if n in after and not torch.equal(after[n], before[n])
-        ),
+        "update": update if keep_tensors else None,
+        "master_update": master_update if keep_tensors else None,
+        "landing": landing,
+        "frozen_params": frozen,
+        "frozen_changed": [n for n in frozen if n in after and not torch.equal(after[n], before[n])],
         "gradient_clipping": max_norm,
         "clip_norm": None if clip_norm is None else float(clip_norm),
         "reduced_grad_norm": reduced_norm,
         "clip_coefficients": {"exact": exact, "grad_dtype": float(torch.tensor(exact).to(lowp))},
-        "clip_applied_measured": consumed_norm / reduced_norm if reduced_norm else None,
-        "adamw_agreement": adamw_agreement(before, after, consumed, opt, lowp, 1.0, torch.float32),
+        "clip_applied_measured": math.sqrt(consumed_sq) / reduced_norm if reduced_norm else None,
+        "adamw_agreement": agreement,
         "optimizer_hyper": hyper,
     }
 
