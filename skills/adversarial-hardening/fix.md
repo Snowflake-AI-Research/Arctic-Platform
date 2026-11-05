@@ -15,7 +15,7 @@ Keep `PR_DESCRIPTION.md` at this clone’s root current for **this** group only.
 ## Tests (required)
 
 1. Re-run the **same** repro tests. They must pass now, and fail if the fix is reverted.
-2. Run the **existing** suite for the touched tree (CPU here; GPU / HTTP / Ray / DeepSpeed via autorun). Follow [../test-writing/SKILL.md](../test-writing/SKILL.md).
+2. Run the **existing** suite for the touched tree (CPU here; GPU / on-prem Ray CUDA e2e / DeepSpeed via autorun; Cortex server claims against a live endpoint). Follow [../test-writing/SKILL.md](../test-writing/SKILL.md).
 
 A green repro test with a red neighbor is not done.
 
@@ -45,6 +45,6 @@ A fix is new code. Run [probe.md](probe.md) on **this group’s** fix diff — i
 
 ## Real-contract gate
 
-Before calling this group done: one run against a real server or the real CUDA kernel when the finding is a kernel / HTTP / Ray / DeepSpeed hole (autorun — resolve root and host from [SKILL.md](SKILL.md) Paths). A green mock/unit is not enough.
+Before calling this group done: one run against a real server or the real CUDA kernel when the finding is a kernel / Cortex server / Ray / DeepSpeed hole (GPU autorun, or a client against a live Cortex endpoint — resolve runtime paths from [SKILL.md](SKILL.md) Paths). A green mock/unit is not enough.
 
 Do not commit or push unless the operator asks.

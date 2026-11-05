@@ -29,8 +29,8 @@ Shipped tests follow [../test-writing/SKILL.md](../test-writing/SKILL.md). `#N` 
 Resolve checkout and autorun from [SKILL.md](SKILL.md) Paths (this clone’s root). Do not hardcode a clone path or GPU hostname.
 
 - CPU routing / wire / client tests here (cwd = this clone).
-- Kernel / HTTP / Ray e2e / DeepSpeed: autorun on the GPU box. Local `import` / `pip list` / mtimes are the CPU node.
-- Client often has `CUDA_VISIBLE_DEVICES=` empty; the server has the GPUs. A CPU-client torch fallback does not prove the CUDA kernel.
+- Kernel / on-prem Ray CUDA e2e / DeepSpeed: autorun on the GPU box. Local `import` / `pip list` / mtimes do not establish the GPU worker's runtime.
+- On-prem Ray runs in the client process: retain the harness-assigned GPU visibility in its subprocess. Remote Cortex HTTP e2e may use a CPU client, but must reach a live GPU-backed endpoint to validate server behavior. CPU torch fallbacks and mocked endpoints do not prove the CUDA kernel; see [test-writing](../test-writing/SKILL.md#cpu-tests-vs-gpu-tests).
 
 Hand the **failing** repro tests to [fix.md](fix.md) **on this same clone**. Update `PROBE_REPRO_TESTS.md` with the real test path and “repro test failed on current code” once each test has run.
 

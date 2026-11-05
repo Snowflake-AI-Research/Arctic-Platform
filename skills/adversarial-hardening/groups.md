@@ -84,7 +84,7 @@ Work-unit index `k` is 1 for the first group you start, 2 for the next, and so o
 
 `Where` is the **start** of each hole (function or block). Multiple `file:line` when the hole spans files or distant areas in one file — not a dump of every touched line.
 
-**Repro plan** must name: (1) the **correct** contract the test asserts, (2) `tests/…/file.py::Class.test_name` (create or extend), (3) where it runs (CPU pytest in this clone vs autorun for kernel / HTTP / Ray / DeepSpeed), (4) why it **fails** on current `main`, (5) which **existing** suite you re-run after the fix. Follow [../test-writing/SKILL.md](../test-writing/SKILL.md). Copy this into `PROBE_REPRO_TESTS.md` on the group clone — do not invent a second plan.
+**Repro plan** must name: (1) the **correct** contract the test asserts, (2) `tests/…/file.py::Class.test_name` (create or extend), (3) where it runs (CPU pytest here, GPU autorun for kernel / on-prem Ray CUDA e2e / DeepSpeed, or a client against a live Cortex endpoint), (4) why it **fails** on current `main`, (5) which **existing** suite you re-run after the fix. Follow [../test-writing/SKILL.md](../test-writing/SKILL.md). Copy this into `PROBE_REPRO_TESTS.md` on the group clone — do not invent a second plan.
 
 **Related issues, same group** (same contract or same hunk). One Problem / Where / Repro plan per issue (`kA`, `kB`, …). A combined fix refers to those labels:
 
@@ -105,13 +105,13 @@ Work-unit index `k` is 1 for the first group you start, 2 for the next, and so o
 
 If only some of the bundle share a fix, say `Fix plan (kA–kB)` for that subset and give `kC` its own plan. Do not collapse `kA` and `kB` into one Problem paragraph. One repro test can cover `kA`–`kB` only when it is the same contract — say so on both Repro lines.
 
-**Worked example** (first High, one `#N`, so labels are `1` and `#1` — not a dump of the merge):
+**Historical worked example** (first High, one `#N`, so labels are `1` and `#1` — not a dump of the merge). The temperature squeeze defect below is already fixed; the card describes the buggy revision, not current `main`. Do not reuse it as a new finding or expect its existing regressions to fail today.
 
 ```markdown
 ### 1 — #1 `lm_head_logits` squeeze drops a size-1 batch when temperature ≠ 1
 - Problem: SFT/RL hidden CE with `temperature != 1` and a leading dim of 1 (`[1, H]` microbatch, or a one-row ZoRRo tile shard). `lm_head_logits` squeezes dim 0 before the divide, so `[1, V]` becomes `[V]`. The caller then `view(*batch_dim)` with an empty `batch_dim` and raises `TypeError: view() got ()`. `[1, S, H]` with S>1 does not crash but silently drops the batch axis (B=1 and B=2 disagree on rank). `temperature=1` skips the branch and is fine.
-- Where: `arctic_platform/common/utils/tiled_logits.py:96` (`lm_head_logits` squeeze), `arctic_platform/common/utils/tiled_logits.py:171` (`tiled_logprobs_entropy_from_hidden` `view`)
-- Repro plan: Tests in `tests/common/test_tiled_logits.py::TestLmHeadTemperatureLayout` assert logits/logprobs keep the incoming rank at any temperature. They must **fail** on current `main` ((a) `[1,H]` `temperature=0.7` → `TypeError: view() got ()`; (b) `[1,S,H]` vs `[2,S,H]` at `1.5` → B=1 drops the batch axis; (c) `TiledLogProbEntropy.apply` 1-row shards at `0.7` → crash). After the fix the **same** tests pass. Existing suite: `tests/common/test_tiled_logits.py` (CPU here; GPU class via autorun). Current GPU tests use `temperature=1.0` and would miss this.
+- Where: `arctic_platform/common/utils/tiled_logits.py`, `lm_head_logits` squeeze and `tiled_logprobs_entropy_from_hidden` reshape in the buggy revision.
+- Repro plan: Tests in `tests/common/test_tiled_logits.py::TestLmHeadTemperatureLayout` assert logits/logprobs keep the incoming rank at any temperature. On the buggy revision they **fail** ((a) `[1,H]` `temperature=0.7` → `TypeError: view() got ()`; (b) `[1,S,H]` vs `[2,S,H]` at `1.5` → B=1 drops the batch axis; (c) `TiledLogProbEntropy.apply` 1-row shards at `0.7` → crash). After the fix the **same** tests pass. Existing suite: `tests/common/test_tiled_logits.py` (CPU here; GPU class via autorun). At the time, the GPU tests used `temperature=1.0` and missed this.
 - Fix plan: Scale by temperature without changing rank. Remove `squeeze(0)`; divide in place (or broadcast `/ temperature`) so `[N, V]` / `[B, S, V]` still match the hidden layout.
 ```
 
@@ -120,7 +120,7 @@ If only some of the bundle share a fix, say `Fix plan (kA–kB)` for that subset
 On that clone, after the product fix (same repro tests, no flip):
 
 1. Run the **same** repro tests. They must pass now, and fail if the fix is reverted.
-2. Run the **existing** suite that covers the touched area (CPU here; GPU / HTTP / Ray / DeepSpeed via autorun). A green repro test with a broken neighbor is not done.
+2. Run the **existing** suite that covers the touched area (CPU here; GPU / on-prem Ray CUDA e2e / DeepSpeed via autorun; Cortex server claims against a live endpoint). A green repro test with a broken neighbor is not done.
 3. Run **`make format`** on this clone before calling the group ready — `GIT_CONFIG_GLOBAL` temp file, see [fix.md](fix.md). Do not skip to autorun or ask the operator.
 
 Follow [../test-writing/SKILL.md](../test-writing/SKILL.md).

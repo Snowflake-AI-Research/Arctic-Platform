@@ -29,7 +29,7 @@ A generic edge-case dump is not a plan. “I will read `processor.py`” is not 
 
 ### Whole-tree / no time bound
 
-Do not skim the famous contracts. Pick **2–3 high-risk subsystems** by blast radius. **One must be a live contract** (DeepSpeed worker, HTTP or Ray server, or the real CUDA kernel) unless the operator carves that out. “RL tensor losses + SFT labels + Pydantic” with the worker in Residual is a failed pick.
+Do not skim the famous contracts. Pick **2–3 high-risk subsystems** by blast radius. **One must be a live contract** (DeepSpeed worker, remote Cortex HTTP endpoint, in-process Ray server, or the real CUDA kernel) unless the operator carves that out. “RL tensor losses + SFT labels + Pydantic” with the worker in Residual is a failed pick.
 
 Inside those, be **exhaustive**: every checklist recipe that can hit the surface, every path tests skip, every sibling after a landing. Depth is not “forty CPU calls and stop.”
 
@@ -45,7 +45,7 @@ Prefer the path that can lie:
 2. **Second time / empty / error / resume / rank ≠ 0.** Happy-path once on rank 0 is the tour.
 3. **Lie in the comment.** If a docstring, Cortex-parity note, or `# gathered` disagrees with the next ten lines, believe the lines and construct the call that hits them.
 4. **Two implementations of one claim.** Different kernel, transport, client, or fallback. Same seed/batch/config; compare the thing the claim is about (loss **and** backward, or the exact payload).
-5. **Execute every attack.** CPU pytest here (cwd = resolved checkout). Kernel / HTTP / Ray / DeepSpeed via autorun on the GPU box — resolve the autorun root and host at runtime ([SKILL.md](SKILL.md) Paths). Local `import` / `pip list` / mtimes are the CPU node. `inspect.getsource`, comment grep, and “the docstring says unused” are **reads**, not runs. A GPU/HTTP/Ray claim run only as a CPU helper is incomplete — run the live path or mark Residual-impossible **after** a runtime probe (`import ray`, `torch.cuda.is_available()` on the worker), not after one ImportError.
+5. **Execute every attack.** CPU pytest here (cwd = resolved checkout). Kernel / on-prem Ray CUDA e2e / DeepSpeed via autorun on the GPU box — resolve the autorun root and host at runtime ([SKILL.md](SKILL.md) Paths). Remote Cortex HTTP e2e may run from a CPU client against a live endpoint; mocks cover only transport contracts. Local `import` / `pip list` / mtimes do not establish the GPU worker's runtime. `inspect.getsource`, comment grep, and “the docstring says unused” are **reads**, not runs. A live-server or GPU claim run only as a CPU helper is incomplete — run the live path or mark Residual-impossible **after** a runtime probe (endpoint reachability, or `import ray` / `torch.cuda.is_available()` on the worker), not after one ImportError.
 
 Construct the counterexample in the findings row: the request body, the batch shape, the kwargs, the branch that would `TypeError`.
 
@@ -57,7 +57,7 @@ The job is **as many breaks as you can find**, not “enough attacks to look ser
 - Residual is only for attacks that are **impossible this pass** (autorun down, operator deferred, runtime probe showed the stack missing). “I skipped it” is not Residual.
 - After a landing, grep the category and **run** each sibling. “Would same-path” is not a run. Table: site → ran → saw.
 - Walk every [checklist.md](checklist.md) recipe that the chosen surfaces can hit. Put a **coverage table** in the findings (section → row ids or impossible-why). Empty / second call / error / resume / rank ≠ 0 / path tests skip are not optional samples.
-- For a GPU/kernel/HTTP/Ray claim: the real contract (autorun), not a CPU-client torch fallback.
+- For a GPU/kernel/live-server claim: the real contract (GPU autorun or a live Cortex endpoint), not a CPU torch fallback or mocked server.
 - Do not re-file a hole already in a prior iteration’s Failed (or operator-deferred) as a new landing. Put it under **Still broken (already filed)**. `New landings` in the report counts only new rows.
 - Keep inventing attacks until a pass adds none that you can still construct and run.
 

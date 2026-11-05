@@ -19,6 +19,7 @@ Follow the existing harness so CPU, GPU, and pytest-xdist runs stay consistent.
 | --- | --- |
 | Shared helpers / skips / asserts | `arctic_platform/testing_utils.py` |
 | Root xdist GPU partition + `MASTER_PORT` | `tests/conftest.py` |
+| Shared client requests / Cortex transport tests | `tests/client/` |
 | RL client/session harness + fake batches | `tests/rl/rl_harness.py` |
 | `gpu_serial` lock wiring (RL) | `tests/rl/conftest.py` |
 | `gpu_serial` lock wiring (SFT) | `tests/sft/conftest.py` |
@@ -26,27 +27,30 @@ Follow the existing harness so CPU, GPU, and pytest-xdist runs stay consistent.
 
 Prefer importing helpers from `arctic_platform.testing_utils`. Do not reinvent skips, port picking, or tensor asserts in the test file.
 
+## Current client API
+
+**The shared frontend does not imply identical backend payloads.** Public clients are exported from [arctic_platform.client](../../arctic_platform/client/__init__.py); shared sync/async operations live in [client/base.py](../../arctic_platform/client/base.py), request builders in [client/requests.py](../../arctic_platform/client/requests.py), and `Request` / `JobHandles` / operation registries in [client/transport.py](../../arctic_platform/client/transport.py). Extend the shared frontend tests in `tests/client/test_client_ops.py` when changing a shared operation.
+
+- Configuration uses nested `training` and `sampling` blocks in [client/config.py](../../arctic_platform/client/config.py). `OnPremConfig(type="onprem")` launches in-process Ray; `CortexConfig(type="remote", protocol="cortex")` talks to a remote HTTP endpoint. There is no on-prem HTTP transport.
+- Test the routing target, body, omitted options, and sync/async behavior separately from transport-specific serialization. Canonical `JobId` is `int | str`; preserve either type rather than coercing job handles.
+- `fwd_bwd` accepts backend-specific batch contents: Cortex RPC `args` / `kwargs`, versus on-prem pretokenized `batch` / `meta` / `processing`. Assert each backend's documented request and response contract, not byte-identical bodies or metrics across backends.
+- On-prem server behavior lives in [common/ray_server.py](../../arctic_platform/common/ray_server.py), with request models in [common/utils/server_models.py](../../arctic_platform/common/utils/server_models.py). Use those implementation anchors rather than removed transport modules.
+
 ## In-tree inference tests
 
-`tests/inference` covers `arctic_platform.inference`. It is not part of the
-platform harness above. Default `pytest` and the `[sft,testing]` CI job skip
-it. `[cortex]` and `[sft]` do not install the `[inference]` extra.
-`[rl]` selects `arctic_platform[sft,inference]`, which pins vLLM 0.31.
+`tests/inference` covers `arctic_platform.inference`. It is not part of the platform harness above. Default `pytest` skips this tree unless explicitly targeted; the `[sft,testing]` CI job runs the isolated CPU streaming tests separately. `[cortex]` and `[sft]` do not install the `[inference]` extra. `[rl]` selects `arctic_platform[sft,inference]`; use the vLLM pin in [pyproject.toml](../../pyproject.toml), not a copied version here.
 
 ```text
 pip install -e ".[inference]"
 ARCTIC_INFERENCE_PRECOMPILED_OPS=1 pip install --no-build-isolation -e ".[inference]"
-pytest tests/inference
+pytest -sv tests/inference
 ```
 
-The second install is what compiles `csrc/`. Without
-`ARCTIC_INFERENCE_PRECOMPILED_OPS`, hatchling does not run `setup.py`.
+The second install is what compiles `csrc/`. Without `ARCTIC_INFERENCE_PRECOMPILED_OPS`, hatchling does not run `setup.py`.
 
-Docs, benchmarks, projects, and scripts live in `arctic_platform/inference/`
-and are excluded from the wheel. `csrc/` and `setup.py` are not.
+The wheel excludes `arctic_platform/inference/docs/`, `benchmark/`, `projects/`, and `README.md`; see the Hatch exclude list in `pyproject.toml`. `csrc/`, `setup.py`, and `semi_persistence/scripts` remain in the wheel.
 
-Do not pull these tests into the default suite; collecting them imports vLLM.
-Sampling and NCCL tests need a GPU.
+Do not pull the whole inference tree into the default suite; its GPU tests import vLLM. Sampling and NCCL tests need a GPU.
 
 ## Base style
 
@@ -77,7 +81,8 @@ Anti-patterns: widening `atol`/`rtol` until green; comparing only shapes; assert
 
 - **Client / routing / wire-format tests** (CPU): stub kernels or use FakeTransport; never require CUDA. Example: `TestSftCeLogitsOptimizationRouting` in `tests/sft/test_sft_losses.py`.
 - **Kernel / numeric / on-prem e2e on CUDA**: mark with `@require_torch_gpu` and run via autorun on the GPU box. Do **not** “prove” GPU CE by forcing the torch fallback on a CPU client — that is not the production path.
-- On-prem e2e runs the Ray server in the client process, so the client subprocess must see the GPUs (e.g. `env["CUDA_VISIBLE_DEVICES"] = "0"`).
+- On-prem CUDA e2e runs the Ray server in the client process, so the client subprocess must retain its assigned `CUDA_VISIBLE_DEVICES` slice. Do not hide its GPUs or overwrite the harness's xdist partition with a fixed device id.
+- Remote Cortex e2e can run from a CPU client against a live GPU-backed endpoint. A mocked HTTP endpoint validates transport contracts, not the server's CUDA kernels.
 
 ## pytest-xdist: ports and GPUs
 
@@ -121,6 +126,7 @@ Lightweight in-process CUDA unit tests (tiny tensors, no DeepSpeed/vLLM cluster)
 | Kind of test | Typical location | Notes |
 | --- | --- | --- |
 | Pure helpers / shared math | `tests/common/` | No network |
+| Shared sync/async client ops / Cortex transport | `tests/client/` | FakeTransport or mocked HTTP; CPU by default |
 | SFT losses, batch wire, client ops | `tests/sft/` | CPU by default |
 | SFT CUDA kernels / local demo | `tests/sft/` | `@require_torch_gpu`; e2e → `gpu_serial` |
 | RL engine / generate / e2e | `tests/rl/` | Use `rl_harness` session helpers |

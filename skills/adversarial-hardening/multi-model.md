@@ -100,7 +100,7 @@ Two clocks, both required:
 
 If they set `45m` / `2h`, that is a **hard** deadline from `launched_at` and wins over the sibling formula. Heartbeat 15 min still applies inside the cap. `no cap` = sibling formula + heartbeat only.
 
-A thinking-high + live 4-GPU HTTP probe can honestly take hours. Prefer `no cap` + heartbeat unless they want a budget.
+A thinking-high + live 4-GPU Cortex or on-prem Ray probe can honestly take hours. Prefer `no cap` + heartbeat unless they want a budget.
 
 ## Failed / aborted runners (retry, then replace)
 

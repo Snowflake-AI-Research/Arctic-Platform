@@ -13,12 +13,13 @@ Companion to [probe.md](probe.md). Each bullet is an **attack to construct and r
 ## Client ↔ server contracts
 
 - Send what the client allows and the server rejects (and the reverse). Validate the strict side on the permissive side.
-- Send every advertised kwarg and see if the receiver applies it. A dropped `path=` / `lr=` / `colocate` is a break if the client still exposes it.
+- Send every advertised kwarg and see if the intended backend applies it. Check the current client signature (`learning_rate`, checkpoint `path` vs `checkpoint_id`) before constructing the call; do not revive removed kwargs.
 - Change one side of a duplicated constant / hardcoded list (`if x in ("a", "b")` vs `x in REGISTRY`) and see who drifts.
 - Encode→decode a payload with the awkward value (string id, omitted optional, extra field).
-- Pydantic v2: send `sub_job_id` as `int` and as `str`. `int` is not a `str`. On-prem uses ints; Cortex may use string handles.
-- Same operation on HTTP and on Ray. Omit a field on one transport.
-- `colocate` is launch state. Unset `cuda_ipc` / `low_memory` (`None`) must fall back to the training job; a non-`None` value overrides one call. Attack: omit vs override vs stale job config.
+- Canonical `JobId` is `int | str`; test `Request.job_id`, `JobHandles`, and control-envelope `sub_job_id` routing without coercing handles. On-prem uses ints; Cortex may use strings.
+- Exercise a shared operation through remote Cortex HTTP and in-process on-prem Ray. Assert the canonical routing/envelope and each backend's payload contract separately: `fwd_bwd` batch contents and step metrics are not identical across backends. Omit an optional field and verify it stays omitted.
+- Configuration is nested under `training` / `sampling`; backend `colocate` is launch state, not a per-call kwarg. Unset `sync_weights(cuda_ipc=None, low_memory=None)` options stay omitted so training-job defaults apply; a non-`None` value overrides one call. Attack: omit vs override vs stale job config.
+- Probe weight-sync backend restrictions and safety: Cortex-only `weight_format="lora"` / `bucket_size`, rejection of full-weight sync for trainable LoRA, and checksum mismatch raising by default. Cortex sleep/wake no-ops are intentional because Cortex does not colocate; do not classify them as dropped operations.
 
 ## Config, schedules, scaling
 
@@ -33,7 +34,7 @@ Companion to [probe.md](probe.md). Each bullet is an **attack to construct and r
 
 - Labels with `-100`: shift, clamp-to-safe-index, then mask. A gather on raw `-100` is an OOB read — construct that label tensor.
 - `logits_optimization` `none` / `compute` / `memory`: same seed/batch; compare **backward** (`grad_norm`, `lm_head.grad`) on a large vocab. Forward match is not the attack. A test that only checks finite/nonzero grads is a test hole if the claim is same-math.
-- Force the CPU fallback vs the CUDA kernel (`flat_logits.is_cuda`). A CPU-client torch path does not prove Triton/flash-attn.
+- Force the CPU fallback vs the CUDA kernel (`flat_logits.is_cuda`). A CPU torch helper does not prove Triton/flash-attn; distinguish that from a CPU Cortex client submitting real GPU work.
 - Autocast / dtype: bf16 logprobs vs fp32 CE reduction.
 
 ## Control flow and silent loss

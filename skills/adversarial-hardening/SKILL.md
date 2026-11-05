@@ -6,7 +6,7 @@ description: >-
   for the ones that land, then fix and re-attack. Use after a feature or fix
   (before calling it done), when the user says "find holes / break the code /
   adversarial", or
-  when hardening an SFT/RL/HTTP/Ray integration. Not confirm-it-works.
+  when hardening an SFT/RL/Cortex/Ray integration. Not confirm-it-works.
 ---
 
 # Adversarial hardening
@@ -14,6 +14,8 @@ description: >-
 **Goal: break this code in as many ways as possible.** Assume it is wrong. Invent every constructible attack in scope and **run all of them**. A probe that re-reads last month’s contracts, plans ten attacks and executes one, or scores 46 cheap CPU calls while the live server is Residual, has failed.
 
 Do not start until an implementation exists. Do not confirm it works. Do not use this skill’s example bugs as the claim list.
+
+**Current deployment contracts:** remote Cortex uses HTTP; on-prem uses an in-process Ray server, not a separate HTTP server. Shared clients build canonical `Request` objects, but training batch contents and results can still differ by backend. Start from the current exports, nested config, and request builders linked in [test-writing's Current client API](../test-writing/SKILL.md#current-client-api); do not reconstruct removed transport interfaces from these examples.
 
 ## Paths (resolve at runtime)
 

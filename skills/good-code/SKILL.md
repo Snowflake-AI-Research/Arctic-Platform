@@ -6,7 +6,7 @@ description: >-
   attributes set in init, no values computed then thrown away on the
   default path, one default per variable (resolve once, do not re-default
   the same key later). Use when writing, editing, or reviewing Python
-  (especially training.py / DeepSpeed / Ray DSS), when adding helpers or
+  (especially the DeepSpeed worker / shared client / Ray server), when adding helpers or
   guards, when the user asks if a check is necessary, or when cleaning a
   PR diff.
 ---
@@ -80,9 +80,9 @@ if not sp_enabled:
 
 ## What to leave alone
 
-- `getattr(self, "_engine", None)` in `destroy` / teardown: init can fail before the object exists.
+- Attribute guards in teardown only when failed initialization can leave the attribute unassigned. The AP `DeepSpeedWorker` initializes `self.engine = None` before engine setup, so its teardown can read `self.engine` directly; see [deepspeed_worker.py](../../arctic_platform/common/deepspeed_worker.py).
 - `getattr(module, "optional_hook", None)` on **other** objects (HF config, DeepSpeed engine APIs, mixins that run before those fields are assigned).
-- Checks that enforce **this service's** schedule contract (`model_call_count`, DSS `micro_batch_size` for row grouping). Those are not DeepSpeed's `train_micro_batch_size_per_gpu`.
+- Checks that enforce **this service's** schedule contract (for example, loss `model_call_count_callback` accounting). Those are not DeepSpeed's `train_micro_batch_size_per_gpu`.
 - A real early-return that applies to **every** branch (e.g. `real_batch_size == 0` before loss-mode dispatch). That is not "thrown away on the default path."
 
 ## Upstream already set it
@@ -110,7 +110,7 @@ Same bug, other spellings:
 
 `object.__new__` tests that skip init must **set the attribute on the stub**. Do not weaken production reads for them.
 
-The exception is teardown / failed-init (`destroy` reading `_engine`) and attributes on **other** objects you do not construct — see What to leave alone.
+The exception is teardown after failed initialization when an attribute may really be absent, and attributes on **other** objects you do not construct — see What to leave alone.
 
 ## One default per variable
 
