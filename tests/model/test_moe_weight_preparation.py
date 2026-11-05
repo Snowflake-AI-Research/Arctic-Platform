@@ -128,6 +128,8 @@ def test_preparation_marker_uses_explicit_shared_cache_root(monkeypatch, tmp_pat
 
 
 class _FakePrimeModel:
+    """Isolate writer and failure branches; real model inheritance and conversion are tested separately."""
+
     def state_dict(self):
         return {"model.layers.0.mlp.experts.w1": None}
 
@@ -142,6 +144,70 @@ class _FakePrimeModel:
 
     def convert_to_hf(self, state_dict):
         return state_dict
+
+
+@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+@pytest.mark.parametrize(
+    "source_format,model_format", [("hf", "prime"), ("prime", "hf"), ("prime", "prime"), ("hf", "hf")]
+)
+def test_preparation_with_real_prime_base_class(monkeypatch, tmp_path, family, source_format, model_format):
+    import torch
+    import torch.distributed as dist
+    from transformers import PretrainedConfig
+
+    from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.implementations.moe.weights import save_state_dict
+    from arctic_platform.testing_utils import torch_assert_equal
+
+    class MinimalPrimeModel(PreTrainedModelPrimeRL):
+        config_class = PretrainedConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.register_parameter(f"{model_format}_weight", torch.nn.Parameter(torch.zeros(2)))
+
+        @classmethod
+        def is_hf_state_dict(cls, state_dict):
+            return "hf_weight" in state_dict
+
+        @classmethod
+        def is_prime_state_dict(cls, state_dict):
+            return "prime_weight" in state_dict
+
+        @classmethod
+        def convert_to_prime(cls, state_dict):
+            state_dict["prime_weight"] = state_dict.pop("hf_weight")
+            return state_dict
+
+        @classmethod
+        def convert_to_hf(cls, state_dict):
+            state_dict["hf_weight"] = state_dict.pop("prime_weight")
+            return state_dict
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
+    assert builder.PreTrainedModelPrimeRL is PreTrainedModelPrimeRL
+    model = MinimalPrimeModel(PretrainedConfig())
+    assert isinstance(model, PreTrainedModelPrimeRL)
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node-local")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *args, **kwargs: pytest.fail("unexpected collective"))
+    source = tmp_path / "source"
+    weight = torch.tensor([1.0, 2.0])
+    save_state_dict({f"{source_format}_weight": weight}, source)
+    config = SimpleNamespace(name=str(source), dequantize_checkpoint=False, weight_conversion_cache_dir="")
+
+    destination = builder.prepare_weight_conversion(model, config, source, rank=0, local_rank=0)
+
+    if source_format == model_format:
+        assert destination is None
+        assert not (source / model_format).exists()
+    else:
+        assert destination == source / model_format
+        converted = load_state_dict(destination)
+        assert converted.keys() == model.state_dict().keys()
+        torch_assert_equal(converted[f"{model_format}_weight"], weight)
 
 
 @pytest.mark.parametrize("family", ["qwen35", "glm52"])
@@ -916,6 +982,7 @@ def _prepare_subset_rank_process(rank, rendezvous, source, family, result):
 
     import torch.distributed as dist
 
+    from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
     from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights
     from arctic_platform.model.implementations.moe.distributed import ep_backend
     from arctic_platform.model.implementations.moe.weights import load_state_dict
@@ -962,7 +1029,10 @@ def _prepare_subset_rank_process(rank, rendezvous, source, family, result):
                 rank=0,
                 local_rank=0,
             )
-            expected = _tiny_preparation_model(family).convert_to_prime(load_state_dict(source))
+            model = _tiny_preparation_model(family)
+            assert isinstance(model, PreTrainedModelPrimeRL)
+            assert builder.PreTrainedModelPrimeRL is PreTrainedModelPrimeRL
+            expected = model.convert_to_prime(load_state_dict(source))
             actual = load_state_dict(destination)
             assert actual.keys() == expected.keys()
             for name, weight in expected.items():

@@ -68,11 +68,11 @@ def begin_conversion_preparation() -> None:
         start()
 
 
-def record_conversion_preparation_failure(function=None, *, distributed: bool = True, heartbeat: bool = True):
-    """Report setup failures; distributed entry points require every process-group rank to call.
+def record_conversion_preparation_failure(function=None, *, distributed: bool = False, heartbeat: bool = True):
+    """Report setup failures without collectives unless distributed=True is explicitly selected.
 
-    Establish the attempt before discovery so a rank-zero setup failure can reach waiting peers.
-    Rank-subset preparation must use distributed=False; that mode never introduces a collective.
+    Collective loaders must opt in and require every process-group rank to call. They establish the
+    attempt before discovery so a rank-zero setup failure can reach waiting peers.
     """
     if function is None:
         return lambda wrapped: record_conversion_preparation_failure(
@@ -88,7 +88,7 @@ def record_conversion_preparation_failure(function=None, *, distributed: bool = 
         config = arguments.get("config", arguments.get("options"))
         if getattr(getattr(config, "debug", None), "random_init", False):
             return function(*args, **kwargs)
-        # All ranks agree before checkpoint inspection, model setup or source download can fail.
+        # Collective loaders agree before checkpoint inspection, model setup or source download can fail.
         attempt, fresh_attempt = conversion_cache_attempt_id(distributed=distributed)
         context = _ACTIVE_ATTEMPT.set((attempt, fresh_attempt))
         marker = None
