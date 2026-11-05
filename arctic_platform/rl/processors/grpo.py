@@ -283,7 +283,27 @@ def _reject_unsupported_score_centering(values: dict, context: dict) -> None:
         raise ValueError("score_centering needs importance_sampling_level='token'")
     if values["prox_logp_method"] != PROX_LOGP_METHOD_RECOMPUTE or context.get("prox_logp_shifted") is not None:
         raise ValueError("score_centering needs the sampler as the proximal policy (prox_logp_method='recompute')")
-    if values["m2_threshold"] is not None or values["ratio_masks"] is not None:
+    masks = values["ratio_masks"]
+    # ``ratio_stats`` alone builds RatioMasks for telemetry and leaves the policy term as is.
+    if values["m2_threshold"] is not None or (
+        masks is not None
+        and (
+            any(
+                bound is not None
+                for bound in (
+                    masks.ratio_bounds_pos,
+                    masks.ratio_bounds_neg,
+                    masks.prob_diff_max_pos,
+                    masks.prob_diff_max_neg,
+                    masks.seq_bounds_pos,
+                    masks.seq_bounds_neg,
+                    masks.m2_threshold,
+                )
+            )
+            or masks.log_ratio_sq_coef > 0.0
+            or masks.rebalance
+        )
+    ):
         raise ValueError("score_centering does not support M2PO or ratio masks")
     if context.get("nll_mask") is not None or context.get("rollout_is_weights") is not None:
         raise ValueError("score_centering does not support nll_mask or rollout_is_weights")

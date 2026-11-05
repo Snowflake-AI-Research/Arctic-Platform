@@ -177,6 +177,14 @@ class TestScoreCentering(TestCasePlus):
         loss.output_callback(outputs)
         self.assertEqual(outputs, {"logprobs": 2})
 
+    def test_ratio_stats_telemetry_does_not_change_the_centered_update(self):
+        logits, _, ids, tokens, context = _setup(seed=11)
+        config = {**CAP, "score_centering": True}
+        _, grad, _ = _loss_grad("grpo", logits, ids, tokens, context, config)
+        _, with_stats, metrics = _loss_grad("grpo", logits, ids, tokens, context, {**config, "ratio_stats": True})
+        torch_assert_close(with_stats, grad)
+        self.assertIn("score_centering_coef_abs_sum", metrics)
+
     def test_packed_call_trains_like_the_padded_one(self):
         logits, _, ids, tokens, context = _setup(seed=5, rows=1, width=6)
         config = {**CAP, "score_centering": True}
