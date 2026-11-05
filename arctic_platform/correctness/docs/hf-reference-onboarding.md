@@ -2,6 +2,30 @@
 
 **Prepare independent Hugging Face (HF) references explicitly before regression.** The two supported checks are `single-step-grads` and `single-step-optimizer`. Onboarding runs on an already prepared allocation and publishes compact JSON measurements; regression consumes those measurements without falling back to fresh HF computation.
 
+## Configuration And Reference Layout
+
+**Catalog imports preserve the entire recipe path below `cortex-training/model-catalog/models/`.** Replace that prefix with `arctic_platform/correctness/configs/`, keeping every remaining directory and the filename exactly. For example, `cortex-training/model-catalog/models/qwen3.5-2b/standard/h200-inference-lora.json` imports as `arctic_platform/correctness/configs/qwen3.5-2b/standard/h200-inference-lora.json`. Import recipe JSON, not the catalog's `model.json` metadata; copying a recipe must not rewrite fields, reformat JSON or otherwise change its bytes.
+
+**Only noncatalog configs use derived placement: `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`.** Derive each component from the supplied recipe:
+
+- `<model-name>` is the lowercase model basename, without its repository owner: `Qwen/Qwen3-8B` becomes `qwen3-8b`. For an HF cache snapshot, use the model component, not the snapshot hash.
+- `long` requires an explicitly configured `max_tokens_per_mb >= 262144`, including a catalog-style training sub-job's `mb_spec.max_tokens_per_mb` or native `training.ds_worker_config.mb_spec.max_tokens_per_mb`. Missing or smaller budgets mean `standard`; `max_seq_len`, an old filename containing `256k`, and runtime defaults do not select `long`.
+- `training` takes precedence when training and sampling jobs both exist; a sampling-only job uses `inference`. Placement does not change whether a training-plus-sampling recipe is reinforcement learning (RL).
+- `lora` means the selected job has nonempty parameter-efficient fine-tuning (PEFT) settings for low-rank adaptation (LoRA); otherwise use `full`. Inspect the selected training or sampling job, not an unrelated sub-job.
+- `<gpu>` comes from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU. If none identifies the hardware, report the missing prerequisite rather than guess a GPU type.
+
+**Reference folders mirror the config-relative path with the extension removed.** A config at `configs/qwen3-8b/standard/h200-training-full.json` uses `reference_data/qwen3-8b/standard/h200-training-full/<check-id>/...`. An explicit `--reference-records-dir` changes only the root prefix; the model, sequence-choice and recipe-stem directories remain. Check-specific subdirectories and measurement filenames are unchanged.
+
+**The `arctic_platform/correctness/config-layout.json` manifest preserves migrated frozen config IDs independently of placement.** Moving an existing config or its reference folder does not rename its specification, relabel recorded numerical identities, remeasure references or rewrite historical measurement bytes. A placement-only move is not reference preparation and does not make a historically incompatible identity compatible.
+
+**Configs without a manifest entry derive new IDs from their config-relative paths.** The [config identity helper](../harness/config.py) joins the relative path components, without the extension, with `-`. For example, `tiny-qwen3-129m/standard/h200-training-full.json` derives `tiny-qwen3-129m-standard-h200-training-full` when no manifest entry exists; a migrated entry for that path retains `tiny-qwen3-129m-one-h200`. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`. Use the resolved ID printed by the command or `list`, not the source filename or a guess based on the new folder.
+
+**Old correctness-config paths remain aliases only within their original config root.** Frozen specifications can still locate migrated configs through the manifest. A deleted source recipe under `cortex-training/model-catalog/models/` is not such an alias; importing that source still requires the recipe file to exist.
+
+**Distinct existing recipes retain explicit descriptive `--<variant>` filename suffixes when their derived placements collide.** For example, different training recipes may use `h200-training-full--sft-16gpus-sp16-256k.json` and `h200-training-full--rl-32gpus-sp16-256k.json`. Their reference folders include those suffixes, but their frozen IDs remain unchanged. New imports reuse an identical existing copy and error on conflicting bytes. For a noncatalog variant, append a lowercase descriptive suffix such as `--rl-16gpus` to the source filename stem before importing; the importer retains that suffix in the derived recipe filename. Catalog imports still retain their exact catalog-relative filenames.
+
+**Sampling-only recipes can be imported, but P1's two correctness checks require training.** Preserve an inference-only catalog recipe's sampling settings and catalog placement. Import acceptance is not numerical onboarding or runtime validation: a training-based check must reject a recipe without a training sub-job before preparing model assets.
+
 ## Create A Reviewed Specification
 
 **Start with the complete example in the [operator guide](running-tests.md).** That example checks out this branch, resolves `axolotl-ai-co/tiny-qwen3-129m`'s weights and tokenizer through Hugging Face's existing `/checkpoint/huggingface` cache, creates a complete one-H200, 128-token training config, and defines every directory used below. Hugging Face reuses cached files and automatically downloads missing files. The example requires an exclusively allocated, prepared head node with the upstream DSS gateway installed. Correctness uses Cortex-training; onboarding manages its own local gateway when no service is configured.
@@ -13,7 +37,7 @@ python -m arctic_platform.correctness onboard \
   --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and the adjacent `tiny-qwen3-129m-one-h200.onboarding.json` summary before accepting the gates. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
+**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/<config-id>.json` and the adjacent `<config-id>.onboarding.json` summary before accepting the gates, using the resolved ID printed by onboarding. The demo retains `tiny-qwen3-129m-one-h200` only when the layout manifest freezes that migrated ID; without an entry, its ID is `tiny-qwen3-129m-standard-h200-training-full`. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
 
 **Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.md#onboarding) for retained reports.
 
@@ -33,15 +57,15 @@ python -m arctic_platform.correctness onboard \
 
 **Records bind measurements to the exact workload.** Identity includes configuration checksum, check and arm, model asset contents, reference source and dependency identities, adapter initialization where applicable, input tensor semantics, and check-specific settings. Records use readable arm filenames; integrity hashes remain inside each compact JSON record. They do not contain model or optimizer tensors.
 
-**Each workload folder retains only its latest complete reference set.** Publication stages and validates the complete replacement, renames the previous set aside, installs the new set, and removes the previous directory. Failed publication restores the previous complete set; regression never replaces references. The maintained layout is:
+**Each workload folder retains only its latest complete reference set.** Publication stages and validates the complete replacement, renames the previous set aside, installs the new set, and removes the previous directory. Failed publication restores the previous complete set; regression never replaces references. For the imported demo config `configs/tiny-qwen3-129m/standard/h200-training-full.json`, the maintained filenames below are relative to the reference root, regardless of whether its ID is migrated or newly derived:
 
 ```text
-<config-id>/single-step-grads/gradients-only/gas1.json
-<config-id>/single-step-grads/gradients-only/gas4.json
-<config-id>/single-step-grads/with-optimizer/gas1.json
-<config-id>/single-step-grads/with-optimizer/gas4.json
-<config-id>/single-step-optimizer/gas1.json
-<config-id>/single-step-optimizer/gas4.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-grads/gradients-only/gas1.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-grads/gradients-only/gas4.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-grads/with-optimizer/gas1.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-grads/with-optimizer/gas4.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-optimizer/gas1.json
+tiny-qwen3-129m/standard/h200-training-full/single-step-optimizer/gas4.json
 ```
 
 **Compact records are generated local artifacts, not files to commit.** They default to the Git-ignored `arctic_platform/correctness/reference_data` directory. Retain them for later regression; regression cannot regenerate missing HF measurements. The publisher validates containment under the executing library's Git root, not Git tracking or merely the shell's current directory. An unrelated sibling records directory is rejected. No measurements are bundled. To override the default, pass the same `--reference-records-dir` inside the checkout to preparation and regression. Model weights and adapter tensors do not belong in this directory or in Git.
@@ -73,7 +97,7 @@ python -m arctic_platform.correctness onboard \
 
 ## LoRA Prerequisites
 
-**First-two reference preparation detects low-rank adaptation (LoRA) settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
+**First-two reference preparation detects low-rank adaptation (LoRA) settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Onboarding and regression use upstream PEFT's default initializer with the explicit harness seed `1234`, a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
 
 **Compact records contain the generation recipe and content hashes, not adapter tensors.** Identity binds the dependency versions, topology, tensor shapes/dtypes and exact values. Regression reconstructs adapter factors and requires matching prepared references; it never runs HF again to accommodate a mismatch. Only explicit onboarding measures references.
 

@@ -432,7 +432,7 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     raw = _cortex_recipe()
     if hardware is not None:
         raw["hardware"] = hardware
-    source = tmp_path / "external" / "qwen38_flash_next.json"
+    source = tmp_path / "external" / "h200-qwen38_flash_next.json"
     source.parent.mkdir()
     source.write_text(json.dumps(raw, indent=2) + "\n")
     imported = local_config_path(source, tmp_path / "configs")
@@ -447,8 +447,9 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.optimizer_dtype == "bfloat16"
     assert config_checksum(cfg) == config_checksum(load_config(source))
     client_config = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1"))
-    assert cfg.hardware == client_config.hardware == hardware
-    assert cfg.gpu_type == (hardware.lower() if hardware is not None else None)
+    assert cfg.hardware == hardware
+    assert client_config.hardware == (hardware or "H200")
+    assert cfg.gpu_type == (hardware.lower() if hardware is not None else "h200")
     wire = client_config.to_cortex()[0]
     assert wire["weight_format"] == "vllm"
     for key in ("sp_size", "ep_size", "ep_group_layout", "ac_config", "optimizer"):
@@ -562,7 +563,6 @@ def test_cortex_recipe_sampling_preserves_rl_classification(tmp_path):
         "empty",
         "nonlist",
         "nonobject",
-        "no_training",
         "duplicate",
         "bad_role",
         "no_model",
@@ -586,9 +586,6 @@ def test_cortex_recipe_invalid_inputs_fail_before_import(tmp_path, damage):
         raw["sub_job_configs"] = {}
     elif damage == "nonobject":
         raw["sub_job_configs"] = [None]
-    elif damage == "no_training":
-        sub["job_type"] = "sampling"
-        sub["inference_config"] = sub.pop("training_config")
     elif damage == "duplicate":
         raw["sub_job_configs"].append(sub)
     elif damage == "bad_role":
@@ -2699,7 +2696,7 @@ def test_operator_api_config_only_selects_each_applicable_test_once():
 
 @pytest.mark.parametrize("is_rl", [False, True])
 def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tmp_path, monkeypatch, is_rl):
-    config = tmp_path / "external.json"
+    config = tmp_path / "h200-external.json"
     config.write_text(
         json.dumps(
             _config_factory_native_config(
@@ -2723,7 +2720,7 @@ def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tm
     local_root = tmp_path / "checkout" / "configs"
     selected = api.select(api.RunRequest(config=config, config_dir=local_root))
     assert [case.test_id for case in selected] == (["rl-only", "shared"] if is_rl else ["gradients", "shared"])
-    assert all(case.config_path == local_root / config.name for case in selected)
+    assert all(case.config_path == local_root / "qwen3-8b/standard/h200-training-full.json" for case in selected)
     assert selected[0].config_path.read_bytes() == config.read_bytes()
     incompatible = "gradients" if is_rl else "rl-only"
     explicit = api.select(api.RunRequest(config=config, config_dir=local_root, tests=(incompatible,)))
@@ -2737,14 +2734,14 @@ def test_operator_external_config_copy_is_local_and_idempotent(tmp_path, suffix,
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import local_config_path
 
-    source = tmp_path / directory / f"Mixed-Case-model{suffix}"
+    source = tmp_path / directory / f"h200-Mixed-Case-model{suffix}"
     source.parent.mkdir(parents=True)
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16}), indent=2) + "\n")
     root = tmp_path / "checkout" / "configs"
     local = local_config_path(source, root)
-    assert local == root / source.name
+    assert local == root / "qwen3-8b/standard/h200-training-full.json"
     assert local.read_bytes() == source.read_bytes()
-    assert config_id(local) == source.stem
+    assert config_id(local) == "qwen3-8b-standard-h200-training-full"
     assert load_config(local).native == load_config(source).native
     modified = local.stat().st_mtime_ns
     assert local_config_path(source, root) == local
@@ -2756,7 +2753,7 @@ def test_operator_external_config_copy_is_local_and_idempotent(tmp_path, suffix,
 def test_operator_external_config_copy_preserves_local_recipe_on_collision(tmp_path):
     from arctic_platform.correctness.harness.config import local_config_path
 
-    source = tmp_path / "model.json"
+    source = tmp_path / "h200-model.json"
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
     root = tmp_path / "checkout" / "configs"
     local = local_config_path(source, root)
@@ -2773,20 +2770,25 @@ def test_operator_external_config_copy_rejects_id_collision_across_extensions_an
     from arctic_platform.correctness.harness.config import config_id
     from arctic_platform.correctness.harness.config import local_config_path
 
-    root = tmp_path / "checkout" / "configs"
-    local = root / "model" / "h200" / "train.config"
-    local.parent.mkdir(parents=True)
-    local.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
-    source = tmp_path / "model-h200-train.json"
-    source.write_bytes(local.read_bytes())
-    assert config_id(source) == config_id(local)
+    layout = _config_layout_synthetic_migration(
+        tmp_path, previous_name="synthetic-model-standard-h200-training-full--variant.json"
+    )
+    root = layout.base / "configs"
+    destination = root / "synthetic-model/standard/h200-training-full--variant.json"
+    source = tmp_path / "h200-external--variant.json"
+    source.write_bytes(layout.config_bytes)
+    # A frozen migrated ID may collide with a newly derived recipe ID at a different placement.
+    assert config_id(destination) == config_id(layout.current) == layout.identifier
     with pytest.raises(ValueError, match="configuration ID"):
         local_config_path(source, root)
-    assert not (root / source.name).exists()
-    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16})))
+    assert not destination.exists()
+    source.write_text(
+        json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16}, model_name="Owner/Synthetic-Model"))
+    )
     with pytest.raises(ValueError, match="configuration ID"):
         local_config_path(source, root)
-    assert not (root / source.name).exists()
+    assert not destination.exists()
+    assert layout.current.read_bytes() == layout.config_bytes
 
 
 def test_operator_external_config_copy_rejects_invalid_input_before_import(tmp_path):
@@ -2804,7 +2806,7 @@ def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, m
     from arctic_platform.correctness.harness.config import local_config_path
     from arctic_platform.correctness.onboarding import onboard
 
-    source = tmp_path / "model.json"
+    source = tmp_path / "h200-model.json"
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
     root = tmp_path / "checkout" / "configs"
     args = execution.parse_args(["onboard", "--config", str(source)])
@@ -2816,7 +2818,7 @@ def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, m
     used = []
     monkeypatch.setattr(onboard, "_onboard_configuration", lambda child: used.append(child.config) or 0)
     assert onboard.run(args) == 0
-    assert used == [root / source.name]
+    assert used == [root / "qwen3-8b/standard/h200-training-full.json"]
     assert used[0].read_bytes() == source.read_bytes()
 
 
@@ -7752,17 +7754,15 @@ def test_operator_external_config_copy_refuses_id_collision_instead_of_changing_
     from arctic_platform.correctness.harness.config import local_config_path
 
     root = tmp_path / "checkout" / "configs"
-    local = root / "model" / "h200" / "train.config"
+    local = root / "qwen3-8b" / "standard" / "h200-training-full.json"
     local.parent.mkdir(parents=True)
     local.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
-    source = tmp_path / "model-h200-train.json"
+    source = tmp_path / "qwen3-8b-standard-h200-training-full.json"
     source.write_bytes(local.read_bytes())
     assert config_id(source) == config_id(local)
-    with pytest.raises(ValueError, match="configuration ID.*already exists"):
-        local_config_path(source, root)
-    assert not (root / source.name).exists()
+    assert local_config_path(source, root) == local
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16})))
-    with pytest.raises(ValueError, match="configuration ID.*already exists"):
+    with pytest.raises(ValueError, match="different contents"):
         local_config_path(source, root)
     assert not (root / source.name).exists()
 
@@ -13124,18 +13124,24 @@ def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path
 # Optimizer capture.
 
 
-@pytest.fixture
-def _native_participation_worker(tmp_path, monkeypatch):
+@pytest.fixture(params=[False, True], ids=["shared-storage", "node-local-storage"])
+def _native_participation_worker(tmp_path, monkeypatch, request):
     model = torch.nn.Module()
     model.decoder = torch.nn.Linear(2, 2, bias=False)
     model.head = torch.nn.Linear(2, 2, bias=False)
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.get_decoder = lambda: model.decoder
     model.get_output_embeddings = lambda: model.head
-    engine = SimpleNamespace(module=model, global_steps=0)
+    engine = SimpleNamespace(
+        module=model,
+        global_steps=0,
+        use_node_local_storage=lambda: request.param,
+        save_non_zero_checkpoint=False,
+    )
     pair = _native_ep_bf16_pair(tmp_path)
 
     def save(engine, root, tag):
+        assert engine.save_non_zero_checkpoint is request.param
         target = Path(root) / tag
         target.mkdir(parents=True, exist_ok=True)
         source = pair.before if engine.global_steps == 0 else pair.after
@@ -13144,7 +13150,7 @@ def _native_participation_worker(tmp_path, monkeypatch):
         return "saved"
 
     checkpointer = SimpleNamespace(save_resumable=save)
-    worker = SimpleNamespace(job_id="child", _engine=engine, _checkpointer=checkpointer)
+    worker = SimpleNamespace(job_id="child", local_rank=0, _engine=engine, _checkpointer=checkpointer)
     monkeypatch.setattr(decoder, "_native_runtime_sources", lambda *args: None)
     monkeypatch.setattr(
         decoder,
@@ -13163,6 +13169,7 @@ def test_native_participation_collector_observes_backward_and_restores_all_hooks
     (case.model.head(case.model.decoder(torch.ones(1, 2))) * 0).sum().backward()
     case.worker._engine.global_steps = 1
     case.worker._checkpointer.save_resumable(case.worker._engine, case.root, "global_step1")
+    assert case.worker._engine.save_non_zero_checkpoint is False
     after = json.loads((case.root / "global_step1/native_optimizer_layout/rank00000.json").read_text())
     assert after["participation"]["parameters"]["decoder.weight"]["state"] == "active"
     assert after["participation"]["parameters"]["visual.weight"]["state"] == "inactive"
@@ -14444,6 +14451,111 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     assert widths == [cfg.n_gpus] == [4]
 
 
+@pytest.mark.parametrize(
+    "local_fixture,ep_size,selected,expect_native",
+    [
+        (True, 2, ["single-step-optimizer"], True),
+        (True, 2, ["single-step-grads", "single-step-optimizer"], True),
+        (True, 1, ["single-step-optimizer"], False),
+        (True, 2, ["single-step-grads"], False),
+        (False, 2, ["single-step-optimizer"], False),
+        (False, 2, None, False),
+    ],
+)
+def test_native_optimizer_owner_split_cli_guarded_forwarding(
+    tmp_path, monkeypatch, local_fixture, ep_size, selected, expect_native
+):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import native_optimizer
+
+    path = tmp_path / "config.json"
+    config = SimpleNamespace(
+        config_id="synthetic-owner-split",
+        model_name="synthetic-model",
+        n_gpus=4,
+        max_seq_len=32,
+        is_rl=False,
+        attention_implementation="sdpa",
+        training={"ep_size": ep_size},
+    )
+    config.at_gpu_width = lambda width: SimpleNamespace(
+        config_id=config.config_id, n_gpus=width, training={"ep_size": ep_size}
+    )
+    spec = SimpleNamespace(model=SimpleNamespace(cache_path=str(tmp_path / "model")))
+    backend = CortexConfig(base_url="http://127.0.0.1:8003")
+    tests = selected or ["single-step-grads", "single-step-optimizer"]
+    owners = []
+    calls = []
+
+    def select(request):
+        assert Path(request.config) == path and list(request.tests) == (selected or [])
+        return tuple(api.SelectedCase(config.config_id, path, test_id) for test_id in tests)
+
+    def owner_split(run_cfg):
+        bundle = {
+            "workdir": tmp_path / f"native-{run_cfg.n_gpus}",
+            "native_optimizer_scope": object(),
+            "native_optimizer_scope_source": {"path": "owned-producer.py", "sha256": "a" * 64},
+        }
+        owners.append((run_cfg, bundle))
+        return bundle
+
+    def execute(run_cfg, run_spec, arms, **kwargs):
+        assert run_spec is spec and kwargs["client_backend"] is backend
+        assert kwargs["select"] == tests
+        assert arms[0].global_batch_size == 4 * (run_cfg.n_gpus // config.n_gpus)
+        assert kwargs.get("local_cortex_fixture", False) is local_fixture
+        calls.append((run_cfg, kwargs))
+        return [Result(test_id, config.config_id, Outcome.PASS) for test_id in tests]
+
+    monkeypatch.setattr(api, "select", select)
+    monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
+    monkeypatch.setattr(cli, "load_config", lambda config_path: config)
+    monkeypatch.setattr(cli, "placement_widths", lambda declared, pool: [declared, pool])
+    monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
+    monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 32)
+    monkeypatch.setattr(
+        cli, "local_cortex_gateway", lambda *args, **kwargs: pytest.fail("explicit endpoint must remain external")
+    )
+    monkeypatch.setattr(
+        cortex,
+        "load_local_fixture",
+        lambda actual_backend, actual_spec: {"model_name": spec.model.cache_path, "fixture_sha256": "local"},
+    )
+    monkeypatch.setattr(native_optimizer, "owner_split_execution", owner_split)
+    monkeypatch.setattr(cli, "execute", execute)
+    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(cli, "write_report", lambda *args, **kwargs: None)
+    arguments = [
+        "run",
+        "--config",
+        str(path),
+        "--base-url",
+        backend.base_url,
+        "--gpu-pool",
+        "8",
+        "--out",
+        str(tmp_path / "report"),
+    ]
+    if local_fixture:
+        arguments.append("--local-cortex-fixture")
+    for test_id in selected or []:
+        arguments.extend(["--test", test_id])
+    assert cli.main(arguments) == 0
+    assert [run_cfg.n_gpus for run_cfg, _ in calls] == ([4] if local_fixture else [4, 8])
+    if expect_native:
+        assert len(owners) == len(calls) == 1
+        for (owner_cfg, bundle), (run_cfg, kwargs) in zip(owners, calls):
+            assert owner_cfg is run_cfg
+            assert all(kwargs[name] is value for name, value in bundle.items())
+    else:
+        assert not owners
+        assert all(
+            not {"workdir", "native_optimizer_scope", "native_optimizer_scope_source"} & kwargs.keys()
+            for _, kwargs in calls
+        )
+
+
 def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
     config = {
         "zero_optimization": {"stage": 2},
@@ -15152,7 +15264,15 @@ def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
             request, gateway_snowapi=snow, gateway=gateway, manager=manager, ray=ray
         )
         scope = factory(case.session, case.job)
-    return SimpleNamespace(scope=scope, workers=workers, child=child, helper_source=helper_source)
+    return SimpleNamespace(
+        scope=scope,
+        workers=workers,
+        child=child,
+        helper_source=helper_source,
+        request=request,
+        gateway=gateway,
+        manager=manager,
+    )
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
@@ -16780,7 +16900,13 @@ def _automatic_participation_receipts(tmp_path, shapes, world_size):
     for entry in after["participation"]["parameters"].values():
         entry["state"] = "active"
     return [
-        {"rank": rank, "job_id": "child", "before": deepcopy(before), "after": deepcopy(after)}
+        {
+            "rank": rank,
+            "job_id": "child",
+            "before": deepcopy(before),
+            "after": deepcopy(after),
+            "expert_parallel_widths": {name: 1 for name in shapes},
+        }
         for rank in range(world_size)
     ]
 
@@ -18000,6 +18126,39 @@ def test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values(t
     assert len(receipt["verified_tensors"]) == 4
     with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError):
         deterministic_lora.bind_payload({"training_config": cfg.training}, output)
+
+
+def test_onboarding_generated_shared_adapter_matches_runner_adapter(tmp_path, monkeypatch):
+    from transformers import Qwen3Config
+
+    from arctic_platform.correctness.harness import runner
+
+    root = tmp_path / "data-fast"
+    root.mkdir()
+    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", root)
+    monkeypatch.setenv(workdir.CORRECTNESS_TMPDIR_ENV, str(root / "tmp"))
+    source = root / "model"
+    Qwen3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        architectures=["Qwen3ForCausalLM"],
+    ).save_pretrained(source)
+    peft_config = {"peft_type": "Lora", "r": 4, "lora_alpha": 8, "target_modules": ["q_proj", "v_proj"]}
+    config = SimpleNamespace(training={"peft_config": peft_config})
+    onboarded = onboard._shared_adapter(argparse.Namespace(peft_adapter=None), config, source)
+    regression = deterministic_lora.generate_adapter(
+        source, peft_config, root / "runner" / "initial-adapter", seed=runner.SEED
+    )
+    expected = deterministic_lora.shared_adapter_identity(regression, peft_config)
+    actual = deterministic_lora.shared_adapter_identity(onboarded, peft_config)
+    assert actual["generation"]["seed"] == expected["generation"]["seed"]
+    assert actual["adapter_model_sha256"] == expected["adapter_model_sha256"]
+    assert actual == expected
 
 
 # Qwen4 reference.
@@ -22358,9 +22517,9 @@ def test_shared_adapter_generated_onboard_cache_reuses_exact_pack_and_refuses_mu
     original_generate = shared.generate_adapter
     generated = []
 
-    def generate(model_path, peft_config, destination):
+    def generate(model_path, peft_config, destination, *, seed):
         assert model_path == source.path and peft_config == source.config
-        path = original_generate(model_path, peft_config, destination)
+        path = original_generate(model_path, peft_config, destination, seed=seed)
         generated.append(path)
         return path
 
@@ -45521,3 +45680,696 @@ def _expected_cortex_training_fields(training: dict) -> dict:
     if expected.get("model_provider") == "prime_rl":
         expected["model_provider"] = "arctic"
     return expected
+
+
+def _native_ap_ep_shards(pair, source, root, step, ep_ranks):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import _ep_checkpoint_path
+
+    tag, ep_size = f"global_step{step}", pair.layout["ep_size"]
+    paths = []
+    for ep_rank in ep_ranks:
+        identity = {"group_name": f"ep_size_{ep_size}", "ep_size": ep_size, "ep_rank": ep_rank}
+        module = torch.load(source / tag / f"experts_ep_rank_{ep_rank:03d}.pt", weights_only=True)
+        path = _ep_checkpoint_path(root, tag, identity)
+        torch.save({"version": 1, **identity, "exclude_frozen_parameters": False, "module": module}, path)
+        paths.append(path)
+    return paths
+
+
+def test_automatic_participation_globalizes_expert_parallel_shapes(monkeypatch):
+    from arctic_platform.debug.training import WorkerParticipation
+    from arctic_platform.debug.training import merge_worker_receipts
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(2, 2, bias=False)
+    model.head = torch.nn.Linear(2, 2, bias=False)
+    model.experts = torch.nn.Parameter(torch.ones(1, 2, 2))
+    model.experts.allreduce = False
+    model.experts.group_name = "ep_size_4"
+    model.get_decoder = lambda: model.decoder
+    model.get_output_embeddings = lambda: model.head
+    monkeypatch.setitem(
+        sys.modules, "deepspeed.utils.groups", SimpleNamespace(_get_expert_parallel_group=lambda name: name)
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: {"ep_size_4": 4}[group])
+    receipts = []
+    for rank in range(4):
+        worker = SimpleNamespace(job_id="child", rank=rank, _engine=SimpleNamespace(module=model, global_steps=0))
+        capture = WorkerParticipation(worker)
+        try:
+            model.head(model.decoder(torch.ones(1, 2)) @ model.experts[0]).sum().backward()
+            worker._engine.global_steps = 1
+            receipts.append(capture.finish())
+        finally:
+            capture.close()
+    result = merge_worker_receipts(receipts, job_id="child", world_size=4)
+    assert result["parameters"]["experts"] == {"shape": [4, 2, 2], "state": "active", "evidence": None}
+    assert result["parameters"]["decoder.weight"]["shape"] == [2, 2]
+    assert all(not parameter._backward_hooks for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("damage", ["absent", "inventory", "zero", "rank-drift"])
+def test_automatic_participation_rejects_incomplete_expert_parallel_widths(tmp_path, damage):
+    from arctic_platform.debug.training import merge_worker_receipts
+
+    receipts = _automatic_participation_receipts(tmp_path, {"weight": [2, 2]}, 2)
+    if damage == "absent":
+        del receipts[0]["expert_parallel_widths"]
+    elif damage == "inventory":
+        receipts[0]["expert_parallel_widths"] = {}
+    elif damage == "zero":
+        receipts[0]["expert_parallel_widths"]["weight"] = 0
+    else:
+        receipts[1]["expert_parallel_widths"]["weight"] = 2
+    with pytest.raises(ValueError, match="expert-parallel widths"):
+        merge_worker_receipts(receipts, job_id="child", world_size=2)
+
+
+@pytest.mark.parametrize("global_steps", [None, 0, 2])
+def test_automatic_participation_step_factory_rejects_nonfirst_step_before_receipts(monkeypatch, global_steps):
+    from arctic_platform.debug import training as debug
+
+    class Coordinator:
+        async def step(self, learning_rate=None):
+            return {"global_steps": global_steps}
+
+    monkeypatch.setattr(debug, "merge_worker_receipts", lambda *a, **kw: pytest.fail("must reject before merging"))
+    coordinator = debug.participation_step_class(Coordinator)()
+    with pytest.raises(ValueError, match="exactly the first optimizer step"):
+        asyncio.run(coordinator.step())
+
+
+def test_automatic_participation_worker_factory_does_not_allow_second_step():
+    from arctic_platform.debug import training as debug
+
+    class Worker:
+        def fwd_bwd(self, batch):
+            self._engine.module(batch).sum().backward()
+
+        def step(self, learning_rate=None):
+            self._engine.global_steps += 1
+            return {"global_steps": self._engine.global_steps}
+
+    worker = debug.participation_worker_class(Worker)()
+    worker.job_id, worker.rank = "child", 0
+    worker._engine = SimpleNamespace(module=torch.nn.Linear(2, 2, bias=False), global_steps=0)
+    worker.fwd_bwd(torch.ones(1, 2))
+    assert worker.step()["global_steps"] == 1
+    with pytest.raises(ValueError):
+        worker.step()
+    assert all(not parameter._backward_hooks for parameter in worker._engine.module.parameters())
+
+
+def test_maintained_native_optimizer_keeps_ordinary_participation_receipts_out_of_native_decode(
+    _maintained_native_capture, monkeypatch
+):
+    case = _maintained_native_capture
+    receipts = [{"rank": rank} for rank in range(8)]
+    native_step = case.client.step
+
+    def step(learning_rate):
+        response = native_step(learning_rate)
+        response["participation"] = {"training_child_id": "actual-child", "rank_receipts": receipts}
+        return response
+
+    # The fixture transport is not a CorrectnessCortexTransport; this stands in for its bound training child.
+    def training_child(transport, selector):
+        assert transport is case.client.transport and selector == "actual-parent:train:0"
+        return "actual-child"
+
+    original, decoded = decoder.decode_optimizer_capture, []
+
+    def decode(before, after, output, **kwargs):
+        decoded.append(kwargs)
+        return original(before, after, output, **kwargs)
+
+    case.client.step = step
+    monkeypatch.setattr(capture, "_dense_training_child", training_child)
+    monkeypatch.setattr(decoder, "decode_optimizer_capture", decode)
+    result = _maintained_native_run(case)
+    assert len(decoded) == 1 and "expected_native_layout" in decoded[0]
+    assert "participation_receipts" not in decoded[0] and "expected_participation_job_id" not in decoded[0]
+    assert Path(result.optimizer_state_manifest).is_file()
+
+
+def test_maintained_native_optimizer_supplier_admits_node_local_ap_expert_shards(_maintained_native_capture):
+    case = _maintained_native_capture
+    original_supplier = case.supplier
+    routes = case.pair.layout["expert_data_parallel_groups"]["native-experts"]
+    # The shard writer is each EP rank's first expert-DP rank; only writers on the head node (ranks 0-3) save here.
+    head_ep_ranks = [ep_rank for ep_rank, route in enumerate(routes) if route[0] < 4]
+    written = []
+
+    def supplier(root, *, step):
+        source = case.pair.before if step == 0 else case.pair.after
+        written.extend(_native_ap_ep_shards(case.pair, source, root, step, head_ep_ranks))
+        return original_supplier(root, step=step)
+
+    case.supplier = supplier
+    result = _maintained_native_run(case)
+    record = json.loads(Path(result.optimizer_state_manifest).read_text())
+    assert len(written) == 2 * len(head_ep_ranks) == 8
+    assert all(row["name"] in case.pair.expected for row in record["parameters"])
+    for entry in record["parameters"]:
+        value = torch.load(Path(result.optimizer_state_manifest).parent / entry["file"], weights_only=True)
+        torch.testing.assert_close(value["parameter_update"], case.pair.expected[entry["name"]], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("node_rank", [-1, True, None])
+def test_native_optimizer_model_writer_rejects_invalid_node_rank_before_mutation(node_rank):
+    engine = SimpleNamespace(use_node_local_storage=lambda: True, save_non_zero_checkpoint=False)
+    with pytest.raises(ValueError, match="nonnegative rank"):
+        with decoder.node_local_model_state_writer(engine, node_rank):
+            pytest.fail("invalid node rank must not enter the save")
+    assert engine.save_non_zero_checkpoint is False
+
+
+@pytest.mark.parametrize("node_local,node_rank", [(False, 0), (False, 1), (True, 0), (True, 1)])
+@pytest.mark.parametrize("failed", [False, True])
+def test_native_optimizer_model_writer_selects_one_rank_per_node_and_restores(node_local, node_rank, failed):
+    original = object()
+    engine = SimpleNamespace(use_node_local_storage=lambda: node_local, save_non_zero_checkpoint=original)
+
+    def save():
+        with decoder.node_local_model_state_writer(engine, node_rank):
+            expected = node_rank == 0 if node_local else original
+            assert engine.save_non_zero_checkpoint is expected
+            if failed:
+                raise RuntimeError("save failed")
+
+    if failed:
+        with pytest.raises(RuntimeError, match="save failed"):
+            save()
+    else:
+        save()
+    assert engine.save_non_zero_checkpoint is original
+
+
+def test_native_optimizer_owner_split_refusal_before_arm_leaves_client_shutdown_unfenced(
+    _maintained_native_capture, monkeypatch
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from arctic_platform.correctness.harness import native_optimizer
+
+    case = _maintained_native_capture
+    fixture = _maintained_native_scope(case, monkeypatch, split=True)
+    fixture.gateway.app = FastAPI()
+    fixture.gateway._zones["actual-zone"] = SimpleNamespace(url="http://zone-head")
+    zone = FastAPI()
+    zone.state.manager = fixture.manager
+    native_optimizer.install_gateway_route(fixture.gateway)
+    native_optimizer.install_zone_routes(zone)
+    clients = {case.session.backend.base_url: TestClient(fixture.gateway.app), "http://zone-head": TestClient(zone)}
+    monkeypatch.setattr(
+        native_optimizer,
+        "_post",
+        lambda base_url, route, body: native_optimizer._reply(route, clients[base_url].post(route, json=body)),
+    )
+    # The fixture's parent verifier is this file, not the module whose closure the zone head verifies with.
+    scope = native_optimizer.owner_split_scope(fixture.request)
+    with pytest.raises(native_optimizer.NativeOwnerError, match="native-optimizer/open") as caught:
+        with scope(case.session, case.job):
+            raise AssertionError("an unverifiable parent verifier must not arm workers")
+    assert caught.value.cleanup_complete is True
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+    assert decoder._SCOPE_STATE not in vars(case.client) and "shutdown" not in vars(case.client)
+    case.client.shutdown()
+    assert case.events == ["release"]
+
+
+def test_native_optimizer_owner_split_request_binds_installed_producer_sources(tmp_path, monkeypatch):
+    pytest.importorskip("deepspeed")
+    pytest.importorskip("dss.ray_dss.jobs.checkpointing")
+    ray = pytest.importorskip("ray")
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from dss.ray_dss.jobs.checkpointing import ExpertParallelCheckpointer
+
+    from arctic_platform.correctness.harness import native_optimizer
+    from arctic_platform.correctness.harness import storage
+
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n")
+    cfg = SimpleNamespace(training={"ep_size": 16}, n_gpus=16)
+    request = native_optimizer.owner_split_request(cfg, checkpoint_parent=tmp_path / "run", hostfile=hostfile)
+    assert decoder._native_split_request(request) == decoder._native_split_request(json.loads(json.dumps(request)))
+    assert request["allocation_hosts"] == ["10.0.0.1", "10.0.0.2"] and request["expected_world_size"] == 16
+    assert request["checkpoint_parent"] == str(tmp_path / "run")
+    assert request["reserve_bytes"] == 0 and request["rpc_timeout_seconds"] == 900
+    assert request["verify_parent_binding_source"] == native_optimizer.owner_split_source()
+    sources = request["source_files"]
+    decoder.verify_native_callback(ExpertParallelCheckpointer.save_resumable, sources["expert_checkpointer"])
+    decoder.verify_native_callback(DeepSpeedZeroOptimizer.backward, sources["zero_base"])
+    decoder.verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
+    decoder._native_scope_origin(ray.get, request["route_sources"]["ray_get"])
+    with pytest.raises(ValueError, match="allocation hosts"):
+        hostfile.write_text("10.0.0.1 slots=8\n10.0.0.1 slots=8\n")
+        native_optimizer.owner_split_request(cfg, checkpoint_parent=tmp_path / "run", hostfile=hostfile)
+
+
+@pytest.mark.parametrize("failure", [None, "target", "parent"])
+def test_native_optimizer_owner_split_routes_capture_through_gateway_and_zone_head(
+    _maintained_native_capture, monkeypatch, failure
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from arctic_platform.correctness.harness import native_optimizer
+
+    case = _maintained_native_capture
+    fixture = _maintained_native_scope(case, monkeypatch, split=True)
+    source = native_optimizer.owner_split_source()
+    request = {**fixture.request, "verify_parent_binding_source": source}
+    fixture.gateway.app = FastAPI()
+    fixture.gateway._zones["actual-zone"] = SimpleNamespace(url="http://zone-head")
+    zone = FastAPI()
+    zone.state.manager = fixture.manager
+    native_optimizer.install_gateway_route(fixture.gateway)
+    native_optimizer.install_zone_routes(zone)
+    clients = {case.session.backend.base_url: TestClient(fixture.gateway.app), "http://zone-head": TestClient(zone)}
+    routes = []
+
+    def post(base_url, route, body):
+        routes.append(route)
+        return native_optimizer._reply(route, clients[base_url].post(route, json=body))
+
+    monkeypatch.setattr(native_optimizer, "_post", post)
+    if failure == "target":
+        case.state.failure = "fwd_bwd"
+    scope = native_optimizer.owner_split_scope(request)
+
+    def run():
+        with scope(case.session, case.job) as supplier:
+            case.supplier, case.descriptor = supplier, source
+            with pytest.raises(RuntimeError, match="child release is blocked"):
+                case.client.shutdown()
+            if failure == "parent":
+                fixture.child.job_id = "wrong"
+            result = _maintained_native_run(case)
+            assert Path(result.optimizer_state_manifest).is_file()
+
+    if failure:
+        with pytest.raises((RuntimeError, ValueError)):
+            run()
+    else:
+        run()
+        assert routes.count(native_optimizer.SUPPLY_ROUTE) == 2
+    assert routes[:2] == [native_optimizer.PARENT_ROUTE, native_optimizer.OPEN_ROUTE]
+    # Only the zone head's own parent re-verification may follow the runner's close.
+    closed = routes.index(native_optimizer.CLOSE_ROUTE)
+    assert set(routes[closed + 1 :]) <= {native_optimizer.PARENT_ROUTE}
+    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
+    assert all(decoder._CLEANUP_STATE not in vars(worker) for worker in fixture.workers)
+    assert decoder._SCOPE_STATE not in vars(case.client) and "shutdown" not in vars(case.client)
+    case.client.shutdown()
+    assert case.events[-1] == "release"
+    if failure is None:
+        assert all(not root.exists() for root in case.saved)
+    else:
+        _maintained_native_unpublished(case, supplier_failed=failure == "parent")
+
+
+def _config_layout_synthetic_migration(tmp_path, *, previous_name="legacy.config"):
+    """Isolated manifest fixture, not a model or hardware assignment for P1."""
+    base = tmp_path / "checkout"
+    previous = base / "configs" / previous_name
+    relative = Path("synthetic-model/standard/h200-training-full.json")
+    current = base / "configs" / relative
+    identifier = Path(previous_name).stem
+    raw = _config_factory_native_config({"n_gpus": 1}, model_name="Owner/Synthetic-Model")
+    config_bytes = (json.dumps(raw, indent=2).replace("\n", " \r\n") + "  ").encode()
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(config_bytes)
+    checksum = config_checksum(load_config(previous))
+    current.parent.mkdir(parents=True)
+    previous.rename(current)
+    (base / "config-layout.json").write_text(
+        json.dumps({relative.as_posix(): {"config_id": identifier, "previous_path": previous_name}})
+    )
+    return SimpleNamespace(
+        base=base,
+        current=current,
+        previous=previous,
+        identifier=identifier,
+        config_bytes=config_bytes,
+        config_checksum=checksum,
+    )
+
+
+@pytest.mark.parametrize("mode", ["training", "inference"])
+@pytest.mark.parametrize("tuning", ["full", "lora"])
+def test_config_layout_catalog_import_preserves_relative_path_and_bytes(tmp_path, mode, tuning):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+
+    relative = Path(f"qwen3.5-2b/standard/h200-{mode}-{tuning}.json")
+    source = tmp_path / "cortex-training/model-catalog/models" / relative
+    raw = _cortex_recipe()
+    sub = raw["sub_job_configs"][0]
+    sub["model_name"] = "Qwen/Qwen3.5-2B"
+    if mode == "inference":
+        sub["job_type"] = "sampling"
+        sub["inference_config"] = sub.pop("training_config")
+    if tuning == "lora":
+        settings = sub["training_config" if mode == "training" else "inference_config"]
+        settings["peft_config"] = {"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]}
+    source.parent.mkdir(parents=True)
+    source.write_bytes((json.dumps(raw, indent=2).replace("\n", " \r\n") + "  ").encode())
+    root = tmp_path / "checkout/configs"
+    imported = local_config_path(source, root)
+    assert imported == root / relative
+    assert imported.read_bytes() == source.read_bytes()
+    assert local_config_path(source, root) == imported
+    loaded = load_config(imported)
+    assert loaded.has_training == (mode == "training")
+    assert loaded.gpu_type == "h200"
+    assert config_id(imported) == "-".join(relative.with_suffix("").parts)
+    assert reference_config_subpath(imported, loaded.config_id) == relative.with_suffix("")
+
+
+def test_config_layout_catalog_metadata_is_not_a_recipe(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "cortex-training/model-catalog/models/my-model/model.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps(_cortex_recipe()))
+    with pytest.raises(ValueError, match="not model metadata"):
+        local_config_path(source, tmp_path / "checkout/configs")
+
+
+def test_config_layout_discovery_lists_json_recipes_and_excludes_metadata(tmp_path):
+    from arctic_platform.correctness.harness.config import config_paths
+
+    root = tmp_path / "configs"
+    for relative in [
+        "my-model/standard/h200-training-full.json",
+        "legacy.config",
+        "my-model/model.json",
+        "archive/retired.json",
+        ".hidden/ignored.json",
+        "specs/test.json",
+    ]:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    expected = [root / "legacy.config", root / "my-model/standard/h200-training-full.json"]
+    assert config_paths(root) == expected
+    args = SimpleNamespace(all_configs=True, config_dir=root, any_gpu=True)
+    assert execution._resolve_configs(args) == expected
+
+
+def test_config_layout_external_import_rejects_ancestor_symlink_before_writes(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "h200-external.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    root = tmp_path / "configs"
+    root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "retained.json"
+    sentinel.write_bytes(b"retained external evidence\n")
+    (root / "my-model").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError):
+        local_config_path(source, root)
+    assert list(external.rglob("*")) == [sentinel]
+    assert sentinel.read_bytes() == b"retained external evidence\n"
+
+
+def test_config_layout_external_import_requires_hardware_without_a_gpu_host(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import config as config_module
+
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: None)
+    source = tmp_path / "external.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1})))
+    root = tmp_path / "checkout/configs"
+    with pytest.raises(ValueError, match="placement requires explicit hardware"):
+        config_module.local_config_path(source, root)
+    assert not root.exists()
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: "h200")
+    assert config_module.local_config_path(source, root) == root / "qwen3-8b/standard/h200-training-full.json"
+
+
+@pytest.mark.parametrize("inference_only", [False, True])
+def test_config_layout_external_import_selects_job_and_peft_mode(tmp_path, inference_only):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _cortex_recipe()
+    sub = raw["sub_job_configs"][0]
+    sub["model_name"] = "Owner/My-Model"
+    sub["training_config"]["peft_config"] = {"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]}
+    sampling = {
+        "job_type": "sampling",
+        "model_name": "Owner/My-Model",
+        "inference_config": {"n_gpus": 1, "max_seq_len": 16},
+    }
+    raw["hardware"] = "H200"
+    raw["sub_job_configs"] = [sampling] if inference_only else [sampling, sub]
+    source = tmp_path / "external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    expected = (
+        "my-model/standard/h200-inference-full.json" if inference_only else "my-model/long/h200-training-lora.json"
+    )
+    imported = local_config_path(source, root)
+    assert imported == root / expected
+    assert load_config(imported).is_rl == (not inference_only)
+
+
+@pytest.mark.parametrize(
+    "budget,sequence", [(None, "standard"), (262143, "standard"), (262144, "long"), (524288, "long")]
+)
+@pytest.mark.parametrize("native", [False, True])
+def test_config_layout_external_import_uses_explicit_budget_not_sequence_length(tmp_path, budget, sequence, native):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    training = {"n_gpus": 1, "max_seq_len": 1048576}
+    if budget is not None:
+        training["mb_spec"] = {"max_tokens_per_mb": budget}
+    raw = (
+        _config_factory_native_config(training, model_name="Owner/My-Model")
+        if native
+        else {
+            "hardware": "B200",
+            "sub_job_configs": [{"job_type": "training", "model_name": "Owner/My-Model", "training_config": training}],
+        }
+    )
+    source = tmp_path / "b200-external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    imported = local_config_path(source, root)
+    assert imported == root / f"my-model/{sequence}/b200-training-full.json"
+    assert imported.read_bytes() == source.read_bytes()
+
+
+def test_config_layout_external_import_uses_hf_model_component_not_snapshot_hash(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _config_factory_native_config(
+        {"n_gpus": 1}, model_name="/checkpoint/hub/models--Qwen--Qwen3-0.6B/snapshots/abc123"
+    )
+    source = tmp_path / "h200-external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    assert local_config_path(source, root) == root / "qwen3-0.6b/standard/h200-training-full.json"
+
+
+def test_config_layout_inference_onboarding_rejects_before_preparation(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.onboarding import onboard
+
+    source = tmp_path / "configs/my-model/standard/h200-inference-full.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {"job_type": "sampling", "model_name": "Owner/My-Model", "inference_config": {"n_gpus": 1}}
+                ]
+            }
+        )
+    )
+    args = execution.parse_args(["onboard", "--config", str(source)])
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(
+        "arctic_platform.correctness.harness.config.local_config_path",
+        lambda path: local_config_path(path, tmp_path / "configs"),
+    )
+    monkeypatch.setattr(onboard, "_onboard_configuration", lambda *a: pytest.fail("must reject before preparation"))
+    with pytest.raises(ValueError, match="inference-only"):
+        onboard.run(args)
+
+
+@pytest.mark.parametrize(
+    "previous_name",
+    [
+        "train-sft-full-4gpus-64k.config",
+        "tiny-qwen3-129m-one-h200.json",
+        "model-h200-train.config",
+        "h200-training-full.json",
+    ],
+)
+def test_config_layout_migration_preserves_config_bytes_ids_checksums_and_spec_locators(tmp_path, previous_name):
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+    from arctic_platform.correctness.harness.config import resolve_config_path
+
+    # These are locator cases only; the parent's manifest owns P1's actual destinations.
+    layout = _config_layout_synthetic_migration(tmp_path, previous_name=previous_name)
+    assert layout.current.is_file() and not layout.previous.exists()
+    assert layout.current.read_bytes() == layout.config_bytes
+    assert resolve_config_path(layout.previous) == layout.current
+    assert config_id(layout.current) == config_id(layout.previous) == layout.identifier
+    assert config_checksum(load_config(layout.previous)) == layout.config_checksum
+    relative = layout.current.relative_to(layout.base / "configs").with_suffix("")
+    assert reference_config_subpath(layout.previous, layout.identifier) == relative
+
+    spec_path = layout.base / "specs" / f"{layout.identifier}.json"
+    spec_path.parent.mkdir()
+    spec_bytes = (
+        json.dumps(
+            {
+                "config_id": layout.identifier,
+                "config_path": str(layout.previous),
+                "config_checksum": layout.config_checksum,
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode()
+    spec_path.write_bytes(spec_bytes)
+    spec = json.loads(spec_path.read_bytes())
+    assert resolve_config_path(spec["config_path"]) == layout.current
+    assert config_checksum(load_config(layout.current)) == spec["config_checksum"]
+    assert spec_path.read_bytes() == spec_bytes
+    assert layout.current.read_bytes() == layout.config_bytes
+
+
+def test_config_layout_missing_cortex_recipe_does_not_alias_migrated_correctness_config(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.config import resolve_config_path
+
+    layout = _config_layout_synthetic_migration(tmp_path)
+    cortex = tmp_path / "cortex-training/model-catalog/models" / layout.previous.name
+    assert layout.current.is_file()
+    assert not cortex.exists()
+    assert resolve_config_path(layout.previous) == layout.current
+    assert resolve_config_path(cortex) == cortex
+    with pytest.raises(FileNotFoundError):
+        load_config(cortex)
+    root = tmp_path / "configs"
+    with pytest.raises(ValueError, match="existing"):
+        local_config_path(cortex, root)
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "root_name,relative,identifier",
+    [
+        (
+            "configs",
+            "my-model/standard/variants/long/h200-training-full.json",
+            "my-model-standard-variants-long-h200-training-full",
+        ),
+        (
+            "configs",
+            "my-model/standard/variants/configs/h200-training-full.json",
+            "my-model-standard-variants-configs-h200-training-full",
+        ),
+        (
+            "custom-recipes",
+            "my-model/standard/variants/long/h200-training-full.json",
+            "my-model-standard-variants-long-h200-training-full",
+        ),
+        ("custom-recipes", "my-model/standard/h200-training-full.json", "my-model-standard-h200-training-full"),
+        ("custom-recipes", "my-model/long/h200-training-full.json", "my-model-long-h200-training-full"),
+    ],
+)
+def test_config_layout_recipe_identity_and_references_retain_root_relative_path(
+    tmp_path, root_name, relative, identifier
+):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+
+    relative = Path(relative)
+    path = tmp_path / root_name / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    loaded = load_config(path)
+    assert loaded.config_id == config_id(path) == identifier
+    assert reference_config_subpath(path, identifier) == relative.with_suffix("")
+
+
+@pytest.mark.parametrize("config_locator", ["current", "previous", "spec-only", "id-only"])
+def test_config_layout_reference_publication_and_load_mirror_recipe_without_changing_identity(
+    _reference_records_ctx, _reference_records_identity, config_locator, tmp_path, monkeypatch
+):
+    from arctic_platform.correctness.harness import config as config_module
+
+    layout = _config_layout_synthetic_migration(tmp_path)
+    relative = layout.current.relative_to(layout.base / "configs").with_suffix("")
+    monkeypatch.setattr(config_module, "__file__", str(layout.base / "harness/config.py"))
+    ctx = _reference_records_ctx
+    ctx.config_id = layout.identifier
+    ctx.spec.config_path = str(layout.previous) if config_locator == "spec-only" else None
+    if config_locator in {"current", "previous"}:
+        ctx.cfg.path = layout.current if config_locator == "current" else layout.previous
+    identity = deepcopy(_reference_records_identity)
+    identity["config_id"] = layout.identifier
+    expected_identity = deepcopy(identity)
+    measurements = _reference_records_measurements()
+    path = records.publish_record(ctx, identity, measurements)
+    assert path == ctx.reference_records_dir / relative / _reference_records_GRADS / "gradients-only/gas1.json"
+    assert json.loads(path.read_text())["identity"] == expected_identity
+    assert identity == expected_identity
+    assert records.load_record(ctx, identity) == measurements
+    assert not (ctx.reference_records_dir / layout.identifier).exists()
+
+
+def test_config_layout_reference_publication_rejects_ancestor_symlink_before_writes(
+    _reference_records_ctx, _reference_records_identity, tmp_path
+):
+    from arctic_platform.correctness.harness.config import config_id
+
+    ctx = _reference_records_ctx
+    path = tmp_path / "configs/my-model/standard/h200-training-full.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    ctx.cfg.path = path
+    ctx.config_id = config_id(path)
+    identity = deepcopy(_reference_records_identity)
+    identity["config_id"] = ctx.config_id
+    ctx.reference_records_dir.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "retained.json"
+    sentinel.write_bytes(b"retained external evidence\n")
+    (ctx.reference_records_dir / "my-model").symlink_to(external, target_is_directory=True)
+    with pytest.raises(records.ReferencePrerequisiteError):
+        records.publish_record(ctx, identity, _reference_records_measurements())
+    assert list(external.rglob("*")) == [sentinel]
+    assert sentinel.read_bytes() == b"retained external evidence\n"
+    assert ctx.reference_record_paths == {}
+
+
+def test_config_layout_reference_publication_rejects_mixed_ids_in_one_recipe_folder(
+    _reference_records_ctx, _reference_records_identity, tmp_path
+):
+    layout = _config_layout_synthetic_migration(tmp_path)
+    ctx = _reference_records_ctx
+    ctx.cfg.path = layout.current
+    first = deepcopy(_reference_records_identity)
+    second = deepcopy(first)
+    second["config_id"] = "different-config"
+    second["arm"] = "gas4"
+    with pytest.raises(records.ReferencePrerequisiteError, match="one configuration"):
+        records.publish_record_set(
+            ctx,
+            [(first, _reference_records_measurements()), (second, _reference_records_measurements())],
+            expected_identities=[first, second],
+        )
+    assert not list(ctx.reference_records_dir.rglob("*.json"))

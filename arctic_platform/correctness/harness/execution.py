@@ -56,6 +56,7 @@ from .config import TestSpec
 from .config import arms_for
 from .config import config_checksum
 from .config import config_id
+from .config import config_paths as discover_config_paths
 from .config import load_config
 from .config import local_config_path
 from .config import local_gpu_type
@@ -82,7 +83,7 @@ def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
     if getattr(args, "resolved_paths", None) is not None:
         return list(args.resolved_paths)
     if args.all_configs:
-        paths = sorted(Path(args.config_dir).rglob("*.config"))
+        paths = discover_config_paths(Path(args.config_dir))
         if not filter_by_local_gpu or args.any_gpu:
             return paths
         gpu_type = local_gpu_type()
@@ -540,6 +541,17 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 run_cases = scaled_for_placement(selected_cases, multiple)
                 if len(widths) > 1:
                     print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
+                native_optimizer = {}
+                if (
+                    local_fixture
+                    and "single-step-optimizer" in args.test
+                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+                    and run_cfg.training.get("ep_size", 1) > 1
+                ):
+                    # Expert-parallel optimizer checkpoints require the native rank-local decoder.
+                    from arctic_platform.correctness.harness.native_optimizer import owner_split_execution
+
+                    native_optimizer = owner_split_execution(run_cfg)
                 results.extend(
                     run_executor(
                         run_cfg,
@@ -568,6 +580,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             if getattr(args, "reference_records_dir", None) is not None
                             else {}
                         ),
+                        **native_optimizer,
                     )
                 )
 

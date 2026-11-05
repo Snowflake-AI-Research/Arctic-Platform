@@ -31,8 +31,10 @@ from typing import Callable
 from typing import Sequence
 
 from .harness.config import config_id
+from .harness.config import config_paths
 from .harness.config import load_config
 from .harness.config import local_config_path
+from .harness.config import resolve_config_path
 from .harness.registry import TestOutcome
 from .harness.registry import TestResult
 from .harness.registry import registered_tests
@@ -92,15 +94,15 @@ class BatchResult:
 
 
 def catalog(config_dir: Path | None = None) -> dict[str, Path]:
-    """Operator-supplied configurations, ordered by exact ID; archived files are excluded."""
+    """Active reviewed configurations, ordered by exact ID; archived files are excluded."""
     root = Path(config_dir) if config_dir is not None else PACKAGE_DIR / "configs"
     found = {}
-    paths = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix in {".config", ".json"})
+    paths = config_paths(root)
     for path in paths:
         identifier = config_id(path)
-        if "archive" in path.relative_to(root).parts:
+        if {"archive", "specs"} & set(path.relative_to(root).parts):
             continue
-        if "specs" in path.relative_to(root).parts:
+        if not (PACKAGE_DIR / "specs" / f"{identifier}.json").is_file():
             continue
         if identifier in found:
             raise ValueError(f"duplicate configuration ID: {identifier}")
@@ -123,14 +125,14 @@ def select(request: RunRequest) -> tuple[SelectedCase, ...]:
         selector = str(request.config)
         if selector in configs:
             paths = [configs[selector]]
-        elif Path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
+        elif resolve_config_path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
             paths = [local_config_path(selector, request.config_dir)]
         else:
             raise ValueError(f"unknown configuration: {selector}; use the list command or an existing config path")
     else:
         paths = list(configs.values())
     if not paths:
-        raise ValueError(f"no configurations in {request.config_dir}; supply --config or --config-dir")
+        raise ValueError(f"no active reviewed configurations in {request.config_dir}")
     selected = []
     for path in sorted(paths, key=config_id):
         if request.tests:

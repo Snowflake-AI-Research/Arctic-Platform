@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -286,7 +287,15 @@ class LoadedConfig:
 
     @property
     def training(self) -> Dict[str, Any]:
+        if not self.has_training:
+            raise ValueError(
+                f"{self.config_id}: correctness checks require a training sub-job; this is inference-only"
+            )
         return self.sub_job["training_config"]
+
+    @property
+    def has_training(self) -> bool:
+        return "training_config" in self.sub_job and self.sub_job.get("job_type", "training") == "training"
 
     @property
     def is_rl(self) -> bool:
@@ -439,11 +448,7 @@ class LoadedConfig:
         """
         if self.hardware is not None:
             return self.hardware.lower()
-        parts = list(self.path.resolve().with_suffix("").parts)
-        if CONFIG_ROOT not in parts:
-            return None
-        below = parts[parts.index(CONFIG_ROOT) + 1 :]
-        return below[1].lower() if len(below) >= 3 else None
+        return _path_gpu_type(self.path)
 
     @property
     def attention_implementation(self) -> str:
@@ -518,47 +523,33 @@ def expected_attention_implementation(gpu_type: str | None) -> str | None:
 
 
 def config_id(path: Path) -> str:
-    """``configs/qwen3.8-27b/h200/train-sft-8gpus-2k.config`` -> ``qwen3.8-27b-h200-train-sft-8gpus-2k``.
-
-    The layout is model / GPU type / workload, and a filename is unique only within one model and GPU
-    type, so the identifier names the whole path to keep reports and spec files distinct. A config outside
-    the tree keeps its filename.
-    """
-    parts = list(path.resolve().with_suffix("").parts)
-    if CONFIG_ROOT in parts:
-        parts = parts[parts.index(CONFIG_ROOT) + 1 :]
-    else:
-        parts = parts[-1:]
-    return "-".join(parts)
+    """Identify new recipes by their relative path and retain migrated recipes' frozen IDs."""
+    path = resolve_config_path(path).resolve()
+    root = _config_root(path)
+    if root is None:
+        return path.stem
+    relative = path.relative_to(root)
+    entry = _layout_entries(root).get(relative.as_posix())
+    return entry["config_id"] if entry is not None else "-".join(relative.with_suffix("").parts)
 
 
 def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
-    """Import an external config once, preserving its ID and bytes without overwriting local recipes."""
-    source = Path(path).expanduser().resolve()
+    """Import recipe bytes at their hierarchical placement without overwriting another recipe."""
+    source = resolve_config_path(path).resolve()
     root = (config_dir if config_dir is not None else Path(__file__).resolve().parents[1] / "configs").resolve()
     if source.suffix not in {".config", ".json"} or not source.is_file():
         raise ValueError(f"expected an existing .config or .json configuration: {source}")
     if source.is_relative_to(root):
         return source
-    load_config(source)
-    identifier = source.stem
-    matches = [
-        candidate
-        for candidate in root.rglob("*")
-        if candidate.is_file()
-        and candidate.suffix in {".config", ".json"}
-        and "archive" not in candidate.relative_to(root).parts
-        and config_id(candidate) == identifier
-    ]
-    if len(matches) > 1:
-        raise ValueError(f"duplicate configuration ID: {identifier}")
-    destination = root / source.name
-    if matches and matches[0] != destination:
-        raise ValueError(
-            f"configuration ID {identifier!r} already exists at {matches[0]}; use a distinct configuration filename"
-        )
+    destination = root / config_import_subpath(load_config(source))
+    if not destination.resolve().is_relative_to(root):
+        raise ValueError(f"configuration destination must stay inside the config root: {destination}")
+    identifier = config_id(destination)
+    for candidate in config_paths(root):
+        if candidate != destination and config_id(candidate) == identifier:
+            raise ValueError(f"configuration ID {identifier!r} already exists at {candidate}")
     contents = source.read_bytes()
-    root.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         with destination.open("xb") as imported:
             imported.write(contents)
@@ -566,7 +557,7 @@ def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
         if destination.read_bytes() != contents:
             raise ValueError(
                 f"configuration already exists with different contents: {destination}; "
-                "use a distinct configuration filename"
+                "use an explicit distinct recipe variant"
             ) from None
     return destination
 
@@ -628,6 +619,8 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
         }
         if native.sampling.arctic_inference_config:
             inference.update(deepcopy(native.sampling.arctic_inference_config))
+        if native.training.peft is not None:
+            inference["peft_config"] = deepcopy(native.training.peft)
         sub_jobs.append(
             {
                 "job_type": "sampling",
@@ -684,14 +677,12 @@ def _load_cortex_recipe(path: Path, raw: dict) -> LoadedConfig:
             )
         else:
             ReviewedSamplingConfig.model_validate({"weight_format": sub.get("weight_format")})
-    if "training" not in roles:
-        raise ValueError(f"{path}: correctness requires exactly one training sub-job")
-    training = next(sub for sub in sub_jobs if sub["job_type"] == "training")
-    return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs, hardware=hardware)
+    selected = next((sub for sub in sub_jobs if sub["job_type"] == "training"), sub_jobs[0])
+    return LoadedConfig(config_id=config_id(path), path=path, sub_job=selected, sub_jobs=sub_jobs, hardware=hardware)
 
 
 def load_config(path: str | Path) -> LoadedConfig:
-    path = Path(path)
+    path = resolve_config_path(path)
     raw = normalize_ints(json.loads(path.read_text()))
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: configuration must be a JSON object")
@@ -703,6 +694,11 @@ def load_config(path: str | Path) -> LoadedConfig:
         backend.pop("protocol")
     native = ReviewedClientConfig.model_validate(raw)
     training, sub_jobs = _legacy_views(native)
+    if native.training_gpus <= 0:
+        sub_jobs = [sub for sub in sub_jobs if sub["job_type"] != "training"]
+        if not sub_jobs:
+            raise ValueError(f"{path}: correctness config requires a training or sampling sub-job")
+        training = sub_jobs[0]
     return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs, native=native)
 
 
@@ -728,17 +724,17 @@ def config_checksum(config: LoadedConfig) -> str:
 
 
 def _sibling_for(path: Path, gpu_type: str) -> str:
-    """The same workload under another accelerator: ``<model>/h200/<name>`` -> ``<model>/b200/<name>``.
-
-    Named whether or not it exists, because the point is to say where the config for this host belongs.
-    """
+    """Name the corresponding accelerator recipe, whether or not that recipe exists."""
     parts = list(path.parts)
     if CONFIG_ROOT in parts:
         i = parts.index(CONFIG_ROOT)
         if len(parts) - i >= 4:
+            if parts[i + 2] in {"standard", "long"}:
+                parts[-1] = re.sub(r"^[^-]+-", f"{gpu_type}-", parts[-1], count=1)
+                return str(Path(*parts))
             parts[i + 2] = gpu_type
             return str(Path(*parts))
-    return str(Path(CONFIG_ROOT, "<model>", gpu_type, path.name))
+    return str(Path(CONFIG_ROOT, "<model>", "standard", f"{gpu_type}-training-full.json"))
 
 
 # A config is also measured at a multiple of the width it declares, never wider than this many times it.
@@ -880,3 +876,110 @@ def arms_for(max_row_tokens: int, gpu_count: int) -> List[ArmDefinition]:
     """One and four GAS groups, each with one variable-length row per configured GPU."""
     row_tokens = max_sequence_tokens(max_row_tokens, gpu_count)
     return [ArmDefinition(f"gas{gas}", gpu_count * gas, row_tokens) for gas in GAS_VALUES]
+
+
+def _config_root(path: Path) -> Path | None:
+    parents = path.resolve().parents
+    # Catalog variants can contain these directory names; keep the outer recipe root.
+    root = next((parent for parent in reversed(parents) if parent.name == CONFIG_ROOT), None)
+    if root is not None:
+        return root
+    # Hierarchical recipes also support an explicitly supplied root not named "configs".
+    return next((parent.parent.parent for parent in reversed(parents) if parent.name in {"standard", "long"}), None)
+
+
+def _layout_entries(root: Path) -> dict:
+    manifest = root.parent / "config-layout.json"
+    return json.loads(manifest.read_text()) if manifest.is_file() else {}
+
+
+def resolve_config_path(path: str | Path) -> Path:
+    """Resolve a pre-migration config locator without changing frozen specification bytes."""
+    path = Path(path).expanduser()
+    root = _config_root(path)
+    if not path.exists() and root is not None:
+        relative = path.resolve().relative_to(root).as_posix()
+        for destination, entry in _layout_entries(root).items():
+            if entry["previous_path"] == relative:
+                return root / destination
+    return path
+
+
+def config_paths(root: Path) -> List[Path]:
+    """Discover recipe JSON and legacy configs, excluding metadata and archived evidence."""
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in {".config", ".json"}
+        and not any(part.startswith(".") or part in {"archive", "specs"} for part in path.relative_to(root).parts)
+        and path.name != "model.json"
+    )
+
+
+def reference_config_subpath(path: str | Path | None, identifier: str) -> Path:
+    """Mirror config placement, keeping numerical identity independent of filesystem placement."""
+    if path is not None:
+        source = resolve_config_path(path).resolve()
+        root = _config_root(source)
+        if source.is_file() and root is not None:
+            return source.relative_to(root).with_suffix("")
+    root = Path(__file__).resolve().parents[1] / CONFIG_ROOT
+    for relative, entry in _layout_entries(root).items():
+        if entry["config_id"] == identifier:
+            return Path(relative).with_suffix("")
+    return Path(identifier)
+
+
+def _path_gpu_type(path: Path) -> str | None:
+    for part in reversed(path.parts):
+        match = re.search(r"(?:^|[-_])(h\d+|b\d+|a\d+|l\d+)(?:[-_.]|$)", part.lower())
+        if match:
+            return match[1]
+    return None
+
+
+def _model_basename(name: str) -> str:
+    parts = Path(name.rstrip("/")).parts
+    if not parts:
+        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
+    cached = next((part for part in parts if part.startswith("models--")), None)
+    basename = cached.split("--", 2)[-1] if cached is not None else parts[-1]
+    basename = basename.lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", basename) is None:
+        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
+    return basename
+
+
+def config_import_subpath(config: LoadedConfig) -> Path:
+    """Catalog recipes retain their path; other recipes use model/sequence/hardware-mode-tuning."""
+    source = config.path.resolve()
+    for parent in source.parents:
+        if (
+            parent.name == "models"
+            and parent.parent.name == "model-catalog"
+            and parent.parent.parent.name == "cortex-training"
+        ):
+            relative = source.relative_to(parent)
+            if len(relative.parts) < 3 or relative.name == "model.json":
+                raise ValueError(f"expected a model-catalog recipe, not model metadata: {source}")
+            return relative
+    settings = config.training if config.has_training else config.sub_job["inference_config"]
+    budget = (settings.get("mb_spec") or {}).get("max_tokens_per_mb")
+    if budget is not None and (type(budget) is not int or budget <= 0):
+        raise ValueError(f"{source}: mb_spec.max_tokens_per_mb must be a positive integer")
+    sequence = "long" if budget is not None and budget >= 262144 else "standard"
+    gpu = config.gpu_type or local_gpu_type()
+    if gpu is None:
+        raise ValueError(
+            f"{source}: config placement requires explicit hardware, a GPU in the source path, or a GPU host"
+        )
+    mode = "training" if config.has_training else "inference"
+    tuning = "lora" if settings.get("peft_config") else "full"
+    variant = source.stem.partition("--")[2]
+    if variant and re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", variant) is None:
+        raise ValueError(
+            f"{source}: recipe variant must contain lowercase letters, digits, dots, dashes or underscores"
+        )
+    suffix = f"--{variant}" if variant else ""
+    return Path(_model_basename(config.model_name), sequence, f"{gpu}-{mode}-{tuning}{suffix}.json")

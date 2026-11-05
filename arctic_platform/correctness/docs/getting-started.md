@@ -57,6 +57,7 @@ config = {
             "gradient_accumulation_steps": 1,
             "zero_optimization": {"stage": 2},
             "bf16": {"enabled": True},
+            "data_types": {"grad_accum_dtype": "fp32"},
             "gradient_clipping": 1.0,
             "optimizer": {
                 "type": "AdamW",
@@ -97,6 +98,8 @@ All subsequent commands run from the checkout root.
 
 ## Step 3. Config Onboard
 
+**The supplied config is copied byte for byte into the checkout's hierarchical config tree.** Recipes below `cortex-training/model-catalog/models/` retain their complete relative path under `arctic_platform/correctness/configs/`. Other `.json` and `.config` files use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`; the [layout contract](hf-reference-onboarding.md#configuration-and-reference-layout) defines those components. This demo imports as `configs/tiny-qwen3-129m/standard/h200-training-full.json`, and its compact reference folders mirror that relative path without the extension. Identical copies are reused; different contents at the same destination are rejected without overwriting. No automatic Git commit is made.
+
 **Give onboarding the config; it selects all applicable checks automatically.** On this P1 branch that means gradients followed by optimizer state. The harness derives the checkpoint from `model_name`, creates the fixture and specification, calibrates tolerances, publishes single-check and combined-selection references, and validates the target. You do not need to invent a specification, record location or prerequisite command. The quick demo uses a four-layer fixture and short batches, with eight nondeterministic calibration samples per gradient accumulation step (GAS) arm, GAS1 and GAS4. Eight samples is also the default for real-model onboarding. This is a workflow demo, not full-model, distributed-training or maximum-sequence-length validation.
 
 **Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
@@ -105,7 +108,7 @@ All subsequent commands run from the checkout root.
 python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Inspect the generated specification and onboarding summary before accepting the gates.** They are `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json`. The summary records each check's result and diagnostic directory, plus any combined-reference preparation error. Compact measurements default to `arctic_platform/correctness/reference_data`; no model or adapter tensors belong in Git. The new config name keeps this demo separate from existing 8B configs and their reference records.
+**Inspect the generated specification and onboarding summary before accepting the gates.** Use the resolved ID printed by onboarding to find `arctic_platform/correctness/specs/<config-id>.json` and `arctic_platform/correctness/specs/<config-id>.onboarding.json`. A migrated manifest entry retains the demo's frozen `tiny-qwen3-129m-one-h200` ID; without an entry, the relative config path derives `tiny-qwen3-129m-standard-h200-training-full`. The summary records each check's result and diagnostic directory, plus any combined-reference preparation error. Compact measurements use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...` for either ID; no model or adapter tensors belong in Git. The tiny-model directory keeps this demo separate from existing 8B configs and their reference records. Moving placement does not rewrite or remeasure historical evidence.
 
 **Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
 
@@ -117,8 +120,6 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **To onboard only one check, add `--test single-step-grads` or `--test single-step-optimizer`.** Missing fixture prerequisites are handled automatically. An RL config is reported as inapplicable for these two supervised-reference checks; onboarding does not manufacture SFT measurements for RL.
 
-**The supplied config is copied into the checkout first, with its filename unchanged.** External `.json` and `.config` files are imported byte for byte into `arctic_platform/correctness/configs/`, then treated as local configs. Identical copies are reused; different contents under an existing local filename are rejected without overwriting it. No automatic Git commit is made.
-
 **Existing Cortex-training recipes with `sub_job_configs` are accepted directly, alongside native client configs.** Point the same onboarding command at the recipe JSON; do not flatten or rewrite it. Import preserves the original bytes, training topology, sequence limit, optimizer, offload settings and weight format. The first-two checks still use their reduced reference fixture and existing correctness token cap, not a full-model or maximum-sequence-length run. A recipe with training and sampling sub-jobs remains classified as RL and is inapplicable to these two supervised checks.
 
 ```bash
@@ -126,7 +127,9 @@ python -m arctic_platform.correctness onboard \
   --config ../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
 
-**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Onboarding requires an existing file and does not resolve deleted recipe paths automatically. The imported filename is `h200-training-full.json`; use a distinct filename when importing a different recipe with that same basename.
+**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Onboarding requires an existing file and does not resolve deleted Cortex recipe paths automatically. Its imported path is `configs/qwen3.8-flash-next/long/h200-training-full.json`, so other models or sequence choices can retain the same recipe basename without colliding. Old migrated correctness-config paths remain aliases only within their original config root through `config-layout.json`.
+
+**Conflicting recipes require explicit variants, not arbitrary source filenames.** For a noncatalog config, append a lowercase descriptive suffix such as `--sft-4gpus` to the source filename stem; the importer retains that suffix in the derived filename and mirrored reference folder. Catalog imports preserve the exact catalog-relative filename. A sampling-only catalog recipe can be imported unchanged, but P1's two supervised checks reject it before model preparation because no training sub-job exists.
 
 ## Step 4. Run Config Tests
 
@@ -203,7 +206,7 @@ rm -r ./work/reports/output1/
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json \
   --out ./work/reports/output1
 ```
 

@@ -1260,6 +1260,7 @@ _SCHEMA_GLOBALS = {
 }
 _OPTIM_FILE = re.compile(r"(?:bf16_|fp16_)?zero_pp_rank_(\d+)_mp_rank_00_optim_states\.pt")
 _NATIVE_OPTIM_FILE = re.compile(r"bf16_zero_pp_rank_(\d+)_mp_rank_(\d+)_optim_states\.pt")
+_AP_EP_SHARD_FILE = re.compile(r"ap_ep_.+_rank_(\d{2,})_model_states\.pt")
 _NATIVE_SOURCE_ROLES = {
     "expert_checkpointer",
     "base_checkpointer",
@@ -1662,7 +1663,8 @@ def arm_native_optimizer_collector(
             raise ValueError("native collector save scope or step changed")
         before = _native_worker_layout(worker, target, tag, sources)
         _claim_native_checkpoint_root(vars(worker)[_COLLECTOR_STATE], target)
-        result = original(selected_engine, str(target), tag)
+        with node_local_model_state_writer(engine, worker.local_rank):
+            result = original(selected_engine, str(target), tag)
         if worker.job_id != training_child_id or worker._engine is not engine or engine.global_steps != step:
             raise ValueError("native collector training child/engine changed during save")
         after = _native_worker_layout(worker, target, tag, sources)
@@ -2573,7 +2575,7 @@ def assemble_native_optimizer_layout(
 def _native_checkpoint_files(root: Path, layout: dict) -> tuple[Path, list[Path], list[Path]]:
     if not root.is_dir() or root.is_symlink():
         raise ValueError("checkpoint root must be a local directory")
-    models = list(root.rglob("*_model_states.pt"))
+    models = [path for path in root.rglob("*_model_states.pt") if not _AP_EP_SHARD_FILE.fullmatch(path.name)]
     if len(models) != 1 or models[0].name != "mp_rank_00_model_states.pt":
         raise ValueError("native checkpoint requires exactly one replicated mp_rank_00 model")
     model = models[0]
@@ -2595,6 +2597,9 @@ def _native_checkpoint_files(root: Path, layout: dict) -> tuple[Path, list[Path]
             if rank >= layout["world_size"] or rank in optimizers or mp != layout["optimizer_mp_ranks"][rank]:
                 raise ValueError("native optimizer rank inventory or MP filename mismatch")
             optimizers[rank] = path
+            continue
+        match = _AP_EP_SHARD_FILE.fullmatch(path.name)
+        if match and int(match.group(1)) < layout["ep_size"]:
             continue
         match = re.fullmatch(r"experts_ep_rank_(\d{3})\.pt", path.name)
         if not match or int(match.group(1)) in experts:
@@ -4211,7 +4216,13 @@ def capture_optimizer_step(
             }
         decoded = scratch / "decoded"
         participation_options = {}
-        if result.participation is not None and "rank_receipts" in result.participation:
+        # A native capture's participation comes from its collector's save receipts; the decoder refuses both.
+        if (
+            native is None
+            and native_layout_supplier is None
+            and result.participation is not None
+            and "rank_receipts" in result.participation
+        ):
             actual_child = _dense_training_child(transport, job.client.jobs.training)
             if (
                 job.client.transport is not transport
@@ -4333,3 +4344,26 @@ def compare_model_state(left: Path, right: Path, *, ranks: int) -> dict:
         "engines": engines,
         "differences": differences,
     }
+
+
+@contextlib.contextmanager
+def node_local_model_state_writer(engine, node_rank: int):
+    """Let only the first rank of each node write ``mp_rank_00_model_states.pt`` under node-local storage.
+
+    DeepSpeed selects the node-local model-state writer by ``engine.local_rank``, read from ``LOCAL_RANK``. DSS starts
+    every Ray worker with ``LOCAL_RANK=0`` and one visible GPU, so with ``checkpoint.use_node_local_storage`` every
+    rank writes its own module state to the same path. Under expert parallelism those states hold different experts,
+    and the file left on a node is whichever rank wrote it last, not the rank-zero state the expert sidefile check
+    and the collector receipts attribute it to. ``node_rank`` is the worker's rank within its node.
+    """
+    if type(node_rank) is not int or node_rank < 0:
+        raise ValueError("node-local model-state writer requires the worker's nonnegative rank within its node")
+    if not engine.use_node_local_storage():
+        yield
+        return
+    saved = engine.save_non_zero_checkpoint
+    engine.save_non_zero_checkpoint = node_rank == 0
+    try:
+        yield
+    finally:
+        engine.save_non_zero_checkpoint = saved

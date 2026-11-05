@@ -43,6 +43,7 @@ from types import SimpleNamespace
 
 from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from arctic_platform.correctness.harness.config import reference_calibration_worker_count
+from arctic_platform.correctness.harness.config import reference_config_subpath
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
@@ -458,13 +459,14 @@ def _resume_phase(args: argparse.Namespace, phase: str, operation):
     if phase in {"references", "calibration", "validation"}:
         from arctic_platform.correctness.harness.storage import DEFAULT_RECORDS_DIR
 
-        records = Path(args.reference_records_dir or DEFAULT_RECORDS_DIR) / args.test_spec.stem
+        spec = json.loads(args.test_spec.read_text()) if args.test_spec.exists() else {}
+        records = Path(args.reference_records_dir or DEFAULT_RECORDS_DIR) / reference_config_subpath(
+            getattr(args, "config", None), spec.get("config_id", args.test_spec.stem)
+        )
         files.update({str(path): _checkpoint_file_identity(path) for path in records.rglob("*.json")})
-        if args.test_spec.exists():
-            spec = json.loads(args.test_spec.read_text())
-            model_path = spec.get("model", {}).get("cache_path")
-            if model_path:
-                models[model_path] = model_identity(model_path)
+        model_path = spec.get("model", {}).get("cache_path")
+        if model_path:
+            models[model_path] = model_identity(model_path)
     if phase == "validation" and isinstance(result, dict):
         files.update(
             {
@@ -493,16 +495,16 @@ def _validate_storage(args: argparse.Namespace) -> None:
 
 
 def _checkout_root(config_path: Path) -> Path:
-    """Resolve the executing library's Git checkout, not the operator config's directory."""
+    """Resolve the executing source tree, requiring Git backing rather than adopting a parent tree."""
     source_root = Path(__file__).resolve().parents[3]
-    result = subprocess.run(
+    subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=source_root,
         check=True,
         capture_output=True,
         text=True,
     )
-    return Path(result.stdout.strip())
+    return source_root
 
 
 def _resolve_source(value: str) -> str:
@@ -1080,6 +1082,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         return None
     if path is None:
         from arctic_platform.correctness.harness.lora import generate_adapter
+        from arctic_platform.correctness.harness.sft import SEED
 
         if model_path is None:
             return None
@@ -1087,7 +1090,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         key = str(model_path.resolve())
         if key not in generated:
             generated[key] = generate_adapter(
-                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter"
+                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter", seed=SEED
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
@@ -1626,7 +1629,11 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
             raise ValueError(
                 "optimizer reference preparation returned target results instead of reference-only success"
             )
-        paths = sorted((ctx.reference_records_dir / config.config_id / test_id).glob("*.json"))
+        paths = sorted(
+            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).glob(
+                "*.json"
+            )
+        )
         if len(paths) != len(arms):
             raise ValueError("optimizer norm publication requires exactly one compact reference for every frozen arm")
         expected_model = model_identity(args.optimizer_model_path)
@@ -2142,6 +2149,7 @@ def _prepare_references(args: argparse.Namespace) -> int:
 
 def run(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import local_config_path
 
     if args.test_id == "all" and (getattr(args, "prepare_references", False) or args.probe_layers is not None):
@@ -2175,6 +2183,11 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("sizing reuse is only supported for gradient onboarding, not probes or reference prep")
     _validate_storage(args)
     args.config = local_config_path(args.config)
+    config = load_config(args.config)
+    if not config.has_training:
+        raise ValueError(
+            f"{config.config_id}: correctness onboarding requires a training sub-job; this is inference-only"
+        )
     if args.reference_records_dir is not None:
         args.reference_records_dir = args.reference_records_dir.resolve()
     if getattr(args, "peft_adapter", None) is not None:

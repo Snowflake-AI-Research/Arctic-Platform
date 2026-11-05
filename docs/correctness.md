@@ -4,8 +4,10 @@
 
 **This branch supports two canonical checks: `single-step-grads` and `single-step-optimizer`.** Run from a prepared allocated head. Supply a native model config to onboarding; the harness selects both applicable checks, creates a reduced-fixture specification, calibrates gates, prepares compact Hugging Face records and validates the target. The default backend is `cortex-training`; the removed `onprem` correctness backend is rejected. The harness does not allocate machines or install the GPU runtime.
 
-- [Operator guide](../arctic_platform/correctness/docs/running-tests.md): prerequisites, config/test selection, backend options, reports, and diagnostics.
-- [HF reference onboarding](../arctic_platform/correctness/docs/hf-reference-onboarding.md): sizing, calibration, compact records, and immutable workload identities.
+**For config import and reference locations, follow the [configuration and reference layout](../arctic_platform/correctness/docs/hf-reference-onboarding.md#configuration-and-reference-layout).** Catalog imports preserve paths below `cortex-training/model-catalog/models/`; noncatalog configs derive a model/sequence/recipe hierarchy. Reference folders mirror config-relative paths without the extension. The `config-layout.json` manifest retains migrated frozen IDs; configs without a manifest entry derive new IDs from their relative paths. Layout migration leaves historical measurement bytes unchanged. Import acceptance, including for sampling-only recipes, is not a numerical onboarding pass.
+
+- [Operator guide](../arctic_platform/correctness/docs/running-tests.md): prerequisites, imported config locations, config/test selection, backend options, reports, and diagnostics.
+- [HF reference onboarding](../arctic_platform/correctness/docs/hf-reference-onboarding.md): config/reference hierarchy, migrated and new IDs, sizing, calibration, compact records, and immutable workload identities.
 - [Code map](../arctic_platform/correctness/docs/code-inventory.md): retained implementation boundaries and Test2 export dependencies.
 - [Correctness skill](../skills/correctness/SKILL.md): agent workflow for harness changes, reference integrity, validation and evidence boundaries; replaces the correctness-specific `AGENTS.md`.
 

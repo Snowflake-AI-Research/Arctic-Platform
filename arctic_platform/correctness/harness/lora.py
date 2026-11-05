@@ -52,6 +52,9 @@ from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.debug.training import maybe_select_participation_coordinator
+from arctic_platform.debug.training import participation_capture_enabled
+from arctic_platform.debug.training import participation_step_class
+from arctic_platform.debug.training import participation_worker_class
 
 # Lora
 
@@ -1487,11 +1490,15 @@ def _coordinator_class(training, request: dict, files_ref):
     import ray
 
     _verify_runtime(training, request["sources"])
+    capture = participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
+    if capture:
+        coordinator_base = participation_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class OriginalAdapterWorker(worker_base):
-        def __init__(self, cfg, source_stage_info=None):
+        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+        def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1508,12 +1515,14 @@ def _coordinator_class(training, request: dict, files_ref):
                 job_id=cfg["job_id"],
                 rank=rank,
             ) as receipt:
-                super().__init__(cfg, source_stage_info)
+                super().__init__(cfg, *args, **kwargs)
             _verify_runtime(native_training, request["sources"])
             self._correctness_original_adapter_receipt = deepcopy(receipt)
 
         def original_adapter_receipt(self):
             return deepcopy(self._correctness_original_adapter_receipt)
+
+    selected_worker = participation_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
 
     class OriginalAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
@@ -1525,11 +1534,11 @@ def _coordinator_class(training, request: dict, files_ref):
             native_spawn = super()._spawn_workers
             namespace, original_worker = _spawn_worker_binding(native_spawn, native_training, request["sources"])
             # Ray can deserialize inherited methods with globals separate from the imported module.
-            namespace["_DeepSpeedWorker"] = OriginalAdapterWorker
+            namespace["_DeepSpeedWorker"] = selected_worker
             try:
                 try:
                     await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
-                    if namespace.get("_DeepSpeedWorker") is not OriginalAdapterWorker:
+                    if namespace.get("_DeepSpeedWorker") is not selected_worker:
                         raise ValueError("native original adapter worker selection changed during creation")
                 finally:
                     namespace["_DeepSpeedWorker"] = original_worker
@@ -1578,11 +1587,15 @@ def _shared_coordinator_class(training, request: dict, files_ref):
     import ray
 
     _verify_shared_runtime(training, request["sources"])
+    capture = participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
+    if capture:
+        coordinator_base = participation_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class SharedAdapterWorker(worker_base):
-        def __init__(self, cfg, source_stage_info=None):
+        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+        def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1598,12 +1611,14 @@ def _shared_coordinator_class(training, request: dict, files_ref):
                 job_id=cfg["job_id"],
                 rank=rank,
             ) as receipt:
-                super().__init__(cfg, source_stage_info)
+                super().__init__(cfg, *args, **kwargs)
             _verify_shared_runtime(native_training, request["sources"])
             self._correctness_shared_adapter_receipt = deepcopy(receipt)
 
         def shared_adapter_receipt(self):
             return deepcopy(self._correctness_shared_adapter_receipt)
+
+    selected_worker = participation_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
 
     class SharedAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
@@ -1618,11 +1633,11 @@ def _shared_coordinator_class(training, request: dict, files_ref):
                 raise ValueError("native shared adapter coordinator layout or configuration differs")
             native_spawn = super()._spawn_workers
             namespace, original_worker = _spawn_worker_binding(native_spawn, native_training, request["sources"])
-            namespace["_DeepSpeedWorker"] = SharedAdapterWorker
+            namespace["_DeepSpeedWorker"] = selected_worker
             try:
                 try:
                     await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
-                    if namespace.get("_DeepSpeedWorker") is not SharedAdapterWorker:
+                    if namespace.get("_DeepSpeedWorker") is not selected_worker:
                         raise ValueError("native shared adapter worker selection changed during creation")
                 finally:
                     namespace["_DeepSpeedWorker"] = original_worker
@@ -2144,6 +2159,9 @@ def main() -> None:
             install_manager(server_head.app.state.manager)
 
         async def serve(args):
+            from arctic_platform.correctness.harness.native_optimizer import install_zone_routes
+
+            install_zone_routes(server_head.app)
             return await _serve_with_listener(server_head, original_serve, args, listener)
 
         with _zone_listener() as listener:
